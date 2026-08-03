@@ -130,23 +130,27 @@ async fn install_and_configure(domain: &str) -> Result<()> {
     // 3. Reload (or start) Caddy.
     reload_caddy(&path);
 
-    // 4. Harden the relay: enable it and bind it to loopback so the only
+    // 4. Harden the signaling relay: enable it and bind it to loopback so the only
     //    public door is Caddy's TLS — no plaintext ws://host:{port}
     //    straight to the relay. Applied live through the daemon when it's
     //    running; otherwise persisted to config for the next start.
     match crate::cli::ctl::bind_signaling_loopback().await {
-        Ok(true) => println!("✓ Relay enabled and bound to 127.0.0.1 (reachable only via Caddy)."),
+        Ok(true) => println!(
+            "✓ Signaling relay enabled and bound to 127.0.0.1 (reachable only via Caddy)."
+        ),
         Ok(false) => match persist_signaling_loopback() {
             Ok(()) => println!(
-                "✓ Set the relay to 127.0.0.1 in config — restart the daemon (or `myownmesh \
+                "✓ Set the signaling relay to 127.0.0.1 in config — restart the daemon (or `myownmesh \
                  serve`) to apply."
             ),
             Err(e) => println!(
-                "• Couldn't update the relay bind ({e}). Set services.signaling.bind = \
+                "• Couldn't update the signaling relay bind ({e}). Set services.signaling.bind = \
                  \"127.0.0.1\" yourself."
             ),
         },
-        Err(e) => println!("• Couldn't reach the daemon to bind the relay to loopback: {e}"),
+        Err(e) => println!(
+            "• Couldn't reach the daemon to bind the signaling relay to loopback: {e}"
+        ),
     }
 
     // 5. What's left for the user.

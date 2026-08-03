@@ -15,11 +15,6 @@
 //! 5. Connector retirement fences callbacks, drains owned work, and explicitly
 //!    closes the native peer connection.
 
-#![allow(
-    deprecated,
-    reason = "the connector contains the frozen implementation behind its explicitly deprecated legacy media facade"
-)]
-
 use std::future::Future;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
@@ -31,6 +26,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -65,9 +61,8 @@ use crate::resource::{
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness, ConnectorCallbackPolicy,
     ConnectorCallbackServiceWeights, ConnectorCandidateCapability, ConnectorCapableResourcePolicy,
-    ConnectorResourceOwnerReport, EnabledRealtimeConnectorPolicy, LegacyWebRtcMediaProfile,
-    MeshConnectorResourceReport, MeshConnectorResourceScope, PendingRemoteCandidatePolicy,
-    RealtimeConnectorPolicy,
+    ConnectorResourceOwnerReport, EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport,
+    MeshConnectorResourceScope, RealtimeConnectorPolicy,
 };
 
 use super::ice::build_rtc_configuration;
@@ -76,11 +71,13 @@ mod callback;
 mod cleanup;
 mod h264;
 mod media;
+mod policy;
 mod realtime;
 use callback::*;
 use cleanup::*;
 use h264::*;
 pub use media::*;
+pub use policy::*;
 use realtime::*;
 
 /// Interface-name prefixes for virtual / container / overlay networks
@@ -157,10 +154,8 @@ pub enum TransportEvent {
     /// engine per peer, so a burst of lane changes costs one offer.
     RenegotiationNeeded,
     /// One assembled access unit from the peer's video track lane.
-    #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility event")]
     VideoSample(VideoSample),
     /// One encoded audio frame from the peer's audio track lane.
-    #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility event")]
     AudioSample(AudioSample),
 }
 
@@ -285,6 +280,22 @@ struct ConnectorEventSink {
     operation_fence: Arc<ConnectorOperationFence>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectorCallbackInsertResult {
+    Queued,
+    DiscardedAfterClose,
+    Overloaded,
+    ReceiverClosed,
+    PolicyRefused,
+    WrongOwnerPath,
+}
+
+impl ConnectorCallbackInsertResult {
+    const fn accepted(self) -> bool {
+        matches!(self, Self::Queued | Self::DiscardedAfterClose)
+    }
+}
+
 impl ConnectorEventSink {
     fn open_inbound_realtime_flow(&self) -> Option<RealtimeFlowPort> {
         self.realtime_flows.open_inbound_flow()
@@ -330,10 +341,14 @@ impl ConnectorEventSink {
     }
 
     async fn emit_data_channel(&self, event: TransportEvent) -> bool {
+        self.try_emit_data_channel(event).await.accepted()
+    }
+
+    async fn try_emit_data_channel(&self, event: TransportEvent) -> ConnectorCallbackInsertResult {
         if matches!(event, TransportEvent::DataChannelClosed) {
             self.realtime_delivery.store(false, Ordering::Release);
             if !self.operation_fence.begin_close() {
-                return true;
+                return ConnectorCallbackInsertResult::DiscardedAfterClose;
             }
             self.realtime_flows.retire();
             return self.emit_inner(event, false).await;
@@ -342,14 +357,18 @@ impl ConnectorEventSink {
     }
 
     async fn emit(&self, event: TransportEvent) -> bool {
-        self.emit_inner(event, true).await
+        self.emit_inner(event, true).await.accepted()
     }
 
-    async fn emit_inner(&self, event: TransportEvent, fence_operation: bool) -> bool {
+    async fn emit_inner(
+        &self,
+        event: TransportEvent,
+        fence_operation: bool,
+    ) -> ConnectorCallbackInsertResult {
         let _operation = if fence_operation {
             match self.operation_fence.try_enter() {
                 Some(operation) => Some(operation),
-                None => return true,
+                None => return ConnectorCallbackInsertResult::DiscardedAfterClose,
             }
         } else {
             None
@@ -366,7 +385,7 @@ impl ConnectorEventSink {
             TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_)
         ) && !self.realtime_delivery.load(Ordering::Acquire)
         {
-            return true;
+            return ConnectorCallbackInsertResult::PolicyRefused;
         }
         let payload_limit = callback_payload_limit(self.callback_policy, callback_class);
         if let Some(limit) = payload_limit.filter(|limit| payload_bytes > *limit) {
@@ -376,7 +395,7 @@ impl ConnectorEventSink {
                 callback_class = ?callback_class,
                 "dropping oversized connector callback payload"
             );
-            return true;
+            return ConnectorCallbackInsertResult::PolicyRefused;
         }
         let family = match &event {
             TransportEvent::Message(_) => PreAuthResourceFamily::FrameBytes,
@@ -396,78 +415,30 @@ impl ConnectorEventSink {
                 )),
             )
         });
-        let mut queued = Some(QueuedTransportEvent { event, observation });
+        let queued = QueuedTransportEvent { event, observation };
         let Some(mailbox) = self.events.sender(callback_class) else {
             // Real-time units must enter through an exact RealtimeFlowPort.
             // A connector-wide compatibility mailbox would let one flow
             // consume or reorder another flow's admitted queue.
-            return false;
+            return ConnectorCallbackInsertResult::WrongOwnerPath;
         };
-        let mut connector_close = self.operation_fence.subscribe_close();
-        let send = async {
-            loop {
-                let mut connector_retirement = self.callback_gate.subscribe_retirement();
-                let Some(liveness) = self.attempt_liveness.as_ref() else {
-                    if *connector_retirement.borrow() || !self.callback_gate.is_active() {
-                        return false;
-                    }
-                    let permit = tokio::select! {
-                        biased;
-                        _ = connector_retirement.changed() => return false,
-                        _ = connector_close.changed(), if fence_operation => return true,
-                        result = mailbox.reserve() => result,
-                    };
-                    let Ok(permit) = permit else {
-                        return false;
-                    };
-                    if *connector_retirement.borrow() || !self.callback_gate.is_active() {
-                        return false;
-                    }
-                    let Some(event) = queued.take() else {
-                        return false;
-                    };
-                    permit.send(event);
-                    return true;
-                };
-                let mut retirement = liveness.subscribe_retirement();
-                if (*connector_retirement.borrow() || !self.callback_gate.is_active())
-                    || ((*retirement.borrow() || !liveness.is_active())
-                        && !self.candidate_promoted.load(Ordering::Acquire))
-                {
-                    return false;
-                }
-                tokio::select! {
-                    biased;
-                    _ = connector_retirement.changed() => return false,
-                    _ = connector_close.changed(), if fence_operation => return true,
-                    _ = retirement.changed(), if !self.candidate_promoted.load(Ordering::Acquire) => {
-                        if !self.candidate_promoted.load(Ordering::Acquire) {
-                            return false;
-                        }
-                    }
-                    result = mailbox.reserve() => {
-                        let Ok(permit) = result else {
-                            return false;
-                        };
-                        if *connector_retirement.borrow() || !self.callback_gate.is_active() {
-                            return false;
-                        }
-                        if (*retirement.borrow() || !liveness.is_active())
-                            && !self.candidate_promoted.load(Ordering::Acquire)
-                        {
-                            return false;
-                        }
-                        let Some(event) = queued.take() else {
-                            return false;
-                        };
-                        permit.send(event);
-                        return true;
-                    }
-                }
+        if fence_operation && self.operation_fence.is_closed() {
+            return ConnectorCallbackInsertResult::DiscardedAfterClose;
+        }
+        if !self.callback_gate.is_active()
+            || self.attempt_liveness.as_ref().is_some_and(|liveness| {
+                !liveness.is_active() && !self.candidate_promoted.load(Ordering::Acquire)
+            })
+        {
+            return ConnectorCallbackInsertResult::ReceiverClosed;
+        }
+        match mailbox.try_send(queued) {
+            Ok(()) => ConnectorCallbackInsertResult::Queued,
+            Err(mpsc::error::TrySendError::Full(_)) => ConnectorCallbackInsertResult::Overloaded,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                ConnectorCallbackInsertResult::ReceiverClosed
             }
-        };
-
-        send.await
+        }
     }
 }
 
@@ -776,6 +747,7 @@ impl PendingRemoteCandidate {
 
 /// Apply an observed candidate while retaining its lease across the await.
 /// Cancellation drops both the future and its observation.
+#[cfg(test)]
 async fn apply_pending_remote_candidate<F, Fut, T>(pending: PendingRemoteCandidate, apply: F) -> T
 where
     F: FnOnce(LocalIceCandidate) -> Fut,
@@ -818,18 +790,11 @@ impl PendingRemoteCandidateQueue {
         candidate: LocalIceCandidate,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
-        if self
-            .entries
-            .iter()
-            .any(|pending| pending.candidate == candidate)
-        {
-            return PendingRemoteCandidateQueuePush::Duplicate;
-        }
-        let Some(payload_bytes) = candidate_payload_bytes(&candidate) else {
+        let Some(content_bytes) = candidate_content_bytes(&candidate) else {
             self.budget.poison();
             return PendingRemoteCandidateQueuePush::Refused;
         };
-        let Some(reservation) = self.budget.reserve(payload_bytes) else {
+        let Some(reservation) = self.budget.reserve(content_bytes) else {
             return PendingRemoteCandidateQueuePush::Refused;
         };
         self.entries.push(PendingRemoteCandidate::retained(
@@ -852,11 +817,32 @@ impl PendingRemoteCandidateQueue {
     }
 
     fn take(&mut self) -> PendingRemoteCandidateDrain {
-        let queue = std::mem::replace(self, Self::new(self.budget.policy));
+        let entries = std::mem::take(&mut self.entries);
+        let container_observation = self.container_observation.take();
         PendingRemoteCandidateDrain {
-            entries: queue.entries.into_iter(),
-            _container_observation: queue.container_observation,
+            entries: entries.into_iter(),
+            _container_observation: container_observation,
         }
+    }
+
+    fn pop_last_for_application(
+        &mut self,
+        resource_scope: &PeerConnectionResourceScope,
+    ) -> Option<PendingRemoteCandidate> {
+        let pending = self.entries.pop()?;
+        self.entries.shrink_to_fit();
+        if self.entries.is_empty() {
+            self.container_observation = None;
+        } else if let Some(observation) = self.container_observation.as_mut() {
+            observation.replace_measurement(queue_container_resource_measurement(&self.entries));
+        } else {
+            self.container_observation =
+                Some(resource_scope.observe_pre_authentication_measurement(
+                    PreAuthResourceFamily::CandidateObject,
+                    queue_container_resource_measurement(&self.entries),
+                ));
+        }
+        Some(pending)
     }
 }
 
@@ -870,7 +856,9 @@ enum PendingRemoteCandidateQueuePush {
 #[derive(Debug)]
 struct PendingRemoteCandidateBudgetState {
     items: usize,
-    payload_bytes: usize,
+    content_bytes: usize,
+    duplicate_submissions: usize,
+    application_work: usize,
     accounting_poisoned: bool,
 }
 
@@ -886,7 +874,9 @@ impl PendingRemoteCandidateBudget {
             policy,
             state: SyncMutex::new(PendingRemoteCandidateBudgetState {
                 items: 0,
-                payload_bytes: 0,
+                content_bytes: 0,
+                duplicate_submissions: 0,
+                application_work: 0,
                 accounting_poisoned: false,
             }),
         }
@@ -894,7 +884,7 @@ impl PendingRemoteCandidateBudget {
 
     fn reserve(
         self: &Arc<Self>,
-        payload_bytes: usize,
+        content_bytes: usize,
     ) -> Option<PendingRemoteCandidateReservation> {
         let mut state = self.state.lock();
         if state.accounting_poisoned {
@@ -904,19 +894,19 @@ impl PendingRemoteCandidateBudget {
             state.accounting_poisoned = true;
             return None;
         };
-        let Some(bytes) = state.payload_bytes.checked_add(payload_bytes) else {
+        let Some(bytes) = state.content_bytes.checked_add(content_bytes) else {
             state.accounting_poisoned = true;
             return None;
         };
-        if items > self.policy.max_items().get() || bytes > self.policy.max_payload_bytes().get() {
+        if items > self.policy.max_unique_items().get()
+            || bytes > self.policy.max_content_bytes().get()
+        {
             return None;
         }
         state.items = items;
-        state.payload_bytes = bytes;
+        state.content_bytes = bytes;
         Some(PendingRemoteCandidateReservation {
             budget: Arc::clone(self),
-            payload_bytes,
-            active: true,
         })
     }
 
@@ -924,46 +914,67 @@ impl PendingRemoteCandidateBudget {
         self.state.lock().accounting_poisoned = true;
     }
 
+    fn record_duplicate(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.accounting_poisoned {
+            return false;
+        }
+        let Some(duplicates) = state.duplicate_submissions.checked_add(1) else {
+            state.accounting_poisoned = true;
+            return false;
+        };
+        if duplicates > self.policy.max_duplicate_submissions().get() {
+            return false;
+        }
+        state.duplicate_submissions = duplicates;
+        true
+    }
+
+    fn reserve_application_work(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.accounting_poisoned {
+            return false;
+        }
+        let Some(work) = state.application_work.checked_add(1) else {
+            state.accounting_poisoned = true;
+            return false;
+        };
+        if work > self.policy.max_application_work().get() {
+            return false;
+        }
+        state.application_work = work;
+        true
+    }
+
     #[cfg(test)]
-    fn report(&self) -> (usize, usize, bool) {
+    fn report(&self) -> (usize, usize, usize, usize, bool) {
         let state = self.state.lock();
-        (state.items, state.payload_bytes, state.accounting_poisoned)
+        (
+            state.items,
+            state.content_bytes,
+            state.duplicate_submissions,
+            state.application_work,
+            state.accounting_poisoned,
+        )
     }
 }
 
 #[derive(Debug)]
 struct PendingRemoteCandidateReservation {
     budget: Arc<PendingRemoteCandidateBudget>,
-    payload_bytes: usize,
-    active: bool,
 }
 
-impl Drop for PendingRemoteCandidateReservation {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut state = self.budget.state.lock();
-        let Some(items) = state.items.checked_sub(1) else {
-            state.accounting_poisoned = true;
-            return;
-        };
-        let Some(payload_bytes) = state.payload_bytes.checked_sub(self.payload_bytes) else {
-            state.accounting_poisoned = true;
-            return;
-        };
-        state.items = items;
-        state.payload_bytes = payload_bytes;
-        self.active = false;
-    }
-}
-
-fn candidate_payload_bytes(candidate: &LocalIceCandidate) -> Option<usize> {
-    candidate
+fn candidate_content_bytes(candidate: &LocalIceCandidate) -> Option<usize> {
+    let strings = candidate
         .candidate
         .len()
         .checked_add(candidate.sdp_mid.as_ref().map_or(0, String::len))?
-        .checked_add(candidate.username_fragment.as_ref().map_or(0, String::len))
+        .checked_add(candidate.username_fragment.as_ref().map_or(0, String::len))?;
+    strings.checked_add(
+        candidate
+            .sdp_mline_index
+            .map_or(0, |_| std::mem::size_of::<u16>()),
+    )
 }
 
 #[derive(Debug)]
@@ -1004,6 +1015,8 @@ impl ExactSizeIterator for PendingRemoteCandidateDrain {}
 struct RemoteCandidateState {
     remote_description_set: bool,
     pending: PendingRemoteCandidateQueue,
+    seen: std::collections::HashSet<[u8; 32]>,
+    retained_reservations: Vec<PendingRemoteCandidateReservation>,
 }
 
 impl RemoteCandidateState {
@@ -1011,6 +1024,56 @@ impl RemoteCandidateState {
         Self {
             remote_description_set: false,
             pending: PendingRemoteCandidateQueue::new(policy),
+            seen: std::collections::HashSet::new(),
+            retained_reservations: Vec::new(),
+        }
+    }
+
+    fn admit(
+        &mut self,
+        candidate: LocalIceCandidate,
+        resource_scope: &PeerConnectionResourceScope,
+    ) -> PendingRemoteCandidateQueuePush {
+        let digest = candidate_content_digest(&candidate);
+        if self.seen.contains(&digest) {
+            return if self.pending.budget.record_duplicate() {
+                PendingRemoteCandidateQueuePush::Duplicate
+            } else {
+                PendingRemoteCandidateQueuePush::Refused
+            };
+        }
+        let result = self.pending.push(candidate, resource_scope);
+        if result == PendingRemoteCandidateQueuePush::Queued {
+            self.seen.insert(digest);
+        }
+        result
+    }
+
+    fn renew_for_ice_restart(&mut self) {
+        let policy = self.pending.budget.policy;
+        *self = Self::new(policy);
+        self.remote_description_set = true;
+    }
+}
+
+fn candidate_content_digest(candidate: &LocalIceCandidate) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash_candidate_string(&mut hash, Some(&candidate.candidate));
+    hash_candidate_string(&mut hash, candidate.sdp_mid.as_ref());
+    hash.update(candidate.sdp_mline_index.unwrap_or(u16::MAX).to_be_bytes());
+    hash_candidate_string(&mut hash, candidate.username_fragment.as_ref());
+    hash.finalize().into()
+}
+
+fn hash_candidate_string(hash: &mut Sha256, value: Option<&String>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.len().to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        None => {
+            hash.update([0]);
         }
     }
 }
@@ -1295,12 +1358,15 @@ impl ConnectorOwnership {
 }
 
 fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeasurement {
-    let (logical_bytes, logical_inexact) = measured_sum([
+    let (logical_bytes, _) = measured_sum([
         candidate.candidate.len(),
         candidate.sdp_mid.as_ref().map_or(0, String::len),
+        candidate
+            .sdp_mline_index
+            .map_or(0, |_| std::mem::size_of::<u16>()),
         candidate.username_fragment.as_ref().map_or(0, String::len),
     ]);
-    let (retained_bytes, retained_inexact) = measured_sum([
+    let (retained_bytes, _) = measured_sum([
         candidate.candidate.capacity(),
         candidate.sdp_mid.as_ref().map_or(0, String::capacity),
         candidate
@@ -1309,11 +1375,10 @@ fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeas
             .map_or(0, String::capacity),
     ]);
     let observed = ResourceUse::observed(1, logical_bytes, retained_bytes, 0);
-    if logical_inexact || retained_inexact {
-        ResourceMeasurement::inexact(observed)
-    } else {
-        ResourceMeasurement::exact(observed)
-    }
+    // String capacities and the content fields are observable, but allocator
+    // overhead and storage retained inside webrtc-rs are not. This must not be
+    // reported as exact retained memory.
+    ResourceMeasurement::inexact(observed)
 }
 
 fn queue_container_resource_measurement(
@@ -1322,13 +1387,10 @@ fn queue_container_resource_measurement(
     let bytes = entries
         .capacity()
         .checked_mul(size_of::<PendingRemoteCandidate>());
-    let (retained_bytes, inexact) = measured_usize(bytes);
+    let (retained_bytes, _) = measured_usize(bytes);
     let observed = ResourceUse::observed(0, 0, retained_bytes, 0);
-    if inexact {
-        ResourceMeasurement::inexact(observed)
-    } else {
-        ResourceMeasurement::exact(observed)
-    }
+    // Vec capacity is observable, but allocator overhead is not.
+    ResourceMeasurement::inexact(observed)
 }
 
 fn measured_usize(value: Option<usize>) -> (u64, bool) {
@@ -1433,6 +1495,7 @@ struct AdmittedConnectorOwnership {
     close_owner: Arc<ConnectorCloseOwner>,
     resource_scope: PeerConnectionResourceScope,
     transport_observation: ObservationLease,
+    remote_candidate_policy: PendingRemoteCandidatePolicy,
 }
 
 impl WebRtcConnectorWorker {
@@ -1448,11 +1511,12 @@ impl WebRtcConnectorWorker {
             close_owner,
             resource_scope,
             transport_observation,
+            remote_candidate_policy,
         } = admitted;
         let attempt_retirement = attempt_liveness.subscribe_retirement();
         let session = Arc::new(session);
         let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::new(
-            close_owner.pending_remote_candidate_policy(),
+            remote_candidate_policy,
         )));
         if !close_owner.attach_remote_candidates(Arc::clone(&remote_candidates)) {
             close_owner.start();
@@ -1516,8 +1580,9 @@ impl WebRtcConnectorWorker {
             if !self.ownership.incarnation.is_active() {
                 return Err(Error::Transport("connector worker is retired".to_string()));
             }
+            let admitted = state.admit(candidate, &self.resource_scope);
             if !state.remote_description_set {
-                return Ok(match state.pending.push(candidate, &self.resource_scope) {
+                return Ok(match admitted {
                     PendingRemoteCandidateQueuePush::Queued => {
                         RemoteCandidateDisposition::QueuedUntilRemoteDescription
                     }
@@ -1529,7 +1594,22 @@ impl WebRtcConnectorWorker {
                     }
                 });
             }
-            PendingRemoteCandidate::observe(candidate, &self.resource_scope)
+            match admitted {
+                PendingRemoteCandidateQueuePush::Queued => state
+                    .pending
+                    .pop_last_for_application(&self.resource_scope)
+                    .ok_or_else(|| {
+                        Error::Transport(
+                            "remote-candidate admission lost its exact queued value".to_string(),
+                        )
+                    })?,
+                PendingRemoteCandidateQueuePush::Duplicate => {
+                    return Ok(RemoteCandidateDisposition::DuplicateIgnored)
+                }
+                PendingRemoteCandidateQueuePush::Refused => {
+                    return Ok(RemoteCandidateDisposition::RefusedByOwner)
+                }
+            }
         };
         self.apply_remote_candidate(pending).await?;
         Ok(RemoteCandidateDisposition::Applied)
@@ -1587,16 +1667,40 @@ impl WebRtcConnectorWorker {
         if !self.ownership.incarnation.is_active() {
             return Err(Error::Transport("connector worker is retired".to_string()));
         }
+        let budget = pending
+            ._queue_reservation
+            .as_ref()
+            .map(|reservation| Arc::clone(&reservation.budget));
+        if budget
+            .as_ref()
+            .is_some_and(|budget| !budget.reserve_application_work())
+        {
+            return Err(Error::Transport(
+                "remote-candidate application work exceeded the owner-selected ICE-attempt envelope"
+                    .to_string(),
+            ));
+        }
         let _ice_observation =
             observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::IceWork, 1, 0);
-        await_until_connector_retirement(
+        let PendingRemoteCandidate {
+            candidate,
+            observation,
+            _queue_reservation,
+        } = pending;
+        let result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
-            apply_pending_remote_candidate(pending, |candidate| async move {
-                self.session.add_ice_candidate(candidate).await
-            }),
+            self.session.add_ice_candidate(candidate),
         )
         .await
-        .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?
+        .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?;
+        drop(observation);
+        if let Some(reservation) = _queue_reservation {
+            self.remote_candidates
+                .lock()
+                .retained_reservations
+                .push(reservation);
+        }
+        result
     }
 
     pub(crate) fn observe_owned_task(&self) -> ObservationLease {
@@ -1745,17 +1849,12 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during audio send".to_string()))?
     }
 
-    pub(crate) fn has_reapable_lanes(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-    ) -> bool {
-        let Some(_operation) = self.ownership.operation_fence.try_enter() else {
-            return false;
-        };
-        self.owns_realtime_flow(capability) && self.session.has_reapable_lanes()
-    }
-
-    pub(crate) async fn reap_drained_lanes(
+    #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
+    #[allow(
+        dead_code,
+        reason = "this explicit event is used only by the deprecated legacy-media deployment owner"
+    )]
+    pub(crate) async fn finalize_suspended_lanes(
         &self,
         capability: &crate::connector::ConnectorRealtimeFlowCapability,
     ) -> usize {
@@ -1767,7 +1866,7 @@ impl WebRtcConnectorWorker {
         }
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
-            self.session.reap_drained_lanes(),
+            self.session.finalize_suspended_lanes(),
         )
         .await
         .unwrap_or(0)
@@ -1794,7 +1893,9 @@ impl WebRtcConnectorWorker {
         .await
         .ok_or_else(|| {
             Error::Transport("connector worker retired during ICE restart".to_string())
-        })?
+        })??;
+        self.remote_candidates.lock().renew_for_ice_restart();
+        Ok(())
     }
 
     pub(crate) async fn selected_candidate_pair(
@@ -1818,6 +1919,9 @@ impl WebRtcConnectorWorker {
     }
 
     pub(crate) fn confirm_data_channel_open(&self) -> DataChannelOpenOwnership {
+        let Some(_operation) = self.ownership.operation_fence.try_enter() else {
+            return DataChannelOpenOwnership::Rejected;
+        };
         match self.ownership.mark_data_channel_open() {
             DataChannelOpenTransition::Connected(capability) => {
                 DataChannelOpenOwnership::Connected(EndpointAuthHandoff::new(
@@ -1842,6 +1946,7 @@ impl WebRtcConnectorWorker {
         &self,
         task: &crate::endpoint_auth::EndpointAuthTask,
     ) -> Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>> {
+        let _operation = self.ownership.operation_fence.try_enter()?;
         if !self.owns_endpoint_auth(task)
             || !self.ownership.incarnation.is_active()
             || !self.session.realtime_enabled()
@@ -1906,6 +2011,7 @@ pub struct Transport {
     runtime: crate::runtime::RuntimeIncarnation,
     ice_transport_policy: RTCIceTransportPolicy,
     connector_resource_scope: Option<MeshConnectorResourceScope>,
+    webrtc_profile: Option<WebRtcConnectorProfile>,
     #[cfg(test)]
     construction_hook: Option<Arc<ConstructionTestHook>>,
 }
@@ -2141,6 +2247,7 @@ impl Transport {
             runtime: crate::runtime::RuntimeIncarnation::new(),
             ice_transport_policy: RTCIceTransportPolicy::All,
             connector_resource_scope: None,
+            webrtc_profile: None,
             #[cfg(test)]
             construction_hook: None,
         })
@@ -2151,8 +2258,10 @@ impl Transport {
     pub(crate) fn with_connector_resource_scope(
         mut self,
         scope: MeshConnectorResourceScope,
+        profile: WebRtcConnectorProfile,
     ) -> Self {
         self.connector_resource_scope = Some(scope);
+        self.webrtc_profile = Some(profile);
         self
     }
 
@@ -2166,7 +2275,7 @@ impl Transport {
         let root = ProcessResourceRoot::global();
         root.install_connector_policy(policy.process())?;
         let scope = root.issue_mesh_connector_scope(policy.mesh())?;
-        Ok(self.with_connector_resource_scope(scope))
+        Ok(self.with_connector_resource_scope(scope, policy.webrtc()))
     }
 
     pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
@@ -2220,6 +2329,7 @@ impl Transport {
             .connector_resource_scope
             .clone()
             .ok_or(Error::ConnectorPolicyRequired)?;
+        let webrtc_profile = self.webrtc_profile.ok_or(Error::ConnectorPolicyRequired)?;
         let transport_observation = observe_inexact_item(
             &resource_scope,
             PreAuthResourceFamily::TransportObject,
@@ -2267,9 +2377,9 @@ impl Transport {
                         attempt_liveness: Some(construction_liveness),
                         candidate_promoted: construction_candidate_promoted,
                         callback_gate: construction_incarnation,
-                        callback_policy: resource_owner.callbacks(),
+                        callback_policy: webrtc_profile.callbacks(),
                         operation_fence,
-                        legacy_media_profile: resource_owner.legacy_media(),
+                        legacy_media_profile: webrtc_profile.legacy_media(),
                         close_owner: Some(Arc::clone(&construction_close_owner)),
                     },
                 )
@@ -2322,6 +2432,7 @@ impl Transport {
                 close_owner,
                 resource_scope,
                 transport_observation,
+                remote_candidate_policy: webrtc_profile.remote_candidates(),
             },
         );
         if admitted.is_ok() {
@@ -2344,7 +2455,6 @@ impl Transport {
             NonZeroUsize::new(media_lanes).expect("lab transport has at least one media lane"),
             PRE_PROVISIONED_LANES.min(media_lanes),
             PRE_PROVISIONED_LANES.min(media_lanes),
-            *LANE_DRAIN_GRACE,
         )
         .map_err(|error| Error::Transport(error.to_string()))?;
         self.open_peer_with_config_and_legacy_media_profile(role, config, legacy_media_profile)
@@ -2467,7 +2577,13 @@ impl Transport {
             };
             let data_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
 
-            register_callbacks(&pc, &event_sink, &data_channel, resource_scope.clone());
+            register_callbacks(
+                &pc,
+                &event_sink,
+                &data_channel,
+                resource_scope.clone(),
+                legacy_media_profile,
+            );
 
             // Generic real-time ownership creates no native tracks. The
             // explicit legacy H.264 and Opus profile is the only source of
@@ -2555,6 +2671,8 @@ impl Transport {
                 lane_operations: Mutex::new(()),
                 #[cfg(test)]
                 fail_next_track_attach: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_track_remove: AtomicBool::new(false),
                 callback_gate,
                 role,
                 resource_scope,
@@ -2663,6 +2781,7 @@ fn register_callbacks(
     events_tx: &ConnectorEventSink,
     data_channel: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     resource_scope: Option<PeerConnectionResourceScope>,
+    legacy_media_profile: Option<LegacyWebRtcMediaProfile>,
 ) {
     let remote_tracks = Arc::new(SyncMutex::new(
         std::collections::HashSet::<(bool, u8)>::new(),
@@ -2755,6 +2874,10 @@ fn register_callbacks(
             let dc_slot = dc_slot.clone();
             let handler_scope = handler_scope.clone();
             Box::pin(async move {
+                let Some(_operation) = tx.operation_fence.try_enter() else {
+                    let _ = dc.close().await;
+                    return;
+                };
                 if dc.label() != APP_DATA_CHANNEL_LABEL {
                     trace!(label = dc.label(), "ignoring non-app data channel");
                     let _ = dc.close().await;
@@ -2781,6 +2904,7 @@ fn register_callbacks(
         let tx = events_tx.clone();
         let task_scope = resource_scope.clone();
         let remote_tracks = Arc::clone(&remote_tracks);
+        let media_profile = legacy_media_profile;
         let callback_observation = observe_inexact_item_if(
             resource_scope.as_ref(),
             PreAuthResourceFamily::Callback,
@@ -2791,48 +2915,54 @@ fn register_callbacks(
             let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             let remote_tracks = Arc::clone(&remote_tracks);
-            let flow = tx.open_inbound_realtime_flow();
             let task_observation =
                 observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
             Box::pin(async move {
-                let Some(flow) = flow else {
+                let Some(_operation) = tx.operation_fence.try_enter() else {
                     let _ = transceiver.stop().await;
                     return;
                 };
-                let lane = lane_of_track_id(&track.id());
-                let key = match track.kind() {
-                    RTPCodecType::Video => Some((true, lane)),
-                    RTPCodecType::Audio => Some((false, lane)),
-                    _ => None,
-                };
-                let Some(key) = key else {
+                if !tx.callback_gate.is_active() {
+                    let _ = transceiver.stop().await;
+                    return;
+                }
+                let Some(profile) = media_profile else {
                     let _ = transceiver.stop().await;
                     return;
                 };
+                let Some((_kind, is_video, lane)) = legacy_track_identity(
+                    track.kind(),
+                    &track.codec().capability.mime_type,
+                    &track.id(),
+                    profile,
+                ) else {
+                    let _ = transceiver.stop().await;
+                    return;
+                };
+                let key = (is_video, lane);
                 if !remote_tracks.lock().insert(key) {
                     let _ = transceiver.stop().await;
                     return;
                 }
+                let Some(flow) = tx.open_inbound_realtime_flow() else {
+                    remote_tracks.lock().remove(&key);
+                    let _ = transceiver.stop().await;
+                    return;
+                };
+                let owner = LegacyInboundTrackOwner {
+                    task_observation,
+                    remote_tracks,
+                    track_key: key,
+                    flow,
+                    transceiver: Arc::clone(&transceiver),
+                    lane,
+                };
                 match track.kind() {
                     RTPCodecType::Video => {
-                        tokio::spawn(pump_video_track(
-                            track,
-                            tx,
-                            task_observation,
-                            remote_tracks,
-                            key,
-                            flow,
-                        ));
+                        tokio::spawn(pump_video_track(track, tx, owner));
                     }
                     RTPCodecType::Audio => {
-                        tokio::spawn(pump_audio_track(
-                            track,
-                            tx,
-                            task_observation,
-                            remote_tracks,
-                            key,
-                            flow,
-                        ));
+                        tokio::spawn(pump_audio_track(track, tx, owner));
                     }
                     _ => unreachable!("track kind was classified above"),
                 }
@@ -2994,8 +3124,8 @@ pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     /// Lifecycle-managed lane slots, index = lane id. `None` = lane
-    /// never opened (or fully reaped); see [`LaneSlot`] for the
-    /// open/draining split. Slot count is fixed at
+    /// never opened or explicitly finalized; see [`LaneSlot`] for the
+    /// open/suspended split. Slot count is fixed at
     /// [`PeerSession::max_lanes`] so ids stay stable; a std Mutex
     /// because holders only clone the Arc out (never held across an
     /// await).
@@ -3011,6 +3141,8 @@ pub struct PeerSession {
     lane_operations: Mutex<()>,
     #[cfg(test)]
     fail_next_track_attach: AtomicBool,
+    #[cfg(test)]
+    fail_next_track_remove: AtomicBool,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     role: Role,
     resource_scope: Option<PeerConnectionResourceScope>,
@@ -3393,6 +3525,32 @@ mod tests {
             .expect("fixture has a nonzero candidate bound");
         let callback_capacity = std::num::NonZeroUsize::new(callback_capacity)
             .expect("fixture has nonzero callback bounds");
+        let _callbacks = ConnectorCallbackPolicy::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
+                callback_capacity,
+                callback_capacity,
+            ),
+            ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
+            RealtimeConnectorPolicy::Disabled,
+        )
+        .expect("fixture callback policy is valid");
+        let candidate_content_bytes = candidate_content_bytes(&observed_candidate())
+            .and_then(|bytes| bytes.checked_mul(max_active_candidates.get()))
+            .and_then(NonZeroUsize::new)
+            .expect("fixture candidate-byte ceiling is representable and nonzero");
+        let _ = candidate_content_bytes;
+        let policy = crate::runtime::attempt::ConnectorResourcePolicy::new(max_active_candidates)
+            .expect("fixture connector resource policy is valid");
+        crate::runtime::attempt::ConnectorResourceOwnerPort::new(policy)
+            .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
+                max_active_candidates,
+            ))
+            .expect("fixture process owner issues one explicit Mesh scope")
+    }
+
+    fn test_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
+        let callback_capacity =
+            NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
             crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
                 callback_capacity,
@@ -3402,20 +3560,39 @@ mod tests {
             RealtimeConnectorPolicy::Disabled,
         )
         .expect("fixture callback policy is valid");
-        let candidate_payload_bytes = candidate_payload_bytes(&observed_candidate())
-            .and_then(|bytes| bytes.checked_mul(max_active_candidates.get()))
-            .and_then(NonZeroUsize::new)
-            .expect("fixture candidate-byte ceiling is representable and nonzero");
-        let policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
-            max_active_candidates,
+        WebRtcConnectorProfile::new(
             callbacks,
-            PendingRemoteCandidatePolicy::new(max_active_candidates, candidate_payload_bytes),
-        );
-        crate::runtime::attempt::ConnectorResourceOwnerPort::new(policy)
-            .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
-                max_active_candidates,
-            ))
-            .expect("fixture process owner issues one explicit Mesh scope")
+            PendingRemoteCandidatePolicy::new(
+                callback_capacity,
+                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+                callback_capacity,
+                callback_capacity,
+            ),
+        )
+    }
+
+    fn test_generic_realtime_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
+        let callback_capacity =
+            NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero");
+        WebRtcConnectorProfile::new(
+            explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16),
+            PendingRemoteCandidatePolicy::new(
+                callback_capacity,
+                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+                callback_capacity,
+                callback_capacity,
+            ),
+        )
+    }
+
+    fn test_legacy_realtime_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
+        let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
+        test_generic_realtime_webrtc_profile(callback_capacity)
+            .with_legacy_webrtc_media(
+                LegacyWebRtcMediaProfile::h264_opus(one, 0, 0)
+                    .expect("fixture legacy provider is structurally valid"),
+            )
+            .expect("fixture real-time policy admits the explicit legacy provider")
     }
 
     fn close_owner_fixture(
@@ -3508,12 +3685,14 @@ mod tests {
     }
 
     fn test_pending_candidate_policy() -> PendingRemoteCandidatePolicy {
-        let candidate_bytes = candidate_payload_bytes(&observed_candidate())
+        let candidate_bytes = candidate_content_bytes(&observed_candidate())
             .and_then(NonZeroUsize::new)
-            .expect("fixture candidate has a nonzero representable payload");
+            .expect("fixture candidate has nonzero representable content");
         PendingRemoteCandidatePolicy::new(
             NonZeroUsize::new(1).expect("fixture item ceiling is nonzero"),
             candidate_bytes,
+            NonZeroUsize::new(1).expect("fixture duplicate ceiling is nonzero"),
+            NonZeroUsize::new(1).expect("fixture work ceiling is nonzero"),
         )
     }
 
@@ -3599,7 +3778,7 @@ mod tests {
         sink
     }
 
-    async fn open_zero_grace_legacy_peer(
+    async fn open_explicit_legacy_media_peer(
         transport: &Transport,
         role: Role,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
@@ -3609,7 +3788,6 @@ mod tests {
             NonZeroUsize::new(MEDIA_LANES).expect("legacy test lane ceiling is nonzero"),
             PRE_PROVISIONED_LANES,
             PRE_PROVISIONED_LANES,
-            Duration::ZERO,
         )
         .expect("legacy test profile is structurally valid");
         transport
@@ -3666,16 +3844,12 @@ mod tests {
                     max_in_progress_units_per_flow,
                     "per-flow in-progress unit limit",
                 ),
+                nonzero(1, "pre-auth packet limit"),
+                nonzero(max_accounted_bytes, "pre-auth content-byte limit"),
             ),
             ConnectorRealtimeByteBudgets::new(
                 nonzero(max_accounted_bytes, "inbound accounted-byte limit"),
                 nonzero(max_accounted_bytes, "outbound accounted-byte limit"),
-                nonzero(
-                    max_accounted_bytes
-                        .checked_mul(2)
-                        .expect("fixture aggregate byte limit is representable"),
-                    "aggregate accounted-byte limit",
-                ),
             ),
             crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
         );
@@ -3823,7 +3997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03f_close_fence_rejects_a_blocked_causally_later_message() {
+    async fn v4_arc03h_full_mailbox_does_not_hide_a_producer_before_close() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
         let policy = ConnectorCallbackPolicy::new(
             crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
@@ -3838,23 +4012,22 @@ mod tests {
             sink.emit_data_channel(TransportEvent::Message(Bytes::from_static(b"before-close")))
                 .await
         );
-        let later_sink = sink.clone();
-        let later = tokio::spawn(async move {
-            later_sink
-                .emit_data_channel(TransportEvent::Message(Bytes::from_static(b"after-close")))
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !later.is_finished(),
-            "the later callback is blocked by the full mailbox"
+        assert_eq!(
+            sink.try_emit_data_channel(TransportEvent::Message(Bytes::from_static(b"overload")))
+                .await,
+            ConnectorCallbackInsertResult::Overloaded,
+            "a full mailbox returns typed overload without parking a producer"
         );
 
         assert!(
             sink.emit_data_channel(TransportEvent::DataChannelClosed)
                 .await
         );
-        assert!(later.await.expect("later callback task joins"));
+        assert!(
+            sink.emit_data_channel(TransportEvent::Message(Bytes::from_static(b"after-close")))
+                .await,
+            "a causally later message is discarded after the close commit"
+        );
 
         receiver.scheduler.cursor = ConnectorCallbackClass::EndpointData.index();
         receiver.scheduler.remaining = 1;
@@ -4413,7 +4586,7 @@ mod tests {
         drop(oversized_fragment);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
-        assert_eq!(state.in_progress_units, 0);
+        assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
         assert_eq!(state.accounting_poisoned_by_domain, [false, false]);
     }
 
@@ -4422,8 +4595,14 @@ mod tests {
         let nonzero = |value| NonZeroUsize::new(value).expect("fixture value is nonzero");
         let flows = ConnectorRealtimeFlowPolicy::new(
             ConnectorRealtimeFlowCapacities::new(nonzero(1), nonzero(1), nonzero(1)),
-            ConnectorRealtimeInboundLimits::new(nonzero(4), nonzero(1), nonzero(1)),
-            ConnectorRealtimeByteBudgets::new(nonzero(8), nonzero(4), nonzero(12)),
+            ConnectorRealtimeInboundLimits::new(
+                nonzero(4),
+                nonzero(1),
+                nonzero(1),
+                nonzero(1),
+                nonzero(4),
+            ),
+            ConnectorRealtimeByteBudgets::new(nonzero(8), nonzero(4)),
             crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
         );
         let realtime = RealtimeConnectorPolicy::enabled(nonzero(4), flows)
@@ -4448,7 +4627,7 @@ mod tests {
         drop(assembly);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
-        assert_eq!(state.in_progress_units, 0);
+        assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
         assert!(realtime_accounting_is_clean(&state));
     }
 
@@ -4464,6 +4643,11 @@ mod tests {
 
         let state = registry.state.lock();
         assert!(state.accounting_poisoned_by_domain[RealtimeFlowDomain::InboundQuarantine.index()]);
+        assert_eq!(
+            state.retained_bytes_by_domain[RealtimeFlowDomain::InboundQuarantine.index()],
+            8,
+            "a damaged domain is conservatively charged at its full ceiling"
+        );
         assert!(
             !state.accounting_poisoned_by_domain[RealtimeFlowDomain::OutboundCompatibility.index()]
         );
@@ -4474,6 +4658,25 @@ mod tests {
             registry.open_outbound_flow().is_some(),
             "inbound accounting corruption does not poison the independent outbound owner"
         );
+    }
+
+    #[test]
+    fn v4_arc03h_sustained_pre_auth_rtp_exhausts_a_finite_cumulative_envelope() {
+        let registry =
+            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let _flow = registry
+            .open_inbound_flow()
+            .expect("explicit provider owns one speculative inbound flow");
+
+        assert!(registry.admit_pre_auth_packet(8, false));
+        assert!(
+            !registry.admit_pre_auth_packet(1, false),
+            "the packet ceiling stops sustained speculative work without a timer"
+        );
+        let state = registry.state.lock();
+        assert_eq!(state.pre_auth_packets, 1);
+        assert_eq!(state.pre_auth_content_bytes, 8);
+        assert!(state.pre_auth_exhausted);
     }
 
     #[tokio::test]
@@ -4722,6 +4925,49 @@ mod tests {
         let (permit, _lifetime, claim) =
             admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
         assert!(permit.reserve_connector_candidate(claim).is_some());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03h_cleanup_future_panic_marks_exact_owner_failed() {
+        let owner = test_resource_owner(2, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        close_owner.panic_cleanup_future_for_test();
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("cleanup panic must retain this exact claim");
+        assert!(error.to_string().contains("panicked"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner.process_report().cleanup.failed_jobs == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup health observes the panic");
+        let report = owner.process_report();
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 1);
+        assert_eq!(report.cleanup.failed_jobs, 1);
+        assert!(!report.cleanup.executor_failed);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03h_cleanup_executor_failure_refuses_job_and_fails_exact_owner() {
+        let owner = test_resource_owner(2, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        owner.fail_cleanup_executor_for_test();
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("failed executor must retain this exact claim");
+        assert!(error
+            .to_string()
+            .contains("cleanup executor is unavailable"));
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 1);
+        assert!(owner.process_report().cleanup.executor_failed);
     }
 
     #[tokio::test]
@@ -5027,69 +5273,119 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let first = observed_candidate();
-        let payload_bytes =
-            candidate_payload_bytes(&first).expect("fixture payload is representable");
+        let content_bytes =
+            candidate_content_bytes(&first).expect("fixture content is representable");
         let one = NonZeroUsize::new(1).expect("one is nonzero");
         let two = NonZeroUsize::new(2).expect("two is nonzero");
-        let two_payloads = payload_bytes
+        let two_candidates = content_bytes
             .checked_mul(2)
             .and_then(NonZeroUsize::new)
-            .expect("two fixture payloads are representable and nonzero");
+            .expect("two candidate contents are representable and nonzero");
 
-        let mut item_bounded =
-            PendingRemoteCandidateQueue::new(PendingRemoteCandidatePolicy::new(one, two_payloads));
+        let mut item_bounded = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
+            one,
+            two_candidates,
+            one,
+            two,
+        ));
         assert_eq!(
-            item_bounded.push(first.clone(), &scope),
+            item_bounded.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
         assert_eq!(
-            item_bounded.push(first.clone(), &scope),
+            item_bounded.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Duplicate
         );
-        assert_eq!(item_bounded.budget.report(), (1, payload_bytes, false));
+        assert_eq!(
+            item_bounded.pending.budget.report(),
+            (1, content_bytes, 1, 0, false)
+        );
         let mut distinct = first.clone();
         distinct.candidate.replace_range(0..1, "C");
         assert_eq!(
-            candidate_payload_bytes(&distinct),
-            Some(payload_bytes),
+            candidate_content_bytes(&distinct),
+            Some(content_bytes),
             "fixture variation keeps the byte test independent from item count"
         );
         assert_eq!(
-            item_bounded.push(distinct.clone(), &scope),
+            item_bounded.admit(distinct.clone(), &scope),
             PendingRemoteCandidateQueuePush::Refused
         );
-        assert_eq!(item_bounded.budget.report(), (1, payload_bytes, false));
+        assert_eq!(
+            item_bounded.pending.budget.report(),
+            (1, content_bytes, 1, 0, false)
+        );
 
         let exact_one_payload =
-            NonZeroUsize::new(payload_bytes).expect("fixture candidate payload is nonzero");
-        let mut byte_bounded = PendingRemoteCandidateQueue::new(PendingRemoteCandidatePolicy::new(
+            NonZeroUsize::new(content_bytes).expect("fixture candidate content is nonzero");
+        let mut byte_bounded = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
             two,
             exact_one_payload,
+            one,
+            two,
         ));
         assert_eq!(
-            byte_bounded.push(first, &scope),
+            byte_bounded.admit(first, &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
         assert_eq!(
-            byte_bounded.push(distinct, &scope),
+            byte_bounded.admit(distinct, &scope),
             PendingRemoteCandidateQueuePush::Refused
         );
-        assert_eq!(byte_bounded.budget.report(), (1, payload_bytes, false));
+        assert_eq!(
+            byte_bounded.pending.budget.report(),
+            (1, content_bytes, 0, 0, false)
+        );
     }
 
     #[test]
-    fn v4_arc03g_candidate_queue_claim_survives_delayed_apply_and_releases_on_cancellation() {
+    fn v4_arc03h_candidate_content_bytes_cover_every_candidate_content_field() {
+        let candidate = LocalIceCandidate {
+            candidate: "candidate-content".to_string(),
+            sdp_mid: Some("mid".to_string()),
+            sdp_mline_index: Some(7),
+            username_fragment: Some("ufrag".to_string()),
+        };
+        assert_eq!(
+            candidate_content_bytes(&candidate),
+            Some("candidate-content".len() + "mid".len() + size_of::<u16>() + "ufrag".len())
+        );
+    }
+
+    #[test]
+    fn v4_arc03h_candidate_digest_is_structurally_unambiguous() {
+        let mut first = observed_candidate();
+        first.candidate = "a".to_string();
+        first.sdp_mid = Some("b\0".to_string());
+        first.sdp_mline_index = None;
+        first.username_fragment = None;
+        let mut second = first.clone();
+        second.candidate = "a\0b".to_string();
+        second.sdp_mid = None;
+
+        assert_ne!(first, second);
+        assert_ne!(
+            candidate_content_digest(&first),
+            candidate_content_digest(&second),
+            "field boundaries participate in duplicate identity"
+        );
+    }
+
+    #[test]
+    fn v4_arc03h_candidate_attempt_envelope_survives_delayed_apply_and_cancellation() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
         let candidate = observed_candidate();
-        let payload_bytes =
-            candidate_payload_bytes(&candidate).expect("fixture payload is representable");
+        let content_bytes =
+            candidate_content_bytes(&candidate).expect("fixture content is representable");
         let policy = PendingRemoteCandidatePolicy::new(
             NonZeroUsize::new(1).expect("one is nonzero"),
-            NonZeroUsize::new(payload_bytes).expect("fixture payload is nonzero"),
+            NonZeroUsize::new(content_bytes).expect("fixture content is nonzero"),
+            NonZeroUsize::new(1).expect("one is nonzero"),
+            NonZeroUsize::new(1).expect("one is nonzero"),
         );
         let mut queue = PendingRemoteCandidateQueue::new(policy);
         let budget = Arc::clone(&queue.budget);
@@ -5107,15 +5403,15 @@ mod tests {
         let waker = Waker::noop();
         let mut task_context = Context::from_waker(waker);
         assert_eq!(application.as_mut().poll(&mut task_context), Poll::Pending);
-        assert_eq!(budget.report(), (1, payload_bytes, false));
+        assert_eq!(budget.report(), (1, content_bytes, 0, 0, false));
 
         drop(application);
-        assert_eq!(budget.report(), (0, 0, false));
+        assert_eq!(budget.report(), (1, content_bytes, 0, 0, false));
         drop(drain);
     }
 
     #[test]
-    fn v4_arc03g_candidate_queue_replacement_releases_displaced_claims() {
+    fn v4_arc03h_new_attempt_gets_a_fresh_candidate_envelope() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -5132,8 +5428,88 @@ mod tests {
 
         let displaced = std::mem::replace(&mut state, RemoteCandidateState::new(policy));
         drop(displaced);
-        assert_eq!(displaced_budget.report(), (0, 0, false));
-        assert_eq!(state.pending.budget.report(), (0, 0, false));
+        assert_eq!(displaced_budget.report().0, 1);
+        assert_eq!(state.pending.budget.report(), (0, 0, 0, 0, false));
+    }
+
+    #[test]
+    fn v4_arc03h_post_sdp_candidates_share_one_cumulative_attempt_envelope() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let first = observed_candidate();
+        let content_bytes = candidate_content_bytes(&first).expect("fixture content is finite");
+        let two = NonZeroUsize::new(2).expect("two is nonzero");
+        let policy = PendingRemoteCandidatePolicy::new(
+            two,
+            NonZeroUsize::new(content_bytes * 2).expect("fixture content bound is nonzero"),
+            two,
+            NonZeroUsize::new(1).expect("one application is permitted"),
+        );
+        let mut state = RemoteCandidateState::new(policy);
+        state.remote_description_set = true;
+
+        assert_eq!(
+            state.admit(first.clone(), &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let first_pending = state
+            .pending
+            .pop_last_for_application(&scope)
+            .expect("post-SDP candidate moves directly to application");
+        let first_reservation = first_pending
+            ._queue_reservation
+            .expect("unique candidate carries the attempt budget");
+        assert!(first_reservation.budget.reserve_application_work());
+        state.retained_reservations.push(first_reservation);
+
+        assert_eq!(
+            state.admit(first.clone(), &scope),
+            PendingRemoteCandidateQueuePush::Duplicate
+        );
+        assert_eq!(
+            state.admit(first.clone(), &scope),
+            PendingRemoteCandidateQueuePush::Duplicate
+        );
+        assert_eq!(
+            state.admit(first, &scope),
+            PendingRemoteCandidateQueuePush::Refused
+        );
+
+        let mut second = observed_candidate();
+        second.candidate.replace_range(0..1, "C");
+        assert_eq!(
+            state.admit(second, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let second_pending = state
+            .pending
+            .pop_last_for_application(&scope)
+            .expect("second unique post-SDP candidate is owned");
+        let second_reservation = second_pending
+            ._queue_reservation
+            .expect("second unique candidate carries the same attempt budget");
+        assert!(
+            !second_reservation.budget.reserve_application_work(),
+            "native application work is cumulative even when no candidate is queued"
+        );
+        drop(second_reservation);
+
+        let mut third = observed_candidate();
+        third.candidate.replace_range(0..1, "D");
+        assert_eq!(
+            state.admit(third, &scope),
+            PendingRemoteCandidateQueuePush::Refused
+        );
+        let old_budget = Arc::clone(&state.pending.budget);
+        assert_eq!(old_budget.report(), (2, content_bytes * 2, 2, 1, false));
+
+        state.renew_for_ice_restart();
+        assert!(state.remote_description_set);
+        assert_eq!(state.pending.budget.report(), (0, 0, 0, 0, false));
+        assert_eq!(old_budget.report(), (2, content_bytes * 2, 2, 1, false));
     }
 
     #[test]
@@ -5146,21 +5522,23 @@ mod tests {
             .and_then(NonZeroUsize::new)
             .expect("candidate-burst count is a nonzero integer");
         let mut candidates = Vec::with_capacity(candidate_count.get());
-        let mut total_payload_bytes = 0usize;
+        let mut total_content_bytes = 0usize;
         for index in 0..candidate_count.get() {
             let mut candidate = observed_candidate();
             candidate.candidate.push_str(&format!(" {index}"));
-            let payload_bytes = candidate_payload_bytes(&candidate)
-                .expect("finite observation candidate payload is representable");
-            total_payload_bytes = total_payload_bytes
-                .checked_add(payload_bytes)
-                .expect("finite observation burst payload is representable");
+            let content_bytes = candidate_content_bytes(&candidate)
+                .expect("finite observation candidate content is representable");
+            total_content_bytes = total_content_bytes
+                .checked_add(content_bytes)
+                .expect("finite observation burst content is representable");
             candidates.push(candidate);
         }
         let policy = PendingRemoteCandidatePolicy::new(
             candidate_count,
-            NonZeroUsize::new(total_payload_bytes)
-                .expect("observation burst retains a nonzero payload"),
+            NonZeroUsize::new(total_content_bytes)
+                .expect("observation burst carries nonzero candidate content"),
+            candidate_count,
+            candidate_count,
         );
         let process = ProcessResourceRoot::isolated();
         let scope = process
@@ -5175,9 +5553,9 @@ mod tests {
                 queue.push(candidate, &scope),
                 PendingRemoteCandidateQueuePush::Queued
             );
-            let (items, payload_bytes, poisoned) = queue.budget.report();
+            let (items, content_bytes, duplicates, work, poisoned) = queue.budget.report();
             println!(
-                "arc03_candidate_burst_raw index={index} push_ns={} items={items} payload_bytes={payload_bytes} poisoned={poisoned}",
+                "arc03_candidate_burst_raw index={index} push_ns={} items={items} content_bytes={content_bytes} duplicates={duplicates} application_work={work} poisoned={poisoned}",
                 pushed_at.elapsed().as_nanos()
             );
         }
@@ -5193,7 +5571,10 @@ mod tests {
         );
         let budget = Arc::clone(&queue.budget);
         drop(queue.take());
-        assert_eq!(budget.report(), (0, 0, false));
+        assert_eq!(
+            budget.report(),
+            (candidate_count.get(), total_content_bytes, 1, 0, false)
+        );
     }
 
     #[test]
@@ -5333,17 +5714,15 @@ mod tests {
         assert_eq!(first.as_mut().poll(&mut context), Poll::Ready(true));
 
         let mut second = Box::pin(sink.emit(second));
-        assert_eq!(second.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(second.as_mut().poll(&mut context), Poll::Ready(false));
         drop(
             receiver
                 .try_recv()
                 .expect("first callback occupies the queue"),
         );
-        assert_eq!(second.as_mut().poll(&mut context), Poll::Ready(true));
-        drop(
-            receiver
-                .try_recv()
-                .expect("second callback enters after drain"),
+        assert!(
+            receiver.try_recv().is_err(),
+            "overload creates no hidden queue"
         );
     }
 
@@ -5674,34 +6053,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03_retirement_wakes_producer_blocked_by_full_callback_queue() {
+    async fn v4_arc03h_callback_producer_flood_cannot_queue_behind_full_mailbox() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let callback_gate = Arc::new(WebRtcConnectorIncarnation::new());
         let policy = ConnectorCallbackPolicy::unrestricted_lab(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
-        let mut sink = test_event_sink(events, policy, None);
-        sink.callback_gate = Arc::clone(&callback_gate);
+        let sink = test_event_sink(events, policy, None);
 
-        assert!(sink.emit(TransportEvent::DataChannelOpen).await);
-        let blocked =
-            tokio::spawn(async move { sink.emit(TransportEvent::DataChannelClosed).await });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
         assert!(
-            !blocked.is_finished(),
-            "the first event keeps the queue full"
+            sink.emit(TransportEvent::Message(Bytes::from_static(b"retained")))
+                .await
         );
-
-        callback_gate.retire();
-        assert!(!tokio::time::timeout(Duration::from_secs(1), blocked)
-            .await
-            .expect("retirement wakes the blocked producer")
-            .expect("blocked callback task joins"));
+        let mut producers = tokio::task::JoinSet::new();
+        for _ in 0..128 {
+            let producer = sink.clone();
+            producers.spawn(async move {
+                producer
+                    .emit(TransportEvent::Message(Bytes::from_static(b"refused")))
+                    .await
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(result) = producers.join_next().await {
+                assert!(!result.expect("producer task joins"));
+            }
+        })
+        .await
+        .expect("all overloaded producers finish without a hidden queue");
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::DataChannelOpen)
+            Ok(TransportEvent::Message(bytes)) if bytes == Bytes::from_static(b"retained")
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -5803,7 +6184,7 @@ mod tests {
         let context = process.mesh_runtime_scope().network_instance_scope();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(test_resource_owner(1, 4));
+            .with_connector_resource_scope(test_resource_owner(1, 4), test_webrtc_profile(4));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
@@ -5876,7 +6257,7 @@ mod tests {
         let context = process.mesh_runtime_scope().network_instance_scope();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(owner.clone());
+            .with_connector_resource_scope(owner.clone(), test_webrtc_profile(4));
         let hook =
             ConstructionTestHook::new(ConstructionPause::AfterNativeAllocationWithCloseError);
         transport.construction_hook = Some(Arc::clone(&hook));
@@ -5942,7 +6323,7 @@ mod tests {
         let context = process.mesh_runtime_scope().network_instance_scope();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(test_resource_owner(1, 4));
+            .with_connector_resource_scope(test_resource_owner(1, 4), test_webrtc_profile(4));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterResultDelivery);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
@@ -6005,7 +6386,7 @@ mod tests {
         let owner = test_resource_owner(1, 4);
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(owner.clone());
+            .with_connector_resource_scope(owner.clone(), test_webrtc_profile(4));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let process = ProcessResourceRoot::isolated();
@@ -6084,7 +6465,7 @@ mod tests {
         let owner = test_resource_owner(1, 4);
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(owner.clone());
+            .with_connector_resource_scope(owner.clone(), test_webrtc_profile(4));
         let hook = ConstructionTestHook::new(ConstructionPause::FailAfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let process = ProcessResourceRoot::isolated();
@@ -6316,19 +6697,45 @@ mod tests {
     }
 
     #[test]
-    fn track_id_carries_its_lane() {
-        // The id a lane's track advertises round-trips to its index…
-        assert_eq!(lane_of_track_id("video-0"), 0);
-        assert_eq!(lane_of_track_id("video-3"), 3);
-        assert_eq!(lane_of_track_id("audio-7"), 7);
-        // …a bare id from a pre-pool peer is lane 0…
-        assert_eq!(lane_of_track_id("video"), 0);
-        assert_eq!(lane_of_track_id("audio"), 0);
-        // …and anything out of range or unparseable falls back to 0 rather
-        // than indexing a lane that doesn't exist.
-        assert_eq!(lane_of_track_id(&format!("video-{MEDIA_LANES}")), 0);
-        assert_eq!(lane_of_track_id("video-x"), 0);
-        assert_eq!(lane_of_track_id("weird"), 0);
+    fn legacy_track_id_requires_exact_kind_and_in_range_lane() {
+        assert_eq!(lane_of_track_id("video-0", LaneKind::Video, 8), Some(0));
+        assert_eq!(lane_of_track_id("video-3", LaneKind::Video, 8), Some(3));
+        assert_eq!(lane_of_track_id("audio-7", LaneKind::Audio, 8), Some(7));
+        assert_eq!(lane_of_track_id("video", LaneKind::Video, 8), None);
+        assert_eq!(lane_of_track_id("audio", LaneKind::Audio, 8), None);
+        assert_eq!(lane_of_track_id("video-8", LaneKind::Video, 8), None);
+        assert_eq!(lane_of_track_id("video-x", LaneKind::Video, 8), None);
+        assert_eq!(lane_of_track_id("video-00", LaneKind::Video, 8), None);
+        assert_eq!(lane_of_track_id("video-+0", LaneKind::Video, 8), None);
+        assert_eq!(lane_of_track_id("video- 0", LaneKind::Video, 8), None);
+        assert_eq!(lane_of_track_id("video-0", LaneKind::Audio, 8), None);
+        assert_eq!(lane_of_track_id("weird", LaneKind::Video, 8), None);
+    }
+
+    #[test]
+    fn v4_arc03h_legacy_provider_rejects_wrong_codec_and_malformed_track() {
+        let profile = LegacyWebRtcMediaProfile::h264_opus(
+            NonZeroUsize::new(8).expect("fixture lane ceiling is nonzero"),
+            1,
+            1,
+        )
+        .expect("fixture profile is valid");
+        assert_eq!(
+            legacy_track_identity(RTPCodecType::Video, MIME_TYPE_H264, "video-3", profile),
+            Some((LaneKind::Video, true, 3))
+        );
+        assert_eq!(
+            legacy_track_identity(RTPCodecType::Video, "video/VP8", "video-3", profile),
+            None
+        );
+        assert_eq!(
+            legacy_track_identity(RTPCodecType::Audio, MIME_TYPE_H264, "audio-3", profile),
+            None
+        );
+        assert_eq!(
+            legacy_track_identity(RTPCodecType::Video, MIME_TYPE_H264, "video-x", profile),
+            None
+        );
     }
 
     // ---- ICE interface filter -----------------------------------------
@@ -6434,7 +6841,7 @@ mod tests {
         assert!(assembler.parts.is_empty());
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
-        assert_eq!(state.in_progress_units, 0);
+        assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
         assert!(realtime_accounting_is_clean(&state));
     }
 
@@ -6451,13 +6858,13 @@ mod tests {
         {
             let state = registry.state.lock();
             assert_eq!(retained_realtime_bytes(&state), FU_S.len());
-            assert_eq!(state.in_progress_units, 1);
+            assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 1);
         }
 
         drop(assembler);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
-        assert_eq!(state.in_progress_units, 0);
+        assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
         assert!(realtime_accounting_is_clean(&state));
     }
 
@@ -6517,11 +6924,20 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(second.parts.len(), 1);
-        assert_eq!(registry.state.lock().in_progress_units, 2);
+        assert_eq!(
+            RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
+            2
+        );
         drop(first);
-        assert_eq!(registry.state.lock().in_progress_units, 1);
+        assert_eq!(
+            RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
+            1
+        );
         drop(second);
-        assert_eq!(registry.state.lock().in_progress_units, 0);
+        assert_eq!(
+            RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
+            0
+        );
     }
 
     #[test]
@@ -6543,7 +6959,10 @@ mod tests {
         let second_unit = second_flow
             .begin_unit()
             .expect("another flow retains its independent unit slot");
-        assert_eq!(registry.state.lock().in_progress_units, 2);
+        assert_eq!(
+            RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
+            2
+        );
 
         drop(first_unit);
         assert!(first_flow.begin_unit().is_some());
@@ -7054,7 +7473,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
-    async fn v4_arc03f_data_only_connector_allocates_no_realtime_tracks() {
+    async fn v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks() {
         let observed_at = Instant::now();
         let owner = test_resource_owner(1, 4);
         let process = ProcessResourceRoot::isolated();
@@ -7064,7 +7483,7 @@ mod tests {
             .peer_connection_scope();
         let transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(owner);
+            .with_connector_resource_scope(owner, test_generic_realtime_webrtc_profile(4));
         let (worker, _events) = transport
             .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
@@ -7072,13 +7491,14 @@ mod tests {
 
         assert_eq!(worker.session.open_lane_count(LaneKind::Video), 0);
         assert_eq!(worker.session.open_lane_count(LaneKind::Audio), 0);
+        assert!(worker.session.legacy_media_profile.is_none());
         assert!(worker
             .session
             .send_video(0, Bytes::from_static(b"unit"), Duration::ZERO)
             .await
-            .expect_err("data-only policy refuses a real-time flow")
+            .expect_err("codec-neutral policy has no compatibility provider")
             .to_string()
-            .contains("flow was refused"));
+            .contains("no video lane"));
         if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
             println!(
                 "arc03_data_only_raw constructed_ns={} video_tracks=0 audio_tracks=0",
@@ -7103,7 +7523,7 @@ mod tests {
             .peer_connection_scope();
         let transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(owner);
+            .with_connector_resource_scope(owner, test_webrtc_profile(4));
         let (worker, _events) = transport
             .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
@@ -7144,6 +7564,62 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03h_close_wins_before_open_promotion() {
+        let owner = test_resource_owner(1, 4);
+        let scope = ProcessResourceRoot::isolated()
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner, test_webrtc_profile(4));
+        let (worker, _events) = transport
+            .open_connector_peer(Role::Answerer, &[], &[], scope)
+            .await
+            .expect("data-only connector is constructed");
+
+        worker.retire();
+        assert!(matches!(
+            worker.confirm_data_channel_open(),
+            DataChannelOpenOwnership::Rejected
+        ));
+        worker
+            .retire_and_close()
+            .await
+            .expect("native peer closes through its exact owner");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03h_close_wins_before_legacy_realtime_admission() {
+        let owner = test_resource_owner(1, 4);
+        let scope = ProcessResourceRoot::isolated()
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner, test_legacy_realtime_webrtc_profile(4));
+        let (worker, _events) = transport
+            .open_connector_peer(Role::Answerer, &[], &[], scope)
+            .await
+            .expect("legacy-provider connector is constructed");
+        let handoff = match worker.confirm_data_channel_open() {
+            DataChannelOpenOwnership::Connected(handoff) => handoff,
+            _ => panic!("live connector produces one Endpoint Auth handoff"),
+        };
+        let task = crate::endpoint_auth::EndpointAuthTask::begin(handoff);
+
+        worker.retire();
+        assert!(worker.admit_legacy_realtime_flow(&task).is_none());
+        worker
+            .retire_and_close()
+            .await
+            .expect("native peer closes through its exact owner");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
     async fn v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner() {
         let transport = Transport::new().expect("transport");
         let (session, _events) = transport
@@ -7173,7 +7649,7 @@ mod tests {
     #[tokio::test]
     async fn lanes_are_lifecycle_managed_not_pre_pooled() {
         let transport = Transport::new().expect("transport");
-        let (session, mut events) = open_zero_grace_legacy_peer(&transport, Role::Offerer)
+        let (session, mut events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
             .await
             .expect("open");
 
@@ -7237,7 +7713,7 @@ mod tests {
         }
         assert!(saw_reneg, "a fresh explicit open flags a renegotiation");
 
-        // Close is a *drain*: the slot keeps its m-line, nothing is
+        // Suspend keeps the slot's m-line, emits nothing, and is idempotent.
         // signaled, and it's idempotent.
         session
             .close_media_lane(LaneKind::Video, 3)
@@ -7246,51 +7722,43 @@ mod tests {
         assert_eq!(
             session.open_lane_count(LaneKind::Video),
             3,
-            "a draining lane still holds its m-line"
+            "a suspended lane still holds its m-line"
         );
-        assert!(
-            events.try_recv().is_err(),
-            "a drain is silent — no renegotiation on close"
-        );
+        assert!(events.try_recv().is_err(), "suspension is silent");
         session
             .close_media_lane(LaneKind::Video, 3)
             .await
             .expect("double close is a no-op");
 
-        // Reopen within the grace revives the drained lane — same id,
-        // zero SDP work. This is the settings stop→start fast path.
+        // Resume revives the exact suspended lane with no SDP work.
         let lane = session
             .open_media_lane(LaneKind::Video)
             .await
             .expect("reopen");
-        assert_eq!(lane, 3, "reopen revives the draining lane");
+        assert_eq!(lane, 3, "resume revives the suspended lane");
         assert!(
             events.try_recv().is_err(),
             "a revival is free — no renegotiation"
         );
 
-        // A drain past the grace is reaped: slot freed, track removed.
-        // The reaper's caller carries the removal in its own offer, so
-        // no event fires here either.
+        // Finalization is explicit. No elapsed time changes ownership.
         session
             .close_media_lane(LaneKind::Video, 3)
             .await
             .expect("re-close");
-        assert!(session.has_reapable_lanes());
-        assert_eq!(session.reap_drained_lanes().await, 1);
+        assert_eq!(session.finalize_suspended_lanes().await, 1);
         assert_eq!(session.open_lane_count(LaneKind::Video), 2);
         assert!(!session
             .outbound_realtime_flows
             .lock()
             .contains_key(&(true, 3)));
-        assert!(!session.has_reapable_lanes());
 
-        // With nothing draining, an explicit open claims the lowest
+        // With nothing suspended, an explicit open claims the lowest
         // free slot again.
         let lane = session
             .open_media_lane(LaneKind::Video)
             .await
-            .expect("fresh open after reap");
+            .expect("fresh open after finalize");
         assert_eq!(lane, 2, "explicit open takes the lowest free slot");
 
         // The device ceiling still errors rather than mis-routing.
@@ -7308,15 +7776,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_lane_drains_but_is_never_reaped() {
+    async fn pinned_lane_suspends_until_explicit_finalization() {
         let transport = Transport::new().expect("transport");
-        let (session, mut events) = open_zero_grace_legacy_peer(&transport, Role::Offerer)
+        let (session, mut events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
             .await
             .expect("open");
 
-        // Lane 0 is pre-provisioned. Closing it drains the lane (keeps its
-        // track) but — being pinned — it is never eligible for reaping, no
-        // matter how far past the grace. A re-open therefore always revives
+        // Lane 0 is pre-provisioned. Suspending it keeps its track and explicit
+        // finalization leaves it pinned. A reopen therefore always revives
         // the same negotiated track (zero SDP) instead of recycling an
         // m-line, which is the reliable path. This is the CEC console
         // stop→start fast path made durable rather than time-boxed.
@@ -7326,24 +7793,19 @@ mod tests {
             .expect("close lane 0");
         assert!(
             events.try_recv().is_err(),
-            "a drain is silent — no renegotiation on close"
+            "suspension is silent: no renegotiation occurs until explicit finalization"
         );
 
-        // Even at zero grace (maximally eager reaping) the pinned lane is
-        // neither counted nor reaped, and it keeps its m-line.
-        assert!(
-            !session.has_reapable_lanes(),
-            "the pinned lane never counts as reapable"
-        );
+        // Explicit finalization does not remove a pinned compatibility lane.
         assert_eq!(
-            session.reap_drained_lanes().await,
+            session.finalize_suspended_lanes().await,
             0,
-            "the pinned lane is never reaped"
+            "the pinned lane is never finalized"
         );
         assert_eq!(
             session.open_lane_count(LaneKind::Video),
             PRE_PROVISIONED_LANES,
-            "the pinned lane keeps its m-line through the drain"
+            "the pinned lane keeps its m-line while suspended"
         );
 
         // Re-open revives the same lane in place, free.
@@ -7357,8 +7819,7 @@ mod tests {
             "reviving the pinned lane is free — no renegotiation"
         );
 
-        // Contrast: a transient lane (1+) still reaps past its grace, so the
-        // pin is narrowly scoped to the pre-provisioned lane.
+        // A transient lane can be finalized by an explicit owner event.
         session
             .send_video(
                 1,
@@ -7372,19 +7833,74 @@ mod tests {
             .close_media_lane(LaneKind::Video, 1)
             .await
             .expect("close lane 1");
-        assert!(
-            session.has_reapable_lanes(),
-            "a transient lane past grace is reapable"
-        );
         assert_eq!(
-            session.reap_drained_lanes().await,
+            session.finalize_suspended_lanes().await,
             1,
-            "the transient lane is reaped"
+            "the transient lane is finalized"
         );
         assert!(!session
             .outbound_realtime_flows
             .lock()
             .contains_key(&(true, 1)));
+
+        session.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn v4_arc03h_failed_remove_track_retains_exact_lane_owner_and_blocks_reuse() {
+        let transport = Transport::new().expect("transport");
+        let (session, mut events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
+            .await
+            .expect("open");
+        session
+            .send_video(
+                1,
+                Bytes::from_static(b"x"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect("open transient lane");
+        while events.try_recv().is_ok() {}
+        session
+            .close_media_lane(LaneKind::Video, 1)
+            .await
+            .expect("suspend transient lane");
+        let retained_flow = session
+            .outbound_realtime_flows
+            .lock()
+            .get(&(true, 1))
+            .cloned()
+            .expect("transient lane owns one exact flow before finalization");
+        session
+            .fail_next_track_remove
+            .store(true, Ordering::Release);
+
+        assert_eq!(session.finalize_suspended_lanes().await, 0);
+        let failed_flow = match &session.video_tracks.lock().expect("lane pool")[1] {
+            Some(LaneSlot::FailedRemove { flow, .. }) => flow.clone(),
+            _ => panic!("failed removal retains the exact lane owner"),
+        };
+        assert!(Arc::ptr_eq(&retained_flow.lifetime, &failed_flow.lifetime));
+        assert!(!session
+            .outbound_realtime_flows
+            .lock()
+            .contains_key(&(true, 1)));
+        let error = session
+            .send_video(
+                1,
+                Bytes::from_static(b"y"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect_err("failed native removal makes the exact lane non-reusable");
+        assert!(error.to_string().contains("non-reusable"));
+        assert!(
+            !session
+                .outbound_realtime_flows
+                .lock()
+                .contains_key(&(true, 1)),
+            "failed-lane reuse must not allocate a second flow owner"
+        );
 
         session.close().await.expect("close");
     }

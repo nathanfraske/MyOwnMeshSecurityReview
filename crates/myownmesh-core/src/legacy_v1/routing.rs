@@ -1,8 +1,8 @@
-//! Topology-aware frame routing — how application frames cross a
+//! Frozen topology-aware application frame routing for LegacyV1.
 //! shaped network (star / hubs / ring) between members that don't hold
 //! a direct connection.
 //!
-//! Rides the existing relay wire ([`crate::services::relay`]): a routed
+//! Rides the frozen LegacyV1 relay wire: a routed
 //! frame is a [`RelayEnvelope`] on [`RELAY_CHANNEL`] whose payload
 //! carries the transparent-channel wrapper (`__channel` / `__body` /
 //! `__ttl` / `__id`). Legacy envelopes (application users of the
@@ -36,11 +36,11 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tracing::{debug, trace};
 
+use super::relay::{RelayEnvelope, RELAY_CHANNEL};
 use crate::error::{Error, Result};
-use crate::services::relay::{RelayEnvelope, RELAY_CHANNEL};
 
-use super::connection::PeerStatus;
-use super::state::NetworkState;
+use crate::engine::connection::PeerStatus;
+use crate::engine::state::NetworkState;
 
 /// Dedup-ring capacity for `(origin, frame id)` pairs. Sized like the
 /// signaling dedup ring: far beyond any realistic in-flight window.
@@ -106,23 +106,19 @@ fn first_sighting(state: &NetworkState, origin: &str, id: u64) -> bool {
 /// Shelved — a shelved link is still a live path for routed frames,
 /// exactly as the standalone relay treats it).
 fn connected_ids(state: &NetworkState) -> Vec<String> {
-    state.peers.collect_map(|peer| {
-        let data = peer.state.read();
-        (matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.data_channel_open)
-            .then(|| peer.device_id.clone())
-    })
+    state
+        .peer_snapshot()
+        .into_iter()
+        .filter(|peer| matches!(peer.status, PeerStatus::Active | PeerStatus::Shelved))
+        .map(|peer| peer.device_id)
+        .collect()
 }
 
 /// Try to consume an inbound `RELAY_CHANNEL` frame as a routed
 /// envelope. Returns `false` when the frame isn't wrapper-shaped —
 /// the caller passes it through to channel subscribers (the legacy
 /// `RelayService` flow).
-pub(crate) async fn on_relay_frame(
-    _marker: crate::legacy_v1::LegacyV1Marker,
-    state: &Arc<NetworkState>,
-    from: &str,
-    payload: &Value,
-) -> bool {
+pub(crate) async fn on_relay_frame(state: &Arc<NetworkState>, from: &str, payload: &Value) -> bool {
     let Ok(env) = serde_json::from_value::<RelayEnvelope>(payload.clone()) else {
         return false;
     };
@@ -150,8 +146,8 @@ pub(crate) async fn on_relay_frame(
         };
         if !carrier_forwards {
             debug!(
-                from = %super::short_peer(from),
-                origin = %super::short_peer(&origin),
+                from = %crate::engine::short_peer(from),
+                origin = %crate::engine::short_peer(&origin),
                 "dropping routed frame: carrier is not a forwarder"
             );
             return true; // consumed (and dropped)
@@ -168,7 +164,7 @@ pub(crate) async fn on_relay_frame(
     if for_me {
         // Deliver with the origin as the sender — the application sees
         // who actually said it, not which hub carried it.
-        super::on_channel_frame(state, &origin, w.channel.clone(), w.body.clone()).await;
+        state.dispatch_channel_frame(&w.channel, &origin, w.body.clone());
     }
     if !broadcast && env.dst == me {
         return true;
@@ -183,7 +179,7 @@ pub(crate) async fn on_relay_frame(
     if !i_forward || w.ttl == 0 {
         if !broadcast && !i_forward {
             trace!(
-                dst = %super::short_peer(&env.dst),
+                dst = %crate::engine::short_peer(&env.dst),
                 "routed frame reached a non-forwarder that isn't its destination — dropped"
             );
         }
@@ -233,7 +229,7 @@ pub(crate) async fn on_relay_frame(
 }
 
 async fn send_envelope(state: &Arc<NetworkState>, peer: &str, envelope: &Value) -> Result<()> {
-    super::send_to_peer(
+    crate::engine::send_to_peer(
         state,
         peer,
         &crate::protocol::MeshMessage::Channel {
@@ -249,7 +245,6 @@ async fn send_envelope(state: &Arc<NetworkState>, peer: &str, envelope: &Value) 
 /// accepted it — the routed-delivery guarantee, weaker than an ack and
 /// said so in the docs.
 pub(crate) async fn send_routed(
-    _marker: crate::legacy_v1::LegacyV1Marker,
     state: &Arc<NetworkState>,
     dest: &str,
     channel: &str,
@@ -290,7 +285,6 @@ pub(crate) async fn send_routed(
 /// connected, unshelved peer; forwarders re-fan it across the shape.
 /// Returns how many first-hop peers accepted the frame.
 pub(crate) async fn broadcast_flood(
-    _marker: crate::legacy_v1::LegacyV1Marker,
     state: &Arc<NetworkState>,
     channel: &str,
     payload: &Value,
@@ -307,14 +301,14 @@ pub(crate) async fn broadcast_flood(
     let Ok(env_value) = serde_json::to_value(&env) else {
         return 0;
     };
-    let targets: Vec<String> = state.peers.collect_map(|peer| {
-        let data = peer.state.read();
-        (matches!(data.status, PeerStatus::Active)
-            && !data.local_shelved
-            && !data.remote_shelved
-            && data.data_channel_open)
-            .then(|| peer.device_id.clone())
-    });
+    let targets: Vec<String> = state
+        .peer_snapshot()
+        .into_iter()
+        .filter(|peer| {
+            matches!(peer.status, PeerStatus::Active) && !peer.local_shelved && !peer.remote_shelved
+        })
+        .map(|peer| peer.device_id)
+        .collect();
     let mut delivered = 0usize;
     for peer in targets {
         if send_envelope(state, &peer, &env_value).await.is_ok() {
@@ -382,13 +376,7 @@ mod tests {
             payload: json!({"app": "data"}),
         })
         .unwrap();
-        let consumed = on_relay_frame(
-            crate::legacy_v1::LegacyV1Runtime::frozen().marker(),
-            &state,
-            "peer-x",
-            &legacy,
-        )
-        .await;
+        let consumed = on_relay_frame(&state, "peer-x", &legacy).await;
         assert!(
             !consumed,
             "legacy envelope passes through to the channel layer"
@@ -407,13 +395,7 @@ mod tests {
             payload: wrap("app.control", &json!(1), 2, 99),
         })
         .unwrap();
-        let consumed = on_relay_frame(
-            crate::legacy_v1::LegacyV1Runtime::frozen().marker(),
-            &state,
-            "carrier-spoke",
-            &env,
-        )
-        .await;
+        let consumed = on_relay_frame(&state, "carrier-spoke", &env).await;
         assert!(consumed, "wrapper-shaped frame is always consumed");
         assert!(
             state.routing_seen.lock().is_empty(),

@@ -1,8 +1,3 @@
-#![allow(
-    deprecated,
-    reason = "this facade retains explicitly deprecated legacy media entry points during migration"
-)]
-
 //! User-facing facade — what embedders actually call.
 //!
 //! - [`Mesh`] is the entry constructor. One per process.
@@ -609,11 +604,9 @@ impl JoinedNetwork {
         self.state.media_lane_open(peer, kind).await
     }
 
-    /// Close a media lane toward `peer`. The close is a *drain*: the
-    /// track stays negotiated for a short grace so an immediate reopen
-    /// (a settings change's stop→start) is free, and the engine reaps
-    /// the m-line only once the grace lapses. Idempotent — a lane that
-    /// isn't open is a no-op, so teardown can't double-fault.
+    /// Suspend a media lane toward `peer`. The track remains negotiated until
+    /// an explicit resume or finalize event. No elapsed time changes its
+    /// ownership. Suspending a lane that is not open is a no-op.
     #[deprecated(
         since = "0.3.2",
         note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
@@ -625,6 +618,22 @@ impl JoinedNetwork {
         lane: u8,
     ) -> Result<()> {
         self.state.media_lane_close(peer, kind, lane).await
+    }
+
+    /// Finalize all explicitly suspended transient lanes for one peer and
+    /// schedule the resulting lane-set renegotiation. No elapsed time can
+    /// trigger this transition.
+    #[cfg(feature = "legacy-media")]
+    #[allow(
+        deprecated,
+        reason = "this exact method is the temporary legacy media finalization boundary"
+    )]
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
+    )]
+    pub async fn finalize_suspended_media_lanes(&self, peer: &str) -> Result<usize> {
+        self.state.media_lanes_finalize(peer).await
     }
 
     /// Point-in-time traffic accounting for this network: frames and

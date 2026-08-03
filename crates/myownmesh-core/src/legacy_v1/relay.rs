@@ -1,4 +1,4 @@
-//! Roster-gated frame relay. A device running the relay service
+//! Frozen LegacyV1 roster-gated application frame relay.
 //! forwards [`RelayEnvelope`] frames it receives on [`RELAY_CHANNEL`]
 //! to other roster members, so peers that can each reach the relay but
 //! not each other still exchange messages — the device becomes a
@@ -16,11 +16,6 @@
 //! also approved. The relay never forwards for or to strangers, and it
 //! stamps the authenticated sender id into the forwarded envelope so the
 //! recipient can trust the `src` field rather than the wire claim.
-
-#![allow(
-    deprecated,
-    reason = "this entire module is the frozen LegacyV1 compatibility implementation"
-)]
 
 use std::sync::Arc;
 
@@ -126,16 +121,20 @@ pub struct RelayService {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[allow(
+    deprecated,
+    reason = "this implementation is confined to the frozen LegacyV1 subtree"
+)]
 impl RelayService {
     /// Start forwarding on `state`'s network. `max_fanout` caps
     /// broadcast fan-out (0 = unlimited).
     pub fn start(
         state: Arc<NetworkState>,
         max_fanout: u32,
-        runtime: &crate::legacy_v1::LegacyV1Runtime,
+        runtime: &super::LegacyV1Runtime,
     ) -> RelayService {
-        let marker = runtime.marker();
-        let task = tokio::spawn(run(marker, state, max_fanout));
+        let _authority = runtime;
+        let task = tokio::spawn(run(state, max_fanout));
         RelayService { task }
     }
 
@@ -152,7 +151,11 @@ impl Drop for RelayService {
     }
 }
 
-async fn run(_marker: crate::legacy_v1::LegacyV1Marker, state: Arc<NetworkState>, max_fanout: u32) {
+#[allow(
+    deprecated,
+    reason = "this function is confined to the frozen LegacyV1 subtree"
+)]
+async fn run(state: Arc<NetworkState>, max_fanout: u32) {
     let channel: Channel<RelayEnvelope> = Channel::new(RELAY_CHANNEL.to_string(), state.clone());
     let mut sub = channel.subscribe();
     debug!(network = %state.network_id, "relay service listening on {RELAY_CHANNEL}");

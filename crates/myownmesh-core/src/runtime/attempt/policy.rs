@@ -1,6 +1,7 @@
 //! Owner-selected connector policy values.
 
 use super::*;
+use crate::transport::webrtc::WebRtcConnectorProfile;
 
 /// Owner-selected bounds for the connector's closed callback-class set.
 ///
@@ -142,6 +143,8 @@ pub struct ConnectorRealtimeInboundLimits {
     max_fragment_bytes: NonZeroUsize,
     max_fragments_per_unit: NonZeroUsize,
     max_in_progress_units: NonZeroUsize,
+    max_pre_auth_packets: NonZeroUsize,
+    max_pre_auth_content_bytes: NonZeroUsize,
 }
 
 impl ConnectorRealtimeInboundLimits {
@@ -149,11 +152,15 @@ impl ConnectorRealtimeInboundLimits {
         max_fragment_bytes: NonZeroUsize,
         max_fragments_per_unit: NonZeroUsize,
         max_in_progress_units: NonZeroUsize,
+        max_pre_auth_packets: NonZeroUsize,
+        max_pre_auth_content_bytes: NonZeroUsize,
     ) -> Self {
         Self {
             max_fragment_bytes,
             max_fragments_per_unit,
             max_in_progress_units,
+            max_pre_auth_packets,
+            max_pre_auth_content_bytes,
         }
     }
 }
@@ -172,33 +179,27 @@ pub struct ConnectorRealtimeFlowPolicy {
     max_inbound_fragment_bytes: NonZeroUsize,
     max_inbound_fragments_per_unit: NonZeroUsize,
     max_in_progress_units_per_flow: NonZeroUsize,
+    max_pre_auth_packets: NonZeroUsize,
+    max_pre_auth_content_bytes: NonZeroUsize,
     byte_budgets: ConnectorRealtimeByteBudgets,
     overflow_rule: RealtimeQueueOverflowRule,
 }
 
 /// Owner-selected byte partitions for one connector's real-time work.
 ///
-/// The inbound and outbound ceilings are independent reservations beneath the
-/// total connector ceiling. Their sum must fit inside the total, so speculative
-/// inbound quarantine cannot consume capacity reserved for locally authorized
-/// outbound work.
+/// The inbound and outbound ceilings are independent hard partitions. There is
+/// no borrowing and therefore no third aggregate input for an owner to select.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorRealtimeByteBudgets {
     max_inbound_bytes: NonZeroUsize,
     max_outbound_bytes: NonZeroUsize,
-    max_total_bytes: NonZeroUsize,
 }
 
 impl ConnectorRealtimeByteBudgets {
-    pub const fn new(
-        max_inbound_bytes: NonZeroUsize,
-        max_outbound_bytes: NonZeroUsize,
-        max_total_bytes: NonZeroUsize,
-    ) -> Self {
+    pub const fn new(max_inbound_bytes: NonZeroUsize, max_outbound_bytes: NonZeroUsize) -> Self {
         Self {
             max_inbound_bytes,
             max_outbound_bytes,
-            max_total_bytes,
         }
     }
 
@@ -208,10 +209,6 @@ impl ConnectorRealtimeByteBudgets {
 
     pub const fn max_outbound_bytes(self) -> NonZeroUsize {
         self.max_outbound_bytes
-    }
-
-    pub const fn max_total_bytes(self) -> NonZeroUsize {
-        self.max_total_bytes
     }
 }
 
@@ -229,6 +226,8 @@ impl ConnectorRealtimeFlowPolicy {
             max_inbound_fragment_bytes: inbound.max_fragment_bytes,
             max_inbound_fragments_per_unit: inbound.max_fragments_per_unit,
             max_in_progress_units_per_flow: inbound.max_in_progress_units,
+            max_pre_auth_packets: inbound.max_pre_auth_packets,
+            max_pre_auth_content_bytes: inbound.max_pre_auth_content_bytes,
             byte_budgets,
             overflow_rule,
         }
@@ -256,6 +255,14 @@ impl ConnectorRealtimeFlowPolicy {
 
     pub const fn max_in_progress_units_per_flow(self) -> NonZeroUsize {
         self.max_in_progress_units_per_flow
+    }
+
+    pub const fn max_pre_auth_packets(self) -> NonZeroUsize {
+        self.max_pre_auth_packets
+    }
+
+    pub const fn max_pre_auth_content_bytes(self) -> NonZeroUsize {
+        self.max_pre_auth_content_bytes
     }
 
     /// Bytes whose ownership is visible to this connector's real-time
@@ -292,22 +299,6 @@ pub enum ConnectorCallbackPolicyError {
     OutboundBytesCannotHoldOneUnit {
         required_bytes: usize,
         available_bytes: usize,
-    },
-    #[error(
-        "real-time domain byte ceilings require {required_bytes} aggregate bytes but the connector ceiling is {available_bytes}"
-    )]
-    RealtimeDomainBudgetsExceedAggregate {
-        required_bytes: usize,
-        available_bytes: usize,
-    },
-    #[error("legacy WebRTC media compatibility requires enabled generic real-time ownership")]
-    LegacyMediaRequiresRealtime,
-    #[error(
-        "legacy WebRTC media pre-provisions {required_flows} outbound flows but the owner ceiling is {available_flows}"
-    )]
-    LegacyMediaExceedsOutboundFlowCeiling {
-        required_flows: usize,
-        available_flows: usize,
     },
     #[error("data-only callback policy must not carry a real-time service weight")]
     DisabledRealtimeHasServiceWeight,
@@ -400,11 +391,14 @@ impl ConnectorCallbackPolicy {
                             .expect("quarter of usize::MAX is nonzero"),
                         NonZeroUsize::new(usize::MAX / 4)
                             .expect("quarter of usize::MAX is nonzero"),
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
                     ),
                     ConnectorRealtimeByteBudgets::new(
                         NonZeroUsize::new(usize::MAX / 2).expect("half of usize::MAX is nonzero"),
                         NonZeroUsize::new(usize::MAX / 2).expect("half of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX - 1).expect("usize::MAX minus one is nonzero"),
                     ),
                     RealtimeQueueOverflowRule::DropNewest,
                 ),
@@ -445,19 +439,6 @@ impl RealtimeConnectorPolicy {
                 },
             );
         }
-        let required_total = byte_budgets
-            .max_inbound_bytes()
-            .get()
-            .checked_add(byte_budgets.max_outbound_bytes().get())
-            .ok_or(ConnectorCallbackPolicyError::AssemblyBoundOverflow)?;
-        if byte_budgets.max_total_bytes().get() < required_total {
-            return Err(
-                ConnectorCallbackPolicyError::RealtimeDomainBudgetsExceedAggregate {
-                    required_bytes: required_total,
-                    available_bytes: byte_budgets.max_total_bytes().get(),
-                },
-            );
-        }
         Ok(Self::Enabled(EnabledRealtimeConnectorPolicy {
             max_unit_bytes,
             flows,
@@ -475,188 +456,43 @@ impl EnabledRealtimeConnectorPolicy {
     }
 }
 
-/// Owner-selected bound for the connector's pre-SDP remote-candidate queue.
-///
-/// The byte ceiling covers exact candidate payload bytes retained by the
-/// connector. The item ceiling independently bounds queue metadata. There is no
-/// default because both values depend on the deployment's ICE environment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingRemoteCandidatePolicy {
-    max_items: NonZeroUsize,
-    max_payload_bytes: NonZeroUsize,
-}
-
-impl PendingRemoteCandidatePolicy {
-    pub const fn new(max_items: NonZeroUsize, max_payload_bytes: NonZeroUsize) -> Self {
-        Self {
-            max_items,
-            max_payload_bytes,
-        }
-    }
-
-    pub const fn max_items(self) -> NonZeroUsize {
-        self.max_items
-    }
-
-    pub const fn max_payload_bytes(self) -> NonZeroUsize {
-        self.max_payload_bytes
-    }
-}
-
-/// Temporary provider-specific H.264 and Opus media compatibility profile.
-///
-/// Generic real-time ownership never creates media tracks. This explicit
-/// profile is the only construction input that can request the legacy WebRTC
-/// adapter. Its lane grace remains compatibility behavior and is not part of
-/// the generic real-time flow contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LegacyWebRtcMediaProfile {
-    max_lanes_per_kind: NonZeroUsize,
-    preprovisioned_video_lanes: usize,
-    preprovisioned_audio_lanes: usize,
-    lane_drain_grace: Duration,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum LegacyWebRtcMediaProfileError {
-    #[error("legacy WebRTC media lane ceiling {requested} exceeds the u8 lane identity space")]
-    LaneIdentitySpaceExceeded { requested: usize },
-    #[error(
-        "legacy WebRTC media pre-provisions {preprovisioned} {kind} lanes but its per-kind ceiling is {maximum}"
-    )]
-    PreprovisionedLanesExceedCeiling {
-        kind: &'static str,
-        preprovisioned: usize,
-        maximum: usize,
-    },
-}
-
-impl LegacyWebRtcMediaProfile {
-    pub fn h264_opus(
-        max_lanes_per_kind: NonZeroUsize,
-        preprovisioned_video_lanes: usize,
-        preprovisioned_audio_lanes: usize,
-        lane_drain_grace: Duration,
-    ) -> std::result::Result<Self, LegacyWebRtcMediaProfileError> {
-        let maximum = max_lanes_per_kind.get();
-        let lane_identity_space = usize::from(u8::MAX) + 1;
-        if maximum > lane_identity_space {
-            return Err(LegacyWebRtcMediaProfileError::LaneIdentitySpaceExceeded {
-                requested: maximum,
-            });
-        }
-        for (kind, preprovisioned) in [
-            ("video", preprovisioned_video_lanes),
-            ("audio", preprovisioned_audio_lanes),
-        ] {
-            if preprovisioned > maximum {
-                return Err(
-                    LegacyWebRtcMediaProfileError::PreprovisionedLanesExceedCeiling {
-                        kind,
-                        preprovisioned,
-                        maximum,
-                    },
-                );
-            }
-        }
-        Ok(Self {
-            max_lanes_per_kind,
-            preprovisioned_video_lanes,
-            preprovisioned_audio_lanes,
-            lane_drain_grace,
-        })
-    }
-
-    pub const fn max_lanes_per_kind(self) -> NonZeroUsize {
-        self.max_lanes_per_kind
-    }
-
-    pub const fn preprovisioned_video_lanes(self) -> usize {
-        self.preprovisioned_video_lanes
-    }
-
-    pub const fn preprovisioned_audio_lanes(self) -> usize {
-        self.preprovisioned_audio_lanes
-    }
-
-    pub const fn lane_drain_grace(self) -> Duration {
-        self.lane_drain_grace
-    }
-
-    pub const fn preprovisioned_outbound_flows(self) -> Option<usize> {
-        self.preprovisioned_video_lanes
-            .checked_add(self.preprovisioned_audio_lanes)
-    }
-}
-
 /// Explicit policy supplied by the process resource owner.
 ///
-/// Arc 03 deliberately provides no `Default`: the maximum number of admitted
-/// candidates, callback capacities, and the pre-SDP queue bounds are operational
-/// values that require owner review.
+/// Arc 03 deliberately provides no `Default`. This process policy contains
+/// only the global active-connector-candidate ceiling. WebRTC work policy lives
+/// in `WebRtcConnectorProfile`; both are explicit owner inputs to the combined
+/// connector-capable policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorResourcePolicy {
     max_active_candidates: NonZeroUsize,
-    callbacks: ConnectorCallbackPolicy,
-    pending_remote_candidates: PendingRemoteCandidatePolicy,
-    legacy_media: Option<LegacyWebRtcMediaProfile>,
 }
 
 impl ConnectorResourcePolicy {
-    pub const fn new(
+    pub fn new(
         max_active_candidates: NonZeroUsize,
-        callbacks: ConnectorCallbackPolicy,
-        pending_remote_candidates: PendingRemoteCandidatePolicy,
-    ) -> Self {
-        Self {
-            max_active_candidates,
-            callbacks,
-            pending_remote_candidates,
-            legacy_media: None,
+    ) -> std::result::Result<Self, ConnectorResourcePolicyError> {
+        if max_active_candidates.get() > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(
+                ConnectorResourcePolicyError::CleanupQueueCapacityExceedsRuntimeLimit {
+                    requested: max_active_candidates.get(),
+                    maximum: tokio::sync::Semaphore::MAX_PERMITS,
+                },
+            );
         }
+        Ok(Self {
+            max_active_candidates,
+        })
     }
 
     pub const fn max_active_candidates(self) -> NonZeroUsize {
         self.max_active_candidates
     }
+}
 
-    pub const fn callbacks(self) -> ConnectorCallbackPolicy {
-        self.callbacks
-    }
-
-    pub const fn pending_remote_candidates(self) -> PendingRemoteCandidatePolicy {
-        self.pending_remote_candidates
-    }
-
-    pub const fn legacy_media(self) -> Option<LegacyWebRtcMediaProfile> {
-        self.legacy_media
-    }
-
-    pub fn with_legacy_webrtc_media(
-        mut self,
-        profile: LegacyWebRtcMediaProfile,
-    ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
-        let enabled = match self.callbacks.realtime() {
-            RealtimeConnectorPolicy::Disabled => {
-                return Err(ConnectorCallbackPolicyError::LegacyMediaRequiresRealtime)
-            }
-            RealtimeConnectorPolicy::Enabled(enabled) => enabled,
-        };
-        let required_flows = profile
-            .preprovisioned_outbound_flows()
-            .ok_or(ConnectorCallbackPolicyError::AssemblyBoundOverflow)?;
-        let available_flows = enabled.flows().max_outbound_active_flows().get();
-        if required_flows > available_flows {
-            return Err(
-                ConnectorCallbackPolicyError::LegacyMediaExceedsOutboundFlowCeiling {
-                    required_flows,
-                    available_flows,
-                },
-            );
-        }
-        self.legacy_media = Some(profile);
-        Ok(self)
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectorResourcePolicyError {
+    #[error("cleanup queue capacity {requested} exceeds Tokio's supported maximum {maximum}")]
+    CleanupQueueCapacityExceedsRuntimeLimit { requested: usize, maximum: usize },
 }
 
 /// A process resource root already owns a different connector policy.
@@ -681,9 +517,17 @@ pub struct ConnectorResourceOwnerReport {
     /// Aggregate accounting is no longer exact, so all later admissions are
     /// refused. A known per-candidate cleanup failure does not set this flag.
     pub accounting_poisoned: bool,
-    pub callbacks: ConnectorCallbackPolicy,
-    pub pending_remote_candidates: PendingRemoteCandidatePolicy,
-    pub legacy_media: Option<LegacyWebRtcMediaProfile>,
+    pub cleanup: ConnectorCleanupHealth,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectorCleanupHealth {
+    pub queue_capacity: usize,
+    pub queued_jobs: usize,
+    pub active_jobs: usize,
+    pub completed_jobs: u64,
+    pub failed_jobs: u64,
+    pub executor_failed: bool,
 }
 
 /// Explicit owner-selected connector ceiling for one live [`crate::Mesh`]
@@ -707,11 +551,20 @@ pub struct MeshConnectorResourcePolicy {
 pub struct ConnectorCapableResourcePolicy {
     process: ConnectorResourcePolicy,
     mesh: MeshConnectorResourcePolicy,
+    webrtc: WebRtcConnectorProfile,
 }
 
 impl ConnectorCapableResourcePolicy {
-    pub const fn new(process: ConnectorResourcePolicy, mesh: MeshConnectorResourcePolicy) -> Self {
-        Self { process, mesh }
+    pub const fn new(
+        process: ConnectorResourcePolicy,
+        mesh: MeshConnectorResourcePolicy,
+        webrtc: WebRtcConnectorProfile,
+    ) -> Self {
+        Self {
+            process,
+            mesh,
+            webrtc,
+        }
     }
 
     pub const fn process(self) -> ConnectorResourcePolicy {
@@ -720,6 +573,10 @@ impl ConnectorCapableResourcePolicy {
 
     pub const fn mesh(self) -> MeshConnectorResourcePolicy {
         self.mesh
+    }
+
+    pub const fn webrtc(self) -> WebRtcConnectorProfile {
+        self.webrtc
     }
 }
 
@@ -732,5 +589,22 @@ impl MeshConnectorResourcePolicy {
 
     pub const fn max_active_candidates(self) -> NonZeroUsize {
         self.max_active_candidates
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v4_arc03h_cleanup_queue_capacity_is_validated_at_policy_construction() {
+        let unsupported = tokio::sync::Semaphore::MAX_PERMITS
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .expect("Tokio maximum leaves one representable unsupported value");
+        assert!(matches!(
+            ConnectorResourcePolicy::new(unsupported),
+            Err(ConnectorResourcePolicyError::CleanupQueueCapacityExceedsRuntimeLimit { .. })
+        ));
     }
 }

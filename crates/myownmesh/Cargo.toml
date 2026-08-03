@@ -17,6 +17,7 @@ publish = false
 [features]
 default = []
 legacy-v1 = ["myownmesh-core/legacy-v1"]
+legacy-media = ["myownmesh-core/legacy-media"]
 
 [[bin]]
 name = "myownmesh"

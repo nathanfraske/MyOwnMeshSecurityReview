@@ -1,8 +1,3 @@
-#![allow(
-    deprecated,
-    reason = "the engine still hosts the frozen legacy media adapter during downstream migration"
-)]
-
 //! Connection engine — the runtime that turns the protocol +
 //! transport + topology primitives into a working mesh.
 //!
@@ -34,12 +29,6 @@ pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
-#[cfg(feature = "legacy-v1")]
-#[allow(
-    dead_code,
-    reason = "frozen LegacyV1 routing remains unreachable from V4 and awaits named downstream deletion"
-)]
-pub mod routing;
 pub mod scheduler;
 pub mod signaling_bridge;
 pub mod state;
@@ -927,11 +916,11 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
 }
 
-/// Drive the media-lane renegotiations the transport flagged — OFF the
-/// driver task. The tick only *selects* peers (pending flag, or drained
-/// lanes due for reaping) and spawns one task per peer; the webrtc-rs
-/// excursion (reap's remove_track, create_offer's ICE re-gather) runs
-/// there, so the driver — and every input frame queued behind it —
+/// Drive the media-lane renegotiations the transport flagged off the
+/// driver task. The tick only selects peers with an explicit pending
+/// lane-set change and spawns one task per peer. The webrtc-rs excursion
+/// remove_track during finalization and ICE re-gather for the offer run
+/// there, so the driver and every input frame queued behind it
 /// never waits on SDP work. Glare-guarded: a peer whose signaling state
 /// isn't Stable is skipped and retried next tick rather than wedging
 /// webrtc-rs with a mid-negotiation offer. Single-flighted per peer via
@@ -951,16 +940,16 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         let Some(entry) = state.peers.get(&device_id) else {
             continue;
         };
-        let Some((session, realtime_flow)) = entry.realtime_flow_ports() else {
+        let Some((session, _realtime_flow)) = entry.realtime_flow_ports() else {
             continue;
         };
         let pending = {
             let d = entry.state.read();
             d.media_reneg_pending
         };
-        // Anything draining past the grace? (Cheap read; the actual
-        // removal happens in the spawned task.)
-        if !pending && !session.has_reapable_lanes(&realtime_flow) {
+        // Explicit finalization is the only operation that creates a pending
+        // removal. Elapsed time never does so.
+        if !pending {
             continue;
         }
         {
@@ -978,15 +967,12 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                 != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
             {
                 // Mid-negotiation (glare, or our own earlier offer still
-                // settling) — don't stack an offer on it, and don't touch
-                // the session either: unreaped drains keep the peer a
-                // candidate, and the Err below re-arms the pending flag.
+                // settling): do not stack an offer on it or touch the
+                // session. The error below re-arms the explicit pending flag.
                 Err("signaling not stable".to_string())
             } else {
-                // Finalize due drains first so the offer below carries
-                // the removals too — one renegotiation for the whole
-                // delta.
-                let reaped = session.reap_drained_lanes(&realtime_flow).await;
+                // Explicit finalization already changed the lane set. One
+                // offer now carries the complete pending delta.
                 match session.create_offer().await {
                     Ok(desc) => {
                         if state.peers.get_if_current(&owner).is_none() {
@@ -996,14 +982,12 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                             crate::events::DiagLevel::Debug,
                             "media",
                             format!(
-                                "media renegotiation offer to {} (lane set changed{})",
-                                short_peer(&device_id),
-                                if reaped > 0 { ", drains reaped" } else { "" }
+                                "media renegotiation offer to {} (lane set changed)",
+                                short_peer(&device_id)
                             ),
                             serde_json::json!({
                                 "peer": device_id,
                                 "sdp_bytes": desc.sdp.len(),
-                                "reaped": reaped,
                             }),
                         );
                         let _ = state.signaling_tx.send(SignalingOutbound::Offer {
@@ -3298,12 +3282,15 @@ fn build_test_state_parts(
         crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
     )
     .expect("engine fixture data-only callback policy is valid");
-    let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
-        max_connectors,
+    let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(max_connectors)
+        .expect("engine fixture connector policy is valid");
+    let webrtc_profile = crate::WebRtcConnectorProfile::new(
         callbacks,
-        crate::runtime::attempt::PendingRemoteCandidatePolicy::new(
+        crate::PendingRemoteCandidatePolicy::new(
             max_connectors,
             std::num::NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+            max_connectors,
+            max_connectors,
         ),
     );
     let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(connector_policy);
@@ -3314,7 +3301,7 @@ fn build_test_state_parts(
         .expect("engine fixture process owner issues one explicit Mesh scope");
     let transport = crate::transport::Transport::new()
         .expect("transport")
-        .with_connector_resource_scope(scope);
+        .with_connector_resource_scope(scope, webrtc_profile);
     let (state, _signaling_in_rx, cmd_rx) =
         NetworkState::new(config, identity, transport).expect("network state");
     (state, cmd_rx)
@@ -3349,6 +3336,24 @@ pub(crate) fn insert_session_less_peer(
 ) {
     let peer = Arc::new(PeerConnection::new(device_id.to_string(), None));
     peer.state.write().last_recv_at = last_recv_at;
+    install_peer(&state.peers, peer);
+}
+
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn insert_admitted_legacy_test_peer(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    auth_task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+) {
+    let peer = Arc::new(PeerConnection::new(device_id.to_string(), Some(worker)));
+    assert!(peer.install_endpoint_auth(auth_task));
+    {
+        let mut data = peer.state.write();
+        data.authenticated = true;
+        data.status = PeerStatus::Active;
+        data.data_channel_open = true;
+    }
     install_peer(&state.peers, peer);
 }
 

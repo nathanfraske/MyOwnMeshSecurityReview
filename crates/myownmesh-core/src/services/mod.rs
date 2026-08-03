@@ -1,43 +1,29 @@
-//! Mesh-native service concepts: the roles a device advertises when it
-//! hosts infrastructure for the mesh, the structured advertisement
-//! peers read to discover those services, and the roster-gated relay
-//! runtime that forwards traffic between members.
+//! Mesh-native service advertisements for signaling, STUN, TURN, and the
+//! frozen LegacyV1 ordinary-member relay wire name.
 //!
-//! The heavyweight network servers themselves — the STUN / TURN
-//! listener and the Nostr-compatible signaling relay — live *outside*
+//! The heavyweight network servers themselves, including the STUN / TURN
+//! listener and the Nostr-compatible signaling relay, live outside
 //! core (`myownmesh-services` and `myownmesh-signaling::server`) so
 //! embedders that only want the mesh runtime don't inherit those
 //! dependency trees (the `turn` / `stun` / extra websocket-server
-//! plumbing). What lives here is the part the protocol cares about: how
-//! a device tells the mesh "I'm a relay / signaling host / STUN / TURN
-//! handler" (so peers can discover and adopt it — the bit that makes a
-//! fully self-hosted, internet-isolated network trivial), plus the
-//! relay forwarder, which needs nothing beyond the core channel API.
-
-#[cfg(feature = "legacy-v1")]
-pub mod relay;
-
-#[cfg(feature = "legacy-v1")]
-#[allow(
-    deprecated,
-    reason = "this re-export exists only inside the frozen LegacyV1 feature boundary"
-)]
-pub use relay::{relay_targets, RelayEnvelope, RelayService, RELAY_CHANNEL};
+//! plumbing). This module owns only the stable advertised names and endpoint
+//! hints. Frozen LegacyV1 forwarding lives under `legacy_v1/` and is not TURN,
+//! signaling, or a generic relay.
 
 use serde::{Deserialize, Serialize};
 
 /// A role a device can advertise when it offers infrastructure to the
 /// mesh. Surfaced as stable tag strings inside
 /// [`crate::protocol::CapabilityAdvert::tags`] (each prefixed
-/// `service:`) so existing peers — which already exchange capability
-/// tags at handshake — discover service hosts with no wire-format
+/// `service:`) so existing peers, which already exchange capability
+/// tags at handshake, discover service hosts with no wire-format
 /// change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRole {
-    /// Forwards traffic between roster members — a router / ingress /
-    /// egress hub.
-    Relay,
+    /// Frozen pre-V4 application-frame forwarding between roster members.
+    /// This role is not TURN, signaling, or a generic opaque relay.
+    LegacyV1MemberRelay,
     /// Hosts a signaling relay usable in place of public Nostr.
     Signaling,
     /// Answers STUN binding requests.
@@ -53,7 +39,7 @@ impl ServiceRole {
     /// collide with an embedder's own tag.
     pub const fn tag(self) -> &'static str {
         match self {
-            ServiceRole::Relay => "service:relay",
+            ServiceRole::LegacyV1MemberRelay => "service:relay",
             ServiceRole::Signaling => "service:signaling",
             ServiceRole::Stun => "service:stun",
             ServiceRole::Turn => "service:turn",
@@ -62,7 +48,12 @@ impl ServiceRole {
 
     /// Every role, for iteration.
     pub fn all() -> [ServiceRole; 4] {
-        [Self::Relay, Self::Signaling, Self::Stun, Self::Turn]
+        [
+            Self::LegacyV1MemberRelay,
+            Self::Signaling,
+            Self::Stun,
+            Self::Turn,
+        ]
     }
 
     /// Parse a capability tag back into a role. Returns `None` for tags
@@ -79,7 +70,7 @@ pub const SERVICE_ADVERT_KEY: &str = "services";
 /// Structured advisory a service host publishes inside
 /// [`crate::protocol::CapabilityAdvert::extra`] under the
 /// [`SERVICE_ADVERT_KEY`] key. The role *tags* answer "what does this
-/// device do"; this answers "and here's how to reach it" — the
+/// device do"; this answers "and here's how to reach it": the
 /// endpoints a peer can drop straight into its own `signaling.servers` /
 /// `stun_servers` / `turn_servers` config to adopt the host. Every
 /// field is optional so a host can advertise a role via tag without
@@ -97,10 +88,10 @@ pub struct ServiceAdvert {
     /// `turn:host:port`, when hosted and reachable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_url: Option<String>,
-    /// True when this device forwards roster traffic on
-    /// [`RELAY_CHANNEL`].
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub relay: bool,
+    /// True only for the frozen LegacyV1 ordinary-member application relay.
+    /// The serialized key stays `relay` for wire compatibility.
+    #[serde(default, rename = "relay", skip_serializing_if = "is_false")]
+    pub legacy_v1_member_relay: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -140,7 +131,7 @@ impl ServiceAdvert {
         self.signaling_url.is_none()
             && self.stun_url.is_none()
             && self.turn_url.is_none()
-            && !self.relay
+            && !self.legacy_v1_member_relay
     }
 }
 
@@ -161,7 +152,7 @@ mod tests {
     fn role_tag_strings_are_stable() {
         // These strings travel on the wire — pin them so a refactor
         // can't silently break discovery across versions.
-        assert_eq!(ServiceRole::Relay.tag(), "service:relay");
+        assert_eq!(ServiceRole::LegacyV1MemberRelay.tag(), "service:relay");
         assert_eq!(ServiceRole::Signaling.tag(), "service:signaling");
         assert_eq!(ServiceRole::Stun.tag(), "service:stun");
         assert_eq!(ServiceRole::Turn.tag(), "service:turn");
@@ -172,7 +163,7 @@ mod tests {
         let advert = ServiceAdvert {
             signaling_url: Some("ws://10.0.0.5:4848".into()),
             turn_url: Some("turn:10.0.0.5:3478".into()),
-            relay: true,
+            legacy_v1_member_relay: true,
             ..Default::default()
         };
         let mut extra = serde_json::json!({ "other": "kept" });
@@ -195,7 +186,7 @@ mod tests {
     #[test]
     fn relay_only_advert_skips_url_fields() {
         let advert = ServiceAdvert {
-            relay: true,
+            legacy_v1_member_relay: true,
             ..Default::default()
         };
         let s = serde_json::to_string(&advert).unwrap();

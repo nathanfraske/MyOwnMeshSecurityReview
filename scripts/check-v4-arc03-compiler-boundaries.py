@@ -192,6 +192,7 @@ def main() -> int:
         CORE / "src" / "transport" / "webrtc" / "cleanup.rs",
         CORE / "src" / "transport" / "webrtc" / "h264.rs",
         CORE / "src" / "transport" / "webrtc" / "media.rs",
+        CORE / "src" / "transport" / "webrtc" / "policy.rs",
         CORE / "src" / "transport" / "webrtc" / "realtime.rs",
     )
     attempt_source = read_sources(
@@ -201,18 +202,28 @@ def main() -> int:
         CORE / "src" / "runtime" / "attempt" / "policy.rs",
         CORE / "src" / "runtime" / "attempt" / "resource_owner.rs",
     )
+    attempt_policy_source = (
+        CORE / "src" / "runtime" / "attempt" / "policy.rs"
+    ).read_text(encoding="utf-8")
+    webrtc_policy_source = (
+        CORE / "src" / "transport" / "webrtc" / "policy.rs"
+    ).read_text(encoding="utf-8")
     engine_source = (CORE / "src" / "engine" / "mod.rs").read_text(
         encoding="utf-8"
     )
-    routing_source = (CORE / "src" / "engine" / "routing.rs").read_text(
+    routing_path = CORE / "src" / "legacy_v1" / "routing.rs"
+    relay_path = CORE / "src" / "legacy_v1" / "relay.rs"
+    routing_source = routing_path.read_text(
         encoding="utf-8"
     )
-    relay_source = (CORE / "src" / "services" / "relay.rs").read_text(
+    relay_source = relay_path.read_text(
         encoding="utf-8"
     )
     legacy_profile_source = (CORE / "src" / "legacy_v1.rs").read_text(
         encoding="utf-8"
     )
+    lib_source = (CORE / "src" / "lib.rs").read_text(encoding="utf-8")
+    core_manifest = (CORE / "Cargo.toml").read_text(encoding="utf-8")
     endpoint_auth_source = (CORE / "src" / "endpoint_auth" / "mod.rs").read_text(
         encoding="utf-8"
     )
@@ -223,8 +234,7 @@ def main() -> int:
         "close_media_lane",
         "send_video",
         "send_audio",
-        "has_reapable_lanes",
-        "reap_drained_lanes",
+        "finalize_suspended_lanes",
     ):
         signature = re.search(
             rf"pub\(crate\)\s+(?:async\s+)?fn\s+{consumer}\s*\((?P<args>.{{0,700}}?)\)\s*(?:->|\{{)",
@@ -269,6 +279,29 @@ def main() -> int:
     if "ProcessResourceRoot::global().mesh_runtime_scope()" not in engine_source:
         failures.append("public Mesh runtime path does not use the process resource root")
 
+    for transport_policy_type in (
+        "struct PendingRemoteCandidatePolicy",
+        "struct LegacyWebRtcMediaProfile",
+        "struct WebRtcConnectorProfile",
+    ):
+        if transport_policy_type in attempt_policy_source:
+            failures.append(
+                f"WebRTC-specific type remains in generic attempt policy: {transport_policy_type}"
+            )
+        if transport_policy_type not in webrtc_policy_source:
+            failures.append(
+                f"WebRTC-specific policy module is missing {transport_policy_type}"
+            )
+    process_policy = re.search(
+        r"pub struct ConnectorResourcePolicy\s*\{(?P<body>.*?)\}",
+        attempt_policy_source,
+        flags=re.DOTALL,
+    )
+    if process_policy is None:
+        failures.append("connector-neutral process policy type is missing")
+    elif re.search(r"WebRtc|ICE|CandidatePolicy|Media|Codec", process_policy.group("body")):
+        failures.append("process connector resource policy contains transport-specific fields")
+
     capacity_shape = re.search(
         r"pub struct ConnectorCallbackMailboxCapacities\s*\{(?P<body>.*?)\}",
         attempt_source,
@@ -293,7 +326,8 @@ def main() -> int:
             "max_in_progress_units_per_flow",
             "max_inbound_bytes",
             "max_outbound_bytes",
-            "max_total_bytes",
+            "max_pre_auth_packets",
+            "max_pre_auth_content_bytes",
         ):
             if structural_bound not in attempt_source:
                 failures.append(f"real-time policy is missing {structural_bound}")
@@ -326,7 +360,10 @@ def main() -> int:
         "ConnectorCloseStatus::Closing" in webrtc_source
         and "match native.close().await" in webrtc_source
         and "ConnectorCleanupExecutor" in attempt_source
-        and "tokio::sync::mpsc::channel(self.capacity.get())" in attempt_source
+        and re.search(
+            r"tokio::sync::mpsc::channel(?:::<ConnectorCleanupJob>)?\(self\.capacity\.get\(\)\)",
+            attempt_source,
+        )
     ):
         failures.append("native close is not owned by the bounded process cleanup executor")
 
@@ -339,6 +376,10 @@ def main() -> int:
         failures.append("bounded callback scheduler is missing")
     elif "biased;" in recv_queued.group(0):
         failures.append("callback receiver still uses permanently biased selection")
+    if "reserve().await" in webrtc_source or ".reserve(\n" in webrtc_source:
+        failures.append("connector callback producer can still await mailbox capacity")
+    if "match mailbox.try_send(queued)" not in webrtc_source:
+        failures.append("connector callback insertion does not use typed nonblocking admission")
 
     for legacy_call in (
         "routing::send_routed(",
@@ -350,18 +391,23 @@ def main() -> int:
 
     if "pub struct LegacyV1Runtime" not in legacy_profile_source:
         failures.append("frozen LegacyV1 compatibility runtime is missing")
-    if "pub(crate) struct LegacyV1Marker" not in legacy_profile_source:
-        failures.append("private LegacyV1 marker is missing")
+    if "LegacyV1Marker" in legacy_profile_source or "LegacyV1Marker" in routing_source:
+        failures.append("removed LegacyV1 marker remains reachable")
     if "impl Default for LegacyV1Runtime" in legacy_profile_source:
         failures.append("LegacyV1 runtime must not be selected by default")
+    if 'mod legacy_v1;' not in lib_source or 'legacy-v1 = []' not in core_manifest:
+        failures.append("LegacyV1 source is not behind its explicit Cargo feature")
+    if (CORE / "src" / "engine" / "routing.rs").exists():
+        failures.append("LegacyV1 routing still exists under the V4 engine subtree")
+    if (CORE / "src" / "services" / "relay.rs").exists():
+        failures.append("LegacyV1 relay still exists under the generic services subtree")
+    if "mod routing;" not in legacy_profile_source:
+        failures.append("LegacyV1 facade does not privately own its routing module")
+    if re.search(r"pub\s+use\s+legacy_v1::", lib_source):
+        failures.append("crate-root LegacyV1 compatibility re-export remains reachable")
     for legacy_api in ("on_relay_frame", "send_routed", "broadcast_flood"):
-        signature = re.search(
-            rf"fn\s+{legacy_api}\s*\((?P<args>.{{0,900}}?)\)",
-            routing_source,
-            flags=re.DOTALL,
-        )
-        if signature is None or "LegacyV1Marker" not in signature.group("args"):
-            failures.append(f"legacy routing API {legacy_api} lacks the private marker")
+        if not re.search(rf"pub\(crate\)\s+async\s+fn\s+{legacy_api}\s*\(", routing_source):
+            failures.append(f"legacy routing API {legacy_api} is missing or externally public")
     relay_start = re.search(
         r"fn\s+start\s*\((?P<args>.{0,900}?)\)", relay_source, flags=re.DOTALL
     )
@@ -372,7 +418,7 @@ def main() -> int:
         ("V4 engine", engine_source),
         ("Endpoint Auth", endpoint_auth_source),
     ):
-        if "LegacyV1Marker" in source or "LegacyV1Runtime" in source:
+        if "LegacyV1Marker" in source or "LegacyV1Runtime" in source or "legacy_v1::" in source:
             failures.append(f"{name} path can reach the LegacyV1 runtime")
 
     if "LegacyPayloadRelayForbidden" not in services_source:
@@ -429,7 +475,7 @@ def main() -> int:
 
     print(
         "V4 Arc 03 compiler-boundary checks passed: one positive public-type "
-        f"control, {len(REJECTED)} cause-matched rejection controls, and six exact "
+        f"control, {len(REJECTED)} cause-matched rejection controls, and five exact "
         "real-time-flow consumers."
     )
     return 0

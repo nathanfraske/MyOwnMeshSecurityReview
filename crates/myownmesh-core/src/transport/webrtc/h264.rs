@@ -1,8 +1,3 @@
-#![allow(
-    deprecated,
-    reason = "this module is the frozen H.264 compatibility implementation"
-)]
-
 //! Structurally bounded H.264 compatibility assembly.
 
 use super::*;
@@ -46,7 +41,7 @@ pub(super) struct GuardedVideoSample {
 
 /// More packets than any sane unit (a 40 Mbps keyframe is ~400): a unit
 /// this size means the stream is wedged — drop it rather than balloon.
-pub(super) const MAX_AU_PARTS: usize = 2048;
+pub(super) const MAX_AU_PARTS: usize = super::LEGACY_H264_MAX_FRAGMENTS_PER_UNIT;
 
 impl H264AuAssembler {
     pub(super) fn guarded(flow: RealtimeFlowPort) -> Self {

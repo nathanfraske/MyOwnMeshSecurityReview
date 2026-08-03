@@ -33,6 +33,7 @@ pub(super) enum RealtimeFlowDropReason {
     UnitOversize,
     InProgressLimit,
     AggregateBytes,
+    PreAuthEnvelope,
     FlowQueueFull,
     Retired,
 }
@@ -107,7 +108,10 @@ pub(super) struct RealtimeFlowRegistryState {
     pub(super) flows: std::collections::BTreeMap<RealtimeFlowKey, RealtimeFlowQueue>,
     pub(super) ready: std::collections::VecDeque<RealtimeFlowKey>,
     pub(super) retained_bytes_by_domain: [usize; 2],
-    pub(super) in_progress_units: usize,
+    pub(super) in_progress_units_by_domain: [usize; 2],
+    pub(super) pre_auth_packets: usize,
+    pub(super) pre_auth_content_bytes: usize,
+    pub(super) pre_auth_exhausted: bool,
     pub(super) accounting_poisoned_by_domain: [bool; 2],
     pub(super) retired: bool,
 }
@@ -140,7 +144,10 @@ impl RealtimeFlowRegistry {
                 flows: std::collections::BTreeMap::new(),
                 ready: std::collections::VecDeque::new(),
                 retained_bytes_by_domain: [0; 2],
-                in_progress_units: 0,
+                in_progress_units_by_domain: [0; 2],
+                pre_auth_packets: 0,
+                pre_auth_content_bytes: 0,
+                pre_auth_exhausted: false,
                 accounting_poisoned_by_domain: [false; 2],
                 retired: false,
             }),
@@ -218,7 +225,7 @@ impl RealtimeFlowRegistry {
             },
         );
         let Some(active_flows) = active_in_domain.checked_add(1) else {
-            state.accounting_poisoned_by_domain[domain.index()] = true;
+            self.poison_domain_locked(&mut state, domain);
             state.flows.remove(&key);
             return None;
         };
@@ -270,7 +277,36 @@ impl RealtimeFlowRegistry {
         state.retained_bytes_by_domain[0].checked_add(state.retained_bytes_by_domain[1])
     }
 
+    pub(super) fn in_progress_units(state: &RealtimeFlowRegistryState) -> usize {
+        state.in_progress_units_by_domain[0]
+            .checked_add(state.in_progress_units_by_domain[1])
+            .unwrap_or(usize::MAX)
+    }
+
+    fn domain_byte_limit(&self, domain: RealtimeFlowDomain) -> usize {
+        let budgets = self
+            .policy
+            .expect("enabled flow owns real-time policy")
+            .flows()
+            .byte_budgets();
+        match domain {
+            RealtimeFlowDomain::InboundQuarantine => budgets.max_inbound_bytes().get(),
+            RealtimeFlowDomain::OutboundCompatibility => budgets.max_outbound_bytes().get(),
+        }
+    }
+
+    fn poison_domain_locked(
+        &self,
+        state: &mut RealtimeFlowRegistryState,
+        domain: RealtimeFlowDomain,
+    ) {
+        let index = domain.index();
+        state.accounting_poisoned_by_domain[index] = true;
+        state.retained_bytes_by_domain[index] = self.domain_byte_limit(domain);
+    }
+
     fn release_bytes_locked(
+        &self,
         state: &mut RealtimeFlowRegistryState,
         domain: RealtimeFlowDomain,
         bytes: usize,
@@ -285,26 +321,28 @@ impl RealtimeFlowRegistry {
                 true
             }
             None => {
-                state.accounting_poisoned_by_domain[index] = true;
+                self.poison_domain_locked(state, domain);
                 false
             }
         }
     }
 
     fn release_unit_locked(
+        &self,
         state: &mut RealtimeFlowRegistryState,
         domain: RealtimeFlowDomain,
     ) -> bool {
         if state.accounting_poisoned_by_domain[domain.index()] {
             return false;
         }
-        match state.in_progress_units.checked_sub(1) {
+        let index = domain.index();
+        match state.in_progress_units_by_domain[index].checked_sub(1) {
             Some(units) => {
-                state.in_progress_units = units;
+                state.in_progress_units_by_domain[index] = units;
                 true
             }
             None => {
-                state.accounting_poisoned_by_domain[domain.index()] = true;
+                self.poison_domain_locked(state, domain);
                 false
             }
         }
@@ -336,20 +374,22 @@ impl RealtimeFlowRegistry {
             return None;
         }
         let Some(next_flow_units) = current_flow_units.checked_add(1) else {
-            state.accounting_poisoned_by_domain[domain.index()] = true;
+            self.poison_domain_locked(&mut state, domain);
             return None;
         };
-        let Some(next_total_units) = state.in_progress_units.checked_add(1) else {
-            state.accounting_poisoned_by_domain[domain.index()] = true;
+        let index = domain.index();
+        let Some(next_domain_units) = state.in_progress_units_by_domain[index].checked_add(1)
+        else {
+            self.poison_domain_locked(&mut state, domain);
             return None;
         };
         let Some(flow) = state.flows.get_mut(&key) else {
-            state.accounting_poisoned_by_domain[domain.index()] = true;
+            self.poison_domain_locked(&mut state, domain);
             return None;
         };
         flow.in_progress_units = next_flow_units;
-        state.in_progress_units = next_total_units;
-        let in_progress_units = state.in_progress_units;
+        state.in_progress_units_by_domain[index] = next_domain_units;
+        let in_progress_units = Self::in_progress_units(&state);
         let retained_bytes = Self::retained_bytes(&state).unwrap_or(usize::MAX);
         drop(state);
         self.record(RealtimeFlowObservation::Assembly {
@@ -366,6 +406,47 @@ impl RealtimeFlowRegistry {
             retained_fragments: 0,
             active: true,
         })
+    }
+
+    pub(super) fn admit_pre_auth_packet(&self, payload_bytes: usize, promoted: bool) -> bool {
+        if promoted {
+            return true;
+        }
+        let Some(policy) = self.policy.map(EnabledRealtimeConnectorPolicy::flows) else {
+            return false;
+        };
+        let mut state = self.state.lock();
+        let domain = RealtimeFlowDomain::InboundQuarantine;
+        if state.retired
+            || state.accounting_poisoned_by_domain[domain.index()]
+            || state.pre_auth_exhausted
+        {
+            return false;
+        }
+        let Some(packets) = state.pre_auth_packets.checked_add(1) else {
+            self.poison_domain_locked(&mut state, domain);
+            return false;
+        };
+        let Some(bytes) = state.pre_auth_content_bytes.checked_add(payload_bytes) else {
+            self.poison_domain_locked(&mut state, domain);
+            return false;
+        };
+        if packets > policy.max_pre_auth_packets().get()
+            || bytes > policy.max_pre_auth_content_bytes().get()
+        {
+            state.pre_auth_exhausted = true;
+            drop(state);
+            self.record(RealtimeFlowObservation::Drop {
+                key: None,
+                reason: RealtimeFlowDropReason::PreAuthEnvelope,
+                queue_age: Duration::ZERO,
+                payload_bytes,
+            });
+            return false;
+        }
+        state.pre_auth_packets = packets;
+        state.pre_auth_content_bytes = bytes;
+        true
     }
 
     pub(super) fn reserve_output(
@@ -394,19 +475,14 @@ impl RealtimeFlowRegistry {
         let byte_budgets = policy.byte_budgets();
         let index = domain.index();
         let Some(next_domain) = state.retained_bytes_by_domain[index].checked_add(bytes) else {
-            state.accounting_poisoned_by_domain[index] = true;
+            self.poison_domain_locked(&mut state, domain);
             return None;
         };
         let domain_limit = match domain {
             RealtimeFlowDomain::InboundQuarantine => byte_budgets.max_inbound_bytes().get(),
             RealtimeFlowDomain::OutboundCompatibility => byte_budgets.max_outbound_bytes().get(),
         };
-        let other = state.retained_bytes_by_domain[1 - index];
-        let Some(next_total) = next_domain.checked_add(other) else {
-            state.accounting_poisoned_by_domain[index] = true;
-            return None;
-        };
-        if next_domain > domain_limit || next_total > byte_budgets.max_total_bytes().get() {
+        if next_domain > domain_limit {
             drop(state);
             self.record(RealtimeFlowObservation::Drop {
                 key: Some(key),
@@ -462,7 +538,7 @@ impl RealtimeFlowRegistry {
             return false;
         };
         if flow.domain != domain {
-            state.accounting_poisoned_by_domain[domain.index()] = true;
+            self.poison_domain_locked(&mut state, domain);
             return false;
         }
         if flow.events.len() >= policy.queue_capacity_per_flow().get() {
@@ -623,7 +699,8 @@ pub(super) struct RealtimeAssemblyReservation {
 
 impl RealtimeAssemblyReservation {
     fn poison_domain(&self) {
-        self.registry.state.lock().accounting_poisoned_by_domain[self.domain.index()] = true;
+        let mut state = self.registry.state.lock();
+        self.registry.poison_domain_locked(&mut state, self.domain);
     }
 
     pub(super) fn retain_fragment(&mut self, bytes: usize) -> bool {
@@ -676,19 +753,14 @@ impl RealtimeAssemblyReservation {
         let policy = policy.byte_budgets();
         let index = self.domain.index();
         let Some(next_domain) = state.retained_bytes_by_domain[index].checked_add(bytes) else {
-            state.accounting_poisoned_by_domain[index] = true;
-            return false;
-        };
-        let other = state.retained_bytes_by_domain[1 - index];
-        let Some(next_total) = next_domain.checked_add(other) else {
-            state.accounting_poisoned_by_domain[index] = true;
+            self.registry.poison_domain_locked(&mut state, self.domain);
             return false;
         };
         let domain_limit = match self.domain {
             RealtimeFlowDomain::InboundQuarantine => policy.max_inbound_bytes().get(),
             RealtimeFlowDomain::OutboundCompatibility => policy.max_outbound_bytes().get(),
         };
-        if next_domain > domain_limit || next_total > policy.max_total_bytes().get() {
+        if next_domain > domain_limit {
             drop(state);
             self.registry.record(RealtimeFlowObservation::Drop {
                 key: Some(self.key),
@@ -701,7 +773,7 @@ impl RealtimeAssemblyReservation {
         state.retained_bytes_by_domain[index] = next_domain;
         self.retained_bytes = unit_bytes;
         self.retained_fragments = fragment_count;
-        let in_progress_units = state.in_progress_units;
+        let in_progress_units = RealtimeFlowRegistry::in_progress_units(&state);
         let retained_bytes = RealtimeFlowRegistry::retained_bytes(&state).unwrap_or(usize::MAX);
         drop(state);
         self.registry.record(RealtimeFlowObservation::Assembly {
@@ -729,11 +801,12 @@ impl Drop for RealtimeAssemblyReservation {
             }
         });
         if !flow_released {
-            state.accounting_poisoned_by_domain[self.domain.index()] = true;
+            self.registry.poison_domain_locked(&mut state, self.domain);
         }
-        RealtimeFlowRegistry::release_bytes_locked(&mut state, self.domain, self.retained_bytes);
-        RealtimeFlowRegistry::release_unit_locked(&mut state, self.domain);
-        let in_progress_units = state.in_progress_units;
+        self.registry
+            .release_bytes_locked(&mut state, self.domain, self.retained_bytes);
+        self.registry.release_unit_locked(&mut state, self.domain);
+        let in_progress_units = RealtimeFlowRegistry::in_progress_units(&state);
         let retained_bytes = RealtimeFlowRegistry::retained_bytes(&state).unwrap_or(usize::MAX);
         drop(state);
         self.registry.record(RealtimeFlowObservation::Assembly {
@@ -758,12 +831,16 @@ impl RealtimeOutputReservation {
             return false;
         }
         let Some(released) = self.bytes.checked_sub(bytes) else {
-            self.registry.state.lock().accounting_poisoned_by_domain[self.domain.index()] = true;
+            let mut state = self.registry.state.lock();
+            self.registry.poison_domain_locked(&mut state, self.domain);
             return false;
         };
         if released != 0 {
             let mut state = self.registry.state.lock();
-            if !RealtimeFlowRegistry::release_bytes_locked(&mut state, self.domain, released) {
+            if !self
+                .registry
+                .release_bytes_locked(&mut state, self.domain, released)
+            {
                 return false;
             }
             self.bytes = bytes;
@@ -786,7 +863,8 @@ impl Drop for RealtimeOutputReservation {
     fn drop(&mut self) {
         if self.active {
             let mut state = self.registry.state.lock();
-            RealtimeFlowRegistry::release_bytes_locked(&mut state, self.domain, self.bytes);
+            self.registry
+                .release_bytes_locked(&mut state, self.domain, self.bytes);
         }
     }
 }
@@ -801,7 +879,8 @@ struct RealtimePayloadReservation {
 impl Drop for RealtimePayloadReservation {
     fn drop(&mut self) {
         let mut state = self.registry.state.lock();
-        RealtimeFlowRegistry::release_bytes_locked(&mut state, self.domain, self.bytes);
+        self.registry
+            .release_bytes_locked(&mut state, self.domain, self.bytes);
         let retained_bytes = RealtimeFlowRegistry::retained_bytes(&state).unwrap_or(usize::MAX);
         drop(state);
         self.registry.record(RealtimeFlowObservation::Queue {

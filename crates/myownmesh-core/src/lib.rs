@@ -134,8 +134,6 @@ pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
-#[cfg(feature = "legacy-v1")]
-pub use legacy_v1::LegacyV1Runtime;
 pub use network_state::{
     NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
     SIGN_DOMAIN_TAG_STATE,
@@ -149,19 +147,16 @@ pub use runtime::attempt::{
     ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorRealtimeByteBudgets,
     ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy, ConnectorRealtimeInboundLimits,
     ConnectorResourceOwnerPort, ConnectorResourceOwnerReport, ConnectorResourcePolicy,
-    ConnectorResourcePolicyConflict, EnabledRealtimeConnectorPolicy, LegacyWebRtcMediaProfile,
-    LegacyWebRtcMediaProfileError, MeshConnectorResourcePolicy, MeshConnectorResourceReport,
-    MeshConnectorResourceScopeIssueError, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy,
+    ConnectorResourcePolicyConflict, EnabledRealtimeConnectorPolicy, MeshConnectorResourcePolicy,
+    MeshConnectorResourceReport, MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy,
     RealtimeQueueOverflowRule,
 };
-#[cfg(feature = "legacy-v1")]
-#[allow(
-    deprecated,
-    reason = "these exports exist only inside the frozen LegacyV1 feature boundary"
-)]
-pub use services::{relay_targets, RelayEnvelope, RelayService, RELAY_CHANNEL};
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
+pub use transport::webrtc::{
+    LegacyWebRtcMediaProfile, LegacyWebRtcMediaProfileError, PendingRemoteCandidatePolicy,
+    WebRtcConnectorProfile, WebRtcConnectorProfileError,
+};
 
 /// Domain-separation tag prefixed to every signed handshake payload.
 /// A signature obtained for one protocol step cannot be replayed in

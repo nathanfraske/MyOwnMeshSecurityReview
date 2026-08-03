@@ -1,8 +1,4 @@
 #![cfg(target_os = "linux")]
-#![allow(
-    deprecated,
-    reason = "this positive control exercises the frozen legacy media compatibility path"
-)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,13 +10,17 @@ use myownmesh_core::config::{
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
 use myownmesh_core::identity::Identity;
+#[allow(
+    deprecated,
+    reason = "this import is used only by the frozen legacy media negative control"
+)]
 use myownmesh_core::transport::webrtc::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     Channel, ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
     ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
     MeshConnectorResourcePolicy, MeshEvent, PeerEvent, PendingRemoteCandidatePolicy,
-    RealtimeConnectorPolicy,
+    RealtimeConnectorPolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -57,15 +57,18 @@ fn test_connector_resource_policy() -> ConnectorCapableResourcePolicy {
         RealtimeConnectorPolicy::Disabled,
     )
     .expect("fixture data-only callback policy is valid");
-    let process = ConnectorResourcePolicy::new(
-        two,
+    let process =
+        ConnectorResourcePolicy::new(two).expect("fixture cleanup queue capacity is supported");
+    let webrtc = WebRtcConnectorProfile::new(
         callbacks,
         PendingRemoteCandidatePolicy::new(
             two,
             std::num::NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+            two,
+            two,
         ),
     );
-    ConnectorCapableResourcePolicy::new(process, MeshConnectorResourcePolicy::new(two))
+    ConnectorCapableResourcePolicy::new(process, MeshConnectorResourcePolicy::new(two), webrtc)
 }
 
 fn relay_only_test_transport() -> Transport {
@@ -155,6 +158,10 @@ async fn wait_for_relay_pair(state: &myownmesh_core::engine::state::NetworkState
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    deprecated,
+    reason = "this exact test proves TURN cannot bypass the frozen legacy media admission boundary"
+)]
 async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
     let observed_at = std::time::Instant::now();
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");

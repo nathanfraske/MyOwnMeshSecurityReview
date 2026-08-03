@@ -88,6 +88,8 @@ pub(super) struct ConnectorCloseOwner {
     connected_claims: SyncMutex<ConnectedClaimRetention>,
     #[cfg(test)]
     fail_background_start: AtomicBool,
+    #[cfg(test)]
+    panic_cleanup_future: AtomicBool,
 }
 
 impl ConnectorCloseOwner {
@@ -109,15 +111,13 @@ impl ConnectorCloseOwner {
             connected_claims: SyncMutex::new(ConnectedClaimRetention::Empty),
             #[cfg(test)]
             fail_background_start: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_cleanup_future: AtomicBool::new(false),
         })
     }
 
     pub(super) fn attach_native(&self, native: Arc<RTCPeerConnection>) -> bool {
         self.attach_native_port(Arc::new(WebRtcNativeClosePort { peer: native }))
-    }
-
-    pub(super) fn pending_remote_candidate_policy(&self) -> PendingRemoteCandidatePolicy {
-        self.resource_owner.pending_remote_candidates()
     }
 
     pub(super) fn attach_native_port(&self, native: Arc<dyn NativeConnectorClosePort>) -> bool {
@@ -216,9 +216,17 @@ impl ConnectorCloseOwner {
             return;
         }
         let owner = Arc::clone(self);
+        let failure_owner = Arc::downgrade(self);
         if self
             .resource_owner
-            .submit_cleanup(Box::pin(async move { owner.run().await }))
+            .submit_cleanup(
+                Box::pin(async move { owner.run().await }),
+                Box::new(move |reason| {
+                    if let Some(owner) = failure_owner.upgrade() {
+                        owner.fail_cleanup(reason);
+                    }
+                }),
+            )
             .is_err()
         {
             self.fail_cleanup("process cleanup executor refused the close owner".to_string());
@@ -226,6 +234,10 @@ impl ConnectorCloseOwner {
     }
 
     async fn run(self: Arc<Self>) {
+        #[cfg(test)]
+        if self.panic_cleanup_future.load(Ordering::Acquire) {
+            panic!("injected cleanup future panic");
+        }
         let native = self.native.lock().clone();
         let Some(native) = native else {
             self.finish_closed();
@@ -296,6 +308,11 @@ impl ConnectorCloseOwner {
     #[cfg(test)]
     pub(super) fn fail_background_start_for_test(&self) {
         self.fail_background_start.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn panic_cleanup_future_for_test(&self) {
+        self.panic_cleanup_future.store(true, Ordering::Release);
     }
 
     #[cfg(test)]

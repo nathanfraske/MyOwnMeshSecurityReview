@@ -13,11 +13,6 @@
 //! line until the client disconnects. The GUI's Tauri backend uses
 //! this to forward live mesh events into the frontend.
 
-#![allow(
-    deprecated,
-    reason = "the local control protocol retains the frozen legacy media facade for downstream migration"
-)]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,7 +23,9 @@ use interprocess::local_socket::{
 use myownmesh_core::{MeshConfig, MeshHandle, NetworkConfig, ServicesConfig, TopologyMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(feature = "legacy-media")]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -185,6 +182,7 @@ pub enum Request {
     /// Open the lowest free media lane (`kind`: "video" | "audio")
     /// toward a connected peer, returning `{ lane }`. Lanes also open
     /// transparently on first write; this is the explicit reservation.
+    #[cfg(feature = "legacy-media")]
     MediaLaneOpen {
         network: String,
         peer: String,
@@ -193,6 +191,7 @@ pub enum Request {
     /// Close a media lane toward a peer (idempotent). The track is
     /// removed and the next renegotiation drops its m-line send side —
     /// media capacity is paid only while a session uses it.
+    #[cfg(feature = "legacy-media")]
     MediaLaneClose {
         network: String,
         peer: String,
@@ -475,6 +474,7 @@ pub enum Request {
     /// connection at negotiation, so this works the moment the peer is
     /// up — no renegotiation, no subscription required. `duration_us`
     /// paces the RTP clock (1/fps).
+    #[cfg(feature = "legacy-media")]
     VideoSend {
         network: String,
         peer: String,
@@ -491,6 +491,7 @@ pub enum Request {
     /// (`[u32 len][body]`, see [`decode_media_frame`]) — H.264 access units and
     /// Opus frames with no base64 and no per-frame JSON. Nothing else rides
     /// this connection; MJPEG/PCM/route signalling stay on the JSON pipe.
+    #[cfg(feature = "legacy-media")]
     MediaTrackPipe,
     /// Convert this connection into a dedicated **binary media-source pipe**
     /// for `client_id` (its `EventsSubscribe` id): after the ack, the daemon
@@ -498,16 +499,19 @@ pub enum Request {
     /// [`encode_inbound_frame`]) for everything that client is subscribed to —
     /// no base64, no JSON. While registered, inbound media routes here instead
     /// of as base64 `video_inbound`/`audio_inbound` on the event socket.
+    #[cfg(feature = "legacy-media")]
     MediaSourcePipe {
         client_id: crate::ipc::ClientId,
     },
     /// Route assembled video access units arriving from this network's
     /// peers to this client's event socket as `video_inbound` frames.
+    #[cfg(feature = "legacy-media")]
     VideoSubscribe {
         client_id: crate::ipc::ClientId,
         network: String,
     },
     /// Release a video subscription. No-op if not subscribed.
+    #[cfg(feature = "legacy-media")]
     VideoUnsubscribe {
         client_id: crate::ipc::ClientId,
         network: String,
@@ -519,6 +523,7 @@ pub enum Request {
     /// lane — works the moment the peer is up, no subscription required.
     /// `duration_us` is the frame length (20 000 for the canonical Opus
     /// frame); it paces the RTP clock.
+    #[cfg(feature = "legacy-media")]
     AudioSend {
         network: String,
         peer: String,
@@ -532,11 +537,13 @@ pub enum Request {
     },
     /// Route audio frames arriving from this network's peers to this
     /// client's event socket as `audio_inbound` frames.
+    #[cfg(feature = "legacy-media")]
     AudioSubscribe {
         client_id: crate::ipc::ClientId,
         network: String,
     },
     /// Release an audio subscription. No-op if not subscribed.
+    #[cfg(feature = "legacy-media")]
     AudioUnsubscribe {
         client_id: crate::ipc::ClientId,
         network: String,
@@ -764,6 +771,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
         // of media frames (H.264/Opus), exactly the EventsSubscribe pattern but
         // reading instead of writing. After the ack the connection speaks only
         // length-prefixed binary frames — no per-frame JSON or base64.
+        #[cfg(feature = "legacy-media")]
         if matches!(request, Request::MediaTrackPipe) {
             let ack = Response::ok(serde_json::json!({ "media_track_pipe": true }));
             let line = serde_json::to_string(&ack)? + "\n";
@@ -778,6 +786,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
         // (binary) to this connection for the named client, instead of base64
         // events on its event socket. Register a sink on that client, then drain
         // it to the wire until either side closes.
+        #[cfg(feature = "legacy-media")]
         if let Request::MediaSourcePipe { client_id } = &request {
             let client_id = *client_id;
             let Some(client) = state.clients.client(client_id) else {
@@ -813,6 +822,11 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
 /// nothing back per frame: errors are logged here (rate-limited by the caller's
 /// own cadence) rather than answered, which is the whole latency win. Returns
 /// when the client disconnects.
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "this function is the explicit deprecated legacy-media control adapter"
+)]
 async fn run_media_track_pipe<R>(state: &Arc<ControlState>, mut reader: R) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -870,6 +884,7 @@ where
 /// `[u32 len][body]`. One-way (daemon → client); the only thing read back is
 /// EOF, which — like a dropped sink — ends the loop so the caller clears the
 /// client's sink and the pumps fall back to base64 events.
+#[cfg(feature = "legacy-media")]
 async fn run_media_source_pipe<R, W>(
     mut reader: R,
     writer: &mut W,
@@ -904,24 +919,21 @@ where
 
 async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
     match req {
-        Request::Status => Response::ok(serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "device_id": state.mesh.identity().display_id(),
-            "joined_networks": state.mesh.joined_network_ids(),
-            // How many independent video/audio lanes each peer connection
-            // provisions. A client reads this to know how many simultaneous
-            // streams to one peer it can send at full quality (the rest fall
-            // back to MJPEG); absent means a pre-pool daemon — one lane.
-            // The RESOLVED count (honoring MYOWNMESH_MEDIA_LANES), not the
-            // compile-time ceiling: a device provisioning 1 lane must not
-            // promise 8 — sends on the phantom lanes fail per-frame.
-            "media_lanes": myownmesh_core::transport::resolved_media_lanes(),
-            // Whether this daemon speaks the binary media pipes (media_track_pipe
-            // / media_source_pipe). A capability flag, not a version gate: a
-            // client uses the binary path only when this is true, else the base64
-            // video_send/audio_send ops. Absent on daemons that predate it.
-            "media_pipes": true,
-        })),
+        Request::Status => {
+            let status = serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "device_id": state.mesh.identity().display_id(),
+                "joined_networks": state.mesh.joined_network_ids(),
+            });
+            #[cfg(feature = "legacy-media")]
+            let status = {
+                let mut status = status;
+                status["media_lanes"] = serde_json::json!(legacy_media_lanes());
+                status["media_pipes"] = serde_json::json!(true);
+                status
+            };
+            Response::ok(status)
+        }
         Request::IdentityShow => Response::ok(serde_json::json!({
             "device_id": state.mesh.identity().display_id(),
             "pubkey": state.mesh.identity().public_id(),
@@ -1060,6 +1072,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             network_connect_peer(state, &network, &peer, pin, wait_ms).await
         }
 
+        #[cfg(feature = "legacy-media")]
+        #[allow(
+            deprecated,
+            reason = "this match arm is the explicit deprecated legacy-media control adapter"
+        )]
         Request::MediaLaneOpen {
             network,
             peer,
@@ -1078,6 +1095,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        #[cfg(feature = "legacy-media")]
+        #[allow(
+            deprecated,
+            reason = "this match arm is the explicit deprecated legacy-media control adapter"
+        )]
         Request::MediaLaneClose {
             network,
             peer,
@@ -1593,6 +1615,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Response::ok(serde_json::json!({ "advertised": true }))
         }
 
+        #[cfg(feature = "legacy-media")]
+        #[allow(
+            deprecated,
+            reason = "this match arm is the explicit deprecated legacy-media control adapter"
+        )]
         Request::VideoSend {
             network,
             peer,
@@ -1622,6 +1649,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             }
         }
 
+        #[cfg(feature = "legacy-media")]
         Request::VideoSubscribe { client_id, network } => {
             if state.clients.client(client_id).is_none() {
                 return Response::err(format!("unknown client_id: {client_id}"));
@@ -1636,6 +1664,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Response::ok(serde_json::json!({ "subscribed": true }))
         }
 
+        #[cfg(feature = "legacy-media")]
         Request::VideoUnsubscribe { client_id, network } => {
             state.clients.unsubscribe_video(&network, client_id);
             // The pump exits on its next sample once it sees an empty
@@ -1643,6 +1672,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
 
+        #[cfg(feature = "legacy-media")]
+        #[allow(
+            deprecated,
+            reason = "this match arm is the explicit deprecated legacy-media control adapter"
+        )]
         Request::AudioSend {
             network,
             peer,
@@ -1672,6 +1706,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             }
         }
 
+        #[cfg(feature = "legacy-media")]
         Request::AudioSubscribe { client_id, network } => {
             if state.clients.client(client_id).is_none() {
                 return Response::err(format!("unknown client_id: {client_id}"));
@@ -1686,6 +1721,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Response::ok(serde_json::json!({ "subscribed": true }))
         }
 
+        #[cfg(feature = "legacy-media")]
         Request::AudioUnsubscribe { client_id, network } => {
             state.clients.unsubscribe_audio(&network, client_id);
             // Passive pump teardown, exactly like video.
@@ -1694,7 +1730,9 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
 
         // Handled in `handle_client` (they convert the whole connection); never
         // reach the per-request dispatcher.
+        #[cfg(feature = "legacy-media")]
         Request::MediaTrackPipe => Response::err("media_track_pipe must open its own connection"),
+        #[cfg(feature = "legacy-media")]
         Request::MediaSourcePipe { .. } => {
             Response::err("media_source_pipe must open its own connection")
         }
@@ -2199,6 +2237,7 @@ fn persist_network_update(net: &NetworkConfig) -> Result<()> {
 }
 
 /// Map the wire's lane-kind string onto the transport enum.
+#[cfg(feature = "legacy-media")]
 fn parse_lane_kind(kind: &str) -> Option<myownmesh_core::transport::webrtc::LaneKind> {
     use myownmesh_core::transport::webrtc::LaneKind;
     match kind {
@@ -2206,6 +2245,15 @@ fn parse_lane_kind(kind: &str) -> Option<myownmesh_core::transport::webrtc::Lane
         "audio" => Some(LaneKind::Audio),
         _ => None,
     }
+}
+
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "this query is confined to the explicit deprecated legacy-media daemon surface"
+)]
+fn legacy_media_lanes() -> usize {
+    myownmesh_core::transport::resolved_media_lanes()
 }
 
 fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<TopologyMode, String> {
@@ -2372,13 +2420,17 @@ static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(No
 // tested below.
 
 /// `kind` byte for an H.264 access unit.
+#[cfg(feature = "legacy-media")]
 pub const MEDIA_KIND_VIDEO: u8 = 0;
 /// `kind` byte for an Opus frame.
+#[cfg(feature = "legacy-media")]
 pub const MEDIA_KIND_AUDIO: u8 = 1;
 /// Defensive cap on one frame body — a corrupt length never allocates more.
+#[cfg(feature = "legacy-media")]
 pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// One decoded media-track frame.
+#[cfg(feature = "legacy-media")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaFrame {
     pub kind: u8,
@@ -2392,6 +2444,7 @@ pub struct MediaFrame {
 /// Parse a media frame body (the bytes after the `u32` length prefix). Returns
 /// `None` on any truncation or non-UTF-8 id — a malformed frame is dropped,
 /// never panics.
+#[cfg(feature = "legacy-media")]
 pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
     fn rd<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
         let end = p.checked_add(n)?;
@@ -2427,6 +2480,7 @@ pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
 /// `decode_inbound_frame`, kept byte-for-byte identical. Layout:
 /// `kind u8 · key u8 · stream u8 · rtp_timestamp u32 · from_len u16 · from ·
 /// data…`, integers little-endian.
+#[cfg(feature = "legacy-media")]
 pub fn encode_inbound_frame(
     kind: u8,
     key: bool,
@@ -2448,6 +2502,35 @@ pub fn encode_inbound_frame(
 }
 
 #[cfg(test)]
+mod legacy_media_control_boundary_tests {
+    use super::Request;
+
+    const LEGACY_VIDEO_SEND: &str = r#"{
+        "op":"video_send",
+        "network":"test-network",
+        "peer":"test-peer",
+        "stream":0,
+        "duration_us":1,
+        "data":"AA=="
+    }"#;
+
+    #[cfg(not(feature = "legacy-media"))]
+    #[test]
+    fn v4_arc03h_normal_daemon_rejects_legacy_media_control_operations() {
+        assert!(serde_json::from_str::<Request>(LEGACY_VIDEO_SEND).is_err());
+    }
+
+    #[cfg(feature = "legacy-media")]
+    #[test]
+    fn v4_arc03h_legacy_media_feature_exposes_the_compatibility_control_operation() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(LEGACY_VIDEO_SEND),
+            Ok(Request::VideoSend { .. })
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "legacy-media"))]
 mod media_frame_tests {
     use super::*;
 

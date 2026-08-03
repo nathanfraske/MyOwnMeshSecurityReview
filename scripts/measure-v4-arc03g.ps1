@@ -118,6 +118,17 @@ function Invoke-MeasuredTest {
         throw "The test executable path cannot contain a single quote."
     }
 
+    $listCommand = "cd $quotedRepo && '$testExecutable' '$TestName' --exact$ignoredArgument --list"
+    $listOutput = @(& wsl.exe -d Ubuntu-24.04 -- bash -lc $listCommand)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Measurement scenario '$Label' failed to enumerate its exact test."
+    }
+    $expectedListing = "${TestName}: test"
+    $listedTests = @($listOutput | Where-Object { $_ -eq $expectedListing })
+    if ($listedTests.Count -ne 1) {
+        throw "Measurement scenario '$Label' expected one exact test and found $($listedTests.Count)."
+    }
+
     for ($iteration = 0; $iteration -lt $Repeats; $iteration++) {
         $command = "cd $quotedRepo && env $($environmentPrefix -join ' ') MYOWNMESH_ARC03_OBSERVE_ITERATION=$iteration /usr/bin/time -v '$testExecutable' '$TestName' --exact$ignoredArgument --nocapture --test-threads=1"
         Write-Output "arc03g_measurement_begin scenario=$Label iteration=$iteration commit=$sourceCommit"
@@ -198,7 +209,7 @@ foreach ($item in $selected) {
         "data-only" {
             Invoke-MeasuredTest -Label $item -Environment @{
                 MYOWNMESH_ARC03_OBSERVE_RAW = 1
-            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03f_data_only_connector_allocates_no_realtime_tracks" -Ignored
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks" -Ignored
         }
         "h264" {
             Invoke-MeasuredTest -Label $item -Environment @{

@@ -12,10 +12,40 @@ use std::num::NonZeroUsize;
 use anyhow::{anyhow, Context, Result};
 
 pub async fn run() -> Result<()> {
+    run_with_compatibility(ServeCompatibility::V4).await
+}
+
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "this exact entry point is the explicit frozen LegacyV1 daemon option"
+)]
+pub async fn run_with_legacy_v1() -> Result<()> {
+    run_with_compatibility(ServeCompatibility::LegacyV1(
+        myownmesh_core::legacy_v1::LegacyV1Runtime::frozen(),
+    ))
+    .await
+}
+
+enum ServeCompatibility {
+    V4,
+    #[cfg(feature = "legacy-v1")]
+    LegacyV1(myownmesh_core::legacy_v1::LegacyV1Runtime),
+}
+
+async fn run_with_compatibility(compatibility: ServeCompatibility) -> Result<()> {
     let cfg = myownmesh_core::MeshConfig::load().context("load config")?;
     let daemon = if cfg.services.node.enabled {
         let policy = connector_policy_from_lookup(|name| std::env::var(name).ok())?;
-        myownmesh::embedded::start_connector_capable(cfg, policy).await?
+        match compatibility {
+            ServeCompatibility::V4 => {
+                myownmesh::embedded::start_connector_capable(cfg, policy).await?
+            }
+            #[cfg(feature = "legacy-v1")]
+            ServeCompatibility::LegacyV1(runtime) => {
+                start_legacy_v1_daemon(cfg, policy, runtime).await?
+            }
+        }
     } else {
         myownmesh::embedded::start_infrastructure_only(cfg).await?
     };
@@ -25,6 +55,20 @@ pub async fn run() -> Result<()> {
     tracing::info!("shutdown requested");
     daemon.shutdown().await;
     Ok(())
+}
+
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "this exact helper is the explicit frozen LegacyV1 daemon option"
+)]
+async fn start_legacy_v1_daemon(
+    cfg: myownmesh_core::MeshConfig,
+    policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
+) -> std::result::Result<myownmesh::embedded::EmbeddedDaemon, myownmesh::embedded::EmbeddedStartError>
+{
+    myownmesh::embedded::start_connector_capable_with_legacy_v1(cfg, policy, runtime).await
 }
 
 fn connector_policy_from_lookup(
@@ -47,8 +91,18 @@ fn connector_policy_from_lookup(
     let mesh_candidates = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES")?;
     let pending_candidate_items =
         nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS")?;
-    let pending_candidate_bytes =
-        nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_BYTES")?;
+    let pending_candidate_content_bytes = nonzero(
+        &mut lookup,
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
+    )?;
+    let pending_candidate_duplicates = nonzero(
+        &mut lookup,
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
+    )?;
+    let pending_candidate_application_work = nonzero(
+        &mut lookup,
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK",
+    )?;
     let control_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY")?;
     let endpoint_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY")?;
     let control_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT")?;
@@ -94,6 +148,14 @@ fn connector_policy_from_lookup(
                 &mut lookup,
                 "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
             )?;
+            let max_pre_auth_packets = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS",
+            )?;
+            let max_pre_auth_content_bytes = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_CONTENT_BYTES",
+            )?;
             let max_inbound_accounted_bytes = nonzero(
                 &mut lookup,
                 "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
@@ -101,10 +163,6 @@ fn connector_policy_from_lookup(
             let max_outbound_accounted_bytes = nonzero(
                 &mut lookup,
                 "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
-            )?;
-            let max_total_accounted_bytes = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES",
             )?;
             let flows = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
                 myownmesh_core::ConnectorRealtimeFlowCapacities::new(
@@ -116,11 +174,12 @@ fn connector_policy_from_lookup(
                     max_inbound_fragment_bytes,
                     max_inbound_fragments_per_unit,
                     max_in_progress_units_per_flow,
+                    max_pre_auth_packets,
+                    max_pre_auth_content_bytes,
                 ),
                 myownmesh_core::ConnectorRealtimeByteBudgets::new(
                     max_inbound_accounted_bytes,
                     max_outbound_accounted_bytes,
-                    max_total_accounted_bytes,
                 ),
                 myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
             );
@@ -148,17 +207,20 @@ fn connector_policy_from_lookup(
         service_weights,
         realtime,
     )?;
-    let process = myownmesh_core::ConnectorResourcePolicy::new(
-        process_candidates,
+    let process = myownmesh_core::ConnectorResourcePolicy::new(process_candidates)?;
+    let webrtc = myownmesh_core::WebRtcConnectorProfile::new(
         callbacks,
         myownmesh_core::PendingRemoteCandidatePolicy::new(
             pending_candidate_items,
-            pending_candidate_bytes,
+            pending_candidate_content_bytes,
+            pending_candidate_duplicates,
+            pending_candidate_application_work,
         ),
     );
     Ok(myownmesh_core::ConnectorCapableResourcePolicy::new(
         process,
         myownmesh_core::MeshConnectorResourcePolicy::new(mesh_candidates),
+        webrtc,
     ))
 }
 
@@ -196,11 +258,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const BASE_POLICY_KEYS: [&str; 9] = [
+    const BASE_POLICY_KEYS: [&str; 11] = [
         "MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES",
         "MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES",
         "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS",
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_BYTES",
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK",
         "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY",
         "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY",
         "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT",
@@ -208,7 +272,7 @@ mod tests {
         "MYOWNMESH_CONNECTOR_REALTIME_POLICY",
     ];
 
-    const ENABLED_REALTIME_KEYS: [&str; 11] = [
+    const ENABLED_REALTIME_KEYS: [&str; 12] = [
         "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT",
         "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS",
@@ -217,9 +281,10 @@ mod tests {
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
+        "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS",
+        "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_CONTENT_BYTES",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES",
     ];
 
     fn fixture_values(realtime: &str) -> HashMap<&'static str, String> {
@@ -238,10 +303,6 @@ mod tests {
                 "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
                 "2".to_string(),
             );
-            values.insert(
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES",
-                "3".to_string(),
-            );
         }
         values
     }
@@ -249,12 +310,12 @@ mod tests {
     #[test]
     fn connector_capable_serve_requires_every_owner_value() {
         let mut values = fixture_values("enabled");
-        values.remove("MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES");
+        values.remove("MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS");
         let error = connector_policy_from_lookup(|name| values.get(name).cloned())
             .expect_err("an omitted owner value is rejected");
         assert!(error
             .to_string()
-            .contains("MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES"));
+            .contains("MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS"));
     }
 
     #[test]
@@ -277,7 +338,7 @@ mod tests {
         assert_eq!(policy.process().max_active_candidates().get(), 1);
         assert_eq!(policy.mesh().max_active_candidates().get(), 1);
         assert!(matches!(
-            policy.process().callbacks().realtime(),
+            policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Enabled(_)
         ));
     }
@@ -288,7 +349,7 @@ mod tests {
         let policy = connector_policy_from_lookup(|name| values.get(name).cloned())
             .expect("an explicit data-only policy needs no real-time limits");
         assert!(matches!(
-            policy.process().callbacks().realtime(),
+            policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Disabled
         ));
     }

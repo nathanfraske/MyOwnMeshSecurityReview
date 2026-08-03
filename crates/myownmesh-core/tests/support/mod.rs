@@ -4,7 +4,7 @@ use myownmesh_core::transport::Transport;
 use myownmesh_core::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackServiceWeights,
     ConnectorCapableResourcePolicy, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
-    PendingRemoteCandidatePolicy, RealtimeConnectorPolicy,
+    PendingRemoteCandidatePolicy, RealtimeConnectorPolicy, WebRtcConnectorProfile,
 };
 
 /// Explicit integration-test resource owner.
@@ -42,17 +42,21 @@ pub fn test_transport() -> Transport {
         RealtimeConnectorPolicy::Disabled,
     )
     .expect("fixture data-only callback policy is valid");
-    let policy = ConnectorResourcePolicy::new(
-        process_connector_count,
+    let process_policy = ConnectorResourcePolicy::new(process_connector_count)
+        .expect("fixture cleanup queue capacity is supported");
+    let webrtc_profile = WebRtcConnectorProfile::new(
         callbacks,
         PendingRemoteCandidatePolicy::new(
             process_connector_count,
             NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+            process_connector_count,
+            process_connector_count,
         ),
     );
     let policy = ConnectorCapableResourcePolicy::new(
-        policy,
+        process_policy,
         MeshConnectorResourcePolicy::new(mesh_connector_count),
+        webrtc_profile,
     );
     Transport::new()
         .expect("transport")

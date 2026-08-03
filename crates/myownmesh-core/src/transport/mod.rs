@@ -14,11 +14,6 @@
 //!   bounded mpsc. One worker pump handles each peer in order, while
 //!   exact owner checks fence replacement races.
 
-#![allow(
-    deprecated,
-    reason = "this module re-exports the explicitly deprecated legacy media facade"
-)]
-
 pub mod diag;
 pub mod ice;
 pub mod webrtc;
@@ -28,9 +23,14 @@ pub use diag::{
     SelectedCandidatePair,
 };
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
+#[allow(
+    deprecated,
+    reason = "this one symbol is the explicit legacy media compatibility query"
+)]
+pub use webrtc::resolved_media_lanes;
 pub use webrtc::{
-    resolved_media_lanes, AudioSample, LocalIceCandidate, PeerSession, Role, Transport,
-    TransportEvent, VideoSample, MEDIA_LANES,
+    AudioSample, LocalIceCandidate, PeerSession, Role, Transport, TransportEvent, VideoSample,
+    MEDIA_LANES,
 };
 pub(crate) use webrtc::{
     DataChannelOpenOwnership, EndpointAuthHandoff, RemoteCandidateDisposition,

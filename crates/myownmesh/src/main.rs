@@ -28,7 +28,13 @@ enum Command {
     /// Run the mesh daemon in the foreground (headless). The desktop
     /// GUI auto-spawns this; run it yourself on servers and headless
     /// boxes. A bare `myownmesh` (no subcommand) opens the GUI instead.
-    Serve,
+    Serve {
+        /// Enable the frozen pre-V4 application routing and relay profile.
+        /// This option is temporary and available only in legacy-v1 builds.
+        #[cfg(feature = "legacy-v1")]
+        #[arg(long)]
+        legacy_v1: bool,
+    },
     /// Show this device's identity.
     Identity {
         #[command(subcommand)]
@@ -216,7 +222,23 @@ fn main() -> ExitCode {
 
     let result: Result<()> = runtime.block_on(async move {
         match cmd {
-            Command::Serve => cli::serve::run().await,
+            Command::Serve {
+                #[cfg(feature = "legacy-v1")]
+                legacy_v1,
+            } => {
+                #[cfg(feature = "legacy-v1")]
+                {
+                    if legacy_v1 {
+                        cli::serve::run_with_legacy_v1().await
+                    } else {
+                        cli::serve::run().await
+                    }
+                }
+                #[cfg(not(feature = "legacy-v1"))]
+                {
+                    cli::serve::run().await
+                }
+            }
             Command::Identity { action } => cli::identity::run(action).await,
             Command::Ctl { action } => cli::ctl::run(action).await,
             Command::Update { action } => cli::update::run(action).await,
@@ -233,5 +255,20 @@ fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(all(test, feature = "legacy-v1"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v4_arc03h_legacy_v1_daemon_option_is_explicit() {
+        let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-v1"])
+            .expect("legacy-v1 feature exposes the deprecated explicit daemon option");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { legacy_v1: true })
+        ));
     }
 }

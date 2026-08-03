@@ -9,7 +9,6 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::resource::{PreAuthResourceFamily, ResourceUse, PRE_AUTH_RESOURCE_FAMILY_COUNT};
@@ -203,26 +202,21 @@ pub(crate) fn two_connector_candidates_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::webrtc::{
+        LegacyWebRtcMediaProfile, PendingRemoteCandidatePolicy, WebRtcConnectorProfile,
+        WebRtcConnectorProfileError,
+    };
 
     fn explicit_test_policy(max_active_candidates: usize) -> ConnectorResourcePolicy {
-        let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("fixture data-only callback policy is valid");
         ConnectorResourcePolicy::new(
             NonZeroUsize::new(max_active_candidates).expect("fixture connector bound is nonzero"),
-            callbacks,
-            PendingRemoteCandidatePolicy::new(one, one),
         )
+        .expect("fixture connector policy is valid")
     }
 
-    fn explicit_realtime_test_policy(max_outbound_flows: usize) -> ConnectorResourcePolicy {
+    fn explicit_realtime_test_policy(max_outbound_flows: usize) -> WebRtcConnectorProfile {
         let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
         let two = NonZeroUsize::new(2).expect("fixture value is nonzero");
-        let three = NonZeroUsize::new(3).expect("fixture value is nonzero");
         let flows = ConnectorRealtimeFlowPolicy::new(
             ConnectorRealtimeFlowCapacities::new(
                 one,
@@ -230,8 +224,8 @@ mod tests {
                     .expect("fixture outbound flow ceiling is nonzero"),
                 one,
             ),
-            ConnectorRealtimeInboundLimits::new(one, one, one),
-            ConnectorRealtimeByteBudgets::new(two, one, three),
+            ConnectorRealtimeInboundLimits::new(one, one, one, one, one),
+            ConnectorRealtimeByteBudgets::new(two, one),
             RealtimeQueueOverflowRule::DropNewest,
         );
         let realtime = RealtimeConnectorPolicy::enabled(one, flows)
@@ -242,7 +236,10 @@ mod tests {
             realtime,
         )
         .expect("fixture callback policy is valid");
-        ConnectorResourcePolicy::new(one, callbacks, PendingRemoteCandidatePolicy::new(one, one))
+        WebRtcConnectorProfile::new(
+            callbacks,
+            PendingRemoteCandidatePolicy::new(one, one, one, one),
+        )
     }
 
     #[test]
@@ -253,13 +250,13 @@ mod tests {
     #[test]
     fn v4_arc03g_legacy_video_and_audio_require_two_preprovisioned_flows() {
         let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
-        let profile = LegacyWebRtcMediaProfile::h264_opus(one, 1, 1, Duration::ZERO)
+        let profile = LegacyWebRtcMediaProfile::h264_opus(one, 1, 1)
             .expect("one lane per compatibility kind is representable");
         assert_eq!(
             explicit_realtime_test_policy(1)
                 .with_legacy_webrtc_media(profile)
                 .expect_err("one outbound flow cannot pre-provision both compatibility kinds"),
-            ConnectorCallbackPolicyError::LegacyMediaExceedsOutboundFlowCeiling {
+            WebRtcConnectorProfileError::LegacyMediaExceedsOutboundFlowCeiling {
                 required_flows: 2,
                 available_flows: 1,
             }
@@ -707,8 +704,8 @@ mod tests {
         let seven = NonZeroUsize::new(7).expect("seven is nonzero");
         let flows = ConnectorRealtimeFlowPolicy::new(
             ConnectorRealtimeFlowCapacities::new(one, one, one),
-            ConnectorRealtimeInboundLimits::new(four, one, one),
-            ConnectorRealtimeByteBudgets::new(seven, four, NonZeroUsize::new(11).unwrap()),
+            ConnectorRealtimeInboundLimits::new(four, one, one, one, four),
+            ConnectorRealtimeByteBudgets::new(seven, four),
             RealtimeQueueOverflowRule::DropNewest,
         );
         assert!(matches!(
@@ -730,12 +727,8 @@ mod tests {
         let eight = NonZeroUsize::new(8).expect("eight is nonzero");
         let flows = ConnectorRealtimeFlowPolicy::new(
             ConnectorRealtimeFlowCapacities::new(one, one, one),
-            ConnectorRealtimeInboundLimits::new(five, one, one),
-            ConnectorRealtimeByteBudgets::new(
-                eight,
-                four,
-                NonZeroUsize::new(12).expect("twelve is nonzero"),
-            ),
+            ConnectorRealtimeInboundLimits::new(five, one, one, one, five),
+            ConnectorRealtimeByteBudgets::new(eight, four),
             RealtimeQueueOverflowRule::DropNewest,
         );
         assert!(matches!(

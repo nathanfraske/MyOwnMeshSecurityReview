@@ -19,3 +19,11 @@ pub mod embedded;
 pub mod ipc;
 pub mod registry;
 pub mod services;
+
+/// One process-global connector ceiling shared by daemon-library tests.
+///
+/// The value is the existing four-connector bridge fixture bound. Keeping it
+/// in one place prevents feature-gated tests from trying to replace the
+/// deliberately immutable process owner with smaller fixture policies.
+#[cfg(test)]
+pub(crate) const TEST_PROCESS_CONNECTOR_CAPACITY: usize = 4;

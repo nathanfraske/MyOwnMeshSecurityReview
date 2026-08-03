@@ -1,8 +1,3 @@
-#![allow(
-    deprecated,
-    reason = "this state retains the explicitly deprecated legacy media facade during migration"
-)]
-
 //! Shared per-network state. Exposes the operations subsystems
 //! (`Channel<T>`, `Rpc`, `MeshHandle`) call to interact with the
 //! engine; all per-peer state mutation is funneled through the
@@ -39,7 +34,6 @@ use super::scheduler::{
 /// One assembled video access unit from a peer's track lane, as the
 /// embedder-facing subscription surfaces it.
 #[derive(Debug, Clone)]
-#[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility value")]
 pub struct InboundVideoSample {
     /// The authenticated peer the unit arrived from.
     pub from: String,
@@ -49,7 +43,6 @@ pub struct InboundVideoSample {
 /// One audio frame from a peer's track lane, as the engine's
 /// subscribers receive it (tagged with the sending peer).
 #[derive(Debug, Clone)]
-#[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility value")]
 pub struct InboundAudioSample {
     /// Sending peer's device id.
     pub from: String,
@@ -1574,6 +1567,30 @@ impl NetworkState {
             .map_err(|_| Error::Network("engine command queue closed".into()))?;
         rx.await
             .map_err(|_| Error::Network("engine dropped the lane close".into()))?
+    }
+
+    #[cfg(feature = "legacy-media")]
+    #[allow(
+        deprecated,
+        reason = "this exact method is the temporary legacy media finalization boundary"
+    )]
+    pub(crate) async fn media_lanes_finalize(&self, peer: &str) -> Result<usize> {
+        let owner = self
+            .peers
+            .owner(peer)
+            .ok_or_else(|| Error::Network(format!("peer not found: {peer}")))?;
+        let flow = self
+            .peers
+            .get_if_current(&owner)
+            .and_then(|entry| entry.realtime_flow_ports())
+            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
+        let finalized = flow.0.finalize_suspended_lanes(&flow.1).await;
+        if finalized != 0 {
+            if let Some(entry) = self.peers.get_if_current(&owner) {
+                entry.state.write().media_reneg_pending = true;
+            }
+        }
+        Ok(finalized)
     }
 
     /// Whether `device_id` has a standing dial (config pin or runtime

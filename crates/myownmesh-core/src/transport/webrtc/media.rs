@@ -12,10 +12,6 @@ use super::*;
 /// the 90 kHz video clock, `key` marks an IDR, and `lane` identifies the
 /// adapter lane on which it arrived.
 #[derive(Debug, Clone)]
-#[deprecated(
-    since = "0.3.2",
-    note = "temporary legacy H.264 compatibility value; use a session-bound codec-neutral flow"
-)]
 pub struct VideoSample {
     pub rtp_timestamp: u32,
     pub key: bool,
@@ -28,10 +24,6 @@ pub struct VideoSample {
 /// contains one frame, so no assembly is required. `rtp_timestamp` ticks at
 /// the 48 kHz Opus clock and `lane` identifies the compatibility lane.
 #[derive(Debug, Clone)]
-#[deprecated(
-    since = "0.3.2",
-    note = "temporary legacy Opus compatibility value; use a session-bound codec-neutral flow"
-)]
 pub struct AudioSample {
     pub rtp_timestamp: u32,
     pub lane: u8,
@@ -41,31 +33,13 @@ pub struct AudioSample {
 
 /// Historical per-kind lane ceiling for the temporary H.264 and Opus adapter.
 /// The generic connector does not read this value or create media tracks.
-#[deprecated(
-    since = "0.3.2",
-    note = "temporary legacy H.264/Opus lane compatibility ceiling"
-)]
-pub const MEDIA_LANES: usize = 8;
+pub const MEDIA_LANES: usize = LEGACY_MEDIA_MAX_LANES_PER_KIND;
 
 /// Historical adapter behavior pre-provisions lane zero. This constant is
 /// available only to tests and the raw transport lab. A production owner must
 /// put the value in an explicit [`LegacyWebRtcMediaProfile`].
 #[cfg(any(test, feature = "transport-lab"))]
 pub(super) const PRE_PROVISIONED_LANES: usize = 1;
-
-/// Historical lane-drain input used only to construct the raw lab's explicit
-/// compatibility profile. It is not a queue lifetime, resource authority, or
-/// input to the generic real-time owner.
-#[cfg(any(test, feature = "transport-lab"))]
-pub(super) static LANE_DRAIN_GRACE: std::sync::LazyLock<Duration> =
-    std::sync::LazyLock::new(|| {
-        let secs = std::env::var("MYOWNMESH_LANE_DRAIN_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(90)
-            .clamp(1, 600);
-        Duration::from_secs(secs)
-    });
 
 /// Resolve the historical raw-lab lane ceiling. Generic connector construction
 /// does not call this function.
@@ -96,35 +70,63 @@ pub fn resolved_media_lanes() -> usize {
     deprecated,
     reason = "legacy track identifiers use the frozen lane ceiling"
 )]
-pub(super) fn lane_of_track_id(id: &str) -> u8 {
-    id.rsplit_once('-')
-        .and_then(|(_, n)| n.parse::<u8>().ok())
-        .filter(|n| (*n as usize) < MEDIA_LANES)
-        .unwrap_or(0)
+pub(super) fn lane_of_track_id(id: &str, kind: LaneKind, max_lanes: usize) -> Option<u8> {
+    let expected = match kind {
+        LaneKind::Video => "video",
+        LaneKind::Audio => "audio",
+    };
+    let (prefix, raw_lane) = id.split_once('-')?;
+    if prefix != expected || raw_lane.is_empty() || raw_lane.contains('-') {
+        return None;
+    }
+    raw_lane
+        .parse::<u8>()
+        .ok()
+        .filter(|lane| usize::from(*lane) < max_lanes && raw_lane == lane.to_string())
+}
+
+pub(super) fn legacy_track_identity(
+    kind: RTPCodecType,
+    mime: &str,
+    id: &str,
+    profile: LegacyWebRtcMediaProfile,
+) -> Option<(LaneKind, bool, u8)> {
+    let (lane_kind, expected_mime, is_video) = match kind {
+        RTPCodecType::Video => (LaneKind::Video, MIME_TYPE_H264, true),
+        RTPCodecType::Audio => (LaneKind::Audio, MIME_TYPE_OPUS, false),
+        _ => return None,
+    };
+    if !mime.eq_ignore_ascii_case(expected_mime) {
+        return None;
+    }
+    lane_of_track_id(id, lane_kind, profile.max_lanes_per_kind().get())
+        .map(|lane| (lane_kind, is_video, lane))
 }
 
 /// Which media pool a lane belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[deprecated(
-    since = "0.3.2",
-    note = "temporary legacy H.264/Opus lane compatibility type"
-)]
 pub enum LaneKind {
     Video,
     Audio,
 }
 
-/// One lifecycle-managed lane slot's state. (`None` in the pool =
-/// never opened / fully reaped.)
+/// One lifecycle-managed lane slot's state. `None` means never opened or
+/// explicitly finalized.
 #[derive(Clone)]
 pub(super) enum LaneSlot {
     /// Negotiated (or negotiating) and writable.
     Open(Arc<TrackLocalStaticSample>),
-    /// Closed by the app with its track retained until the explicit legacy
-    /// profile permits reaping. Reopening before then revives the same track.
-    Draining {
+    /// Suspended by an explicit event. Reopening resumes the same track. Only
+    /// a separate explicit finalize event removes it.
+    Suspended { track: Arc<TrackLocalStaticSample> },
+    #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
+    #[allow(
+        dead_code,
+        reason = "the failure state is exercised only by owners that finalize legacy media lanes"
+    )]
+    FailedRemove {
         track: Arc<TrackLocalStaticSample>,
-        since: Instant,
+        flow: RealtimeFlowPort,
     },
 }
 
@@ -167,6 +169,16 @@ pub(super) async fn attach_track(
     Ok(())
 }
 
+/// Exact ownership retained by one temporary compatibility track pump.
+pub(super) struct LegacyInboundTrackOwner {
+    pub(super) task_observation: Option<ObservationLease>,
+    pub(super) remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
+    pub(super) track_key: (bool, u8),
+    pub(super) flow: RealtimeFlowPort,
+    pub(super) transceiver: Arc<webrtc::rtp_transceiver::RTCRtpTransceiver>,
+    pub(super) lane: u8,
+}
+
 /// Drain one remote audio track: every RTP packet carries exactly one
 /// Opus frame (RFC 7587 — no fragmentation, no aggregation), so each
 /// non-empty payload surfaces directly as [`TransportEvent::AudioSample`].
@@ -174,12 +186,16 @@ pub(super) async fn attach_track(
 pub(super) async fn pump_audio_track(
     track: Arc<TrackRemote>,
     tx: ConnectorEventSink,
-    _task_observation: Option<ObservationLease>,
-    remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
-    track_key: (bool, u8),
-    flow: RealtimeFlowPort,
+    owner: LegacyInboundTrackOwner,
 ) {
-    let lane = lane_of_track_id(&track.id());
+    let LegacyInboundTrackOwner {
+        task_observation: _task_observation,
+        remote_tracks,
+        track_key,
+        flow,
+        transceiver,
+        lane,
+    } = owner;
     loop {
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
@@ -188,7 +204,16 @@ pub(super) async fn pump_audio_track(
         if pkt.payload.is_empty() {
             continue; // padding / probe
         }
-        if !tx.realtime_delivery.load(Ordering::Acquire) {
+        let promoted = tx.realtime_delivery.load(Ordering::Acquire);
+        if !flow
+            .lifetime
+            .registry
+            .admit_pre_auth_packet(pkt.payload.len(), promoted)
+        {
+            let _ = transceiver.stop().await;
+            break;
+        }
+        if !promoted {
             continue;
         }
         let Some(mut fragment) = flow.begin_unit() else {
@@ -220,19 +245,32 @@ pub(super) async fn pump_audio_track(
 pub(super) async fn pump_video_track(
     track: Arc<TrackRemote>,
     tx: ConnectorEventSink,
-    _task_observation: Option<ObservationLease>,
-    remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
-    track_key: (bool, u8),
-    flow: RealtimeFlowPort,
+    owner: LegacyInboundTrackOwner,
 ) {
-    let lane = lane_of_track_id(&track.id());
+    let LegacyInboundTrackOwner {
+        task_observation: _task_observation,
+        remote_tracks,
+        track_key,
+        flow,
+        transceiver,
+        lane,
+    } = owner;
     let mut assembler = H264AuAssembler::guarded(flow.clone());
     loop {
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
             Err(_) => break, // track ended with its connection
         };
-        if !tx.realtime_delivery.load(Ordering::Acquire) {
+        let promoted = tx.realtime_delivery.load(Ordering::Acquire);
+        if !flow
+            .lifetime
+            .registry
+            .admit_pre_auth_packet(pkt.payload.len(), promoted)
+        {
+            let _ = transceiver.stop().await;
+            break;
+        }
+        if !promoted {
             continue;
         }
         match assembler.push_guarded(&pkt) {
@@ -366,6 +404,18 @@ impl PeerSession {
         lane: u8,
     ) -> Result<(Arc<TrackLocalStaticSample>, RealtimeFlowPort)> {
         let _operation = self.lane_operations.lock().await;
+        #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
+        if self
+            .pool(kind)
+            .lock()
+            .expect("lane pool")
+            .get(usize::from(lane))
+            .is_some_and(|slot| matches!(slot, Some(LaneSlot::FailedRemove { .. })))
+        {
+            return Err(Error::Transport(format!(
+                "legacy media lane {lane} is non-reusable after native track removal failed"
+            )));
+        }
         let (flow, newly_owned) = self.acquire_outbound_realtime_flow(kind, lane)?;
         match self.ensure_lane_after_owner(kind, lane).await {
             Ok(track) => Ok((track, flow)),
@@ -389,7 +439,7 @@ impl PeerSession {
     /// lane that doesn't exist yet creates the track, attaches it, and
     /// flags a renegotiation — writes are no-ops until the new m-line
     /// negotiates, exactly the semantics callers already tolerate at
-    /// stream start. A *draining* lane revives in place: the track
+    /// stream start. A suspended lane revives in place: the track
     /// never left the SDP, so the write flows immediately and nothing
     /// is renegotiated — this is the settings stop→start fast path. A
     /// lane at or past the device ceiling errors.
@@ -410,10 +460,17 @@ impl PeerSession {
             let mut pool = self.pool(kind).lock().expect("lane pool");
             match &pool[lane as usize] {
                 Some(LaneSlot::Open(track)) => return Ok(track.clone()),
-                Some(LaneSlot::Draining { track, .. }) => {
+                Some(LaneSlot::Suspended { track }) => {
                     let track = track.clone();
                     pool[lane as usize] = Some(LaneSlot::Open(track.clone()));
                     return Ok(track);
+                }
+                #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
+                Some(LaneSlot::FailedRemove { track, flow }) => {
+                    let _ = (track, flow);
+                    return Err(Error::Transport(format!(
+                        "legacy media lane {lane} is non-reusable after native track removal failed"
+                    )));
                 }
                 None => {}
             }
@@ -439,10 +496,16 @@ impl PeerSession {
                     track
                 }
                 Some(LaneSlot::Open(winner)) => winner.clone(),
-                Some(LaneSlot::Draining { track: winner, .. }) => {
+                Some(LaneSlot::Suspended { track: winner }) => {
                     let winner = winner.clone();
                     pool[lane as usize] = Some(LaneSlot::Open(winner.clone()));
                     winner
+                }
+                #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
+                Some(LaneSlot::FailedRemove { .. }) => {
+                    return Err(Error::Transport(format!(
+                        "legacy media lane {lane} is non-reusable after native track removal failed"
+                    )))
                 }
             }
         };
@@ -460,7 +523,7 @@ impl PeerSession {
 
     /// Open a lane of `kind`, returning its id. The explicit twin of
     /// the write-time auto-open, for callers that want to reserve a
-    /// lane before producing media. Prefers reviving a draining lane
+    /// lane before producing media. Prefers resuming a suspended lane
     /// (its track is still negotiated — the open costs zero SDP work)
     /// over claiming a fresh slot (one in-place renegotiation); errors
     /// only when every slot is genuinely open.
@@ -469,7 +532,7 @@ impl PeerSession {
         let target = {
             let pool = self.pool(kind).lock().expect("lane pool");
             pool.iter()
-                .position(|slot| matches!(slot, Some(LaneSlot::Draining { .. })))
+                .position(|slot| matches!(slot, Some(LaneSlot::Suspended { .. })))
                 .or_else(|| pool.iter().position(|slot| slot.is_none()))
         };
         let Some(lane) = target else {
@@ -489,9 +552,9 @@ impl PeerSession {
         Ok(lane)
     }
 
-    /// Mark an open legacy lane as draining. The profile's compatibility grace
-    /// determines when the reaper may remove its track. Reopening first revives
-    /// that track. Closing a missing or already-draining lane is idempotent.
+    /// Suspend an open legacy lane without removing its native track. Reopening
+    /// revives that exact track. Finalization is a separate explicit event.
+    /// Closing a missing or already-suspended lane is idempotent.
     pub(super) async fn close_media_lane(&self, kind: LaneKind, lane: u8) -> Result<()> {
         let _operation = self.lane_operations.lock().await;
         if lane as usize >= self.max_lanes {
@@ -499,111 +562,114 @@ impl PeerSession {
         }
         let mut pool = self.pool(kind).lock().expect("lane pool");
         if let Some(LaneSlot::Open(track)) = &pool[lane as usize] {
-            pool[lane as usize] = Some(LaneSlot::Draining {
+            pool[lane as usize] = Some(LaneSlot::Suspended {
                 track: track.clone(),
-                since: Instant::now(),
             });
         }
         Ok(())
     }
 
-    /// Whether any drained lane has outlived `grace` and owes the
-    /// connection a teardown. Cheap sync scan — the engine's tick uses
-    /// it to decide whether this peer needs a renegotiation pass at
-    /// all.
-    pub(super) fn has_reapable_lanes(&self) -> bool {
-        let Some(profile) = self.legacy_media_profile else {
-            return false;
-        };
-        let grace = profile.lane_drain_grace();
-        [LaneKind::Video, LaneKind::Audio].iter().any(|kind| {
-            let pinned = match kind {
-                LaneKind::Video => profile.preprovisioned_video_lanes(),
-                LaneKind::Audio => profile.preprovisioned_audio_lanes(),
-            };
-            self.pool(*kind)
-                .lock()
-                .expect("lane pool")
-                .iter()
-                .enumerate()
-                .any(|(idx, slot)| {
-                    idx >= pinned
-                        && matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace)
-                })
-        })
-    }
-
-    /// Finalize every drain that outlived `grace`: free the slots and
-    /// remove their tracks from the connection, so the caller's next
-    /// offer drops the m-lines' send side. Returns how many lanes were
-    /// reaped. Slots free first, under the lock, then the webrtc-rs
-    /// `remove_track` calls run outside it — a concurrent revive can't
-    /// resurrect a slot the reaper already committed to tearing down.
-    pub(super) async fn reap_drained_lanes(&self) -> usize {
+    /// Finalize every explicitly suspended transient lane. The exact track and
+    /// flow owner move together into this operation. A failed native removal
+    /// installs a non-reusable failure state that retains both values.
+    #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
+    #[allow(
+        dead_code,
+        reason = "this explicit event is used only by the deprecated legacy-media deployment owner"
+    )]
+    pub(super) async fn finalize_suspended_lanes(&self) -> usize {
         let Some(profile) = self.legacy_media_profile else {
             return 0;
         };
-        let grace = profile.lane_drain_grace();
         let _operation = self.lane_operations.lock().await;
-        let mut victims: Vec<(LaneKind, u8, Arc<TrackLocalStaticSample>)> = Vec::new();
+        let mut candidates = Vec::new();
         for kind in [LaneKind::Video, LaneKind::Audio] {
             let pinned = match kind {
                 LaneKind::Video => profile.preprovisioned_video_lanes(),
                 LaneKind::Audio => profile.preprovisioned_audio_lanes(),
             };
-            let mut pool = self.pool(kind).lock().expect("lane pool");
-            for (idx, slot) in pool.iter_mut().enumerate() {
-                // The pre-provisioned lane is pinned: it drains silent but
+            let pool = self.pool(kind).lock().expect("lane pool");
+            for (idx, slot) in pool.iter().enumerate() {
+                // The pre-provisioned lane is pinned: it suspends silently but
                 // never loses its track, so a re-open always hits the
                 // zero-SDP free-revive path instead of a recycled-m-line
                 // renegotiation (which doesn't reliably re-`ontrack` on the
                 // viewer — the CEC console re-open hang). Only transient
-                // lanes (1+) are reaped once past the grace.
+                // lanes may be finalized only by an explicit owner event.
                 if idx < pinned {
                     continue;
                 }
-                let due = matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace);
-                if due {
-                    if let Some(LaneSlot::Draining { track, .. }) = slot.take() {
-                        victims.push((kind, idx as u8, track));
-                    }
+                if matches!(slot, Some(LaneSlot::Suspended { .. })) {
+                    candidates.push((kind, idx as u8));
                 }
             }
         }
-        if victims.is_empty() {
+        if candidates.is_empty() {
             return 0;
         }
-        // A victim absent from `get_senders` is already detached. A failed
-        // `remove_track` is the only case that must retain its flow claim.
-        let mut failed_reaps = Vec::new();
-        for sender in self.pc.get_senders().await {
-            let victim = sender.track().await.and_then(|sender_track| {
-                victims
-                    .iter()
-                    .find(|(_, _, track)| sender_track.id() == track.id())
-                    .map(|(kind, lane, _)| (*kind, *lane))
-            });
-            if let Some((kind, lane)) = victim {
-                if let Err(e) = self.pc.remove_track(&sender).await {
-                    warn!("reap: remove_track failed: {e}");
-                    failed_reaps.push((kind, lane));
-                }
+        let owned_candidates = {
+            let flows = self.outbound_realtime_flows.lock();
+            candidates
+                .into_iter()
+                .filter_map(|(kind, lane)| {
+                    flows
+                        .get(&(kind == LaneKind::Video, lane))
+                        .cloned()
+                        .map(|flow| (kind, lane, flow))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut victims = Vec::new();
+        for (kind, lane, flow) in owned_candidates {
+            let mut pool = self.pool(kind).lock().expect("lane pool");
+            if let Some(LaneSlot::Suspended { track }) = pool[usize::from(lane)].take() {
+                victims.push((kind, lane, track, flow));
             }
         }
-        let fully_reaped = victims
-            .iter()
-            .map(|(kind, lane, _)| (*kind, *lane))
-            .filter(|victim| !failed_reaps.contains(victim))
-            .collect::<Vec<_>>();
-        let mut flows = self.outbound_realtime_flows.lock();
-        for (kind, lane) in &fully_reaped {
-            flows.remove(&(*kind == LaneKind::Video, *lane));
+        let senders = self.pc.get_senders().await;
+        let mut finalized = 0usize;
+        for (kind, lane, track, flow) in victims {
+            let mut matching_sender = None;
+            for sender in &senders {
+                if sender
+                    .track()
+                    .await
+                    .is_some_and(|sender_track| sender_track.id() == track.id())
+                {
+                    matching_sender = Some(sender);
+                    break;
+                }
+            }
+            #[cfg(test)]
+            let injected_failure = self.fail_next_track_remove.swap(false, Ordering::AcqRel);
+            #[cfg(not(test))]
+            let injected_failure = false;
+            let failed = if injected_failure {
+                true
+            } else if let Some(sender) = matching_sender {
+                if let Err(error) = self.pc.remove_track(sender).await {
+                    warn!("finalize: remove_track failed: {error}");
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let key = (kind == LaneKind::Video, lane);
+            self.outbound_realtime_flows.lock().remove(&key);
+            if failed {
+                self.pool(kind).lock().expect("lane pool")[usize::from(lane)] =
+                    Some(LaneSlot::FailedRemove { track, flow });
+            } else {
+                finalized = finalized.saturating_add(1);
+            }
         }
-        fully_reaped.len()
+        finalized
     }
 
-    /// How many lanes of `kind` are currently occupied. Draining lanes count
-    /// because they retain their negotiated track until reaped.
+    /// How many lanes of `kind` are currently occupied. Suspended and failed
+    /// lanes count because they retain their native track.
     #[cfg(test)]
     pub(super) fn open_lane_count(&self, kind: LaneKind) -> usize {
         self.pool(kind)

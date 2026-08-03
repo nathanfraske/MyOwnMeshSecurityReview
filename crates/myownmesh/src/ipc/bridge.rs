@@ -24,11 +24,6 @@
 //!   reference so a swept-away registry doesn't keep tasks
 //!   alive.
 
-#![allow(
-    deprecated,
-    reason = "the IPC bridge retains the frozen legacy media facade for downstream migration"
-)]
-
 use myownmesh_core::JoinedNetwork;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -220,6 +215,11 @@ pub fn spawn_channel_pump(
 /// pump (or a slow client socket) lags, old samples are dropped
 /// at the broadcast and the stream resumes from the freshest one
 /// — video is freshness, never a backlog.
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "this pump is confined to the explicit deprecated legacy-media daemon surface"
+)]
 pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
     let mut sub = network.state().subscribe_video();
     tokio::spawn(async move {
@@ -274,6 +274,11 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
 /// teardown (exits once the subscriber list empties) and the same
 /// lag policy (a slow client sheds the oldest frames; live audio
 /// is freshness, never a backlog).
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "this pump is confined to the explicit deprecated legacy-media daemon surface"
+)]
 pub fn spawn_audio_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
     let mut sub = network.state().subscribe_audio();
     tokio::spawn(async move {
@@ -383,7 +388,7 @@ mod tests {
     use myownmesh_core::{
         ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
         ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
-        MeshConnectorResourcePolicy, PendingRemoteCandidatePolicy,
+        MeshConnectorResourcePolicy, PendingRemoteCandidatePolicy, WebRtcConnectorProfile,
     };
     use myownmesh_signaling::local::LocalBroker;
     use std::num::NonZeroUsize;
@@ -445,8 +450,8 @@ mod tests {
     }
 
     fn test_transport() -> Transport {
-        let connector_count =
-            NonZeroUsize::new(4).expect("test connector count is explicitly nonzero");
+        let connector_count = NonZeroUsize::new(crate::TEST_PROCESS_CONNECTOR_CAPACITY)
+            .expect("shared test process connector count is explicitly nonzero");
         let callback_capacity =
             NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
@@ -455,17 +460,21 @@ mod tests {
             myownmesh_core::RealtimeConnectorPolicy::Disabled,
         )
         .expect("test data-only callback policy is valid");
-        let process_policy = ConnectorResourcePolicy::new(
-            connector_count,
+        let process_policy = ConnectorResourcePolicy::new(connector_count)
+            .expect("test cleanup queue capacity is supported");
+        let webrtc_profile = WebRtcConnectorProfile::new(
             callbacks,
             PendingRemoteCandidatePolicy::new(
                 connector_count,
                 NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+                connector_count,
+                connector_count,
             ),
         );
         let policy = ConnectorCapableResourcePolicy::new(
             process_policy,
             MeshConnectorResourcePolicy::new(connector_count),
+            webrtc_profile,
         );
         Transport::new()
             .expect("transport")

@@ -1,6 +1,7 @@
 //! Process and per-Mesh connector resource ownership.
 
 use super::*;
+use futures_util::FutureExt;
 
 /// Point-in-time report for one exact live Mesh connector scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,9 +388,7 @@ impl ConnectorResourceOwnerInner {
             active_candidates,
             failed_cleanup_candidates,
             accounting_poisoned,
-            callbacks: self.policy.callbacks(),
-            pending_remote_candidates: self.policy.pending_remote_candidates(),
-            legacy_media: self.policy.legacy_media(),
+            cleanup: self.cleanup_executor.report(),
         }
     }
 
@@ -498,27 +497,24 @@ impl MeshConnectorResourceScope {
         self.token.owner.report()
     }
 
-    pub(crate) fn callbacks(&self) -> ConnectorCallbackPolicy {
-        self.token.owner.policy.callbacks()
-    }
-
-    pub(crate) fn pending_remote_candidates(&self) -> PendingRemoteCandidatePolicy {
-        self.token.owner.policy.pending_remote_candidates()
-    }
-
-    pub(crate) fn legacy_media(&self) -> Option<LegacyWebRtcMediaProfile> {
-        self.token.owner.policy.legacy_media()
-    }
-
     pub(crate) fn submit_cleanup(
         &self,
         cleanup: ConnectorCleanupFuture,
-    ) -> std::result::Result<(), ConnectorCleanupFuture> {
-        self.token.owner.cleanup_executor.submit(cleanup)
+        on_failure: ConnectorCleanupFailure,
+    ) -> std::result::Result<(), ConnectorCleanupJob> {
+        self.token
+            .owner
+            .cleanup_executor
+            .submit(ConnectorCleanupJob::new(cleanup, on_failure))
     }
 
     pub(crate) fn poison_accounting(&self) {
         self.token.owner.poison_mesh_accounting(self.token.id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_cleanup_executor_for_test(&self) {
+        self.token.owner.cleanup_executor.fail_for_test();
     }
 
     pub(super) fn reserve(
@@ -542,9 +538,52 @@ impl MeshConnectorResourceScope {
 }
 
 pub(crate) type ConnectorCleanupFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub(crate) type ConnectorCleanupFailure = Box<dyn FnOnce(String) + Send + 'static>;
+
+pub(crate) struct ConnectorCleanupJob {
+    future: Option<ConnectorCleanupFuture>,
+    on_failure: Option<ConnectorCleanupFailure>,
+}
+
+impl ConnectorCleanupJob {
+    fn new(future: ConnectorCleanupFuture, on_failure: ConnectorCleanupFailure) -> Self {
+        Self {
+            future: Some(future),
+            on_failure: Some(on_failure),
+        }
+    }
+
+    fn fail(&mut self, reason: String) {
+        self.future = None;
+        if let Some(on_failure) = self.on_failure.take() {
+            on_failure(reason);
+        }
+    }
+
+    fn complete(&mut self) {
+        self.future = None;
+        self.on_failure = None;
+    }
+}
+
+impl Drop for ConnectorCleanupJob {
+    fn drop(&mut self) {
+        if self.on_failure.is_some() {
+            self.fail("cleanup job terminated before completion".to_string());
+        }
+    }
+}
+
+struct ConnectorCleanupHealthState {
+    queued_jobs: AtomicUsize,
+    active_jobs: AtomicUsize,
+    completed_jobs: std::sync::atomic::AtomicU64,
+    failed_jobs: std::sync::atomic::AtomicU64,
+    executor_failed: AtomicBool,
+}
 
 struct ConnectorCleanupExecutorState {
-    sender: Option<tokio::sync::mpsc::Sender<ConnectorCleanupFuture>>,
+    sender: Option<tokio::sync::mpsc::Sender<ConnectorCleanupJob>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -555,6 +594,7 @@ struct ConnectorCleanupExecutorState {
 struct ConnectorCleanupExecutor {
     capacity: NonZeroUsize,
     state: Mutex<ConnectorCleanupExecutorState>,
+    health: Arc<ConnectorCleanupHealthState>,
 }
 
 impl ConnectorCleanupExecutor {
@@ -565,16 +605,32 @@ impl ConnectorCleanupExecutor {
                 sender: None,
                 thread: None,
             }),
+            health: Arc::new(ConnectorCleanupHealthState {
+                queued_jobs: AtomicUsize::new(0),
+                active_jobs: AtomicUsize::new(0),
+                completed_jobs: std::sync::atomic::AtomicU64::new(0),
+                failed_jobs: std::sync::atomic::AtomicU64::new(0),
+                executor_failed: AtomicBool::new(false),
+            }),
         }
     }
 
     fn submit(
         &self,
-        cleanup: ConnectorCleanupFuture,
-    ) -> std::result::Result<(), ConnectorCleanupFuture> {
+        mut cleanup: ConnectorCleanupJob,
+    ) -> std::result::Result<(), ConnectorCleanupJob> {
+        if self.health.executor_failed.load(Ordering::Acquire) {
+            self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+            cleanup.fail("cleanup executor is unavailable".to_string());
+            return Err(cleanup);
+        }
         let mut state = match self.state.lock() {
             Ok(state) => state,
-            Err(_) => return Err(cleanup),
+            Err(_) => {
+                self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                cleanup.fail("cleanup executor state is poisoned".to_string());
+                return Err(cleanup);
+            }
         };
         if state.sender.is_none() {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -582,31 +638,100 @@ impl ConnectorCleanupExecutor {
                 .build()
             {
                 Ok(runtime) => runtime,
-                Err(_) => return Err(cleanup),
+                Err(_) => {
+                    self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                    cleanup.fail("cleanup runtime construction failed".to_string());
+                    return Err(cleanup);
+                }
             };
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(self.capacity.get());
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::channel::<ConnectorCleanupJob>(self.capacity.get());
+            let health = Arc::clone(&self.health);
             let thread = match std::thread::Builder::new()
                 .name("myownmesh-connector-cleanup".to_string())
                 .spawn(move || {
-                    runtime.block_on(async move {
-                        while let Some(cleanup) = receiver.recv().await {
-                            tokio::spawn(cleanup);
-                        }
-                    });
+                    let loop_health = Arc::clone(&health);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(async move {
+                            while let Some(mut cleanup) = receiver.recv().await {
+                                loop_health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
+                                let job_health = Arc::clone(&loop_health);
+                                tokio::spawn(async move {
+                                    job_health.active_jobs.fetch_add(1, Ordering::AcqRel);
+                                    let future = cleanup
+                                        .future
+                                        .take()
+                                        .expect("queued cleanup job owns one future");
+                                    let outcome =
+                                        std::panic::AssertUnwindSafe(future).catch_unwind().await;
+                                    match outcome {
+                                        Ok(()) => {
+                                            cleanup.complete();
+                                            job_health
+                                                .completed_jobs
+                                                .fetch_add(1, Ordering::AcqRel);
+                                        }
+                                        Err(_) => {
+                                            cleanup.fail("cleanup future panicked".to_string());
+                                            job_health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                                        }
+                                    }
+                                    job_health.active_jobs.fetch_sub(1, Ordering::AcqRel);
+                                });
+                            }
+                        });
+                    }));
+                    health.executor_failed.store(true, Ordering::Release);
                 }) {
                 Ok(thread) => thread,
-                Err(_) => return Err(cleanup),
+                Err(_) => {
+                    self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                    cleanup.fail("cleanup executor thread construction failed".to_string());
+                    return Err(cleanup);
+                }
             };
             state.sender = Some(sender);
             state.thread = Some(thread);
         }
         let Some(sender) = state.sender.as_ref() else {
+            self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+            cleanup.fail("cleanup executor has no submission port".to_string());
             return Err(cleanup);
         };
+        self.health.queued_jobs.fetch_add(1, Ordering::AcqRel);
         match sender.try_send(cleanup) {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(cleanup))
-            | Err(tokio::sync::mpsc::error::TrySendError::Closed(cleanup)) => Err(cleanup),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(mut cleanup)) => {
+                self.health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
+                self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                cleanup.fail("cleanup executor queue is full".to_string());
+                Err(cleanup)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(mut cleanup)) => {
+                self.health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
+                self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                cleanup.fail("cleanup executor queue is closed".to_string());
+                Err(cleanup)
+            }
+        }
+    }
+
+    fn report(&self) -> ConnectorCleanupHealth {
+        ConnectorCleanupHealth {
+            queue_capacity: self.capacity.get(),
+            queued_jobs: self.health.queued_jobs.load(Ordering::Acquire),
+            active_jobs: self.health.active_jobs.load(Ordering::Acquire),
+            completed_jobs: self.health.completed_jobs.load(Ordering::Acquire),
+            failed_jobs: self.health.failed_jobs.load(Ordering::Acquire),
+            executor_failed: self.health.executor_failed.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_for_test(&self) {
+        self.health.executor_failed.store(true, Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            state.sender.take();
         }
     }
 }
@@ -627,11 +752,9 @@ impl From<PreAuthResourceClaim> for ConnectorResourceOwnerPort {
             RealtimeConnectorPolicy::Disabled,
         )
         .expect("test data-only callback policy is valid");
-        let policy = ConnectorResourcePolicy::new(
-            candidates,
-            callbacks,
-            PendingRemoteCandidatePolicy::new(candidates, candidates),
-        );
+        let _ = callbacks;
+        let policy = ConnectorResourcePolicy::new(candidates)
+            .expect("test connector resource policy is valid");
         Self::new(policy)
     }
 }

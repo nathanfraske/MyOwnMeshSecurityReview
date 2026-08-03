@@ -1,8 +1,3 @@
-#![allow(
-    deprecated,
-    reason = "the scheduler still classifies frozen legacy media events during migration"
-)]
-
 //! Callback classification, lifecycle fencing, and bounded scheduling.
 
 use super::*;
@@ -107,10 +102,6 @@ impl ConnectorOperationFence {
 
     pub(super) fn is_closed(&self) -> bool {
         self.state.lock().closing
-    }
-
-    pub(super) fn subscribe_close(&self) -> watch::Receiver<bool> {
-        self.closed_signal.subscribe()
     }
 
     pub(super) async fn wait_for_operations(&self) {
