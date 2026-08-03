@@ -65,6 +65,30 @@ $quotedRepo = "'$repoWsl'"
 $targetDir = "/tmp/mom-arc03g-measure"
 $sourceCommit = (git -C $repoPath rev-parse HEAD).Trim()
 
+function Invoke-WslBash {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Command
+    )
+
+    # Windows PowerShell 5 maps a native program's stderr to its error stream.
+    # Cargo and /usr/bin/time both use stderr for ordinary status output, so
+    # ErrorActionPreference=Stop would otherwise abort a successful run before
+    # LASTEXITCODE can be checked.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& wsl.exe -d Ubuntu-24.04 -- bash -lc $Command 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
 function Invoke-MeasuredTest {
     param(
         [Parameter(Mandatory)]
@@ -88,10 +112,12 @@ function Invoke-MeasuredTest {
         "CARGO_PROFILE_TEST_DEBUG=0"
     )
     $buildCommand = "cd $quotedRepo && env $($environmentPrefix -join ' ') /root/.cargo/bin/cargo test $CargoTargetArguments --no-run --message-format=json"
-    $buildOutput = & wsl.exe -d Ubuntu-24.04 -- bash -lc $buildCommand
-    if ($LASTEXITCODE -ne 0) {
-        throw "Measurement scenario '$Label' failed to build with exit code $LASTEXITCODE."
+    $buildResult = Invoke-WslBash -Command $buildCommand
+    if ($buildResult.ExitCode -ne 0) {
+        $buildResult.Output | Write-Output
+        throw "Measurement scenario '$Label' failed to build with exit code $($buildResult.ExitCode)."
     }
+    $buildOutput = $buildResult.Output
 
     $executables = @(
         foreach ($line in $buildOutput) {
@@ -119,10 +145,12 @@ function Invoke-MeasuredTest {
     }
 
     $listCommand = "cd $quotedRepo && '$testExecutable' '$TestName' --exact$ignoredArgument --list"
-    $listOutput = @(& wsl.exe -d Ubuntu-24.04 -- bash -lc $listCommand)
-    if ($LASTEXITCODE -ne 0) {
+    $listResult = Invoke-WslBash -Command $listCommand
+    if ($listResult.ExitCode -ne 0) {
+        $listResult.Output | Write-Output
         throw "Measurement scenario '$Label' failed to enumerate its exact test."
     }
+    $listOutput = $listResult.Output
     $expectedListing = "${TestName}: test"
     $listedTests = @($listOutput | Where-Object { $_ -eq $expectedListing })
     if ($listedTests.Count -ne 1) {
@@ -132,9 +160,10 @@ function Invoke-MeasuredTest {
     for ($iteration = 0; $iteration -lt $Repeats; $iteration++) {
         $command = "cd $quotedRepo && env $($environmentPrefix -join ' ') MYOWNMESH_ARC03_OBSERVE_ITERATION=$iteration /usr/bin/time -v '$testExecutable' '$TestName' --exact$ignoredArgument --nocapture --test-threads=1"
         Write-Output "arc03g_measurement_begin scenario=$Label iteration=$iteration commit=$sourceCommit"
-        & wsl.exe -d Ubuntu-24.04 -- bash -lc $command
-        if ($LASTEXITCODE -ne 0) {
-            throw "Measurement scenario '$Label' iteration $iteration failed with exit code $LASTEXITCODE."
+        $runResult = Invoke-WslBash -Command $command
+        $runResult.Output | Write-Output
+        if ($runResult.ExitCode -ne 0) {
+            throw "Measurement scenario '$Label' iteration $iteration failed with exit code $($runResult.ExitCode)."
         }
         Write-Output "arc03g_measurement_end scenario=$Label iteration=$iteration"
     }
