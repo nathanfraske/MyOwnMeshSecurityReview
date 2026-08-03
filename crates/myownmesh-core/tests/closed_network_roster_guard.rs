@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::state::NetworkState;
+use myownmesh_core::engine::NetworkState;
 use myownmesh_core::engine::{governance, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::protocol::governance::{RosterEntriesMessage, RosterEntry};

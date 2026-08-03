@@ -85,7 +85,7 @@ async fn multicast_available() -> bool {
 
 async fn wait_for_approval(
     side: &str,
-    state: &Arc<myownmesh_core::engine::state::NetworkState>,
+    state: &Arc<myownmesh_core::engine::NetworkState>,
     rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
     trace_rx: &mut tokio::sync::broadcast::Receiver<ConnTrace>,
     peer_id: &str,

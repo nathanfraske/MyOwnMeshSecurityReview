@@ -216,15 +216,13 @@ impl ConnectorCloseOwner {
             return;
         }
         let owner = Arc::clone(self);
-        let failure_owner = Arc::downgrade(self);
+        let failure_owner = Arc::clone(self);
         if self
             .resource_owner
             .submit_cleanup(
                 Box::pin(async move { owner.run().await }),
                 Box::new(move |reason| {
-                    if let Some(owner) = failure_owner.upgrade() {
-                        owner.fail_cleanup(reason);
-                    }
+                    failure_owner.fail_cleanup(reason);
                 }),
             )
             .is_err()

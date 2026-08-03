@@ -34,6 +34,10 @@ use super::scheduler::{
 /// One assembled video access unit from a peer's track lane, as the
 /// embedder-facing subscription surfaces it.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(feature = "legacy-media"),
+    allow(dead_code, reason = "frozen legacy-media compatibility value")
+)]
 pub struct InboundVideoSample {
     /// The authenticated peer the unit arrived from.
     pub from: String,
@@ -43,6 +47,10 @@ pub struct InboundVideoSample {
 /// One audio frame from a peer's track lane, as the engine's
 /// subscribers receive it (tagged with the sending peer).
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(feature = "legacy-media"),
+    allow(dead_code, reason = "frozen legacy-media compatibility value")
+)]
 pub struct InboundAudioSample {
     /// Sending peer's device id.
     pub from: String,
@@ -147,6 +155,7 @@ pub enum NetworkCmd {
     /// Open the lowest free media lane of `kind` toward `peer`,
     /// resolving with the lane id. The explicit twin of the
     /// write-time auto-open.
+    #[cfg(feature = "legacy-media")]
     MediaLaneOpen {
         peer: String,
         kind: crate::transport::webrtc::LaneKind,
@@ -154,6 +163,7 @@ pub enum NetworkCmd {
     },
     /// Close an open media lane (idempotent) — the track is removed
     /// and the next renegotiation drops its m-line send side.
+    #[cfg(feature = "legacy-media")]
     MediaLaneClose {
         peer: String,
         kind: crate::transport::webrtc::LaneKind,
@@ -561,12 +571,12 @@ pub struct NetworkState {
     /// track lanes. One broadcast per network (subscribers filter by
     /// `from`); kept shallow — video is a freshness stream, a lagging
     /// subscriber loses old frames, never delays new ones.
-    pub video_subscribers: broadcast::Sender<InboundVideoSample>,
+    pub(crate) video_subscribers: broadcast::Sender<InboundVideoSample>,
     /// Fan-out for audio frames arriving on peers' audio lanes —
     /// deeper than video's (audio frames are tiny and a dropped one
     /// is an audible tick), still bounded so a lagging subscriber
     /// sheds the oldest instead of growing a backlog.
-    pub audio_subscribers: broadcast::Sender<InboundAudioSample>,
+    pub(crate) audio_subscribers: broadcast::Sender<InboundAudioSample>,
     pub rpc: RwLock<Option<Arc<RpcInner>>>,
 
     pub signaling_tx: mpsc::UnboundedSender<SignalingOutbound>,
@@ -1139,6 +1149,7 @@ impl NetworkState {
     /// this network (filter by [`InboundVideoSample::from`]). Lagging
     /// loses old frames, never delays new ones — video is freshness.
     #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility facade")]
+    #[cfg(feature = "legacy-media")]
     pub fn subscribe_video(&self) -> broadcast::Receiver<InboundVideoSample> {
         self.video_subscribers.subscribe()
     }
@@ -1158,6 +1169,7 @@ impl NetworkState {
     /// writes on a lane the peer never consumes are simply discarded
     /// by the far side.
     #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility facade")]
+    #[cfg(feature = "legacy-media")]
     pub async fn send_video_sample(
         &self,
         peer: &str,
@@ -1180,6 +1192,7 @@ impl NetworkState {
     /// (filter by [`InboundAudioSample::from`]). Lagging loses old
     /// frames, never delays new ones — live audio is freshness too.
     #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility facade")]
+    #[cfg(feature = "legacy-media")]
     pub fn subscribe_audio(&self) -> broadcast::Receiver<InboundAudioSample> {
         self.audio_subscribers.subscribe()
     }
@@ -1197,6 +1210,7 @@ impl NetworkState {
     /// `duration` is the frame length (20 ms canonically) — it paces
     /// the RTP clock. Same contract as [`Self::send_video_sample`].
     #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility facade")]
+    #[cfg(feature = "legacy-media")]
     pub async fn send_audio_sample(
         &self,
         peer: &str,
@@ -1532,6 +1546,7 @@ impl NetworkState {
     }
 
     /// Open the lowest free media lane of `kind` toward `peer`.
+    #[cfg(feature = "legacy-media")]
     pub(crate) async fn media_lane_open(
         &self,
         peer: &str,
@@ -1550,6 +1565,7 @@ impl NetworkState {
     }
 
     /// Close a media lane toward `peer` (idempotent).
+    #[cfg(feature = "legacy-media")]
     pub(crate) async fn media_lane_close(
         &self,
         peer: &str,

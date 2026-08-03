@@ -1,6 +1,8 @@
 # V4 Arc 01 state and effect inventory
 
-Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with current coverage through the Arc 03 WebRTC Connector Worker implementation.
+Status: historical Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`. It is not a current Arc 03I source inventory.
+
+The Arc 03I source check intentionally fails against this record. The record contains 106 production Rust units and 1,792 declaration members, while the Arc 03I working tree contains 117 units and 2,099 members. It also names removed module paths and earlier Arc 03 markers. Do not use this file or its JSON as evidence of current source coverage. Refreshing hundreds of ownership assignments requires a separate reviewed inventory arc and is not folded into the bounded Arc 03I connector correction.
 
 This inventory refresh changes no product behavior and deletes no code. It records the ownership seams that later implementation arcs must reduce. The checker opens no listener, peer connection, firewall rule, or live MyOwnMesh instance.
 
@@ -15,9 +17,9 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The baseline commit remains fixed. The current fingerprints cover that baseline, the linked Arc 02 capability and resource-observation modules, and the Arc 03 WebRTC connector-owner implementation:
+The baseline commit remains fixed. These recorded fingerprints describe an earlier transition snapshot and do not cover the Arc 03I implementation:
 
-| Input class | Recorded count | Snapshot SHA-256 |
+| Historical input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
 | Production Rust source units | 106 | `b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba` |
 | Production Rust declaration members | 1,792 | `f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a` |

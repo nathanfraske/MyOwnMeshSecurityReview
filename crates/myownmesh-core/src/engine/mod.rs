@@ -31,7 +31,7 @@ pub mod reconcile;
 pub mod reliable;
 pub mod scheduler;
 pub mod signaling_bridge;
-pub mod state;
+pub(crate) mod state;
 pub mod tick;
 pub mod traffic;
 pub mod wake;
@@ -87,10 +87,13 @@ use crate::transport::{
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
-pub use state::{
-    InboundAudioSample, InboundVideoSample, NetworkCmd, NetworkState, SignalingInbound,
-    SignalingOutbound,
-};
+#[cfg(feature = "legacy-media")]
+#[deprecated(
+    since = "0.3.2",
+    note = "temporary legacy H.264 and Opus compatibility surface"
+)]
+pub use state::{InboundAudioSample, InboundVideoSample};
+pub use state::{NetworkCmd, NetworkState, SignalingInbound, SignalingOutbound};
 
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
@@ -309,6 +312,7 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             sticky,
             reply,
         } => connect_peer(state, &device_id, sticky, reply).await,
+        #[cfg(feature = "legacy-media")]
         NetworkCmd::MediaLaneOpen { peer, kind, reply } => {
             let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
             let result = match flow {
@@ -319,6 +323,7 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "legacy-media")]
         NetworkCmd::MediaLaneClose {
             peer,
             kind,

@@ -3,8 +3,8 @@ use std::num::NonZeroUsize;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackServiceWeights,
-    ConnectorCapableResourcePolicy, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
-    PendingRemoteCandidatePolicy, RealtimeConnectorPolicy, WebRtcConnectorProfile,
+    ConnectorResourcePolicy, MeshConnectorResourcePolicy, PendingRemoteCandidatePolicy,
+    RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 
 /// Explicit integration-test resource owner.
@@ -53,7 +53,7 @@ pub fn test_transport() -> Transport {
             process_connector_count,
         ),
     );
-    let policy = ConnectorCapableResourcePolicy::new(
+    let policy = WebRtcConnectorCapablePolicy::new(
         process_policy,
         MeshConnectorResourcePolicy::new(mesh_connector_count),
         webrtc_profile,

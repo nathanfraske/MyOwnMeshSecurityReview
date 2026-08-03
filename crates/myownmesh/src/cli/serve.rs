@@ -64,7 +64,7 @@ async fn run_with_compatibility(compatibility: ServeCompatibility) -> Result<()>
 )]
 async fn start_legacy_v1_daemon(
     cfg: myownmesh_core::MeshConfig,
-    policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    policy: myownmesh_core::WebRtcConnectorCapablePolicy,
     runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
 ) -> std::result::Result<myownmesh::embedded::EmbeddedDaemon, myownmesh::embedded::EmbeddedStartError>
 {
@@ -73,7 +73,7 @@ async fn start_legacy_v1_daemon(
 
 fn connector_policy_from_lookup(
     mut lookup: impl FnMut(&str) -> Option<String>,
-) -> Result<myownmesh_core::ConnectorCapableResourcePolicy> {
+) -> Result<myownmesh_core::WebRtcConnectorCapablePolicy> {
     fn nonzero(
         lookup: &mut impl FnMut(&str) -> Option<String>,
         name: &'static str,
@@ -217,7 +217,7 @@ fn connector_policy_from_lookup(
             pending_candidate_application_work,
         ),
     );
-    Ok(myownmesh_core::ConnectorCapableResourcePolicy::new(
+    Ok(myownmesh_core::WebRtcConnectorCapablePolicy::new(
         process,
         myownmesh_core::MeshConnectorResourcePolicy::new(mesh_candidates),
         webrtc,

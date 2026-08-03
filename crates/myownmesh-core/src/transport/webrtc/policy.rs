@@ -61,6 +61,13 @@ impl PendingRemoteCandidatePolicy {
 /// profile is the only construction input that can request the legacy WebRTC
 /// adapter. Lane suspension and finalization are explicit events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, feature = "legacy-media")),
+    allow(
+        dead_code,
+        reason = "the compatibility profile is inert without legacy-media"
+    )
+)]
 pub struct LegacyWebRtcMediaProfile {
     max_lanes_per_kind: NonZeroUsize,
     preprovisioned_video_lanes: usize,
@@ -68,6 +75,13 @@ pub struct LegacyWebRtcMediaProfile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(
+    not(any(test, feature = "legacy-media")),
+    allow(
+        dead_code,
+        reason = "the compatibility profile is inert without legacy-media"
+    )
+)]
 pub enum LegacyWebRtcMediaProfileError {
     #[error(
         "legacy WebRTC media lane ceiling {requested} exceeds the fixed compatibility provider ceiling {maximum}"
@@ -83,6 +97,13 @@ pub enum LegacyWebRtcMediaProfileError {
     },
 }
 
+#[cfg_attr(
+    not(any(test, feature = "legacy-media")),
+    allow(
+        dead_code,
+        reason = "the compatibility profile is inert without legacy-media"
+    )
+)]
 impl LegacyWebRtcMediaProfile {
     pub fn h264_opus(
         max_lanes_per_kind: NonZeroUsize,
@@ -184,6 +205,15 @@ impl WebRtcConnectorProfile {
         self.remote_candidates
     }
 
+    pub(crate) const fn legacy_media_internal(self) -> Option<LegacyWebRtcMediaProfile> {
+        self.legacy_media
+    }
+
+    #[cfg(feature = "legacy-media")]
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy H.264 and Opus compatibility profile query"
+    )]
     pub const fn legacy_media(self) -> Option<LegacyWebRtcMediaProfile> {
         self.legacy_media
     }
@@ -229,6 +259,13 @@ impl WebRtcConnectorProfile {
 pub const LEGACY_H264_MAX_FRAGMENTS_PER_UNIT: usize = 2_048;
 
 /// Fixed lane count implemented by the temporary H.264 and Opus adapter.
+#[cfg_attr(
+    not(any(test, feature = "legacy-media")),
+    allow(
+        dead_code,
+        reason = "the compatibility profile is inert without legacy-media"
+    )
+)]
 pub const LEGACY_MEDIA_MAX_LANES_PER_KIND: usize = 8;
 
 #[cfg(test)]

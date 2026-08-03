@@ -145,6 +145,201 @@ impl Drop for ConnectorOperationPermit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConnectorLifecyclePhase {
+    AwaitingOpen,
+    OpenPending,
+    OpenCommitted,
+    ClosedPending,
+    ClosedDelivered,
+}
+
+struct ConnectorLifecycleState {
+    phase: ConnectorLifecyclePhase,
+    open_exposed: bool,
+    renegotiation_pending: bool,
+    ice_connection_state: Option<RTCIceConnectionState>,
+    peer_connection_state: Option<RTCPeerConnectionState>,
+}
+
+/// Fixed, lossless owner for connector lifecycle and coalesced observations.
+///
+/// Open, close, and renegotiation never compete for ordinary callback mailbox
+/// capacity. ICE and peer-connection state are latest-value observations.
+pub(super) struct ConnectorLifecycleOwner {
+    state: SyncMutex<ConnectorLifecycleState>,
+    ready: tokio::sync::Notify,
+}
+
+impl Default for ConnectorLifecycleOwner {
+    fn default() -> Self {
+        Self {
+            state: SyncMutex::new(ConnectorLifecycleState {
+                phase: ConnectorLifecyclePhase::AwaitingOpen,
+                open_exposed: false,
+                renegotiation_pending: false,
+                ice_connection_state: None,
+                peer_connection_state: None,
+            }),
+            ready: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl ConnectorLifecycleOwner {
+    pub(super) fn record_open(&self) -> ConnectorCallbackInsertResult {
+        let mut state = self.state.lock();
+        let result = match state.phase {
+            ConnectorLifecyclePhase::AwaitingOpen => {
+                state.phase = ConnectorLifecyclePhase::OpenPending;
+                state.open_exposed = false;
+                ConnectorCallbackInsertResult::Queued
+            }
+            ConnectorLifecyclePhase::OpenPending | ConnectorLifecyclePhase::OpenCommitted => {
+                ConnectorCallbackInsertResult::PolicyRefused
+            }
+            ConnectorLifecyclePhase::ClosedPending | ConnectorLifecyclePhase::ClosedDelivered => {
+                ConnectorCallbackInsertResult::DiscardedAfterClose
+            }
+        };
+        drop(state);
+        if result == ConnectorCallbackInsertResult::Queued {
+            self.ready.notify_one();
+        }
+        result
+    }
+
+    pub(super) fn record_close(&self) -> ConnectorCallbackInsertResult {
+        let mut state = self.state.lock();
+        let result = match state.phase {
+            ConnectorLifecyclePhase::ClosedPending | ConnectorLifecyclePhase::ClosedDelivered => {
+                ConnectorCallbackInsertResult::DiscardedAfterClose
+            }
+            ConnectorLifecyclePhase::AwaitingOpen
+            | ConnectorLifecyclePhase::OpenPending
+            | ConnectorLifecyclePhase::OpenCommitted => {
+                state.phase = ConnectorLifecyclePhase::ClosedPending;
+                state.renegotiation_pending = false;
+                state.ice_connection_state = None;
+                state.peer_connection_state = None;
+                ConnectorCallbackInsertResult::Queued
+            }
+        };
+        drop(state);
+        if result == ConnectorCallbackInsertResult::Queued {
+            self.ready.notify_one();
+        }
+        result
+    }
+
+    pub(super) fn commit_open(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.phase != ConnectorLifecyclePhase::OpenPending || !state.open_exposed {
+            return false;
+        }
+        state.phase = ConnectorLifecyclePhase::OpenCommitted;
+        true
+    }
+
+    pub(super) fn record_renegotiation(&self) -> ConnectorCallbackInsertResult {
+        let mut state = self.state.lock();
+        if matches!(
+            state.phase,
+            ConnectorLifecyclePhase::ClosedPending | ConnectorLifecyclePhase::ClosedDelivered
+        ) {
+            return ConnectorCallbackInsertResult::DiscardedAfterClose;
+        }
+        state.renegotiation_pending = true;
+        drop(state);
+        self.ready.notify_one();
+        ConnectorCallbackInsertResult::Queued
+    }
+
+    pub(super) fn record_ice_state(
+        &self,
+        value: RTCIceConnectionState,
+    ) -> ConnectorCallbackInsertResult {
+        let mut state = self.state.lock();
+        if matches!(
+            state.phase,
+            ConnectorLifecyclePhase::ClosedPending | ConnectorLifecyclePhase::ClosedDelivered
+        ) {
+            return ConnectorCallbackInsertResult::DiscardedAfterClose;
+        }
+        state.ice_connection_state = Some(value);
+        drop(state);
+        self.ready.notify_one();
+        ConnectorCallbackInsertResult::Queued
+    }
+
+    pub(super) fn record_peer_state(
+        &self,
+        value: RTCPeerConnectionState,
+    ) -> ConnectorCallbackInsertResult {
+        let mut state = self.state.lock();
+        if matches!(
+            state.phase,
+            ConnectorLifecyclePhase::ClosedPending | ConnectorLifecyclePhase::ClosedDelivered
+        ) {
+            return ConnectorCallbackInsertResult::DiscardedAfterClose;
+        }
+        state.peer_connection_state = Some(value);
+        drop(state);
+        self.ready.notify_one();
+        ConnectorCallbackInsertResult::Queued
+    }
+
+    pub(super) fn try_take_event(&self) -> Option<QueuedTransportEvent> {
+        let mut state = self.state.lock();
+        let event = match state.phase {
+            ConnectorLifecyclePhase::ClosedPending => {
+                state.phase = ConnectorLifecyclePhase::ClosedDelivered;
+                Some(TransportEvent::DataChannelClosed)
+            }
+            ConnectorLifecyclePhase::OpenPending if !state.open_exposed => {
+                state.open_exposed = true;
+                Some(TransportEvent::DataChannelOpen)
+            }
+            _ if state.renegotiation_pending => {
+                state.renegotiation_pending = false;
+                Some(TransportEvent::RenegotiationNeeded)
+            }
+            _ => state
+                .ice_connection_state
+                .take()
+                .map(TransportEvent::IceConnectionStateChanged)
+                .or_else(|| {
+                    state
+                        .peer_connection_state
+                        .take()
+                        .map(TransportEvent::PeerConnectionStateChanged)
+                }),
+        }?;
+        Some(QueuedTransportEvent {
+            event,
+            observation: None,
+        })
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        let state = self.state.lock();
+        state.phase == ConnectorLifecyclePhase::ClosedPending
+            || (state.phase == ConnectorLifecyclePhase::OpenPending && !state.open_exposed)
+            || state.renegotiation_pending
+            || state.ice_connection_state.is_some()
+            || state.peer_connection_state.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn phase(&self) -> ConnectorLifecyclePhase {
+        self.state.lock().phase
+    }
+
+    pub(super) async fn notified(&self) {
+        self.ready.notified().await;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ConnectorCallbackScheduler {
     pub(super) weights: [usize; 3],

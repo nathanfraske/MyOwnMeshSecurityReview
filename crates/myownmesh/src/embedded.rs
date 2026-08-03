@@ -79,7 +79,7 @@ impl EmbeddedDaemon {
 /// capacity, callback weight, or structural real-time limit is inferred here.
 pub async fn start_connector_capable(
     cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     ServiceManager::validate_config(&cfg.services)?;
     let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
@@ -99,7 +99,7 @@ pub async fn start_connector_capable(
 )]
 pub async fn start_connector_capable_with_legacy_media(
     cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
     media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     let connector_policy = connector_policy_with_legacy_media(connector_policy, media_profile)?;
@@ -112,16 +112,16 @@ pub async fn start_connector_capable_with_legacy_media(
     reason = "this exact helper is confined to the temporary legacy media deployment boundary"
 )]
 fn connector_policy_with_legacy_media(
-    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
     media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
 ) -> std::result::Result<
-    myownmesh_core::ConnectorCapableResourcePolicy,
+    myownmesh_core::WebRtcConnectorCapablePolicy,
     myownmesh_core::WebRtcConnectorProfileError,
 > {
     let webrtc = connector_policy
         .webrtc()
         .with_legacy_webrtc_media(media_profile)?;
-    Ok(myownmesh_core::ConnectorCapableResourcePolicy::new(
+    Ok(myownmesh_core::WebRtcConnectorCapablePolicy::new(
         connector_policy.process(),
         connector_policy.mesh(),
         webrtc,
@@ -145,7 +145,7 @@ fn connector_policy_with_legacy_media(
 )]
 pub async fn start_connector_capable_with_legacy_v1(
     cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
     runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-media")]
-    fn legacy_media_test_policy() -> myownmesh_core::ConnectorCapableResourcePolicy {
+    fn legacy_media_test_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
         // These values belong only to this one-process startup fixture. They
         // make no production sizing or queue-capacity recommendation.
         let realtime = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
@@ -281,7 +281,7 @@ mod tests {
             callbacks,
             myownmesh_core::PendingRemoteCandidatePolicy::new(nz(8), nz(16_384), nz(8), nz(8)),
         );
-        myownmesh_core::ConnectorCapableResourcePolicy::new(
+        myownmesh_core::WebRtcConnectorCapablePolicy::new(
             myownmesh_core::ConnectorResourcePolicy::new(nz(
                 crate::TEST_PROCESS_CONNECTOR_CAPACITY,
             ))

@@ -2238,8 +2238,8 @@ fn persist_network_update(net: &NetworkConfig) -> Result<()> {
 
 /// Map the wire's lane-kind string onto the transport enum.
 #[cfg(feature = "legacy-media")]
-fn parse_lane_kind(kind: &str) -> Option<myownmesh_core::transport::webrtc::LaneKind> {
-    use myownmesh_core::transport::webrtc::LaneKind;
+fn parse_lane_kind(kind: &str) -> Option<myownmesh_core::transport::LaneKind> {
+    use myownmesh_core::transport::LaneKind;
     match kind {
         "video" => Some(LaneKind::Video),
         "audio" => Some(LaneKind::Audio),

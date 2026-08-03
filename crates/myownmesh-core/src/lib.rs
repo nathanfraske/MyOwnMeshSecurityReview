@@ -8,7 +8,7 @@
 //! # Quick tour
 //!
 //! ```no_run
-//! # async fn _ex(connector_policy: myownmesh_core::ConnectorCapableResourcePolicy) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn _ex(connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy) -> Result<(), Box<dyn std::error::Error>> {
 //! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
 //!
 //! // The process owner supplies the reviewed connector policy explicitly.
@@ -144,18 +144,23 @@ pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackPolicyError,
-    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorRealtimeByteBudgets,
-    ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy, ConnectorRealtimeInboundLimits,
-    ConnectorResourceOwnerPort, ConnectorResourceOwnerReport, ConnectorResourcePolicy,
-    ConnectorResourcePolicyConflict, EnabledRealtimeConnectorPolicy, MeshConnectorResourcePolicy,
-    MeshConnectorResourceReport, MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy,
-    RealtimeQueueOverflowRule,
+    ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities,
+    ConnectorRealtimeFlowPolicy, ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort,
+    ConnectorResourceOwnerReport, ConnectorResourcePolicy, ConnectorResourcePolicyConflict,
+    EnabledRealtimeConnectorPolicy, MeshConnectorResourcePolicy, MeshConnectorResourceReport,
+    MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
+    WebRtcConnectorCapablePolicy,
 };
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
-pub use transport::webrtc::{
-    LegacyWebRtcMediaProfile, LegacyWebRtcMediaProfileError, PendingRemoteCandidatePolicy,
-    WebRtcConnectorProfile, WebRtcConnectorProfileError,
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "these are the explicit deprecated legacy-media compatibility exports"
+)]
+pub use transport::{LegacyWebRtcMediaProfile, LegacyWebRtcMediaProfileError};
+pub use transport::{
+    PendingRemoteCandidatePolicy, WebRtcConnectorProfile, WebRtcConnectorProfileError,
 };
 
 /// Domain-separation tag prefixed to every signed handshake payload.

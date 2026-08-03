@@ -78,6 +78,7 @@ def relative(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
 
 
+@functools.lru_cache(maxsize=None)
 def mask_rust(text: str) -> str:
     """Mask comments and literals while retaining newlines and byte offsets."""
 
@@ -624,6 +625,7 @@ class FunctionSpan:
         return f"{self.name}@{self.ordinal}"
 
 
+@functools.lru_cache(maxsize=None)
 def function_spans(masked: str) -> list[FunctionSpan]:
     pattern = re.compile(
         r"(?m)^\s*(?P<vis>pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
@@ -823,6 +825,7 @@ def snapshot_record(keys: list[str]) -> dict[str, int | str]:
     }
 
 
+@functools.lru_cache(maxsize=1)
 def source_snapshot_keys() -> list[str]:
     keys = []
     for path in rust_sources():

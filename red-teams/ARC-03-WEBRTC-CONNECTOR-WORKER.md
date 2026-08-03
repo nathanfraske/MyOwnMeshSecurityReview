@@ -1,6 +1,6 @@
 # Arc 03 WebRTC connector ownership red team
 
-Status: Arc 03H executable review record. Fork PR #4 remains draft, unmerged, and held at `f180373c732c0a42a1f50c51f184d5ce88615d20`. Passing this record does not authorize merge or select a production resource value.
+Status: Arc 03I executable review record. Fork PR #4 remains draft and unmerged, but its Arc 03H head is superseded by `arc/03i-final-connector-boundary`. Passing this record does not authorize merge or select a production resource value.
 
 ## 1. Isolation and exact-head commands
 
@@ -8,7 +8,7 @@ Run socket-bearing checks only inside Ubuntu 24.04 WSL. Do not run Windows test 
 
 ```powershell
 $repo = (Resolve-Path "C:\Users\Admin\MyOwnMesh Security Audit\MyOwnMeshV4Transition").Path
-$target = "/tmp/mom-arc03h-red-team"
+$target = "/tmp/mom-arc03i-red-team"
 
 wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target /root/.cargo/bin/cargo fmt --all -- --check
 wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target /root/.cargo/bin/cargo check --workspace --all-targets -j 16
@@ -24,7 +24,7 @@ wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target PATH=/root/.carg
 After retaining the logs, remove only this target:
 
 ```powershell
-wsl.exe -d Ubuntu-24.04 -- rm -rf /tmp/mom-arc03h-red-team
+wsl.exe -d Ubuntu-24.04 -- rm -rf /tmp/mom-arc03i-red-team
 ```
 
 ## 2. RT-03-01: manufacture connector capacity
@@ -68,6 +68,20 @@ Controls:
 
 Residual: this proves the enumerated Arc 03 connector paths. It is not repository-wide proof that every application behavior uses this fence.
 
+## 4A. RT-03-03A: lose open or close behind callback saturation
+
+Attack: fill the control and endpoint mailboxes, queue open and close together, place endpoint data ahead of open in the scheduler, and emit callback observations after close.
+
+Required result: open and close use their fixed lifecycle owner instead of an ordinary mailbox. Close may supersede an uncommitted open. Close is exposed once. No event after close reaches Endpoint Auth or application dispatch. Renegotiation remains a sticky coalesced obligation, while ICE and peer-connection state retain only the latest observation.
+
+Controls:
+
+- `v4_arc03i_close_supersedes_prequeued_endpoint_data_without_hidden_producers`
+- `v4_arc03i_open_and_close_do_not_depend_on_control_mailbox_capacity`
+- `v4_arc03i_close_supersedes_an_uncommitted_open_exactly_once`
+- `v4_arc03i_candidate_and_gathering_overload_retires_the_connector`
+- `v4_arc03i_renegotiation_and_state_observations_are_coalesced`
+
 ## 5. RT-03-04: hide producers behind a full callback mailbox
 
 Attack: fill a callback mailbox, then submit one or many later callbacks while the receiver is stalled.
@@ -79,6 +93,14 @@ Controls:
 - `v4_arc03h_full_mailbox_does_not_hide_a_producer_before_close`
 - `v4_arc03h_callback_producer_flood_cannot_queue_behind_full_mailbox`
 - source rejection of callback `reserve().await`
+
+The native callback surface has a separate structural bound. Data-only mode admits one application data channel and no media tracks. The temporary legacy profile admits one application data channel and only its finite, exact H.264 and Opus track set. The first shape violation retires the connector, and later violations coalesce into that one action.
+
+Additional controls:
+
+- `v4_arc03i_native_data_channel_shape_is_fixed_and_violation_work_is_coalesced`
+- `v4_arc03i_legacy_track_shape_bounds_duplicates_codecs_and_track_count`
+- `v4_arc03i_first_structural_violation_retires_once`
 
 ## 6. RT-03-05: reorder channel-open and endpoint protocol data
 
@@ -106,6 +128,8 @@ Controls:
 - `v4_arc03h_candidate_attempt_envelope_survives_delayed_apply_and_cancellation`
 - `v4_arc03h_post_sdp_candidates_share_one_cumulative_attempt_envelope`
 - `v4_arc03h_new_attempt_gets_a_fresh_candidate_envelope`
+- `v4_arc03i_candidate_digest_distinguishes_absent_and_maximum_mline_index`
+- `v4_arc03i_ice_restart_retires_old_candidate_identity_before_replacement`
 
 The content-byte limit is not an exact retained-memory limit. Candidate retained-memory observations must remain inexact.
 
@@ -113,7 +137,7 @@ The content-byte limit is not an exact retained-memory limit. Candidate retained
 
 Attack: enable codec-neutral real-time ownership with no provider, or present a track callback anyway.
 
-Required result: no compatibility tracks are provisioned. An inbound transceiver without a provider is stopped. H.264 and Opus processing starts only from the explicit temporary provider.
+Required result: no compatibility codecs or tracks are provisioned. An inbound transceiver without a provider is stopped. Codec registration and H.264 or Opus processing start only from the explicit temporary provider.
 
 Controls:
 
@@ -209,6 +233,8 @@ Controls:
 - `v4_arc03h_cleanup_executor_failure_refuses_job_and_fails_exact_owner`
 - `v4_arc03_cleanup_owner_outlives_caller_runtime_shutdown`
 - `v4_arc03_terminal_cleanup_failure_cannot_be_overwritten_by_start`
+- `v4_arc03i_cleanup_panic_retains_claim_after_last_external_owner_drops`
+- `v4_arc03i_executor_termination_retains_active_job_without_external_owner`
 
 ## 16. RT-03-15: release real-time bytes while payloads survive
 
@@ -252,7 +278,7 @@ Controls:
 
 Attack: call application routing or ordinary-member relay from the normal V4 connector, Endpoint Auth task, or daemon path.
 
-Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling.
+Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Routing wrappers and plain relay envelopes have exactly one semantic consumer each. Malformed input does not stop later valid delivery.
 
 Controls:
 

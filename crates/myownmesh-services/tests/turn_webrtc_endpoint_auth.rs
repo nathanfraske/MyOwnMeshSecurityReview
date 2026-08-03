@@ -14,13 +14,13 @@ use myownmesh_core::identity::Identity;
     deprecated,
     reason = "this import is used only by the frozen legacy media negative control"
 )]
-use myownmesh_core::transport::webrtc::LaneKind;
+use myownmesh_core::transport::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     Channel, ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
-    MeshConnectorResourcePolicy, MeshEvent, PeerEvent, PendingRemoteCandidatePolicy,
-    RealtimeConnectorPolicy, WebRtcConnectorProfile,
+    ConnectorCallbackServiceWeights, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
+    MeshEvent, PeerEvent, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy,
+    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -47,7 +47,7 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
     }
 }
 
-fn test_connector_resource_policy() -> ConnectorCapableResourcePolicy {
+fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
     let two = std::num::NonZeroUsize::new(2)
         .expect("the two-endpoint fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
@@ -68,7 +68,7 @@ fn test_connector_resource_policy() -> ConnectorCapableResourcePolicy {
             two,
         ),
     );
-    ConnectorCapableResourcePolicy::new(process, MeshConnectorResourcePolicy::new(two), webrtc)
+    WebRtcConnectorCapablePolicy::new(process, MeshConnectorResourcePolicy::new(two), webrtc)
 }
 
 fn relay_only_test_transport() -> Transport {
@@ -138,7 +138,7 @@ async fn wait_for_authenticated(
     .expect("endpoint authentication timed out");
 }
 
-async fn wait_for_relay_pair(state: &myownmesh_core::engine::state::NetworkState, peer_id: &str) {
+async fn wait_for_relay_pair(state: &myownmesh_core::engine::NetworkState, peer_id: &str) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             if state

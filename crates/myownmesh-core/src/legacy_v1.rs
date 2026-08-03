@@ -66,11 +66,17 @@ impl LegacyV1Network {
             crate::Channel::new(RELAY_CHANNEL.to_string(), std::sync::Arc::clone(&state));
         let mut subscription = channel.subscribe();
         let listener = tokio::spawn(async move {
-            while let Some(Ok(message)) = subscription.recv().await {
-                let Ok(payload) = serde_json::to_value(message.body) else {
+            while let Some(item) = subscription.recv().await {
+                let message = match item {
+                    Ok(message) => message,
+                    Err(_) => continue,
+                };
+                let Ok(payload) = serde_json::to_value(&message.body) else {
                     continue;
                 };
-                routing::on_relay_frame(&listener_state, &message.from, &payload).await;
+                if routing::on_relay_frame(&listener_state, &message.from, &payload).await {
+                    continue;
+                }
             }
         });
         Self { state, listener }
@@ -281,6 +287,12 @@ mod tests {
         let legacy_a = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_a));
         let _legacy_b = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_b));
         let _legacy_c = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_c));
+        let _relay_b = RelayService::start(Arc::clone(&state_b), 0, &runtime);
+        state_b.dispatch_channel_frame(
+            RELAY_CHANNEL,
+            &id_a,
+            serde_json::json!({"malformed": true}),
+        );
         let payload = serde_json::json!({"proof": "two-native-hops"});
         legacy_a
             .send_to(&id_c, "legacy-v1-test", &payload)
@@ -298,6 +310,12 @@ mod tests {
             .expect("application payload decodes");
         assert_eq!(delivered.from, id_a);
         assert_eq!(delivered.body, payload);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), application.recv())
+                .await
+                .is_err(),
+            "directed LegacyV1 payload is delivered exactly once"
+        );
 
         for worker in [&ab.left, &ab.right, &bc.left, &bc.right] {
             worker

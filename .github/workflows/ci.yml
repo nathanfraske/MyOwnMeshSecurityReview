@@ -77,10 +77,15 @@ jobs:
       - name: Arc 03 compiler boundary controls
         run: python3 scripts/check-v4-arc03-compiler-boundaries.py
 
-      - name: Arc 03H native lifecycle and provider controls
+      - name: Arc 03I native lifecycle, cleanup, and provider controls
         run: |
           set -euo pipefail
           for control in \
+            v4_arc03_cancelled_construction_closes_partial_native_peer \
+            v4_arc03_cancelled_construction_with_native_close_error_retains_exact_claim \
+            v4_arc03_cancelled_delivered_result_closes_native_peer_before_release \
+            v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed \
+            v4_arc03_background_construction_failure_closes_partial_native_peer \
             v4_arc03h_close_wins_before_open_promotion \
             v4_arc03h_close_wins_before_legacy_realtime_admission \
             v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks \
@@ -109,7 +114,7 @@ jobs:
             -- --nocapture --test-threads=1
 
   # Validate the static-musl appliance daemons actually cross-compile on every
-  # PR — not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
+  # PR, not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
   # (NanoKVM-Pro) are the exact `cargo zigbuild` invocations release.yml ships,
   # so a broken .cargo/config.toml, a dependency that won't cross-compile, or the
   # static-musl getrandom link regression is caught here instead of at release.
@@ -130,7 +135,7 @@ jobs:
       # Pin to the same toolchain as rust-toolchain.toml (channel 1.88.0) and the
       # release jobs. `@stable` would add the cross target to the stable
       # toolchain, but cargo honors rust-toolchain.toml's pin and builds with
-      # 1.88.0 — which would then lack the target ("can't find crate for core").
+      # 1.88.0, which would then lack the target ("can't find crate for core").
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.target }}

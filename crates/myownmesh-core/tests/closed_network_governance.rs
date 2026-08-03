@@ -52,8 +52,8 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
 /// test doesn't depend on the wire-level approve flow's side
 /// effects on roster state.
 async fn cross_approve(
-    alice: &Arc<myownmesh_core::engine::state::NetworkState>,
-    bob: &Arc<myownmesh_core::engine::state::NetworkState>,
+    alice: &Arc<myownmesh_core::engine::NetworkState>,
+    bob: &Arc<myownmesh_core::engine::NetworkState>,
     alice_id: &Identity,
     bob_id: &Identity,
 ) {
@@ -1307,7 +1307,7 @@ async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
     // ignored — one device can't fork itself off the owner's shape.
     bob_state
         .cmd_tx
-        .send(myownmesh_core::engine::state::NetworkCmd::SetTopology(
+        .send(myownmesh_core::engine::NetworkCmd::SetTopology(
             TopologyMode::FullMesh,
         ))
         .expect("send local set");
@@ -1349,7 +1349,7 @@ async fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) {
 }
 
 /// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
-fn rostered(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) -> bool {
+fn rostered(state: &Arc<myownmesh_core::engine::NetworkState>, id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), id)
 }
 
@@ -1357,7 +1357,7 @@ fn rostered(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) 
 /// is present. This is the projection the fleet UI renders each member's
 /// grant/withdraw controls from, so a role change that doesn't reach here
 /// "doesn't take" on the device that authored it.
-fn roster_role(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) -> Option<Role> {
+fn roster_role(state: &Arc<myownmesh_core::engine::NetworkState>, id: &str) -> Option<Role> {
     let pk = myownmesh_core::signing::pubkey_part(id);
     state
         .roster

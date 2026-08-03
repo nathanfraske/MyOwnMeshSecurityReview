@@ -70,6 +70,10 @@ fn parse_wrapper(payload: &Value) -> Option<Wrapper> {
     })
 }
 
+pub(super) fn is_routing_wrapper(payload: &Value) -> bool {
+    parse_wrapper(payload).is_some()
+}
+
 fn wrap(channel: &str, body: &Value, ttl: u8, id: u64) -> Value {
     json!({
         "__channel": channel,

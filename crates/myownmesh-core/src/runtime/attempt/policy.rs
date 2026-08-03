@@ -362,7 +362,7 @@ impl ConnectorCallbackPolicy {
         self.realtime
     }
 
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(test)]
     pub(crate) fn unrestricted_lab(mailbox_capacity: NonZeroUsize) -> Self {
         Self {
             mailboxes: ConnectorCallbackMailboxCapacities::new(mailbox_capacity, mailbox_capacity),
@@ -548,13 +548,13 @@ pub struct MeshConnectorResourcePolicy {
 /// The Mesh component is an independent hard ceiling for this exact runtime.
 /// Both values are owner-selected. Neither is inferred from the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorCapableResourcePolicy {
+pub struct WebRtcConnectorCapablePolicy {
     process: ConnectorResourcePolicy,
     mesh: MeshConnectorResourcePolicy,
     webrtc: WebRtcConnectorProfile,
 }
 
-impl ConnectorCapableResourcePolicy {
+impl WebRtcConnectorCapablePolicy {
     pub const fn new(
         process: ConnectorResourcePolicy,
         mesh: MeshConnectorResourcePolicy,

@@ -387,8 +387,8 @@ mod tests {
     use myownmesh_core::transport::Transport;
     use myownmesh_core::{
         ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-        ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
-        MeshConnectorResourcePolicy, PendingRemoteCandidatePolicy, WebRtcConnectorProfile,
+        ConnectorCallbackServiceWeights, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
+        PendingRemoteCandidatePolicy, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
     };
     use myownmesh_signaling::local::LocalBroker;
     use std::num::NonZeroUsize;
@@ -471,7 +471,7 @@ mod tests {
                 connector_count,
             ),
         );
-        let policy = ConnectorCapableResourcePolicy::new(
+        let policy = WebRtcConnectorCapablePolicy::new(
             process_policy,
             MeshConnectorResourcePolicy::new(connector_count),
             webrtc_profile,

@@ -1,6 +1,6 @@
 # V4 Arc 03 WebRTC connector ownership
 
-Status: Arc 03H correction on `arc/03h-bounded-connector-correction`. Fork PR #4 remains draft, unmerged, and held at `f180373c732c0a42a1f50c51f184d5ce88615d20`. Arc 03H is not merge-approved. Arc 04 has not started.
+Status: Arc 03I correction on `arc/03i-final-connector-boundary`. Fork PR #4 remains draft and unmerged, but its Arc 03H head is superseded by this branch. Arc 03I is not merge-approved. Arc 04 has not started.
 
 ## 1. Scope
 
@@ -74,6 +74,8 @@ Remote candidates use one cumulative envelope before and after remote SDP. A uni
 
 Candidate observations include visible string capacities and queue container capacity, but remain marked inexact because allocator overhead and storage inside webrtc-rs are not observable.
 
+Each queued or applying remote candidate carries a process-local `RemoteCandidateAttemptIdentity`. An explicit ICE restart retires the old identity, blocks new work through it, waits for already admitted work to leave, creates a fresh identity and cumulative envelope, and keeps replacement candidates queued until replacement SDP commits. This identity is not serialized and is not a route, generation, ledger fact, timestamp, or timer.
+
 ## 5. Promotion, lock order, and close ordering
 
 Attempt allocation, promotion, and retirement share one attempt-transition mutex. Connector promotion never holds connector authority while acquiring it:
@@ -90,6 +92,18 @@ One `ConnectorOperationFence` orders the Arc 03 operations that can create or us
 
 This is a proof about the listed Arc 03 paths. It is not a claim that every application behavior in the repository has been converted to this fence.
 
+Channel open and close use a fixed lifecycle owner outside the ordinary callback mailboxes:
+
+```text
+AwaitingOpen
+    -> OpenPending
+    -> OpenCommitted
+    -> ClosedPending
+    -> ClosedDelivered
+```
+
+Close may move an uncommitted open directly to `ClosedPending`. Open is committed only after the exact connector installs its working-channel capability and Endpoint Auth handoff. Close is exposed once, clears coalesced observations, and prevents later callback delivery. Renegotiation is a sticky coalesced obligation until it is consumed or the connector retires.
+
 ## 6. Callback producer and scheduler bounds
 
 Control and endpoint data have separate bounded mailboxes. Producers use nonblocking insertion and receive a typed overloaded, closed, policy-refused, or wrong-owner result. There is no `reserve().await` producer backlog and no connector callback queue outside those mailboxes.
@@ -97,6 +111,8 @@ Control and endpoint data have separate bounded mailboxes. Producers use nonbloc
 Real-time events cannot enter a shared callback mailbox. Each admitted real-time flow owns its own bounded queue. Weighted scheduling gives every ready callback class and every ready flow a bounded service opportunity. The weights remain owner inputs.
 
 Endpoint protocol data may arrive before channel-open promotion, but it remains in the bounded endpoint mailbox until the exact open transition commits. Close or replacement drops the uncommitted data.
+
+The admitted native callback shape is also finite. A data-only connector accepts one application data channel and no media tracks. The temporary legacy provider accepts that same one data channel plus only the exact H.264 and Opus tracks named by its profile. Duplicate channels, unexpected channels, wrong codecs, malformed identities, and excess tracks coalesce into one connector violation and retirement. They do not create one cleanup future per violation.
 
 ## 7. Cleanup ownership and diagnostics
 
@@ -111,13 +127,15 @@ One bounded process cleanup executor runs close futures. Its queue capacity is v
 - A caller cancellation does not cancel owner cleanup.
 - There is no close timeout. A dependency that never returns remains visibly `Closing` and keeps its finite claim.
 
+The failure callback owns a strong reference to the close owner. Dropping every external close-owner reference cannot discard the exact failed claim, its terminal diagnostic, or its process and Mesh attribution.
+
 ## 8. Real-time compatibility bounds
 
 The codec-neutral owner separates speculative inbound quarantine from authorized outbound compatibility flows. Connector-owned byte and in-progress counters are split by domain. If a domain's arithmetic becomes unprovable, that domain is charged to its full ceiling and refuses later admission. This proves conservative behavior for connector-owned accounting only. It does not claim complete accounting for allocations hidden inside native WebRTC dependencies.
 
 Each inbound provider flow is bounded by fragment bytes, fragment count, unit bytes, simultaneous units, a per-flow queue, an inbound byte ceiling, and a cumulative pre-promotion packet and content-byte envelope. Exhausting the pre-promotion envelope stops that speculative transceiver. There is no timer or rate window.
 
-Generic real-time ownership does not install a codec provider. An inbound transceiver without an explicit provider is stopped. The temporary legacy provider accepts only H.264 video and Opus audio with exact, in-range `video-N` or `audio-N` track identity. Lane numbers must use their canonical unsigned decimal spelling.
+Generic real-time ownership does not install a codec provider or register compatibility codecs. Codec registration is lazy and occurs only when constructing a connector whose explicit temporary legacy profile requires it. An inbound transceiver without an explicit provider is stopped. The temporary legacy provider accepts only H.264 video and Opus audio with exact, in-range `video-N` or `audio-N` track identity. Lane numbers must use their canonical unsigned decimal spelling.
 
 Complete units use deterministic `DropNewest`. Their byte lease follows the queued event and downstream copies. Dequeue alone does not release it.
 
@@ -134,6 +152,8 @@ The exact candidate becomes `ConnectedChannelCapability`, which moves into `Endp
 ## 10. LegacyV1 boundary
 
 Historical application routing and ordinary-member relay are compiled only with the `legacy-v1` feature. Their source lives under `legacy_v1/`. The feature exposes deprecated `LegacyV1Runtime` and `LegacyV1Network` facades plus an explicit `myownmesh serve --legacy-v1` option. Compatibility callers must name the `legacy_v1` module explicitly because the crate root does not re-export those facades. The normal V4 daemon path does not enable them.
+
+Explicit LegacyV1 daemon mode installs one routing facade per joined Mesh. When legacy member-relay hosting is enabled, it also installs one separate `RelayService` per joined Mesh. Routing wrappers and plain relay envelopes share the frozen reserved wire channel, but they have different semantic owners. The routing owner ignores plain relay envelopes, and the member relay ignores routing wrappers. A malformed envelope is discarded without terminating either owner.
 
 This is structural isolation through a feature boundary, a compatibility subtree, explicit construction, deprecation, and CI that denies deprecated use in normal V4 source. It is not a hard type-level proof that no future source edit could call the compatibility facade.
 
@@ -171,10 +191,25 @@ The library forms are `Mesh::open_connector_capable`, `Mesh::open_connector_capa
 
 `PeerSession` does not implement `Deref`. Production native connector creation stays behind `WebRtcConnectorWorker`.
 
-## 13. Evidence and approval boundary
+## 13. Arc 03I completion contract
+
+Arc 03I may be called code-complete only when the exact pushed head proves all six statements:
+
+1. Channel-open and channel-close transitions cannot be lost.
+2. Cleanup failure retains the exact claim even when cleanup owns the final strong reference.
+3. ICE restart cannot mix old candidate-attempt work with the replacement attempt.
+4. Every pre-authentication native WebRTC callback surface has a structural bound and an explicit overload or violation result.
+5. Generic real-time policy selects no codec, device purpose, media purpose, or lane meaning.
+6. Temporary LegacyV1 and H.264 or Opus paths are explicit, frozen, tested, and unreachable from the V4 authority path without their named compatibility feature and owner.
+
+These statements prove one bounded WebRTC connector candidate produces at most one working-channel capability, cannot outlive its actual connector lifecycle, cannot lose or manufacture resource ownership, and can be handed to Endpoint Auth with exact provenance. They do not prove Endpoint Auth transcript verification or session authority.
+
+## 14. Evidence and approval boundary
 
 The red-team record and [`scripts/measure-v4-arc03g.ps1`](../../scripts/measure-v4-arc03g.ps1) name the controls and measurement inputs. Measurements are observations only and do not select production policy values.
 
-Arc 03H remains unapproved until the exact pushed head passes formatting, workspace checks, Clippy, tests, compiler-boundary checks, native direct and TURN controls, retained-feature controls, the supported-platform matrix, the cross-target matrix, workload measurements, and owner review.
+The historical Arc 01 inventory is not current evidence for this branch. Its checker reports 117 production Rust units and 2,099 declaration members against 106 and 1,792 recorded, plus obsolete module paths and markers. A later reviewed inventory refresh must assign that drift. Arc 03I does not silently rewrite those owner assignments.
 
-Arc 03H does not claim complete hostile-ingress admission, exact native dependency memory accounting, Endpoint Auth verification, authenticated session authority, final application flow authority, final codec policy, repository-wide close fencing, or LegacyV1 removal.
+Arc 03I remains unapproved until the exact pushed head passes formatting, workspace checks, Clippy, tests, compiler-boundary checks, native direct and TURN controls, retained-feature controls, the supported-platform matrix, the cross-target matrix, workload measurements, and owner review.
+
+Arc 03I does not claim complete hostile-ingress admission, exact native dependency memory accounting, Endpoint Auth verification, authenticated session authority, final application flow authority, final codec policy, repository-wide close fencing, or LegacyV1 removal.

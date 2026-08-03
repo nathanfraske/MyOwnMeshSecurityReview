@@ -60,9 +60,9 @@ use crate::resource::{
 };
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness, ConnectorCallbackPolicy,
-    ConnectorCallbackServiceWeights, ConnectorCandidateCapability, ConnectorCapableResourcePolicy,
-    ConnectorResourceOwnerReport, EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport,
-    MeshConnectorResourceScope, RealtimeConnectorPolicy,
+    ConnectorCallbackServiceWeights, ConnectorCandidateCapability, ConnectorResourceOwnerReport,
+    EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport, MeshConnectorResourceScope,
+    RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
 
 use super::ice::build_rtc_configuration;
@@ -117,6 +117,25 @@ pub(crate) fn is_virtual_interface(name: &str) -> bool {
 /// channels (e.g. browser-initiated debug) don't get routed into
 /// the mesh frame path.
 pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeDataChannelAdmission {
+    Install,
+    Violation(&'static str),
+}
+
+fn admit_native_data_channel(
+    label: &str,
+    application_channel_installed: bool,
+) -> NativeDataChannelAdmission {
+    if label != APP_DATA_CHANNEL_LABEL {
+        return NativeDataChannelAdmission::Violation("unexpected application data-channel label");
+    }
+    if application_channel_installed {
+        return NativeDataChannelAdmission::Violation("duplicate application data channel");
+    }
+    NativeDataChannelAdmission::Install
+}
 
 /// Who initiated this peer pairing. Drives whether we create the
 /// data channel pre-offer (offerer) or wait for the peer to open
@@ -255,6 +274,7 @@ fn callback_payload_limit(
 struct ConnectorEventMailboxes {
     control: mpsc::Sender<QueuedTransportEvent>,
     endpoint_data: mpsc::Sender<QueuedTransportEvent>,
+    lifecycle: Arc<ConnectorLifecycleOwner>,
 }
 
 impl ConnectorEventMailboxes {
@@ -276,6 +296,7 @@ struct ConnectorEventSink {
     attempt_liveness: Option<AttemptLiveness>,
     candidate_promoted: Arc<AtomicBool>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
+    callback_violation_reported: Arc<AtomicBool>,
     callback_policy: ConnectorCallbackPolicy,
     operation_fence: Arc<ConnectorOperationFence>,
 }
@@ -341,23 +362,66 @@ impl ConnectorEventSink {
     }
 
     async fn emit_data_channel(&self, event: TransportEvent) -> bool {
-        self.try_emit_data_channel(event).await.accepted()
+        let endpoint_protocol = matches!(&event, TransportEvent::Message(_));
+        let result = self.try_emit_data_channel(event).await;
+        if endpoint_protocol
+            && matches!(
+                result,
+                ConnectorCallbackInsertResult::Overloaded
+                    | ConnectorCallbackInsertResult::PolicyRefused
+                    | ConnectorCallbackInsertResult::ReceiverClosed
+            )
+        {
+            self.retire_after_callback_violation();
+        }
+        result.accepted()
     }
 
     async fn try_emit_data_channel(&self, event: TransportEvent) -> ConnectorCallbackInsertResult {
         if matches!(event, TransportEvent::DataChannelClosed) {
             self.realtime_delivery.store(false, Ordering::Release);
-            if !self.operation_fence.begin_close() {
-                return ConnectorCallbackInsertResult::DiscardedAfterClose;
-            }
+            self.operation_fence.begin_close();
             self.realtime_flows.retire();
-            return self.emit_inner(event, false).await;
+            return self.events.lifecycle.record_close();
         }
         self.emit_inner(event, true).await
     }
 
     async fn emit(&self, event: TransportEvent) -> bool {
-        self.emit_inner(event, true).await.accepted()
+        let candidate_obligation = matches!(&event, TransportEvent::LocalIceCandidate(_));
+        let result = self.emit_inner(event, true).await;
+        if candidate_obligation
+            && matches!(
+                result,
+                ConnectorCallbackInsertResult::Overloaded
+                    | ConnectorCallbackInsertResult::PolicyRefused
+                    | ConnectorCallbackInsertResult::ReceiverClosed
+            )
+        {
+            self.retire_after_callback_violation();
+        }
+        result.accepted()
+    }
+
+    fn retire_after_callback_violation(&self) {
+        self.realtime_delivery.store(false, Ordering::Release);
+        self.operation_fence.begin_close();
+        self.realtime_flows.retire();
+        self.events.lifecycle.record_close();
+    }
+
+    fn structural_violation(&self, reason: &'static str) {
+        if self
+            .callback_violation_reported
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            warn!(
+                reason,
+                "retiring connector after native callback shape violation"
+            );
+            self.retire_after_callback_violation();
+        }
     }
 
     async fn emit_inner(
@@ -372,6 +436,24 @@ impl ConnectorEventSink {
             }
         } else {
             None
+        };
+        let event = match event {
+            TransportEvent::DataChannelOpen => {
+                return self.events.lifecycle.record_open();
+            }
+            TransportEvent::DataChannelClosed => {
+                return self.events.lifecycle.record_close();
+            }
+            TransportEvent::RenegotiationNeeded => {
+                return self.events.lifecycle.record_renegotiation();
+            }
+            TransportEvent::IceConnectionStateChanged(state) => {
+                return self.events.lifecycle.record_ice_state(state);
+            }
+            TransportEvent::PeerConnectionStateChanged(state) => {
+                return self.events.lifecycle.record_peer_state(state);
+            }
+            event => event,
         };
         let callback_class = ConnectorCallbackClass::for_event(&event);
         let payload_bytes = match &event {
@@ -461,6 +543,8 @@ pub(crate) struct WebRtcConnectorEventReceiver {
 pub struct TransportEventReceiver {
     control: mpsc::Receiver<QueuedTransportEvent>,
     endpoint_data: mpsc::Receiver<QueuedTransportEvent>,
+    lifecycle: Arc<ConnectorLifecycleOwner>,
+    lifecycle_closed: bool,
     realtime_flows: Arc<RealtimeFlowRegistry>,
     scheduler: ConnectorCallbackScheduler,
 }
@@ -470,6 +554,15 @@ impl TransportEventReceiver {
         &mut self,
         allow_endpoint_data: bool,
     ) -> Option<QueuedTransportEvent> {
+        if self.lifecycle_closed {
+            return None;
+        }
+        if let Some(event) = self.lifecycle.try_take_event() {
+            if matches!(event.event, TransportEvent::DataChannelClosed) {
+                self.lifecycle_closed = true;
+            }
+            return Some(event);
+        }
         for _ in 0..3 {
             let class = self.scheduler.current();
             if class == ConnectorCallbackClass::EndpointData && !allow_endpoint_data {
@@ -498,6 +591,7 @@ impl TransportEventReceiver {
         None
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     fn try_scheduled(&mut self) -> Option<QueuedTransportEvent> {
         self.try_scheduled_filtered(true)
     }
@@ -515,10 +609,14 @@ impl TransportEventReceiver {
                 && (!allow_endpoint_data
                     || (self.endpoint_data.is_closed() && self.endpoint_data.is_empty()))
                 && self.realtime_flows.is_empty()
+                && !self.lifecycle.has_pending()
             {
                 return None;
             }
             tokio::select! {
+                _ = self.lifecycle.notified() => {
+                    continue;
+                }
                 event = self.control.recv(), if !self.control.is_closed() || !self.control.is_empty() => {
                     if let Some(event) = event {
                         self.scheduler.delivered(ConnectorCallbackClass::Control);
@@ -538,14 +636,17 @@ impl TransportEventReceiver {
         }
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     async fn recv_queued(&mut self) -> Option<QueuedTransportEvent> {
         self.recv_queued_filtered(true).await
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     pub async fn recv(&mut self) -> Option<TransportEvent> {
         self.recv_queued().await.map(|queued| queued.event)
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     pub fn try_recv(&mut self) -> std::result::Result<TransportEvent, mpsc::error::TryRecvError> {
         if let Some(queued) = self.try_scheduled() {
             return Ok(queued.event);
@@ -553,6 +654,7 @@ impl TransportEventReceiver {
         if self.control.is_closed()
             && self.endpoint_data.is_closed()
             && self.realtime_flows.is_empty()
+            && !self.lifecycle.has_pending()
         {
             Err(mpsc::error::TryRecvError::Disconnected)
         } else {
@@ -615,7 +717,9 @@ impl WebRtcConnectorEventReceiver {
     /// Delivering the control event is insufficient because its owner may be
     /// stale or may reject the transition.
     pub(crate) fn commit_data_channel_open(&mut self) {
-        self.data_channel_open_committed = true;
+        if self.raw.lifecycle.commit_open() {
+            self.data_channel_open_committed = true;
+        }
     }
 
     fn reclaim_retired_attempt_candidate(&mut self) -> bool {
@@ -715,12 +819,17 @@ pub(crate) struct RemoteDescriptionApplyReport {
 #[derive(Debug)]
 struct PendingRemoteCandidate {
     candidate: LocalIceCandidate,
+    attempt: Arc<RemoteCandidateAttemptIdentity>,
     observation: CandidateObservationLease,
     _queue_reservation: Option<PendingRemoteCandidateReservation>,
 }
 
 impl PendingRemoteCandidate {
-    fn observe(candidate: LocalIceCandidate, resource_scope: &PeerConnectionResourceScope) -> Self {
+    fn observe(
+        candidate: LocalIceCandidate,
+        attempt: Arc<RemoteCandidateAttemptIdentity>,
+        resource_scope: &PeerConnectionResourceScope,
+    ) -> Self {
         let observation = CandidateObservationLease {
             _observation: resource_scope.observe_pre_authentication_measurement(
                 PreAuthResourceFamily::CandidateObject,
@@ -729,6 +838,7 @@ impl PendingRemoteCandidate {
         };
         Self {
             candidate,
+            attempt,
             observation,
             _queue_reservation: None,
         }
@@ -736,10 +846,11 @@ impl PendingRemoteCandidate {
 
     fn retained(
         candidate: LocalIceCandidate,
+        attempt: Arc<RemoteCandidateAttemptIdentity>,
         resource_scope: &PeerConnectionResourceScope,
         queue_reservation: PendingRemoteCandidateReservation,
     ) -> Self {
-        let mut pending = Self::observe(candidate, resource_scope);
+        let mut pending = Self::observe(candidate, attempt, resource_scope);
         pending._queue_reservation = Some(queue_reservation);
         pending
     }
@@ -755,6 +866,7 @@ where
 {
     let PendingRemoteCandidate {
         candidate,
+        attempt: _,
         observation,
         _queue_reservation,
     } = pending;
@@ -788,6 +900,7 @@ impl PendingRemoteCandidateQueue {
     fn push(
         &mut self,
         candidate: LocalIceCandidate,
+        attempt: Arc<RemoteCandidateAttemptIdentity>,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
         let Some(content_bytes) = candidate_content_bytes(&candidate) else {
@@ -799,6 +912,7 @@ impl PendingRemoteCandidateQueue {
         };
         self.entries.push(PendingRemoteCandidate::retained(
             candidate,
+            attempt,
             resource_scope,
             reservation,
         ));
@@ -1013,6 +1127,7 @@ impl Iterator for PendingRemoteCandidateDrain {
 impl ExactSizeIterator for PendingRemoteCandidateDrain {}
 
 struct RemoteCandidateState {
+    attempt: Arc<RemoteCandidateAttemptIdentity>,
     remote_description_set: bool,
     pending: PendingRemoteCandidateQueue,
     seen: std::collections::HashSet<[u8; 32]>,
@@ -1022,6 +1137,7 @@ struct RemoteCandidateState {
 impl RemoteCandidateState {
     fn new(policy: PendingRemoteCandidatePolicy) -> Self {
         Self {
+            attempt: Arc::new(RemoteCandidateAttemptIdentity::default()),
             remote_description_set: false,
             pending: PendingRemoteCandidateQueue::new(policy),
             seen: std::collections::HashSet::new(),
@@ -1042,17 +1158,115 @@ impl RemoteCandidateState {
                 PendingRemoteCandidateQueuePush::Refused
             };
         }
-        let result = self.pending.push(candidate, resource_scope);
+        let result = self
+            .pending
+            .push(candidate, Arc::clone(&self.attempt), resource_scope);
         if result == PendingRemoteCandidateQueuePush::Queued {
             self.seen.insert(digest);
         }
         result
     }
 
-    fn renew_for_ice_restart(&mut self) {
+    fn begin_ice_restart(&mut self) -> Arc<RemoteCandidateAttemptIdentity> {
         let policy = self.pending.budget.policy;
+        let retiring = Arc::clone(&self.attempt);
+        retiring.retire();
         *self = Self::new(policy);
-        self.remote_description_set = true;
+        retiring
+    }
+
+    fn owns_attempt(&self, attempt: &Arc<RemoteCandidateAttemptIdentity>) -> bool {
+        Arc::ptr_eq(&self.attempt, attempt) && attempt.is_active()
+    }
+}
+
+#[derive(Debug)]
+struct RemoteCandidateAttemptState {
+    active_operations: usize,
+    accounting_poisoned: bool,
+}
+
+/// Process-local identity and cancellation fence for one ICE candidate attempt.
+#[derive(Debug)]
+struct RemoteCandidateAttemptIdentity {
+    active: AtomicBool,
+    state: SyncMutex<RemoteCandidateAttemptState>,
+    active_signal: watch::Sender<usize>,
+}
+
+impl Default for RemoteCandidateAttemptIdentity {
+    fn default() -> Self {
+        let (active_signal, _receiver) = watch::channel(0);
+        Self {
+            active: AtomicBool::new(true),
+            state: SyncMutex::new(RemoteCandidateAttemptState {
+                active_operations: 0,
+                accounting_poisoned: false,
+            }),
+            active_signal,
+        }
+    }
+}
+
+impl RemoteCandidateAttemptIdentity {
+    fn try_enter(self: &Arc<Self>) -> Option<RemoteCandidateAttemptPermit> {
+        let mut state = self.state.lock();
+        if !self.active.load(Ordering::Acquire) || state.accounting_poisoned {
+            return None;
+        }
+        let Some(active_operations) = state.active_operations.checked_add(1) else {
+            state.accounting_poisoned = true;
+            self.active.store(false, Ordering::Release);
+            return None;
+        };
+        state.active_operations = active_operations;
+        self.active_signal.send_replace(active_operations);
+        Some(RemoteCandidateAttemptPermit {
+            attempt: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn retire(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_operations(&self) {
+        let mut active = self.active_signal.subscribe();
+        loop {
+            if *active.borrow() == 0 {
+                return;
+            }
+            if active.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct RemoteCandidateAttemptPermit {
+    attempt: Arc<RemoteCandidateAttemptIdentity>,
+    active: bool,
+}
+
+impl Drop for RemoteCandidateAttemptPermit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.attempt.state.lock();
+        let Some(active_operations) = state.active_operations.checked_sub(1) else {
+            state.accounting_poisoned = true;
+            self.attempt.active.store(false, Ordering::Release);
+            return;
+        };
+        state.active_operations = active_operations;
+        self.attempt.active_signal.send_replace(active_operations);
+        self.active = false;
     }
 }
 
@@ -1060,7 +1274,13 @@ fn candidate_content_digest(candidate: &LocalIceCandidate) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash_candidate_string(&mut hash, Some(&candidate.candidate));
     hash_candidate_string(&mut hash, candidate.sdp_mid.as_ref());
-    hash.update(candidate.sdp_mline_index.unwrap_or(u16::MAX).to_be_bytes());
+    match candidate.sdp_mline_index {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_be_bytes());
+        }
+        None => hash.update([0]),
+    }
     hash_candidate_string(&mut hash, candidate.username_fragment.as_ref());
     hash.finalize().into()
 }
@@ -1631,6 +1851,14 @@ impl WebRtcConnectorWorker {
             1,
             0,
         );
+        let (attempt, _attempt_operation) = {
+            let state = self.remote_candidates.lock();
+            let attempt = Arc::clone(&state.attempt);
+            let operation = attempt.try_enter().ok_or_else(|| {
+                Error::Transport("remote-candidate attempt is retired".to_string())
+            })?;
+            (attempt, operation)
+        };
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.set_remote_description(description),
@@ -1644,6 +1872,11 @@ impl WebRtcConnectorWorker {
             if !self.ownership.incarnation.is_active() {
                 return Err(Error::Transport(
                     "connector worker retired during SDP apply".to_string(),
+                ));
+            }
+            if !state.owns_attempt(&attempt) {
+                return Err(Error::Transport(
+                    "remote description belongs to a retired ICE attempt".to_string(),
                 ));
             }
             state.remote_description_set = true;
@@ -1667,6 +1900,14 @@ impl WebRtcConnectorWorker {
         if !self.ownership.incarnation.is_active() {
             return Err(Error::Transport("connector worker is retired".to_string()));
         }
+        let _attempt_operation = pending.attempt.try_enter().ok_or_else(|| {
+            Error::Transport("remote candidate belongs to a retired ICE attempt".to_string())
+        })?;
+        if !self.remote_candidates.lock().owns_attempt(&pending.attempt) {
+            return Err(Error::Transport(
+                "remote candidate does not own the current ICE attempt".to_string(),
+            ));
+        }
         let budget = pending
             ._queue_reservation
             .as_ref()
@@ -1684,6 +1925,7 @@ impl WebRtcConnectorWorker {
             observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::IceWork, 1, 0);
         let PendingRemoteCandidate {
             candidate,
+            attempt,
             observation,
             _queue_reservation,
         } = pending;
@@ -1693,6 +1935,11 @@ impl WebRtcConnectorWorker {
         )
         .await
         .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?;
+        if !attempt.is_active() {
+            return Err(Error::Transport(
+                "remote candidate completed after its ICE attempt retired".to_string(),
+            ));
+        }
         drop(observation);
         if let Some(reservation) = _queue_reservation {
             self.remote_candidates
@@ -1768,6 +2015,8 @@ impl WebRtcConnectorWorker {
         self.ownership.owns_realtime_flow(capability)
     }
 
+    #[cfg(any(test, feature = "legacy-media"))]
+    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
     pub(crate) async fn open_media_lane(
         &self,
         capability: &crate::connector::ConnectorRealtimeFlowCapability,
@@ -1787,6 +2036,8 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during lane open".to_string()))?
     }
 
+    #[cfg(any(test, feature = "legacy-media"))]
+    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
     pub(crate) async fn close_media_lane(
         &self,
         capability: &crate::connector::ConnectorRealtimeFlowCapability,
@@ -1807,6 +2058,8 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during lane close".to_string()))?
     }
 
+    #[cfg(any(test, feature = "legacy-media"))]
+    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
     pub(crate) async fn send_video(
         &self,
         capability: &crate::connector::ConnectorRealtimeFlowCapability,
@@ -1828,6 +2081,8 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during video send".to_string()))?
     }
 
+    #[cfg(any(test, feature = "legacy-media"))]
+    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
     pub(crate) async fn send_audio(
         &self,
         capability: &crate::connector::ConnectorRealtimeFlowCapability,
@@ -1886,6 +2141,8 @@ impl WebRtcConnectorWorker {
 
     pub(crate) async fn restart_ice(&self) -> Result<()> {
         let _operation = self.ownership.enter_operation()?;
+        let retiring_attempt = self.remote_candidates.lock().begin_ice_restart();
+        retiring_attempt.wait_for_operations().await;
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.restart_ice(),
@@ -1894,7 +2151,6 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| {
             Error::Transport("connector worker retired during ICE restart".to_string())
         })??;
-        self.remote_candidates.lock().renew_for_ice_restart();
         Ok(())
     }
 
@@ -2008,6 +2264,8 @@ impl LocalIceCandidate {
 #[derive(Clone)]
 pub struct Transport {
     api: Arc<webrtc::api::API>,
+    #[cfg(any(test, feature = "legacy-media"))]
+    legacy_media_api: Arc<SyncMutex<Option<Arc<webrtc::api::API>>>>,
     runtime: crate::runtime::RuntimeIncarnation,
     ice_transport_policy: RTCIceTransportPolicy,
     connector_resource_scope: Option<MeshConnectorResourceScope>,
@@ -2183,15 +2441,31 @@ impl Drop for ConstructedConnectorResult {
     }
 }
 
+#[cfg(any(test, feature = "legacy-media"))]
+fn build_legacy_media_api() -> Result<webrtc::api::API> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_default_codecs()
+        .map_err(|error| Error::Transport(format!("register legacy media codecs: {error}")))?;
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut media_engine)
+        .map_err(|error| Error::Transport(format!("register legacy interceptors: {error}")))?;
+    let mut setting_engine = SettingEngine::default();
+    setting_engine.set_interface_filter(Box::new(|name: &str| !is_virtual_interface(name)));
+    setting_engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| !is_link_local_ip(&ip)));
+    Ok(APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
+        .build())
+}
+
 impl Transport {
     /// Build a fresh transport with the default media engine and
     /// interceptors. The webrtc-rs defaults cover everything we
     /// need for data-channel-only operation.
     pub fn new() -> Result<Self> {
         let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .map_err(|e| Error::Transport(format!("register codecs: {e}")))?;
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)
             .map_err(|e| Error::Transport(format!("register interceptors: {e}")))?;
@@ -2244,6 +2518,8 @@ impl Transport {
         );
         Ok(Self {
             api: Arc::new(api),
+            #[cfg(any(test, feature = "legacy-media"))]
+            legacy_media_api: Arc::new(SyncMutex::new(None)),
             runtime: crate::runtime::RuntimeIncarnation::new(),
             ice_transport_policy: RTCIceTransportPolicy::All,
             connector_resource_scope: None,
@@ -2270,7 +2546,7 @@ impl Transport {
     /// cannot multiply the process limit.
     pub fn with_connector_resource_policy(
         self,
-        policy: ConnectorCapableResourcePolicy,
+        policy: WebRtcConnectorCapablePolicy,
     ) -> Result<Self> {
         let root = ProcessResourceRoot::global();
         root.install_connector_policy(policy.process())?;
@@ -2310,10 +2586,12 @@ impl Transport {
         role: Role,
         stun: &[crate::config::StunServer],
         turn: &[crate::config::TurnServer],
+        callback_policy: ConnectorCallbackPolicy,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         let mut config = build_rtc_configuration(stun, turn);
         config.ice_transport_policy = self.ice_transport_policy;
-        self.open_peer_with_config(role, config).await
+        self.open_peer_with_config(role, config, callback_policy)
+            .await
     }
 
     /// Open the engine-owned connector wrapper around the existing WebRTC
@@ -2379,7 +2657,7 @@ impl Transport {
                         callback_gate: construction_incarnation,
                         callback_policy: webrtc_profile.callbacks(),
                         operation_fence,
-                        legacy_media_profile: webrtc_profile.legacy_media(),
+                        legacy_media_profile: webrtc_profile.legacy_media_internal(),
                         close_owner: Some(Arc::clone(&construction_close_owner)),
                     },
                 )
@@ -2449,27 +2727,34 @@ impl Transport {
         &self,
         role: Role,
         config: RTCConfiguration,
+        callback_policy: ConnectorCallbackPolicy,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
-        let media_lanes = resolve_media_lanes();
-        let legacy_media_profile = LegacyWebRtcMediaProfile::h264_opus(
-            NonZeroUsize::new(media_lanes).expect("lab transport has at least one media lane"),
-            PRE_PROVISIONED_LANES.min(media_lanes),
-            PRE_PROVISIONED_LANES.min(media_lanes),
+        self.open_peer_with_config_observed(
+            role,
+            config,
+            PeerOpenOwnership {
+                resource_scope: None,
+                realtime_delivery: Arc::new(AtomicBool::new(false)),
+                attempt_liveness: None,
+                candidate_promoted: Arc::new(AtomicBool::new(true)),
+                callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+                callback_policy,
+                operation_fence: Arc::new(ConnectorOperationFence::default()),
+                legacy_media_profile: None,
+                close_owner: None,
+            },
         )
-        .map_err(|error| Error::Transport(error.to_string()))?;
-        self.open_peer_with_config_and_legacy_media_profile(role, config, legacy_media_profile)
-            .await
+        .await
     }
 
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(test)]
     async fn open_peer_with_config_and_legacy_media_profile(
         &self,
         role: Role,
         config: RTCConfiguration,
         legacy_media_profile: LegacyWebRtcMediaProfile,
+        callback_policy: ConnectorCallbackPolicy,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
-        let one = std::num::NonZeroUsize::new(1)
-            .ok_or_else(|| Error::Transport("invalid lab callback capacity".to_string()))?;
         self.open_peer_with_config_observed(
             role,
             config,
@@ -2479,7 +2764,7 @@ impl Transport {
                 attempt_liveness: None,
                 candidate_promoted: Arc::new(AtomicBool::new(true)),
                 callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-                callback_policy: ConnectorCallbackPolicy::unrestricted_lab(one),
+                callback_policy,
                 operation_fence: Arc::new(ConnectorOperationFence::default()),
                 legacy_media_profile: Some(legacy_media_profile),
                 close_owner: None,
@@ -2505,8 +2790,26 @@ impl Transport {
             legacy_media_profile,
             close_owner,
         } = ownership;
-        let pc = self
-            .api
+        #[cfg(any(test, feature = "legacy-media"))]
+        let api = if legacy_media_profile.is_some() {
+            let mut legacy_api = self.legacy_media_api.lock();
+            if legacy_api.is_none() {
+                *legacy_api = Some(Arc::new(build_legacy_media_api()?));
+            }
+            Arc::clone(
+                legacy_api
+                    .as_ref()
+                    .expect("legacy media API was installed under its owner lock"),
+            )
+        } else {
+            Arc::clone(&self.api)
+        };
+        #[cfg(not(any(test, feature = "legacy-media")))]
+        let api = {
+            debug_assert!(legacy_media_profile.is_none());
+            Arc::clone(&self.api)
+        };
+        let pc = api
             .new_peer_connection(config)
             .await
             .map_err(|e| Error::Transport(format!("new_peer_connection: {e}")))?;
@@ -2561,10 +2864,12 @@ impl Transport {
             let (endpoint_data_tx, endpoint_data_rx) =
                 mpsc::channel(mailboxes.endpoint_data().get());
             let realtime_flows = RealtimeFlowRegistry::new(callback_policy);
+            let lifecycle = Arc::new(ConnectorLifecycleOwner::default());
             let event_sink = ConnectorEventSink {
                 events: ConnectorEventMailboxes {
                     control: control_tx,
                     endpoint_data: endpoint_data_tx,
+                    lifecycle: Arc::clone(&lifecycle),
                 },
                 realtime_flows: Arc::clone(&realtime_flows),
                 resource_scope: resource_scope.clone(),
@@ -2572,10 +2877,11 @@ impl Transport {
                 attempt_liveness,
                 candidate_promoted,
                 callback_gate: Arc::clone(&callback_gate),
+                callback_violation_reported: Arc::new(AtomicBool::new(false)),
                 callback_policy,
                 operation_fence: Arc::clone(&operation_fence),
             };
-            let data_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
+            let data_channel = Arc::new(SyncMutex::new(None::<Arc<RTCDataChannel>>));
 
             register_callbacks(
                 &pc,
@@ -2656,7 +2962,7 @@ impl Transport {
                     event_sink.clone(),
                     resource_scope.as_ref(),
                 );
-                *data_channel.lock().await = Some(dc);
+                *data_channel.lock() = Some(dc);
             }
 
             let session = PeerSession {
@@ -2682,6 +2988,8 @@ impl Transport {
                 TransportEventReceiver {
                     control: control_rx,
                     endpoint_data: endpoint_data_rx,
+                    lifecycle,
+                    lifecycle_closed: false,
                     realtime_flows,
                     scheduler: ConnectorCallbackScheduler::new(callback_policy.service_weights()),
                 },
@@ -2779,7 +3087,7 @@ impl Drop for PeerConstructionGuard {
 fn register_callbacks(
     pc: &Arc<RTCPeerConnection>,
     events_tx: &ConnectorEventSink,
-    data_channel: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    data_channel: &Arc<SyncMutex<Option<Arc<RTCDataChannel>>>>,
     resource_scope: Option<PeerConnectionResourceScope>,
     legacy_media_profile: Option<LegacyWebRtcMediaProfile>,
 ) {
@@ -2875,22 +3183,18 @@ fn register_callbacks(
             let handler_scope = handler_scope.clone();
             Box::pin(async move {
                 let Some(_operation) = tx.operation_fence.try_enter() else {
-                    let _ = dc.close().await;
                     return;
                 };
-                if dc.label() != APP_DATA_CHANNEL_LABEL {
-                    trace!(label = dc.label(), "ignoring non-app data channel");
-                    let _ = dc.close().await;
-                    return;
-                }
                 {
-                    let mut slot = dc_slot.lock().await;
-                    if slot.is_some() {
-                        drop(slot);
-                        let _ = dc.close().await;
-                        return;
+                    let mut slot = dc_slot.lock();
+                    match admit_native_data_channel(dc.label(), slot.is_some()) {
+                        NativeDataChannelAdmission::Install => *slot = Some(dc.clone()),
+                        NativeDataChannelAdmission::Violation(reason) => {
+                            drop(slot);
+                            tx.structural_violation(reason);
+                            return;
+                        }
                     }
-                    *slot = Some(dc.clone());
                 }
                 install_data_channel_handlers(dc.clone(), tx, handler_scope.as_ref());
             })
@@ -2919,34 +3223,40 @@ fn register_callbacks(
                 observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
             Box::pin(async move {
                 let Some(_operation) = tx.operation_fence.try_enter() else {
-                    let _ = transceiver.stop().await;
                     return;
                 };
                 if !tx.callback_gate.is_active() {
-                    let _ = transceiver.stop().await;
                     return;
                 }
                 let Some(profile) = media_profile else {
-                    let _ = transceiver.stop().await;
+                    tx.structural_violation(
+                        "media track presented without a compatibility provider",
+                    );
                     return;
                 };
-                let Some((_kind, is_video, lane)) = legacy_track_identity(
-                    track.kind(),
-                    &track.codec().capability.mime_type,
-                    &track.id(),
-                    profile,
-                ) else {
-                    let _ = transceiver.stop().await;
-                    return;
+                let key = {
+                    let mut admitted = remote_tracks.lock();
+                    match admit_legacy_track_shape(
+                        track.kind(),
+                        &track.codec().capability.mime_type,
+                        &track.id(),
+                        profile,
+                        &mut admitted,
+                    ) {
+                        Ok(key) => key,
+                        Err(reason) => {
+                            drop(admitted);
+                            tx.structural_violation(reason);
+                            return;
+                        }
+                    }
                 };
-                let key = (is_video, lane);
-                if !remote_tracks.lock().insert(key) {
-                    let _ = transceiver.stop().await;
-                    return;
-                }
+                let (_, lane) = key;
                 let Some(flow) = tx.open_inbound_realtime_flow() else {
                     remote_tracks.lock().remove(&key);
-                    let _ = transceiver.stop().await;
+                    tx.structural_violation(
+                        "compatibility media track exceeds admitted flow capacity",
+                    );
                     return;
                 };
                 let owner = LegacyInboundTrackOwner {
@@ -3122,22 +3432,42 @@ pub(crate) fn sdp_fingerprint(sdp: &str) -> Option<String> {
 
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
-    data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    data_channel: Arc<SyncMutex<Option<Arc<RTCDataChannel>>>>,
     /// Lifecycle-managed lane slots, index = lane id. `None` = lane
     /// never opened or explicitly finalized; see [`LaneSlot`] for the
     /// open/suspended split. Slot count is fixed at
     /// [`PeerSession::max_lanes`] so ids stay stable; a std Mutex
     /// because holders only clone the Arc out (never held across an
     /// await).
+    #[cfg_attr(
+        not(any(test, feature = "legacy-media")),
+        allow(dead_code, reason = "frozen legacy-media compatibility state")
+    )]
     video_tracks: std::sync::Mutex<Vec<Option<LaneSlot>>>,
+    #[cfg_attr(
+        not(any(test, feature = "legacy-media")),
+        allow(dead_code, reason = "frozen legacy-media compatibility state")
+    )]
     audio_tracks: std::sync::Mutex<Vec<Option<LaneSlot>>>,
     /// Device lane ceiling (see [`resolve_media_lanes`]).
+    #[cfg_attr(
+        not(any(test, feature = "legacy-media")),
+        allow(dead_code, reason = "frozen legacy-media compatibility state")
+    )]
     max_lanes: usize,
     legacy_media_profile: Option<LegacyWebRtcMediaProfile>,
     events_tx: ConnectorEventSink,
     /// Codec-neutral flow owners used by the WebRTC compatibility adapter.
     /// The `(is_video_adapter, lane)` key never leaves this adapter.
+    #[cfg_attr(
+        not(any(test, feature = "legacy-media")),
+        allow(dead_code, reason = "frozen legacy-media compatibility state")
+    )]
     outbound_realtime_flows: SyncMutex<std::collections::BTreeMap<(bool, u8), RealtimeFlowPort>>,
+    #[cfg_attr(
+        not(any(test, feature = "legacy-media")),
+        allow(dead_code, reason = "frozen legacy-media compatibility state")
+    )]
     lane_operations: Mutex<()>,
     #[cfg(test)]
     fail_next_track_attach: AtomicBool,
@@ -3145,6 +3475,10 @@ pub struct PeerSession {
     fail_next_track_remove: AtomicBool,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     role: Role,
+    #[cfg_attr(
+        not(any(test, feature = "legacy-media")),
+        allow(dead_code, reason = "frozen legacy-media compatibility state")
+    )]
     resource_scope: Option<PeerConnectionResourceScope>,
 }
 
@@ -3156,7 +3490,7 @@ impl PeerSession {
     /// True once the data channel is established on this side
     /// (open and `on_open` fired).
     pub async fn has_data_channel(&self) -> bool {
-        self.data_channel.lock().await.is_some()
+        self.data_channel.lock().is_some()
     }
 
     /// Build an offer SDP. Offerer-only (answerer never calls this).
@@ -3288,9 +3622,10 @@ impl PeerSession {
     /// Send bytes on the data channel. Returns the number of bytes
     /// queued for transmission (matches webrtc-rs's contract).
     pub async fn send(&self, payload: Bytes) -> Result<usize> {
-        let dc = self.data_channel.lock().await;
-        let dc = dc
-            .as_ref()
+        let dc = self
+            .data_channel
+            .lock()
+            .clone()
             .ok_or_else(|| Error::Transport("data channel not open".into()))?;
         dc.send(&payload)
             .await
@@ -3735,14 +4070,18 @@ mod tests {
         let (control, control_rx) = mpsc::channel(capacities.control().get());
         let (endpoint_data, endpoint_data_rx) = mpsc::channel(capacities.endpoint_data().get());
         let realtime_flows = RealtimeFlowRegistry::new(policy);
+        let lifecycle = Arc::new(ConnectorLifecycleOwner::default());
         (
             ConnectorEventMailboxes {
                 control,
                 endpoint_data,
+                lifecycle: Arc::clone(&lifecycle),
             },
             TransportEventReceiver {
                 control: control_rx,
                 endpoint_data: endpoint_data_rx,
+                lifecycle,
+                lifecycle_closed: false,
                 realtime_flows,
                 scheduler: ConnectorCallbackScheduler::new(policy.service_weights()),
             },
@@ -3762,6 +4101,7 @@ mod tests {
             attempt_liveness: None,
             candidate_promoted: Arc::new(AtomicBool::new(true)),
             callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+            callback_violation_reported: Arc::new(AtomicBool::new(false)),
             callback_policy: policy,
             operation_fence: Arc::new(ConnectorOperationFence::default()),
         }
@@ -3790,8 +4130,11 @@ mod tests {
             PRE_PROVISIONED_LANES,
         )
         .expect("legacy test profile is structurally valid");
+        let callback_policy = ConnectorCallbackPolicy::unrestricted_lab(
+            NonZeroUsize::new(32).expect("native compatibility fixture capacity is nonzero"),
+        );
         transport
-            .open_peer_with_config_and_legacy_media_profile(role, config, profile)
+            .open_peer_with_config_and_legacy_media_profile(role, config, profile, callback_policy)
             .await
     }
 
@@ -3997,7 +4340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03h_full_mailbox_does_not_hide_a_producer_before_close() {
+    async fn v4_arc03i_close_supersedes_prequeued_endpoint_data_without_hidden_producers() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
         let policy = ConnectorCallbackPolicy::new(
             crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
@@ -4029,12 +4372,201 @@ mod tests {
             "a causally later message is discarded after the close commit"
         );
 
-        receiver.scheduler.cursor = ConnectorCallbackClass::EndpointData.index();
-        receiver.scheduler.remaining = 1;
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::Message(bytes)) if bytes == Bytes::from_static(b"before-close")
+            Ok(TransportEvent::DataChannelClosed)
         ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03i_open_and_close_do_not_depend_on_control_mailbox_capacity() {
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let policy = ConnectorCallbackPolicy::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
+            ConnectorCallbackServiceWeights::data_only(one, one),
+            RealtimeConnectorPolicy::Disabled,
+        )
+        .expect("data-only fixture policy is valid");
+        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+
+        assert!(sink.emit(TransportEvent::LocalIceCandidate(None)).await);
+        assert_eq!(
+            sink.try_emit_data_channel(TransportEvent::DataChannelOpen)
+                .await,
+            ConnectorCallbackInsertResult::Queued
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::DataChannelOpen)
+        ));
+        assert!(receiver.lifecycle.commit_open());
+
+        assert_eq!(
+            sink.try_emit_data_channel(TransportEvent::DataChannelClosed)
+                .await,
+            ConnectorCallbackInsertResult::Queued
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::DataChannelClosed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03i_close_supersedes_an_uncommitted_open_exactly_once() {
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+        );
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+
+        assert_eq!(
+            sink.try_emit_data_channel(TransportEvent::DataChannelOpen)
+                .await,
+            ConnectorCallbackInsertResult::Queued
+        );
+        assert_eq!(
+            sink.try_emit_data_channel(TransportEvent::DataChannelClosed)
+                .await,
+            ConnectorCallbackInsertResult::Queued
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::DataChannelClosed)
+        ));
+        assert!(!receiver.lifecycle.commit_open());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03i_candidate_and_gathering_overload_retires_the_connector() {
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let policy = ConnectorCallbackPolicy::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
+            ConnectorCallbackServiceWeights::data_only(one, one),
+            RealtimeConnectorPolicy::Disabled,
+        )
+        .expect("data-only fixture policy is valid");
+        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+
+        assert!(
+            sink.emit(TransportEvent::LocalIceCandidate(
+                Some(observed_candidate())
+            ))
+            .await
+        );
+        assert!(
+            !sink.emit(TransportEvent::LocalIceCandidate(None)).await,
+            "gathering completion reports overload instead of disappearing"
+        );
+        assert_eq!(
+            receiver.lifecycle.phase(),
+            ConnectorLifecyclePhase::ClosedPending
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::DataChannelClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03i_renegotiation_and_state_observations_are_coalesced() {
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+        );
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+
+        assert!(sink.emit(TransportEvent::RenegotiationNeeded).await);
+        assert!(sink.emit(TransportEvent::RenegotiationNeeded).await);
+        assert!(
+            sink.emit(TransportEvent::IceConnectionStateChanged(
+                RTCIceConnectionState::Checking,
+            ))
+            .await
+        );
+        assert!(
+            sink.emit(TransportEvent::IceConnectionStateChanged(
+                RTCIceConnectionState::Connected,
+            ))
+            .await
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::RenegotiationNeeded)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::IceConnectionStateChanged(
+                RTCIceConnectionState::Connected
+            ))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn v4_arc03i_first_structural_violation_retires_once() {
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+        );
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+
+        sink.structural_violation("first fixture violation");
+        sink.structural_violation("second fixture violation");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::DataChannelClosed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn v4_arc03i_native_data_channel_shape_is_fixed_and_violation_work_is_coalesced() {
+        assert_eq!(
+            admit_native_data_channel(APP_DATA_CHANNEL_LABEL, false),
+            NativeDataChannelAdmission::Install
+        );
+        assert_eq!(
+            admit_native_data_channel(APP_DATA_CHANNEL_LABEL, true),
+            NativeDataChannelAdmission::Violation("duplicate application data channel")
+        );
+
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+        );
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+        for _ in 0..32 {
+            let NativeDataChannelAdmission::Violation(reason) =
+                admit_native_data_channel("unexpected", true)
+            else {
+                panic!("unexpected label cannot become an application channel");
+            };
+            sink.structural_violation(reason);
+        }
+        sink.structural_violation("duplicate application data channel");
+
         assert!(matches!(
             receiver.try_recv(),
             Ok(TransportEvent::DataChannelClosed)
@@ -4953,6 +5485,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v4_arc03i_cleanup_panic_retains_claim_after_last_external_owner_drops() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        close_owner.panic_cleanup_future_for_test();
+        close_owner.start();
+        drop(close_owner);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner.report().failed_cleanup_candidates != 1
+                || owner.process_report().cleanup.failed_jobs != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cleanup job retains its exact failure owner");
+        let mesh = owner.report();
+        let process = owner.process_report();
+        assert_eq!(mesh.active_candidates, 1);
+        assert_eq!(mesh.failed_cleanup_candidates, 1);
+        assert_eq!(process.active_candidates, 1);
+        assert_eq!(process.failed_cleanup_candidates, 1);
+        assert_eq!(process.cleanup.failed_jobs, 1);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03i_executor_termination_retains_active_job_without_external_owner() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Gate(gate),
+                calls: Arc::clone(&calls),
+            }))
+        );
+        close_owner.start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup future is active before executor termination");
+        drop(close_owner);
+
+        owner.fail_cleanup_executor_for_test();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner.report().failed_cleanup_candidates != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("executor termination invokes the job-owned failure capability");
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.process_report().failed_cleanup_candidates, 1);
+        assert!(owner.process_report().cleanup.executor_failed);
+    }
+
+    #[tokio::test]
     async fn v4_arc03h_cleanup_executor_failure_refuses_job_and_fails_exact_owner() {
         let owner = test_resource_owner(2, 1);
         let (close_owner, _lifetime) = close_owner_fixture(&owner);
@@ -5236,7 +5829,11 @@ mod tests {
         let candidate_use = candidate_resource_measurement(&candidate).observed();
         let mut queue = PendingRemoteCandidateQueue::new(test_pending_candidate_policy());
         assert_eq!(
-            queue.push(candidate, &scope),
+            queue.push(
+                candidate,
+                Arc::new(RemoteCandidateAttemptIdentity::default()),
+                &scope,
+            ),
             PendingRemoteCandidateQueuePush::Queued
         );
         let container_use = queue_container_resource_measurement(&queue.entries).observed();
@@ -5372,6 +5969,20 @@ mod tests {
     }
 
     #[test]
+    fn v4_arc03i_candidate_digest_distinguishes_absent_and_maximum_mline_index() {
+        let mut absent = observed_candidate();
+        absent.sdp_mline_index = None;
+        let mut maximum = absent.clone();
+        maximum.sdp_mline_index = Some(u16::MAX);
+
+        assert_ne!(
+            candidate_content_digest(&absent),
+            candidate_content_digest(&maximum),
+            "option presence participates in duplicate identity"
+        );
+    }
+
+    #[test]
     fn v4_arc03h_candidate_attempt_envelope_survives_delayed_apply_and_cancellation() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
@@ -5390,7 +6001,11 @@ mod tests {
         let mut queue = PendingRemoteCandidateQueue::new(policy);
         let budget = Arc::clone(&queue.budget);
         assert_eq!(
-            queue.push(candidate, &scope),
+            queue.push(
+                candidate,
+                Arc::new(RemoteCandidateAttemptIdentity::default()),
+                &scope,
+            ),
             PendingRemoteCandidateQueuePush::Queued
         );
         let mut drain = queue.take();
@@ -5421,7 +6036,9 @@ mod tests {
         let mut state = RemoteCandidateState::new(policy);
         let displaced_budget = Arc::clone(&state.pending.budget);
         assert_eq!(
-            state.pending.push(observed_candidate(), &scope),
+            state
+                .pending
+                .push(observed_candidate(), Arc::clone(&state.attempt), &scope,),
             PendingRemoteCandidateQueuePush::Queued
         );
         assert_eq!(displaced_budget.report().0, 1);
@@ -5430,6 +6047,58 @@ mod tests {
         drop(displaced);
         assert_eq!(displaced_budget.report().0, 1);
         assert_eq!(state.pending.budget.report(), (0, 0, 0, 0, false));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03i_ice_restart_retires_old_candidate_identity_before_replacement() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        assert_eq!(
+            state.admit(observed_candidate(), &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let old_attempt = Arc::clone(&state.attempt);
+        let old_operation = old_attempt
+            .try_enter()
+            .expect("old attempt admits work before restart");
+        let retiring = state.begin_ice_restart();
+
+        assert!(Arc::ptr_eq(&old_attempt, &retiring));
+        assert!(!old_attempt.is_active());
+        assert!(state.attempt.is_active());
+        assert!(!Arc::ptr_eq(&old_attempt, &state.attempt));
+        assert!(!state.remote_description_set);
+        assert!(state.pending.entries.is_empty());
+
+        let replacement_candidate = observed_candidate();
+        assert_eq!(
+            state.admit(replacement_candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        assert_eq!(state.pending.entries.len(), 1);
+        assert!(Arc::ptr_eq(
+            &state.pending.entries[0].attempt,
+            &state.attempt
+        ));
+        assert!(
+            !state.remote_description_set,
+            "replacement candidates remain held until replacement SDP commits"
+        );
+
+        let mut waiting = Box::pin(retiring.wait_for_operations());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(old_operation);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("restart barrier releases after old work retires");
     }
 
     #[test]
@@ -5506,8 +6175,9 @@ mod tests {
         let old_budget = Arc::clone(&state.pending.budget);
         assert_eq!(old_budget.report(), (2, content_bytes * 2, 2, 1, false));
 
-        state.renew_for_ice_restart();
-        assert!(state.remote_description_set);
+        let retiring_attempt = state.begin_ice_restart();
+        assert!(!retiring_attempt.is_active());
+        assert!(!state.remote_description_set);
         assert_eq!(state.pending.budget.report(), (0, 0, 0, 0, false));
         assert_eq!(old_budget.report(), (2, content_bytes * 2, 2, 1, false));
     }
@@ -5550,7 +6220,11 @@ mod tests {
         for (index, candidate) in candidates.iter().cloned().enumerate() {
             let pushed_at = Instant::now();
             assert_eq!(
-                queue.push(candidate, &scope),
+                queue.push(
+                    candidate,
+                    Arc::new(RemoteCandidateAttemptIdentity::default()),
+                    &scope,
+                ),
                 PendingRemoteCandidateQueuePush::Queued
             );
             let (items, content_bytes, duplicates, work, poisoned) = queue.budget.report();
@@ -5561,7 +6235,11 @@ mod tests {
         }
         let duplicate_at = Instant::now();
         assert_eq!(
-            queue.push(candidates[0].clone(), &scope),
+            queue.push(
+                candidates[0].clone(),
+                Arc::new(RemoteCandidateAttemptIdentity::default()),
+                &scope,
+            ),
             PendingRemoteCandidateQueuePush::Duplicate
         );
         println!(
@@ -5582,7 +6260,11 @@ mod tests {
         let process = ProcessResourceRoot::isolated();
         let context = process.mesh_runtime_scope().network_instance_scope();
         let scope = context.peer_connection_scope();
-        let pending = PendingRemoteCandidate::observe(observed_candidate(), &scope);
+        let pending = PendingRemoteCandidate::observe(
+            observed_candidate(),
+            Arc::new(RemoteCandidateAttemptIdentity::default()),
+            &scope,
+        );
         let mut application = Box::pin(apply_pending_remote_candidate(pending, |_| {
             std::future::pending::<std::result::Result<(), ()>>()
         }));
@@ -5605,7 +6287,11 @@ mod tests {
         let process = ProcessResourceRoot::isolated();
         let context = process.mesh_runtime_scope().network_instance_scope();
         let scope = context.peer_connection_scope();
-        let pending = PendingRemoteCandidate::observe(observed_candidate(), &scope);
+        let pending = PendingRemoteCandidate::observe(
+            observed_candidate(),
+            Arc::new(RemoteCandidateAttemptIdentity::default()),
+            &scope,
+        );
         let incarnation = Arc::new(WebRtcConnectorIncarnation::new());
         let retirement = incarnation.subscribe_retirement();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -5778,11 +6464,24 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc03_control_callback_contention_honors_configured_bound() {
-        assert_callback_class_backpressure(
-            TransportEvent::DataChannelOpen,
-            TransportEvent::DataChannelClosed,
+    fn v4_arc03i_lifecycle_control_does_not_compete_for_mailbox_capacity() {
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
+        let sink = test_event_sink(events, policy, None);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        let mut open = Box::pin(sink.emit(TransportEvent::DataChannelOpen));
+        assert_eq!(open.as_mut().poll(&mut context), Poll::Ready(true));
+        let mut close = Box::pin(sink.emit(TransportEvent::DataChannelClosed));
+        assert_eq!(close.as_mut().poll(&mut context), Poll::Ready(true));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::DataChannelClosed)
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -6146,10 +6845,13 @@ mod tests {
         let attempt_retirement = candidate.liveness().subscribe_retirement();
         let ownership = admitted_ownership(candidate);
         let remote_candidates = Arc::new(SyncMutex::new(test_remote_candidate_state()));
-        remote_candidates
-            .lock()
-            .pending
-            .push(observed_candidate(), &resource_scope);
+        {
+            let mut candidates = remote_candidates.lock();
+            let attempt = Arc::clone(&candidates.attempt);
+            candidates
+                .pending
+                .push(observed_candidate(), attempt, &resource_scope);
+        }
         let (_events_tx, events) = test_event_mailboxes(1);
         let mut receiver = WebRtcConnectorEventReceiver {
             ownership: ownership.clone(),
@@ -6738,6 +7440,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v4_arc03i_legacy_track_shape_bounds_duplicates_codecs_and_track_count() {
+        let profile = LegacyWebRtcMediaProfile::h264_opus(
+            NonZeroUsize::new(2).expect("fixture lane ceiling is nonzero"),
+            0,
+            0,
+        )
+        .expect("fixture profile is valid");
+        let mut admitted = std::collections::HashSet::new();
+
+        for (kind, mime, id) in [
+            (RTPCodecType::Video, MIME_TYPE_H264, "video-0"),
+            (RTPCodecType::Video, MIME_TYPE_H264, "video-1"),
+            (RTPCodecType::Audio, MIME_TYPE_OPUS, "audio-0"),
+            (RTPCodecType::Audio, MIME_TYPE_OPUS, "audio-1"),
+        ] {
+            assert!(admit_legacy_track_shape(kind, mime, id, profile, &mut admitted).is_ok());
+        }
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(
+            admit_legacy_track_shape(
+                RTPCodecType::Video,
+                MIME_TYPE_H264,
+                "video-0",
+                profile,
+                &mut admitted,
+            ),
+            Err("duplicate compatibility media track")
+        );
+        for (kind, mime, id) in [
+            (RTPCodecType::Video, "video/VP8", "video-0"),
+            (RTPCodecType::Audio, MIME_TYPE_OPUS, "audio-x"),
+            (RTPCodecType::Video, MIME_TYPE_H264, "video-2"),
+        ] {
+            assert_eq!(
+                admit_legacy_track_shape(kind, mime, id, profile, &mut admitted),
+                Err("media track is outside the compatibility provider")
+            );
+        }
+        assert_eq!(admitted.len(), 4);
+    }
+
     // ---- ICE interface filter -----------------------------------------
 
     #[test]
@@ -7111,13 +7855,13 @@ mod tests {
         let observed_at = Instant::now();
         let transport = Transport::new().expect("transport");
         let cfg = RTCConfiguration::default();
-
+        let callback_policy = test_webrtc_profile(32).callbacks();
         let (offerer, mut off_rx) = transport
-            .open_peer_with_config(Role::Offerer, cfg.clone())
+            .open_peer_with_config(Role::Offerer, cfg.clone(), callback_policy)
             .await
             .expect("offerer");
         let (answerer, mut ans_rx) = transport
-            .open_peer_with_config(Role::Answerer, cfg)
+            .open_peer_with_config(Role::Answerer, cfg, callback_policy)
             .await
             .expect("answerer");
 
@@ -7277,14 +8021,10 @@ mod tests {
         // the negotiation-without-renegotiation property end to end:
         // m-line in the one offer/answer, RTP, depacketize, reassembly.
         let transport = Transport::new().expect("transport");
-        let cfg = RTCConfiguration::default();
-
-        let (offerer, mut off_rx) = transport
-            .open_peer_with_config(Role::Offerer, cfg.clone())
+        let (offerer, mut off_rx) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
             .await
             .expect("offerer");
-        let (answerer, mut ans_rx) = transport
-            .open_peer_with_config(Role::Answerer, cfg)
+        let (answerer, mut ans_rx) = open_explicit_legacy_media_peer(&transport, Role::Answerer)
             .await
             .expect("answerer");
 
@@ -7379,14 +8119,10 @@ mod tests {
         // negotiates both lanes, and no reassembly exists to get wrong
         // (one frame per RTP packet, RFC 7587).
         let transport = Transport::new().expect("transport");
-        let cfg = RTCConfiguration::default();
-
-        let (offerer, mut off_rx) = transport
-            .open_peer_with_config(Role::Offerer, cfg.clone())
+        let (offerer, mut off_rx) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
             .await
             .expect("offerer");
-        let (answerer, mut ans_rx) = transport
-            .open_peer_with_config(Role::Answerer, cfg)
+        let (answerer, mut ans_rx) = open_explicit_legacy_media_peer(&transport, Role::Answerer)
             .await
             .expect("answerer");
 
@@ -7484,10 +8220,29 @@ mod tests {
         let transport = Transport::new()
             .expect("test transport")
             .with_connector_resource_scope(owner, test_generic_realtime_webrtc_profile(4));
+        assert!(
+            transport.legacy_media_api.lock().is_none(),
+            "generic construction does not register compatibility codecs"
+        );
         let (worker, _events) = transport
-            .open_connector_peer(Role::Answerer, &[], &[], scope)
+            .open_connector_peer(Role::Offerer, &[], &[], scope)
             .await
             .expect("data-only connector is constructed");
+
+        let offer = worker
+            .create_offer()
+            .await
+            .expect("data-only connector creates an offer");
+        assert!(offer
+            .sdp
+            .lines()
+            .any(|line| line.starts_with("m=application")));
+        assert!(!offer.sdp.lines().any(|line| line.starts_with("m=audio")));
+        assert!(!offer.sdp.lines().any(|line| line.starts_with("m=video")));
+        assert!(
+            transport.legacy_media_api.lock().is_none(),
+            "opening a provider-free connector keeps codec registration absent"
+        );
 
         assert_eq!(worker.session.open_lane_count(LaneKind::Video), 0);
         assert_eq!(worker.session.open_lane_count(LaneKind::Audio), 0);
@@ -7622,8 +8377,7 @@ mod tests {
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
     async fn v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner() {
         let transport = Transport::new().expect("transport");
-        let (session, _events) = transport
-            .open_peer(Role::Offerer, &[], &[])
+        let (session, _events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
             .await
             .expect("open");
         let baseline = session.outbound_realtime_flows.lock().len();

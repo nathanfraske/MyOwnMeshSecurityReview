@@ -244,7 +244,10 @@ mod tests {
 
     #[test]
     fn v4_arc03g_generic_realtime_policy_does_not_request_media_tracks() {
-        assert_eq!(explicit_realtime_test_policy(1).legacy_media(), None);
+        assert_eq!(
+            explicit_realtime_test_policy(1).legacy_media_internal(),
+            None
+        );
     }
 
     #[test]

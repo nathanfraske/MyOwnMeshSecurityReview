@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "baseline_commit": "2a04e29e0a4c09b95a4914972018850ddb2cbacb",
-  "scope": "Production Rust in workspace crates, crate build scripts, and the Tauri Rust client at the Arc 01 baseline, additively extended with the linked Arc 02 capability and resource-observation modules and the Arc 03 WebRTC connector-owner implementation. Test-only code is excluded. Normalized full source, declaration bodies and members, named callable bodies, registered transport callbacks, static state, and mechanically discoverable effects are fingerprinted.",
+  "scope": "Historical Arc 01 transition snapshot. This record is not current for Arc 03I and its checker intentionally reports source, declaration, surface, marker, and resource drift until a separate reviewed inventory refresh assigns the new owners. Test-only code is excluded from the recorded snapshot.",
   "node_targets": [
     "Semantic Node",
     "Signaling Node",

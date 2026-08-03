@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::state::NetworkState;
+use myownmesh_core::engine::NetworkState;
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;

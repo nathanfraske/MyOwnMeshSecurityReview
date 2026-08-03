@@ -16,23 +16,35 @@
 
 pub mod diag;
 pub mod ice;
-pub mod webrtc;
+pub(crate) mod webrtc;
 
 pub use diag::{
     IceCandidateKind, IceCandidateStats, IceCheckSnapshot, IcePairSnapshot, PeerDiag,
     SelectedCandidatePair,
 };
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
+#[cfg(feature = "transport-lab")]
+pub use webrtc::TransportEvent;
+#[cfg(not(feature = "transport-lab"))]
+pub(crate) use webrtc::TransportEvent;
+#[cfg(feature = "legacy-media")]
 #[allow(
     deprecated,
-    reason = "this one symbol is the explicit legacy media compatibility query"
+    reason = "these are the explicit deprecated legacy-media compatibility exports"
 )]
-pub use webrtc::resolved_media_lanes;
+#[deprecated(
+    since = "0.3.2",
+    note = "temporary legacy H.264 and Opus compatibility surface"
+)]
 pub use webrtc::{
-    AudioSample, LocalIceCandidate, PeerSession, Role, Transport, TransportEvent, VideoSample,
-    MEDIA_LANES,
+    resolved_media_lanes, AudioSample, LaneKind, LegacyWebRtcMediaProfile,
+    LegacyWebRtcMediaProfileError, VideoSample, MEDIA_LANES,
 };
 pub(crate) use webrtc::{
     DataChannelOpenOwnership, EndpointAuthHandoff, RemoteCandidateDisposition,
     WebRtcConnectorEvent, WebRtcConnectorIncarnation, WebRtcConnectorWorker,
+};
+pub use webrtc::{
+    LocalIceCandidate, PeerSession, PendingRemoteCandidatePolicy, Role, Transport,
+    WebRtcConnectorProfile, WebRtcConnectorProfileError,
 };

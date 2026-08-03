@@ -37,7 +37,7 @@ policy. MyOwnMesh does not provide default policy values. Use
 `Mesh::open_infrastructure_only` only for a runtime that cannot join a network.
 
 ```rust
-use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig};
+use myownmesh_core::{Mesh, MeshConfig, WebRtcConnectorCapablePolicy};
 
 let mesh = Mesh::open_connector_capable(
     MeshConfig::default(),

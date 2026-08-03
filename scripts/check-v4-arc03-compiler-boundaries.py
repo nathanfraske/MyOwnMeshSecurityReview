@@ -41,11 +41,35 @@ fn main() {}
     ),
     RejectedProbe(
         "connector_worker_is_not_public",
-        """use myownmesh_core::transport::webrtc::WebRtcConnectorWorker; // expected-error
+        """use myownmesh_core::transport::WebRtcConnectorWorker; // expected-error
 fn main() { let _ = std::mem::size_of::<WebRtcConnectorWorker>(); }
 """,
         "E0603",
         ("WebRtcConnectorWorker", "private"),
+    ),
+    RejectedProbe(
+        "legacy_media_sample_is_not_in_default_v4_api",
+        """use myownmesh_core::transport::VideoSample; // expected-error
+fn main() { let _ = std::mem::size_of::<VideoSample>(); }
+""",
+        "E0432",
+        ("VideoSample", "no `VideoSample`"),
+    ),
+    RejectedProbe(
+        "legacy_media_lane_is_not_in_default_v4_api",
+        """use myownmesh_core::transport::LaneKind; // expected-error
+fn main() { let _ = std::mem::size_of::<LaneKind>(); }
+""",
+        "E0432",
+        ("LaneKind", "no `LaneKind`"),
+    ),
+    RejectedProbe(
+        "legacy_media_profile_is_not_in_default_v4_api",
+        """use myownmesh_core::LegacyWebRtcMediaProfile; // expected-error
+fn main() { let _ = std::mem::size_of::<LegacyWebRtcMediaProfile>(); }
+""",
+        "E0432",
+        ("LegacyWebRtcMediaProfile", "no `LegacyWebRtcMediaProfile`"),
     ),
     RejectedProbe(
         "raw_peer_constructor_is_not_production_api",
@@ -346,6 +370,22 @@ def main() -> int:
         failures.append("ambiguous ownerless embedded::start constructor still exists")
     if "ConnectorOperationFence" not in webrtc_source:
         failures.append("connector operation lifecycle fence is missing")
+    for lifecycle_phase in (
+        "AwaitingOpen",
+        "OpenPending",
+        "OpenCommitted",
+        "ClosedPending",
+        "ClosedDelivered",
+    ):
+        if lifecycle_phase not in webrtc_source:
+            failures.append(f"connector lifecycle owner is missing {lifecycle_phase}")
+    if not (
+        "lifecycle: Arc<ConnectorLifecycleOwner>" in webrtc_source
+        and "self.events.lifecycle.record_open()" in webrtc_source
+        and "self.events.lifecycle.record_close()" in webrtc_source
+        and "self.raw.lifecycle.commit_open()" in webrtc_source
+    ):
+        failures.append("open and close are not owned by the fixed connector lifecycle owner")
     for forbidden_close_authority in (
         "ConnectorCloseStatus::Unproven",
         "mark_cleanup_unproven",
@@ -380,6 +420,31 @@ def main() -> int:
         failures.append("connector callback producer can still await mailbox capacity")
     if "match mailbox.try_send(queued)" not in webrtc_source:
         failures.append("connector callback insertion does not use typed nonblocking admission")
+    if not (
+        "struct RemoteCandidateAttemptIdentity" in webrtc_source
+        and "pending.attempt.try_enter()" in webrtc_source
+        and "begin_ice_restart" in webrtc_source
+        and "wait_for_operations().await" in webrtc_source
+    ):
+        failures.append("remote candidates do not carry an exact ICE-attempt lifetime fence")
+    if not re.search(
+        r"match\s+candidate\.sdp_mline_index\s*\{\s*Some\(value\).*?hash\.update\(\[1\]\).*?None\s*=>\s*hash\.update\(\[0\]\)",
+        webrtc_source,
+        flags=re.DOTALL,
+    ):
+        failures.append("candidate duplicate identity does not tag media-line option presence")
+    if not (
+        "NativeDataChannelAdmission" in webrtc_source
+        and "admit_legacy_track_shape" in webrtc_source
+        and "callback_violation_reported" in webrtc_source
+    ):
+        failures.append("native data-channel and track cardinality are not structurally bounded")
+    if not (
+        "legacy_media_api: Arc<SyncMutex<Option<Arc<webrtc::api::API>>>>" in webrtc_source
+        and "if legacy_media_profile.is_some()" in webrtc_source
+        and "build_legacy_media_api()?" in webrtc_source
+    ):
+        failures.append("compatibility codec registration is not provider-selected and lazy")
 
     for legacy_call in (
         "routing::send_routed(",
@@ -413,6 +478,18 @@ def main() -> int:
     )
     if relay_start is None or "LegacyV1Runtime" not in relay_start.group("args"):
         failures.append("legacy relay service start lacks the explicit runtime")
+    if not (
+        "legacy_v1_networks: HashMap<String, LegacyNetworkRuntime>" in services_source
+        and "legacy_v1_relays: HashMap<String, LegacyRelayRuntime>" in services_source
+        and "LegacyNetworkRuntime::bind(runtime, &joined)" in services_source
+        and "LegacyRelayRuntime::start(" in services_source
+    ):
+        failures.append("LegacyV1 routing and member relay do not have separate daemon owners")
+    if not (
+        "routing::is_routing_wrapper" in relay_source
+        and "routing::on_relay_frame" in legacy_profile_source
+    ):
+        failures.append("LegacyV1 reserved-wire envelopes lack one semantic owner")
     for name, source in (
         ("V4 connector", webrtc_source),
         ("V4 engine", engine_source),

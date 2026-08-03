@@ -167,46 +167,55 @@ async fn run(state: Arc<NetworkState>, max_fanout: u32) {
                 continue;
             }
         };
-        let from = msg.from;
-        let env = msg.body;
-
-        // Snapshot roster + reachable peers fresh per frame so a peer
-        // that just left or was removed isn't relayed to.
-        let rostered: Vec<String> = state
-            .roster
-            .read()
-            .authorized_devices
-            .iter()
-            .map(|d| d.device_id.clone())
-            .collect();
-        let reachable: Vec<String> = state
-            .peer_snapshot()
-            .into_iter()
-            .filter(|p| is_reachable_status(p.status))
-            .map(|p| p.device_id)
-            .collect();
-
-        let targets = relay_targets(&from, &env.dst, &rostered, &reachable, max_fanout);
-        if targets.is_empty() {
-            trace!(%from, dst = %env.dst, "relay: no eligible targets");
+        if super::routing::is_routing_wrapper(&msg.body.payload) {
             continue;
         }
-
-        // Stamp the authenticated origin and clear dst so the recipient
-        // sees a flat "from src" frame regardless of how it was
-        // addressed.
-        let out = RelayEnvelope {
-            dst: String::new(),
-            src: from.clone(),
-            payload: env.payload,
-        };
-        for target in &targets {
-            if let Err(e) = channel.send_to(target, &out).await {
-                trace!(%target, "relay: forward failed: {e}");
-            }
-        }
-        debug!(%from, count = targets.len(), "relay: forwarded frame");
+        forward_envelope(&state, &channel, msg.from, msg.body, max_fanout).await;
     }
+}
+
+#[allow(
+    deprecated,
+    reason = "this function is confined to the frozen LegacyV1 subtree"
+)]
+pub(super) async fn forward_envelope(
+    state: &Arc<NetworkState>,
+    channel: &Channel<RelayEnvelope>,
+    from: String,
+    env: RelayEnvelope,
+    max_fanout: u32,
+) {
+    let rostered: Vec<String> = state
+        .roster
+        .read()
+        .authorized_devices
+        .iter()
+        .map(|device| device.device_id.clone())
+        .collect();
+    let reachable: Vec<String> = state
+        .peer_snapshot()
+        .into_iter()
+        .filter(|peer| is_reachable_status(peer.status))
+        .map(|peer| peer.device_id)
+        .collect();
+
+    let targets = relay_targets(&from, &env.dst, &rostered, &reachable, max_fanout);
+    if targets.is_empty() {
+        trace!(%from, dst = %env.dst, "relay: no eligible targets");
+        return;
+    }
+
+    let out = RelayEnvelope {
+        dst: String::new(),
+        src: from.clone(),
+        payload: env.payload,
+    };
+    for target in &targets {
+        if let Err(error) = channel.send_to(target, &out).await {
+            trace!(%target, "relay: forward failed: {error}");
+        }
+    }
+    debug!(%from, count = targets.len(), "relay: forwarded frame");
 }
 
 #[cfg(test)]

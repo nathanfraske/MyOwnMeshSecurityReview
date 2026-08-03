@@ -27,7 +27,7 @@ use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceRep
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
 use crate::runtime::attempt::{
-    ConnectorCapableResourcePolicy, ConnectorResourceOwnerReport, MeshConnectorResourceReport,
+    ConnectorResourceOwnerReport, MeshConnectorResourceReport, WebRtcConnectorCapablePolicy,
 };
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
@@ -80,7 +80,7 @@ impl Mesh {
     /// inferred capacity.
     pub async fn open_connector_capable(
         config: MeshConfig,
-        policy: ConnectorCapableResourcePolicy,
+        policy: WebRtcConnectorCapablePolicy,
     ) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
         Self::open_connector_capable_with_identity(config, identity, policy).await
@@ -107,7 +107,7 @@ impl Mesh {
     pub async fn open_connector_capable_with_identity(
         _config: MeshConfig,
         identity: Arc<Identity>,
-        policy: ConnectorCapableResourcePolicy,
+        policy: WebRtcConnectorCapablePolicy,
     ) -> Result<MeshHandle> {
         let transport = Transport::new()?.with_connector_resource_policy(policy)?;
         Self::open_with_identity_and_transport(identity, transport)
@@ -596,10 +596,11 @@ impl JoinedNetwork {
         since = "0.3.2",
         note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
     )]
+    #[cfg(feature = "legacy-media")]
     pub async fn open_media_lane(
         &self,
         peer: &str,
-        kind: crate::transport::webrtc::LaneKind,
+        kind: crate::transport::LaneKind,
     ) -> Result<u8> {
         self.state.media_lane_open(peer, kind).await
     }
@@ -611,10 +612,11 @@ impl JoinedNetwork {
         since = "0.3.2",
         note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
     )]
+    #[cfg(feature = "legacy-media")]
     pub async fn close_media_lane(
         &self,
         peer: &str,
-        kind: crate::transport::webrtc::LaneKind,
+        kind: crate::transport::LaneKind,
         lane: u8,
     ) -> Result<()> {
         self.state.media_lane_close(peer, kind, lane).await

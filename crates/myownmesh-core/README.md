@@ -2,7 +2,7 @@
 
 The mesh runtime. This is the crate embedders depend on.
 
-Pull via git tag — library crates aren't on crates.io yet:
+Pull via git tag. The library crates are not on crates.io yet:
 
 ```toml
 myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }
@@ -14,20 +14,20 @@ catalogue and the path to crates.io.
 
 ## What's in here
 
-- **Identity** — long-lived ed25519 keypair, base32-lowercase device id.
-- **Roster** — per-network approved-peers file (0600 on Unix).
-- **Wire protocol** — `MeshMessage` variants, capability matrix.
-- **Topology** — Ring (default) / Star / FullMesh selectors. Pure functions; symmetric across peers.
-- **Transport** — webrtc-rs wrapper. `PeerSession` per peer, event mpsc the engine drains.
-- **Engine** — `hello` → `auth_response` handshake, ping/pong heartbeat, recovery driven by reliable transport signals (in-place ICE restart confirmed by inbound traffic, clean rebuild on failure), topology shelving.
-- **Channels** — typed pub/sub via `Channel<T>`.
-- **RPC** — generic `Rpc::call` / `serve` / `call_stream` / `serve_stream`.
-- **Facade** — `Mesh` → `MeshHandle` → `JoinedNetwork`.
+- **Identity:** long-lived ed25519 keypair, base32-lowercase device id.
+- **Roster:** per-network approved-peers file (0600 on Unix).
+- **Wire protocol:** `MeshMessage` variants and capability matrix.
+- **Topology:** Ring (default), Star, and FullMesh selectors. Pure functions that are symmetric across peers.
+- **Transport:** webrtc-rs wrapper. One `PeerSession` per peer, with event queues drained by the engine.
+- **Engine:** `hello` → `auth_response` handshake, ping/pong heartbeat, recovery driven by reliable transport signals, and topology shelving. Recovery uses in-place ICE restart confirmed by inbound traffic, then a clean rebuild on failure.
+- **Channels:** typed pub/sub via `Channel<T>`.
+- **RPC:** generic `Rpc::call`, `serve`, `call_stream`, and `serve_stream` operations.
+- **Facade:** `Mesh` → `MeshHandle` → `JoinedNetwork`.
 
 ## Public API tour
 
 ```rust
-use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig, NetworkConfig, TopologyMode};
+use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode, WebRtcConnectorCapablePolicy};
 
 // `connector_policy` is selected by the process owner. The library has no default.
 let mesh = Mesh::open_connector_capable(MeshConfig::default(), connector_policy).await?;
@@ -45,15 +45,15 @@ Full surface: `Mesh`, `MeshHandle`, `JoinedNetwork`, `MeshConfig`,
 Constants: `SIGN_DOMAIN_TAG`, `TRYSTERO_APP_ID`, `PROTOCOL_VERSION`.
 
 See [`../../docs/QUICKSTART.md`](../../docs/QUICKSTART.md) for the
-narrative walkthrough — identity, channels, RPC, roster,
+narrative walkthrough of identity, channels, RPC, roster,
 topology, shutdown.
 
 ## Persistent state
 
 ```
 ~/.myownmesh/
-├── .secrets/identity.json       (0600 — ed25519 keypair)
-└── mesh/rosters/{network_id}.json  (0600 — per-network approved peers)
+├── .secrets/identity.json       (0600, ed25519 keypair)
+└── mesh/rosters/{network_id}.json  (0600, per-network approved peers)
 ```
 
 Override the root via `MYOWNMESH_HOME=~/.youapp/mesh` so embedders
@@ -65,6 +65,6 @@ keep their state under their own directory tree.
 cargo test -p myownmesh-core
 ```
 
-Includes [`tests/two_peer_handshake.rs`](tests/two_peer_handshake.rs) —
+Includes [`tests/two_peer_handshake.rs`](tests/two_peer_handshake.rs), which uses
 two ephemeral identities, joined the same network via the in-process
 broker, full handshake + typed channel exchange end-to-end.

@@ -2,6 +2,7 @@
 
 #![allow(
     deprecated,
+    dead_code,
     reason = "this module is the frozen implementation behind the deprecated legacy media facade"
 )]
 
@@ -101,6 +102,23 @@ pub(super) fn legacy_track_identity(
     }
     lane_of_track_id(id, lane_kind, profile.max_lanes_per_kind().get())
         .map(|lane| (lane_kind, is_video, lane))
+}
+
+pub(super) fn admit_legacy_track_shape(
+    kind: RTPCodecType,
+    mime: &str,
+    id: &str,
+    profile: LegacyWebRtcMediaProfile,
+    admitted: &mut std::collections::HashSet<(bool, u8)>,
+) -> std::result::Result<(bool, u8), &'static str> {
+    let Some((_kind, is_video, lane)) = legacy_track_identity(kind, mime, id, profile) else {
+        return Err("media track is outside the compatibility provider");
+    };
+    let key = (is_video, lane);
+    if !admitted.insert(key) {
+        return Err("duplicate compatibility media track");
+    }
+    Ok(key)
 }
 
 /// Which media pool a lane belongs to.
