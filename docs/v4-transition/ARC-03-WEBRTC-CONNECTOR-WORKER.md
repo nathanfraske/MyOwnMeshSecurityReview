@@ -1,6 +1,6 @@
 # V4 Arc 03 WebRTC connector ownership
 
-Status: Arc 03I correction on `arc/03i-final-connector-boundary`. Fork PR #4 remains draft and unmerged, but its Arc 03H head is superseded by this branch. Arc 03I is not merge-approved. Arc 04 has not started.
+Status: Arc 03I correction on `arc/03i-final-connector-boundary` in draft fork PR #5. Fork PR #4 was closed without merge as a superseded Arc 03G record. Arc 03I is not merge-approved. Arc 04 has not started.
 
 ## 1. Scope
 

@@ -1,6 +1,6 @@
 # Arc 03 WebRTC connector ownership red team
 
-Status: Arc 03I executable review record. Fork PR #4 remains draft and unmerged, but its Arc 03H head is superseded by `arc/03i-final-connector-boundary`. Passing this record does not authorize merge or select a production resource value.
+Status: Arc 03I executable review record for draft fork PR #5 on `arc/03i-final-connector-boundary`. Fork PR #4 was closed without merge as a superseded Arc 03G record. Passing this record does not authorize merge or select a production resource value.
 
 ## 1. Isolation and exact-head commands
 
