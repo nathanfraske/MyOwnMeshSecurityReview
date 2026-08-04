@@ -1,6 +1,6 @@
 # Arc 03 WebRTC connector ownership red team
 
-Status: Arc 03I executable review record for draft fork PR #5 on `arc/03i-final-connector-boundary`. Fork PR #4 was closed without merge as a superseded Arc 03G record. Passing this record does not authorize merge or select a production resource value.
+Status: Arc 03J executable review record for draft fork PR #5 on `arc/03i-final-connector-boundary`. Fork PR #4 was closed without merge as a superseded Arc 03G record. Passing this record does not authorize merge or select a production resource value.
 
 ## 1. Isolation and exact-head commands
 
@@ -8,7 +8,7 @@ Run socket-bearing checks only inside Ubuntu 24.04 WSL. Do not run Windows test 
 
 ```powershell
 $repo = (Resolve-Path "C:\Users\Admin\MyOwnMesh Security Audit\MyOwnMeshV4Transition").Path
-$target = "/tmp/mom-arc03i-red-team"
+$target = "/tmp/mom-arc03j-red-team"
 
 wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target /root/.cargo/bin/cargo fmt --all -- --check
 wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target /root/.cargo/bin/cargo check --workspace --all-targets -j 16
@@ -24,7 +24,7 @@ wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target PATH=/root/.carg
 After retaining the logs, remove only this target:
 
 ```powershell
-wsl.exe -d Ubuntu-24.04 -- rm -rf /tmp/mom-arc03i-red-team
+wsl.exe -d Ubuntu-24.04 -- rm -rf /tmp/mom-arc03j-red-team
 ```
 
 ## 2. RT-03-01: manufacture connector capacity
@@ -118,7 +118,11 @@ Controls:
 
 Attack: submit unique and duplicate candidates on both sides of remote SDP, delay application, cancel application, and continue until application-work capacity is exhausted.
 
-Required result: one ICE-attempt envelope bounds unique items, candidate content bytes, duplicates, and native application work. Application does not reset the envelope. Only a new attempt or successful explicit ICE restart renews it.
+Required result: one ICE-attempt envelope bounds unique items, candidate content bytes, duplicates, and native application work. The first refusal retires the exact attempt. Later submissions return the terminal result before hashing or logging unique candidate content. Application does not reset the envelope.
+
+A local restart creates a provisional attempt, retires the old attempt, waits for admitted old work, and commits only after native restart succeeds. Native failure does not publish the replacement and retires the connector when rollback is not proven. A remote restart is detected from changed effective ICE credentials on an existing MID, or media-line index when MID is absent. Media reordering or addition cannot manufacture a fresh candidate envelope. The replacement stays provisional until the exact remote description commits. The DTLS fingerprint does not stand in for ICE credentials.
+
+A replacement candidate may arrive before the replacement SDP. It must consume finite ingress capacity without reaching the old native ICE agent, then move only to a provisional attempt whose exact SDP credentials and declared media section match it. Delayed old-attempt work cannot mutate the replacement. Concurrent local restart and remote-description transactions fail closed instead of creating two candidate owners.
 
 Controls:
 
@@ -129,7 +133,16 @@ Controls:
 - `v4_arc03h_post_sdp_candidates_share_one_cumulative_attempt_envelope`
 - `v4_arc03h_new_attempt_gets_a_fresh_candidate_envelope`
 - `v4_arc03i_candidate_digest_distinguishes_absent_and_maximum_mline_index`
-- `v4_arc03i_ice_restart_retires_old_candidate_identity_before_replacement`
+- `v4_arc03j_local_ice_restart_is_provisional_until_explicit_commit`
+- `v4_arc03j_local_restart_failure_discards_replacement_without_rollback`
+- `v4_arc03j_native_local_ice_restart_commits_exact_replacement` in WSL
+- `v4_arc03j_native_local_ice_restart_failure_retires_connector` in WSL
+- `v4_arc03j_remote_same_fingerprint_credential_change_is_transactional`
+- `v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt`
+- `v4_arc03j_terminal_candidate_exhaustion_stops_later_hash_and_work_admission`
+- `v4_arc03j_sdp_ice_credentials_apply_session_inheritance_and_media_overrides`
+- `v4_arc03j_restart_transactions_reject_ambiguous_interleavings`
+- `v4_arc03j_corrupt_restart_migration_leaves_no_viable_attempt`
 
 The content-byte limit is not an exact retained-memory limit. Candidate retained-memory observations must remain inexact.
 
@@ -278,12 +291,14 @@ Controls:
 
 Attack: call application routing or ordinary-member relay from the normal V4 connector, Endpoint Auth task, or daemon path.
 
-Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Routing wrappers and plain relay envelopes have exactly one semantic consumer each. Malformed input does not stop later valid delivery.
+Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Typed routed envelopes use `__mesh_route__/v1`. Opaque plain relay envelopes use `__mesh_relay__/v1`. No application payload field selects the owner. Malformed input does not stop later valid delivery.
 
 Controls:
 
 - `v4_arc03h_legacy_v1_daemon_option_is_explicit`
 - `legacy_v1_runtime_explicitly_enables_one_daemon_channel_relay`
+- `routed_and_plain_relay_wires_are_disjoint`
+- `mixed_version_plain_payload_is_not_reclassified_as_routed`
 - `v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops` in WSL
 - default-feature `-D deprecated` checks for `myownmesh-core` and `myownmesh`
 
@@ -293,11 +308,16 @@ Residual: this is a maintained compatibility boundary, not a hard theorem that f
 
 Attack: enable generic real-time policy and assume the old H.264 and Opus adapter appears, or allow ordinary startup to infer a media profile.
 
-Required result: normal startup remains codec-neutral. The temporary feature-gated embedder form requires an explicit reviewed profile and attaches it to the connector policy.
+Required result: normal startup remains codec-neutral. The temporary feature-gated embedder form requires an explicit reviewed profile and attaches it to the connector policy. The combined sidecar form also requires explicit LegacyV1 authority. The command-line sidecar requires `--legacy-v1 --legacy-media` and every profile field from the owner. Its media engine registers only H.264 and Opus.
 
 Controls:
 
 - `v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form`
+- `v4_arc03j_legacy_media_sidecar_composes_only_with_explicit_legacy_v1_runtime`
+- `v4_arc03j_legacy_media_is_an_explicit_legacy_v1_sidecar_option`
+- `v4_arc03j_legacy_media_sidecar_rejects_an_incomplete_owner_vector`
+- `v4_arc03j_legacy_media_sidecar_uses_only_the_complete_owner_vector`
+- `v4_arc03j_legacy_codec_registration_is_only_h264_and_opus`
 - feature-specific build and test job in `.github/workflows/ci.yml`
 
 ## 21. RT-03-20: start without connector policy

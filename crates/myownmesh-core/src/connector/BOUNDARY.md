@@ -26,7 +26,7 @@ The connector depends on the attempt capability and its connector-specific trans
 
 ## Resources
 
-Connector work remains covered by the child reservation owned by the consumed candidate. Promotion explicitly transfers the opening claim to a connected claim. The connected claim moves into Endpoint Auth Task, while the connector cleanup owner retains release responsibility through successful native close. A known close error, timeout, or cleanup-start failure retains only that connector's exact claim. It does not poison unrelated slots. Aggregate accounting corruption remains process-fatal because the total can no longer be proved. Arc 03 observes known WebRTC ownership sites, but complete dependency resources remain outside the structural claim.
+Connector work remains covered by the child reservation owned by the consumed candidate. Promotion explicitly transfers the opening claim to a connected claim. The connected claim moves into Endpoint Auth Task, while the connector cleanup owner retains release responsibility through successful native close. A returned close error or cleanup-start failure retains only that connector's exact claim. A native close that does not return remains `Closing` and retains its finite claim. No timer changes that state. Aggregate accounting corruption remains process-fatal because the total can no longer be proved. Arc 03 observes known WebRTC ownership sites, but complete dependency resources remain outside the structural claim.
 
 ## Restart behavior
 

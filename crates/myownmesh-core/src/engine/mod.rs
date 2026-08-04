@@ -814,6 +814,9 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     Ok(RemoteCandidateDisposition::DuplicateIgnored) => {
                         trace!(peer = %device_id, "duplicate remote candidate ignored");
                     }
+                    Ok(RemoteCandidateDisposition::AttemptRetired) => {
+                        trace!(peer = %device_id, "remote candidate ignored for terminal ICE attempt");
+                    }
                     Ok(RemoteCandidateDisposition::RefusedByOwner) => {
                         state.log_diag_with(
                             crate::events::DiagLevel::Warn,
@@ -3315,7 +3318,7 @@ fn build_test_state_parts(
 /// Build test state with the same serialized command consumer that owns
 /// delayed exact-peer mutations in the production driver.
 #[cfg(test)]
-fn build_test_state_with_command_driver(
+pub(crate) fn build_test_state_with_command_driver(
     network_id_suffix: &str,
 ) -> (Arc<NetworkState>, tokio::task::JoinHandle<()>) {
     let (state, mut cmd_rx) = build_test_state_parts(network_id_suffix);
@@ -3360,6 +3363,22 @@ pub(crate) fn insert_admitted_legacy_test_peer(
         data.data_channel_open = true;
     }
     install_peer(&state.peers, peer);
+}
+
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn spawn_admitted_legacy_test_pump(
+    state: Arc<NetworkState>,
+    device_id: String,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    mut events: crate::transport::webrtc::WebRtcConnectorEventReceiver,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Some(TransportEvent::Message(bytes)) = worker.accept_event(event) {
+                handle_inbound_frame(&state, &device_id, bytes).await;
+            }
+        }
+    })
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 # V4 Arc 01 state and effect inventory
 
-Status: historical Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`. It is not a current Arc 03I source inventory.
+Status: historical Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`. It is not a current Arc 03J source inventory.
 
-The Arc 03I source check intentionally fails against this record. The record contains 106 production Rust units and 1,792 declaration members, while the Arc 03I working tree contains 117 units and 2,099 members. It also names removed module paths and earlier Arc 03 markers. Do not use this file or its JSON as evidence of current source coverage. Refreshing hundreds of ownership assignments requires a separate reviewed inventory arc and is not folded into the bounded Arc 03I connector correction.
+The current source check intentionally fails against this record. The record contains 106 production Rust units and 1,792 declaration members from its fixed baseline. Later Arc 03 source has different units, declarations, module paths, and markers. Do not use this file or its JSON as current source coverage. The machine-readable Arc 03 ownership delta records the bounded current owner changes without rewriting this historical inventory.
 
 This inventory refresh changes no product behavior and deletes no code. It records the ownership seams that later implementation arcs must reduce. The checker opens no listener, peer connection, firewall rule, or live MyOwnMesh instance.
 
@@ -17,7 +17,7 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The baseline commit remains fixed. These recorded fingerprints describe an earlier transition snapshot and do not cover the Arc 03I implementation:
+The baseline commit remains fixed. These recorded fingerprints describe an earlier transition snapshot and do not cover the Arc 03J implementation:
 
 | Historical input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|

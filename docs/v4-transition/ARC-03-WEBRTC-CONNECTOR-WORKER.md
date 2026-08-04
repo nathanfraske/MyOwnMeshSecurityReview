@@ -1,6 +1,6 @@
 # V4 Arc 03 WebRTC connector ownership
 
-Status: Arc 03I correction on `arc/03i-final-connector-boundary` in draft fork PR #5. Fork PR #4 was closed without merge as a superseded Arc 03G record. Arc 03I is not merge-approved. Arc 04 has not started.
+Status: Arc 03J correction on `arc/03i-final-connector-boundary` in draft fork PR #5. Fork PR #4 was closed without merge as a superseded Arc 03G record. Arc 03J is not merge-approved. Arc 04 has not started.
 
 ## 1. Scope
 
@@ -74,7 +74,11 @@ Remote candidates use one cumulative envelope before and after remote SDP. A uni
 
 Candidate observations include visible string capacities and queue container capacity, but remain marked inexact because allocator overhead and storage inside webrtc-rs are not observable.
 
-Each queued or applying remote candidate carries a process-local `RemoteCandidateAttemptIdentity`. An explicit ICE restart retires the old identity, blocks new work through it, waits for already admitted work to leave, creates a fresh identity and cumulative envelope, and keeps replacement candidates queued until replacement SDP commits. This identity is not serialized and is not a route, generation, ledger fact, timestamp, or timer.
+Each queued or applying remote candidate carries a process-local `RemoteCandidateAttemptIdentity`. A restart first retires the old identity and creates a provisional replacement. The old identity remains the recorded current attempt until commit. A local restart commits the replacement only after native `restart_ice` succeeds. A remote restart is detected when the effective ICE username fragment or password changes on the same MID, or media-line index when MID is absent. Session-level inheritance and media-level overrides are resolved before comparison. Media reordering, addition, or removal does not renew the candidate envelope when existing transport credentials remain unchanged. A remote restart commits only after the exact replacement remote description succeeds. An unchanged DTLS fingerprint is not treated as proof that ICE credentials are unchanged.
+
+Candidates received during a provisional transaction are retained only by the provisional attempt. The old attempt cannot apply them. A candidate carrying a replacement username fragment may arrive before its replacement SDP. It consumes the old attempt's finite ingress envelope but is not applied to the old native ICE agent. Once an exact replacement SDP arrives, only candidates matching its effective credentials and exact declared MID or media-line index move to the provisional attempt under a fresh bounded reservation. A delayed old candidate remains bounded and cannot enter the replacement native ICE agent. A candidate without a declared username fragment is bound by the process-local attempt that admitted it, but any declared MID or media-line index must still select an exact active SDP section. Local restart failure and replacement remote-description failure do not publish the provisional envelope. With no proven native rollback, the connector is retired and its cleanup owner closes the native peer.
+
+The first unique-item, content-byte, duplicate, or application-work refusal retires the exact candidate attempt. Later submissions return the terminal attempt result before candidate hashing, retention, duplicate accounting, or native application work. Only an explicit local restart or a remote SDP with changed exact ICE credentials may create another attempt envelope. The process-local identity is not serialized and is not a route, generation, ledger fact, timestamp, or timer.
 
 ## 5. Promotion, lock order, and close ordering
 
@@ -153,7 +157,9 @@ The exact candidate becomes `ConnectedChannelCapability`, which moves into `Endp
 
 Historical application routing and ordinary-member relay are compiled only with the `legacy-v1` feature. Their source lives under `legacy_v1/`. The feature exposes deprecated `LegacyV1Runtime` and `LegacyV1Network` facades plus an explicit `myownmesh serve --legacy-v1` option. Compatibility callers must name the `legacy_v1` module explicitly because the crate root does not re-export those facades. The normal V4 daemon path does not enable them.
 
-Explicit LegacyV1 daemon mode installs one routing facade per joined Mesh. When legacy member-relay hosting is enabled, it also installs one separate `RelayService` per joined Mesh. Routing wrappers and plain relay envelopes share the frozen reserved wire channel, but they have different semantic owners. The routing owner ignores plain relay envelopes, and the member relay ignores routing wrappers. A malformed envelope is discarded without terminating either owner.
+Explicit LegacyV1 daemon mode installs one routing facade per joined Mesh. When legacy member-relay hosting is enabled, it also installs one separate `RelayService` per joined Mesh. Routed compatibility frames use the typed `__mesh_route__/v1` wire. Opaque plain member-relay envelopes use `__mesh_relay__/v1`. The wire channel selects the owner, so arbitrary application payload fields are never inspected to infer routing.
+
+Mixed versions do not reinterpret each other's bytes. An older routing wrapper sent on the plain relay wire remains opaque plain-relay payload. An older node does not understand the new routed wire. That means mixed-version routed delivery is unavailable until every routed participant uses the disjoint wire, but it cannot collide with or silently consume a plain application payload. Malformed routed values are discarded by the typed subscription, which continues to process later valid frames.
 
 This is structural isolation through a feature boundary, a compatibility subtree, explicit construction, deprecation, and CI that denies deprecated use in normal V4 source. It is not a hard type-level proof that no future source edit could call the compatibility facade.
 
@@ -169,7 +175,13 @@ Supported construction is explicit:
 - `embedded::start_infrastructure_only(config)`;
 - feature-gated deprecated `embedded::start_connector_capable_with_legacy_v1(config, policy, runtime)`;
 - feature-gated deprecated `embedded::start_connector_capable_with_legacy_media(config, policy, media_profile)`;
-- feature-gated deprecated `myownmesh serve --legacy-v1`.
+- feature-gated deprecated `embedded::start_connector_capable_with_legacy_v1_and_media(config, policy, runtime, media_profile)`;
+- feature-gated deprecated `myownmesh serve --legacy-v1`;
+- feature-gated deprecated `myownmesh serve --legacy-v1 --legacy-media`.
+
+The command-line media sidecar requires three owner-supplied profile fields: maximum lanes per codec kind, pre-provisioned H.264 lanes, and pre-provisioned Opus lanes. No profile value is inferred. The compatibility media engine registers only H.264 profiles and Opus, never the dependency's broader default codec set.
+
+The temporary compatibility artifact is defined for Linux x86-64, Windows x86-64, and macOS ARM64. CI compiles and runs the retained `legacy-v1` and `legacy-media` controls on those desktop platforms. The default appliance cross-builds remain separate evidence and do not imply compatibility-feature support on musl appliances.
 
 Infrastructure-only startup requires node participation to be disabled. Later node enablement fails without changing runtime state. Normal connector-capable startup is codec-neutral and rejects missing, zero, invalid, or inconsistent owner values before joining.
 
@@ -191,13 +203,13 @@ The library forms are `Mesh::open_connector_capable`, `Mesh::open_connector_capa
 
 `PeerSession` does not implement `Deref`. Production native connector creation stays behind `WebRtcConnectorWorker`.
 
-## 13. Arc 03I completion contract
+## 13. Arc 03J completion contract
 
-Arc 03I may be called code-complete only when the exact pushed head proves all six statements:
+Arc 03J may be called code-complete only when the exact pushed head proves all six statements:
 
 1. Channel-open and channel-close transitions cannot be lost.
 2. Cleanup failure retains the exact claim even when cleanup owns the final strong reference.
-3. ICE restart cannot mix old candidate-attempt work with the replacement attempt.
+3. Local and remote ICE restart are transactional, exact to WebRTC ICE credentials, and cannot mix old candidate-attempt work with the replacement attempt.
 4. Every pre-authentication native WebRTC callback surface has a structural bound and an explicit overload or violation result.
 5. Generic real-time policy selects no codec, device purpose, media purpose, or lane meaning.
 6. Temporary LegacyV1 and H.264 or Opus paths are explicit, frozen, tested, and unreachable from the V4 authority path without their named compatibility feature and owner.
@@ -208,8 +220,8 @@ These statements prove one bounded WebRTC connector candidate produces at most o
 
 The red-team record and [`scripts/measure-v4-arc03g.ps1`](../../scripts/measure-v4-arc03g.ps1) name the controls and measurement inputs. Measurements are observations only and do not select production policy values.
 
-The historical Arc 01 inventory is not current evidence for this branch. Its checker reports 117 production Rust units and 2,099 declaration members against 106 and 1,792 recorded, plus obsolete module paths and markers. A later reviewed inventory refresh must assign that drift. Arc 03I does not silently rewrite those owner assignments.
+The historical Arc 01 inventory remains provenance for its recorded commit. It is not current evidence for this branch. [`arc-03-ownership-delta.json`](arc-03-ownership-delta.json) records the Arc 03 owner changes without rewriting the historical assignments. [`ARC-03-OWNER-POLICY-DOSSIER.md`](ARC-03-OWNER-POLICY-DOSSIER.md) records the owner inputs still required before any production value can be selected.
 
-Arc 03I remains unapproved until the exact pushed head passes formatting, workspace checks, Clippy, tests, compiler-boundary checks, native direct and TURN controls, retained-feature controls, the supported-platform matrix, the cross-target matrix, workload measurements, and owner review.
+Arc 03J remains unapproved until the exact pushed head passes formatting, workspace checks, Clippy, tests, compiler-boundary checks, native direct and TURN controls, local and remote restart controls, retained-feature controls, the supported-platform matrix, the cross-target matrix, workload measurements, and owner review.
 
-Arc 03I does not claim complete hostile-ingress admission, exact native dependency memory accounting, Endpoint Auth verification, authenticated session authority, final application flow authority, final codec policy, repository-wide close fencing, or LegacyV1 removal.
+Arc 03J does not claim complete hostile-ingress admission, exact native dependency memory accounting, Endpoint Auth verification, authenticated session authority, final application flow authority, final codec policy, repository-wide close fencing, or LegacyV1 removal.

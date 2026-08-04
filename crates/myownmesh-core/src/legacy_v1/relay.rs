@@ -167,9 +167,6 @@ async fn run(state: Arc<NetworkState>, max_fanout: u32) {
                 continue;
             }
         };
-        if super::routing::is_routing_wrapper(&msg.body.payload) {
-            continue;
-        }
         forward_envelope(&state, &channel, msg.from, msg.body, max_fanout).await;
     }
 }

@@ -62,8 +62,10 @@ impl LegacyV1Network {
     ) -> Self {
         let _authority = runtime;
         let listener_state = std::sync::Arc::clone(&state);
-        let channel: crate::Channel<RelayEnvelope> =
-            crate::Channel::new(RELAY_CHANNEL.to_string(), std::sync::Arc::clone(&state));
+        let channel: crate::Channel<routing::RoutedEnvelope> = crate::Channel::new(
+            routing::ROUTING_CHANNEL.to_string(),
+            std::sync::Arc::clone(&state),
+        );
         let mut subscription = channel.subscribe();
         let listener = tokio::spawn(async move {
             while let Some(item) = subscription.recv().await {
@@ -71,12 +73,7 @@ impl LegacyV1Network {
                     Ok(message) => message,
                     Err(_) => continue,
                 };
-                let Ok(payload) = serde_json::to_value(&message.body) else {
-                    continue;
-                };
-                if routing::on_relay_frame(&listener_state, &message.from, &payload).await {
-                    continue;
-                }
+                routing::on_routed_frame(&listener_state, &message.from, message.body).await;
             }
         });
         Self { state, listener }
@@ -116,7 +113,7 @@ mod tests {
         _left_events: WebRtcConnectorEventReceiver,
         left_auth: Arc<crate::endpoint_auth::EndpointAuthTask>,
         right: Arc<WebRtcConnectorWorker>,
-        right_events: WebRtcConnectorEventReceiver,
+        right_events: Option<WebRtcConnectorEventReceiver>,
         right_auth: Arc<crate::endpoint_auth::EndpointAuthTask>,
     }
 
@@ -211,39 +208,20 @@ mod tests {
             _left_events: left_events,
             left_auth: left_auth.expect("left data channel opens"),
             right,
-            right_events,
+            right_events: Some(right_events),
             right_auth: right_auth.expect("right data channel opens"),
         }
-    }
-
-    async fn next_legacy_payload(
-        worker: &WebRtcConnectorWorker,
-        events: &mut WebRtcConnectorEventReceiver,
-    ) -> (String, serde_json::Value) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let event = events.recv().await.expect("connector remains live");
-                if let Some(TransportEvent::Message(bytes)) = worker.accept_event(event) {
-                    let message: MeshMessage =
-                        serde_json::from_slice(&bytes).expect("mesh frame decodes");
-                    if let MeshMessage::Channel { channel, payload } = message {
-                        if channel == RELAY_CHANNEL {
-                            return (channel, payload);
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("legacy payload reaches the next native peer")
     }
 
     #[tokio::test]
     #[ignore = "opens two native WebRTC links; run in the isolated WSL legacy-v1 control"]
     async fn v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops() {
-        let state_a = crate::engine::build_test_state("legacy-hop-a");
-        let state_b = crate::engine::build_test_state("legacy-hop-b");
-        let state_c = crate::engine::build_test_state("legacy-hop-c");
+        let (state_a, command_a) =
+            crate::engine::build_test_state_with_command_driver("legacy-hop-a");
+        let (state_b, command_b) =
+            crate::engine::build_test_state_with_command_driver("legacy-hop-b");
+        let (state_c, command_c) =
+            crate::engine::build_test_state_with_command_driver("legacy-hop-c");
         let id_a = state_a.identity.public_id().to_string();
         let id_b = state_b.identity.public_id().to_string();
         let id_c = state_c.identity.public_id().to_string();
@@ -288,21 +266,37 @@ mod tests {
         let _legacy_b = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_b));
         let _legacy_c = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_c));
         let _relay_b = RelayService::start(Arc::clone(&state_b), 0, &runtime);
-        state_b.dispatch_channel_frame(
-            RELAY_CHANNEL,
-            &id_a,
-            serde_json::json!({"malformed": true}),
+        let pump_b = crate::engine::spawn_admitted_legacy_test_pump(
+            Arc::clone(&state_b),
+            id_a.clone(),
+            Arc::clone(&ab.right),
+            ab.right_events
+                .take()
+                .expect("B owns the AB endpoint event stream"),
         );
+        let pump_c = crate::engine::spawn_admitted_legacy_test_pump(
+            Arc::clone(&state_c),
+            id_b.clone(),
+            Arc::clone(&bc.right),
+            bc.right_events
+                .take()
+                .expect("C owns the BC endpoint event stream"),
+        );
+        let malformed = serde_json::to_vec(&MeshMessage::Channel {
+            channel: routing::ROUTING_CHANNEL.to_string(),
+            payload: serde_json::json!({"malformed": true}),
+        })
+        .expect("malformed routed control frame encodes as endpoint bytes");
+        ab.left
+            .send_owned(malformed.into())
+            .await
+            .expect("malformed routed frame crosses the first native link");
         let payload = serde_json::json!({"proof": "two-native-hops"});
         legacy_a
             .send_to(&id_c, "legacy-v1-test", &payload)
             .await
             .expect("A hands the payload to B");
 
-        let (_, at_b) = next_legacy_payload(&ab.right, &mut ab.right_events).await;
-        state_b.dispatch_channel_frame(RELAY_CHANNEL, &id_a, at_b);
-        let (_, at_c) = next_legacy_payload(&bc.right, &mut bc.right_events).await;
-        state_c.dispatch_channel_frame(RELAY_CHANNEL, &id_b, at_c);
         let delivered = tokio::time::timeout(Duration::from_secs(2), application.recv())
             .await
             .expect("application delivery is bounded")
@@ -322,6 +316,14 @@ mod tests {
                 .retire_and_close()
                 .await
                 .expect("native legacy test connector closes");
+        }
+        pump_b.abort();
+        pump_c.abort();
+        for state in [&state_a, &state_b, &state_c] {
+            let _ = state.cmd_tx.send(crate::engine::NetworkCmd::Shutdown);
+        }
+        for command in [command_a, command_b, command_c] {
+            command.await.expect("legacy command driver stops cleanly");
         }
     }
 }

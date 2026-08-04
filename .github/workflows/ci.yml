@@ -46,6 +46,17 @@ jobs:
       - name: Tests
         run: cargo test --workspace --no-fail-fast
 
+      - name: Arc 03J desktop compatibility artifact
+        run: |
+          cargo check -p myownmesh-core --all-targets --features "legacy-v1"
+          cargo check -p myownmesh-core --all-targets --features "legacy-media"
+          cargo check -p myownmesh-core --all-targets --features "legacy-v1,legacy-media"
+          cargo check -p myownmesh --all-targets --features "legacy-v1"
+          cargo check -p myownmesh --all-targets --features "legacy-media"
+          cargo check -p myownmesh --all-targets --features "legacy-v1,legacy-media"
+          cargo test -p myownmesh-core --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
+          cargo test -p myownmesh --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
+
   arc03-compatibility:
     name: Arc 03 retained compatibility paths
     runs-on: ubuntu-22.04
@@ -77,7 +88,7 @@ jobs:
       - name: Arc 03 compiler boundary controls
         run: python3 scripts/check-v4-arc03-compiler-boundaries.py
 
-      - name: Arc 03I native lifecycle, cleanup, and provider controls
+      - name: Arc 03J native lifecycle, cleanup, restart, and provider controls
         run: |
           set -euo pipefail
           for control in \
@@ -86,6 +97,8 @@ jobs:
             v4_arc03_cancelled_delivered_result_closes_native_peer_before_release \
             v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed \
             v4_arc03_background_construction_failure_closes_partial_native_peer \
+            v4_arc03j_native_local_ice_restart_commits_exact_replacement \
+            v4_arc03j_native_local_ice_restart_failure_retires_connector \
             v4_arc03h_close_wins_before_open_promotion \
             v4_arc03h_close_wins_before_legacy_realtime_admission \
             v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks \

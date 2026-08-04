@@ -1,86 +1,46 @@
-//! Frozen topology-aware application frame routing for LegacyV1.
-//! shaped network (star / hubs / ring) between members that don't hold
-//! a direct connection.
+//! Frozen topology-aware application routing for LegacyV1.
 //!
-//! Rides the frozen LegacyV1 relay wire: a routed
-//! frame is a [`RelayEnvelope`] on [`RELAY_CHANNEL`] whose payload
-//! carries the transparent-channel wrapper (`__channel` / `__body` /
-//! `__ttl` / `__id`). Legacy envelopes (application users of the
-//! standalone `RelayService`) don't carry the wrapper and pass through
-//! to channel subscribers untouched — the two uses of the wire
-//! coexist.
-//!
-//! Semantics:
-//! * **Directed** (`dst` set): forwarders move the envelope toward
-//!   `dst` via [`Topology::next_hops`], decrementing `__ttl`; the
-//!   destination unwraps and delivers to its channel router with the
-//!   *origin* as the sender. Handed-to-forwarder is the delivery
-//!   guarantee (best-effort beyond the first hop) — callers who need
-//!   acknowledged delivery still use a direct edge.
-//! * **Broadcast** (`dst` empty): flood with per-node dedup — every
-//!   node delivers once; forwarders re-fan to their connected peers
-//!   (minus the arrival edge and the origin) while `__ttl` lasts.
-//!
-//! Trust: a forwarded envelope's `src` (origin) is asserted by whoever
-//! carries it. Two gates bound that: the carrier must be an
-//! authenticated, connected peer (every frame already rides a
-//! mutually-authenticated channel), and an envelope whose `src ≠ from`
-//! is accepted only when the *carrier* is a forwarder under the
-//! current topology — spokes cannot launder origins, only the hubs the
-//! network's owner designated (on a ring, any member — flood trust
-//! there is membership trust). End-to-end origin signatures can layer
-//! on later without changing this wire.
+//! Routed frames use a typed envelope on [`ROUTING_CHANNEL`]. Opaque plain
+//! relay frames use the separate [`super::relay::RELAY_CHANNEL`]. The wire
+//! channel decides the compatibility behavior. Application payload content is
+//! never inspected to infer routing.
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{debug, trace};
-
-use super::relay::{RelayEnvelope, RELAY_CHANNEL};
-use crate::error::{Error, Result};
 
 use crate::engine::connection::PeerStatus;
 use crate::engine::state::NetworkState;
+use crate::error::{Error, Result};
 
-/// Dedup-ring capacity for `(origin, frame id)` pairs. Sized like the
-/// signaling dedup ring: far beyond any realistic in-flight window.
+/// Dedup-ring capacity for `(origin, frame id)` pairs.
 pub(crate) const ROUTING_SEEN_CAPACITY: usize = 2048;
 
-/// The wrapper a routed frame carries inside `RelayEnvelope::payload`.
-struct Wrapper {
+/// Explicit routed wire. This must remain disjoint from the plain relay wire.
+pub(crate) const ROUTING_CHANNEL: &str = "__mesh_route__/v1";
+
+/// One explicitly routed LegacyV1 application frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RoutedEnvelope {
+    #[serde(default)]
+    dst: String,
+    #[serde(default)]
+    src: String,
     channel: String,
     body: Value,
     ttl: u8,
     id: u64,
 }
 
-fn parse_wrapper(payload: &Value) -> Option<Wrapper> {
-    let obj = payload.as_object()?;
-    let channel = obj.get("__channel")?.as_str()?.to_string();
-    // A wrapper naming the relay channel itself would recurse the
-    // router; nothing legitimate produces it.
-    if channel == RELAY_CHANNEL {
-        return None;
+impl RoutedEnvelope {
+    fn has_valid_shape(&self) -> bool {
+        !self.channel.is_empty()
+            && self.channel != ROUTING_CHANNEL
+            && self.channel != super::relay::RELAY_CHANNEL
+            && self.id != 0
     }
-    Some(Wrapper {
-        channel,
-        body: obj.get("__body").cloned().unwrap_or(Value::Null),
-        ttl: obj.get("__ttl").and_then(Value::as_u64).unwrap_or(0) as u8,
-        id: obj.get("__id").and_then(Value::as_u64).unwrap_or(0),
-    })
-}
-
-pub(super) fn is_routing_wrapper(payload: &Value) -> bool {
-    parse_wrapper(payload).is_some()
-}
-
-fn wrap(channel: &str, body: &Value, ttl: u8, id: u64) -> Value {
-    json!({
-        "__channel": channel,
-        "__body": body,
-        "__ttl": ttl,
-        "__id": id,
-    })
 }
 
 fn fresh_frame_id() -> u64 {
@@ -88,15 +48,12 @@ fn fresh_frame_id() -> u64 {
     rand::thread_rng().gen::<u64>() | 1
 }
 
-/// Record `(origin, id)` in the dedup ring; `false` = already seen.
 fn first_sighting(state: &NetworkState, origin: &str, id: u64) -> bool {
-    if id == 0 {
-        // No id (shouldn't happen from our senders) — deliver, never
-        // re-forward; the ttl guard below keeps it bounded anyway.
-        return true;
-    }
     let mut seen = state.routing_seen.lock();
-    if seen.iter().any(|(o, i)| *i == id && o == origin) {
+    if seen
+        .iter()
+        .any(|(seen_origin, seen_id)| *seen_id == id && seen_origin == origin)
+    {
         return false;
     }
     if seen.len() >= ROUTING_SEEN_CAPACITY {
@@ -106,9 +63,6 @@ fn first_sighting(state: &NetworkState, origin: &str, id: u64) -> bool {
     true
 }
 
-/// Peers whose data channel can carry frames right now (Active or
-/// Shelved — a shelved link is still a live path for routed frames,
-/// exactly as the standalone relay treats it).
 fn connected_ids(state: &NetworkState) -> Vec<String> {
     state
         .peer_snapshot()
@@ -118,31 +72,24 @@ fn connected_ids(state: &NetworkState) -> Vec<String> {
         .collect()
 }
 
-/// Try to consume an inbound `RELAY_CHANNEL` frame as a routed
-/// envelope. Returns `false` when the frame isn't wrapper-shaped —
-/// the caller passes it through to channel subscribers (the legacy
-/// `RelayService` flow).
-pub(crate) async fn on_relay_frame(state: &Arc<NetworkState>, from: &str, payload: &Value) -> bool {
-    let Ok(env) = serde_json::from_value::<RelayEnvelope>(payload.clone()) else {
-        return false;
-    };
-    let Some(w) = parse_wrapper(&env.payload) else {
-        return false;
-    };
-    // The carrier is guaranteed admitted here: `on_relay_frame` is only reached
-    // via `on_channel_frame` for an inbound `Channel` frame, which the
-    // admission gate in `handle_inbound_frame` already drops from an unadmitted
-    // peer — so no separate carrier check is needed (or wanted per-frame).
+/// Consume one value that was decoded from the exact routed wire.
+pub(crate) async fn on_routed_frame(
+    state: &Arc<NetworkState>,
+    from: &str,
+    envelope: RoutedEnvelope,
+) {
+    if !envelope.has_valid_shape() {
+        trace!("dropping malformed LegacyV1 routed envelope");
+        return;
+    }
+
     let me = state.identity.public_id().to_string();
-    let origin = if env.src.is_empty() {
+    let origin = if envelope.src.is_empty() {
         from.to_string()
     } else {
-        env.src.clone()
+        envelope.src.clone()
     };
 
-    // Origin laundering gate: an envelope claiming someone else's
-    // origin is only honoured from a carrier the topology designates
-    // as a forwarder.
     if origin != from {
         let carrier_forwards = {
             let known = connected_ids(state);
@@ -152,158 +99,156 @@ pub(crate) async fn on_relay_frame(state: &Arc<NetworkState>, from: &str, payloa
             debug!(
                 from = %crate::engine::short_peer(from),
                 origin = %crate::engine::short_peer(&origin),
-                "dropping routed frame: carrier is not a forwarder"
+                "dropping routed frame from a non-forwarding carrier"
             );
-            return true; // consumed (and dropped)
+            return;
         }
     }
 
-    if !first_sighting(state, &origin, w.id) {
-        return true; // duplicate along another path — already handled
+    if !first_sighting(state, &origin, envelope.id) {
+        return;
     }
 
-    let broadcast = env.dst.is_empty();
-    let for_me = broadcast || env.dst == me;
-
+    let broadcast = envelope.dst.is_empty();
+    let for_me = broadcast || envelope.dst == me;
     if for_me {
-        // Deliver with the origin as the sender — the application sees
-        // who actually said it, not which hub carried it.
-        state.dispatch_channel_frame(&w.channel, &origin, w.body.clone());
+        state.dispatch_channel_frame(&envelope.channel, &origin, envelope.body.clone());
     }
-    if !broadcast && env.dst == me {
-        return true;
+    if !broadcast && envelope.dst == me {
+        return;
     }
 
-    // Onward duty — forwarders only, while the hop budget lasts.
     let (i_forward, connected) = {
         let connected = connected_ids(state);
-        let f = state.topology_impl.read().forwards(&me, &connected);
-        (f, connected)
+        let forwards = state.topology_impl.read().forwards(&me, &connected);
+        (forwards, connected)
     };
-    if !i_forward || w.ttl == 0 {
+    if !i_forward || envelope.ttl == 0 {
         if !broadcast && !i_forward {
             trace!(
-                dst = %crate::engine::short_peer(&env.dst),
-                "routed frame reached a non-forwarder that isn't its destination — dropped"
+                dst = %crate::engine::short_peer(&envelope.dst),
+                "routed frame reached a non-forwarder that is not its destination"
             );
         }
-        return true;
+        return;
     }
+
     state.traffic.record_forwarded();
-    let onward = RelayEnvelope {
-        dst: env.dst.clone(),
+    let onward = RoutedEnvelope {
+        dst: envelope.dst.clone(),
         src: origin.clone(),
-        payload: wrap(&w.channel, &w.body, w.ttl - 1, w.id),
-    };
-    let onward_value = match serde_json::to_value(&onward) {
-        Ok(v) => v,
-        Err(_) => return true,
+        channel: envelope.channel,
+        body: envelope.body,
+        ttl: envelope.ttl - 1,
+        id: envelope.id,
     };
 
     if broadcast {
-        // Re-fan to everyone connected except the arrival edge and the
-        // origin; per-node dedup absorbs any cross-paths.
         for peer in connected {
             if peer == from || peer == origin {
                 continue;
             }
-            let _ = send_envelope(state, &peer, &onward_value).await;
+            let _ = send_envelope(state, &peer, &onward).await;
         }
     } else {
-        // Directed: straight to the destination when it's ours, else
-        // toward it. First hop that accepts wins.
-        let hops = if connected.iter().any(|c| c == &env.dst) {
-            vec![env.dst.clone()]
+        let hops = if connected.iter().any(|peer| peer == &onward.dst) {
+            vec![onward.dst.clone()]
         } else {
             state
                 .topology_impl
                 .read()
-                .next_hops(&me, &env.dst, &connected)
+                .next_hops(&me, &onward.dst, &connected)
         };
         for hop in hops {
             if hop == from {
                 continue;
             }
-            if send_envelope(state, &hop, &onward_value).await.is_ok() {
+            if send_envelope(state, &hop, &onward).await.is_ok() {
                 break;
             }
         }
     }
-    true
 }
 
-async fn send_envelope(state: &Arc<NetworkState>, peer: &str, envelope: &Value) -> Result<()> {
-    crate::engine::send_to_peer(
-        state,
-        peer,
-        &crate::protocol::MeshMessage::Channel {
-            channel: RELAY_CHANNEL.to_string(),
-            payload: envelope.clone(),
-        },
-    )
-    .await
+async fn send_envelope(
+    state: &Arc<NetworkState>,
+    peer: &str,
+    envelope: &RoutedEnvelope,
+) -> Result<()> {
+    let channel: crate::Channel<RoutedEnvelope> =
+        crate::Channel::new(ROUTING_CHANNEL.to_string(), Arc::clone(state));
+    channel
+        .send_to(peer, envelope)
+        .await
+        .map_err(|error| Error::Network(format!("LegacyV1 routed send to {peer} failed: {error}")))
 }
 
-/// Send a directed frame to a member we hold no direct connection to,
-/// by handing it to the topology's next hop(s). `Ok` means a forwarder
-/// accepted it — the routed-delivery guarantee, weaker than an ack and
-/// said so in the docs.
 pub(crate) async fn send_routed(
     state: &Arc<NetworkState>,
-    dest: &str,
+    destination: &str,
     channel: &str,
     payload: &Value,
 ) -> Result<()> {
+    if channel.is_empty() || channel == ROUTING_CHANNEL || channel == super::relay::RELAY_CHANNEL {
+        return Err(Error::Network(
+            "LegacyV1 routed application channel is empty or reserved".to_string(),
+        ));
+    }
     let me = state.identity.public_id().to_string();
     let (hops, ttl) = {
         let connected = connected_ids(state);
-        let topo = state.topology_impl.read();
-        (topo.next_hops(&me, dest, &connected), topo.flood_ttl())
+        let topology = state.topology_impl.read();
+        (
+            topology.next_hops(&me, destination, &connected),
+            topology.flood_ttl(),
+        )
     };
     if hops.is_empty() {
         return Err(Error::Network(format!(
-            "no route to {dest}: not directly connected and the topology names no next hop"
+            "no route to {destination}: the topology names no reachable next hop"
         )));
     }
+
     let id = fresh_frame_id();
-    // Our own sighting: if the shape ever loops the frame back, drop it.
     first_sighting(state, &me, id);
-    let env = RelayEnvelope {
-        dst: dest.to_string(),
+    let envelope = RoutedEnvelope {
+        dst: destination.to_string(),
         src: me,
-        payload: wrap(channel, payload, ttl, id),
+        channel: channel.to_string(),
+        body: payload.clone(),
+        ttl,
+        id,
     };
-    let env_value = serde_json::to_value(&env).map_err(Error::Serde)?;
-    let mut last_err: Option<Error> = None;
+    let mut last_error = None;
     for hop in hops {
-        match send_envelope(state, &hop, &env_value).await {
+        match send_envelope(state, &hop, &envelope).await {
             Ok(()) => return Ok(()),
-            Err(e) => last_err = Some(e),
+            Err(error) => last_error = Some(error),
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| Error::Network(format!("no forwarder accepted the frame for {dest}"))))
+    Err(last_error.unwrap_or_else(|| {
+        Error::Network(format!("no forwarder accepted the frame for {destination}"))
+    }))
 }
 
-/// Broadcast under a shaped topology: one wrapped envelope to every
-/// connected, unshelved peer; forwarders re-fan it across the shape.
-/// Returns how many first-hop peers accepted the frame.
 pub(crate) async fn broadcast_flood(
     state: &Arc<NetworkState>,
     channel: &str,
     payload: &Value,
 ) -> usize {
+    if channel.is_empty() || channel == ROUTING_CHANNEL || channel == super::relay::RELAY_CHANNEL {
+        return 0;
+    }
     let me = state.identity.public_id().to_string();
-    let ttl = state.topology_impl.read().flood_ttl();
     let id = fresh_frame_id();
     first_sighting(state, &me, id);
-    let env = RelayEnvelope {
+    let envelope = RoutedEnvelope {
         dst: String::new(),
         src: me,
-        payload: wrap(channel, payload, ttl, id),
-    };
-    let Ok(env_value) = serde_json::to_value(&env) else {
-        return 0;
+        channel: channel.to_string(),
+        body: payload.clone(),
+        ttl: state.topology_impl.read().flood_ttl(),
+        id,
     };
     let targets: Vec<String> = state
         .peer_snapshot()
@@ -315,7 +260,7 @@ pub(crate) async fn broadcast_flood(
         .collect();
     let mut delivered = 0usize;
     for peer in targets {
-        if send_envelope(state, &peer, &env_value).await.is_ok() {
+        if send_envelope(state, &peer, &envelope).await.is_ok() {
             delivered += 1;
         }
     }
@@ -325,85 +270,90 @@ pub(crate) async fn broadcast_flood(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn wrapper_round_trips_and_rejects_relay_channel_recursion() {
-        let w = wrap("app.control", &json!({"k": 1}), 3, 42);
-        let parsed = parse_wrapper(&w).expect("parses");
-        assert_eq!(parsed.channel, "app.control");
-        assert_eq!(parsed.ttl, 3);
-        assert_eq!(parsed.id, 42);
-        assert_eq!(parsed.body, json!({"k": 1}));
-
-        let bad = wrap(RELAY_CHANNEL, &json!(1), 3, 42);
-        assert!(
-            parse_wrapper(&bad).is_none(),
-            "self-referential wrapper rejected"
+    fn routed_and_plain_relay_wires_are_disjoint() {
+        assert_ne!(ROUTING_CHANNEL, super::super::relay::RELAY_CHANNEL);
+        let routed = RoutedEnvelope {
+            dst: "c".to_string(),
+            src: "a".to_string(),
+            channel: "app.control".to_string(),
+            body: json!({"__channel": "arbitrary-application-key"}),
+            ttl: 3,
+            id: 42,
+        };
+        let encoded = serde_json::to_value(&routed).expect("typed routed envelope encodes");
+        assert_eq!(
+            serde_json::from_value::<RoutedEnvelope>(encoded)
+                .expect("typed routed envelope decodes"),
+            routed
         );
+        assert!(routed.has_valid_shape());
     }
 
     #[test]
-    fn legacy_envelope_payloads_are_not_wrappers() {
-        // A plain RelayService payload (no __channel) must pass through
-        // to channel subscribers, not be consumed by the router.
-        assert!(parse_wrapper(&json!({"hi": 1})).is_none());
-        assert!(parse_wrapper(&json!("string")).is_none());
+    fn mixed_version_plain_payload_is_not_reclassified_as_routed() {
+        let old_routing_wrapper = json!({
+            "__channel": "legacy.application",
+            "__destination": "c",
+            "__payload": {"value": 7}
+        });
+        let plain_wire_value = json!({
+            "dst": "c",
+            "src": "a",
+            "payload": old_routing_wrapper
+        });
+        let plain =
+            serde_json::from_value::<super::super::relay::RelayEnvelope>(plain_wire_value.clone())
+                .expect("the old wrapper remains an opaque plain-relay payload");
+        assert_eq!(plain.payload, old_routing_wrapper);
+        assert!(
+            serde_json::from_value::<RoutedEnvelope>(plain_wire_value).is_err(),
+            "the routed owner cannot decode a plain relay envelope by inspecting its payload"
+        );
+        assert_ne!(ROUTING_CHANNEL, super::super::relay::RELAY_CHANNEL);
     }
 
     #[tokio::test]
     async fn dedup_ring_drops_replays_and_is_bounded() {
         let state = crate::engine::build_test_state("route-dedup");
         assert!(first_sighting(&state, "origin-a", 7));
-        assert!(
-            !first_sighting(&state, "origin-a", 7),
-            "same (origin,id) drops"
-        );
-        assert!(
-            first_sighting(&state, "origin-b", 7),
-            "different origin is fresh"
-        );
-        for i in 0..(ROUTING_SEEN_CAPACITY as u64 + 10) {
-            first_sighting(&state, "origin-c", 1000 + i);
+        assert!(!first_sighting(&state, "origin-a", 7));
+        assert!(first_sighting(&state, "origin-b", 7));
+        for id in 0..(ROUTING_SEEN_CAPACITY as u64 + 10) {
+            first_sighting(&state, "origin-c", 1000 + id);
         }
-        assert!(
-            state.routing_seen.lock().len() <= ROUTING_SEEN_CAPACITY,
-            "ring stays bounded"
-        );
+        assert!(state.routing_seen.lock().len() <= ROUTING_SEEN_CAPACITY);
     }
 
     #[tokio::test]
-    async fn non_wrapper_relay_frame_is_left_to_subscribers() {
-        let state = crate::engine::build_test_state("route-passthru");
-        let legacy = serde_json::to_value(RelayEnvelope {
-            dst: String::new(),
-            src: String::new(),
-            payload: json!({"app": "data"}),
-        })
-        .unwrap();
-        let consumed = on_relay_frame(&state, "peer-x", &legacy).await;
-        assert!(
-            !consumed,
-            "legacy envelope passes through to the channel layer"
-        );
-    }
-
-    #[tokio::test]
-    async fn spoke_cannot_launder_origins() {
-        // Default test topology is FullMesh: forwards() == false for
-        // everyone, so an envelope claiming a foreign origin from any
-        // carrier is consumed-and-dropped.
+    async fn spoke_cannot_launder_routed_origin() {
         let state = crate::engine::build_test_state("route-launder");
-        let env = serde_json::to_value(RelayEnvelope {
+        let envelope = RoutedEnvelope {
             dst: String::new(),
-            src: "claimed-origin".into(),
-            payload: wrap("app.control", &json!(1), 2, 99),
-        })
-        .unwrap();
-        let consumed = on_relay_frame(&state, "carrier-spoke", &env).await;
-        assert!(consumed, "wrapper-shaped frame is always consumed");
-        assert!(
-            state.routing_seen.lock().is_empty(),
-            "dropped before the dedup ring — never treated as delivered"
-        );
+            src: "claimed-origin".to_string(),
+            channel: "app.control".to_string(),
+            body: json!(1),
+            ttl: 2,
+            id: 99,
+        };
+        on_routed_frame(&state, "carrier-spoke", envelope).await;
+        assert!(state.routing_seen.lock().is_empty());
+    }
+
+    #[test]
+    fn reserved_or_malformed_routed_channels_are_rejected() {
+        for channel in ["", ROUTING_CHANNEL, super::super::relay::RELAY_CHANNEL] {
+            let envelope = RoutedEnvelope {
+                dst: "c".to_string(),
+                src: "a".to_string(),
+                channel: channel.to_string(),
+                body: Value::Null,
+                ttl: 1,
+                id: 1,
+            };
+            assert!(!envelope.has_valid_shape());
+        }
     }
 }

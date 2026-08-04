@@ -152,6 +152,31 @@ pub async fn start_connector_capable_with_legacy_v1(
     start_with_mesh(cfg, mesh, ServiceCompatibility::LegacyV1(runtime)).await
 }
 
+/// Start the frozen LegacyV1 routing runtime with the temporary reviewed
+/// H.264 and Opus provider attached as an explicit sidecar profile.
+///
+/// This is the only deployment form that composes both compatibility paths.
+/// Normal V4 startup cannot infer either authority.
+#[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+#[allow(
+    deprecated,
+    reason = "this API is the explicit LegacyV1 plus legacy-media sidecar boundary"
+)]
+#[deprecated(
+    since = "0.3.2",
+    note = "temporary LegacyV1 and H.264/Opus sidecar for downstream migration"
+)]
+pub async fn start_connector_capable_with_legacy_v1_and_media(
+    cfg: myownmesh_core::MeshConfig,
+    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
+    runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
+    media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    let connector_policy = connector_policy_with_legacy_media(connector_policy, media_profile)?;
+    let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
+    start_with_mesh(cfg, mesh, ServiceCompatibility::LegacyV1(runtime)).await
+}
+
 /// Start a daemon that only hosts signaling, STUN, or TURN infrastructure.
 ///
 /// The configuration must explicitly disable node participation. This form
@@ -333,6 +358,39 @@ mod tests {
         )
         .await
         .expect("temporary legacy-media daemon starts only from the explicit profile");
+        assert!(daemon.mesh().connector_resource_report().is_some());
+        daemon.shutdown().await;
+    }
+
+    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    #[allow(
+        deprecated,
+        reason = "this test proves the explicit temporary sidecar deployment boundary"
+    )]
+    #[tokio::test]
+    async fn v4_arc03j_legacy_media_sidecar_composes_only_with_explicit_legacy_v1_runtime() {
+        let temp = tempfile::tempdir().expect("temporary daemon state");
+        let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
+        daemon_config.control_socket = Some(temp.path().join("daemon-sidecar.sock"));
+        let cfg = myownmesh_core::MeshConfig {
+            identity_path: Some(temp.path().join("identity-sidecar.json")),
+            auto_update: myownmesh_core::AutoUpdateConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            daemon: daemon_config,
+            ..Default::default()
+        };
+        let media_profile = myownmesh_core::LegacyWebRtcMediaProfile::h264_opus(nz(2), 1, 1)
+            .expect("reviewed sidecar fixture is valid");
+        let daemon = start_connector_capable_with_legacy_v1_and_media(
+            cfg,
+            legacy_media_test_policy(),
+            myownmesh_core::legacy_v1::LegacyV1Runtime::frozen(),
+            media_profile,
+        )
+        .await
+        .expect("the explicit combined compatibility constructor starts");
         assert!(daemon.mesh().connector_resource_report().is_some());
         daemon.shutdown().await;
     }

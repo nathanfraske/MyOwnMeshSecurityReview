@@ -27,10 +27,29 @@ pub async fn run_with_legacy_v1() -> Result<()> {
     .await
 }
 
+#[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+#[allow(
+    deprecated,
+    reason = "this exact entry point is the explicit LegacyV1 media sidecar option"
+)]
+pub async fn run_with_legacy_v1_and_media() -> Result<()> {
+    let media_profile = legacy_media_profile_from_lookup(|name| std::env::var(name).ok())?;
+    run_with_compatibility(ServeCompatibility::LegacyV1WithMedia(
+        myownmesh_core::legacy_v1::LegacyV1Runtime::frozen(),
+        media_profile,
+    ))
+    .await
+}
+
 enum ServeCompatibility {
     V4,
     #[cfg(feature = "legacy-v1")]
     LegacyV1(myownmesh_core::legacy_v1::LegacyV1Runtime),
+    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    LegacyV1WithMedia(
+        myownmesh_core::legacy_v1::LegacyV1Runtime,
+        myownmesh_core::LegacyWebRtcMediaProfile,
+    ),
 }
 
 async fn run_with_compatibility(compatibility: ServeCompatibility) -> Result<()> {
@@ -44,6 +63,10 @@ async fn run_with_compatibility(compatibility: ServeCompatibility) -> Result<()>
             #[cfg(feature = "legacy-v1")]
             ServeCompatibility::LegacyV1(runtime) => {
                 start_legacy_v1_daemon(cfg, policy, runtime).await?
+            }
+            #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+            ServeCompatibility::LegacyV1WithMedia(runtime, media_profile) => {
+                start_legacy_v1_media_sidecar(cfg, policy, runtime, media_profile).await?
             }
         }
     } else {
@@ -69,6 +92,66 @@ async fn start_legacy_v1_daemon(
 ) -> std::result::Result<myownmesh::embedded::EmbeddedDaemon, myownmesh::embedded::EmbeddedStartError>
 {
     myownmesh::embedded::start_connector_capable_with_legacy_v1(cfg, policy, runtime).await
+}
+
+#[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+#[allow(
+    deprecated,
+    reason = "this helper is the explicit LegacyV1 media sidecar boundary"
+)]
+async fn start_legacy_v1_media_sidecar(
+    cfg: myownmesh_core::MeshConfig,
+    policy: myownmesh_core::WebRtcConnectorCapablePolicy,
+    runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
+    media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
+) -> std::result::Result<myownmesh::embedded::EmbeddedDaemon, myownmesh::embedded::EmbeddedStartError>
+{
+    myownmesh::embedded::start_connector_capable_with_legacy_v1_and_media(
+        cfg,
+        policy,
+        runtime,
+        media_profile,
+    )
+    .await
+}
+
+#[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+fn legacy_media_profile_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<myownmesh_core::LegacyWebRtcMediaProfile> {
+    fn required(
+        lookup: &mut impl FnMut(&str) -> Option<String>,
+        name: &'static str,
+    ) -> Result<String> {
+        lookup(name).ok_or_else(|| {
+            anyhow!("legacy-media sidecar requires owner-selected environment value {name}")
+        })
+    }
+    let max_lanes = required(&mut lookup, "MYOWNMESH_LEGACY_MEDIA_MAX_LANES_PER_KIND")?
+        .parse::<usize>()
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            anyhow!("MYOWNMESH_LEGACY_MEDIA_MAX_LANES_PER_KIND must be a nonzero integer")
+        })?;
+    let video_lanes = required(
+        &mut lookup,
+        "MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_VIDEO_LANES",
+    )?
+    .parse::<usize>()
+    .map_err(|_| {
+        anyhow!("MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_VIDEO_LANES must be a nonnegative integer")
+    })?;
+    let audio_lanes = required(
+        &mut lookup,
+        "MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_AUDIO_LANES",
+    )?
+    .parse::<usize>()
+    .map_err(|_| {
+        anyhow!("MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_AUDIO_LANES must be a nonnegative integer")
+    })?;
+    myownmesh_core::LegacyWebRtcMediaProfile::h264_opus(max_lanes, video_lanes, audio_lanes)
+        .map_err(Into::into)
 }
 
 fn connector_policy_from_lookup(
@@ -352,5 +435,41 @@ mod tests {
             policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Disabled
         ));
+    }
+
+    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    #[test]
+    fn v4_arc03j_legacy_media_sidecar_rejects_an_incomplete_owner_vector() {
+        let mut values = HashMap::from([
+            ("MYOWNMESH_LEGACY_MEDIA_MAX_LANES_PER_KIND", "2".to_string()),
+            (
+                "MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_VIDEO_LANES",
+                "1".to_string(),
+            ),
+        ]);
+        let error = legacy_media_profile_from_lookup(|name| values.remove(name))
+            .expect_err("an omitted owner field is rejected");
+        assert!(error
+            .to_string()
+            .contains("MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_AUDIO_LANES"));
+    }
+
+    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    #[test]
+    fn v4_arc03j_legacy_media_sidecar_uses_only_the_complete_owner_vector() {
+        let mut values = HashMap::from([
+            ("MYOWNMESH_LEGACY_MEDIA_MAX_LANES_PER_KIND", "2".to_string()),
+            (
+                "MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_VIDEO_LANES",
+                "1".to_string(),
+            ),
+            (
+                "MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_AUDIO_LANES",
+                "1".to_string(),
+            ),
+        ]);
+        legacy_media_profile_from_lookup(|name| values.remove(name))
+            .expect("the complete explicit test vector is accepted");
+        assert!(values.is_empty());
     }
 }

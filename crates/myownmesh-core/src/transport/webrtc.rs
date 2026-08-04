@@ -48,7 +48,11 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+#[cfg(any(test, feature = "legacy-media"))]
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
+#[cfg(any(test, feature = "legacy-media"))]
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -770,8 +774,15 @@ async fn wait_for_optional_retirement(retirement: &mut Option<watch::Receiver<bo
 }
 
 fn drain_remote_candidates(remote_candidates: &SyncMutex<RemoteCandidateState>) {
-    let pending = remote_candidates.lock().pending.take();
-    drop(pending);
+    let mut state = remote_candidates.lock();
+    let current = state.current.pending.take();
+    let provisional = state
+        .provisional
+        .as_mut()
+        .map(|attempt| attempt.envelope.pending.take());
+    drop(state);
+    drop(current);
+    drop(provisional);
 }
 
 /// Result of applying an inbound candidate through the connector owner.
@@ -781,6 +792,7 @@ pub(crate) enum RemoteCandidateDisposition {
     QueuedUntilRemoteDescription,
     DuplicateIgnored,
     RefusedByOwner,
+    AttemptRetired,
 }
 
 /// Outcome of the data-channel-open ownership transition.
@@ -939,6 +951,17 @@ impl PendingRemoteCandidateQueue {
         }
     }
 
+    fn retain_matching_remote_credentials(&mut self, credentials: &RemoteIceCredentials) {
+        self.entries.retain(|pending| {
+            candidate_matches_remote_credentials(&pending.candidate, credentials)
+        });
+        if self.entries.is_empty() {
+            self.container_observation = None;
+        } else if let Some(observation) = self.container_observation.as_mut() {
+            observation.replace_measurement(queue_container_resource_measurement(&self.entries));
+        }
+    }
+
     fn pop_last_for_application(
         &mut self,
         resource_scope: &PeerConnectionResourceScope,
@@ -965,6 +988,7 @@ enum PendingRemoteCandidateQueuePush {
     Queued,
     Duplicate,
     Refused,
+    Retired,
 }
 
 #[derive(Debug)]
@@ -1126,15 +1150,17 @@ impl Iterator for PendingRemoteCandidateDrain {
 
 impl ExactSizeIterator for PendingRemoteCandidateDrain {}
 
-struct RemoteCandidateState {
+struct RemoteCandidateAttemptEnvelope {
     attempt: Arc<RemoteCandidateAttemptIdentity>,
     remote_description_set: bool,
     pending: PendingRemoteCandidateQueue,
     seen: std::collections::HashSet<[u8; 32]>,
     retained_reservations: Vec<PendingRemoteCandidateReservation>,
+    remote_ice_credentials: Option<RemoteIceCredentials>,
+    remote_description_in_flight: bool,
 }
 
-impl RemoteCandidateState {
+impl RemoteCandidateAttemptEnvelope {
     fn new(policy: PendingRemoteCandidatePolicy) -> Self {
         Self {
             attempt: Arc::new(RemoteCandidateAttemptIdentity::default()),
@@ -1142,6 +1168,8 @@ impl RemoteCandidateState {
             pending: PendingRemoteCandidateQueue::new(policy),
             seen: std::collections::HashSet::new(),
             retained_reservations: Vec::new(),
+            remote_ice_credentials: None,
+            remote_description_in_flight: false,
         }
     }
 
@@ -1150,11 +1178,15 @@ impl RemoteCandidateState {
         candidate: LocalIceCandidate,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
+        if !self.attempt.is_active() {
+            return PendingRemoteCandidateQueuePush::Retired;
+        }
         let digest = candidate_content_digest(&candidate);
         if self.seen.contains(&digest) {
             return if self.pending.budget.record_duplicate() {
                 PendingRemoteCandidateQueuePush::Duplicate
             } else {
+                self.attempt.retire();
                 PendingRemoteCandidateQueuePush::Refused
             };
         }
@@ -1163,21 +1195,320 @@ impl RemoteCandidateState {
             .push(candidate, Arc::clone(&self.attempt), resource_scope);
         if result == PendingRemoteCandidateQueuePush::Queued {
             self.seen.insert(digest);
+        } else if result == PendingRemoteCandidateQueuePush::Refused {
+            self.attempt.retire();
         }
         result
-    }
-
-    fn begin_ice_restart(&mut self) -> Arc<RemoteCandidateAttemptIdentity> {
-        let policy = self.pending.budget.policy;
-        let retiring = Arc::clone(&self.attempt);
-        retiring.retire();
-        *self = Self::new(policy);
-        retiring
     }
 
     fn owns_attempt(&self, attempt: &Arc<RemoteCandidateAttemptIdentity>) -> bool {
         Arc::ptr_eq(&self.attempt, attempt) && attempt.is_active()
     }
+
+    fn last_candidate_matches_remote_credentials(&self) -> bool {
+        let Some(credentials) = self.remote_ice_credentials.as_ref() else {
+            return true;
+        };
+        self.pending.entries.last().is_none_or(|pending| {
+            candidate_matches_remote_credentials(&pending.candidate, credentials)
+        })
+    }
+
+    fn adopt_queued_candidates_for_remote_restart(
+        &mut self,
+        source: &mut Self,
+        credentials: &RemoteIceCredentials,
+    ) -> bool {
+        self.pending.entries = std::mem::take(&mut source.pending.entries);
+        self.pending.container_observation = source.pending.container_observation.take();
+        self.pending.retain_matching_remote_credentials(credentials);
+
+        for pending in &mut self.pending.entries {
+            let Some(content_bytes) = candidate_content_bytes(&pending.candidate) else {
+                self.attempt.retire();
+                self.pending.budget.poison();
+                return false;
+            };
+            let Some(reservation) = self.pending.budget.reserve(content_bytes) else {
+                self.attempt.retire();
+                return false;
+            };
+            pending.attempt = Arc::clone(&self.attempt);
+            pending._queue_reservation = Some(reservation);
+            self.seen
+                .insert(candidate_content_digest(&pending.candidate));
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IceRestartDirection {
+    Local,
+    Remote,
+}
+
+struct ProvisionalRemoteCandidateAttempt {
+    direction: IceRestartDirection,
+    envelope: RemoteCandidateAttemptEnvelope,
+}
+
+struct RemoteCandidateState {
+    current: RemoteCandidateAttemptEnvelope,
+    provisional: Option<ProvisionalRemoteCandidateAttempt>,
+}
+
+impl RemoteCandidateState {
+    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
+        Self {
+            current: RemoteCandidateAttemptEnvelope::new(policy),
+            provisional: None,
+        }
+    }
+
+    fn admission_target(&mut self) -> &mut RemoteCandidateAttemptEnvelope {
+        self.provisional
+            .as_mut()
+            .map_or(&mut self.current, |provisional| &mut provisional.envelope)
+    }
+
+    fn admit(
+        &mut self,
+        candidate: LocalIceCandidate,
+        resource_scope: &PeerConnectionResourceScope,
+    ) -> PendingRemoteCandidateQueuePush {
+        self.admission_target().admit(candidate, resource_scope)
+    }
+
+    fn begin_local_ice_restart(
+        &mut self,
+    ) -> Result<(
+        Arc<RemoteCandidateAttemptIdentity>,
+        Arc<RemoteCandidateAttemptIdentity>,
+    )> {
+        if self.provisional.is_some() {
+            return Err(Error::Transport(
+                "an ICE restart transaction is already provisional".to_string(),
+            ));
+        }
+        if self.current.remote_description_in_flight {
+            return Err(Error::Transport(
+                "cannot begin local ICE restart while a remote description is in flight"
+                    .to_string(),
+            ));
+        }
+        let policy = self.current.pending.budget.policy;
+        let retiring = Arc::clone(&self.current.attempt);
+        retiring.retire();
+        let replacement = RemoteCandidateAttemptEnvelope::new(policy);
+        let replacement_attempt = Arc::clone(&replacement.attempt);
+        self.provisional = Some(ProvisionalRemoteCandidateAttempt {
+            direction: IceRestartDirection::Local,
+            envelope: replacement,
+        });
+        Ok((retiring, replacement_attempt))
+    }
+
+    fn owns_attempt(&self, attempt: &Arc<RemoteCandidateAttemptIdentity>) -> bool {
+        self.current.owns_attempt(attempt)
+            || self
+                .provisional
+                .as_ref()
+                .is_some_and(|provisional| provisional.envelope.owns_attempt(attempt))
+    }
+
+    fn candidate_matches_attempt(
+        &self,
+        attempt: &Arc<RemoteCandidateAttemptIdentity>,
+        candidate: &LocalIceCandidate,
+    ) -> bool {
+        let envelope = if Arc::ptr_eq(&self.current.attempt, attempt) {
+            Some(&self.current)
+        } else {
+            self.provisional.as_ref().and_then(|provisional| {
+                Arc::ptr_eq(&provisional.envelope.attempt, attempt).then_some(&provisional.envelope)
+            })
+        };
+        let Some(credentials) =
+            envelope.and_then(|envelope| envelope.remote_ice_credentials.as_ref())
+        else {
+            return envelope.is_some();
+        };
+        candidate_matches_remote_credentials(candidate, credentials)
+    }
+
+    fn commit_local_ice_restart(
+        &mut self,
+        attempt: &Arc<RemoteCandidateAttemptIdentity>,
+    ) -> Result<()> {
+        let provisional = self.provisional.take().ok_or_else(|| {
+            Error::Transport("local ICE restart lost its provisional attempt".to_string())
+        })?;
+        if provisional.direction != IceRestartDirection::Local
+            || !provisional.envelope.owns_attempt(attempt)
+        {
+            provisional.envelope.attempt.retire();
+            return Err(Error::Transport(
+                "local ICE restart provisional attempt was replaced".to_string(),
+            ));
+        }
+        self.current = provisional.envelope;
+        Ok(())
+    }
+
+    fn fail_provisional(&mut self, attempt: &Arc<RemoteCandidateAttemptIdentity>) {
+        if self
+            .provisional
+            .as_ref()
+            .is_some_and(|provisional| Arc::ptr_eq(&provisional.envelope.attempt, attempt))
+        {
+            if let Some(provisional) = self.provisional.take() {
+                provisional.envelope.attempt.retire();
+            }
+        }
+    }
+
+    fn has_no_viable_attempt(&self) -> bool {
+        !self.current.attempt.is_active()
+            && self
+                .provisional
+                .as_ref()
+                .is_none_or(|provisional| !provisional.envelope.attempt.is_active())
+    }
+
+    fn prepare_remote_description(
+        &mut self,
+        credentials: RemoteIceCredentials,
+    ) -> Result<RemoteDescriptionAttempt> {
+        if let Some(provisional) = self.provisional.as_mut() {
+            if provisional.direction == IceRestartDirection::Local {
+                return Err(Error::Transport(
+                    "replacement remote description arrived before native local ICE restart committed"
+                        .to_string(),
+                ));
+            }
+            if provisional.envelope.remote_description_in_flight {
+                return Err(Error::Transport(
+                    "replacement remote description is already in flight".to_string(),
+                ));
+            }
+            if let Some(expected) = provisional.envelope.remote_ice_credentials.as_ref() {
+                if expected != &credentials {
+                    provisional.envelope.attempt.retire();
+                    return Err(Error::Transport(
+                        "replacement remote description changed ICE credentials during the provisional transaction"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                provisional.envelope.remote_ice_credentials = Some(credentials.clone());
+            }
+            provisional.envelope.remote_description_in_flight = true;
+            return Ok(RemoteDescriptionAttempt {
+                attempt: Arc::clone(&provisional.envelope.attempt),
+                provisional: true,
+                retiring: None,
+                credentials,
+            });
+        }
+
+        if self.current.remote_description_in_flight {
+            return Err(Error::Transport(
+                "remote description is already in flight for this ICE attempt".to_string(),
+            ));
+        }
+
+        let is_restart = self
+            .current
+            .remote_ice_credentials
+            .as_ref()
+            .is_some_and(|current| current.proves_restart_to(&credentials));
+        if !is_restart {
+            self.current.remote_description_in_flight = true;
+            return Ok(RemoteDescriptionAttempt {
+                attempt: Arc::clone(&self.current.attempt),
+                provisional: false,
+                retiring: None,
+                credentials,
+            });
+        }
+
+        let policy = self.current.pending.budget.policy;
+        let mut replacement = RemoteCandidateAttemptEnvelope::new(policy);
+        replacement.remote_ice_credentials = Some(credentials.clone());
+        replacement.remote_description_in_flight = true;
+        let migrated =
+            replacement.adopt_queued_candidates_for_remote_restart(&mut self.current, &credentials);
+        let retiring = Arc::clone(&self.current.attempt);
+        retiring.retire();
+        let attempt = Arc::clone(&replacement.attempt);
+        self.provisional = Some(ProvisionalRemoteCandidateAttempt {
+            direction: IceRestartDirection::Remote,
+            envelope: replacement,
+        });
+        if !migrated {
+            return Err(Error::Transport(
+                "remote ICE restart could not conservatively transfer its bounded pre-description candidates"
+                    .to_string(),
+            ));
+        }
+        Ok(RemoteDescriptionAttempt {
+            attempt,
+            provisional: true,
+            retiring: Some(retiring),
+            credentials,
+        })
+    }
+
+    fn commit_remote_description(
+        &mut self,
+        prepared: &RemoteDescriptionAttempt,
+    ) -> Result<PendingRemoteCandidateDrain> {
+        if prepared.provisional {
+            let provisional = self.provisional.take().ok_or_else(|| {
+                Error::Transport("remote description lost its provisional ICE attempt".to_string())
+            })?;
+            if !provisional.envelope.owns_attempt(&prepared.attempt) {
+                provisional.envelope.attempt.retire();
+                return Err(Error::Transport(
+                    "remote description provisional ICE attempt was replaced".to_string(),
+                ));
+            }
+            self.current = provisional.envelope;
+        } else if !self.current.owns_attempt(&prepared.attempt) {
+            return Err(Error::Transport(
+                "remote description belongs to a retired ICE attempt".to_string(),
+            ));
+        }
+        if !self.current.remote_description_in_flight {
+            self.current.attempt.retire();
+            return Err(Error::Transport(
+                "remote description commit lost its in-flight transaction".to_string(),
+            ));
+        }
+        self.current.remote_description_in_flight = false;
+        self.current.remote_ice_credentials = Some(prepared.credentials.clone());
+        self.current.remote_description_set = true;
+        self.current
+            .pending
+            .retain_matching_remote_credentials(&prepared.credentials);
+        Ok(self.current.pending.take())
+    }
+
+    fn fail_remote_description(&mut self, prepared: &RemoteDescriptionAttempt) {
+        if prepared.provisional {
+            self.fail_provisional(&prepared.attempt);
+        } else if Arc::ptr_eq(&self.current.attempt, &prepared.attempt) {
+            self.current.remote_description_in_flight = false;
+        }
+    }
+}
+
+struct RemoteDescriptionAttempt {
+    attempt: Arc<RemoteCandidateAttemptIdentity>,
+    provisional: bool,
+    retiring: Option<Arc<RemoteCandidateAttemptIdentity>>,
+    credentials: RemoteIceCredentials,
 }
 
 #[derive(Debug)]
@@ -1801,7 +2132,11 @@ impl WebRtcConnectorWorker {
                 return Err(Error::Transport("connector worker is retired".to_string()));
             }
             let admitted = state.admit(candidate, &self.resource_scope);
-            if !state.remote_description_set {
+            let target = state.admission_target();
+            if !target.remote_description_set
+                || (admitted == PendingRemoteCandidateQueuePush::Queued
+                    && !target.last_candidate_matches_remote_credentials())
+            {
                 return Ok(match admitted {
                     PendingRemoteCandidateQueuePush::Queued => {
                         RemoteCandidateDisposition::QueuedUntilRemoteDescription
@@ -1812,10 +2147,13 @@ impl WebRtcConnectorWorker {
                     PendingRemoteCandidateQueuePush::Refused => {
                         RemoteCandidateDisposition::RefusedByOwner
                     }
+                    PendingRemoteCandidateQueuePush::Retired => {
+                        RemoteCandidateDisposition::AttemptRetired
+                    }
                 });
             }
             match admitted {
-                PendingRemoteCandidateQueuePush::Queued => state
+                PendingRemoteCandidateQueuePush::Queued => target
                     .pending
                     .pop_last_for_application(&self.resource_scope)
                     .ok_or_else(|| {
@@ -1828,6 +2166,9 @@ impl WebRtcConnectorWorker {
                 }
                 PendingRemoteCandidateQueuePush::Refused => {
                     return Ok(RemoteCandidateDisposition::RefusedByOwner)
+                }
+                PendingRemoteCandidateQueuePush::Retired => {
+                    return Ok(RemoteCandidateDisposition::AttemptRetired)
                 }
             }
         };
@@ -1851,22 +2192,50 @@ impl WebRtcConnectorWorker {
             1,
             0,
         );
-        let (attempt, _attempt_operation) = {
-            let state = self.remote_candidates.lock();
-            let attempt = Arc::clone(&state.attempt);
-            let operation = attempt.try_enter().ok_or_else(|| {
-                Error::Transport("remote-candidate attempt is retired".to_string())
-            })?;
-            (attempt, operation)
+        let credentials = sdp_ice_credentials(&description.sdp)?;
+        let prepared = {
+            let mut state = self.remote_candidates.lock();
+            match state.prepare_remote_description(credentials) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let must_retire_connector = state.has_no_viable_attempt();
+                    drop(state);
+                    if must_retire_connector {
+                        self.close_owner.start();
+                    }
+                    return Err(error);
+                }
+            }
         };
-        await_until_connector_retirement(
+        if let Some(retiring) = prepared.retiring.as_ref() {
+            retiring.wait_for_operations().await;
+        }
+        let _attempt_operation = match prepared.attempt.try_enter() {
+            Some(operation) => operation,
+            None => {
+                if prepared.provisional {
+                    self.close_owner.start();
+                }
+                return Err(Error::Transport(
+                    "remote-candidate attempt is retired".to_string(),
+                ));
+            }
+        };
+        let native_result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.set_remote_description(description),
         )
         .await
-        .ok_or_else(|| {
-            Error::Transport("connector worker retired during SDP apply".to_string())
-        })??;
+        .ok_or_else(|| Error::Transport("connector worker retired during SDP apply".to_string()))?;
+        if let Err(error) = native_result {
+            self.remote_candidates
+                .lock()
+                .fail_remote_description(&prepared);
+            if prepared.provisional {
+                self.close_owner.start();
+            }
+            return Err(error);
+        }
         let pending = {
             let mut state = self.remote_candidates.lock();
             if !self.ownership.incarnation.is_active() {
@@ -1874,13 +2243,14 @@ impl WebRtcConnectorWorker {
                     "connector worker retired during SDP apply".to_string(),
                 ));
             }
-            if !state.owns_attempt(&attempt) {
-                return Err(Error::Transport(
-                    "remote description belongs to a retired ICE attempt".to_string(),
-                ));
+            match state.commit_remote_description(&prepared) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    drop(state);
+                    self.close_owner.start();
+                    return Err(error);
+                }
             }
-            state.remote_description_set = true;
-            state.pending.take()
         };
         let queued_candidate_count = pending.len();
         let mut candidate_failures = Vec::new();
@@ -1903,9 +2273,15 @@ impl WebRtcConnectorWorker {
         let _attempt_operation = pending.attempt.try_enter().ok_or_else(|| {
             Error::Transport("remote candidate belongs to a retired ICE attempt".to_string())
         })?;
-        if !self.remote_candidates.lock().owns_attempt(&pending.attempt) {
+        let candidate_matches_attempt = {
+            let state = self.remote_candidates.lock();
+            state.owns_attempt(&pending.attempt)
+                && state.candidate_matches_attempt(&pending.attempt, &pending.candidate)
+        };
+        if !candidate_matches_attempt {
+            pending.attempt.retire();
             return Err(Error::Transport(
-                "remote candidate does not own the current ICE attempt".to_string(),
+                "remote candidate does not match the exact current ICE attempt".to_string(),
             ));
         }
         let budget = pending
@@ -1916,6 +2292,7 @@ impl WebRtcConnectorWorker {
             .as_ref()
             .is_some_and(|budget| !budget.reserve_application_work())
         {
+            pending.attempt.retire();
             return Err(Error::Transport(
                 "remote-candidate application work exceeded the owner-selected ICE-attempt envelope"
                     .to_string(),
@@ -1935,17 +2312,17 @@ impl WebRtcConnectorWorker {
         )
         .await
         .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?;
-        if !attempt.is_active() {
+        if !attempt.is_active() || !self.remote_candidates.lock().owns_attempt(&attempt) {
             return Err(Error::Transport(
                 "remote candidate completed after its ICE attempt retired".to_string(),
             ));
         }
         drop(observation);
         if let Some(reservation) = _queue_reservation {
-            self.remote_candidates
-                .lock()
-                .retained_reservations
-                .push(reservation);
+            let mut state = self.remote_candidates.lock();
+            if state.current.owns_attempt(&attempt) {
+                state.current.retained_reservations.push(reservation);
+            }
         }
         result
     }
@@ -2141,16 +2518,32 @@ impl WebRtcConnectorWorker {
 
     pub(crate) async fn restart_ice(&self) -> Result<()> {
         let _operation = self.ownership.enter_operation()?;
-        let retiring_attempt = self.remote_candidates.lock().begin_ice_restart();
+        let (retiring_attempt, replacement_attempt) =
+            self.remote_candidates.lock().begin_local_ice_restart()?;
         retiring_attempt.wait_for_operations().await;
-        await_until_connector_retirement(
+        let native_result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.restart_ice(),
         )
         .await
         .ok_or_else(|| {
             Error::Transport("connector worker retired during ICE restart".to_string())
-        })??;
+        })?;
+        if let Err(error) = native_result {
+            self.remote_candidates
+                .lock()
+                .fail_provisional(&replacement_attempt);
+            self.close_owner.start();
+            return Err(error);
+        }
+        if let Err(error) = self
+            .remote_candidates
+            .lock()
+            .commit_local_ice_restart(&replacement_attempt)
+        {
+            self.close_owner.start();
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -2442,11 +2835,87 @@ impl Drop for ConstructedConnectorResult {
 }
 
 #[cfg(any(test, feature = "legacy-media"))]
+fn legacy_media_codecs() -> Vec<(RTCRtpCodecParameters, RTPCodecType)> {
+    let feedback = vec![
+        RTCPFeedback {
+            typ: "goog-remb".to_string(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "ccm".to_string(),
+            parameter: "fir".to_string(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_string(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_string(),
+            parameter: "pli".to_string(),
+        },
+    ];
+    let mut codecs = vec![(
+        RTCRtpCodecParameters {
+            capability: RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_string(),
+                clock_rate: 48_000,
+                channels: 2,
+                sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
+                rtcp_feedback: Vec::new(),
+            },
+            payload_type: 111,
+            ..Default::default()
+        },
+        RTPCodecType::Audio,
+    )];
+    for (payload_type, sdp_fmtp_line) in [
+        (
+            102,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+        ),
+        (
+            127,
+            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f",
+        ),
+        (
+            125,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+        ),
+        (
+            108,
+            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f",
+        ),
+        (
+            123,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032",
+        ),
+    ] {
+        codecs.push((
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_H264.to_string(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line: sdp_fmtp_line.to_string(),
+                    rtcp_feedback: feedback.clone(),
+                },
+                payload_type,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        ));
+    }
+    codecs
+}
+
+#[cfg(any(test, feature = "legacy-media"))]
 fn build_legacy_media_api() -> Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
-    media_engine
-        .register_default_codecs()
-        .map_err(|error| Error::Transport(format!("register legacy media codecs: {error}")))?;
+    for (codec, kind) in legacy_media_codecs() {
+        media_engine.register_codec(codec, kind).map_err(|error| {
+            Error::Transport(format!("register frozen legacy media codec: {error}"))
+        })?;
+    }
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)
         .map_err(|error| Error::Transport(format!("register legacy interceptors: {error}")))?;
@@ -2796,11 +3265,11 @@ impl Transport {
             if legacy_api.is_none() {
                 *legacy_api = Some(Arc::new(build_legacy_media_api()?));
             }
-            Arc::clone(
-                legacy_api
-                    .as_ref()
-                    .expect("legacy media API was installed under its owner lock"),
-            )
+            legacy_api.as_ref().cloned().ok_or_else(|| {
+                Error::Transport(
+                    "legacy media API owner lost the value installed under its lock".to_string(),
+                )
+            })?
         } else {
             Arc::clone(&self.api)
         };
@@ -3419,15 +3888,279 @@ fn pair_state_str(s: webrtc::ice::candidate::CandidatePairState) -> String {
 /// channel, the provisioned pool of video + audio track lanes (see
 /// [`MEDIA_LANES`]), and transport-level event sink.
 /// Extract the DTLS fingerprint (`a=fingerprint:<hash> <value>`) from an SDP
-/// blob, lowercased for stable comparison. Returns the first one found —
-/// session-level or the first media section; for our single-bundle sessions
-/// they're identical. Used to tell a peer's in-place ICE restart (same
-/// fingerprint) from a full rebuild (new fingerprint) on the answerer side.
+/// blob and lowercase it for stable comparison. This is endpoint-authentication
+/// binding and diagnostic input. ICE restart detection uses the exact effective
+/// ICE credentials instead of this fingerprint.
 pub(crate) fn sdp_fingerprint(sdp: &str) -> Option<String> {
     sdp.lines()
         .map(str::trim)
         .find_map(|line| line.strip_prefix("a=fingerprint:"))
         .map(|v| v.trim().to_ascii_lowercase())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteIceCredentialBinding {
+    media_index: usize,
+    mid: Option<String>,
+    username_fragment: String,
+    password: String,
+}
+
+/// Exact effective remote ICE credentials for every SDP media section.
+///
+/// Session-level credentials are inherited by a media section only when that
+/// section does not override them. MID, or media index when MID is absent,
+/// identifies an existing ICE transport across renegotiation. Adding or
+/// removing a media section does not manufacture an ICE restart. A changed
+/// credential pair on the same transport does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteIceCredentials {
+    bindings: Vec<RemoteIceCredentialBinding>,
+}
+
+impl RemoteIceCredentials {
+    fn contains_username_fragment(&self, username_fragment: &str) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.username_fragment == username_fragment)
+    }
+
+    fn proves_restart_to(&self, replacement: &Self) -> bool {
+        let mut overlapping_transport = false;
+        for current in &self.bindings {
+            let next = match current.mid.as_deref() {
+                Some(mid) => replacement
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.mid.as_deref() == Some(mid)),
+                None => replacement.bindings.iter().find(|binding| {
+                    binding.mid.is_none() && binding.media_index == current.media_index
+                }),
+            };
+            let Some(next) = next else {
+                continue;
+            };
+            overlapping_transport = true;
+            if current.username_fragment != next.username_fragment
+                || current.password != next.password
+            {
+                return true;
+            }
+        }
+        if overlapping_transport {
+            return false;
+        }
+
+        let mut current_pairs: Vec<(&str, &str)> = self
+            .bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.username_fragment.as_str(),
+                    binding.password.as_str(),
+                )
+            })
+            .collect();
+        let mut replacement_pairs: Vec<(&str, &str)> = replacement
+            .bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.username_fragment.as_str(),
+                    binding.password.as_str(),
+                )
+            })
+            .collect();
+        current_pairs.sort_unstable();
+        current_pairs.dedup();
+        replacement_pairs.sort_unstable();
+        replacement_pairs.dedup();
+        current_pairs != replacement_pairs
+    }
+}
+
+fn candidate_username_fragment(candidate: &LocalIceCandidate) -> Option<&str> {
+    if let Some(username_fragment) = candidate.username_fragment.as_deref() {
+        return Some(username_fragment);
+    }
+    let mut fields = candidate.candidate.split_ascii_whitespace();
+    while let Some(field) = fields.next() {
+        if field.eq_ignore_ascii_case("ufrag") {
+            return fields.next();
+        }
+    }
+    None
+}
+
+fn candidate_matches_remote_credentials(
+    candidate: &LocalIceCandidate,
+    credentials: &RemoteIceCredentials,
+) -> bool {
+    // webrtc-rs currently serializes a gathered candidate with `Some("")` for
+    // an unavailable MID while still supplying the exact media-line index.
+    // An empty MID carries no identity. A nonempty MID and an index, when both
+    // exist, must still resolve to the same credential binding.
+    let candidate_mid = candidate.sdp_mid.as_deref().filter(|mid| !mid.is_empty());
+    let declares_location = candidate.sdp_mline_index.is_some() || candidate_mid.is_some();
+    let exact_binding = credentials.bindings.iter().find(|binding| {
+        candidate
+            .sdp_mline_index
+            .is_none_or(|media_index| usize::from(media_index) == binding.media_index)
+            && candidate_mid.is_none_or(|mid| binding.mid.as_deref() == Some(mid))
+    });
+    if declares_location && exact_binding.is_none() {
+        return false;
+    }
+    candidate_username_fragment(candidate).is_none_or(|username_fragment| {
+        exact_binding.map_or_else(
+            || credentials.contains_username_fragment(username_fragment),
+            |binding| binding.username_fragment == username_fragment,
+        )
+    })
+}
+
+#[derive(Default)]
+struct ParsedIceMediaSection {
+    rejected: bool,
+    mid: Option<String>,
+    username_fragment: Option<String>,
+    password: Option<String>,
+}
+
+fn sdp_ice_credentials(sdp: &str) -> Result<RemoteIceCredentials> {
+    let mut session_username_fragment = None;
+    let mut session_password = None;
+    let mut sections = Vec::<ParsedIceMediaSection>::new();
+
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim().trim_end_matches('\r');
+        if let Some(media) = line.strip_prefix("m=") {
+            let rejected = media
+                .split_ascii_whitespace()
+                .nth(1)
+                .and_then(|port| port.split('/').next())
+                .is_some_and(|port| port == "0");
+            sections.push(ParsedIceMediaSection {
+                rejected,
+                ..Default::default()
+            });
+            continue;
+        }
+        let target = sections.last_mut();
+        if let Some(value) = line.strip_prefix("a=mid:") {
+            if let Some(section) = target {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(Error::Transport(
+                        "remote SDP carries an empty MID".to_string(),
+                    ));
+                }
+                if section.mid.is_some() {
+                    return Err(Error::Transport(
+                        "remote SDP media section carries more than one MID".to_string(),
+                    ));
+                }
+                section.mid = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=ice-ufrag:") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(Error::Transport(
+                    "remote SDP carries an empty ICE username fragment".to_string(),
+                ));
+            }
+            match target {
+                Some(section) if section.username_fragment.is_some() => {
+                    return Err(Error::Transport(
+                        "remote SDP media section carries more than one ICE username fragment"
+                            .to_string(),
+                    ));
+                }
+                Some(section) => section.username_fragment = Some(value.to_string()),
+                None if session_username_fragment.is_some() => {
+                    return Err(Error::Transport(
+                        "remote SDP session carries more than one ICE username fragment"
+                            .to_string(),
+                    ));
+                }
+                None => session_username_fragment = Some(value.to_string()),
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=ice-pwd:") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(Error::Transport(
+                    "remote SDP carries an empty ICE password".to_string(),
+                ));
+            }
+            match target {
+                Some(section) if section.password.is_some() => {
+                    return Err(Error::Transport(
+                        "remote SDP media section carries more than one ICE password".to_string(),
+                    ));
+                }
+                Some(section) => section.password = Some(value.to_string()),
+                None if session_password.is_some() => {
+                    return Err(Error::Transport(
+                        "remote SDP session carries more than one ICE password".to_string(),
+                    ));
+                }
+                None => session_password = Some(value.to_string()),
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        return Err(Error::Transport(
+            "remote SDP has no media section for exact ICE credentials".to_string(),
+        ));
+    }
+
+    let mut bindings = Vec::with_capacity(sections.len());
+    let mut active_mids = std::collections::HashSet::new();
+    for (media_index, section) in sections.into_iter().enumerate() {
+        if section.rejected {
+            continue;
+        }
+        if let Some(mid) = section.mid.as_ref() {
+            if !active_mids.insert(mid.clone()) {
+                return Err(Error::Transport(format!(
+                    "remote SDP repeats active MID {mid}"
+                )));
+            }
+        }
+        let username_fragment = section
+            .username_fragment
+            .or_else(|| session_username_fragment.clone())
+            .ok_or_else(|| {
+                Error::Transport(format!(
+                    "remote SDP media section {media_index} has no effective ICE username fragment"
+                ))
+            })?;
+        let password = section
+            .password
+            .or_else(|| session_password.clone())
+            .ok_or_else(|| {
+                Error::Transport(format!(
+                    "remote SDP media section {media_index} has no effective ICE password"
+                ))
+            })?;
+        bindings.push(RemoteIceCredentialBinding {
+            media_index,
+            mid: section.mid,
+            username_fragment,
+            password,
+        });
+    }
+    if bindings.is_empty() {
+        return Err(Error::Transport(
+            "remote SDP has no active media section with exact ICE credentials".to_string(),
+        ));
+    }
+    Ok(RemoteIceCredentials { bindings })
 }
 
 pub struct PeerSession {
@@ -4017,6 +4750,19 @@ mod tests {
             sdp_mline_index: None,
             username_fragment: Some(username_fragment),
         }
+    }
+
+    fn exact_ice_sdp(username_fragment: &str, password: &str, fingerprint: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=- 1 2 IN IP4 127.0.0.1\r\n\
+             a=group:BUNDLE data\r\n\
+             a=ice-ufrag:{username_fragment}\r\n\
+             a=ice-pwd:{password}\r\n\
+             a=fingerprint:sha-256 {fingerprint}\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:data\r\n"
+        )
     }
 
     fn test_pending_candidate_policy() -> PendingRemoteCandidatePolicy {
@@ -5894,7 +6640,7 @@ mod tests {
             PendingRemoteCandidateQueuePush::Duplicate
         );
         assert_eq!(
-            item_bounded.pending.budget.report(),
+            item_bounded.current.pending.budget.report(),
             (1, content_bytes, 1, 0, false)
         );
         let mut distinct = first.clone();
@@ -5909,7 +6655,7 @@ mod tests {
             PendingRemoteCandidateQueuePush::Refused
         );
         assert_eq!(
-            item_bounded.pending.budget.report(),
+            item_bounded.current.pending.budget.report(),
             (1, content_bytes, 1, 0, false)
         );
 
@@ -5930,7 +6676,7 @@ mod tests {
             PendingRemoteCandidateQueuePush::Refused
         );
         assert_eq!(
-            byte_bounded.pending.budget.report(),
+            byte_bounded.current.pending.budget.report(),
             (1, content_bytes, 0, 0, false)
         );
     }
@@ -6034,11 +6780,13 @@ mod tests {
             .peer_connection_scope();
         let policy = test_pending_candidate_policy();
         let mut state = RemoteCandidateState::new(policy);
-        let displaced_budget = Arc::clone(&state.pending.budget);
+        let displaced_budget = Arc::clone(&state.current.pending.budget);
         assert_eq!(
-            state
-                .pending
-                .push(observed_candidate(), Arc::clone(&state.attempt), &scope,),
+            state.current.pending.push(
+                observed_candidate(),
+                Arc::clone(&state.current.attempt),
+                &scope,
+            ),
             PendingRemoteCandidateQueuePush::Queued
         );
         assert_eq!(displaced_budget.report().0, 1);
@@ -6046,11 +6794,11 @@ mod tests {
         let displaced = std::mem::replace(&mut state, RemoteCandidateState::new(policy));
         drop(displaced);
         assert_eq!(displaced_budget.report().0, 1);
-        assert_eq!(state.pending.budget.report(), (0, 0, 0, 0, false));
+        assert_eq!(state.current.pending.budget.report(), (0, 0, 0, 0, false));
     }
 
     #[tokio::test]
-    async fn v4_arc03i_ice_restart_retires_old_candidate_identity_before_replacement() {
+    async fn v4_arc03j_local_ice_restart_is_provisional_until_explicit_commit() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -6061,31 +6809,43 @@ mod tests {
             state.admit(observed_candidate(), &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        let old_attempt = Arc::clone(&state.attempt);
+        let old_attempt = Arc::clone(&state.current.attempt);
         let old_operation = old_attempt
             .try_enter()
             .expect("old attempt admits work before restart");
-        let retiring = state.begin_ice_restart();
+        let (retiring, replacement) = state
+            .begin_local_ice_restart()
+            .expect("one local restart becomes provisional");
 
         assert!(Arc::ptr_eq(&old_attempt, &retiring));
         assert!(!old_attempt.is_active());
-        assert!(state.attempt.is_active());
-        assert!(!Arc::ptr_eq(&old_attempt, &state.attempt));
-        assert!(!state.remote_description_set);
-        assert!(state.pending.entries.is_empty());
+        assert!(Arc::ptr_eq(&old_attempt, &state.current.attempt));
+        assert!(!state.current.attempt.is_active());
+        let provisional = state
+            .provisional
+            .as_ref()
+            .expect("replacement is provisional");
+        assert!(Arc::ptr_eq(&replacement, &provisional.envelope.attempt));
+        assert!(provisional.envelope.attempt.is_active());
+        assert!(!provisional.envelope.remote_description_set);
+        assert!(provisional.envelope.pending.entries.is_empty());
 
         let replacement_candidate = observed_candidate();
         assert_eq!(
             state.admit(replacement_candidate, &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(state.pending.entries.len(), 1);
+        let provisional = state
+            .provisional
+            .as_ref()
+            .expect("replacement remains provisional");
+        assert_eq!(provisional.envelope.pending.entries.len(), 1);
         assert!(Arc::ptr_eq(
-            &state.pending.entries[0].attempt,
-            &state.attempt
+            &provisional.envelope.pending.entries[0].attempt,
+            &replacement
         ));
         assert!(
-            !state.remote_description_set,
+            !provisional.envelope.remote_description_set,
             "replacement candidates remain held until replacement SDP commits"
         );
 
@@ -6099,6 +6859,223 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), waiting)
             .await
             .expect("restart barrier releases after old work retires");
+
+        state
+            .commit_local_ice_restart(&replacement)
+            .expect("native success commits the exact provisional replacement");
+        assert!(state.provisional.is_none());
+        assert!(Arc::ptr_eq(&state.current.attempt, &replacement));
+        assert_eq!(state.current.pending.entries.len(), 1);
+    }
+
+    #[test]
+    fn v4_arc03j_local_restart_failure_discards_replacement_without_rollback() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let old_attempt = Arc::clone(&state.current.attempt);
+        let (_retiring, replacement) = state
+            .begin_local_ice_restart()
+            .expect("local restart becomes provisional");
+        assert_eq!(
+            state.admit(observed_candidate(), &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+
+        state.fail_provisional(&replacement);
+
+        assert!(state.provisional.is_none());
+        assert!(Arc::ptr_eq(&state.current.attempt, &old_attempt));
+        assert!(!state.current.attempt.is_active());
+        assert!(!replacement.is_active());
+        assert_eq!(
+            state.admit(observed_candidate(), &scope),
+            PendingRemoteCandidateQueuePush::Retired,
+            "failure cannot publish or renew a candidate envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc03j_remote_same_fingerprint_credential_change_is_transactional() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let mut replacement_candidate = observed_candidate();
+        replacement_candidate.username_fragment = Some("second-fragment".to_string());
+        let candidate_bytes = candidate_content_bytes(&replacement_candidate)
+            .expect("fixture candidate content is representable");
+        let two = NonZeroUsize::new(2).expect("two is nonzero");
+        let policy = PendingRemoteCandidatePolicy::new(
+            two,
+            NonZeroUsize::new(candidate_bytes * 2)
+                .expect("two fixture candidates have nonzero content"),
+            two,
+            two,
+        );
+        let mut state = RemoteCandidateState::new(policy);
+        let fingerprint = "AA:BB:CC:DD";
+        let initial_sdp = exact_ice_sdp("remote-fragment", "old-password", fingerprint);
+        let initial = state
+            .prepare_remote_description(
+                sdp_ice_credentials(&initial_sdp).expect("initial credentials are exact"),
+            )
+            .expect("initial description uses the current attempt");
+        assert!(!initial.provisional);
+        drop(
+            state
+                .commit_remote_description(&initial)
+                .expect("initial description commits"),
+        );
+        let old_attempt = Arc::clone(&state.current.attempt);
+        let old_operation = old_attempt
+            .try_enter()
+            .expect("old candidate work can be in flight");
+
+        let replacement_sdp = exact_ice_sdp("second-fragment", "new-password", fingerprint);
+        assert_eq!(
+            state.admit(replacement_candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued,
+            "a replacement candidate may arrive before its replacement SDP"
+        );
+        assert_eq!(state.current.pending.entries.len(), 1);
+        assert_eq!(
+            sdp_fingerprint(&initial_sdp),
+            sdp_fingerprint(&replacement_sdp),
+            "DTLS identity is unchanged for an in-place remote ICE restart"
+        );
+        let prepared = state
+            .prepare_remote_description(
+                sdp_ice_credentials(&replacement_sdp).expect("replacement credentials are exact"),
+            )
+            .expect("changed ICE credentials create a provisional replacement");
+        assert!(prepared.provisional);
+        assert!(!old_attempt.is_active());
+        assert!(Arc::ptr_eq(&state.current.attempt, &old_attempt));
+        assert!(state.provisional.is_some());
+
+        let provisional = state
+            .provisional
+            .as_ref()
+            .expect("replacement stays provisional");
+        assert!(Arc::ptr_eq(
+            &provisional.envelope.pending.entries[0].attempt,
+            &prepared.attempt
+        ));
+
+        let mut waiting = Box::pin(
+            prepared
+                .retiring
+                .as_ref()
+                .expect("remote restart retires the previous attempt")
+                .wait_for_operations(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "a delayed old-attempt completion holds the replacement barrier"
+        );
+        drop(old_operation);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("old-attempt work eventually drains");
+
+        let pending = state
+            .commit_remote_description(&prepared)
+            .expect("native SDP success commits the exact replacement");
+        assert_eq!(pending.len(), 1);
+        assert!(state.provisional.is_none());
+        assert!(Arc::ptr_eq(&state.current.attempt, &prepared.attempt));
+
+        let mut old_candidate = observed_candidate();
+        old_candidate.username_fragment = Some("remote-fragment".to_string());
+        assert_eq!(
+            state.admit(old_candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued,
+            "a delayed old candidate is retained only as bounded future-SDP work"
+        );
+        assert!(state.current.attempt.is_active());
+        assert!(!state.current.last_candidate_matches_remote_credentials());
+    }
+
+    #[test]
+    fn v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt() {
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let initial_sdp = exact_ice_sdp("data-u", "data-p", "AA:BB:CC:DD");
+        let initial = state
+            .prepare_remote_description(
+                sdp_ice_credentials(&initial_sdp).expect("initial credentials are exact"),
+            )
+            .expect("initial remote description starts");
+        drop(
+            state
+                .commit_remote_description(&initial)
+                .expect("initial remote description commits"),
+        );
+        let exact_attempt = Arc::clone(&state.current.attempt);
+
+        let added_media = "v=0\r\n\
+                           a=fingerprint:sha-256 AA:BB:CC:DD\r\n\
+                           m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                           a=mid:data\r\n\
+                           a=ice-ufrag:data-u\r\n\
+                           a=ice-pwd:data-p\r\n\
+                           m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                           a=mid:audio\r\n\
+                           a=ice-ufrag:audio-u\r\n\
+                           a=ice-pwd:audio-p\r\n";
+        let renegotiation = state
+            .prepare_remote_description(
+                sdp_ice_credentials(added_media).expect("added media credentials are exact"),
+            )
+            .expect("ordinary media renegotiation stays on the current attempt");
+        assert!(!renegotiation.provisional);
+        assert!(Arc::ptr_eq(&renegotiation.attempt, &exact_attempt));
+        drop(
+            state
+                .commit_remote_description(&renegotiation)
+                .expect("renegotiation updates bindings without renewing capacity"),
+        );
+        assert!(Arc::ptr_eq(&state.current.attempt, &exact_attempt));
+    }
+
+    #[test]
+    fn v4_arc03j_terminal_candidate_exhaustion_stops_later_hash_and_work_admission() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        assert_eq!(
+            state.admit(observed_candidate(), &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let mut over_limit = observed_candidate();
+        over_limit.candidate.push_str(" distinct");
+        assert_eq!(
+            state.admit(over_limit, &scope),
+            PendingRemoteCandidateQueuePush::Refused
+        );
+        let terminal_report = state.current.pending.budget.report();
+        for index in 0..1024 {
+            let mut hostile = observed_candidate();
+            hostile.candidate.push_str(&format!(" hostile-{index}"));
+            assert_eq!(
+                state.admit(hostile, &scope),
+                PendingRemoteCandidateQueuePush::Retired
+            );
+        }
+        assert_eq!(
+            state.current.pending.budget.report(),
+            terminal_report,
+            "terminal attempts perform no later digest, retention, duplicate, or work accounting"
+        );
     }
 
     #[test]
@@ -6118,13 +7095,14 @@ mod tests {
             NonZeroUsize::new(1).expect("one application is permitted"),
         );
         let mut state = RemoteCandidateState::new(policy);
-        state.remote_description_set = true;
+        state.current.remote_description_set = true;
 
         assert_eq!(
             state.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
         let first_pending = state
+            .current
             .pending
             .pop_last_for_application(&scope)
             .expect("post-SDP candidate moves directly to application");
@@ -6132,7 +7110,7 @@ mod tests {
             ._queue_reservation
             .expect("unique candidate carries the attempt budget");
         assert!(first_reservation.budget.reserve_application_work());
-        state.retained_reservations.push(first_reservation);
+        state.current.retained_reservations.push(first_reservation);
 
         assert_eq!(
             state.admit(first.clone(), &scope),
@@ -6147,39 +7125,34 @@ mod tests {
             PendingRemoteCandidateQueuePush::Refused
         );
 
+        let old_budget = Arc::clone(&state.current.pending.budget);
+        assert_eq!(old_budget.report(), (1, content_bytes, 2, 1, false));
+        assert!(!state.current.attempt.is_active());
+
         let mut second = observed_candidate();
         second.candidate.replace_range(0..1, "C");
         assert_eq!(
             state.admit(second, &scope),
-            PendingRemoteCandidateQueuePush::Queued
+            PendingRemoteCandidateQueuePush::Retired,
+            "the first envelope refusal makes later unique submissions constant-work refusals"
         );
-        let second_pending = state
-            .pending
-            .pop_last_for_application(&scope)
-            .expect("second unique post-SDP candidate is owned");
-        let second_reservation = second_pending
-            ._queue_reservation
-            .expect("second unique candidate carries the same attempt budget");
-        assert!(
-            !second_reservation.budget.reserve_application_work(),
-            "native application work is cumulative even when no candidate is queued"
-        );
-        drop(second_reservation);
-
-        let mut third = observed_candidate();
-        third.candidate.replace_range(0..1, "D");
-        assert_eq!(
-            state.admit(third, &scope),
-            PendingRemoteCandidateQueuePush::Refused
-        );
-        let old_budget = Arc::clone(&state.pending.budget);
-        assert_eq!(old_budget.report(), (2, content_bytes * 2, 2, 1, false));
-
-        let retiring_attempt = state.begin_ice_restart();
+        let (retiring_attempt, replacement_attempt) = state
+            .begin_local_ice_restart()
+            .expect("only an explicit restart creates a fresh envelope");
         assert!(!retiring_attempt.is_active());
-        assert!(!state.remote_description_set);
-        assert_eq!(state.pending.budget.report(), (0, 0, 0, 0, false));
-        assert_eq!(old_budget.report(), (2, content_bytes * 2, 2, 1, false));
+        let replacement = state
+            .provisional
+            .as_ref()
+            .expect("replacement is provisional");
+        assert!(Arc::ptr_eq(
+            &replacement.envelope.attempt,
+            &replacement_attempt
+        ));
+        assert_eq!(
+            replacement.envelope.pending.budget.report(),
+            (0, 0, 0, 0, false)
+        );
+        assert_eq!(old_budget.report(), (1, content_bytes, 2, 1, false));
     }
 
     #[test]
@@ -6847,8 +7820,9 @@ mod tests {
         let remote_candidates = Arc::new(SyncMutex::new(test_remote_candidate_state()));
         {
             let mut candidates = remote_candidates.lock();
-            let attempt = Arc::clone(&candidates.attempt);
+            let attempt = Arc::clone(&candidates.current.attempt);
             candidates
+                .current
                 .pending
                 .push(observed_candidate(), attempt, &resource_scope);
         }
@@ -6877,6 +7851,90 @@ mod tests {
             candidate_report(&context.report().pre_authentication).active,
             ResourceUse::ZERO
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03j_native_local_ice_restart_commits_exact_replacement() {
+        let owner = test_resource_owner(1, 4);
+        let scope = ProcessResourceRoot::isolated()
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner, test_webrtc_profile(4));
+        let (worker, _events) = transport
+            .open_connector_peer(Role::Offerer, &[], &[], scope)
+            .await
+            .expect("data-only connector is constructed");
+        worker
+            .create_offer()
+            .await
+            .expect("local description starts the native ICE agent");
+        let previous_attempt = Arc::clone(&worker.remote_candidates.lock().current.attempt);
+
+        worker
+            .restart_ice()
+            .await
+            .expect("native local restart succeeds");
+
+        {
+            let state = worker.remote_candidates.lock();
+            assert!(state.provisional.is_none());
+            assert!(!Arc::ptr_eq(&state.current.attempt, &previous_attempt));
+            assert!(!previous_attempt.is_active());
+            assert!(state.current.attempt.is_active());
+        }
+        worker
+            .retire_and_close()
+            .await
+            .expect("native peer closes through its exact owner");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03j_native_local_ice_restart_failure_retires_connector() {
+        let owner = test_resource_owner(1, 4);
+        let scope = ProcessResourceRoot::isolated()
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner, test_webrtc_profile(4));
+        let (worker, _events) = transport
+            .open_connector_peer(Role::Offerer, &[], &[], scope)
+            .await
+            .expect("data-only connector is constructed");
+        worker
+            .create_offer()
+            .await
+            .expect("local description starts the native ICE agent");
+        let previous_attempt = Arc::clone(&worker.remote_candidates.lock().current.attempt);
+        worker
+            .session
+            .pc
+            .close()
+            .await
+            .expect("fixture closes the native peer without retiring its V4 owner");
+
+        worker
+            .restart_ice()
+            .await
+            .expect_err("native restart failure cannot publish replacement capacity");
+
+        {
+            let state = worker.remote_candidates.lock();
+            assert!(state.provisional.is_none());
+            assert!(Arc::ptr_eq(&state.current.attempt, &previous_attempt));
+            assert!(!state.current.attempt.is_active());
+        }
+        assert!(!worker.ownership.incarnation.is_active());
+        worker
+            .retire_and_close()
+            .await
+            .expect("idempotent final cleanup owns the already closed native peer");
     }
 
     #[tokio::test]
@@ -7399,6 +8457,253 @@ mod tests {
     }
 
     #[test]
+    fn v4_arc03j_sdp_ice_credentials_apply_session_inheritance_and_media_overrides() {
+        let sdp = "v=0\r\n\
+                   a=ice-ufrag:session-u\r\n\
+                   a=ice-pwd:session-p\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                   a=mid:data\r\n\
+                   m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                   a=mid:audio\r\n\
+                   a=ice-ufrag:audio-u\r\n\
+                   a=ice-pwd:audio-p\r\n";
+        let credentials = sdp_ice_credentials(sdp).expect("every section has exact credentials");
+        assert_eq!(credentials.bindings.len(), 2);
+        assert_eq!(credentials.bindings[0].mid.as_deref(), Some("data"));
+        assert_eq!(credentials.bindings[0].username_fragment, "session-u");
+        assert_eq!(credentials.bindings[0].password, "session-p");
+        assert_eq!(credentials.bindings[1].mid.as_deref(), Some("audio"));
+        assert_eq!(credentials.bindings[1].username_fragment, "audio-u");
+        assert_eq!(credentials.bindings[1].password, "audio-p");
+
+        let reordered = sdp_ice_credentials(
+            "v=0\r\n\
+             a=ice-ufrag:session-u\r\n\
+             a=ice-pwd:session-p\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=mid:audio\r\n\
+             a=ice-ufrag:audio-u\r\n\
+             a=ice-pwd:audio-p\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:data\r\n",
+        )
+        .expect("reordered media sections keep exact credentials");
+        assert!(
+            !credentials.proves_restart_to(&reordered),
+            "media reordering cannot manufacture an ICE restart"
+        );
+
+        let data_restart = sdp_ice_credentials(
+            "v=0\r\n\
+             a=ice-ufrag:replacement-u\r\n\
+             a=ice-pwd:replacement-p\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:data\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=mid:audio\r\n\
+             a=ice-ufrag:audio-u\r\n\
+             a=ice-pwd:audio-p\r\n",
+        )
+        .expect("replacement data credentials are exact");
+        assert!(
+            credentials.proves_restart_to(&data_restart),
+            "changed credentials on one stable MID prove a restart"
+        );
+
+        let incomplete =
+            "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=ice-ufrag:u\r\n";
+        assert!(
+            sdp_ice_credentials(incomplete).is_err(),
+            "a partial credential pair is not exact restart evidence"
+        );
+
+        for ambiguous in [
+            "v=0\r\n\
+             a=ice-ufrag:first\r\n\
+             a=ice-ufrag:second\r\n\
+             a=ice-pwd:password\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:data\r\n",
+            "v=0\r\n\
+             a=ice-ufrag:u\r\n\
+             a=ice-pwd:p\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:data\r\n\
+             a=mid:other\r\n",
+            "v=0\r\n\
+             a=ice-ufrag:u\r\n\
+             a=ice-pwd:p\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:duplicate\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=mid:duplicate\r\n",
+        ] {
+            assert!(
+                sdp_ice_credentials(ambiguous).is_err(),
+                "duplicate credential or MID input cannot choose a parser interpretation"
+            );
+        }
+
+        let rejected_without_credentials = "v=0\r\n\
+                                            a=ice-ufrag:session-u\r\n\
+                                            a=ice-pwd:session-p\r\n\
+                                            m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                                            a=mid:data\r\n\
+                                            m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n\
+                                            a=mid:rejected-audio\r\n";
+        let active = sdp_ice_credentials(rejected_without_credentials)
+            .expect("a rejected media section needs no effective ICE credential pair");
+        assert_eq!(active.bindings.len(), 1);
+
+        let rejected_port_range = rejected_without_credentials.replace(
+            "m=audio 0 UDP/TLS/RTP/SAVPF 111",
+            "m=audio 0/2 UDP/TLS/RTP/SAVPF 111",
+        );
+        assert_eq!(
+            sdp_ice_credentials(&rejected_port_range)
+                .expect("a zero-based rejected port range needs no credentials")
+                .bindings
+                .len(),
+            1
+        );
+
+        let mut candidate = observed_candidate();
+        candidate.username_fragment = None;
+        assert!(
+            candidate_matches_remote_credentials(&candidate, &active),
+            "a candidate without a declared ufrag is bound by its process-local attempt owner"
+        );
+        candidate.candidate.push_str(" ufrag session-u");
+        assert!(candidate_matches_remote_credentials(&candidate, &active));
+        candidate.candidate = candidate.candidate.replace("session-u", "other-u");
+        assert!(!candidate_matches_remote_credentials(&candidate, &active));
+
+        let mut native_candidate = observed_candidate();
+        native_candidate.sdp_mid = Some(String::new());
+        native_candidate.sdp_mline_index = Some(0);
+        native_candidate.username_fragment = Some("session-u".to_string());
+        assert!(
+            candidate_matches_remote_credentials(&native_candidate, &active),
+            "webrtc-rs empty-MID candidates bind through their exact media-line index"
+        );
+        native_candidate.sdp_mline_index = Some(1);
+        assert!(
+            !candidate_matches_remote_credentials(&native_candidate, &active),
+            "an empty native MID cannot excuse an invalid media-line index"
+        );
+
+        let mut audio_candidate = observed_candidate();
+        audio_candidate.sdp_mid = Some("audio".to_string());
+        audio_candidate.sdp_mline_index = Some(1);
+        audio_candidate.username_fragment = Some("audio-u".to_string());
+        assert!(candidate_matches_remote_credentials(
+            &audio_candidate,
+            &credentials
+        ));
+        audio_candidate.sdp_mline_index = Some(0);
+        assert!(
+            !candidate_matches_remote_credentials(&audio_candidate, &credentials),
+            "a username fragment from another media section cannot satisfy the declared index"
+        );
+        audio_candidate.sdp_mline_index = Some(1);
+        audio_candidate.sdp_mid = Some("data".to_string());
+        assert!(
+            !candidate_matches_remote_credentials(&audio_candidate, &credentials),
+            "MID and media-line index must identify the same exact credential binding"
+        );
+        audio_candidate.username_fragment = None;
+        audio_candidate.sdp_mline_index = None;
+        audio_candidate.sdp_mid = Some("unknown".to_string());
+        assert!(
+            !candidate_matches_remote_credentials(&audio_candidate, &credentials),
+            "process-local attempt ownership cannot excuse an invalid declared media location"
+        );
+    }
+
+    #[test]
+    fn v4_arc03j_restart_transactions_reject_ambiguous_interleavings() {
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let credentials = sdp_ice_credentials(&exact_ice_sdp(
+            "remote-fragment",
+            "remote-password",
+            "AA:BB:CC:DD",
+        ))
+        .expect("fixture credentials are exact");
+        let initial = state
+            .prepare_remote_description(credentials.clone())
+            .expect("initial remote description starts");
+        assert!(state.begin_local_ice_restart().is_err());
+        assert!(state
+            .prepare_remote_description(credentials.clone())
+            .is_err());
+        state.fail_remote_description(&initial);
+
+        let (_retiring, local_replacement) = state
+            .begin_local_ice_restart()
+            .expect("local restart begins after the remote transaction ends");
+        assert!(state.prepare_remote_description(credentials).is_err());
+        state.fail_provisional(&local_replacement);
+    }
+
+    #[test]
+    fn v4_arc03j_corrupt_restart_migration_leaves_no_viable_attempt() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let mut state = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
+            one,
+            NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+            one,
+            one,
+        ));
+        let initial_credentials = sdp_ice_credentials(&exact_ice_sdp(
+            "initial-fragment",
+            "initial-password",
+            "AA:BB:CC:DD",
+        ))
+        .expect("initial credentials are exact");
+        let initial = state
+            .prepare_remote_description(initial_credentials)
+            .expect("initial remote description starts");
+        drop(
+            state
+                .commit_remote_description(&initial)
+                .expect("initial remote description commits"),
+        );
+
+        for suffix in ["one", "two"] {
+            let mut candidate = observed_candidate();
+            candidate.username_fragment = Some("replacement-fragment".to_string());
+            candidate.candidate.push_str(suffix);
+            state
+                .current
+                .pending
+                .entries
+                .push(PendingRemoteCandidate::observe(
+                    candidate,
+                    Arc::clone(&state.current.attempt),
+                    &scope,
+                ));
+        }
+        let replacement_credentials = sdp_ice_credentials(&exact_ice_sdp(
+            "replacement-fragment",
+            "replacement-password",
+            "AA:BB:CC:DD",
+        ))
+        .expect("replacement credentials are exact");
+        assert!(state
+            .prepare_remote_description(replacement_credentials)
+            .is_err());
+        assert!(
+            state.has_no_viable_attempt(),
+            "a corrupt over-limit migration must fence both attempts so the caller retires the connector"
+        );
+    }
+
+    #[test]
     fn legacy_track_id_requires_exact_kind_and_in_range_lane() {
         assert_eq!(lane_of_track_id("video-0", LaneKind::Video, 8), Some(0));
         assert_eq!(lane_of_track_id("video-3", LaneKind::Video, 8), Some(3));
@@ -7437,6 +8742,33 @@ mod tests {
         assert_eq!(
             legacy_track_identity(RTPCodecType::Video, MIME_TYPE_H264, "video-x", profile),
             None
+        );
+    }
+
+    #[test]
+    fn v4_arc03j_legacy_codec_registration_is_only_h264_and_opus() {
+        let codecs = legacy_media_codecs();
+        assert!(!codecs.is_empty());
+        assert!(codecs.iter().all(|(codec, kind)| {
+            match kind {
+                RTPCodecType::Audio => codec.capability.mime_type == MIME_TYPE_OPUS,
+                RTPCodecType::Video => codec.capability.mime_type == MIME_TYPE_H264,
+                RTPCodecType::Unspecified => false,
+            }
+        }));
+        assert_eq!(
+            codecs
+                .iter()
+                .filter(|(_, kind)| *kind == RTPCodecType::Audio)
+                .count(),
+            1
+        );
+        assert_eq!(
+            codecs
+                .iter()
+                .filter(|(_, kind)| *kind == RTPCodecType::Video)
+                .count(),
+            5
         );
     }
 
@@ -7866,11 +9198,15 @@ mod tests {
             .expect("answerer");
 
         let offer = offerer.create_offer().await.expect("create_offer");
+        let offer_credentials =
+            sdp_ice_credentials(&offer.sdp).expect("native offer exposes exact ICE credentials");
         answerer
             .set_remote_description(offer)
             .await
             .expect("answerer.set_remote");
         let answer = answerer.create_answer().await.expect("create_answer");
+        let answer_credentials =
+            sdp_ice_credentials(&answer.sdp).expect("native answer exposes exact ICE credentials");
         offerer
             .set_remote_description(answer)
             .await
@@ -7887,6 +9223,10 @@ mod tests {
             tokio::select! {
                 Some(ev) = off_rx.recv() => {
                     if let TransportEvent::LocalIceCandidate(Some(c)) = &ev {
+                        assert!(
+                            candidate_matches_remote_credentials(c, &offer_credentials),
+                            "native offer candidate {c:?} must identify its exact SDP binding {offer_credentials:?}"
+                        );
                         answerer
                             .add_ice_candidate(c.clone())
                             .await
@@ -7896,6 +9236,10 @@ mod tests {
                 }
                 Some(ev) = ans_rx.recv() => {
                     if let TransportEvent::LocalIceCandidate(Some(c)) = &ev {
+                        assert!(
+                            candidate_matches_remote_credentials(c, &answer_credentials),
+                            "native answer candidate {c:?} must identify its exact SDP binding {answer_credentials:?}"
+                        );
                         offerer
                             .add_ice_candidate(c.clone())
                             .await

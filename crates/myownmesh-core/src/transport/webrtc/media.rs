@@ -7,6 +7,7 @@
 )]
 
 use super::*;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 
 /// One H.264 access unit off a peer's video track. This compatibility-adapter
 /// value contains Annex-B bytes ready for a decoder. `rtp_timestamp` ticks at

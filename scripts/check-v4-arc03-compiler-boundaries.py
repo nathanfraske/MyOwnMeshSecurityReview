@@ -253,6 +253,7 @@ def main() -> int:
     )
     services_source = (DAEMON / "src" / "services.rs").read_text(encoding="utf-8")
     embedded_source = (DAEMON / "src" / "embedded.rs").read_text(encoding="utf-8")
+    serve_source = (DAEMON / "src" / "cli" / "serve.rs").read_text(encoding="utf-8")
     for consumer in (
         "open_media_lane",
         "close_media_lane",
@@ -423,10 +424,28 @@ def main() -> int:
     if not (
         "struct RemoteCandidateAttemptIdentity" in webrtc_source
         and "pending.attempt.try_enter()" in webrtc_source
-        and "begin_ice_restart" in webrtc_source
+        and "begin_local_ice_restart" in webrtc_source
+        and "ProvisionalRemoteCandidateAttempt" in webrtc_source
+        and "sdp_ice_credentials" in webrtc_source
+        and "current.proves_restart_to(&credentials)" in webrtc_source
+        and "candidate_matches_remote_credentials" in webrtc_source
+        and "let declares_location = candidate.sdp_mline_index.is_some()" in webrtc_source
+        and "candidate.sdp_mid" in webrtc_source
+        and "adopt_queued_candidates_for_remote_restart" in webrtc_source
+        and "commit_remote_description" in webrtc_source
+        and "fail_remote_description" in webrtc_source
+        and "has_no_viable_attempt" in webrtc_source
+        and "must_retire_connector" in webrtc_source
+        and "remote_description_in_flight" in webrtc_source
         and "wait_for_operations().await" in webrtc_source
     ):
-        failures.append("remote candidates do not carry an exact ICE-attempt lifetime fence")
+        failures.append("remote candidates do not use a transactional exact ICE-attempt fence")
+    if not (
+        "PendingRemoteCandidateQueuePush::Retired" in webrtc_source
+        and "self.attempt.retire();" in webrtc_source
+        and "AttemptRetired" in webrtc_source
+    ):
+        failures.append("candidate-envelope refusal is not terminal for the exact attempt")
     if not re.search(
         r"match\s+candidate\.sdp_mline_index\s*\{\s*Some\(value\).*?hash\.update\(\[1\]\).*?None\s*=>\s*hash\.update\(\[0\]\)",
         webrtc_source,
@@ -443,13 +462,19 @@ def main() -> int:
         "legacy_media_api: Arc<SyncMutex<Option<Arc<webrtc::api::API>>>>" in webrtc_source
         and "if legacy_media_profile.is_some()" in webrtc_source
         and "build_legacy_media_api()?" in webrtc_source
+        and "legacy_media_codecs()" in webrtc_source
     ):
         failures.append("compatibility codec registration is not provider-selected and lazy")
+    legacy_api = re.search(
+        r"fn build_legacy_media_api\(\).*?\n\}", webrtc_source, flags=re.DOTALL
+    )
+    if legacy_api is None or "register_default_codecs" in legacy_api.group(0):
+        failures.append("legacy media API still registers codecs outside H.264 and Opus")
 
     for legacy_call in (
         "routing::send_routed(",
         "routing::broadcast_flood(",
-        "routing::on_relay_frame(",
+        "routing::on_routed_frame(",
     ):
         if legacy_call in engine_source:
             failures.append(f"V4 engine path still invokes legacy forwarding: {legacy_call}")
@@ -470,7 +495,7 @@ def main() -> int:
         failures.append("LegacyV1 facade does not privately own its routing module")
     if re.search(r"pub\s+use\s+legacy_v1::", lib_source):
         failures.append("crate-root LegacyV1 compatibility re-export remains reachable")
-    for legacy_api in ("on_relay_frame", "send_routed", "broadcast_flood"):
+    for legacy_api in ("on_routed_frame", "send_routed", "broadcast_flood"):
         if not re.search(rf"pub\(crate\)\s+async\s+fn\s+{legacy_api}\s*\(", routing_source):
             failures.append(f"legacy routing API {legacy_api} is missing or externally public")
     relay_start = re.search(
@@ -486,10 +511,20 @@ def main() -> int:
     ):
         failures.append("LegacyV1 routing and member relay do not have separate daemon owners")
     if not (
-        "routing::is_routing_wrapper" in relay_source
-        and "routing::on_relay_frame" in legacy_profile_source
+        'ROUTING_CHANNEL: &str = "__mesh_route__/v1"' in routing_source
+        and 'RELAY_CHANNEL: &str = "__mesh_relay__/v1"' in relay_source
+        and "Channel<routing::RoutedEnvelope>" in legacy_profile_source
+        and "routing::on_routed_frame" in legacy_profile_source
+        and "is_routing_wrapper" not in relay_source
+        and "parse_wrapper" not in routing_source
     ):
-        failures.append("LegacyV1 reserved-wire envelopes lack one semantic owner")
+        failures.append("LegacyV1 routing and plain relay do not have disjoint typed wires")
+    if not (
+        "start_connector_capable_with_legacy_v1_and_media" in embedded_source
+        and "LegacyV1WithMedia" in serve_source
+        and "legacy_media_profile_from_lookup" in serve_source
+    ):
+        failures.append("explicit LegacyV1 media sidecar deployment boundary is missing")
     for name, source in (
         ("V4 connector", webrtc_source),
         ("V4 engine", engine_source),

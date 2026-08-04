@@ -34,6 +34,11 @@ enum Command {
         #[cfg(feature = "legacy-v1")]
         #[arg(long)]
         legacy_v1: bool,
+        /// Attach the reviewed H.264 and Opus sidecar to LegacyV1 startup.
+        /// This option requires `--legacy-v1` and both compatibility features.
+        #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+        #[arg(long, requires = "legacy_v1")]
+        legacy_media: bool,
     },
     /// Show this device's identity.
     Identity {
@@ -225,9 +230,15 @@ fn main() -> ExitCode {
             Command::Serve {
                 #[cfg(feature = "legacy-v1")]
                 legacy_v1,
+                #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+                legacy_media,
             } => {
                 #[cfg(feature = "legacy-v1")]
                 {
+                    #[cfg(feature = "legacy-media")]
+                    if legacy_media {
+                        return cli::serve::run_with_legacy_v1_and_media().await;
+                    }
                     if legacy_v1 {
                         cli::serve::run_with_legacy_v1().await
                     } else {
@@ -268,7 +279,25 @@ mod tests {
             .expect("legacy-v1 feature exposes the deprecated explicit daemon option");
         assert!(matches!(
             cli.command,
-            Some(Command::Serve { legacy_v1: true })
+            Some(Command::Serve {
+                legacy_v1: true,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    #[test]
+    fn v4_arc03j_legacy_media_is_an_explicit_legacy_v1_sidecar_option() {
+        assert!(Cli::try_parse_from(["myownmesh", "serve", "--legacy-media"]).is_err());
+        let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-v1", "--legacy-media"])
+            .expect("the combined deprecated compatibility deployment is explicit");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve {
+                legacy_v1: true,
+                legacy_media: true,
+            })
         ));
     }
 }
