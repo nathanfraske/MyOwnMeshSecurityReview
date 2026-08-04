@@ -242,7 +242,7 @@ The signaling runtime must not:
 - synthesize Open withdrawal or Closed removal from disconnect;
 - turn service identity into Device identity;
 - create an authenticated session directly;
-- allocate beyond its own measured bounds.
+- allocate or retain protected resources without live provider leases.
 
 ## 6. Connector runtime
 
@@ -465,7 +465,8 @@ A relay allocation must be ephemeral live state and must bind:
 - exact endpoints A and C;
 - exact relay B or service instance;
 - exact allocation capabilities for each endpoint;
-- bounded lifetime, buffering, bandwidth, retry, and queue resources.
+- explicit provider lifetime state where the relay protocol requires it;
+- lease-backed buffering, bandwidth, retry, and queued work.
 
 The allocation must not accept:
 
@@ -606,40 +607,120 @@ Carrier diagnostics are separate from peer identity and application authorizatio
 
 ## 14. Resource model
 
-### 14.1 Pre-authentication resource class
+### 14.1 Normative resource contract
 
-The owner must measure and select finite bounds for:
+Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit must hold a live finite lease issued by the applicable resource provider. Basal MyOwnMesh defines no fixed semantic cardinality for Mesh runtimes, peers, connector attempts, sessions, or real-time flows.
 
-- accepted connections and half-open handshakes;
-- frame and parser bytes;
-- durable-fact hash and signature work;
-- ephemeral signaling parse work;
-- candidate objects;
-- sockets and transport objects;
-- DNS, STUN, ICE, relay, and connector-specific work;
-- pre-authentication media or packet quarantine;
-- timers, tasks, callbacks, and diagnostic queues;
-- cleanup.
+The resource interface must provide equivalent responsibilities to:
 
-Bounds apply per ingress source where meaningful and globally regardless of identity.
+```text
+ResourceProvider
+    reserve(ResourceClaim) -> ResourceLease
+                            | ResourcePressure(ResourceClass)
+                            | ResourceUnavailable(ResourceClass)
+    reclaim(ResourceClass) -> ReclaimResult
 
-### 14.2 Post-authentication resource class
+ResourceClaim
+    finite quantities by ResourceClass
 
-Separate bounds apply to:
+ResourceLease
+    exact provider, claim, owner, and live release authority
 
-- authenticated sessions;
-- application queues;
-- media decode and encode;
-- relay bandwidth and buffering;
-- session recovery;
-- application callbacks;
-- local handle and subscription state.
+ResourceClass
+    AccountedMemory
+    QueuedBytes
+    SocketOrHandle
+    NativeTransportObject
+    WorkerOrTask
+    CallbackOrScheduledWork
+    StorageBytes
+    StorageObject
+    RelayOrProviderAllocation
+    ParsingOrCpuWork
+    OpaqueDependencyResidual
+```
 
-A successful pre-authentication reservation cannot be reused as proof that post-authentication capacity exists.
+A claim may combine several resource classes. An admitted object's count emerges from the claims and current provider grant. There is no `unlimited` sentinel. Admission is always fallible.
 
-### 14.3 Effect execution
+The process resource root owns the process grant. Each Mesh runtime receives an accounting and fairness child scope, not a new grant. Attempt, candidate, session, and flow owners receive descendant leases. Creating another scope cannot multiply capacity.
 
-State and effect intents commit before external execution. Every effect carries exact live capabilities and reservations and rechecks them before use. Cleanup effects remain available even when the authority for new work disappears.
+The basal provider is work-conserving. Unused process capacity is borrowable across child scopes while preserving bounded service opportunities. Cleanup and release work is protected under pressure. Already admitted and higher-authority work is protected from new unauthenticated speculative work. Speculative work may be backpressured, refused, or reclaimed when its exact contract permits reclamation.
+
+### 14.2 Limit classification
+
+Every limit must be classified as exactly one of:
+
+```text
+Protocol-shape bound
+    required for canonical or valid wire shape
+
+Provider structural limit
+    imposed by a transport, codec, kernel, hardware device, or dependency
+
+Runtime resource availability
+    a current provider grant consumed through leases
+
+Optional local policy ceiling
+    an explicit administrator, cost, isolation, Closed deployment, appliance,
+    test, or temporary compatibility restriction
+```
+
+An implementation must not turn a measured workload size into a protocol bound, turn an optional policy ceiling into basal semantics, or describe an opaque dependency allocation as exact.
+
+### 14.3 Pre-authentication resource class
+
+Pre-authentication claims include accepted connections and handshakes, parser bytes and work, fact verification work, signaling work, candidate storage, sockets and transport objects, DNS, STUN, ICE and relay work, speculative packet quarantine, callbacks, scheduled work, diagnostics, and cleanup ownership.
+
+The process component is checked regardless of identity. Per-ingress accounting may guide fairness or optional policy, but identity rotation cannot create a new process grant.
+
+### 14.4 Post-authentication resource class
+
+Post-authentication claims include authenticated sessions, application-facing queues, codec work, relay buffering, recovery, callbacks, handles, and subscriptions. A successful pre-authentication lease cannot be reused as proof that post-authentication resources exist. Promotion performs an explicit resource transition.
+
+### 14.5 Queue and delayed-work contracts
+
+No queue may grow without leases for its retained storage and scheduled work. Basal MyOwnMesh does not define one universal queue-item count.
+
+```text
+connector lifecycle
+    fixed non-lossy state transition owner
+
+reliable endpoint stream
+    resource-backed bytes plus producer backpressure or typed failure
+
+interactive real-time flow
+    provider or application-selected complete-unit pressure semantics
+
+satellite or store-and-forward
+    delayed-delivery spool backed by storage leases
+
+raw storage or removable media
+    storage-object and storage-byte leases
+```
+
+Elapsed time does not create or release a lease. A slow operation may retain its finite claim until an explicit owner transition releases, replaces, reclaims, or fails it.
+
+### 14.6 Opaque native and operating-system resources
+
+Every opaque family must be reported as one of:
+
+```text
+exactly observable and leasable
+conservatively claimable
+isolatable in a worker, process, job, cgroup, rlimit, or equivalent domain
+observable but not enforceable yet
+unobservable residual
+```
+
+The implementation must prefer host-enforced resource domains and narrow provider guards where available. It must not substitute a guessed peer or flow count for an unobservable native allocation.
+
+### 14.7 Optional local ceilings
+
+An optional `LocalCeilingPolicy` or equivalent wrapper may impose stricter counts or resource partitions for a locked-down appliance, Closed deployment, carrier cost boundary, compatibility provider, or test. It is not required for ordinary V4 construction and cannot mint authority or capacity.
+
+### 14.8 Effect execution
+
+State and effect intents commit before external execution. Every effect carries exact live capabilities and leases and rechecks them before use. Cleanup effects remain available even when authority for new work disappears.
 
 ## 15. Fundamental invariants
 
@@ -681,7 +762,19 @@ Pre-authentication work cannot create durable authority, application delivery, o
 
 ### I10. Work is reserved before allocation
 
-Every protected parser, candidate, socket, relay, handshake, queue, and session allocation is dominated by its resource guard.
+Every protected parser, candidate, socket, relay, handshake, queue entry, task, native object, and session allocation is dominated by a live finite resource lease.
+
+### I10a. Basal semantic cardinality is open
+
+Basal MyOwnMesh defines no fixed maximum for Mesh runtimes, peers, connector attempts, sessions, or real-time flows. Each new object is admitted by its actual composite claim and may fail with typed resource pressure or unavailability.
+
+### I10b. Child scopes do not multiply grants
+
+Mesh and descendant scopes share the process grant. Default scheduling is work-conserving and unused capacity is borrowable. A stricter partition requires an explicit optional local policy.
+
+### I10c. Time is not resource authority
+
+Elapsed duration alone cannot create, release, expire, or validate a resource lease.
 
 ### I11. A working socket is not a session
 
@@ -785,13 +878,18 @@ A release must pass at least the following groups.
 - durable and ephemeral parser separation;
 - carrier identity non-authority;
 - no carrier-synthesized roster changes;
-- bounded frame, queue, retry, and provenance state;
+- lease-backed frame, queue, retry, and provenance state;
 - no application payload construction.
 
 ### 16.3 Speculative transport
 
 - raw hints can create bounded candidate work;
-- global resource limits hold under identity rotation;
+- process resource grants hold under identity rotation;
+- admission continues for another object whenever its exact claim is granted;
+- refusal names the unavailable resource class rather than a basal object-count ceiling;
+- multiple Mesh scopes cannot multiply the process grant;
+- unused capacity is borrowable under the basal provider;
+- optional local ceilings remain explicit wrappers;
 - malformed and unauthorized inputs cannot cross promotion;
 - media and packets remain quarantined before promotion;
 - cleanup completes at every failure point.
@@ -824,7 +922,7 @@ A release must pass at least the following groups.
 - visible member-relay identity;
 - anonymous relay credential rejection;
 - relay endpoint-substitution negatives;
-- measured allocation, buffer, retry, and bandwidth limits.
+- exact allocation ownership, lease-backed buffering and retry, provider bandwidth constraints, and optional local cost policy.
 
 ### 16.7 Reachability and application boundary
 
@@ -850,7 +948,7 @@ A conforming implementation supplies:
 3. durable canonical test vectors;
 4. endpoint-authentication and channel-binding test vectors;
 5. connector profile specifications;
-6. resource measurement report for every supported target;
+6. resource ownership report with exactness and residual classification for every supported target;
 7. model or property tests for durable projection and conflict;
 8. speculative-work and promotion state model;
 9. crash and effect-idempotency model;
@@ -866,10 +964,11 @@ The owner must select:
 - Closed governance proof and relay authorization profile;
 - signaling and connector profiles;
 - required egress and restrictive-network environments;
-- pre-authentication and post-authentication resource values;
+- resource-provider integration and host isolation for each deployment form;
+- any optional local ceiling or cost policy;
 - session recovery and multi-channel policy;
 - reachability display and freshness policy;
 - application data-operation set;
 - optional durable application contract domains.
 
-Every numeric value requires measurement and review.
+Every numeric protocol or provider limit requires proof from that protocol or provider. Every optional local policy value requires owner review. Measurements characterize performance, cost, fairness, regression, and opaque residuals. They do not define universal semantic cardinality.

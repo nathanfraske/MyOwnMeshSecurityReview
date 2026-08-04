@@ -570,7 +570,7 @@ DataChannelOpen
 - no arbitrary destination or fanout;
 - no anonymous relay attestation;
 - no relay-to-relay handoff dependency;
-- exact allocation count, bytes, queues, retry, and bandwidth are measured and owner-bounded;
+- every allocation, retained byte, queued value, and retry owns a finite lease, while provider bandwidth and optional cost policy remain explicit;
 - direct and relay paths expose the same endpoint identity.
 
 **Delete:** `engine/routing.rs` production path and nonconforming `services/relay.rs` behavior.
@@ -620,26 +620,31 @@ DataChannelOpen
 
 ### Arc 15. Resource closure
 
-**Goal:** replace instrumentation-only accounting and unbounded queues with owner-selected, measured limits.
+**Goal:** replace instrumentation-only accounting and unleased work with elastic resource ownership.
 
 **Steps**
 
-1. Run benchmark and adversarial profiles on every supported target class.
-2. Surface measured values for owner review.
-3. Select per-ingress, per-principal, per-mesh, per-attempt, per-session, per-relay, and global limits.
-4. Replace unbounded channels, maps, task spawns, queues, and retries with typed permits and explicit overload results.
-5. Test identity rotation and many-source pressure against global limits.
-6. Verify cleanup cost is itself bounded.
+1. Define the process resource provider, finite claim vector, exact lease, typed pressure results, and explicit residual classification.
+2. Make every protected allocation, retained value, task, queue entry, native object, and scheduled work unit hold a live lease.
+3. Issue accounting and fairness child scopes without multiplying the process grant.
+4. Replace unleased channels, maps, task spawns, queues, retries, and storage with typed admission and pressure results.
+5. Use work-conserving fairness, borrowable unused capacity, protected cleanup, and lower priority for reclaimable speculative work.
+6. Keep protocol bounds, provider structural limits, runtime availability, and optional local ceilings distinct.
+7. Test identity rotation, many-source pressure, unequal claim sizes, exact release, child-scope sharing, optional ceilings, slow work, and storage-backed work.
+8. Measure performance, provider cost, fairness, regression, and opaque residuals without deriving universal object counts.
 
 **Gate**
 
-- every named allocation is dominated by a permit;
+- every named protected allocation and scheduled operation is dominated by a live finite lease;
 - pre-auth and post-auth permits are non-interchangeable;
 - Open overload is reported as resource pressure, never unauthorized identity;
-- no zero or absent setting silently means unlimited;
+- no `unlimited` sentinel or hidden default cardinality exists;
+- no basal maximum Mesh, peer, attempt, session, or flow count exists;
+- unused capacity is borrowable unless an explicit local isolation policy forbids it;
+- cleanup remains admissible under pressure;
 - normal connection and media performance remains owner-acceptable under measured workloads.
 
-**Delete:** all unbounded production queues and legacy ad hoc caps replaced by the reviewed model.
+**Delete:** unleased production work and legacy ad hoc caps presented as basal semantic limits.
 
 ### Arc 16. Legacy engine and compatibility removal
 
@@ -839,7 +844,8 @@ A field fix is not lost because its old module is rejected. The bug reproduction
 
 Pause the arc and surface an owner decision when:
 
-- a value or limit has not been measured;
+- a claimed protocol or provider limit has not been proven;
+- a proposed optional local ceiling lacks owner review;
 - the selected Closed proof profile is still undefined;
 - a competing design presents a real usability/security tradeoff;
 - migration would silently reinterpret existing durable authority;
@@ -867,7 +873,7 @@ The transition is complete when all of the following are true:
 12. handoff is endpoint-driven, with no route ledger or relay-to-relay requirement;
 13. reachability is useful local evidence, not authority;
 14. store opening restores durable state but no live networking capability;
-15. every resource family has measured, owner-approved bounds;
+15. every protected resource family has a live lease, a named provider, typed pressure behavior, and an explicit exactness or residual classification;
 16. every mutable state class has one owner;
 17. the legacy driver, `NetworkState` grab bag, authority bypasses, and compatibility adapters are deleted;
 18. the full conformance and red-team suite passes on built artifacts;
@@ -880,11 +886,11 @@ The playbook does not invent:
 - the final protocol/profile identifier;
 - the Closed governance proof and recovery rule;
 - local-principal authentication per platform;
-- resource, queue, retry, timeout, cache, and bandwidth values;
+- optional local resource, queue, retry, timeout, cache, cost, isolation, and bandwidth policy values;
 - required restrictive-network connector profiles;
 - mixed-version compatibility duration;
 - application data-operation set and optional connector-native real-time flow contract;
 - performance regression tolerances;
 - release cohort and rollback policy.
 
-Each is surfaced with measurements and concrete alternatives for owner review.
+Each optional policy is surfaced with measurements and concrete alternatives for owner review. Measurements do not define basal product cardinality.

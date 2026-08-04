@@ -1,7 +1,7 @@
 {
   "schema": "myownmesh-v4-ownership-delta/v1",
   "arc": "03J",
-  "status": "draft-unmerged",
+  "status": "elastic-resource-correction-draft-unmerged",
   "historical_base": {
     "document": "arc-01-inventory.json",
     "meaning": "historical provenance only"
@@ -9,13 +9,28 @@
   "changes": [
     {
       "owner": "ProcessResourceRoot",
-      "responsibility": "issues process-global connector capacity and child Mesh connector scopes",
-      "source": "crates/myownmesh-core/src/runtime/attempt/resource_owner.rs"
+      "responsibility": "owns one process resource-provider port and issues accounting and fairness child scopes without multiplying the process grant",
+      "source": "crates/myownmesh-core/src/resource/mod.rs"
+    },
+    {
+      "owner": "ResourceProvider",
+      "responsibility": "grants finite composite claims by actual resource dimension and returns typed pressure or unavailability without a basal product-object ceiling",
+      "source": "target of the Arc 03 elastic resource correction"
+    },
+    {
+      "owner": "ResourceLease",
+      "responsibility": "retains exact resource ownership through allocation, queueing, scheduled work, native lifetime, transfer, cleanup, and final release",
+      "source": "target of the Arc 03 elastic resource correction"
     },
     {
       "owner": "MeshConnectorResourceScope",
-      "responsibility": "owns one Mesh runtime connector ceiling and the bounded cleanup executor relationship",
+      "responsibility": "attributes descendant claims to one Mesh runtime, participates in work-conserving fairness, and cannot mint or reserve a fixed share by default",
       "source": "crates/myownmesh-core/src/runtime/attempt/resource_owner.rs"
+    },
+    {
+      "owner": "OptionalLocalCeilingPolicy",
+      "responsibility": "may refuse otherwise grantable claims for explicit isolation, Closed deployment, appliance, cost, compatibility, or test policy but cannot create capacity or mesh authority",
+      "source": "target of the Arc 03 elastic resource correction"
     },
     {
       "owner": "ConnectorCloseOwner",
@@ -39,7 +54,7 @@
     },
     {
       "owner": "RealtimeFlowRegistry",
-      "responsibility": "owns codec-neutral per-flow queues, inbound and outbound resource partitions, and conservative domain corruption state",
+      "responsibility": "owns codec-neutral per-flow retained-unit leases, provider pressure behavior, and conservative domain corruption state",
       "source": "crates/myownmesh-core/src/transport/webrtc/realtime.rs"
     },
     {

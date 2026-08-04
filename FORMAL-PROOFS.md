@@ -15,7 +15,9 @@ B      Genesis or one verified durable semantic basis
 P      Project(M, scope, B, D), the derived durable state
 L      live runtime state
 I      one explicit typed input
-Q      one bounded resource claim vector
+G      the finite resource grant currently assigned to one provider domain
+Q      one finite resource claim vector
+R      the multiset of live resource leases in that provider domain
 E      one bounded effect set
 ```
 
@@ -42,7 +44,7 @@ SessionCapability
 
 A capability is unforgeable within the selected runtime model, bound to one runtime incarnation, and not reconstructible from a durable fact or serialized identifier alone.
 
-For one live connection attempt `a`, let `C(a)` be its finite set of connector candidates. Every `c` in `C(a)` has exactly one attempt owner. A WebRTC candidate `c_w` owns one peer connection and one ICE agent. Its internal ICE candidate and pair sets are finite live connector state, not members of `C(a)` and not authority capabilities.
+For one live connection attempt `a`, let `C(a)` be its finite live set of connector candidates. Every `c` in `C(a)` has exactly one attempt owner and one finite live claim. A WebRTC candidate `c_w` owns one peer connection and one ICE agent. Its internal ICE candidate and pair sets are finite live connector state, not members of `C(a)` and not authority capabilities. The model fixes no universal maximum for `|C(a)|`, Mesh runtimes, peers, sessions, or flows.
 
 ```text
 DataChannelOpen(c_w)
@@ -270,11 +272,11 @@ A Closed governance commitment can encode any reviewed decentralized proof rule.
 
 ### Definition 6.1. Pre-authentication work envelope
 
-Let `W_pre` be the owner-selected finite vector of allowed pre-authentication work and retained state. Every speculative transport effect must reserve against `W_pre` before allocation.
+Let `G_pre` be the finite pre-authentication resource grant currently assigned by the process provider. Let `R_pre` be its live lease multiset. Every speculative transport effect must acquire a finite claim `q` such that `sum(R_pre) + q <= G_pre` before protected allocation or retention.
 
 ### Theorem 6.2. Speculative-work confinement
 
-Assume the reducer and connector effect unions are closed and every pre-authentication effect is resource-guarded. Any untrusted hint can cause at most the reserved pre-authentication effects. It cannot directly create durable authority, an authenticated session capability, or application delivery.
+Assume the reducer and connector effect unions are closed and every pre-authentication effect is resource-guarded. Any untrusted hint can cause only effects whose current live resource claims were granted. It cannot directly create durable authority, an authenticated session capability, or application delivery.
 
 #### Proof
 
@@ -282,15 +284,15 @@ By construction, the only transitions reachable from an untrusted hint before `M
 
 ### Corollary 6.3. Bounded early transport allocation is not a security failure
 
-Creating a candidate, socket, relay allocation, transport object, or bounded media quarantine before endpoint authentication is conforming when it remains inside `W_pre` and cannot reach application delivery or authority.
+Creating a candidate, socket, relay allocation, transport object, or finite media quarantine before endpoint authentication is conforming when every protected object retains its exact lease and cannot reach application delivery or authority.
 
 ### Theorem 6.4. Identity rotation does not bypass the global pre-authentication bound
 
-If `W_pre` includes a global resource component checked before per-identity accounting, an attacker cannot exceed the global bound merely by using fresh valid or invalid Device identities.
+If every claim consumes the process grant before per-identity accounting, an attacker cannot exceed the live process grant merely by using fresh valid or invalid Device identities.
 
 #### Proof
 
-Every allocation consumes the global component independent of identity. The sum of successful reservations cannot exceed the global capacity.
+Every allocation consumes the process component independent of identity. For every admitted claim `q`, admission requires `sum(R_pre) + q <= G_pre`. Identity changes do not alter either side of that inequality.
 
 ## 7. Channel promotion
 
@@ -504,17 +506,45 @@ The local input is identical in both worlds. A deterministic or probabilistic al
 
 ### Theorem 14.1. No unreserved protected work
 
-If every parser, candidate, socket, relay, handshake, media quarantine, session, queue, and effect allocation is dominated by a successful reservation, total allocated work cannot exceed the corresponding configured capacity vector.
+If every parser, candidate, socket, relay, handshake, media quarantine, session, queue entry, task, native object, and effect allocation is dominated by a successful finite lease, then the sum of live claims cannot exceed the provider grant.
+
+#### Proof
+
+The provider grants claim `q` only when component-wise checked addition proves `sum(R) + q <= G`. Release removes exactly the claim held by that lease. Failed subtraction or addition cannot create capacity and instead poisons the affected accounting domain. Induction over grant and release transitions preserves `sum(R) <= G`.
 
 ### Theorem 14.2. Pre-authentication and post-authentication separation
 
 Allowing bounded pre-authentication allocations does not imply that post-authentication session or application resources may be allocated before `MayPromote`. Separate reservation classes enforce the boundary.
 
-### Theorem 14.3. Stale-effect suppression
+### Theorem 14.3. Semantic cardinality need not be fixed
+
+Assume each live product object owns a finite nonzero composite claim and the provider enforces `sum(R) <= G`. Then no fixed Mesh, peer, attempt, session, or flow count is required to preserve resource safety.
+
+#### Proof
+
+Admission depends on the next claim and remaining resources, not on the product-object count. One large object may consume more of `G` than many small objects. Any number of objects may coexist while their summed claims fit. The next object fails with typed pressure when its claim does not fit.
+
+### Theorem 14.4. Child scopes cannot multiply capacity
+
+If every child scope reserves from the same process provider and scope creation grants no resources, adding Mesh scopes cannot increase `G` or permit `sum(R) > G`.
+
+### Theorem 14.5. Work-conserving borrowing preserves safety
+
+Allowing one child to consume capacity unused by another preserves `sum(R) <= G` because both claims are charged to the same process grant. Fair scheduling and protected cleanup classes affect service order, not the resource inequality.
+
+### Theorem 14.6. Optional ceiling confinement
+
+An optional local ceiling wrapper may refuse a claim that the provider could grant. It cannot approve a claim the provider refused, so it can reduce availability but cannot increase capacity or create mesh authority.
+
+### Theorem 14.7. Time independence
+
+If lease transitions are caused only by explicit owner actions or provider reclamation allowed by the claim contract, elapsed time alone cannot change `R`. A slow operation therefore retains its finite claim without acquiring more authority or capacity.
+
+### Theorem 14.8. Stale-effect suppression
 
 If each pending effect carries exact live capabilities and rechecks them before execution, destroying or replacing those capabilities suppresses delayed effects for old candidates, channels, principals, or sessions.
 
-### Theorem 14.4. Crash replay semantic idempotence
+### Theorem 14.9. Crash replay semantic idempotence
 
 If external effect intents have deterministic identities, commit durably before execution, and adapters deduplicate or map duplicates to the same resource, a crash may repeat physical execution but cannot create a second semantic effect.
 
@@ -585,4 +615,5 @@ A concrete implementation must provide:
 11. crash tests for reservations and effect intents;
 12. compaction equivalence tests for each adopted durable domain;
 13. eclipse controls that preserve the impossibility boundary;
-14. resource saturation measurements on every supported target.
+14. elastic-provider controls for grant, pressure, exact release, borrowing, child-scope sharing, optional ceilings, cleanup priority, slow work, and storage-backed work;
+15. resource characterization and opaque-residual reports on every supported target.

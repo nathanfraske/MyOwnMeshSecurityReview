@@ -1,6 +1,6 @@
 # Arc 03 WebRTC connector ownership red team
 
-Status: Arc 03J executable review record for draft fork PR #5 on `arc/03i-final-connector-boundary`. Fork PR #4 was closed without merge as a superseded Arc 03G record. Passing this record does not authorize merge or select a production resource value.
+Status: Arc 03 executable review record for draft fork PR #5 on `arc/03i-final-connector-boundary`. The accepted Arc 03J connector controls remain required. The elastic resource controls below are pending implementation. Passing this record does not authorize merge or select an optional local policy value.
 
 ## 1. Isolation and exact-head commands
 
@@ -27,17 +27,19 @@ After retaining the logs, remove only this target:
 wsl.exe -d Ubuntu-24.04 -- rm -rf /tmp/mom-arc03j-red-team
 ```
 
-## 2. RT-03-01: manufacture connector capacity
+## 2. RT-03-01: manufacture connector resource authority
 
-Attack: construct a worker, process owner, Mesh child, or candidate capability without the process and exact-Mesh reservation.
+Attack: construct a worker, provider, Mesh child, lease, or candidate capability without the process provider and exact claim.
 
-Required result: external code cannot construct those authorities. One process aggregate and one exact child update atomically. Conflicting process policy and exhausted child capacity fail closed.
+Required result: external code cannot construct those authorities. Every admitted candidate holds a finite process-backed lease attributed to its exact Mesh scope. Creating more Mesh scopes cannot multiply the process grant. Admission continues for another object whenever its claim is granted and fails with a named resource class when it is not.
 
 Controls:
 
-- `v4_arc03d_process_root_shares_one_connector_limit_across_mesh_runtimes`
-- `v4_arc03e_mesh_ceiling_isolates_children_inside_the_process_cap`
-- `v4_arc03e_concurrent_children_never_oversubscribe_either_ceiling`
+- no basal `MAX_MESHES`, `MAX_PEERS`, `MAX_ATTEMPTS`, or `MAX_FLOWS` control
+- provider-granted additional admission and named-dimension refusal controls
+- unequal-claim and many-small-claim controls
+- non-multiplying Mesh scope and exact-release restoration controls
+- work-conserving borrowing and optional local ceiling controls
 - cause-matched compiler rejections for private resource and worker constructors
 
 ## 3. RT-03-02: cancel native construction
@@ -86,7 +88,7 @@ Controls:
 
 Attack: fill a callback mailbox, then submit one or many later callbacks while the receiver is stalled.
 
-Required result: insertion returns a typed overload without awaiting capacity. No producer future accumulates behind `reserve().await`, and no second callback queue exists.
+Required result: every retained callback carries queued-byte and scheduled-work leases. Insertion returns typed pressure without an unbounded producer wait. No producer future accumulates behind `reserve().await`, and no second callback queue exists.
 
 Controls:
 
@@ -106,7 +108,7 @@ Additional controls:
 
 Attack: place the scheduler cursor on endpoint data while `DataChannelOpen` and the first handshake message are both queued. Replace or retire the connector before open commits.
 
-Required result: endpoint protocol data remains in its bounded mailbox until exact open promotion. Retirement drops it and releases its observation.
+Required result: endpoint protocol data remains in its lease-backed retention path until exact open promotion. Retirement drops it and releases its claim.
 
 Controls:
 
@@ -116,9 +118,9 @@ Controls:
 
 ## 7. RT-03-06: flood remote candidates before and after SDP
 
-Attack: submit unique and duplicate candidates on both sides of remote SDP, delay application, cancel application, and continue until application-work capacity is exhausted.
+Attack: submit unique and duplicate candidates on both sides of remote SDP, delay application, cancel application, and continue until the provider refuses candidate storage or application work.
 
-Required result: one ICE-attempt envelope bounds unique items, candidate content bytes, duplicates, and native application work. The first refusal retires the exact attempt. Later submissions return the terminal result before hashing or logging unique candidate content. Application does not reset the envelope.
+Required result: one ICE-attempt owner holds every candidate storage, byte, parsing, hashing, and native-work lease. The first provider or optional local-policy refusal retires the exact attempt. Later submissions return the terminal result before hashing or logging unique candidate content. Application does not reset the owner.
 
 A local restart creates a provisional attempt, retires the old attempt, waits for admitted old work, and commits only after native restart succeeds. Native failure does not publish the replacement and retires the connector when rollback is not proven. A remote restart is detected from changed effective ICE credentials on an existing MID, or media-line index when MID is absent. Media reordering or addition cannot manufacture a fresh candidate envelope. The replacement stays provisional until the exact remote description commits. The DTLS fingerprint does not stand in for ICE credentials.
 
@@ -184,7 +186,7 @@ Controls:
 
 Attack: send valid-looking RTP indefinitely before connector promotion.
 
-Required result: one cumulative packet and content-byte envelope bounds the speculative track. Exhaustion stops the transceiver. There is no timer, token window, or rate reset.
+Required result: every retained packet byte and scheduled work unit owns a finite lease. Provider pressure or an explicit compatibility or local ceiling stops the speculative transceiver. There is no timer, token window, or rate reset.
 
 Controls:
 
@@ -195,7 +197,7 @@ Controls:
 
 Attack: underflow or overflow the inbound or outbound connector-owned byte and unit counters.
 
-Required result: the damaged domain is charged to its full ceiling and refuses later admission. Independent domain counters prevent an unproven shared total from creating capacity. The other domain remains governed by its own ceiling.
+Required result: the damaged provider domain is poisoned or conservatively retains every unproven claim. Corruption cannot create capacity. Independent ownership prevents one damaged domain from fabricating capacity in another.
 
 Controls:
 
@@ -208,7 +210,7 @@ Residual: native WebRTC allocations outside connector-owned leases are not inclu
 
 Attack: send oversized fragments, too many fragments, many incomplete units, a silent incomplete unit, reordered units, and full complete-unit queues.
 
-Required result: every connector-retained unit has structural per-flow and byte bounds. Complete queues use deterministic `DropNewest`. A silent partial unit keeps only its finite admitted claim until a concrete owner event releases it.
+Required result: every connector-retained unit has a finite storage and work lease. Proven provider or compatibility shape limits remain distinct. The temporary compatibility queue uses deterministic `DropNewest`. A silent partial unit keeps only its finite admitted claim until a concrete owner event releases it.
 
 Controls:
 
@@ -245,7 +247,7 @@ Controls:
 
 Attack: panic a cleanup future, terminate the executor, fill its queue, poison its state, or shut down the caller runtime.
 
-Required result: policy construction validates queue capacity. A failed job calls the exact owner's failure path. Health reports the bounded queue and terminal failure. No timeout reclaims an unproven result.
+Required result: connector admission reserves cleanup execution ownership. New speculative pressure cannot prevent cleanup from being scheduled. A failed job calls the exact owner's failure path. Health reports leased queued and active work plus terminal failure. No timeout reclaims an unproven result.
 
 Controls:
 
@@ -336,9 +338,9 @@ Controls:
 
 ## 21. RT-03-20: start without connector policy
 
-Attack: start a participating daemon without a connector policy, turn infrastructure-only startup into participation, or infer missing operational values.
+Attack: start a participating daemon without a resource provider, turn infrastructure-only startup into participation, or install hidden product-cardinality defaults.
 
-Required result: connector-capable and infrastructure-only constructors are distinct. Infrastructure-only startup requires participation disabled. Missing, zero, invalid, or inconsistent connector policy fails before network-capable startup.
+Required result: connector-capable and infrastructure-only constructors are distinct. Infrastructure-only startup requires participation disabled. Connector-capable startup requires a resource provider but no static Mesh, peer, attempt, queue, or flow count. Hidden default cardinality is rejected.
 
 Controls:
 
@@ -348,9 +350,31 @@ Controls:
 - `data_only_connector_policy_requires_no_realtime_values`
 - compiler rejection for ambiguous Mesh open
 
-## 22. Measurement and approval boundary
+## 22. Elastic resource controls
 
-[`scripts/measure-v4-arc03g.ps1`](../scripts/measure-v4-arc03g.ps1) records raw queue occupancy, service delay, candidate content size, in-progress bytes, connector concurrency, close duration, process CPU, and retained-memory observations for direct, TURN, data-only, H.264, Opus, flow contention, reconnect, multi-peer, multi-Mesh, close-success, close-error, and candidate-burst scenarios. Each workload shape and repeat count is an explicit owner input. The harness proposes no default or production policy value.
+Attack: impose a hidden object count, multiply capacity with child scopes, starve cleanup with speculative work, retain an object after releasing its lease, expire a slow operation by time, or treat storage-backed delivery like a live packet queue.
+
+Required result:
+
+- no basal Mesh, peer, attempt, session, or flow maximum exists;
+- another object is admitted whenever the mock provider grants its exact claim;
+- refusal names an unavailable resource dimension;
+- one large claim may consume more than many small claims;
+- many small objects coexist while resources remain;
+- Mesh scopes cannot multiply the process grant;
+- exact release restores capacity;
+- unused capacity is borrowable under the basal provider;
+- an optional local ceiling can restrict a deployment without minting capacity;
+- speculative work is reclaimed or refused before cleanup or admitted higher-authority work is starved;
+- slow work retains its finite lease without timer-derived expiry;
+- storage-backed work consumes storage leases;
+- no hidden default cardinality exists.
+
+These controls are pending until the elastic provider implementation lands.
+
+## 23. Measurement and approval boundary
+
+[`scripts/measure-v4-arc03g.ps1`](../scripts/measure-v4-arc03g.ps1) records raw queue occupancy, service delay, candidate content size, in-progress bytes, connector concurrency, close duration, process CPU, and retained-memory observations for direct, TURN, data-only, H.264, Opus, flow contention, reconnect, multi-peer, multi-Mesh, close-success, close-error, and candidate-burst scenarios. These observations characterize performance, provider cost, fairness, regression, and opaque residuals. They do not define universal product cardinality.
 
 Before review, the exact pushed head must pass formatting, workspace checks, Clippy, tests, doctests, compiler-boundary checks, native direct and TURN controls, retained-feature controls, and the unchanged Linux x86-64, macOS ARM64, Windows x86-64, Linux RISC-V musl, and Linux ARM64 musl matrix.
 

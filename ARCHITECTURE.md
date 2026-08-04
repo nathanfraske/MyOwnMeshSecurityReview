@@ -186,7 +186,7 @@ The connector owns pathfinding and packet transport. It may start useful work be
 
 ![Usability-first pathfinding with a strict channel-promotion boundary](diagrams/02-channel-promotion-boundary.svg)
 
-An untrusted hint or partially authenticated signal may create only bounded speculative state, such as:
+An untrusted hint or partially authenticated signal may create only lease-backed speculative state, such as:
 
 ```text
 ConnectorCandidateCapability
@@ -216,13 +216,46 @@ Before promotion, speculative work may not:
 - deliver application payload to a consumer;
 - send application payload as an authenticated peer;
 - select arbitrary relay destinations;
-- exceed the measured pre-authentication resource envelope.
+- retain protected state or schedule protected work without a live resource lease.
 
 MyOwnMesh does not maintain a parallel global route table. A connector may keep local ephemeral candidate and channel indexes for operation and diagnostics. Those local identifiers are not ledger facts, peer identity, application authority, or cross-runtime route identifiers.
 
-### 5.1 Attempt and connector cardinality
+### 5.1 Attempt, connector, and resource cardinality
 
 One connection attempt is a cancellation, race, and aggregate-resource owner. It may own several connector candidates. One WebRTC connector candidate owns exactly one `RTCPeerConnection` and its one ICE agent. That ICE agent may gather, receive, and check many internal ICE candidates and candidate pairs.
+
+These relationships describe ownership, not product-wide maximum counts. Basal MyOwnMesh defines no fixed semantic ceiling for Mesh runtimes, peers, attempts, sessions, or real-time flows. A finite host still has finite resources, so creating any of these objects is fallible. Admission succeeds only when the applicable resource provider grants the object's finite composite claim. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result.
+
+```text
+host or process resource provider
+    -> grants finite ResourceLease for an exact ResourceClaim
+    -> process resource root
+        -> Mesh resource scope
+            -> attempt, candidate, callback, cleanup, and flow owners
+
+sum of live claims in each resource dimension
+    <= resource grant currently assigned to the process
+```
+
+Mesh scopes are accounting and fairness children of one process grant. Creating another Mesh scope does not create capacity. Unused capacity is borrowable under the basal work-conserving provider. An optional local policy may impose isolation or cardinality ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test, but that wrapper is not basal mesh semantics.
+
+Resource limits have four distinct sources:
+
+```text
+Protocol-shape bound
+    canonical parser or wire validity
+
+Provider structural limit
+    actual transport, codec, kernel, or hardware constraint
+
+Runtime resource availability
+    currently granted memory, handles, sockets, tasks, storage, and work
+
+Optional local policy ceiling
+    explicit administrator, cost, isolation, or compatibility restriction
+```
+
+One category cannot be presented as another. Measurements characterize cost and help select optional local policy. They do not establish a universal peer, Mesh, attempt, session, or flow count.
 
 ```text
 one connection attempt
@@ -457,9 +490,12 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 11. **No relay-authorized handoff.** Relays cannot add, select, or retire an application-usable channel.
 12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
-14. **Work is bounded before use.** Pre-authentication and post-authentication resource classes are separately measured and enforced.
-15. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
-16. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
+14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
+15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability.
+16. **Resource scopes do not mint capacity.** Child scopes share one process grant, use work-conserving fairness, and may borrow unused capacity unless an explicit local isolation policy says otherwise.
+17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
+18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
+19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
 
 ## 14. Owner decisions that remain explicit
 
@@ -473,9 +509,9 @@ Owner review must select and test:
 6. Connector profiles and required egress environments.
 7. Endpoint-authentication and channel-binding protocols.
 8. Direct, TURN, generic relay, and Closed member-relay requirements.
-9. Pre-authentication and post-authentication resource budgets.
+9. Resource-provider integration, provider structural limits, and any optional local resource ceilings.
 10. Reachability observation and local path-selection policies.
 11. Session-handle sharing, recovery, and application lifecycle behavior.
-12. The measurements that select every numeric maximum, timeout, retry, queue, and cache value.
+12. Measurements used for performance characterization, provider-cost estimation, regression detection, opaque-allocation discovery, and optional deployment policy.
 
-No numeric value is inferred from a plausible default.
+No numeric product cardinality is inferred from a plausible default. Any numeric protocol or provider limit must be proven by that protocol or provider. Any optional local ceiling requires explicit owner selection.

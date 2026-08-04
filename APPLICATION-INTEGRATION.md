@@ -186,7 +186,8 @@ request_session(mesh_context, exact_remote_device_id)
     | RemoteParticipationUnknown
     | RemoteNotParticipating
     | RemoteNotAuthorized
-    | ResourceLimited
+    | ResourcePressure(resource_class)
+    | ResourceUnavailable(resource_class)
 
 watch_session(session_operation_or_handle)
     -> bounded stream<SessionEvent>
@@ -214,7 +215,8 @@ A conceptual optional interface is:
 open_realtime_flow(session_handle, application_flow_spec)
     -> RealtimeFlowHandle
     | UnsupportedDataPlane
-    | ResourceLimited
+    | ResourcePressure(resource_class)
+    | ResourceUnavailable(resource_class)
     | StaleHandle
 
 write_realtime_unit(realtime_flow_handle, application_encoded_unit)
@@ -474,7 +476,8 @@ SessionFailure =
     | NoSignalingPath
     | NoViablePeerTransport
     | EndpointAuthenticationFailed
-    | ResourceLimited
+    | ResourcePressure(resource_class)
+    | ResourceUnavailable(resource_class)
     | StaleHandle
     | SessionClosed
 ```
@@ -483,7 +486,7 @@ SessionFailure =
 
 ## 14. Resource ownership
 
-MyOwnMesh owns measured limits for:
+MyOwnMesh owns leases and pressure behavior for:
 
 - durable fact validation and storage;
 - signaling connections, frames, queues, and provenance;
@@ -503,7 +506,11 @@ The application owns:
 - application queues, persistence, retries, and fanout;
 - user-visible history and workflow.
 
-The component that allocates a resource reserves it before allocation.
+The component that allocates or retains a protected resource acquires its finite lease before allocation or retention. Basal MyOwnMesh does not expose or require a fixed maximum number of Mesh runtimes, peers, attempts, sessions, or flows. A request succeeds while the process resource provider grants its exact claim. Otherwise the application receives typed pressure or unavailability.
+
+The application does not choose low-level connector counters. It may install an explicit local policy for a locked-down appliance, Closed deployment, carrier cost boundary, or product-specific isolation requirement. Such a policy can be stricter than current host availability but cannot create resources or mesh authority.
+
+Reliable streams, interactive real-time flows, delayed satellite delivery, and storage-backed transport do not share one queue rule. Each uses the pressure contract appropriate to its provider. Every retained unit still owns storage and scheduled-work leases. Time passage alone does not expire a slow operation or release its resources.
 
 ## 15. Acceptance gates
 
@@ -524,7 +531,11 @@ The application integration passes only when:
 - stale or foreign-principal handles fail before payload use;
 - signaling never becomes a generic application-data bus;
 - explicit application intermediaries remain explicit endpoints;
-- every queue, candidate, transport, relay, and session resource remains within owner-selected measured limits.
+- every protected queue entry, candidate, transport, relay, and session object holds a live finite lease;
+- another object is admitted whenever the provider grants its exact claim, without a basal product-count ceiling;
+- resource refusal identifies pressure or unavailability, never Open or Closed authorization;
+- Mesh scopes share one process grant and cannot multiply capacity;
+- optional local ceilings remain explicit deployment policy.
 
 ## 16. Owner decisions
 
@@ -539,5 +550,6 @@ The owner must select:
 7. session recovery and multi-channel behavior;
 8. diagnostic detail;
 9. headless consumer connector types;
-10. every pre-authentication and post-authentication resource value;
-11. the measurements that decide defaults.
+10. resource-provider and host-isolation integration for each deployment form;
+11. any optional local ceilings, cost policies, or isolation policy;
+12. measurements used for performance, cost, fairness, regression, and opaque-resource characterization.
