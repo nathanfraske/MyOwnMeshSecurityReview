@@ -275,6 +275,9 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "legacy-media")]
+    static CONNECTOR_DAEMON_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(feature = "legacy-media")]
     fn nz(value: usize) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(value).expect("legacy-media deployment fixture is nonzero")
     }
@@ -332,6 +335,10 @@ mod tests {
     )]
     #[tokio::test]
     async fn v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form() {
+        // `Mesh` is one per process and owns one process identity anchor. Keep
+        // the two real-daemon compatibility fixtures from manufacturing a
+        // second concurrent process incarnation inside the test binary.
+        let _fixture = CONNECTOR_DAEMON_FIXTURE.lock().await;
         let temp = tempfile::tempdir().expect("temporary daemon state");
         let mut daemon = myownmesh_core::MeshConfig::default().daemon;
         daemon.control_socket = Some(temp.path().join("daemon.sock"));
@@ -369,6 +376,7 @@ mod tests {
     )]
     #[tokio::test]
     async fn v4_arc03j_legacy_media_sidecar_composes_only_with_explicit_legacy_v1_runtime() {
+        let _fixture = CONNECTOR_DAEMON_FIXTURE.lock().await;
         let temp = tempfile::tempdir().expect("temporary daemon state");
         let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
         daemon_config.control_socket = Some(temp.path().join("daemon-sidecar.sock"));
