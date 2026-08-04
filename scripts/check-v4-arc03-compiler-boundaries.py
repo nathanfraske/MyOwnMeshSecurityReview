@@ -541,8 +541,12 @@ def main() -> int:
         failures.append("remote candidates do not use a transactional exact ICE-attempt fence")
     if not (
         "PendingRemoteCandidateQueuePush::Retired" in webrtc_source
+        and "PendingRemoteCandidateQueuePush::InvalidBinding" in webrtc_source
         and "self.attempt.retire();" in webrtc_source
         and "AttemptRetired" in webrtc_source
+        and "RemoteCandidateDisposition::InvalidBinding" in webrtc_source
+        and "v4_arc03j_invalid_candidate_bindings_terminally_retire_the_attempt"
+        in webrtc_source
     ):
         failures.append("candidate-envelope refusal is not terminal for the exact attempt")
     if not re.search(

@@ -124,9 +124,9 @@ A local restart creates a provisional attempt, retires the old attempt, waits fo
 
 A replacement candidate may arrive before the replacement SDP. It must consume finite ingress capacity without reaching the old native ICE agent, then move only when it explicitly declares the replacement username fragment and any declared media location matches the replacement binding. A location-only candidate owned by the old attempt is dropped. A location-only candidate admitted after the provisional replacement exists remains owned by that replacement. Delayed old-attempt work cannot mutate the replacement. Concurrent local restart and remote-description transactions fail closed instead of creating two candidate owners.
 
-Attack: omit MID, media-line index, and username fragment, provide conflicting MID and index values, reuse one username fragment for different effective credential pairs, conflict the structured username fragment with the candidate-line `ufrag`, or repeat the line extension.
+Attack: omit MID, media-line index, and username fragment, provide conflicting MID and index values, reuse one username fragment for different effective credential pairs, conflict the structured username fragment with the candidate-line `ufrag`, repeat the line extension, omit its value, or continue sending malformed bindings after the first refusal.
 
-Required result: every accepted candidate has a binding to the active SDP. MID and index select one exact binding. A username-fragment-only candidate identifies one unambiguous credential pair. Structured and line declarations agree exactly. Empty structured values cannot hide the line declaration, and duplicate line declarations are invalid. The wholly unbound, conflicting-location, ambiguous-username, conflicting-declaration, and duplicate-declaration forms are rejected without adding a generation, route identity, timestamp, or timer.
+Required result: every accepted candidate has a binding to the active SDP. MID and index select one exact binding. A username-fragment-only candidate identifies one unambiguous credential pair. Structured and line declarations agree exactly. Empty structured values cannot hide the line declaration, and duplicate or incomplete line declarations are invalid. The first invalid binding returns one typed reason and retires the exact attempt. Later submissions reach the inactive-attempt check before binding parsing, candidate classification, hashing, retention, duplicate accounting, diagnostic publication, or native work. Queue length, digest cardinality, resource counters, and diagnostic cardinality remain unchanged after the one terminal result. No generation, route identity, timestamp, timer, or new rate counter is added.
 
 Controls:
 
@@ -147,6 +147,7 @@ Controls:
 - `v4_arc03j_sdp_ice_credentials_apply_session_inheritance_and_media_overrides`
 - `v4_arc03j_remote_candidates_require_an_exact_or_unambiguous_binding`
 - `v4_arc03j_candidate_username_fragment_declarations_must_agree`
+- `v4_arc03j_invalid_candidate_bindings_terminally_retire_the_attempt`
 - `v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates`
 - `v4_arc03j_restart_transactions_reject_ambiguous_interleavings`
 - `v4_arc03j_corrupt_restart_migration_leaves_no_viable_attempt`

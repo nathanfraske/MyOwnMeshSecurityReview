@@ -791,8 +791,14 @@ pub(crate) enum RemoteCandidateDisposition {
     Applied,
     QueuedUntilRemoteDescription,
     DuplicateIgnored,
+    InvalidBinding(CandidateUsernameFragmentError),
     RefusedByOwner,
     AttemptRetired,
+}
+
+pub(crate) struct RemoteCandidateAdmissionReport {
+    pub(crate) disposition: RemoteCandidateDisposition,
+    pub(crate) kind: Option<super::diag::IceCandidateKind>,
 }
 
 /// Outcome of the data-channel-open ownership transition.
@@ -998,7 +1004,7 @@ impl PendingRemoteCandidateQueue {
 enum PendingRemoteCandidateQueuePush {
     Queued,
     Duplicate,
-    Invalid,
+    InvalidBinding(CandidateUsernameFragmentError),
     Refused,
     Retired,
 }
@@ -1185,25 +1191,43 @@ impl RemoteCandidateAttemptEnvelope {
         }
     }
 
+    #[cfg(test)]
     fn admit(
         &mut self,
         candidate: LocalIceCandidate,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
+        self.admit_observed(candidate, resource_scope).0
+    }
+
+    fn admit_observed(
+        &mut self,
+        candidate: LocalIceCandidate,
+        resource_scope: &PeerConnectionResourceScope,
+    ) -> (
+        PendingRemoteCandidateQueuePush,
+        Option<super::diag::IceCandidateKind>,
+    ) {
         if !self.attempt.is_active() {
-            return PendingRemoteCandidateQueuePush::Retired;
+            return (PendingRemoteCandidateQueuePush::Retired, None);
         }
-        if candidate_username_fragment(&candidate).is_err() {
-            return PendingRemoteCandidateQueuePush::Invalid;
+        let kind = super::ice::classify_candidate_sdp(&candidate.candidate);
+        if let Err(error) = candidate_username_fragment(&candidate) {
+            self.attempt.retire();
+            return (
+                PendingRemoteCandidateQueuePush::InvalidBinding(error),
+                Some(kind),
+            );
         }
         let digest = candidate_content_digest(&candidate);
         if self.seen.contains(&digest) {
-            return if self.pending.budget.record_duplicate() {
+            let disposition = if self.pending.budget.record_duplicate() {
                 PendingRemoteCandidateQueuePush::Duplicate
             } else {
                 self.attempt.retire();
                 PendingRemoteCandidateQueuePush::Refused
             };
+            return (disposition, Some(kind));
         }
         let result = self
             .pending
@@ -1213,7 +1237,7 @@ impl RemoteCandidateAttemptEnvelope {
         } else if result == PendingRemoteCandidateQueuePush::Refused {
             self.attempt.retire();
         }
-        result
+        (result, Some(kind))
     }
 
     fn owns_attempt(&self, attempt: &Arc<RemoteCandidateAttemptIdentity>) -> bool {
@@ -1288,12 +1312,25 @@ impl RemoteCandidateState {
             .map_or(&mut self.current, |provisional| &mut provisional.envelope)
     }
 
+    #[cfg(test)]
     fn admit(
         &mut self,
         candidate: LocalIceCandidate,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
         self.admission_target().admit(candidate, resource_scope)
+    }
+
+    fn admit_observed(
+        &mut self,
+        candidate: LocalIceCandidate,
+        resource_scope: &PeerConnectionResourceScope,
+    ) -> (
+        PendingRemoteCandidateQueuePush,
+        Option<super::diag::IceCandidateKind>,
+    ) {
+        self.admission_target()
+            .admit_observed(candidate, resource_scope)
     }
 
     fn begin_local_ice_restart(
@@ -2137,31 +2174,42 @@ impl WebRtcConnectorWorker {
     }
 
     /// Apply or retain one inbound candidate under this worker's ownership.
+    #[cfg(test)]
     pub(crate) async fn add_remote_candidate(
         &self,
         candidate: LocalIceCandidate,
     ) -> Result<RemoteCandidateDisposition> {
+        Ok(self
+            .add_remote_candidate_observed(candidate)
+            .await?
+            .disposition)
+    }
+
+    pub(crate) async fn add_remote_candidate_observed(
+        &self,
+        candidate: LocalIceCandidate,
+    ) -> Result<RemoteCandidateAdmissionReport> {
         let _operation = self.ownership.enter_operation()?;
-        let pending = {
+        let (pending, kind) = {
             let mut state = self.remote_candidates.lock();
             if !self.ownership.incarnation.is_active() {
                 return Err(Error::Transport("connector worker is retired".to_string()));
             }
-            let admitted = state.admit(candidate, &self.resource_scope);
+            let (admitted, kind) = state.admit_observed(candidate, &self.resource_scope);
             let target = state.admission_target();
             if !target.remote_description_set
                 || (admitted == PendingRemoteCandidateQueuePush::Queued
                     && !target.last_candidate_matches_remote_credentials())
             {
-                return Ok(match admitted {
+                let disposition = match admitted {
                     PendingRemoteCandidateQueuePush::Queued => {
                         RemoteCandidateDisposition::QueuedUntilRemoteDescription
                     }
                     PendingRemoteCandidateQueuePush::Duplicate => {
                         RemoteCandidateDisposition::DuplicateIgnored
                     }
-                    PendingRemoteCandidateQueuePush::Invalid => {
-                        RemoteCandidateDisposition::RefusedByOwner
+                    PendingRemoteCandidateQueuePush::InvalidBinding(error) => {
+                        RemoteCandidateDisposition::InvalidBinding(error)
                     }
                     PendingRemoteCandidateQueuePush::Refused => {
                         RemoteCandidateDisposition::RefusedByOwner
@@ -2169,9 +2217,10 @@ impl WebRtcConnectorWorker {
                     PendingRemoteCandidateQueuePush::Retired => {
                         RemoteCandidateDisposition::AttemptRetired
                     }
-                });
+                };
+                return Ok(RemoteCandidateAdmissionReport { disposition, kind });
             }
-            match admitted {
+            let pending = match admitted {
                 PendingRemoteCandidateQueuePush::Queued => target
                     .pending
                     .pop_last_for_application(&self.resource_scope)
@@ -2181,21 +2230,37 @@ impl WebRtcConnectorWorker {
                         )
                     })?,
                 PendingRemoteCandidateQueuePush::Duplicate => {
-                    return Ok(RemoteCandidateDisposition::DuplicateIgnored)
+                    return Ok(RemoteCandidateAdmissionReport {
+                        disposition: RemoteCandidateDisposition::DuplicateIgnored,
+                        kind,
+                    })
                 }
-                PendingRemoteCandidateQueuePush::Invalid => {
-                    return Ok(RemoteCandidateDisposition::RefusedByOwner)
+                PendingRemoteCandidateQueuePush::InvalidBinding(error) => {
+                    return Ok(RemoteCandidateAdmissionReport {
+                        disposition: RemoteCandidateDisposition::InvalidBinding(error),
+                        kind,
+                    })
                 }
                 PendingRemoteCandidateQueuePush::Refused => {
-                    return Ok(RemoteCandidateDisposition::RefusedByOwner)
+                    return Ok(RemoteCandidateAdmissionReport {
+                        disposition: RemoteCandidateDisposition::RefusedByOwner,
+                        kind,
+                    })
                 }
                 PendingRemoteCandidateQueuePush::Retired => {
-                    return Ok(RemoteCandidateDisposition::AttemptRetired)
+                    return Ok(RemoteCandidateAdmissionReport {
+                        disposition: RemoteCandidateDisposition::AttemptRetired,
+                        kind,
+                    })
                 }
-            }
+            };
+            (pending, kind)
         };
         self.apply_remote_candidate(pending).await?;
-        Ok(RemoteCandidateDisposition::Applied)
+        Ok(RemoteCandidateAdmissionReport {
+            disposition: RemoteCandidateDisposition::Applied,
+            kind,
+        })
     }
 
     /// Apply remote SDP, transfer queue ownership into the async drain, and
@@ -4007,10 +4072,24 @@ impl RemoteIceCredentials {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CandidateUsernameFragmentError {
+pub(crate) enum CandidateUsernameFragmentError {
     MissingCandidateLineValue,
     DuplicateCandidateLineDeclaration,
     ConflictingDeclarations,
+}
+
+impl CandidateUsernameFragmentError {
+    pub(crate) const fn description(self) -> &'static str {
+        match self {
+            Self::MissingCandidateLineValue => "candidate-line ufrag has no value",
+            Self::DuplicateCandidateLineDeclaration => {
+                "candidate line declares ufrag more than once"
+            }
+            Self::ConflictingDeclarations => {
+                "structured and candidate-line username fragments conflict"
+            }
+        }
+    }
 }
 
 fn candidate_line_username_fragment(
@@ -8907,11 +8986,13 @@ mod tests {
         let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
         assert_eq!(
             state.admit(conflicting, &scope),
-            PendingRemoteCandidateQueuePush::Invalid,
+            PendingRemoteCandidateQueuePush::InvalidBinding(
+                CandidateUsernameFragmentError::ConflictingDeclarations
+            ),
             "conflicting declarations are rejected before hashing or retention"
         );
         assert!(state.current.pending.entries.is_empty());
-        assert!(state.current.attempt.is_active());
+        assert!(!state.current.attempt.is_active());
 
         let mut empty_structured = matching.clone();
         empty_structured.username_fragment = Some(String::new());
@@ -8936,6 +9017,107 @@ mod tests {
             &duplicate_line,
             &credentials
         ));
+    }
+
+    #[test]
+    fn v4_arc03j_invalid_candidate_bindings_terminally_retire_the_attempt() {
+        let mut conflicting = observed_candidate();
+        conflicting.username_fragment = Some("structured-u".to_string());
+        conflicting.candidate.push_str(" ufrag line-u");
+
+        let mut duplicate = observed_candidate();
+        duplicate
+            .candidate
+            .push_str(" ufrag remote-fragment ufrag remote-fragment");
+
+        let mut missing_value = observed_candidate();
+        missing_value.candidate.push_str(" ufrag");
+
+        let cases = [
+            (
+                conflicting,
+                CandidateUsernameFragmentError::ConflictingDeclarations,
+            ),
+            (
+                duplicate,
+                CandidateUsernameFragmentError::DuplicateCandidateLineDeclaration,
+            ),
+            (
+                missing_value,
+                CandidateUsernameFragmentError::MissingCandidateLineValue,
+            ),
+        ];
+
+        for (invalid, expected_error) in cases {
+            let process = ProcessResourceRoot::isolated();
+            let scope = process
+                .mesh_runtime_scope()
+                .network_instance_scope()
+                .peer_connection_scope();
+            let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+            assert_eq!(
+                state.admit(observed_candidate(), &scope),
+                PendingRemoteCandidateQueuePush::Queued,
+                "the terminal snapshot includes one already retained candidate"
+            );
+            let (first, first_kind) = state.admit_observed(invalid.clone(), &scope);
+            assert_eq!(
+                first,
+                PendingRemoteCandidateQueuePush::InvalidBinding(expected_error)
+            );
+            assert!(
+                first_kind.is_some(),
+                "the one terminal result is classified"
+            );
+            assert!(!state.current.attempt.is_active());
+
+            let terminal_queue_len = state.current.pending.entries.len();
+            let terminal_digest_len = state.current.seen.len();
+            let terminal_budget = state.current.pending.budget.report();
+            let terminal_resources = candidate_report(&process.report().pre_authentication);
+            let terminal_resource_counters = (
+                terminal_resources.active,
+                terminal_resources.peak_active,
+                terminal_resources.active_lease_count,
+                terminal_resources.peak_active_lease_count,
+                terminal_resources.completed_lease_count,
+                terminal_resources.completed_total_use,
+                terminal_resources.completed_total_lifetime,
+                terminal_resources.measurement_inexact,
+            );
+            let mut classified_results = usize::from(first_kind.is_some());
+
+            for index in 0..1024 {
+                let mut later = invalid.clone();
+                later.candidate.push_str(&format!(" later-{index}"));
+                let (disposition, kind) = state.admit_observed(later, &scope);
+                assert_eq!(disposition, PendingRemoteCandidateQueuePush::Retired);
+                assert!(
+                    kind.is_none(),
+                    "a retired attempt performs no later diagnostic classification"
+                );
+                classified_results += usize::from(kind.is_some());
+            }
+
+            assert_eq!(classified_results, 1);
+            assert_eq!(state.current.pending.entries.len(), terminal_queue_len);
+            assert_eq!(state.current.seen.len(), terminal_digest_len);
+            assert_eq!(state.current.pending.budget.report(), terminal_budget);
+            let later_resources = candidate_report(&process.report().pre_authentication);
+            assert_eq!(
+                (
+                    later_resources.active,
+                    later_resources.peak_active,
+                    later_resources.active_lease_count,
+                    later_resources.peak_active_lease_count,
+                    later_resources.completed_lease_count,
+                    later_resources.completed_total_use,
+                    later_resources.completed_total_lifetime,
+                    later_resources.measurement_inexact,
+                ),
+                terminal_resource_counters
+            );
+        }
     }
 
     #[test]

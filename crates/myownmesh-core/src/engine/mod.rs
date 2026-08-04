@@ -786,21 +786,53 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             device_id,
             candidate,
         } => {
-            // Classify under the peer-state owner, then move the candidate to
-            // the connector worker before any await.
-            let kind = crate::transport::classify_candidate_sdp(&candidate.candidate);
             // The worker decides whether the remote description is ready and
             // owns either the retained queue value or the live application.
-            let worker = if let Some(peer) = state.peers.get(&device_id) {
-                peer.state.write().diag.remote_candidates.record(kind);
-                peer.session.lock().clone()
-            } else {
-                None
-            };
-            if let Some(worker) = worker {
-                match worker.add_remote_candidate(candidate).await {
-                    Ok(RemoteCandidateDisposition::Applied) => {}
-                    Ok(RemoteCandidateDisposition::QueuedUntilRemoteDescription) => {
+            let owner = state.peers.owner(&device_id);
+            let worker = owner.as_ref().and_then(|owner| {
+                state
+                    .peers
+                    .get_if_current(owner)
+                    .and_then(|peer| peer.session.lock().clone())
+            });
+            if let (Some(owner), Some(worker)) = (owner, worker) {
+                let report = match worker.add_remote_candidate_observed(candidate).await {
+                    Ok(report) => report,
+                    Err(e) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote candidate rejected by {}: {e}",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "error": e.to_string(),
+                            }),
+                        );
+                        warn!(peer = %device_id, "add_ice_candidate failed: {e}");
+                        return;
+                    }
+                };
+                if report.disposition == RemoteCandidateDisposition::AttemptRetired {
+                    return;
+                }
+                let Some(kind) = report.kind else {
+                    return;
+                };
+                if state
+                    .peers
+                    .with_current(&owner, |peer| {
+                        peer.state.write().diag.remote_candidates.record(kind);
+                    })
+                    .is_none()
+                {
+                    return;
+                }
+                match report.disposition {
+                    RemoteCandidateDisposition::Applied => {}
+                    RemoteCandidateDisposition::QueuedUntilRemoteDescription => {
                         state.log_diag_with(
                             crate::events::DiagLevel::Debug,
                             "ice",
@@ -811,13 +843,27 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                             serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
                         );
                     }
-                    Ok(RemoteCandidateDisposition::DuplicateIgnored) => {
+                    RemoteCandidateDisposition::DuplicateIgnored => {
                         trace!(peer = %device_id, "duplicate remote candidate ignored");
                     }
-                    Ok(RemoteCandidateDisposition::AttemptRetired) => {
-                        trace!(peer = %device_id, "remote candidate ignored for terminal ICE attempt");
+                    RemoteCandidateDisposition::AttemptRetired => {}
+                    RemoteCandidateDisposition::InvalidBinding(error) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote {kind:?} candidate from {} has an invalid ICE username-fragment binding: {}",
+                                short_peer(&device_id),
+                                error.description()
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "kind": format!("{kind:?}"),
+                                "reason": error.description(),
+                            }),
+                        );
                     }
-                    Ok(RemoteCandidateDisposition::RefusedByOwner) => {
+                    RemoteCandidateDisposition::RefusedByOwner => {
                         state.log_diag_with(
                             crate::events::DiagLevel::Warn,
                             "ice",
@@ -827,22 +873,6 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                             ),
                             serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
                         );
-                    }
-                    Err(e) => {
-                        state.log_diag_with(
-                            crate::events::DiagLevel::Warn,
-                            "ice",
-                            format!(
-                                "remote {kind:?} candidate rejected by {}: {e}",
-                                short_peer(&device_id)
-                            ),
-                            serde_json::json!({
-                                "peer": device_id,
-                                "kind": format!("{kind:?}"),
-                                "error": e.to_string(),
-                            }),
-                        );
-                        warn!(peer = %device_id, "add_ice_candidate failed: {e}");
                     }
                 }
             }
