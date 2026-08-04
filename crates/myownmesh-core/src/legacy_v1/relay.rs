@@ -1,8 +1,9 @@
 //! Frozen LegacyV1 roster-gated application frame relay.
-//! forwards [`RelayEnvelope`] frames it receives on [`RELAY_CHANNEL`]
+//!
+//! It forwards [`RelayEnvelope`] frames it receives on [`RELAY_CHANNEL`]
 //! to other roster members, so peers that can each reach the relay but
-//! not each other still exchange messages — the device becomes a
-//! router / ingress / egress hub for the network.
+//! not each other can still exchange messages. The device becomes a
+//! router, ingress, and egress hub for the network.
 //!
 //! The forwarder uses nothing beyond the core channel + roster + peer
 //! snapshot APIs, so it lives in core and any embedder can host a relay
@@ -19,7 +20,8 @@
 //!
 //! Corrected LegacyV1 rejects the historical topology-routing wrapper at this
 //! boundary. That wrapper used this same relay channel before routed and plain
-//! relay ownership became disjoint. It is not forwarded as application data.
+//! relay ownership became disjoint. Apart from recognizing and rejecting that
+//! exact wrapper shape, the relay treats application payload as opaque.
 
 use std::sync::Arc;
 
@@ -57,7 +59,9 @@ pub struct RelayEnvelope {
     /// recipient can trust it.
     #[serde(default)]
     pub src: String,
-    /// Opaque application payload. The relay never inspects it.
+    /// Application payload. The corrected relay recognizes and rejects only
+    /// the exact historical routed-wrapper shape. Every other payload remains
+    /// opaque to relay policy.
     pub payload: serde_json::Value,
 }
 
@@ -108,7 +112,7 @@ pub fn relay_targets(
 }
 
 /// A peer is "reachable" for relay purposes when its data channel is
-/// open — Active or Shelved. Shelved peers are demoted by the topology
+/// open, either Active or Shelved. Shelved peers are demoted by the topology
 /// selector but keep the channel open as a heartbeat path, so a relayed
 /// frame still gets through.
 fn is_reachable_status(status: PeerStatus) -> bool {
@@ -278,7 +282,7 @@ mod tests {
     #[test]
     fn broadcast_excludes_non_rostered_reachable_peers() {
         // A reachable peer that isn't in the roster is not a broadcast
-        // target — relay only serves approved members.
+        // target. The relay only serves approved members.
         let targets = relay_targets("a", "", &ids(&["a", "b"]), &ids(&["a", "b", "ghost"]), 0);
         assert_eq!(targets, ids(&["b"]));
     }

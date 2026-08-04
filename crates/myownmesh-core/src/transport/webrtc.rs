@@ -951,15 +951,26 @@ impl PendingRemoteCandidateQueue {
         }
     }
 
-    fn retain_matching_remote_credentials(&mut self, credentials: &RemoteIceCredentials) {
-        self.entries.retain(|pending| {
-            candidate_matches_remote_credentials(&pending.candidate, credentials)
-        });
+    fn retain_candidates(&mut self, mut keep: impl FnMut(&PendingRemoteCandidate) -> bool) {
+        self.entries.retain(|pending| keep(pending));
         if self.entries.is_empty() {
             self.container_observation = None;
         } else if let Some(observation) = self.container_observation.as_mut() {
             observation.replace_measurement(queue_container_resource_measurement(&self.entries));
         }
+    }
+
+    fn retain_matching_remote_credentials(&mut self, credentials: &RemoteIceCredentials) {
+        self.retain_candidates(|pending| {
+            candidate_matches_remote_credentials(&pending.candidate, credentials)
+        });
+    }
+
+    fn retain_remote_restart_migratable_candidates(&mut self, credentials: &RemoteIceCredentials) {
+        self.retain_candidates(|pending| {
+            matches!(candidate_username_fragment(&pending.candidate), Ok(Some(_)))
+                && candidate_matches_remote_credentials(&pending.candidate, credentials)
+        });
     }
 
     fn pop_last_for_application(
@@ -987,6 +998,7 @@ impl PendingRemoteCandidateQueue {
 enum PendingRemoteCandidateQueuePush {
     Queued,
     Duplicate,
+    Invalid,
     Refused,
     Retired,
 }
@@ -1181,6 +1193,9 @@ impl RemoteCandidateAttemptEnvelope {
         if !self.attempt.is_active() {
             return PendingRemoteCandidateQueuePush::Retired;
         }
+        if candidate_username_fragment(&candidate).is_err() {
+            return PendingRemoteCandidateQueuePush::Invalid;
+        }
         let digest = candidate_content_digest(&candidate);
         if self.seen.contains(&digest) {
             return if self.pending.budget.record_duplicate() {
@@ -1221,7 +1236,8 @@ impl RemoteCandidateAttemptEnvelope {
     ) -> bool {
         self.pending.entries = std::mem::take(&mut source.pending.entries);
         self.pending.container_observation = source.pending.container_observation.take();
-        self.pending.retain_matching_remote_credentials(credentials);
+        self.pending
+            .retain_remote_restart_migratable_candidates(credentials);
 
         for pending in &mut self.pending.entries {
             let Some(content_bytes) = candidate_content_bytes(&pending.candidate) else {
@@ -2144,6 +2160,9 @@ impl WebRtcConnectorWorker {
                     PendingRemoteCandidateQueuePush::Duplicate => {
                         RemoteCandidateDisposition::DuplicateIgnored
                     }
+                    PendingRemoteCandidateQueuePush::Invalid => {
+                        RemoteCandidateDisposition::RefusedByOwner
+                    }
                     PendingRemoteCandidateQueuePush::Refused => {
                         RemoteCandidateDisposition::RefusedByOwner
                     }
@@ -2163,6 +2182,9 @@ impl WebRtcConnectorWorker {
                     })?,
                 PendingRemoteCandidateQueuePush::Duplicate => {
                     return Ok(RemoteCandidateDisposition::DuplicateIgnored)
+                }
+                PendingRemoteCandidateQueuePush::Invalid => {
+                    return Ok(RemoteCandidateDisposition::RefusedByOwner)
                 }
                 PendingRemoteCandidateQueuePush::Refused => {
                     return Ok(RemoteCandidateDisposition::RefusedByOwner)
@@ -3984,17 +4006,54 @@ impl RemoteIceCredentials {
     }
 }
 
-fn candidate_username_fragment(candidate: &LocalIceCandidate) -> Option<&str> {
-    if let Some(username_fragment) = candidate.username_fragment.as_deref() {
-        return Some(username_fragment);
-    }
-    let mut fields = candidate.candidate.split_ascii_whitespace();
-    while let Some(field) = fields.next() {
-        if field.eq_ignore_ascii_case("ufrag") {
-            return fields.next();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateUsernameFragmentError {
+    MissingCandidateLineValue,
+    DuplicateCandidateLineDeclaration,
+    ConflictingDeclarations,
+}
+
+fn candidate_line_username_fragment(
+    candidate_line: &str,
+) -> std::result::Result<Option<&str>, CandidateUsernameFragmentError> {
+    let mut fields = candidate_line.split_ascii_whitespace();
+    for _ in 0..8 {
+        if fields.next().is_none() {
+            return Ok(None);
         }
     }
-    None
+
+    let mut username_fragment = None;
+    while let Some(extension) = fields.next() {
+        let value = fields.next();
+        if !extension.eq_ignore_ascii_case("ufrag") {
+            continue;
+        }
+        let Some(value) = value else {
+            return Err(CandidateUsernameFragmentError::MissingCandidateLineValue);
+        };
+        if username_fragment.replace(value).is_some() {
+            return Err(CandidateUsernameFragmentError::DuplicateCandidateLineDeclaration);
+        }
+    }
+    Ok(username_fragment)
+}
+
+fn candidate_username_fragment(
+    candidate: &LocalIceCandidate,
+) -> std::result::Result<Option<&str>, CandidateUsernameFragmentError> {
+    let structured = candidate
+        .username_fragment
+        .as_deref()
+        .filter(|username_fragment| !username_fragment.is_empty());
+    let candidate_line = candidate_line_username_fragment(&candidate.candidate)?;
+    match (structured, candidate_line) {
+        (Some(structured), Some(candidate_line)) if structured != candidate_line => {
+            Err(CandidateUsernameFragmentError::ConflictingDeclarations)
+        }
+        (Some(structured), _) => Ok(Some(structured)),
+        (None, candidate_line) => Ok(candidate_line),
+    }
 }
 
 fn candidate_matches_remote_credentials(
@@ -4007,7 +4066,9 @@ fn candidate_matches_remote_credentials(
     // exist, must still resolve to the same credential binding.
     let candidate_mid = candidate.sdp_mid.as_deref().filter(|mid| !mid.is_empty());
     let declares_location = candidate.sdp_mline_index.is_some() || candidate_mid.is_some();
-    let username_fragment = candidate_username_fragment(candidate);
+    let Ok(username_fragment) = candidate_username_fragment(candidate) else {
+        return false;
+    };
     if !declares_location && username_fragment.is_none() {
         return false;
     }
@@ -4744,7 +4805,7 @@ mod tests {
     }
 
     fn observed_candidate() -> LocalIceCandidate {
-        let candidate_fixture = "candidate:foundation 1 udp host";
+        let candidate_fixture = "candidate:foundation 1 udp 2113937151 192.0.2.1 5000 typ host";
         let mut candidate =
             String::with_capacity(candidate_fixture.len() + "candidate-slack".len());
         candidate.push_str(candidate_fixture);
@@ -7018,6 +7079,129 @@ mod tests {
     }
 
     #[test]
+    fn v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates() {
+        fn initialized_state() -> RemoteCandidateState {
+            let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+            let initial = state
+                .prepare_remote_description(
+                    sdp_ice_credentials(&exact_ice_sdp("old-u", "old-p", "AA:BB:CC:DD"))
+                        .expect("initial credentials are exact"),
+                )
+                .expect("initial remote description starts");
+            drop(
+                state
+                    .commit_remote_description(&initial)
+                    .expect("initial remote description commits"),
+            );
+            state
+        }
+
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let replacement = sdp_ice_credentials(&exact_ice_sdp("new-u", "new-p", "AA:BB:CC:DD"))
+            .expect("replacement credentials are exact");
+
+        let mut state = initialized_state();
+        let mut location_only = observed_candidate();
+        location_only.username_fragment = None;
+        assert_eq!(
+            state.admit(location_only, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let prepared = state
+            .prepare_remote_description(replacement.clone())
+            .expect("changed credentials create a replacement attempt");
+        assert!(
+            state
+                .provisional
+                .as_ref()
+                .expect("replacement stays provisional")
+                .envelope
+                .pending
+                .entries
+                .is_empty(),
+            "a location-only candidate owned by the old attempt cannot migrate"
+        );
+        state.fail_remote_description(&prepared);
+
+        let mut state = initialized_state();
+        let mut replacement_candidate = observed_candidate();
+        replacement_candidate.username_fragment = Some("new-u".to_string());
+        assert_eq!(
+            state.admit(replacement_candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let prepared = state
+            .prepare_remote_description(replacement.clone())
+            .expect("changed credentials create a replacement attempt");
+        let migrated = &state
+            .provisional
+            .as_ref()
+            .expect("replacement stays provisional")
+            .envelope
+            .pending
+            .entries;
+        assert_eq!(migrated.len(), 1);
+        assert!(Arc::ptr_eq(&migrated[0].attempt, &prepared.attempt));
+        state.fail_remote_description(&prepared);
+
+        let mut state = initialized_state();
+        let mut old_candidate = observed_candidate();
+        old_candidate.username_fragment = Some("old-u".to_string());
+        assert_eq!(
+            state.admit(old_candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let prepared = state
+            .prepare_remote_description(replacement.clone())
+            .expect("changed credentials create a replacement attempt");
+        assert!(
+            state
+                .provisional
+                .as_ref()
+                .expect("replacement stays provisional")
+                .envelope
+                .pending
+                .entries
+                .is_empty(),
+            "an old-credential candidate cannot migrate into the replacement attempt"
+        );
+        state.fail_remote_description(&prepared);
+
+        let mut state = initialized_state();
+        let prepared = state
+            .prepare_remote_description(replacement)
+            .expect("changed credentials create a replacement attempt");
+        let mut replacement_owned_location = observed_candidate();
+        replacement_owned_location.username_fragment = None;
+        assert_eq!(
+            state.admit(replacement_owned_location, &scope),
+            PendingRemoteCandidateQueuePush::Queued,
+            "the exact provisional owner may admit a location-only candidate"
+        );
+        let provisional = state
+            .provisional
+            .as_ref()
+            .expect("replacement stays provisional");
+        assert_eq!(provisional.envelope.pending.entries.len(), 1);
+        assert!(Arc::ptr_eq(
+            &provisional.envelope.pending.entries[0].attempt,
+            &prepared.attempt
+        ));
+        assert_eq!(
+            state
+                .commit_remote_description(&prepared)
+                .expect("replacement description commits")
+                .len(),
+            1,
+            "a location-only candidate admitted by the replacement owner survives commit"
+        );
+    }
+
+    #[test]
     fn v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt() {
         let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
         let initial_sdp = exact_ice_sdp("data-u", "data-p", "AA:BB:CC:DD");
@@ -8684,6 +8868,74 @@ mod tests {
             candidate_matches_remote_credentials(&ambiguous_username, &unique_credentials),
             "a username-fragment-only candidate may select one unambiguous credential pair"
         );
+    }
+
+    #[test]
+    fn v4_arc03j_candidate_username_fragment_declarations_must_agree() {
+        let credentials =
+            sdp_ice_credentials(&exact_ice_sdp("session-u", "session-p", "AA:BB:CC:DD"))
+                .expect("one exact active credential pair");
+
+        let mut matching = observed_candidate();
+        matching.username_fragment = Some("session-u".to_string());
+        matching.candidate.push_str(" ufrag session-u");
+        assert_eq!(
+            candidate_username_fragment(&matching),
+            Ok(Some("session-u"))
+        );
+        assert!(candidate_matches_remote_credentials(
+            &matching,
+            &credentials
+        ));
+
+        let mut conflicting = matching.clone();
+        conflicting.username_fragment = Some("other-u".to_string());
+        assert_eq!(
+            candidate_username_fragment(&conflicting),
+            Err(CandidateUsernameFragmentError::ConflictingDeclarations)
+        );
+        assert!(!candidate_matches_remote_credentials(
+            &conflicting,
+            &credentials
+        ));
+
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        assert_eq!(
+            state.admit(conflicting, &scope),
+            PendingRemoteCandidateQueuePush::Invalid,
+            "conflicting declarations are rejected before hashing or retention"
+        );
+        assert!(state.current.pending.entries.is_empty());
+        assert!(state.current.attempt.is_active());
+
+        let mut empty_structured = matching.clone();
+        empty_structured.username_fragment = Some(String::new());
+        assert_eq!(
+            candidate_username_fragment(&empty_structured),
+            Ok(Some("session-u")),
+            "an empty structured value is absent and cannot hide the candidate-line declaration"
+        );
+        assert!(candidate_matches_remote_credentials(
+            &empty_structured,
+            &credentials
+        ));
+
+        let mut duplicate_line = matching;
+        duplicate_line.candidate.push_str(" ufrag session-u");
+        assert_eq!(
+            candidate_username_fragment(&duplicate_line),
+            Err(CandidateUsernameFragmentError::DuplicateCandidateLineDeclaration),
+            "duplicate line declarations are rejected even when their text agrees"
+        );
+        assert!(!candidate_matches_remote_credentials(
+            &duplicate_line,
+            &credentials
+        ));
     }
 
     #[test]

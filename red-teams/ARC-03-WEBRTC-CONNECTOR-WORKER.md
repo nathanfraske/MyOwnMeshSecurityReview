@@ -122,11 +122,11 @@ Required result: one ICE-attempt envelope bounds unique items, candidate content
 
 A local restart creates a provisional attempt, retires the old attempt, waits for admitted old work, and commits only after native restart succeeds. Native failure does not publish the replacement and retires the connector when rollback is not proven. A remote restart is detected from changed effective ICE credentials on an existing MID, or media-line index when MID is absent. Media reordering or addition cannot manufacture a fresh candidate envelope. The replacement stays provisional until the exact remote description commits. The DTLS fingerprint does not stand in for ICE credentials.
 
-A replacement candidate may arrive before the replacement SDP. It must consume finite ingress capacity without reaching the old native ICE agent, then move only to a provisional attempt whose exact SDP credentials and declared media section match it. Delayed old-attempt work cannot mutate the replacement. Concurrent local restart and remote-description transactions fail closed instead of creating two candidate owners.
+A replacement candidate may arrive before the replacement SDP. It must consume finite ingress capacity without reaching the old native ICE agent, then move only when it explicitly declares the replacement username fragment and any declared media location matches the replacement binding. A location-only candidate owned by the old attempt is dropped. A location-only candidate admitted after the provisional replacement exists remains owned by that replacement. Delayed old-attempt work cannot mutate the replacement. Concurrent local restart and remote-description transactions fail closed instead of creating two candidate owners.
 
-Attack: omit MID, media-line index, and username fragment, provide conflicting MID and index values, or reuse one username fragment for different effective credential pairs.
+Attack: omit MID, media-line index, and username fragment, provide conflicting MID and index values, reuse one username fragment for different effective credential pairs, conflict the structured username fragment with the candidate-line `ufrag`, or repeat the line extension.
 
-Required result: every accepted candidate has a binding to the active SDP. MID and index select one exact binding. A username-fragment-only candidate identifies one unambiguous credential pair. The wholly unbound, conflicting-location, and ambiguous-username forms are rejected without adding a generation, route identity, timestamp, or timer.
+Required result: every accepted candidate has a binding to the active SDP. MID and index select one exact binding. A username-fragment-only candidate identifies one unambiguous credential pair. Structured and line declarations agree exactly. Empty structured values cannot hide the line declaration, and duplicate line declarations are invalid. The wholly unbound, conflicting-location, ambiguous-username, conflicting-declaration, and duplicate-declaration forms are rejected without adding a generation, route identity, timestamp, or timer.
 
 Controls:
 
@@ -146,6 +146,8 @@ Controls:
 - `v4_arc03j_terminal_candidate_exhaustion_stops_later_hash_and_work_admission`
 - `v4_arc03j_sdp_ice_credentials_apply_session_inheritance_and_media_overrides`
 - `v4_arc03j_remote_candidates_require_an_exact_or_unambiguous_binding`
+- `v4_arc03j_candidate_username_fragment_declarations_must_agree`
+- `v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates`
 - `v4_arc03j_restart_transactions_reject_ambiguous_interleavings`
 - `v4_arc03j_corrupt_restart_migration_leaves_no_viable_attempt`
 
@@ -296,7 +298,7 @@ Controls:
 
 Attack: call application routing or ordinary-member relay from the normal V4 connector, Endpoint Auth task, or daemon path.
 
-Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Corrected routed envelopes use `__mesh_route__/v1`. Opaque plain relay envelopes use `__mesh_relay__/v1`. The exact historical routed-wrapper shape is rejected on the old relay wire instead of being forwarded as application payload. No application payload field selects routing behavior. Malformed input does not stop later valid delivery.
+Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Corrected routed envelopes use `__mesh_route__/v1`. Plain relay envelopes use `__mesh_relay__/v1`. Their payload remains opaque except for recognition and rejection of the exact historical routed-wrapper shape. No arbitrary application payload field selects corrected routing behavior. Malformed input does not stop later valid delivery.
 
 Controls:
 

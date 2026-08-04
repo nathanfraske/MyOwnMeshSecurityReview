@@ -524,8 +524,13 @@ def main() -> int:
         and "let declares_location = candidate.sdp_mline_index.is_some()" in webrtc_source
         and "if !declares_location && username_fragment.is_none()" in webrtc_source
         and "has_unambiguous_credential_pair" in webrtc_source
+        and "candidate_line_username_fragment" in webrtc_source
+        and "CandidateUsernameFragmentError::ConflictingDeclarations" in webrtc_source
+        and "CandidateUsernameFragmentError::DuplicateCandidateLineDeclaration"
+        in webrtc_source
         and "candidate.sdp_mid" in webrtc_source
         and "adopt_queued_candidates_for_remote_restart" in webrtc_source
+        and "retain_remote_restart_migratable_candidates" in webrtc_source
         and "commit_remote_description" in webrtc_source
         and "fail_remote_description" in webrtc_source
         and "has_no_viable_attempt" in webrtc_source

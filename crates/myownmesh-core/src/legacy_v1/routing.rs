@@ -1,6 +1,6 @@
 //! Frozen topology-aware application routing for LegacyV1.
 //!
-//! Routed frames use a typed envelope on [`ROUTING_CHANNEL`]. Opaque plain
+//! Routed frames use a typed envelope on [`ROUTING_CHANNEL`]. Plain
 //! relay frames use the separate [`super::relay::RELAY_CHANNEL`]. The wire
 //! channel decides the compatibility behavior. Application payload content is
 //! never inspected to infer routing.
