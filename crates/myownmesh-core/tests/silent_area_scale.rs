@@ -42,6 +42,9 @@ use tokio::time::Instant;
 
 const CHANNEL: &str = "area-probe";
 const NETWORK_ID: &str = "silent-area-scale";
+const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
+const REDIAL_INTERVAL: Duration = Duration::from_secs(4);
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn silent_cfg(id: &str) -> NetworkConfig {
     NetworkConfig {
@@ -84,6 +87,36 @@ fn admitted(state: &Arc<NetworkState>, peer: &str) -> bool {
     state.peer_info(peer).is_some_and(|peer| {
         peer.authenticated && matches!(peer.status, PeerStatus::Active | PeerStatus::Shelved)
     })
+}
+
+async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node]) {
+    let deadline = Instant::now() + DIAL_TIMEOUT;
+    let mut next_dial = Instant::now();
+    loop {
+        let admitted_count = spokes
+            .iter()
+            .filter(|spoke| {
+                admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id)
+            })
+            .count();
+        if admitted_count == spokes.len() {
+            return;
+        }
+        if Instant::now() >= next_dial {
+            for spoke in spokes.iter().filter(|spoke| {
+                !admitted(&operator.state, &spoke.id) || !admitted(&spoke.state, &operator.id)
+            }) {
+                operator.state.connect_peer(&spoke.id);
+            }
+            next_dial = Instant::now() + REDIAL_INTERVAL;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline",
+            spokes.len()
+        );
+        tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
+    }
 }
 
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
@@ -169,12 +202,12 @@ async fn run_area(n_spokes: usize) {
     let mut dial_ms = Vec::with_capacity(n_spokes);
     for spoke in &spokes {
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_secs(60);
+        let deadline = t0 + DIAL_TIMEOUT;
         let mut next_dial = Instant::now();
         loop {
             if Instant::now() >= next_dial {
                 operator.state.connect_peer(&spoke.id);
-                next_dial = Instant::now() + Duration::from_secs(4);
+                next_dial = Instant::now() + REDIAL_INTERVAL;
             }
             if admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id) {
                 break;
@@ -184,14 +217,24 @@ async fn run_area(n_spokes: usize) {
                 "operator dial to {} did not come up in 60s",
                 spoke.id
             );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
         }
         dial_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     report("dial connect→session", dial_ms);
 
+    // Sequential latency sampling can leave an early session stale while a
+    // slow runner brings up later sessions. Re-drive only missing pairs and
+    // require one simultaneous admitted snapshot before testing N-session
+    // shape or application delivery.
+    converge_all_operator_sessions(&operator, &spokes).await;
+
     // ---- the area shape holds under N sessions --------------------------
     for (i, spoke) in spokes.iter().enumerate() {
+        assert!(
+            admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id),
+            "member-{i} is not mutually admitted to the operator"
+        );
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
