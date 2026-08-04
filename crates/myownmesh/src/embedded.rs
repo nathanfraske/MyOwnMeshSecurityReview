@@ -366,6 +366,14 @@ mod tests {
         .await
         .expect("temporary legacy-media daemon starts only from the explicit profile");
         assert!(daemon.mesh().connector_resource_report().is_some());
+        let mut relay_attempt = myownmesh_core::ServicesConfig::default();
+        relay_attempt.relay.enabled = true;
+        assert!(matches!(
+            daemon
+                .service_manager
+                .validate_config_for_runtime(&relay_attempt),
+            Err(crate::services::ServicePolicyError::LegacyPayloadRelayForbidden)
+        ));
         daemon.shutdown().await;
     }
 
@@ -400,6 +408,12 @@ mod tests {
         .await
         .expect("the explicit combined compatibility constructor starts");
         assert!(daemon.mesh().connector_resource_report().is_some());
+        let mut relay_attempt = myownmesh_core::ServicesConfig::default();
+        relay_attempt.relay.enabled = true;
+        assert!(daemon
+            .service_manager
+            .validate_config_for_runtime(&relay_attempt)
+            .is_ok());
         daemon.shutdown().await;
     }
 }

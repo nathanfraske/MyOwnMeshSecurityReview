@@ -54,7 +54,7 @@
     },
     {
       "owner": "RelayService",
-      "responsibility": "owns opaque plain LegacyV1 member-relay envelopes on __mesh_relay__/v1",
+      "responsibility": "owns opaque plain LegacyV1 member-relay envelopes on __mesh_relay__/v1 and rejects the exact historical routed-wrapper shape",
       "source": "crates/myownmesh-core/src/legacy_v1/relay.rs"
     },
     {
@@ -64,7 +64,7 @@
     },
     {
       "owner": "LegacyWebRtcMediaProfile",
-      "responsibility": "owns the temporary explicit H.264 and Opus compatibility provider shape; it is not basal connector policy",
+      "responsibility": "owns the independently selected temporary H.264 and Opus compatibility provider shape; it grants no LegacyV1 routing or member-relay authority and is not basal connector policy",
       "source": "crates/myownmesh-core/src/transport/webrtc/policy.rs"
     }
   ],

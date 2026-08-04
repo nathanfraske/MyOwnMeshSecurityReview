@@ -3919,10 +3919,15 @@ struct RemoteIceCredentials {
 }
 
 impl RemoteIceCredentials {
-    fn contains_username_fragment(&self, username_fragment: &str) -> bool {
-        self.bindings
+    fn has_unambiguous_credential_pair(&self, username_fragment: &str) -> bool {
+        let mut matching = self
+            .bindings
             .iter()
-            .any(|binding| binding.username_fragment == username_fragment)
+            .filter(|binding| binding.username_fragment == username_fragment);
+        let Some(first) = matching.next() else {
+            return false;
+        };
+        matching.all(|binding| binding.password == first.password)
     }
 
     fn proves_restart_to(&self, replacement: &Self) -> bool {
@@ -4002,21 +4007,30 @@ fn candidate_matches_remote_credentials(
     // exist, must still resolve to the same credential binding.
     let candidate_mid = candidate.sdp_mid.as_deref().filter(|mid| !mid.is_empty());
     let declares_location = candidate.sdp_mline_index.is_some() || candidate_mid.is_some();
-    let exact_binding = credentials.bindings.iter().find(|binding| {
-        candidate
-            .sdp_mline_index
-            .is_none_or(|media_index| usize::from(media_index) == binding.media_index)
-            && candidate_mid.is_none_or(|mid| binding.mid.as_deref() == Some(mid))
+    let username_fragment = candidate_username_fragment(candidate);
+    if !declares_location && username_fragment.is_none() {
+        return false;
+    }
+    let exact_binding = declares_location.then(|| {
+        credentials.bindings.iter().find(|binding| {
+            candidate
+                .sdp_mline_index
+                .is_none_or(|media_index| usize::from(media_index) == binding.media_index)
+                && candidate_mid.is_none_or(|mid| binding.mid.as_deref() == Some(mid))
+        })
     });
+    let exact_binding = exact_binding.flatten();
     if declares_location && exact_binding.is_none() {
         return false;
     }
-    candidate_username_fragment(candidate).is_none_or(|username_fragment| {
-        exact_binding.map_or_else(
-            || credentials.contains_username_fragment(username_fragment),
-            |binding| binding.username_fragment == username_fragment,
-        )
-    })
+    match (exact_binding, username_fragment) {
+        (Some(binding), Some(username_fragment)) => binding.username_fragment == username_fragment,
+        (Some(_), None) => true,
+        (None, Some(username_fragment)) => {
+            credentials.has_unambiguous_credential_pair(username_fragment)
+        }
+        (None, None) => false,
+    }
 }
 
 #[derive(Default)]
@@ -8571,7 +8585,7 @@ mod tests {
         candidate.username_fragment = None;
         assert!(
             candidate_matches_remote_credentials(&candidate, &active),
-            "a candidate without a declared ufrag is bound by its process-local attempt owner"
+            "a candidate without a declared ufrag is bound by its exact active MID"
         );
         candidate.candidate.push_str(" ufrag session-u");
         assert!(candidate_matches_remote_credentials(&candidate, &active));
@@ -8617,6 +8631,58 @@ mod tests {
         assert!(
             !candidate_matches_remote_credentials(&audio_candidate, &credentials),
             "process-local attempt ownership cannot excuse an invalid declared media location"
+        );
+    }
+
+    #[test]
+    fn v4_arc03j_remote_candidates_require_an_exact_or_unambiguous_binding() {
+        let credentials = sdp_ice_credentials(
+            "v=0\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=mid:data\r\n\
+             a=ice-ufrag:shared-u\r\n\
+             a=ice-pwd:data-p\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=mid:audio\r\n\
+             a=ice-ufrag:shared-u\r\n\
+             a=ice-pwd:audio-p\r\n",
+        )
+        .expect("fixture has two exact active credential pairs");
+
+        let mut unbound = observed_candidate();
+        unbound.sdp_mid = None;
+        unbound.sdp_mline_index = None;
+        unbound.username_fragment = None;
+        assert!(
+            !candidate_matches_remote_credentials(&unbound, &credentials),
+            "a wholly unbound candidate cannot enter an active or replacement attempt"
+        );
+
+        let mut mismatched_location = observed_candidate();
+        mismatched_location.sdp_mid = Some("data".to_string());
+        mismatched_location.sdp_mline_index = Some(1);
+        mismatched_location.username_fragment = Some("shared-u".to_string());
+        assert!(
+            !candidate_matches_remote_credentials(&mismatched_location, &credentials),
+            "MID and media-line index must select the same active SDP binding"
+        );
+
+        let mut ambiguous_username = observed_candidate();
+        ambiguous_username.sdp_mid = None;
+        ambiguous_username.sdp_mline_index = None;
+        ambiguous_username.username_fragment = Some("shared-u".to_string());
+        assert!(
+            !candidate_matches_remote_credentials(&ambiguous_username, &credentials),
+            "a username fragment reused by distinct credential pairs is ambiguous"
+        );
+
+        let unique_credentials =
+            sdp_ice_credentials(&exact_ice_sdp("unique-u", "unique-p", "AA:BB:CC:DD"))
+                .expect("one exact active credential pair");
+        ambiguous_username.username_fragment = Some("unique-u".to_string());
+        assert!(
+            candidate_matches_remote_credentials(&ambiguous_username, &unique_credentials),
+            "a username-fragment-only candidate may select one unambiguous credential pair"
         );
     }
 

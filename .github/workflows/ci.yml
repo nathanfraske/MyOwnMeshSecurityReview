@@ -54,6 +54,9 @@ jobs:
           cargo check -p myownmesh --all-targets --features "legacy-v1"
           cargo check -p myownmesh --all-targets --features "legacy-media"
           cargo check -p myownmesh --all-targets --features "legacy-v1,legacy-media"
+          cargo test -p myownmesh --features "legacy-v1" v4_arc03h_legacy_v1_daemon_option_is_explicit -- --nocapture
+          cargo test -p myownmesh --features "legacy-media" v4_arc03j_legacy_media_daemon_option_is_independent -- --nocapture
+          cargo test -p myownmesh --features "legacy-media" v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form -- --nocapture
           cargo test -p myownmesh-core --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
           cargo test -p myownmesh --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
 

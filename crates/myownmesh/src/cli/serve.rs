@@ -27,6 +27,16 @@ pub async fn run_with_legacy_v1() -> Result<()> {
     .await
 }
 
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "this exact entry point is the explicit legacy-media-only daemon option"
+)]
+pub async fn run_with_legacy_media() -> Result<()> {
+    let media_profile = legacy_media_profile_from_lookup(|name| std::env::var(name).ok())?;
+    run_with_compatibility(ServeCompatibility::LegacyMedia(media_profile)).await
+}
+
 #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
 #[allow(
     deprecated,
@@ -45,6 +55,8 @@ enum ServeCompatibility {
     V4,
     #[cfg(feature = "legacy-v1")]
     LegacyV1(myownmesh_core::legacy_v1::LegacyV1Runtime),
+    #[cfg(feature = "legacy-media")]
+    LegacyMedia(myownmesh_core::LegacyWebRtcMediaProfile),
     #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
     LegacyV1WithMedia(
         myownmesh_core::legacy_v1::LegacyV1Runtime,
@@ -64,6 +76,10 @@ async fn run_with_compatibility(compatibility: ServeCompatibility) -> Result<()>
             ServeCompatibility::LegacyV1(runtime) => {
                 start_legacy_v1_daemon(cfg, policy, runtime).await?
             }
+            #[cfg(feature = "legacy-media")]
+            ServeCompatibility::LegacyMedia(media_profile) => {
+                start_legacy_media_sidecar(cfg, policy, media_profile).await?
+            }
             #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
             ServeCompatibility::LegacyV1WithMedia(runtime, media_profile) => {
                 start_legacy_v1_media_sidecar(cfg, policy, runtime, media_profile).await?
@@ -78,6 +94,20 @@ async fn run_with_compatibility(compatibility: ServeCompatibility) -> Result<()>
     tracing::info!("shutdown requested");
     daemon.shutdown().await;
     Ok(())
+}
+
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "this helper is the explicit legacy-media-only sidecar boundary"
+)]
+async fn start_legacy_media_sidecar(
+    cfg: myownmesh_core::MeshConfig,
+    policy: myownmesh_core::WebRtcConnectorCapablePolicy,
+    media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
+) -> std::result::Result<myownmesh::embedded::EmbeddedDaemon, myownmesh::embedded::EmbeddedStartError>
+{
+    myownmesh::embedded::start_connector_capable_with_legacy_media(cfg, policy, media_profile).await
 }
 
 #[cfg(feature = "legacy-v1")]
@@ -115,7 +145,7 @@ async fn start_legacy_v1_media_sidecar(
     .await
 }
 
-#[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+#[cfg(feature = "legacy-media")]
 fn legacy_media_profile_from_lookup(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<myownmesh_core::LegacyWebRtcMediaProfile> {
@@ -437,7 +467,7 @@ mod tests {
         ));
     }
 
-    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    #[cfg(feature = "legacy-media")]
     #[test]
     fn v4_arc03j_legacy_media_sidecar_rejects_an_incomplete_owner_vector() {
         let mut values = HashMap::from([
@@ -454,7 +484,7 @@ mod tests {
             .contains("MYOWNMESH_LEGACY_MEDIA_PREPROVISIONED_AUDIO_LANES"));
     }
 
-    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+    #[cfg(feature = "legacy-media")]
     #[test]
     fn v4_arc03j_legacy_media_sidecar_uses_only_the_complete_owner_vector() {
         let mut values = HashMap::from([

@@ -17,6 +17,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 CORE = REPO / "crates" / "myownmesh-core"
 DAEMON = REPO / "crates" / "myownmesh"
+COMPILER_TARGET = tempfile.TemporaryDirectory(
+    prefix="myownmesh-v4-arc03-compiler-target-"
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,14 @@ fn main() { let _ = std::mem::size_of::<LegacyWebRtcMediaProfile>(); }
         ("LegacyWebRtcMediaProfile", "no `LegacyWebRtcMediaProfile`"),
     ),
     RejectedProbe(
+        "legacy_v1_runtime_is_not_in_default_v4_api",
+        """use myownmesh_core::legacy_v1::LegacyV1Runtime; // expected-error
+fn main() { let _ = std::mem::size_of::<LegacyV1Runtime>(); }
+""",
+        "E0432",
+        ("legacy_v1", "could not find"),
+    ),
+    RejectedProbe(
         "raw_peer_constructor_is_not_production_api",
         """use myownmesh_core::transport::{Role, Transport};
 async fn bypass(transport: &Transport) {
@@ -121,6 +132,67 @@ fn main() { let _ = public_diagnostic_types; }
 """
 
 
+AUTHORITY_POSITIVES = (
+    ("v4_only_authority_set", (), POSITIVE_SOURCE),
+    (
+        "legacy_v1_only_authority_set",
+        ("legacy-v1",),
+        """#[allow(deprecated)]
+fn main() {
+    let _ = myownmesh_core::legacy_v1::LegacyV1Runtime::frozen();
+}
+""",
+    ),
+    (
+        "legacy_media_only_authority_set",
+        ("legacy-media",),
+        """#[allow(deprecated)]
+fn main() {
+    let one = std::num::NonZeroUsize::new(1).unwrap();
+    let _ = myownmesh_core::LegacyWebRtcMediaProfile::h264_opus(one, 0, 0).unwrap();
+}
+""",
+    ),
+    (
+        "combined_compatibility_authority_set",
+        ("legacy-v1", "legacy-media"),
+        """#[allow(deprecated)]
+fn main() {
+    let _ = myownmesh_core::legacy_v1::LegacyV1Runtime::frozen();
+    let one = std::num::NonZeroUsize::new(1).unwrap();
+    let _ = myownmesh_core::LegacyWebRtcMediaProfile::h264_opus(one, 0, 0).unwrap();
+}
+""",
+    ),
+)
+
+
+AUTHORITY_REJECTED = (
+    (
+        ("legacy-v1",),
+        RejectedProbe(
+            "legacy_v1_only_cannot_construct_media_authority",
+            """use myownmesh_core::LegacyWebRtcMediaProfile; // expected-error
+fn main() { let _ = std::mem::size_of::<LegacyWebRtcMediaProfile>(); }
+""",
+            "E0432",
+            ("LegacyWebRtcMediaProfile", "no `LegacyWebRtcMediaProfile`"),
+        ),
+    ),
+    (
+        ("legacy-media",),
+        RejectedProbe(
+            "legacy_media_only_cannot_construct_legacy_v1_authority",
+            """use myownmesh_core::legacy_v1::LegacyV1Runtime; // expected-error
+fn main() { let _ = std::mem::size_of::<LegacyV1Runtime>(); }
+""",
+            "E0432",
+            ("legacy_v1", "could not find"),
+        ),
+    ),
+)
+
+
 def cargo_toml() -> str:
     core_path = CORE.as_posix().replace('"', '\\"')
     bins = [
@@ -143,9 +215,29 @@ def cargo_toml() -> str:
     )
 
 
+def authority_cargo_toml(name: str, features: tuple[str, ...]) -> str:
+    core_path = CORE.as_posix().replace('"', '\\"')
+    feature_clause = ""
+    if features:
+        selected = ", ".join(json.dumps(feature) for feature in features)
+        feature_clause = f", features = [{selected}]"
+    return (
+        "[package]\n"
+        f'name = "{name}"\n'
+        'version = "0.0.0"\n'
+        'edition = "2021"\n\n'
+        "[dependencies]\n"
+        f'myownmesh-core = {{ path = "{core_path}"{feature_clause} }}\n\n'
+        "[[bin]]\n"
+        f'name = "{name}"\n'
+        f'path = "src/{name}.rs"\n'
+    )
+
+
 def run_check(project: Path, binary: str) -> tuple[int, list[dict], str]:
     environment = os.environ.copy()
     environment["CARGO_TERM_COLOR"] = "never"
+    environment["CARGO_TARGET_DIR"] = COMPILER_TARGET.name
     result = subprocess.run(
         [
             "cargo",
@@ -430,6 +522,8 @@ def main() -> int:
         and "current.proves_restart_to(&credentials)" in webrtc_source
         and "candidate_matches_remote_credentials" in webrtc_source
         and "let declares_location = candidate.sdp_mline_index.is_some()" in webrtc_source
+        and "if !declares_location && username_fragment.is_none()" in webrtc_source
+        and "has_unambiguous_credential_pair" in webrtc_source
         and "candidate.sdp_mid" in webrtc_source
         and "adopt_queued_candidates_for_remote_restart" in webrtc_source
         and "commit_remote_description" in webrtc_source
@@ -517,14 +611,20 @@ def main() -> int:
         and "routing::on_routed_frame" in legacy_profile_source
         and "is_routing_wrapper" not in relay_source
         and "parse_wrapper" not in routing_source
+        and "is_historical_routed_wrapper" in routing_source
+        and "super::routing::is_historical_routed_wrapper(&env.payload)" in relay_source
     ):
-        failures.append("LegacyV1 routing and plain relay do not have disjoint typed wires")
+        failures.append(
+            "LegacyV1 routing and plain relay lack disjoint wires or old-wire rejection"
+        )
     if not (
-        "start_connector_capable_with_legacy_v1_and_media" in embedded_source
+        "start_connector_capable_with_legacy_media" in embedded_source
+        and "start_connector_capable_with_legacy_v1_and_media" in embedded_source
+        and "ServeCompatibility::LegacyMedia" in serve_source
         and "LegacyV1WithMedia" in serve_source
         and "legacy_media_profile_from_lookup" in serve_source
     ):
-        failures.append("explicit LegacyV1 media sidecar deployment boundary is missing")
+        failures.append("independent and combined legacy-media deployment boundaries are missing")
     for name, source in (
         ("V4 connector", webrtc_source),
         ("V4 engine", engine_source),
@@ -579,6 +679,55 @@ def main() -> int:
                     f"and {probe.fragments}, got {summary}; cargo stderr={stderr.strip()!r}"
                 )
 
+    for name, features, source in AUTHORITY_POSITIVES:
+        with tempfile.TemporaryDirectory(prefix=f"myownmesh-{name}-") as temporary:
+            project = Path(temporary)
+            source_dir = project / "src"
+            source_dir.mkdir()
+            (project / "Cargo.toml").write_text(
+                authority_cargo_toml(name, features), encoding="utf-8", newline="\n"
+            )
+            shutil.copyfile(REPO / "Cargo.lock", project / "Cargo.lock")
+            (source_dir / f"{name}.rs").write_text(
+                source, encoding="utf-8", newline="\n"
+            )
+            return_code, diagnostics, stderr = run_check(project, name)
+            if return_code != 0:
+                failures.append(
+                    f"{name} failed to compile for features {features}: "
+                    + (stderr.strip() or str(diagnostics))
+                )
+
+    for features, probe in AUTHORITY_REJECTED:
+        with tempfile.TemporaryDirectory(prefix=f"myownmesh-{probe.name}-") as temporary:
+            project = Path(temporary)
+            source_dir = project / "src"
+            source_dir.mkdir()
+            (project / "Cargo.toml").write_text(
+                authority_cargo_toml(probe.name, features),
+                encoding="utf-8",
+                newline="\n",
+            )
+            shutil.copyfile(REPO / "Cargo.lock", project / "Cargo.lock")
+            (source_dir / f"{probe.name}.rs").write_text(
+                probe.source, encoding="utf-8", newline="\n"
+            )
+            return_code, diagnostics, stderr = run_check(project, probe.name)
+            if return_code == 0:
+                failures.append(f"{probe.name} compiled but rejection was required")
+            elif not matches(probe, diagnostics):
+                summary = [
+                    {
+                        "code": (diagnostic.get("code") or {}).get("code"),
+                        "message": diagnostic.get("message"),
+                    }
+                    for diagnostic in diagnostics
+                ]
+                failures.append(
+                    f"{probe.name} failed for the wrong cause: expected {probe.code} "
+                    f"and {probe.fragments}, got {summary}; cargo stderr={stderr.strip()!r}"
+                )
+
     if failures:
         print("V4 Arc 03 compiler-boundary checks failed:", file=sys.stderr)
         for failure in failures:
@@ -587,8 +736,9 @@ def main() -> int:
 
     print(
         "V4 Arc 03 compiler-boundary checks passed: one positive public-type "
-        f"control, {len(REJECTED)} cause-matched rejection controls, and five exact "
-        "real-time-flow consumers."
+        f"control, {len(REJECTED) + len(AUTHORITY_REJECTED)} cause-matched rejection "
+        f"controls, {len(AUTHORITY_POSITIVES)} exact authority-set controls, and five "
+        "exact real-time-flow consumers."
     )
     return 0
 

@@ -16,6 +16,10 @@
 //! also approved. The relay never forwards for or to strangers, and it
 //! stamps the authenticated sender id into the forwarded envelope so the
 //! recipient can trust the `src` field rather than the wire claim.
+//!
+//! Corrected LegacyV1 rejects the historical topology-routing wrapper at this
+//! boundary. That wrapper used this same relay channel before routed and plain
+//! relay ownership became disjoint. It is not forwarded as application data.
 
 use std::sync::Arc;
 
@@ -182,6 +186,10 @@ pub(super) async fn forward_envelope(
     env: RelayEnvelope,
     max_fanout: u32,
 ) {
+    if super::routing::is_historical_routed_wrapper(&env.payload) {
+        trace!(%from, "relay: rejecting historical routed-wrapper wire shape");
+        return;
+    }
     let rostered: Vec<String> = state
         .roster
         .read()
@@ -295,5 +303,18 @@ mod tests {
         assert_eq!(env.dst, "");
         assert_eq!(env.src, "");
         assert_eq!(env.payload, serde_json::json!({"hi": 1}));
+    }
+
+    #[test]
+    fn corrected_plain_relay_rejects_the_historical_routed_wrapper_shape() {
+        let historical = serde_json::json!({
+            "__channel": "legacy.application",
+            "__body": {"value": 7},
+            "__ttl": 3,
+            "__id": 42
+        });
+        assert!(super::super::routing::is_historical_routed_wrapper(
+            &historical
+        ));
     }
 }

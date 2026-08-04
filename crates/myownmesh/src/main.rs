@@ -34,10 +34,10 @@ enum Command {
         #[cfg(feature = "legacy-v1")]
         #[arg(long)]
         legacy_v1: bool,
-        /// Attach the reviewed H.264 and Opus sidecar to LegacyV1 startup.
-        /// This option requires `--legacy-v1` and both compatibility features.
-        #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
-        #[arg(long, requires = "legacy_v1")]
+        /// Attach the reviewed H.264 and Opus compatibility provider.
+        /// This authority is independent from the LegacyV1 routing profile.
+        #[cfg(feature = "legacy-media")]
+        #[arg(long)]
         legacy_media: bool,
     },
     /// Show this device's identity.
@@ -230,22 +230,35 @@ fn main() -> ExitCode {
             Command::Serve {
                 #[cfg(feature = "legacy-v1")]
                 legacy_v1,
-                #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
+                #[cfg(feature = "legacy-media")]
                 legacy_media,
             } => {
-                #[cfg(feature = "legacy-v1")]
+                #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
                 {
-                    #[cfg(feature = "legacy-media")]
-                    if legacy_media {
-                        return cli::serve::run_with_legacy_v1_and_media().await;
+                    match (legacy_v1, legacy_media) {
+                        (false, false) => cli::serve::run().await,
+                        (true, false) => cli::serve::run_with_legacy_v1().await,
+                        (false, true) => cli::serve::run_with_legacy_media().await,
+                        (true, true) => cli::serve::run_with_legacy_v1_and_media().await,
                     }
+                }
+                #[cfg(all(feature = "legacy-v1", not(feature = "legacy-media")))]
+                {
                     if legacy_v1 {
                         cli::serve::run_with_legacy_v1().await
                     } else {
                         cli::serve::run().await
                     }
                 }
-                #[cfg(not(feature = "legacy-v1"))]
+                #[cfg(all(not(feature = "legacy-v1"), feature = "legacy-media"))]
+                {
+                    if legacy_media {
+                        cli::serve::run_with_legacy_media().await
+                    } else {
+                        cli::serve::run().await
+                    }
+                }
+                #[cfg(all(not(feature = "legacy-v1"), not(feature = "legacy-media")))]
                 {
                     cli::serve::run().await
                 }
@@ -269,10 +282,18 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(all(test, feature = "legacy-v1"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn v4_arc03j_v4_only_daemon_option_set_is_empty() {
+        let cli = Cli::try_parse_from(["myownmesh", "serve"])
+            .expect("ordinary V4 serve remains available without compatibility authority");
+        assert!(matches!(cli.command, Some(Command::Serve { .. })));
+    }
+
+    #[cfg(feature = "legacy-v1")]
     #[test]
     fn v4_arc03h_legacy_v1_daemon_option_is_explicit() {
         let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-v1"])
@@ -286,10 +307,23 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "legacy-media")]
+    #[test]
+    fn v4_arc03j_legacy_media_daemon_option_is_independent() {
+        let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-media"])
+            .expect("legacy-media authority is independently explicit");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve {
+                legacy_media: true,
+                ..
+            })
+        ));
+    }
+
     #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
     #[test]
-    fn v4_arc03j_legacy_media_is_an_explicit_legacy_v1_sidecar_option() {
-        assert!(Cli::try_parse_from(["myownmesh", "serve", "--legacy-media"]).is_err());
+    fn v4_arc03j_combined_compatibility_authorities_require_both_flags() {
         let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-v1", "--legacy-media"])
             .expect("the combined deprecated compatibility deployment is explicit");
         assert!(matches!(

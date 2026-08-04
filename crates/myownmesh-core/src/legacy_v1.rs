@@ -257,10 +257,18 @@ mod tests {
             Arc::clone(&bc.right),
             Arc::clone(&bc.right_auth),
         );
+        {
+            let mut relay_roster = state_b.roster.write();
+            crate::roster::add_peer_in(&mut relay_roster, &id_a, "legacy-hop-a");
+            crate::roster::add_peer_in(&mut relay_roster, &id_c, "legacy-hop-c");
+        }
 
         let app_channel: crate::Channel<serde_json::Value> =
             crate::Channel::new("legacy-v1-test".to_string(), Arc::clone(&state_c));
         let mut application = app_channel.subscribe();
+        let historical_wire: crate::Channel<relay::RelayEnvelope> =
+            crate::Channel::new(relay::RELAY_CHANNEL.to_string(), Arc::clone(&state_c));
+        let mut historical_delivery = historical_wire.subscribe();
         let runtime = LegacyV1Runtime::frozen();
         let legacy_a = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_a));
         let _legacy_b = LegacyV1Network::bind_state(&runtime, Arc::clone(&state_b));
@@ -281,6 +289,56 @@ mod tests {
             bc.right_events
                 .take()
                 .expect("C owns the BC endpoint event stream"),
+        );
+        let historical = relay::RelayEnvelope {
+            dst: id_c.clone(),
+            src: id_a.clone(),
+            payload: serde_json::json!({
+                "__channel": "legacy-v1-test",
+                "__body": {"must": "fail-closed"},
+                "__ttl": 2,
+                "__id": 7001
+            }),
+        };
+        let historical = serde_json::to_vec(&MeshMessage::Channel {
+            channel: relay::RELAY_CHANNEL.to_string(),
+            payload: serde_json::to_value(historical)
+                .expect("historical routed wrapper encodes on its old relay wire"),
+        })
+        .expect("historical mixed-version frame encodes as endpoint bytes");
+        ab.left
+            .send_owned(historical.into())
+            .await
+            .expect("historical frame reaches the corrected intermediate owner");
+
+        let plain_barrier_payload = serde_json::json!({"barrier": "plain-relay"});
+        let plain_barrier = relay::RelayEnvelope {
+            dst: id_c.clone(),
+            src: id_a.clone(),
+            payload: plain_barrier_payload.clone(),
+        };
+        let plain_barrier = serde_json::to_vec(&MeshMessage::Channel {
+            channel: relay::RELAY_CHANNEL.to_string(),
+            payload: serde_json::to_value(plain_barrier)
+                .expect("plain-relay barrier encodes on its reserved wire"),
+        })
+        .expect("plain-relay barrier encodes as endpoint bytes");
+        ab.left
+            .send_owned(plain_barrier.into())
+            .await
+            .expect("plain-relay barrier reaches the corrected intermediate owner");
+        let delivered_barrier =
+            tokio::time::timeout(Duration::from_secs(2), historical_delivery.recv())
+                .await
+                .expect("the ordered plain-relay barrier reaches C")
+                .expect("historical-wire subscription remains open")
+                .expect("plain-relay barrier decodes");
+        assert_eq!(delivered_barrier.body.payload, plain_barrier_payload);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), historical_delivery.recv())
+                .await
+                .is_err(),
+            "the historical routed wrapper was not forwarded before or after the ordered plain-relay barrier"
         );
         let malformed = serde_json::to_vec(&MeshMessage::Channel {
             channel: routing::ROUTING_CHANNEL.to_string(),

@@ -4,6 +4,11 @@
 //! relay frames use the separate [`super::relay::RELAY_CHANNEL`]. The wire
 //! channel decides the compatibility behavior. Application payload content is
 //! never inspected to infer routing.
+//!
+//! Corrected LegacyV1 is not wire-compatible with the historical routed
+//! wrapper that shared the plain relay wire. The plain relay owner recognizes
+//! that exact old wrapper shape and rejects it. It is never reinterpreted as
+//! opaque application payload.
 
 use std::sync::Arc;
 
@@ -41,6 +46,20 @@ impl RoutedEnvelope {
             && self.channel != super::relay::RELAY_CHANNEL
             && self.id != 0
     }
+}
+
+/// Recognize the exact wrapper shape consumed by the historical routed wire.
+///
+/// The old parser treated any object with a string `__channel` other than the
+/// old relay channel as routed control. `__body`, `__ttl`, and `__id` were
+/// optional. Corrected LegacyV1 uses this predicate only to reject that old
+/// control shape at the plain relay boundary.
+pub(super) fn is_historical_routed_wrapper(payload: &Value) -> bool {
+    payload
+        .as_object()
+        .and_then(|object| object.get("__channel"))
+        .and_then(Value::as_str)
+        .is_some_and(|channel| channel != super::relay::RELAY_CHANNEL)
 }
 
 fn fresh_frame_id() -> u64 {
@@ -293,11 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn mixed_version_plain_payload_is_not_reclassified_as_routed() {
+    fn mixed_version_historical_routed_wrapper_is_classified_for_rejection() {
         let old_routing_wrapper = json!({
             "__channel": "legacy.application",
-            "__destination": "c",
-            "__payload": {"value": 7}
+            "__body": {"value": 7},
+            "__ttl": 3,
+            "__id": 42
         });
         let plain_wire_value = json!({
             "dst": "c",
@@ -306,13 +326,26 @@ mod tests {
         });
         let plain =
             serde_json::from_value::<super::super::relay::RelayEnvelope>(plain_wire_value.clone())
-                .expect("the old wrapper remains an opaque plain-relay payload");
+                .expect("the historical outer relay envelope still decodes");
         assert_eq!(plain.payload, old_routing_wrapper);
+        assert!(is_historical_routed_wrapper(&plain.payload));
         assert!(
             serde_json::from_value::<RoutedEnvelope>(plain_wire_value).is_err(),
             "the routed owner cannot decode a plain relay envelope by inspecting its payload"
         );
         assert_ne!(ROUTING_CHANNEL, super::super::relay::RELAY_CHANNEL);
+    }
+
+    #[test]
+    fn ordinary_plain_relay_payload_is_not_rejected_as_historical_routing() {
+        for payload in [
+            json!({"application": "data"}),
+            json!({"__channel": super::super::relay::RELAY_CHANNEL}),
+            json!({"__channel": 7, "__body": "not-the-old-shape"}),
+            json!("plain"),
+        ] {
+            assert!(!is_historical_routed_wrapper(&payload));
+        }
     }
 
     #[tokio::test]

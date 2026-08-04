@@ -124,6 +124,10 @@ A local restart creates a provisional attempt, retires the old attempt, waits fo
 
 A replacement candidate may arrive before the replacement SDP. It must consume finite ingress capacity without reaching the old native ICE agent, then move only to a provisional attempt whose exact SDP credentials and declared media section match it. Delayed old-attempt work cannot mutate the replacement. Concurrent local restart and remote-description transactions fail closed instead of creating two candidate owners.
 
+Attack: omit MID, media-line index, and username fragment, provide conflicting MID and index values, or reuse one username fragment for different effective credential pairs.
+
+Required result: every accepted candidate has a binding to the active SDP. MID and index select one exact binding. A username-fragment-only candidate identifies one unambiguous credential pair. The wholly unbound, conflicting-location, and ambiguous-username forms are rejected without adding a generation, route identity, timestamp, or timer.
+
 Controls:
 
 - `v4_arc03g_candidate_queue_deduplicates_before_retention_and_enforces_both_bounds`
@@ -141,6 +145,7 @@ Controls:
 - `v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt`
 - `v4_arc03j_terminal_candidate_exhaustion_stops_later_hash_and_work_admission`
 - `v4_arc03j_sdp_ice_credentials_apply_session_inheritance_and_media_overrides`
+- `v4_arc03j_remote_candidates_require_an_exact_or_unambiguous_binding`
 - `v4_arc03j_restart_transactions_reject_ambiguous_interleavings`
 - `v4_arc03j_corrupt_restart_migration_leaves_no_viable_attempt`
 
@@ -291,16 +296,19 @@ Controls:
 
 Attack: call application routing or ordinary-member relay from the normal V4 connector, Endpoint Auth task, or daemon path.
 
-Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Typed routed envelopes use `__mesh_route__/v1`. Opaque plain relay envelopes use `__mesh_relay__/v1`. No application payload field selects the owner. Malformed input does not stop later valid delivery.
+Required result: compatibility source stays under `legacy_v1/`, behind the `legacy-v1` feature and deprecated explicit construction. The crate root does not re-export the compatibility facades. Normal V4 source compiles with deprecated use denied. The source name `LegacyV1MemberRelay` cannot be confused with TURN or signaling. Each joined Mesh has one routing owner and, when requested, one separate member-relay owner. Corrected routed envelopes use `__mesh_route__/v1`. Opaque plain relay envelopes use `__mesh_relay__/v1`. The exact historical routed-wrapper shape is rejected on the old relay wire instead of being forwarded as application payload. No application payload field selects routing behavior. Malformed input does not stop later valid delivery.
 
 Controls:
 
 - `v4_arc03h_legacy_v1_daemon_option_is_explicit`
 - `legacy_v1_runtime_explicitly_enables_one_daemon_channel_relay`
 - `routed_and_plain_relay_wires_are_disjoint`
-- `mixed_version_plain_payload_is_not_reclassified_as_routed`
+- `mixed_version_historical_routed_wrapper_is_classified_for_rejection`
+- `corrected_plain_relay_rejects_the_historical_routed_wrapper_shape`
 - `v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops` in WSL
 - default-feature `-D deprecated` checks for `myownmesh-core` and `myownmesh`
+
+Evidence boundary: the two-hop test is a native routing implementation control. `legacy_v1_runtime_explicitly_enables_one_daemon_channel_relay` is the supported deployment startup and owner-installation control. Together they do not claim a full supported-construction two-hop test.
 
 Residual: this is a maintained compatibility boundary, not a hard theorem that future source edits cannot cross it. RTM-001 and RTM-002 remain open until deletion.
 
@@ -308,13 +316,16 @@ Residual: this is a maintained compatibility boundary, not a hard theorem that f
 
 Attack: enable generic real-time policy and assume the old H.264 and Opus adapter appears, or allow ordinary startup to infer a media profile.
 
-Required result: normal startup remains codec-neutral. The temporary feature-gated embedder form requires an explicit reviewed profile and attaches it to the connector policy. The combined sidecar form also requires explicit LegacyV1 authority. The command-line sidecar requires `--legacy-v1 --legacy-media` and every profile field from the owner. Its media engine registers only H.264 and Opus.
+Required result: normal startup remains codec-neutral. The temporary feature-gated embedder and CLI forms require an explicit reviewed profile and attach it to the connector policy. Legacy-media-only startup has no LegacyV1 runtime, network, or member-relay authority. The combined form requires both authorities to be selected explicitly. Every media profile field comes from the owner. The media engine registers only H.264 and Opus.
 
 Controls:
 
 - `v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form`
 - `v4_arc03j_legacy_media_sidecar_composes_only_with_explicit_legacy_v1_runtime`
-- `v4_arc03j_legacy_media_is_an_explicit_legacy_v1_sidecar_option`
+- `v4_arc03j_v4_only_daemon_option_set_is_empty`
+- `v4_arc03h_legacy_v1_daemon_option_is_explicit`
+- `v4_arc03j_legacy_media_daemon_option_is_independent`
+- `v4_arc03j_combined_compatibility_authorities_require_both_flags`
 - `v4_arc03j_legacy_media_sidecar_rejects_an_incomplete_owner_vector`
 - `v4_arc03j_legacy_media_sidecar_uses_only_the_complete_owner_vector`
 - `v4_arc03j_legacy_codec_registration_is_only_h264_and_opus`
