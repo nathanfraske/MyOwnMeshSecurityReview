@@ -369,8 +369,37 @@ def write_manifest(project: Path, manifest: str) -> None:
     (project / "Cargo.toml").write_text(manifest, encoding="utf-8", newline="\n")
 
 
-def run_check(project: Path, binary: str) -> tuple[int, list[dict], str]:
+def normalized_probe_environment() -> dict[str, str]:
+    """Build the deterministic environment used for every probe compilation.
+
+    An inherited rustc flag policy is removed. A caller such as CI may export
+    `RUSTFLAGS=-D warnings` for the workspace gates, and that policy would then
+    also apply to the probe project's freshly built dependency tree, including
+    the isolated vendored `webrtc` sources. Those dependencies would fail on
+    their own warnings before any probe could emit its expected diagnostic,
+    which reports a dependency warning policy as if it were a boundary result.
+
+    The workspace `-D warnings` gates run separately and remain required. A
+    boundary probe must test its exact expected cause, fragments, and primary
+    line instead, so it compiles under an explicit, flag-free policy.
+    """
+
     environment = os.environ.copy()
+    for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"):
+        environment.pop(name, None)
+    # Per-target forms of the same configuration key, for example
+    # `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`.
+    for name in [
+        key
+        for key in environment
+        if key.startswith("CARGO_TARGET_") and key.endswith("_RUSTFLAGS")
+    ]:
+        environment.pop(name, None)
+    return environment
+
+
+def run_check(project: Path, binary: str) -> tuple[int, list[dict], str]:
+    environment = normalized_probe_environment()
     environment["CARGO_TERM_COLOR"] = "never"
     environment.setdefault("CARGO_TARGET_DIR", COMPILER_TARGET.name)
     result = subprocess.run(

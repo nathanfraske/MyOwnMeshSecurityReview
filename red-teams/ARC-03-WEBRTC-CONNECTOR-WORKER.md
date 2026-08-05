@@ -65,9 +65,29 @@ exact real-time-flow consumers. The script starts no listener and uses its own
 isolated compiler target, so this run does not touch live Windows MyOwnMesh
 processes and does not replace the WSL commands above. It is working-tree
 evidence that the harness now reaches its diagnostics instead of dying in
-dependency resolution. It is not exact-pushed-head evidence. The hosted re-run
-after this harness change is still outstanding, and run `31051812846` remains
-superseded and non-evidential.
+dependency resolution. It is not exact-pushed-head evidence.
+
+Second hosted failure. At exact head `2993455`, runs `31054735382` and
+`31054732818` prove that the probes now inherit the pinned vendor patch, so the
+first correction holds. Both runs still failed the compiler-boundary step, for a
+second and different harness reason. The job exports `RUSTFLAGS=-D warnings` for
+the workspace gates, the external probe projects inherited that policy, and the
+isolated vendored `webrtc` compilation died with nine dependency errors before
+any probe emitted its expected diagnostic. The native direct and TURN controls
+were skipped in those runs and produced no evidence either. Local Windows and
+Ubuntu 24.04 WSL runs without the outer policy flag both report one positive
+public-type control, 17 cause-matched rejection controls, four exact
+authority-set controls, and five exact real-time-flow consumers. `run_check`
+now builds each probe environment with inherited `RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, and per-target
+`CARGO_TARGET_*_RUSTFLAGS` values removed, so a probe tests its own expected
+cause, fragments, and primary line instead of a dependency warning policy. The
+workspace `-D warnings` gates listed above run separately and remain required.
+On the uncommitted correction, an Ubuntu 24.04 WSL run with all four flag forms
+injected passed the same one, 17, four, and five controls; that is working-tree
+evidence only. This second correction is unverified on an exact pushed head.
+Runs `31051812846`, `31054735382`, and `31054732818` remain superseded and
+non-evidential for every boundary in this record.
 
 ## 2. RT-03-01: manufacture connector resource authority
 
