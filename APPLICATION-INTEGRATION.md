@@ -508,9 +508,19 @@ The application owns:
 
 The component that allocates or retains a protected resource acquires its finite lease before allocation or retention. Basal MyOwnMesh does not expose or require a fixed maximum number of Mesh runtimes, peers, attempts, sessions, or flows. A request succeeds while the process resource provider grants its exact claim. Otherwise the application receives typed pressure or unavailability.
 
-The application does not choose low-level connector counters, resource weights, quotas, or shares. One finite process grant is shared by all Mesh scopes, and unused capacity is borrowable. Under pressure, each scope may own one move-only pending demand. The provider selects `Cleanup > Admitted > Speculative` and rotates equal-class selection across scopes after each resolved demand.
+The application does not choose low-level connector counters, resource weights, quotas, or shares. One finite process grant is shared by all Mesh scopes, and unused capacity is borrowable. Adding scopes cannot multiply that grant.
 
-The provider may ask an exact reclaimable Speculative owner to retire, but it cannot release that owner's claim. The owner releases by Drop after cleanup or transfers the exact charge into failed-cleanup retention. No timer expires the demand, completes retirement, or releases the claim. This creates no guarantee against nonreclaimable admitted pressure, an ignored retirement request, or failed cleanup. The application receives typed pressure or unavailability rather than an authorization result. It may still install a stricter local ceiling or isolation policy for a locked-down appliance, Closed deployment, carrier cost boundary, or product requirement. Such policy cannot create resources or mesh authority.
+The basal application-visible contract is a set of properties, not a scheduling algorithm:
+
+- **Conservation.** Live claims never exceed the process grant. No admission path mints capacity.
+- **Cleanup ownership.** Only the exact owner releases a claim, and only after its own cleanup. The provider may request retirement of a lease whose owner contract declares it reclaimable, but a request releases nothing.
+- **Honest retention.** An owner whose cleanup cannot be proven transfers the exact charge into failed-cleanup retention rather than dropping it silently.
+- **Fallible admission.** There is no guarantee of eventual admission. A nonreclaimable lease, an ignored retirement request, or a retained failed-cleanup charge may hold capacity indefinitely.
+- **Pressure is not authorization.** The application receives typed pressure or unavailability, never an Open or Closed authorization result, when resources are short.
+- **Time is not resource truth.** No timer expires a pending demand, completes a retirement, or releases a claim. Elapsed time alone never changes what is charged.
+- **Optional isolation.** A deployment may install a stricter local ceiling or isolation policy for a locked-down appliance, Closed deployment, carrier cost boundary, or product requirement. Such policy is explicitly optional, and it cannot create resources or mesh authority.
+
+How a provider orders and services demands under pressure is provider policy, not a basal mesh semantic. The `FiniteResourceProvider` used by the reference implementation adopts a specific per-scope pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes; a different conforming provider may schedule differently. Applications must depend on the properties above, not on any particular selection rule, and no application-visible type encodes one.
 
 Reliable streams, interactive real-time flows, delayed satellite delivery, and storage-backed transport do not share one queue rule. Each uses the pressure contract appropriate to its provider. Every retained unit still owns storage and scheduled-work leases. Time passage alone does not expire a slow operation or release its resources.
 
@@ -538,12 +548,14 @@ The application integration passes only when:
 - resource refusal identifies pressure or unavailability, never Open or Closed authorization;
 - Mesh scopes share one process grant and cannot multiply capacity;
 - no basal weights, quotas, reserved shares, or partitions exist;
-- pending demand uses `Cleanup > Admitted > Speculative` authority order and equal-class per-scope rotation;
-- only exact reclaimable Speculative owners receive retirement requests;
+- no basal pending-demand ordering, rotation rule, or per-scope demand cardinality is required, and no application-visible type encodes one;
+- the selected provider documents its own demand-selection policy and shows that the policy alone mints no capacity;
+- only owners of leases their contract declares reclaimable receive retirement requests;
 - a retirement request does not release its claim;
 - owner Drop or explicit failed-cleanup retention preserves exact release accounting;
-- admission is not guaranteed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
-- optional local ceilings remain explicit deployment policy.
+- admission is not guaranteed against nonreclaimable pressure, ignored retirement, or failed cleanup;
+- elapsed time alone expires no demand, retirement, or claim;
+- optional local ceilings and isolation policies remain explicit, optional deployment policy.
 
 ## 16. Owner decisions
 
@@ -558,7 +570,7 @@ The owner must select:
 7. session recovery and multi-channel behavior;
 8. diagnostic detail;
 9. headless consumer connector types;
-10. resource-provider and host-isolation integration for each deployment form;
-11. any optional local ceilings, cost policies, or isolation requirements;
+10. the resource provider for each deployment form, reported as a provider and host-isolation integration description — its declared demand-selection policy, its residual and isolation boundaries, and the evidence that it satisfies the properties in section 14 — rather than a table of fixed numeric limits, weights, or product counts;
+11. any optional local ceilings, cost policies, or isolation requirements, each recorded as explicitly optional deployment policy;
 12. acceptance or isolation of native WebRTC, allocator, runtime, kernel, driver, and external-provider residuals;
 13. measurements used for performance, cost, scheduling, regression, and opaque-resource characterization.

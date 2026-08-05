@@ -2,6 +2,8 @@
 
 Status: elastic resource-contract correction on `arc/03i-final-connector-boundary` in draft fork PR #5. The connector lifecycle and authority work at `8a2351d` remains accepted. Arc 03 is reopened only where its static resource policy conflicts with the adopted elastic provider contract. PR #5 is not merge-approved. Arc 04 has not started.
 
+Under PR #5 review `4865297956` at `378dd82`, this document states its basal resource requirements as provider-port properties and keeps the exact `FiniteResourceProvider` scheduling as concrete provider policy. That demotion changes classification and evidence framing only. It removes no connector, lifecycle, cleanup, ICE-restart, or codec-neutrality obligation, and it weakens no control.
+
 ## 1. Scope
 
 Arc 03 puts the existing WebRTC connector behind explicit process, Mesh runtime, attempt, candidate, callback, cleanup, and Endpoint Auth provenance owners. It preserves the existing ICE, STUN, TURN, DTLS, direct path, native RTP, mDNS, Nostr, reconnect, and recovery implementations. H.264 and Opus remain in a temporary compatibility adapter, not in basal connector semantics.
@@ -21,7 +23,7 @@ one Mesh connector child scope
     -> shares the process resource grant
     -> may borrow any currently unused capacity
     -> owns no basal weight, quota, share, or partition
-    -> receives structural pressure turns without minting capacity
+    -> is arbitrated under pressure without minting capacity
 
 one connection attempt
     -> multiple connector candidates
@@ -45,7 +47,21 @@ The Arc 03 resource port exposes dimensions for accounted memory, queued bytes, 
 
 Static Arc 03 fields are classified in [`ARC-03-RESOURCE-OWNERSHIP-REPORT.md`](ARC-03-RESOURCE-OWNERSHIP-REPORT.md). Basal product-object ceilings move to resource leases. Actual WebRTC or compatibility shape limits remain provider or compatibility constraints. Optional local ceilings remain explicit wrappers for locked-down, Closed, cost-controlled, test, or compatibility deployments.
 
-The default finite provider is shared and work-conserving. It has no basal weights, quotas, shares, or partitions. Unused capacity is borrowable across Mesh scopes. An exact pending reclamation turn reserves only the charge it still needs. Capacity beyond that charge remains borrowable, including in the same resource dimension. `Cleanup`, then `Admitted`, then `Speculative` receives the next structural turn, with equal-authority scope identities rotating. Every immediate acquisition path applies the same gate to its full provider charge, including scope and reservation bookkeeping. The provider may request retirement only from an exact registered speculative owner. It cannot release or reuse that owner's claim. The connector close owner performs cleanup and the exact lease drop completes release. Failed cleanup retains the charge. The resulting progress claim does not cover nonreclaimable admitted pressure, ignored retirement, or failed cleanup. No native-close timeout exists. No elapsed duration changes resource, protocol, authentication, lane, or cleanup truth.
+Arc 03 states its basal resource requirements as properties of the installed provider port. They are not one arbitration algorithm. A conforming provider must hold every property below:
+
+- one finite process grant is conserved. A child scope is accounting and attribution only, and creating, cloning, or releasing scopes cannot mint capacity.
+- no basal weights, quotas, reserved shares, or partitions exist, so capacity that no live claim holds remains available to any scope whose claim can be admitted.
+- pressure arbitration distributes existing capacity only. It never creates capacity, and it never releases, revokes, replaces, or reuses another owner's live claim.
+- every acquisition path applies the same admission gate to its full provider charge, including the provider's own scope and reservation bookkeeping.
+- reclamation is a request to the exact registered owner of a lease whose owner contract declares it reclaimable. That owner performs cleanup, and the exact lease drop completes release. Failed cleanup retains the charge.
+- refusal is typed and names an unavailable resource dimension instead of a product-object ceiling. Pressure is a resource result, never an authorization result.
+- no demand is starved by construction. A cleanup-class demand cannot be deferred indefinitely behind speculative demand, and no scope may reacquire indefinitely ahead of an equal-authority scope's outstanding demand.
+- elapsed time is not resource truth. No timer or duration creates, releases, or expires a claim.
+- the progress claim is conditional. It does not cover nonreclaimable admitted pressure, ignored retirement, or failed cleanup.
+
+The default `FiniteResourceProvider` is the current concrete policy that implements those properties, and it is the provider these Arc 03 controls execute against. Its exact retained behavior is unchanged: allocation is shared and work-conserving; each scope owns at most one move-only pending demand; an exact pending reclamation turn reserves only the charge it still needs, and capacity beyond that charge remains borrowable, including in the same resource dimension; `Cleanup`, then `Admitted`, then `Speculative` receives the next structural turn, with equal-authority scope identities rotating; and a pending turn blocks only the resource dimensions that the selected demand requires. That ordering, rotation, per-scope pending-demand shape, and bookkeeping charge are this provider's concrete policy. They are not basal MyOwnMesh semantics. A different provider that satisfies the property list above conforms even if it selects turns differently, and it must then supply its own concrete-policy evidence.
+
+The connector close owner performs cleanup and the exact lease drop completes release. Failed cleanup retains the charge. No native-close timeout exists. No elapsed duration changes resource, protocol, authentication, lane, or cleanup truth.
 
 Generic real-time enablement creates no H.264 or Opus tracks by itself. The temporary adapter requires an explicit `LegacyWebRtcMediaProfile`. Profile construction validates its fixed lane identity space, pre-provisioned lane counts, owner-selected flow envelope, and the adapter's fixed 2,048-fragment H.264 ceiling. These checks do not prove exact native or OS resource accounting.
 
@@ -113,7 +129,7 @@ Close may move an uncommitted open directly to `ClosedPending`. Open is committe
 
 Control and endpoint data have separate typed retention paths. Every retained callback owns its accounted bytes and scheduled-work lease. Before calling `webrtc-rs::RTCIceCandidate::to_json`, a native ICE callback owns finite structural work and a named opaque dependency residual. The dependency constructs the candidate wrapper before invoking MyOwnMesh, and `to_json` exposes no allocation plan. Its wrapper, formatting scratch, and initial output allocation are therefore not exact byte claims. After conversion, MyOwnMesh measures the returned String content and capacities and transitions the lease before any await or retention. Refusal drops the value and retires the connector. Producers do not wait in an unbounded `reserve().await` backlog. Pressure returns a typed overloaded, closed, provider-refused, or wrong-owner result. No hidden producer queue exists.
 
-Real-time events cannot enter a shared callback mailbox. Each admitted real-time flow owns its retained units and exact leases. The connector-local callback scheduler gives each nonempty admitted callback class a bounded service opportunity using explicit weights or its internal unit quanta. That scheduling property does not extend to process-provider admission or cross-Mesh fairness.
+Real-time events cannot enter a shared callback mailbox. Each admitted real-time flow owns its retained units and exact leases. The connector-local callback scheduler gives each nonempty admitted callback class a bounded service opportunity using explicit weights or its internal unit quanta. That scheduling property does not extend to process-provider admission or cross-Mesh fairness. A connector-local weight or quantum is a service opportunity only. It reserves no provider capacity, multiplies no process grant, and is not a resource authority.
 
 Endpoint protocol data may arrive before channel-open promotion, but it remains in the bounded endpoint mailbox until the exact open transition commits. Close or replacement drops the uncommitted data.
 
@@ -221,7 +237,7 @@ The accepted connector head established these six review conditions, which the e
 5. Generic real-time policy selects no codec, device purpose, media purpose, or lane meaning.
 6. Temporary LegacyV1 and H.264 or Opus paths are explicit, independently selectable, tested, and unreachable from the V4 authority path without their own named compatibility feature and owner.
 
-Together, these are the target proof obligations: one lease-backed WebRTC connector candidate produces at most one working-channel capability, cannot outlive its actual connector lifecycle, cannot lose or manufacture the resource claims it actually owns, and can be handed to Endpoint Auth with exact provenance. Arc 03 may close only when the exact head also proves that semantic cardinality remains open, child scopes cannot multiply the process grant, every claimed connector allocation and scheduled operation retains its lease for the declared lifetime, and all unclaimed native or OS state is explicitly residual or isolated. The elastic correction must also prove structural authority ordering and equal-class rotation for cooperative demands, plus exact owner wakeup for reclaimable speculative connectors. It cannot claim eventual admission against nonreclaimable admitted work, ignored retirement, failed cleanup, complete native accounting, Endpoint Auth transcript verification, or session authority.
+Together, these are the target proof obligations: one lease-backed WebRTC connector candidate produces at most one working-channel capability, cannot outlive its actual connector lifecycle, cannot lose or manufacture the resource claims it actually owns, and can be handed to Endpoint Auth with exact provenance. Arc 03 may close only when the exact head also proves that semantic cardinality remains open, child scopes cannot multiply the process grant, every claimed connector allocation and scheduled operation retains its lease for the declared lifetime, and all unclaimed native or OS state is explicitly residual or isolated. The elastic correction must also prove the basal properties in section 3 — conservation of the one process grant, no capacity minting under pressure, retirement requested only from the exact registered owner without provider-side release, no starvation by construction for cleanup-class or equal-authority demands, and exact owner wakeup for reclaimable speculative connectors. Separately, it must prove the shipped `FiniteResourceProvider` structural authority ordering and equal-class rotation as that provider's concrete policy, not as a universal requirement on every conforming provider. It cannot claim eventual admission against nonreclaimable admitted work, ignored retirement, failed cleanup, complete native accounting, Endpoint Auth transcript verification, or session authority.
 
 For statement 3, the pinned `webrtc-ice 0.13.0` boundary is patched so
 `add_remote_candidate` awaits internal insertion or mDNS resolution instead of
@@ -232,7 +248,7 @@ operation while dependency work is still able to cross a restart.
 
 ## 14. Evidence and approval boundary
 
-The red-team record names the required ownership and pressure controls. [`scripts/measure-v4-arc03g.ps1`](../../scripts/measure-v4-arc03g.ps1) remains useful for performance, provider-cost, scheduling, regression, and opaque-allocation characterization. Measurements do not establish a universal product-object ceiling.
+The red-team record names the required ownership and pressure controls. [`scripts/measure-v4-arc03g.ps1`](../../scripts/measure-v4-arc03g.ps1) remains useful for performance, provider-cost, scheduling, regression, and opaque-allocation characterization. Measurements do not establish a universal product-object ceiling, and observing the default provider's arbitration does not make that arbitration policy a basal requirement.
 
 The historical Arc 01 inventory remains provenance for its recorded commit. It is not current evidence for this branch. [`arc-03-ownership-delta.json`](arc-03-ownership-delta.json) records the Arc 03 owner changes without rewriting the historical assignments. [`ARC-03-RESOURCE-OWNERSHIP-REPORT.md`](ARC-03-RESOURCE-OWNERSHIP-REPORT.md) records the current-to-target policy map, lease points, pressure behavior, exactness, and native residuals.
 

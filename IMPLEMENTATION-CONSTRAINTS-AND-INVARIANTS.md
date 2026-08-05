@@ -620,7 +620,7 @@ ResourceProvider
          | move-only PendingDemand
          | ResourcePressure(ResourceClass)
          | ResourceUnavailable(ResourceClass)
-    request_speculative_retirement(exact owner)
+    request_retirement(exact owner of a reclaimable lease)
         -> owner notification only
 
 ResourceClaim
@@ -647,11 +647,51 @@ A claim may combine several resource classes. An admitted object's count emerges
 
 The process resource root owns the process grant. Each Mesh runtime receives an accounting and attribution child scope, not a new grant. Attempt, candidate, session, and flow owners receive descendant leases. Creating another scope cannot multiply capacity.
 
-The basal finite provider is shared and work-conserving. It has no weights, quotas, reserved shares, or partitions. Unused process capacity is borrowable across child scopes. Each scope may own at most one exact move-only pending demand. Pending demands are selected in `Cleanup > Admitted > Speculative` authority order, with equal-class selection rotating across scopes after a demand resolves.
+The basal requirements on the finite provider are properties, not a scheduling algorithm. A conforming provider must preserve all of:
 
-When the selected demand cannot fit, the provider may request retirement from exact owners of reclaimable `Speculative` leases. The provider does not release, revoke, replace, or reuse those claims. The notified owner performs cleanup and releases through lease Drop. If cleanup cannot be proven, the owner explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth.
+```text
+P1 Domain conservation
+    the sum of live and failed-cleanup-retained claims in each resource
+    dimension never exceeds the grant actually assigned to the process;
+    a claim never exceeds the provider domain it is drawn from
 
-This scheduling and cooperative retirement model does not guarantee later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. Cleanup authority receives the first pending-demand opportunity, but that ordering does not manufacture capacity and is not a promise that cleanup can start without its exact claim.
+P2 Cleanup ownership
+    only the exact owner releases a claim, and only after cleanup; no
+    provider, peer, message, or timer can forge a release, and resources
+    a cleanup path requires stay retained until that cleanup completes
+
+P3 No minting
+    no scope, child scope, or identity creates capacity
+
+P4 Work conservation
+    capacity that is neither live nor reserved for an in-flight admission
+    is borrowable by any scope that can use it
+
+P5 Explicit isolation
+    every partition, reserved share, or isolation ceiling is explicit
+    local policy, never a basal guarantee
+
+P6 Non-multipliable scheduling weight
+    scheduling gives mintable child identities no way to manufacture
+    service weight; creating scopes or rotating identities cannot
+    improve a claimant's share
+
+P7 Pressure is not authorization
+    refusal, pressure, and unavailability are typed resource results,
+    never an Open or Closed authorization outcome in either direction
+
+P8 Time is not resource truth
+    elapsed duration alone creates, releases, expires, and validates
+    nothing
+```
+
+Pending-demand cardinality, selection order, and rotation are concrete provider policy. The provider implementation selects them, and any policy preserving P1 through P8 is conforming. No other component may depend on a particular selection order or rotation rule, and conformance tests must assert the properties rather than the schedule.
+
+The provider shipped with basal MyOwnMesh implements one such policy: shared and work-conserving, with no weights, quotas, reserved shares, or partitions; unused process capacity borrowable across child scopes; at most one exact move-only pending demand per scope; pending demands selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotating across scopes after a demand resolves. Replacing that policy is a provider decision, not a semantic change.
+
+When the selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Reclaimability is a property of the owner contract, not a provider decision; the shipped policy treats `Speculative` leases as the reclaimable class. The provider does not release, revoke, replace, or reuse those claims. The notified owner performs cleanup and releases through lease Drop. If cleanup cannot be proven, the owner explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth.
+
+No scheduling or cooperative retirement model guarantees later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. A policy that gives cleanup authority the first pending-demand opportunity does not thereby manufacture capacity, and it is not a promise that cleanup can start without its exact claim.
 
 The current resource classes describe an accounting vocabulary, not proof that every dependency exposes that dimension. Exactness is limited to the quantity actually charged. Allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, and external provider allocations must remain named residuals until the responsible adapter can conservatively claim or isolate them.
 
@@ -725,7 +765,9 @@ The implementation must prefer host-enforced resource domains and narrow provide
 
 ### 14.7 Optional local ceilings
 
-An optional `LocalCeilingPolicy` or equivalent wrapper may impose stricter counts or resource partitions for a locked-down appliance, Closed deployment, carrier cost boundary, compatibility provider, or test. It is not required for ordinary V4 construction and cannot mint authority or capacity.
+An optional `LocalCeilingPolicy` or equivalent wrapper may impose stricter counts or resource partitions for a locked-down appliance, Closed deployment, carrier cost boundary, compatibility provider, or test.
+
+This wrapper is explicitly optional. It is not required for ordinary V4 construction, it cannot mint authority or capacity, and basal conformance must never assume it is present. Every isolation domain or reserved share it introduces is local policy, not a basal guarantee, and must be reported as such.
 
 ### 14.8 Effect execution
 
@@ -779,7 +821,7 @@ Basal MyOwnMesh defines no fixed maximum for Mesh runtimes, peers, connector att
 
 ### I10b. Child scopes share one cooperative process grant
 
-Mesh and descendant scopes share one finite process grant. No basal weights, quotas, shares, or partitions exist. Unused capacity is borrowable. Pending demand follows `Cleanup > Admitted > Speculative` authority order and equal-class per-scope rotation. The provider may request exact reclaimable Speculative owners to retire, but it never releases their claims. Admission remains fallible under nonreclaimable admitted pressure, ignored retirement, or failed-cleanup retention.
+Mesh and descendant scopes share one finite process grant. No basal weights, quotas, shares, or partitions exist. Claims never exceed the actual provider domain, no scope mints capacity, unused capacity is work-conservingly borrowable, any isolation or reserved share is explicit local policy, and scheduling gives mintable child identities no way to manufacture service weight. Only the exact owner releases a claim, after cleanup; no forged release exists, and cleanup retains the resources it requires. The pending-demand cardinality, selection order, and rotation rule that satisfy these properties are concrete provider policy, not mesh semantics. The provider may ask an owner whose contract declares its lease reclaimable to retire, but it never releases that owner's claim. Admission remains fallible under nonreclaimable admitted pressure, ignored retirement, or failed-cleanup retention.
 
 ### I10c. Time is not resource authority
 
@@ -897,15 +939,19 @@ A release must pass at least the following groups.
 - admission continues for another object whenever its exact claim is granted;
 - refusal names the unavailable resource class rather than a basal object-count ceiling;
 - multiple Mesh scopes cannot multiply the process grant;
-- unused capacity is borrowable under the basal provider;
+- claims never exceed the actual provider domain in any resource dimension;
+- unused capacity is work-conservingly borrowable;
 - the basal provider has no weights, quotas, reserved shares, or partitions;
-- one move-only pending demand exists per scope;
-- pending demand is selected in `Cleanup > Admitted > Speculative` order with equal-class per-scope rotation;
-- pressure requests retirement only from exact reclaimable Speculative owners;
+- creating scopes or rotating mintable child identities cannot manufacture service weight;
+- pressure and refusal never become an authorization result in either direction;
+- elapsed time alone creates, releases, expires, and validates nothing;
 - a retirement request never releases the claim it targets;
-- release occurs through owner Drop after cleanup, or the exact charge enters failed-cleanup retention;
+- only the exact owner releases, through Drop after cleanup, or the exact charge enters failed-cleanup retention;
+- cleanup retains the resources it requires and cannot depend on a forged release;
 - no admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
-- optional local ceilings remain explicit wrappers;
+- optional local ceilings, isolation domains, and reserved shares remain explicit wrappers;
+- selection order, rotation rule, and pending-demand cardinality are provider policy, so conformance asserts the properties above rather than a particular schedule;
+- when the shipped provider policy is in use, one move-only pending demand exists per scope, pending demand is selected in `Cleanup > Admitted > Speculative` order with equal-class per-scope rotation, and retirement is requested only from exact owners whose contract declares the lease reclaimable;
 - malformed and unauthorized inputs cannot cross promotion;
 - media and packets remain quarantined before promotion;
 - cleanup completes at every failure point.
@@ -964,7 +1010,7 @@ A conforming implementation supplies:
 3. durable canonical test vectors;
 4. endpoint-authentication and channel-binding test vectors;
 5. connector profile specifications;
-6. resource ownership report with exactness and residual classification for every supported target;
+6. resource-provider and integration report for every supported target, giving exactness and residual classification per resource dimension, the host isolation domains used, the concrete scheduling policy the provider implements, and evidence that the policy preserves the basal properties in section 14.1;
 7. model or property tests for durable projection and conflict;
 8. speculative-work and promotion state model;
 9. crash and effect-idempotency model;
@@ -987,4 +1033,6 @@ The owner must select:
 - application data-operation set;
 - optional durable application contract domains.
 
-Every numeric protocol or provider limit requires proof from that protocol or provider. Every optional local policy value requires owner review. Measurements characterize performance, cost, scheduling, regression, and opaque residuals. They do not define universal semantic cardinality.
+These selections are delivered as a provider and integration report, not as a dossier of chosen numbers. The report names each provider and deployment form, states which resource dimensions are exactly observable, conservatively claimable, isolatable in a host-enforced domain, or unobservable residuals, and records the concrete scheduling policy in use with evidence that it preserves the basal properties in section 14.1.
+
+Every numeric protocol or provider limit requires proof from that protocol or provider. Every optional local policy value requires owner review and is never assumed present by basal conformance. Measurements characterize performance, cost, scheduling, regression, and opaque residuals. They do not define universal semantic cardinality.

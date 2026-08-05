@@ -13,11 +13,24 @@ A provider lease is admission evidence for the exact resource claim it carries. 
 
 `ResourceProviderPort` is the authority-bearing process entry point. The process owner installs one finite provider grant. Mesh, attempt, candidate, callback, cleanup, and real-time owners receive scopes or leases over that same grant.
 
-Creating or cloning a scope does not create capacity. The basal finite provider is shared and work-conserving outside an exact pending demand. It assigns no weights, quotas, or per-scope shares. Under pressure, one move-only demand per provider scope receives deterministic `Cleanup`, `Admitted`, then `Speculative` arbitration. Equal-authority scopes rotate by process-local scope identity.
+The port fixes properties, not an arbitration algorithm. Any provider installed behind it must hold:
 
-Only a lease explicitly admitted through the cooperative path can be selected for reclamation, and only while it remains `Speculative`. The provider issues a sticky request to that exact owner. It does not release the lease, infer cleanup from elapsed time, or make the charge reusable. The owner must fence new work and either drop the lease after cleanup succeeds or retain the exact charge after cleanup failure. Without a pending demand, a slow speculative lease may remain live indefinitely.
+- creating or cloning a scope creates no capacity, and no accounting or observation path mints any;
+- concurrently held charges never exceed the grant in any dimension, and exact release restores exactly that capacity;
+- no basal weights, quotas, reserved shares, or partitions exist;
+- unused capacity is borrowable unless an explicit local isolation policy forbids it;
+- arbitration distributes existing capacity only; it never releases, revokes, replaces, or reuses another owner's live claim;
+- only a lease whose owner contract declares it reclaimable can be selected for reclamation;
+- `Cleanup` and `Admitted` leases are never reclamation victims, and cleanup capacity that must be available under every condition is still reserved before allocation;
+- no demand is starved by construction: a cleanup-class demand cannot be deferred indefinitely behind speculative demand, and no scope may reacquire indefinitely ahead of an equal-authority scope's outstanding demand;
+- refusal names an unavailable resource dimension and is a resource result, never an authorization result;
+- elapsed time creates, releases, and expires nothing.
 
-A pending turn blocks conflicting equal- or lower-authority acquisitions only in dimensions required by that turn. Other dimensions remain borrowable. `Cleanup` and `Admitted` leases are never reclamation victims. Cleanup capacity that must be available under every condition must still be reserved before allocation; arbitration cannot manufacture capacity held by non-reclaimable work.
+**Concrete policy of the shipped `FiniteResourceProvider`.** The paragraph below describes this provider's arbitration, verified against this provider. It is not universal or basal semantics. A different conforming provider may satisfy the properties above with different arbitration, and would then supply its own concrete-policy evidence.
+
+The shipped provider is shared and work-conserving outside an exact pending demand. Under pressure, one move-only demand per provider scope receives deterministic `Cleanup`, `Admitted`, then `Speculative` arbitration, and equal-authority scopes rotate by process-local scope identity. A pending turn blocks conflicting equal- or lower-authority acquisitions only in the dimensions required by that turn; other dimensions remain borrowable. Reclamation selects only a lease admitted through the cooperative path, and only while it remains `Speculative`.
+
+Under any conforming provider, a retirement request is a sticky notification to the exact owner. It does not release the lease, infer cleanup from elapsed time, or make the charge reusable. The owner must fence new work and either drop the lease after cleanup succeeds or retain the exact charge after cleanup failure. Without a pending demand, a slow reclaimable lease may remain live indefinitely. Arbitration cannot manufacture capacity held by non-reclaimable work.
 
 Every successful acquisition returns one non-cloneable `ResourceLease`. The lease retains its declared claim until an explicit transition, release, provider-approved reclamation, or failed-cleanup retention. Each resource dimension is independent. No value is an unlimited sentinel.
 

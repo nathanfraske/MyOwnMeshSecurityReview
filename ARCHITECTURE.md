@@ -237,11 +237,53 @@ sum of live and failed-cleanup-retained claims in each resource dimension
     <= resource grant currently assigned to the process
 ```
 
-Mesh scopes attribute use to one finite process grant. Creating another Mesh scope does not create capacity. The basal provider is shared and work-conserving, with no weights, quotas, reserved shares, or partitions. Outside a selected pending turn, unused capacity is borrowable by any scope. During that turn, the provider reserves the selected demand's exact charge and leaves any capacity beyond that charge borrowable, including surplus in an overlapping resource dimension.
+Mesh scopes attribute use to one finite process grant. Creating another Mesh scope does not create capacity.
 
-Under pressure, a scope may own one exact move-only pending demand. Pending demand selection follows `Cleanup > Admitted > Speculative`; after a demand resolves, equal-class selection rotates across scopes. If the selected demand cannot fit, the provider may request retirement from exact owners of reclaimable `Speculative` leases. That request is sticky and contains no timer. It does not release, revoke, or alter a claim. The speculative owner must finish cleanup and drop its lease, or explicitly transfer the unreleased claim into failed-cleanup retention when cleanup cannot be proven.
+Basal MyOwnMesh constrains the finite provider by property, not by algorithm. Any conforming provider must preserve:
 
-This cooperative mechanism does not guarantee admission while capacity is held by nonreclaimable admitted work, while a speculative owner ignores its retirement request, or after cleanup failure retains the claim. Optional local policy may impose stricter cardinality or isolation ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test, but that wrapper is not basal mesh semantics.
+```text
+P1 Domain conservation
+    the sum of live and failed-cleanup-retained claims in each resource
+    dimension never exceeds the grant actually assigned to the process;
+    a claim never exceeds the provider domain it is drawn from
+
+P2 Cleanup ownership
+    only the exact owner releases a claim, and only after cleanup; no
+    provider, peer, message, or timer can forge a release, and resources
+    a cleanup path requires stay retained until that cleanup completes
+
+P3 No minting
+    no scope, child scope, or identity creates capacity
+
+P4 Work conservation
+    capacity that is neither live nor reserved for an in-flight admission
+    is borrowable by any scope that can use it
+
+P5 Explicit isolation
+    every partition, reserved share, or isolation ceiling is explicit
+    local policy, never a basal guarantee
+
+P6 Non-multipliable scheduling weight
+    scheduling gives mintable child identities no way to manufacture
+    service weight; creating scopes or rotating identities cannot
+    improve a claimant's share
+
+P7 Pressure is not authorization
+    refusal, pressure, and unavailability are typed resource results,
+    never an Open or Closed authorization outcome in either direction
+
+P8 Time is not resource truth
+    elapsed duration alone creates, releases, expires, and validates
+    nothing
+```
+
+Selection order, rotation rule, and pending-demand cardinality are concrete provider policy, not basal architecture. A resource-provider implementation chooses them and may replace them with any policy that preserves P1 through P8. No other subsystem may depend on a particular choice.
+
+The provider shipped with basal MyOwnMesh implements one such concrete policy: it is shared and work-conserving with no weights, quotas, reserved shares, or partitions; each scope may own at most one exact move-only pending demand; pending demand is selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotates across scopes after a demand resolves. Outside a selected pending turn, unused capacity is borrowable by any scope. During that turn, the policy reserves the selected demand's exact charge and leaves capacity beyond that charge borrowable, including surplus in an overlapping resource dimension.
+
+Under any such policy, when the selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Which leases are reclaimable is part of the owner contract, not a provider decision; the shipped policy treats `Speculative` leases as the reclaimable class. That request is sticky and contains no timer. It does not release, revoke, or alter a claim. The notified owner must finish cleanup and drop its lease, or explicitly transfer the unreleased claim into failed-cleanup retention when cleanup cannot be proven.
+
+No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. Optional local policy may impose stricter cardinality or isolation ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
 
 Resource limits have four distinct sources:
 
@@ -497,8 +539,8 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
 14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
-15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability.
-16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. A selected pending turn reserves only its exact charge, and surplus capacity remains borrowable. Pending demand uses `Cleanup > Admitted > Speculative` authority order and equal-class per-scope rotation. The provider may request exact reclaimable Speculative owners to retire, but the request changes no claim. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
+15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result in either direction.
+16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and scheduling gives mintable child identities no way to manufacture service weight. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
 17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
 18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
 19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
@@ -515,9 +557,11 @@ Owner review must select and test:
 6. Connector profiles and required egress environments.
 7. Endpoint-authentication and channel-binding protocols.
 8. Direct, TURN, generic relay, and Closed member-relay requirements.
-9. Resource-provider integration, provider structural limits, and any optional local resource ceilings.
+9. Resource-provider integration: the provider actually used in each deployment form, its structural limits, its host isolation domains, and any optional local resource ceiling.
 10. Reachability observation and local path-selection policies.
 11. Session-handle sharing, recovery, and application lifecycle behavior.
 12. Measurements used for performance characterization, provider-cost estimation, regression detection, opaque-allocation discovery, and optional deployment policy.
 
-No numeric product cardinality is inferred from a plausible default. Any numeric protocol or provider limit must be proven by that protocol or provider. Any optional local ceiling requires explicit owner selection.
+Item 9 is delivered as a provider and integration report, not as a dossier of chosen numbers. For each provider and deployment form, that report names which resource dimensions the provider exposes exactly, which are conservatively claimable, which are isolatable in a host-enforced domain, and which remain unobservable residuals. It records the concrete scheduling policy that provider implements, together with the evidence that the policy preserves the basal properties in section 5.1.
+
+No numeric product cardinality is inferred from a plausible default. Any numeric protocol or provider limit must be proven by that protocol or provider. Any optional local ceiling requires explicit owner selection and is never assumed present by basal conformance.

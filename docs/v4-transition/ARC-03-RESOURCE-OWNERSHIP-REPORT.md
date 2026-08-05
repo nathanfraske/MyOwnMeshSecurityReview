@@ -6,6 +6,40 @@ resource correction. The connector lifecycle and authority behavior at
 does not claim that the current branch accounts for every native or OS
 allocation.
 
+This revision reframes the report in response to PR #5 review 4865297956. It
+records no re-verification at that review's commit. Nothing below is an
+exact-head execution claim; every statement about the working tree remains a
+draft disposition until an owner reruns the evidence program in Section 8.
+
+## 0. What this report is
+
+This is a **provider/integration boundary report**, not a numeric owner dossier.
+
+It states *which owner charges which resource dimension* and *which dimensions
+remain named residuals*. It does not state how much capacity exists, and it
+does not supply, recommend, or imply a numeric grant, ceiling, or budget.
+
+```text
+integration report  (this document)
+    which owner holds which lease in which dimension
+    where ownership transfers, and where it ends
+    which dimensions are named residuals rather than charges
+
+provider report  (the deployment or embedder)
+    how much capacity exists in each dimension
+    where that capacity came from
+    which optional local ceilings, if any, are selected
+```
+
+Any number appearing below is a structural ownership-domain count derived from
+the code's shape: how many distinct records, leases, or residual domains an
+owner holds. Structural counts are not magnitudes. They are not bytes, not
+capacities, not budgets, and not admissible-object counts. No value in this
+document may be read as a deployment value.
+
+Reading rule: if a statement here fixes a magnitude, it is a defect in this
+report, not a requirement on an implementation.
+
 ## 1. Contract
 
 Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable resource provider.
@@ -25,9 +59,34 @@ ProcessResourceRoot
     -> callback, cleanup, candidate, and real-time descendants
 ```
 
-Creating a Mesh scope does not create capacity. The current `FiniteResourceProvider` is shared and work-conserving. It assigns no basal weights, quotas, fixed shares, or partitions. Unused capacity remains borrowable. During an exact pending reclamation turn, only the charge still needed by that demand is reserved; surplus capacity remains borrowable even in an overlapping dimension. Every immediate acquisition path applies that gate to its full charge, including child-scope and reservation bookkeeping. Under overlapping pressure, the provider selects `Cleanup`, then `Admitted`, then `Speculative`, and rotates equal-authority turns across process-local scope identities.
+Creating a Mesh scope does not create capacity. No accounting, attribution, or observation path mints capacity. Concurrently held charges never exceed the grant in any dimension, exact release restores exactly that capacity, and every immediate acquisition path applies the admission gate to its full charge, including child-scope and reservation bookkeeping. Unused capacity remains borrowable unless an explicit local isolation policy forbids it. During an exact pending reclamation turn, only the charge still needed by that demand is reserved; surplus capacity remains borrowable even in an overlapping dimension. These are properties required of any conforming provider.
 
-A pending demand may request retirement from the exact owner of a reclaimable speculative lease. That notification does not release, transfer, or invalidate the lease. The owner must finish concrete cleanup and drop the exact lease, or retain the exact charge through its failed-cleanup state. Time passage creates neither a reclaim request nor a release. This provides a bounded service opportunity only when the conflicting capacity is held by registered reclaimable speculation and its owner completes cleanup. It does not promise admission against nonreclaimable admitted work, ignored retirement, or failed cleanup.
+A pending demand may request retirement from the exact owner of a lease whose owner contract declares it reclaimable. That notification does not release, transfer, or invalidate the lease. The owner must finish concrete cleanup and drop the exact lease, or retain the exact charge through its failed-cleanup state. Time passage creates neither a reclaim request nor a release. This provides a bounded service opportunity only when the conflicting capacity is held by registered reclaimable speculation and its owner completes cleanup. It does not promise admission against nonreclaimable admitted work, ignored retirement, or failed cleanup.
+
+### 1.1 Provider boundary
+
+The provider is an injected port, not a fixed implementation. This document fixes the properties above and writes no capacity value.
+
+```text
+production
+    host-backed provider   capacity derived from actual host or OS facts
+    isolated provider      capacity bounded by an enforced container, cgroup, or appliance boundary
+    injected provider      capacity supplied by the embedding process owner
+
+tests and explicit local envelopes
+    deterministic finite provider over one explicit finite grant
+
+optional local ceilings
+    explicitly optional, owner-selected, never a basal limit
+```
+
+Current state, stated as disposition rather than as verified evidence: the deterministic finite provider is the only implementation in the tree. It derives capacity from one explicit finite grant and computes none of it. Tests install it over fixture grants; the connector-capable daemon path installs it over a grant whose every dimension the deployment owner must supply explicitly, with no default and no fallback. A host-backed or isolated production provider does not exist yet. That absence is a named gap, not a silent one.
+
+**Concrete deterministic-provider policy.** The following describes the installed provider's arbitration. It is that provider's policy, verified against that provider. It is not basal architecture, and a different conforming provider may satisfy Section 1 with different arbitration without reopening the property contract.
+
+Under overlapping pressure the deterministic finite provider represents one exact move-only pending demand per scope, selects `Cleanup`, then `Admitted`, then `Speculative`, and rotates equal-authority turns across process-local scope identities. It publishes a reclaim request only after proving the selected victim set can satisfy the deficit. Its arbitration reads no clock, no entropy, and no host fact, so identical claim sequences over identical grants produce identical admission outcomes.
+
+**Optional local ceilings.** Every ceiling named in this report is owner-selected and separable. Removing all of them leaves a conforming system that still admits work solely through provider claims. A ceiling is never a protocol bound and never a provider structural limit, and no ceiling value originates in this document.
 
 ## 2. Limit classes
 
@@ -38,7 +97,7 @@ A pending demand may request retirement from the exact owner of a reclaimable sp
 | Runtime resource availability | Current memory, handles, sockets, tasks, storage, and work grant | Provider grants a lease or returns typed pressure |
 | Optional local policy ceiling | Explicit administrator, Closed, cost, appliance, test, or compatibility restriction | Wrapper may refuse a claim the provider could otherwise grant |
 
-No class may silently stand in for another.
+No class may silently stand in for another. In particular, an optional local policy ceiling may never be reported as a protocol-shape bound or a provider structural limit, and a provider structural limit may never be presented as a recommended deployment value. No value in any class originates in this document.
 
 ## 3. Field-by-field static policy disposition
 
@@ -76,11 +135,13 @@ The current source has two distinct policy surfaces. The process provider grant 
 | `LEGACY_H264_MAX_FRAGMENTS_PER_UNIT` | Fixed hard stop of the temporary H.264 adapter | Provider structural limit, not a production policy recommendation |
 | `LEGACY_MEDIA_MAX_LANES_PER_KIND` | Fixed identity-space limit of the temporary H.264 and Opus adapter | Compatibility structural limit, not a basal Mesh limit |
 
-The daemon requires the owner to select whether the optional local ceiling set is `none` or `enabled`. It does not invent values. Selecting `none` removes the listed product-count ceilings, but it does not make native or OS resources exact. Basal provider fairness remains structural and conditional on the exact reclaimability and cleanup conditions above.
+Every row above marked optional is optional in the strong sense: the owner selects it, the owner supplies its value, and the system remains conforming with the entire set absent. The daemon requires the owner to select whether the optional local ceiling set is `none` or `enabled`. It supplies no default and invents no value. Selecting `none` removes the listed product-count ceilings, but it does not make native or OS resources exact, and it does not remove the provider claims that admit the work. Provider fairness remains structural and conditional on the exact reclaimability and cleanup conditions above.
 
 The terminal candidate-attempt, lifecycle, cleanup, close, restart, codec-neutrality, and compatibility authority semantics remain unchanged. A provider refusal retires the exact speculative attempt where the accepted Arc 03 owner already requires terminal refusal.
 
 ## 4. Current resource ownership and residual matrix
+
+This section is the integration half of the boundary in Section 0. Each row names which owner charges which dimension and where that charge stops being exact. No row states how much capacity exists; that is the provider's half. Unit counts below are structural ownership-domain counts, not magnitudes.
 
 | Resource dimension | Current Arc 03 charge | Exact current boundary | Explicit residual or gap |
 | --- | --- | --- | --- |
@@ -118,17 +179,27 @@ succeeds. A constructor that definitively returns without a closeable port
 retains the exact connector claim and reports terminal failure. It does not
 claim that hidden constructor tasks stopped or make the capacity reusable.
 
-The daemon currently asks the owner for every provider dimension. A supplied `SocketOrHandle` or `RelayOrProviderAllocation` grant does not by itself make the WebRTC adapter consume that dimension. Those fields are forward-compatible policy inputs and must not be reported as enforced native limits until the corresponding adapter claim exists.
+The daemon currently requires the deployment owner to supply every provider dimension explicitly, with no default and no fallback. This is the explicit-local-envelope case of Section 1.1: the deterministic finite provider enforcing a grant the owner wrote. It is not a host-backed or isolated provider, and it must not be described as one. A supplied `SocketOrHandle` or `RelayOrProviderAllocation` grant does not by itself make the WebRTC adapter consume that dimension. Those fields are forward-compatible policy inputs and must not be reported as enforced native limits until the corresponding adapter claim exists.
 
-The `transport-lab` feature exposes fixture-only grant derivation helpers. They sum production structural claims for the connector profiles and Mesh scopes supplied by a test, then add conservative candidate and remote-SDP claims from explicit fixture bounds. Candidate strings, content, concurrent parsing work, queue records, digest records, provider bookkeeping, remote-SDP parser storage, and remote-description retention are separate components. The helpers select no profile, workload, or production value and are absent from the default V4 API. The TURN control funds four data-only profiles and four Mesh scope records for its two sequential scenarios. At most two are active concurrently. It adds signaling-frame-derived candidate and remote-SDP bounds to one process provider. This proves shared-provider enforcement for that finite test workload. It does not claim exact native WebRTC allocation accounting or recommend a deployment grant.
+The `transport-lab` feature is the tests case of Section 1.1. It exposes fixture-only grant derivation helpers. They sum production structural claims for the connector profiles and Mesh scopes supplied by a test, then add conservative candidate and remote-SDP claims from explicit fixture bounds. Candidate strings, content, concurrent parsing work, queue records, digest records, provider bookkeeping, remote-SDP parser storage, and remote-description retention are separate components. The helpers select no profile, workload, or production value and are absent from the default V4 API. The TURN control funds four data-only profiles and four Mesh scope records for its two sequential scenarios. At most two are active concurrently. It adds signaling-frame-derived candidate and remote-SDP bounds to one process provider. This proves shared-provider enforcement for that finite test workload. The profile and scope counts it funds are the structural shape of that fixture, not magnitudes and not a workload recommendation. It does not claim exact native WebRTC allocation accounting or recommend a deployment grant.
 
-## 5. Pressure and admission order
+## 5. Pressure and admission
 
-The process provider checks the composite claim before admission. Child scopes receive no fixed share. Outside a selected pending turn they may borrow all currently unused capacity. During a turn, the selected demand's exact charge is reserved and surplus remains borrowable, including surplus in an overlapping dimension. A demand that cannot fit enters a provider-owned turn only through the cooperative API. The turn is move-only, scoped to overlapping resource dimensions, ordered by `Cleanup`, `Admitted`, then `Speculative`, and rotated across equal-authority scope identities. Dropping the demand cancels the turn without releasing another owner's capacity.
+### 5.1 Properties required of any provider
+
+The process provider checks the composite claim before admission. Child scopes receive no fixed share. Outside a selected pending turn they may borrow all currently unused capacity. During a turn, the selected demand's exact charge is reserved and surplus remains borrowable, including surplus in an overlapping dimension. A demand that cannot fit enters a provider-owned turn only through the cooperative API. Dropping the demand cancels the turn without releasing another owner's capacity.
 
 Connector cleanup work is reserved with the connector before pressure, so native close does not need a new speculative permit after failure. When pressure selects a reclaimable speculative connector, the provider requests retirement through its opaque target and the connector's existing close owner performs cleanup. The provider never reuses the charge until the exact lease is dropped. If cleanup fails, the failed owner keeps that claim charged and later admission receives typed pressure. Resource refusal is an availability result and never an Open or Closed authorization denial.
 
 One large claim may consume more capacity than many small claims. Tests must compare resource quantities, not object counts.
+
+A connector-local scheduling weight or quantum orders work inside its own owner. It reserves no provider capacity, guarantees no cross-scope admission, and multiplying it multiplies no grant.
+
+### 5.2 Concrete deterministic-provider policy
+
+The installed deterministic finite provider implements the turn as move-only, scoped to overlapping resource dimensions, ordered by `Cleanup`, `Admitted`, then `Speculative`, and rotated across equal-authority scope identities. This ordering and rotation are that provider's arbitration policy. They are verified against that provider and are not required of a conforming replacement.
+
+The authority-class taxonomy is part of the provider port and stays architectural. The order in which those classes are served is provider policy. A conforming provider must still satisfy Section 5.1 and must still never release an owner's lease, but it may arbitrate its own way.
 
 ## 6. Queue contracts
 
@@ -153,30 +224,44 @@ No queue may grow without leases. A slow operation is not invalid merely because
 
 ## 7. Required controls
 
-The implementation must prove:
+### 7.1 Property-level controls
+
+These hold for any conforming provider. They are the controls the transition gate depends on.
 
 - no basal `MAX_MESHES`, `MAX_PEERS`, `MAX_ATTEMPTS`, or `MAX_FLOWS`;
+- no hidden default cardinality, `unlimited` sentinel, or default grant exists;
 - one more object is admitted whenever its claim fits the shared grant and provider bookkeeping;
-- refusal names a resource dimension rather than an object count;
-- one large claim may cost more than many small claims;
 - many small peers or flows coexist while resources remain;
-- more Mesh scopes do not multiply the process grant;
-- exact lease release restores capacity;
-- a selected pending turn reserves its exact charge while leaving surplus capacity borrowable;
-- plain scope bookkeeping cannot consume the charge reserved for that turn;
-- the selected requester's scope cannot reacquire capacity ahead of its own turn;
-- reclaim requests are published only after the provider proves the selected victim set can satisfy the deficit;
-- a pending demand selects structural authority before equal-class per-scope rotation;
-- cooperative pressure wakes the exact reclaimable speculative owner without releasing its lease;
-- a released speculative claim lets the selected demand retry, while failed cleanup retains the charge;
+- one large claim may cost more than many small claims, so no object count implies admissibility;
+- more Mesh scopes do not multiply the process grant, and no accounting or observation path mints capacity;
+- exact lease release restores exactly that capacity;
+- concurrently held charges never exceed the grant in any dimension;
+- a selected pending demand reserves its exact charge while leaving surplus capacity borrowable, including surplus in an overlapping dimension;
+- plain scope bookkeeping cannot consume the charge reserved for that demand;
+- refusal names a resource dimension rather than an object count;
+- refusal is an availability result and never an Open or Closed authorization denial;
 - a nonwaiting acquisition returns typed pressure without requesting another owner's cleanup;
-- no valid slow lease is expired or reclaimed merely by elapsed time;
-- an optional local ceiling can deliberately restrict a deployment;
+- cooperative pressure wakes the exact owner of a lease its contract declares reclaimable, without releasing that lease;
+- a released speculative claim lets the selected demand retry, while failed cleanup retains the charge;
 - connector cleanup can proceed from its pre-reserved claim even after the shared grant is full;
-- the fairness claim is limited to reclaimable speculative conflicts whose owner completes cleanup, and does not cover nonreclaimable admitted pressure;
+- a connector-local scheduling weight reserves no provider capacity and multiplying it multiplies no grant;
+- unused capacity is borrowable unless an explicit, named local isolation policy forbids it;
+- no valid slow lease is expired or reclaimed merely by elapsed time;
 - slow work retains its finite lease without time-derived expiry;
 - storage-backed work consumes storage leases;
-- no hidden default cardinality exists.
+- an optional local ceiling can deliberately restrict a deployment, and removing every ceiling still leaves a conforming system;
+- the fairness claim is limited to reclaimable speculative conflicts whose owner completes cleanup, and does not cover nonreclaimable admitted pressure.
+
+### 7.2 Concrete deterministic-provider controls
+
+These are verified against the installed deterministic finite provider. A conforming replacement changes what is verified here without reopening Section 7.1.
+
+- one move-only pending demand exists per scope;
+- a pending demand selects structural authority before equal-class per-scope rotation;
+- reclaim requests are published only after the provider proves the selected victim set can satisfy the deficit;
+- the selected requester's scope cannot reacquire capacity ahead of its own turn;
+- arbitration reads no clock, entropy, or host fact, so identical claim sequences over identical grants produce identical admission outcomes;
+- the provider derives its capacity from one explicit finite grant and computes none of it.
 
 The accepted lifecycle, cleanup, malformed-candidate, restart, direct WebRTC, TURN-selected, compiler-boundary, and compatibility controls remain required.
 
@@ -185,3 +270,5 @@ The accepted lifecycle, cleanup, malformed-candidate, restart, direct WebRTC, TU
 Measurements remain useful for performance characterization, provider-cost estimation, regression detection, scheduler validation, opaque-allocation discovery, and choosing optional deployment policy. They do not define universal correctness or product cardinality.
 
 For every run, retain the exact commit, platform and target, input workload, raw logs, failures, CPU and RSS observations, queue occupancy, service delay, candidate distribution, close result, and every sample. Do not infer a production ceiling from those observations.
+
+A measurement never becomes a grant by being recorded. Crossing from the integration side of Section 0 to the provider side is an explicit owner decision made against a named provider, with the measurement as evidence and not as the value. This report proposes no such crossing.

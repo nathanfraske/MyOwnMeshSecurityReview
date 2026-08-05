@@ -6,6 +6,12 @@ the elastic resource controls below remain required. Source presence is not
 exact-head execution evidence. Passing this record does not authorize merge or
 select an optional local policy value.
 
+Under review `4865297956` at `378dd82`, this record separates basal properties
+required of any installed provider port from the concrete arbitration policy of
+the shipped `FiniteResourceProvider`. Every previously listed control remains
+required. The separation changes only what a passing control is allowed to
+claim.
+
 ## 1. Isolation and exact-head commands
 
 Run socket-bearing checks only inside Ubuntu 24.04 WSL. Do not run Windows test binaries. This keeps the controls away from live Windows MyOwnMesh processes and avoids per-binary Windows Firewall prompts.
@@ -35,7 +41,7 @@ wsl.exe -d Ubuntu-24.04 -- rm -rf /root/.cache/codex/mom-arc03-red-team
 
 Attack: construct a worker, provider, Mesh child, lease, or candidate capability without the process provider and exact claim.
 
-Required result: external code cannot construct those authorities. Every admitted candidate holds a finite process-backed lease attributed to its exact Mesh scope. Creating more Mesh scopes cannot multiply the process grant. Admission continues for another object whenever its claim is granted and fails with a named resource class when it is not.
+Required result: external code cannot construct those authorities. Every admitted candidate holds a finite process-backed lease attributed to its exact Mesh scope. Creating more Mesh scopes cannot multiply the process grant. Admission continues for another object whenever its claim is granted and fails with a named resource class when it is not. These are basal properties of any provider installed behind `ResourceProviderPort`. Where a control below exercises the exact borrowing or turn behavior of the shipped `FiniteResourceProvider`, it is concrete-policy evidence under section 22 rather than a universal provider requirement.
 
 Controls:
 
@@ -43,7 +49,7 @@ Controls:
 - provider-granted additional admission and named-dimension refusal controls
 - unequal-claim and many-small-claim controls
 - non-multiplying Mesh scope and exact-release restoration controls
-- work-conserving borrowing and optional local ceiling controls
+- work-conserving borrowing controls, which are concrete policy of the shipped provider under section 22, and optional local ceiling controls
 - cause-matched compiler rejections for private resource and worker constructors
 - `foreign_port_authority_cannot_release_or_reuse_a_live_reservation`
 - `one_finite_provider_cannot_back_two_distinct_authority_roots`
@@ -386,28 +392,46 @@ Controls:
 
 Attack: impose a hidden object count, multiply capacity with child scopes, let one Mesh repeatedly reacquire shared capacity ahead of another, starve cleanup with speculative work, forge release from a reclaim notification, retain an object after releasing its lease, expire a slow operation by time, or treat storage-backed delivery like a live packet queue.
 
-Required result:
+This section separates two kinds of claim. A basal-property result must hold for
+any provider installed behind `ResourceProviderPort`. A concrete-policy result
+describes the shipped `FiniteResourceProvider` arbitration that Arc 03 actually
+executes against. Both sets remain required evidence on the exact head. A
+concrete-policy control passing is evidence about this provider only; it is not
+a universal conformance statement, and a replacement provider must supply its
+own concrete-policy evidence for the same basal properties.
+
+Required result — basal properties, provider independent:
 
 - no basal Mesh, peer, attempt, session, or flow maximum exists;
 - another object is admitted whenever the mock provider grants its exact claim;
-- refusal names an unavailable resource dimension;
+- refusal names an unavailable resource dimension, and pressure is a resource result rather than an authorization result;
 - one large claim may consume more than many small claims;
 - many small objects coexist while resources remain;
 - Mesh scopes cannot multiply the process grant;
 - exact release restores capacity;
-- a selected pending turn reserves its exact charge while leaving surplus capacity borrowable;
-- cooperative pressure orders `Cleanup`, `Admitted`, then `Speculative` and rotates equal-authority scopes without configured weights or shares;
-- a selected speculative owner receives one exact retirement request, while the provider retains no release or cleanup authority;
-- a demand cancelled before acquisition loses its turn and releases no victim;
+- arbitration distributes existing capacity only; it never mints capacity and never releases, revokes, replaces, or reuses another owner's live claim;
+- the exact owner of a lease its contract declares reclaimable receives one exact retirement request, while the provider retains no release or cleanup authority;
+- a demand cancelled before acquisition releases no victim;
 - nonwaiting acquisition returns typed pressure without creating a hidden demand or requesting cleanup;
 - release or failed-cleanup retention remains attributable to the exact selected claim;
-- an optional local ceiling can restrict a deployment without minting capacity;
-- cooperative `Cleanup` and `Admitted` demands are selected before `Speculative`; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
+- an optional local ceiling can restrict a deployment without minting capacity, and remains absent from the elastic constructors;
+- no demand is starved by construction: a cleanup-class demand cannot be deferred indefinitely behind speculative demand, and no scope may reacquire indefinitely ahead of an equal-authority scope's outstanding demand;
+- `Cleanup` and `Admitted` leases are never reclamation victims; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
+- connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant;
 - slow work retains its finite lease without timer-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
 
-Exact source controls:
+Required result — concrete policy of the shipped `FiniteResourceProvider`:
+
+- a selected pending turn reserves its exact charge while leaving surplus capacity borrowable, including surplus in an overlapping dimension;
+- cooperative pressure orders `Cleanup`, `Admitted`, then `Speculative` and rotates equal-authority scope identities without configured weights or shares;
+- each provider scope owns at most one move-only pending demand, and a cancelled demand loses that turn;
+- a pending turn blocks only the resource dimensions the selected demand requires;
+- scope and reservation bookkeeping passes the same admission gate as ordinary claims;
+- a reclaim request is published only after the selected victim set can satisfy the deficit.
+
+Exact source controls — basal properties:
 
 - `increasing_one_granted_dimension_admits_exactly_one_more_claim`
 - `unequal_claim_cost_not_object_count_controls_admission`
@@ -418,19 +442,10 @@ Exact source controls:
 - `v4_arc03_successful_drop_releases_the_exact_provider_claim`
 - `unused_capacity_is_borrowable_across_mesh_attribution_scopes`
 - `cooperative_pressure_requests_exact_speculation_and_prevents_reacquisition`
-- `active_turn_fences_plain_scope_bookkeeping`
-- `active_demander_cannot_reacquire_ahead_of_its_exact_turn`
-- `insufficient_reclaim_set_is_not_published`
 - `dropping_pending_demand_cancels_its_turn_without_releasing_a_victim`
 - `nonwaiting_reclaimable_admission_returns_pressure_without_requesting_cleanup`
-- `pending_turn_blocks_only_overlapping_resource_dimensions`
-- `cleanup_demand_supersedes_a_speculative_turn_without_reclaiming_cleanup`
 - `slow_speculation_has_no_elapsed_time_reclaim_semantics`
-- `reclaim_and_promotion_are_linearized_in_both_orders`
 - `failed_reclaim_cleanup_retains_charge_and_reports_exact_pressure`
-- `cooperative_child_scope_and_first_lease_remain_one_transaction`
-- `equal_authority_demands_rotate_without_cross_scope_reacquisition`
-- `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
 - `arc03_remote_candidate_local_ceiling_is_explicit_and_attempt_scoped`
 - `slow_storage_work_retains_only_its_finite_lease_until_explicit_drop`
 - `arc03_remote_candidate_apply_releases_exact_retention`
@@ -445,6 +460,26 @@ Exact source controls:
 - `composite_request_overflow_is_not_reported_as_exact_pressure`
 - vendored `test_add_remote_candidate_return_proves_internal_insertion`
 
+Exact source controls — concrete policy of the shipped `FiniteResourceProvider`:
+
+- `active_turn_fences_plain_scope_bookkeeping`
+- `active_demander_cannot_reacquire_ahead_of_its_exact_turn`
+- `insufficient_reclaim_set_is_not_published`
+- `pending_turn_blocks_only_overlapping_resource_dimensions`
+- `cleanup_demand_supersedes_a_speculative_turn_without_reclaiming_cleanup`
+- `reclaim_and_promotion_are_linearized_in_both_orders`
+- `cooperative_child_scope_and_first_lease_remain_one_transaction`
+- `equal_authority_demands_rotate_without_cross_scope_reacquisition`
+- `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
+
+These controls fix the exact ordering, rotation, per-scope pending-demand shape,
+dimension-scoped blocking, and bookkeeping charge of the current provider. Each
+one remains required for this head. None of them may be read as proof that a
+conforming provider must arbitrate this way. The basal obligations they also
+touch — no capacity minting, `Cleanup` and `Admitted` leases never reclaimed,
+no starvation by construction, and no provider-side release — are stated as
+properties above and must hold for any provider.
+
 The compiler-boundary checker separately rejects the listed basal cardinality
 names and requires the elastic constructors and optional local wrappers. These
 controls are claims to execute on the exact pushed head, not a statement that
@@ -458,8 +493,8 @@ the exact charge.
 
 ## 23. Measurement and approval boundary
 
-[`scripts/measure-v4-arc03g.ps1`](../scripts/measure-v4-arc03g.ps1) records raw queue occupancy, service delay, candidate content size, in-progress bytes, connector concurrency, close duration, process CPU, and retained-memory observations for direct, TURN, data-only, H.264, Opus, flow contention, reconnect, multi-peer, multi-Mesh, close-success, close-error, and candidate-burst scenarios. These observations characterize performance, provider cost, fairness, regression, and opaque residuals. They do not define universal product cardinality.
+[`scripts/measure-v4-arc03g.ps1`](../scripts/measure-v4-arc03g.ps1) records raw queue occupancy, service delay, candidate content size, in-progress bytes, connector concurrency, close duration, process CPU, and retained-memory observations for direct, TURN, data-only, H.264, Opus, flow contention, reconnect, multi-peer, multi-Mesh, close-success, close-error, and candidate-burst scenarios. These observations characterize performance, provider cost, fairness, regression, and opaque residuals. They do not define universal product cardinality, and observing the shipped provider's arbitration does not promote that arbitration policy into a basal requirement.
 
 Before review, the exact pushed head must pass formatting, workspace checks, Clippy, tests, doctests, compiler-boundary checks, native direct and TURN controls, retained-feature controls, and the unchanged Linux x86-64, macOS ARM64, Windows x86-64, Linux RISC-V musl, and Linux ARM64 musl matrix.
 
-Reject claims of complete hostile-ingress admission, exact native dependency memory accounting, Endpoint Auth verification, authenticated session authority, final application flow authority, final codec policy, repository-wide close fencing, hard type-level LegacyV1 exclusion, LegacyV1 removal, or supported-platform preservation before exact-head evidence exists.
+Reject claims of complete hostile-ingress admission, exact native dependency memory accounting, Endpoint Auth verification, authenticated session authority, final application flow authority, final codec policy, repository-wide close fencing, hard type-level LegacyV1 exclusion, LegacyV1 removal, or supported-platform preservation before exact-head evidence exists. Also reject any claim that the shipped `FiniteResourceProvider` arbitration policy is itself a basal invariant or universal provider conformance.

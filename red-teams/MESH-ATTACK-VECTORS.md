@@ -453,7 +453,7 @@ Run identical local traces where a newer durable fact or better path exists but 
 
 Let one Mesh scope borrow the last grantable units with reclaimable speculative work. Submit overlapping cooperative demands from another scope and from each authority class.
 
-**Pass:** The provider creates no weight, quota, share, or new capacity. It gives `Cleanup`, then `Admitted`, then `Speculative` the next turn and rotates equal-authority scopes. It requests retirement from the exact speculative owner but does not release the claim. The selected demand acquires only after the owner drops the exact lease.
+**Pass:** The provider creates no weight, quota, share, or new capacity. It requests retirement from the exact speculative owner but does not release the claim. The selected demand acquires only after the owner drops the exact lease. No scope may reacquire indefinitely ahead of an equal-authority scope's outstanding demand. Those are the basal properties. The shipped `FiniteResourceProvider` implements them by giving `Cleanup`, then `Admitted`, then `Speculative` the next turn and rotating equal-authority scope identities. That exact order and rotation is this provider's concrete policy, and the control asserts it as provider evidence rather than as universal provider conformance.
 
 ### HYB-050. Slow valid lease
 
@@ -465,7 +465,7 @@ Keep a valid lease live without completing its operation while other scopes requ
 
 Admit a connector with its cleanup obligation reserved, fill the remaining shared grant with speculative work, then force connector close.
 
-**Pass:** The exact connector cleanup is submitted without acquiring a new speculative permit. A cleanup-class demand gets the next structural turn ahead of admitted and speculative demand, but provider notification never releases another owner's live lease.
+**Pass:** The exact connector cleanup is submitted without acquiring a new speculative permit. A cleanup-class demand cannot be deferred indefinitely behind admitted or speculative demand, and provider notification never releases another owner's live lease. The shipped `FiniteResourceProvider` satisfies that property by giving a cleanup-class demand the next structural turn ahead of admitted and speculative demand; the exact turn order is its concrete policy.
 
 ### HYB-052. Reclaim completion and retained failure
 
@@ -497,7 +497,8 @@ A conformance claim must also show:
 12. store opening reconstructs no live networking authority;
 13. every numeric bound is classified as protocol shape, provider structure, runtime grant, or explicit owner policy;
 14. every cross-scope progress claim is limited to registered reclaimable speculative pressure whose exact owner completes cleanup;
-15. every claimed native or OS dimension has an exercised adapter hook, otherwise it remains an explicit residual.
+15. every claimed native or OS dimension has an exercised adapter hook, otherwise it remains an explicit residual;
+16. every resource statement is classified as a basal property required of any installed provider port or as concrete arbitration policy of the shipped provider, and a concrete-policy pass is never presented as universal provider conformance.
 
 ## 17. Evidence bundle
 

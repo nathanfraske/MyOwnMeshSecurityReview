@@ -535,9 +535,11 @@ If every child scope reserves from the same process provider and scope creation 
 
 Allowing one child to consume capacity unused by another preserves `sum(R) <= G` because both claims are charged to the same finite process grant. No basal weight, quota, reserved share, or partition is needed for this inequality. This theorem proves resource safety only. It does not prove eventual admission.
 
-### Theorem 14.5a. Cooperative demand arbitration preserves safety
+### Theorem 14.5a. Demand arbitration preserves safety
 
-Assume each scope owns at most one move-only pending demand. The provider selects pending demand in `Cleanup > Admitted > Speculative` authority order and rotates equal-class selection across scopes after each resolved demand. Selecting or moving a demand does not change `R`. A successful grant adds its exact claim only after proving the resulting sum does not exceed `G`. Therefore arbitration changes service order without creating capacity or weakening `sum(R) <= G`.
+Assume a provider may retain unsatisfied requests as pending demands and may select among them by any selection policy. Holding, ordering, selecting, or moving a pending demand does not change `R`. A successful grant adds its exact claim only after proving the resulting sum does not exceed `G`. Therefore arbitration changes service order without creating capacity or weakening `sum(R) <= G`.
+
+The theorem is independent of the selection policy. It fixes no authority ordering, rotation rule, queue discipline, or per-scope pending-demand cardinality, and no other proof in this document depends on such a rule. A concrete provider must declare its own selection policy and show only that the policy does not mutate `R`.
 
 ### Theorem 14.5b. Indefinite leases, unrestricted borrowing, and guaranteed later admission are incompatible
 
@@ -555,17 +557,25 @@ one premise must change. A deployment that requires guaranteed cross-scope
 admission must reserve capacity, isolate scopes, or use an owner contract that
 explicitly makes borrowed work reclaimable.
 
-This impossibility result is a prerequisite for the cooperative model. The implemented model changes the nonrevocation premise only for leases whose exact `Speculative` owner contract is reclaimable. It does not claim that every live lease is reclaimable.
+This impossibility result is a prerequisite for any cooperative provider policy. A provider policy may weaken the nonrevocation premise only for leases whose owner contract explicitly declares them reclaimable. It does not claim that every live lease is reclaimable.
 
-### Theorem 14.5c. Cooperative speculative retirement cannot forge release
+### Theorem 14.5c. Retirement requests cannot forge release
 
-Suppose a selected demand does not fit. The provider may notify exact owners of reclaimable `Speculative` leases whose claims contribute to the deficit. Notification changes no member of `R`. Capacity becomes reusable only after an owner finishes cleanup and drops the exact lease. If cleanup cannot be proven, transferring the exact claim into failed-cleanup retention keeps that claim charged. Therefore a retirement request cannot make `sum(R)` understate known live or unreleased resources.
+Suppose a pending demand does not fit. The provider may notify the exact owners of reclaimable leases whose claims contribute to the deficit. Notification changes no member of `R`. Capacity becomes reusable only after an owner finishes cleanup and drops the exact lease. If cleanup cannot be proven, transferring the exact claim into failed-cleanup retention keeps that claim charged. Therefore a retirement request cannot make `sum(R)` understate known live or unreleased resources.
 
-The authority order and equal-class rotation provide deterministic demand selection, not eventual admission. A nonreclaimable admitted lease may retain capacity indefinitely. A speculative owner may ignore a retirement request. Failed cleanup may retain the exact charge indefinitely. No timer resolves any of these cases, so the model makes no stronger liveness claim.
+A deterministic selection policy yields a defined service order, not eventual admission. A nonreclaimable lease may retain capacity indefinitely. A reclaimable owner may ignore a retirement request. Failed cleanup may retain the exact charge indefinitely. No timer resolves any of these cases, so the model makes no stronger liveness claim.
+
+### Note 14.5d. Provider policy is not mesh semantics
+
+Theorems 14.1 through 14.5c constrain any conforming resource provider: conservation of `sum(R) <= G`, explicit owner-held cleanup, honest retention of unreleasable charges, typed pressure rather than authorization, and fallible admission. They deliberately fix no scheduling algorithm.
+
+A concrete provider — for example the `FiniteResourceProvider` used by the reference implementation — may additionally adopt an exact pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes. Such a rule is one provider policy. It is not a universal mesh semantic, is not a proof obligation of this model, and no result above becomes unsound if a different conforming provider selects demands differently.
 
 ### Theorem 14.6. Optional ceiling confinement
 
 An optional local ceiling wrapper may refuse a claim that the provider could grant. It cannot approve a claim the provider refused, so it can reduce availability but cannot increase capacity or create mesh authority.
+
+The same bound holds for an optional local isolation policy that confines a scope to a subset of the grant. Both remain explicitly optional deployment policy. No theorem in this section requires either one, and installing either cannot make an unsound provider sound.
 
 ### Theorem 14.7. Time independence
 
@@ -646,5 +656,5 @@ A concrete implementation must provide:
 11. crash tests for reservations and effect intents;
 12. compaction equivalence tests for each adopted durable domain;
 13. eclipse controls that preserve the impossibility boundary;
-14. elastic-provider controls for grant, pressure, exact release, child-scope borrowing, move-only pending demand, authority ordering, equal-class scope rotation, cooperative Speculative retirement, ignored retirement, failed-cleanup retention, slow work, and storage-backed work;
+14. elastic-provider controls for grant, pressure, exact release, child-scope borrowing, pending demand under the provider's own declared selection policy, retirement requests to reclaimable owners, ignored retirement, failed-cleanup retention, slow work, and storage-backed work;
 15. resource characterization and opaque-residual reports on every supported target.

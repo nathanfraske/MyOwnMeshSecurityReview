@@ -54,6 +54,7 @@ Everything else builds outward from that vertical slice.
 8. **No ordinary mesh forwarding.** A relay is an explicit exact allocation carrying opaque endpoint packets.
 9. **No new behavior in compatibility adapters.** Every adapter has a deletion arc.
 10. **Do not invent numeric budgets.** Instrument the complete path, measure supported targets, and surface values for owner review.
+11. **Own properties, not magnitudes.** This package fixes the *properties* of resource ownership. Capacity magnitudes come from a named provider supplied by the deployment or embedder, never from a document, default, or library constant. A concrete provider's arbitration algorithm is that provider's policy, not a basal architectural requirement.
 
 ## 3. Source-of-truth document set
 
@@ -620,39 +621,75 @@ DataChannelOpen
 
 ### Arc 15. Resource closure
 
-**Goal:** replace instrumentation-only accounting and unleased work with elastic resource ownership.
+**Goal:** replace instrumentation-only accounting and unleased work with property-level resource ownership: every protected allocation, retained value, task, queue entry, native object, and scheduled work unit is dominated by a live finite lease from a named provider.
+
+**Provider boundary**
+
+This arc fixes ownership properties. It does not fix which provider supplies capacity, and it writes no capacity value.
+
+```text
+production
+    host-backed provider   capacity derived from actual host or OS facts
+    isolated provider      capacity bounded by an enforced container, cgroup, or appliance boundary
+    injected provider      capacity supplied by the embedding process owner
+
+tests and explicit local envelopes
+    deterministic finite provider over one explicit finite grant
+
+optional local ceilings
+    explicitly optional, owner-selected, never a basal limit
+```
+
+The provider port is an injection point, not a fixed implementation. Any provider that satisfies the property gate below conforms. A provider that cannot name where its capacity came from does not conform.
+
+The arbitration order and rotation rule of whichever provider is installed are that provider's concrete policy. They are verified against that provider, they are not basal architecture, and replacing a conforming provider with another conforming provider does not reopen the property gate.
 
 **Steps**
 
-1. Define the process resource provider, finite claim vector, exact lease, typed pressure results, and explicit residual classification.
+1. Define the resource provider port, finite claim vector, exact lease, typed pressure results, and explicit residual classification. Keep the port injectable so a host-backed, isolated, injected, or deterministic finite provider can be installed without changing owners.
 2. Make every protected allocation, retained value, task, queue entry, native object, and scheduled work unit hold a live lease.
 3. Issue accounting and attribution child scopes without multiplying the process grant.
 4. Replace unleased channels, maps, task spawns, queues, retries, and storage with typed admission and pressure results.
-5. Keep one basal finite process grant shared and work-conserving, with no weights, quotas, reserved shares, or partitions. Represent one exact move-only pending demand per scope. Reserve only the selected demand's exact charge so surplus stays borrowable. Select `Cleanup > Admitted > Speculative`, then rotate equal-class selection across scopes after each resolved demand.
+5. Keep one process grant shared and work-conserving, with no weights, quotas, reserved shares, or partitions, and reserve only a selected demand's exact charge so surplus stays borrowable. State the installed provider's arbitration as concrete provider policy: the current deterministic finite provider represents one exact move-only pending demand per scope, selects `Cleanup > Admitted > Speculative`, and rotates equal-class selection across process-local scope identities after each resolved demand. Document that order and rotation as this provider's policy, not as a basal limit on conforming providers.
 6. Keep protocol bounds, provider structural limits, runtime availability, and optional local ceilings distinct.
-7. Let the provider request retirement only from exact reclaimable Speculative owners. Keep disposition with owner Drop after cleanup or explicit failed-cleanup retention. Add no timer and claim no guarantee against nonreclaimable admitted pressure, ignored retirement, or failed cleanup.
-8. Test identity rotation, many-source pressure, unequal claim sizes, exact release, child-scope borrowing, move-only pending demand, authority ordering, equal-class rotation, cooperative retirement, ignored retirement, failed-cleanup retention, optional ceilings, slow work, and storage-backed work.
+7. Let a provider request retirement only from the exact owner of a lease whose owner contract declares it reclaimable; the current deterministic finite provider treats `Speculative` leases as that reclaimable class, which is provider policy rather than a basal requirement. Keep disposition with owner Drop after cleanup or explicit failed-cleanup retention. Add no timer and claim no guarantee against nonreclaimable admitted pressure, ignored retirement, or failed cleanup.
+8. Test the property gate and the provider policy separately. Property tests cover identity rotation, many-source pressure, unequal claim sizes, exact release, conservation under concurrent charges, child-scope borrowing, cooperative retirement, ignored retirement, failed-cleanup retention, pre-reserved cleanup under a full grant, optional ceilings including the all-absent case, slow work, and storage-backed work. Provider-policy tests cover move-only pending demand, authority ordering, equal-class rotation, victim-set proof, and arbitration determinism against the installed provider.
 9. Measure performance, provider cost, scheduling, regression, and opaque residuals without deriving universal object counts.
+10. Require the deployment or embedder to name the installed provider and the origin of its capacity. Ship no default grant, no library-supplied numeric value, and no invented ceiling.
 
-**Gate**
+**Gate: property-level resource ownership**
 
-- every named protected allocation and scheduled operation is dominated by a live finite lease;
-- pre-auth and post-auth permits are non-interchangeable;
-- Open overload is reported as resource pressure, never unauthorized identity;
-- no `unlimited` sentinel or hidden default cardinality exists;
-- no basal maximum Mesh, peer, attempt, session, or flow count exists;
-- outside a selected pending charge, unused capacity is borrowable unless an explicit local isolation policy forbids it;
-- a selected pending turn reserves only its exact charge, and surplus remains borrowable;
-- the basal provider has no weights, quotas, reserved shares, or partitions;
+This is the transition gate. It is stated as properties of ownership, and any conforming provider may satisfy it.
+
+- **Domination.** Every named protected allocation and scheduled operation is dominated by a live finite lease, and every lease names its provider, its resource dimension, and its owner.
+- **Conservation.** Exact lease release restores exactly that capacity and nothing else; concurrently held charges never exceed the grant in any dimension.
+- **No capacity minting.** Creating, cloning, or nesting a scope creates no capacity, and no accounting, attribution, or observation path can mint any.
+- **Impossibility.** A composite claim that does not fit the grant is refused; one large claim may cost more than many small claims, so no object count implies admissibility.
+- **Pressure is not authorization.** Refusal names a resource dimension rather than an object count; resource refusal is never an Open or Closed authorization result, and Open overload is reported as resource pressure, never as unauthorized identity.
+- **Non-interchangeable permits.** Pre-auth and post-auth permits cannot substitute for each other.
+- **Non-multipliable service weight.** A scheduling weight, quantum, or share is connector-local ordering only; it reserves no provider capacity, guarantees no cross-scope admission, and multiplying it multiplies no grant.
+- **Cleanup ownership.** Cleanup capacity that must be available under every condition is reserved before allocation, so cleanup proceeds from its pre-reserved claim even when the grant is full; disposition remains owner Drop after cleanup or explicit failed-cleanup retention, and no provider releases or invalidates an owner's lease.
+- **Explicit isolation.** Outside a selected pending charge, unused capacity is borrowable unless an explicit local isolation policy forbids it; isolation is opt-in and named, never implied.
+- **Exact reservation.** A selected pending demand reserves only its exact charge; surplus remains borrowable, including surplus in an overlapping dimension.
+- **No basal cardinality.** No `unlimited` sentinel, default grant, hidden default cardinality, or basal maximum Mesh, peer, attempt, session, or flow count exists; the process grant carries no weights, quotas, reserved shares, or partitions.
+- **Time is not resource truth.** No timer creates, releases, or reclaims capacity, and no valid slow lease expires by elapsed time alone.
+- **Honest limits.** No admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup; every dimension the implementation does not charge is a named residual, not silence.
+- **Optional ceilings stay optional.** Every local ceiling is owner-selected and separable; removing all of them leaves a conforming system, and no ceiling is reported as a protocol bound or a provider structural limit.
+- Normal connection and media performance remains owner-acceptable under measured workloads.
+
+**Gate: concrete deterministic-provider policy**
+
+These are properties of the installed provider, verified against that provider. They are not basal architecture. Installing a different conforming provider changes what is verified here and does not reopen the property gate above.
+
 - one move-only pending demand exists per scope;
-- authority selection is `Cleanup > Admitted > Speculative`, with equal-class per-scope rotation;
+- arbitration selects `Cleanup > Admitted > Speculative`, with equal-class rotation across process-local scope identities;
+- reclaim requests are published only after the provider proves the selected victim set can satisfy the deficit;
 - the provider requests retirement only from exact reclaimable Speculative owners and never releases their claims;
-- disposition remains owner Drop after cleanup or explicit failed-cleanup retention;
-- no timer creates resource truth;
-- no admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
-- normal connection and media performance remains owner-acceptable under measured workloads.
+- arbitration is deterministic: identical claim sequences over identical grants produce identical admission outcomes, with no clock, entropy, or host probe in the decision;
+- the deterministic finite provider derives its capacity from one explicit finite grant and computes none of it;
+- a host-backed or isolated production provider, when introduced, restates this section against its own arbitration and capacity derivation.
 
-**Delete:** unleased production work and legacy ad hoc caps presented as basal semantic limits.
+**Delete:** unleased production work, legacy ad hoc caps presented as basal semantic limits, and any documented arbitration rule presented as a basal requirement on all providers.
 
 ### Arc 16. Legacy engine and compatibility removal
 
@@ -881,7 +918,7 @@ The transition is complete when all of the following are true:
 12. handoff is endpoint-driven, with no route ledger or relay-to-relay requirement;
 13. reachability is useful local evidence, not authority;
 14. store opening restores durable state but no live networking capability;
-15. every protected resource family has a live lease, a named provider, typed pressure behavior, and an explicit exactness or residual classification;
+15. every protected resource family has a live lease, a named provider, typed pressure behavior, and an explicit exactness or residual classification, with the Arc 15 property gate satisfied and no arbitration algorithm required of a conforming provider;
 16. every mutable state class has one owner;
 17. the legacy driver, `NetworkState` grab bag, authority bypasses, and compatibility adapters are deleted;
 18. the full conformance and red-team suite passes on built artifacts;
@@ -894,6 +931,8 @@ The playbook does not invent:
 - the final protocol/profile identifier;
 - the Closed governance proof and recovery rule;
 - local-principal authentication per platform;
+- the installed resource provider, the origin of its capacity, and its arbitration policy;
+- whether the optional local ceiling set is absent or enabled, and every value in it when enabled;
 - optional local resource, queue, retry, timeout, cache, cost, isolation, and bandwidth policy values;
 - required restrictive-network connector profiles;
 - mixed-version compatibility duration;
