@@ -415,7 +415,6 @@ Required result — basal properties, provider independent:
 - nonwaiting acquisition returns typed pressure without creating a hidden demand or requesting cleanup;
 - release or failed-cleanup retention remains attributable to the exact selected claim;
 - an optional local ceiling can restrict a deployment without minting capacity, and remains absent from the elastic constructors;
-- no demand is starved by construction: a cleanup-class demand cannot be deferred indefinitely behind speculative demand, and no scope may reacquire indefinitely ahead of an equal-authority scope's outstanding demand;
 - `Cleanup` and `Admitted` leases are never reclamation victims; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
 - connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant;
 - slow work retains its finite lease without timer-derived expiry;
@@ -426,6 +425,7 @@ Required result — concrete policy of the shipped `FiniteResourceProvider`:
 
 - a selected pending turn reserves its exact charge while leaving surplus capacity borrowable, including surplus in an overlapping dimension;
 - cooperative pressure orders `Cleanup`, `Admitted`, then `Speculative` and rotates equal-authority scope identities without configured weights or shares;
+- that ordering and rotation prevent starvation by construction in this provider: a cleanup-class demand is not deferred indefinitely behind speculative demand, and no scope reacquires indefinitely ahead of an equal-authority scope's outstanding demand;
 - each provider scope owns at most one move-only pending demand, and a cancelled demand loses that turn;
 - a pending turn blocks only the resource dimensions the selected demand requires;
 - scope and reservation bookkeeping passes the same admission gate as ordinary claims;
@@ -477,8 +477,10 @@ dimension-scoped blocking, and bookkeeping charge of the current provider. Each
 one remains required for this head. None of them may be read as proof that a
 conforming provider must arbitrate this way. The basal obligations they also
 touch — no capacity minting, `Cleanup` and `Admitted` leases never reclaimed,
-no starvation by construction, and no provider-side release — are stated as
-properties above and must hold for any provider.
+and no provider-side release — are stated as properties above and must hold for
+any provider. The non-starvation behavior these controls also demonstrate is an
+obligation of this provider's concrete policy; it is not a basal property, and
+fairness-domain liveness is not settled here.
 
 The compiler-boundary checker separately rejects the listed basal cardinality
 names and requires the elastic constructors and optional local wrappers. These

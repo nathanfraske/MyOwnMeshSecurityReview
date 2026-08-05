@@ -453,7 +453,7 @@ Run identical local traces where a newer durable fact or better path exists but 
 
 Let one Mesh scope borrow the last grantable units with reclaimable speculative work. Submit overlapping cooperative demands from another scope and from each authority class.
 
-**Pass:** The provider creates no weight, quota, share, or new capacity. It requests retirement from the exact speculative owner but does not release the claim. The selected demand acquires only after the owner drops the exact lease. No scope may reacquire indefinitely ahead of an equal-authority scope's outstanding demand. Those are the basal properties. The shipped `FiniteResourceProvider` implements them by giving `Cleanup`, then `Admitted`, then `Speculative` the next turn and rotating equal-authority scope identities. That exact order and rotation is this provider's concrete policy, and the control asserts it as provider evidence rather than as universal provider conformance.
+**Pass:** The provider creates no weight, quota, share, or new capacity. It requests retirement from the exact speculative owner but does not release the claim. The selected demand acquires only after the owner drops the exact lease. Those are the basal properties. The shipped `FiniteResourceProvider` implements them by giving `Cleanup`, then `Admitted`, then `Speculative` the next turn and rotating equal-authority scope identities, so that under this provider no scope reacquires indefinitely ahead of an equal-authority scope's outstanding demand. That exact order, that rotation, and the non-reacquisition behavior they produce are this provider's concrete policy, and the control asserts them as provider evidence rather than as universal provider conformance.
 
 ### HYB-050. Slow valid lease
 
@@ -465,7 +465,7 @@ Keep a valid lease live without completing its operation while other scopes requ
 
 Admit a connector with its cleanup obligation reserved, fill the remaining shared grant with speculative work, then force connector close.
 
-**Pass:** The exact connector cleanup is submitted without acquiring a new speculative permit. A cleanup-class demand cannot be deferred indefinitely behind admitted or speculative demand, and provider notification never releases another owner's live lease. The shipped `FiniteResourceProvider` satisfies that property by giving a cleanup-class demand the next structural turn ahead of admitted and speculative demand; the exact turn order is its concrete policy.
+**Pass:** The exact connector cleanup is submitted without acquiring a new speculative permit, and provider notification never releases another owner's live lease. Those are the basal properties. The shipped `FiniteResourceProvider` additionally gives a cleanup-class demand the next structural turn ahead of admitted and speculative demand, so under this provider a cleanup-class demand is not deferred indefinitely behind admitted or speculative demand. That turn order and the non-deferral behavior it produces are this provider's concrete policy, not universal provider conformance.
 
 ### HYB-052. Reclaim completion and retained failure
 
