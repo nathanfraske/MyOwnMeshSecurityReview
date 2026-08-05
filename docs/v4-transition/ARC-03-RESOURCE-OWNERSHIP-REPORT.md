@@ -193,13 +193,17 @@ Connector cleanup work is reserved with the connector before pressure, so native
 
 One large claim may consume more capacity than many small claims. Tests must compare resource quantities, not object counts.
 
-A connector-local scheduling weight or quantum orders work inside its own owner. It reserves no provider capacity, guarantees no cross-scope admission, and multiplying it multiplies no grant.
+Connector-local scheduling metadata is not capacity. A connector-local scheduling weight or quantum orders work inside its own owner. It reserves no provider capacity, guarantees no cross-scope admission, and multiplying it multiplies no grant. This is a claim about capacity authority and does not discharge the claimant-share fairness obligation.
+
+Non-multipliable service weight is a separate obligation: creating or rotating any number of attribution child scopes for one claimant or fairness root must not improve that claimant's service share against another root. It is not satisfied at this disposition; see Section 5.2.
 
 ### 5.2 Concrete deterministic-provider policy
 
 The installed deterministic finite provider implements the turn as move-only, scoped to overlapping resource dimensions, ordered by `Cleanup`, `Admitted`, then `Speculative`, and rotated across equal-authority scope identities. This ordering and rotation are that provider's arbitration policy. They are verified against that provider and are not required of a conforming replacement.
 
 The authority-class taxonomy is part of the provider port and stays architectural. The order in which those classes are served is provider policy. A conforming provider must still satisfy Section 5.1 and must still never release an owner's lease, but it may arbitrate its own way.
+
+**Disclosed fairness nonconformance of the installed provider.** Equal-authority rotation is keyed to process-local scope identities, and attribution child scopes are mintable by the claimant they attribute to. A claimant holding N child scopes therefore receives N turns against another claimant's one, so the installed provider does not satisfy the non-multipliable service weight obligation. This is a disclosed gap, not a passing result. Review 4865297956 §8 defers the correction to Slice D, which must bind a pending demand to a non-multipliable fairness root rather than to a mintable scope identity. The gap is fairness-only and does not affect the conservation, exact-release, no-minting, or cleanup-ownership dispositions recorded elsewhere in this report. It is separate from, and does not overlap, the host-backed and isolated provider gap in Section 1.1.
 
 ## 6. Queue contracts
 
@@ -244,13 +248,16 @@ These hold for any conforming provider. They are the controls the transition gat
 - cooperative pressure wakes the exact owner of a lease its contract declares reclaimable, without releasing that lease;
 - a released speculative claim lets the selected demand retry, while failed cleanup retains the charge;
 - connector cleanup can proceed from its pre-reserved claim even after the shared grant is full;
-- a connector-local scheduling weight reserves no provider capacity and multiplying it multiplies no grant;
+- a connector-local scheduling weight reserves no provider capacity and multiplying it multiplies no grant (connector-local scheduling metadata is not capacity; this does not discharge the claimant-share obligation below);
+- creating or rotating any number of attribution child scopes for one claimant or fairness root cannot improve that claimant's service share against another root — **no named control implements this, and it is not satisfied at this disposition**;
 - unused capacity is borrowable unless an explicit, named local isolation policy forbids it;
 - no valid slow lease is expired or reclaimed merely by elapsed time;
 - slow work retains its finite lease without time-derived expiry;
 - storage-backed work consumes storage leases;
 - an optional local ceiling can deliberately restrict a deployment, and removing every ceiling still leaves a conforming system;
 - the fairness claim is limited to reclaimable speculative conflicts whose owner completes cleanup, and does not cover nonreclaimable admitted pressure.
+
+**Missing control, blocking.** The claimant-share obligation above has no implementing control in this repository, and the installed provider does not satisfy it: equal-authority rotation is keyed to mintable process-local scope identities. No control in Section 7.2 may be cited as evidence for it — those verify per-scope rotation, which is the mechanism at issue rather than a proof of claimant fairness. Section 7.1 is therefore not fully discharged at this disposition. Closing it is a Slice D obligation under review 4865297956 §8.
 
 ### 7.2 Concrete deterministic-provider controls
 

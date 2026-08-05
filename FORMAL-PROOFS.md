@@ -571,6 +571,14 @@ Theorems 14.1 through 14.5c constrain any conforming resource provider: conserva
 
 A concrete provider — for example the `FiniteResourceProvider` used by the reference implementation — may additionally adopt an exact pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes. Such a rule is one provider policy. It is not a universal mesh semantic, is not a proof obligation of this model, and no result above becomes unsound if a different conforming provider selects demands differently.
 
+### Note 14.5e. Fairness against a mintable claimant is a separate, currently unsatisfied obligation
+
+Provider conformance also requires that a claimant cannot manufacture service weight by creating attribution child scopes: creating or rotating any number of child scopes for one claimant or fairness root must not improve that claimant's service share against another root. That is a fairness obligation on the provider, not a corollary of any theorem above.
+
+It is unproven and, at the current disposition, unsatisfied. The reference `FiniteResourceProvider` rotates equal-class turns over mintable process-local scope identities, so a claimant holding N child scopes receives N turns against another claimant's one. Review 4865297956 §8 defers the correction to Slice D, which must bind pending demands to a non-multipliable fairness root.
+
+The conservation and impossibility results are unaffected in both directions. Theorems 14.1 through 14.5c neither prove this fairness obligation nor depend on it: `sum(R) <= G` holds regardless of which demand is served next, because selection and rotation do not change `R`. Conversely, satisfying this fairness obligation later cannot strengthen any liveness claim disclaimed in 14.5b and 14.5c. No safety result in this document may be cited as evidence that the fairness obligation holds.
+
 ### Theorem 14.6. Optional ceiling confinement
 
 An optional local ceiling wrapper may refuse a claim that the provider could grant. It cannot approve a claim the provider refused, so it can reduce availability but cannot increase capacity or create mesh authority.

@@ -416,7 +416,8 @@ Required result — basal properties, provider independent:
 - release or failed-cleanup retention remains attributable to the exact selected claim;
 - an optional local ceiling can restrict a deployment without minting capacity, and remains absent from the elastic constructors;
 - `Cleanup` and `Admitted` leases are never reclamation victims; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
-- connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant;
+- connector-local scheduling metadata is not capacity: connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant. This is a capacity-authority claim and does not discharge the claimant-share obligation below;
+- creating or rotating any number of attribution child scopes for one claimant or fairness root cannot improve that claimant's service share against another root. **No control below implements this, and the shipped provider does not satisfy it. See the missing-control note in this section;**
 - slow work retains its finite lease without timer-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
@@ -481,6 +482,23 @@ and no provider-side release — are stated as properties above and must hold fo
 any provider. The non-starvation behavior these controls also demonstrate is an
 obligation of this provider's concrete policy; it is not a basal property, and
 fairness-domain liveness is not settled here.
+
+Missing control — blocking, no source control exists:
+
+- claimant-share fairness: creating or rotating any number of attribution child
+  scopes for one claimant or fairness root must not improve that claimant's
+  service share against another root.
+
+No control in this record implements that obligation, and none of the controls
+listed above may be cited as evidence for it. `equal_authority_demands_rotate_without_cross_scope_reacquisition`
+and `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
+exercise rotation between scope identities, which is the mechanism at issue
+rather than a proof of fairness between claimants. The shipped
+`FiniteResourceProvider` does not satisfy the obligation: its rotation is keyed
+to process-local scope identities, and a claimant can mint child scopes to
+manufacture turns. This is a disclosed nonconformance, not a pending pass, and
+it must never be reported as passing. Review 4865297956 §8 defers the fix to
+Slice D, which must bind pending demands to a non-multipliable fairness root.
 
 The compiler-boundary checker separately rejects the listed basal cardinality
 names and requires the elastic constructors and optional local wrappers. These

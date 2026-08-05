@@ -522,6 +522,8 @@ The basal application-visible contract is a set of properties, not a scheduling 
 
 How a provider orders and services demands under pressure is provider policy, not a basal mesh semantic. The `FiniteResourceProvider` used by the reference implementation adopts a specific per-scope pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes; a different conforming provider may schedule differently. Applications must depend on the properties above, not on any particular selection rule, and no application-visible type encodes one.
 
+Disclosed gap: that reference provider is not yet fairness-conforming. Its equal-class rotation is keyed to mintable process-local scope identities, so one claimant that creates several attribution child scopes receives proportionally more turns than a claimant with one. An application must not rely on cross-claimant fairness from the current provider, and must not present it as a fairness boundary between tenants, accounts, or peers. Review 4865297956 §8 defers the correction to Slice D. This disclosure concerns fairness only; it does not weaken the conservation, cleanup-ownership, honest-retention, pressure, or time properties above.
+
 Reliable streams, interactive real-time flows, delayed satellite delivery, and storage-backed transport do not share one queue rule. Each uses the pressure contract appropriate to its provider. Every retained unit still owns storage and scheduled-work leases. Time passage alone does not expire a slow operation or release its resources.
 
 ## 15. Acceptance gates

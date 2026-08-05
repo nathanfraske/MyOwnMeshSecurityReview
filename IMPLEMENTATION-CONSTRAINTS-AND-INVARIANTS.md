@@ -687,7 +687,11 @@ P8 Time is not resource truth
 
 Pending-demand cardinality, selection order, and rotation are concrete provider policy. The provider implementation selects them, and any policy preserving P1 through P8 is conforming. No other component may depend on a particular selection order or rotation rule, and conformance tests must assert the properties rather than the schedule.
 
-The provider shipped with basal MyOwnMesh implements one such policy: shared and work-conserving, with no weights, quotas, reserved shares, or partitions; unused process capacity borrowable across child scopes; at most one exact move-only pending demand per scope; pending demands selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotating across scopes after a demand resolves. Replacing that policy is a provider decision, not a semantic change.
+The provider shipped with basal MyOwnMesh implements one policy of this kind, and that policy does not yet satisfy P6: shared and work-conserving, with no weights, quotas, reserved shares, or partitions; unused process capacity borrowable across child scopes; at most one exact move-only pending demand per scope; pending demands selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotating across scopes after a demand resolves. Replacing that policy is a provider decision, not a semantic change.
+
+**Disclosed P6 nonconformance of the shipped provider.** Equal-class rotation is keyed to process-local `ResourceScopeId`, and attribution child scopes are mintable by the claimant they attribute to. A claimant holding N child scopes receives N rotation turns against another claimant's one, which is the manufactured service weight P6 forbids. The shipped provider is therefore not conforming today, and no statement in this document may be read as claiming that it is. Review 4865297956 §8 defers the correction to Slice D, which must bind a pending demand to a non-multipliable fairness root rather than to a mintable scope identity.
+
+P6 is unchanged and remains basal. The shortfall is in the provider, not in the property; a claimant is not redefined as a scope, and P6 is not relaxed to a per-scope guarantee. The shipped provider's standing under P1 through P5, P7, and P8 is asserted only where separately supported and is not implied by this paragraph.
 
 When the selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Reclaimability is a property of the owner contract, not a provider decision; the shipped policy treats `Speculative` leases as the reclaimable class. The provider does not release, revoke, replace, or reuse those claims. The notified owner performs cleanup and releases through lease Drop. If cleanup cannot be proven, the owner explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth.
 
@@ -821,7 +825,7 @@ Basal MyOwnMesh defines no fixed maximum for Mesh runtimes, peers, connector att
 
 ### I10b. Child scopes share one cooperative process grant
 
-Mesh and descendant scopes share one finite process grant. No basal weights, quotas, shares, or partitions exist. Claims never exceed the actual provider domain, no scope mints capacity, unused capacity is work-conservingly borrowable, any isolation or reserved share is explicit local policy, and scheduling gives mintable child identities no way to manufacture service weight. Only the exact owner releases a claim, after cleanup; no forged release exists, and cleanup retains the resources it requires. The pending-demand cardinality, selection order, and rotation rule that satisfy these properties are concrete provider policy, not mesh semantics. The provider may ask an owner whose contract declares its lease reclaimable to retire, but it never releases that owner's claim. Admission remains fallible under nonreclaimable admitted pressure, ignored retirement, or failed-cleanup retention.
+Mesh and descendant scopes share one finite process grant. No basal weights, quotas, shares, or partitions exist. Claims never exceed the actual provider domain, no scope mints capacity, unused capacity is work-conservingly borrowable, any isolation or reserved share is explicit local policy, and scheduling gives mintable child identities no way to manufacture service weight. That last property is a basal requirement that the shipped provider does not yet meet: it rotates over mintable scope identities, so a claimant can manufacture turns by creating child scopes. The gap is disclosed in section 14.1 and deferred to Slice D. Only the exact owner releases a claim, after cleanup; no forged release exists, and cleanup retains the resources it requires. The pending-demand cardinality, selection order, and rotation rule that satisfy these properties are concrete provider policy, not mesh semantics. The provider may ask an owner whose contract declares its lease reclaimable to retire, but it never releases that owner's claim. Admission remains fallible under nonreclaimable admitted pressure, ignored retirement, or failed-cleanup retention.
 
 ### I10c. Time is not resource authority
 
@@ -942,7 +946,7 @@ A release must pass at least the following groups.
 - claims never exceed the actual provider domain in any resource dimension;
 - unused capacity is work-conservingly borrowable;
 - the basal provider has no weights, quotas, reserved shares, or partitions;
-- creating scopes or rotating mintable child identities cannot manufacture service weight;
+- creating or rotating any number of attribution child scopes for one claimant or fairness root cannot improve that claimant's service share against another root;
 - pressure and refusal never become an authorization result in either direction;
 - elapsed time alone creates, releases, expires, and validates nothing;
 - a retirement request never releases the claim it targets;
@@ -955,6 +959,8 @@ A release must pass at least the following groups.
 - malformed and unauthorized inputs cannot cross promotion;
 - media and packets remain quarantined before promotion;
 - cleanup completes at every failure point.
+
+P6 status at this disposition: the shipped provider does not satisfy the claimant-share obligation above, and no named control in this repository proves it. Its equal-class rotation is keyed to mintable process-local scope identities, so one claimant can manufacture turns by creating child scopes. This is a blocking Slice D obligation under review 4865297956 §8. It must not be reported as passing, and no existing control may be cited as evidence for it. The connector-local scheduling-metadata obligation is a separate claim about capacity authority and does not discharge P6.
 
 ### 16.4 Promotion
 
