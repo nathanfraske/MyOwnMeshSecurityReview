@@ -12,6 +12,11 @@ the shipped `FiniteResourceProvider`. Every previously listed control remains
 required. The separation changes only what a passing control is allowed to
 claim.
 
+Review `4869373979` at `f58dab6` is cited here as provenance for the wording and
+harness corrections below. A review identifier is provenance only. It is never
+execution evidence, and no control in this record may be reported as passing
+because a review exists.
+
 ## 1. Isolation and exact-head commands
 
 Run socket-bearing checks only inside Ubuntu 24.04 WSL. Do not run Windows test binaries. This keeps the controls away from live Windows MyOwnMesh processes and avoids per-binary Windows Firewall prompts.
@@ -36,6 +41,33 @@ After retaining the logs, remove only this target:
 ```powershell
 wsl.exe -d Ubuntu-24.04 -- rm -rf /root/.cache/codex/mom-arc03-red-team
 ```
+
+Harness evidence status. Hosted run `31051812846` failed for a harness reason,
+not for a boundary reason. Every temporary probe project created by
+[`scripts/check-v4-arc03-compiler-boundaries.py`](../scripts/check-v4-arc03-compiler-boundaries.py)
+is compiled outside the workspace, so it inherited no root `[patch.crates-io]`
+table. `cargo check --offline` therefore failed on the unpatched `webrtc`
+dependency before any probe could emit its expected diagnostic. That run
+produced no evidence for or against any compiler boundary, and no control in
+this record may be cited from it. The harness now regenerates the repository
+`[patch.crates-io]` entries for the pinned `vendor/webrtc-0.13.0` and
+`vendor/webrtc-ice-0.13.0` sources into every temporary manifest, including the
+authority positives and authority rejections, and fails closed when the root
+table or a vendor manifest is absent. `--offline`, the copied lockfile, the
+shared isolated compiler target, and the exact code, fragment, and primary-line
+cause matching are unchanged.
+
+The corrected harness has since been executed locally on the working tree with
+the Windows Python launcher, `py -3 scripts/check-v4-arc03-compiler-boundaries.py`,
+returning exit 0 in 171.2 s and reporting one positive public-type control, 17
+cause-matched rejection controls, four exact authority-set controls, and five
+exact real-time-flow consumers. The script starts no listener and uses its own
+isolated compiler target, so this run does not touch live Windows MyOwnMesh
+processes and does not replace the WSL commands above. It is working-tree
+evidence that the harness now reaches its diagnostics instead of dying in
+dependency resolution. It is not exact-pushed-head evidence. The hosted re-run
+after this harness change is still outstanding, and run `31051812846` remains
+superseded and non-evidential.
 
 ## 2. RT-03-01: manufacture connector resource authority
 
@@ -417,7 +449,7 @@ Required result — basal properties, provider independent:
 - an optional local ceiling can restrict a deployment without minting capacity, and remains absent from the elastic constructors;
 - `Cleanup` and `Admitted` leases are never reclamation victims; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
 - connector-local scheduling metadata is not capacity: connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant. This is a capacity-authority claim and does not discharge the claimant-share obligation below;
-- creating or rotating any number of attribution child scopes for one claimant or fairness root cannot improve that claimant's service share against another root. **No control below implements this, and the shipped provider does not satisfy it. See the missing-control note in this section;**
+- service weight is not multipliable: creating, cloning, or rotating any number of attribution child scopes beneath one claimant's `FairnessRoot` cannot improve that claimant's service share against another `FairnessRoot`. `FairnessRoot` and attribution child scope are used here with the closed definitions in [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md): a `FairnessRoot` is the trusted local attribution a provider schedules against and is not mintable by the claimant it attributes; an attribution child scope refines accounting beneath exactly one `FairnessRoot` and creates no additional root, share, or turn. **No control below implements this, and the shipped provider does not satisfy it. See the missing-control note in this section;**
 - slow work retains its finite lease without timer-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
@@ -485,9 +517,9 @@ fairness-domain liveness is not settled here.
 
 Missing control — blocking, no source control exists:
 
-- claimant-share fairness: creating or rotating any number of attribution child
-  scopes for one claimant or fairness root must not improve that claimant's
-  service share against another root.
+- claimant-share fairness: creating, cloning, or rotating any number of
+  attribution child scopes beneath one claimant's `FairnessRoot` must not
+  improve that claimant's service share against another `FairnessRoot`.
 
 No control in this record implements that obligation, and none of the controls
 listed above may be cited as evidence for it. `equal_authority_demands_rotate_without_cross_scope_reacquisition`
@@ -495,10 +527,13 @@ and `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
 exercise rotation between scope identities, which is the mechanism at issue
 rather than a proof of fairness between claimants. The shipped
 `FiniteResourceProvider` does not satisfy the obligation: its rotation is keyed
-to process-local scope identities, and a claimant can mint child scopes to
-manufacture turns. This is a disclosed nonconformance, not a pending pass, and
-it must never be reported as passing. Review 4865297956 §8 defers the fix to
-Slice D, which must bind pending demands to a non-multipliable fairness root.
+to process-local scope identities, which are mintable, so a claimant can create
+attribution child scopes to manufacture turns and the provider schedules against
+a mintable identity rather than a `FairnessRoot`. This is a disclosed
+nonconformance, not a pending pass, and it must never be reported as passing.
+Review 4865297956 §8 defers the fix to Slice D, which must bind a pending demand
+to a `FairnessRoot` that the claimant cannot create, split, name, rotate, or
+multiply, and must add the control this record is missing.
 
 The compiler-boundary checker separately rejects the listed basal cardinality
 names and requires the elastic constructors and optional local wrappers. These

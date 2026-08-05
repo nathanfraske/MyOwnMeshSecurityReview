@@ -277,15 +277,40 @@ P8 Time is not resource truth
     nothing
 ```
 
+P6 is stated over fairness roots and attribution child scopes. Both are closed architectural definitions:
+
+```text
+FairnessRoot
+    the unit of scheduling attribution that a provider serves
+    selected locally by the trusted provider or ingress owner that
+        installs the grant
+    process-local: it has meaning only within one process's scheduling.
+        It is never transmitted, never compared across processes, and
+        never derived from a wire value
+    not mintable by the claimant it attributes: a claimant cannot
+        create, split, name, rotate, or multiply its own FairnessRoot
+    not a semantic or durable identity, and not an authentication or
+        authorization root or capability: it is not a Device ID, Mesh
+        ID, durable semantic identity, endpoint identity, or wire value,
+        and holding one grants nothing. It may be a local scheduling
+        identity within its own process
+
+AttributionChildScope
+    an accounting and attribution refinement beneath exactly one
+        FairnessRoot
+    may divide, label, and measure use within that root
+    creates no additional share, turn, or service weight: the
+        scheduling share of a FairnessRoot does not change with the
+        number of attribution child scopes beneath it
+```
+
 Selection order, rotation rule, and pending-demand cardinality are concrete provider policy, not basal architecture. A resource-provider implementation chooses them and may replace them with any policy that preserves P1 through P8. No other subsystem may depend on a particular choice.
 
-The provider shipped with basal MyOwnMesh implements one concrete policy of this kind, and that policy does not yet satisfy P6. It is shared and work-conserving with no weights, quotas, reserved shares, or partitions; each scope may own at most one exact move-only pending demand; pending demand is selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotates across scopes after a demand resolves. Outside a selected pending turn, unused capacity is borrowable by any scope. During that turn, the policy reserves the selected demand's exact charge and leaves capacity beyond that charge borrowable, including surplus in an overlapping resource dimension.
+This architecture selects no scheduler, no fairness-root taxonomy, no weights or quotas, and no mapping from fairness roots to service turns. It requires only that whatever a provider selects, a claimant cannot improve its own share by creating attribution beneath its root.
 
-**Disclosed P6 nonconformance of the shipped provider.** That rotation is over process-local resource scope identities, and attribution child scopes are mintable by the claimant they attribute to. A claimant holding N child scopes therefore receives N rotation turns against another claimant's one, which is exactly the manufactured service weight P6 forbids. The shipped provider is therefore not a conforming provider today. Review 4865297956 §8 defers the correction to Slice D, which must bind pending demands to a non-multipliable fairness root instead of to a mintable scope identity before any conformance claim is made.
+A conforming provider satisfies P1 through P8. Whether any particular provider does so is recorded in the implementation and transition documents, not here.
 
-P6 stands exactly as written above. The shortfall is in the provider, not in the property, and nothing in this section weakens P6 or redefines a claimant as a scope. The shipped provider's behavior with respect to P1 through P5, P7, and P8 is claimed only where separately supported, and no claim about those properties is inferred from this paragraph.
-
-Under any such policy, when the selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Which leases are reclaimable is part of the owner contract, not a provider decision; the shipped policy treats `Speculative` leases as the reclaimable class. That request is sticky and contains no timer. It does not release, revoke, or alter a claim. The notified owner must finish cleanup and drop its lease, or explicitly transfer the unreleased claim into failed-cleanup retention when cleanup cannot be proven.
+Under any such policy, when a selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Which leases are reclaimable is part of the owner contract, not a provider decision. That request is sticky and contains no timer. It does not release, revoke, or alter a claim. The notified owner must finish cleanup and drop its lease, or explicitly transfer the unreleased claim into failed-cleanup retention when cleanup cannot be proven.
 
 No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. Optional local policy may impose stricter cardinality or isolation ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
 
@@ -544,7 +569,7 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
 14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
 15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result in either direction.
-16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and scheduling gives mintable child identities no way to manufacture service weight. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission. The shipped provider does not yet satisfy the non-multipliable scheduling weight property: it rotates over mintable scope identities, so a claimant can manufacture turns by creating child scopes. That gap is disclosed in section 5.1 and deferred to Slice D; it is a provider shortfall, not a relaxation of the invariant.
+16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and scheduling gives a claimant no way to manufacture service weight, because attribution child scopes refine accounting beneath one fairness root without creating another share or turn. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
 17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
 18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
 19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.

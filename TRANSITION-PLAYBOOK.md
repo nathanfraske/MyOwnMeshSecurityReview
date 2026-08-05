@@ -644,16 +644,37 @@ The provider port is an injection point, not a fixed implementation. Any provide
 
 The arbitration order and rotation rule of whichever provider is installed are that provider's concrete policy. They are verified against that provider, they are not basal architecture, and replacing a conforming provider with another conforming provider does not reopen the property gate.
 
+Pending-demand retention is likewise policy, not architecture. This arc requires no pending-demand mechanism at all. Selected turns, exact-charge reservation, cooperative entry, and drop-cancellation belong to the concrete provider gate. The property gate states only what must hold *if* a provider retains capacity for a waiting demand.
+
+**Fairness attribution vocabulary.** This vocabulary is closed. Scheduling attribution has exactly two terms, and any other phrase for the same idea must be read as one of them.
+
+```text
+FairnessRoot
+    process-local scheduling attribution
+    selected by the trusted provider or ingress owner, never by the claimant
+    non-mintable by the claimant
+    NOT a Device identity, Mesh identity, durable identity, endpoint identity,
+        authentication or authorization root or capability, or wire value
+    carries no authority and selects no universal turn model
+
+AttributionChildScope
+    refines accounting below exactly one FairnessRoot
+    cannot create a share; cannot create a turn
+    minting or rotating any number under one root leaves that root's share unchanged
+```
+
+Service share is a property of FairnessRoots. Accounting detail is a property of AttributionChildScopes. A provider that rotates over AttributionChildScope identities instead of FairnessRoots lets a claimant buy turns by minting child scopes, which the vocabulary forbids.
+
 **Steps**
 
 1. Define the resource provider port, finite claim vector, exact lease, typed pressure results, and explicit residual classification. Keep the port injectable so a host-backed, isolated, injected, or deterministic finite provider can be installed without changing owners.
 2. Make every protected allocation, retained value, task, queue entry, native object, and scheduled work unit hold a live lease.
-3. Issue accounting and attribution child scopes without multiplying the process grant.
+3. Issue AttributionChildScopes without multiplying the process grant, and without letting any of them create a share or a turn.
 4. Replace unleased channels, maps, task spawns, queues, retries, and storage with typed admission and pressure results.
-5. Keep one process grant shared and work-conserving, with no weights, quotas, reserved shares, or partitions, and reserve only a selected demand's exact charge so surplus stays borrowable. State the installed provider's arbitration as concrete provider policy: the current deterministic finite provider represents one exact move-only pending demand per scope, selects `Cleanup > Admitted > Speculative`, and rotates equal-class selection across process-local scope identities after each resolved demand. Document that order and rotation as this provider's policy, not as a basal limit on conforming providers.
+5. Keep one process grant shared and work-conserving, with no weights, quotas, reserved shares, or partitions. State the installed provider's retention and arbitration as concrete provider policy: the current deterministic finite provider represents one exact move-only pending demand per scope, reserves only that demand's exact charge so surplus stays borrowable, selects `Cleanup > Admitted > Speculative`, and rotates equal-class selection across process-local AttributionChildScope identities after each resolved demand. Document that retention, order, and rotation as this provider's policy, not as a basal limit on conforming providers. Record that the rotation key is an AttributionChildScope identity rather than a FairnessRoot, which is the disclosed P6 gap.
 6. Keep protocol bounds, provider structural limits, runtime availability, and optional local ceilings distinct.
 7. Let a provider request retirement only from the exact owner of a lease whose owner contract declares it reclaimable; the current deterministic finite provider treats `Speculative` leases as that reclaimable class, which is provider policy rather than a basal requirement. Keep disposition with owner Drop after cleanup or explicit failed-cleanup retention. Add no timer and claim no guarantee against nonreclaimable admitted pressure, ignored retirement, or failed cleanup.
-8. Test the property gate and the provider policy separately. Property tests cover identity rotation, many-source pressure, unequal claim sizes, exact release, conservation under concurrent charges, child-scope borrowing, cooperative retirement, ignored retirement, failed-cleanup retention, pre-reserved cleanup under a full grant, optional ceilings including the all-absent case, slow work, and storage-backed work. Provider-policy tests cover move-only pending demand, authority ordering, equal-class rotation, victim-set proof, and arbitration determinism against the installed provider. The property gate additionally requires a claimant-share control — one claimant minting many attribution child scopes gains no service share against another fairness root — which no named control currently implements. That control is outstanding and blocking for Slice D; the property gate is not satisfied merely because the provider-policy tests pass.
+8. Test the property gate and the provider policy separately. Property tests cover identity rotation, many-source pressure, unequal claim sizes, exact release, conservation under concurrent charges, child-scope borrowing, cooperative retirement, ignored retirement, failed-cleanup retention, pre-reserved cleanup under a full grant, optional ceilings including the all-absent case, slow work, and storage-backed work. Provider-policy tests cover move-only pending demand, exact-charge reservation, cooperative entry, drop-cancellation, authority ordering, equal-class rotation, victim-set proof, and arbitration determinism against the installed provider. Add the P6 test — that minting AttributionChildScopes under one FairnessRoot does not increase that root's service share — and record it as failing rather than omitting it. The property gate additionally requires a claimant-share control — one claimant minting many attribution child scopes gains no service share against another fairness root — which no named control currently implements. That control is outstanding and blocking for Slice D; the property gate is not satisfied merely because the provider-policy tests pass.
 9. Measure performance, provider cost, scheduling, regression, and opaque residuals without deriving universal object counts.
 10. Require the deployment or embedder to name the installed provider and the origin of its capacity. Ship no default grant, no library-supplied numeric value, and no invented ceiling.
 
@@ -668,13 +689,13 @@ This is the transition gate. It is stated as properties of ownership, and any co
 - **Pressure is not authorization.** Refusal names a resource dimension rather than an object count; resource refusal is never an Open or Closed authorization result, and Open overload is reported as resource pressure, never as unauthorized identity.
 - **Non-interchangeable permits.** Pre-auth and post-auth permits cannot substitute for each other.
 - **Connector-local scheduling metadata is not capacity.** A scheduling weight, quantum, or share is connector-local ordering only; it reserves no provider capacity, guarantees no cross-scope admission, and multiplying it multiplies no grant. This is a claim about capacity authority and does not discharge the fairness obligation below.
-- **Non-multipliable service weight (P6).** Creating or rotating any number of attribution child scopes for one claimant or fairness root cannot improve that claimant's service share against another root. **Not satisfied at this disposition.** The installed deterministic finite provider rotates equal-authority turns over mintable process-local scope identities, so one claimant can manufacture turns by minting child scopes. No named control proves this obligation. It is a blocking Slice D obligation under review 4865297956 §8 and must not be reported as passing.
+- **Non-multipliable service weight (P6).** Minting, cloning, or rotating any number of AttributionChildScopes under one FairnessRoot cannot improve that root's service share against another FairnessRoot. **Not satisfied at this disposition.** The installed deterministic finite provider rotates equal-authority turns over mintable AttributionChildScope identities rather than over FairnessRoots, so one claimant can manufacture turns by minting child scopes — an AttributionChildScope creating a turn, which the closed vocabulary forbids. No named control proves this obligation. It is a blocking Slice D obligation under review 4865297956 §8 and must not be reported as passing.
 - **Cleanup ownership.** Cleanup capacity that must be available under every condition is reserved before allocation, so cleanup proceeds from its pre-reserved claim even when the grant is full; disposition remains owner Drop after cleanup or explicit failed-cleanup retention, and no provider releases or invalidates an owner's lease.
-- **Explicit isolation.** Outside a selected pending charge, unused capacity is borrowable unless an explicit local isolation policy forbids it; isolation is opt-in and named, never implied.
-- **Exact reservation.** A selected pending demand reserves only its exact charge; surplus remains borrowable, including surplus in an overlapping dimension.
+- **Explicit isolation.** Unused capacity is borrowable unless an explicit local isolation policy forbids it; isolation is opt-in and named, never implied.
+- **Conditional pending-demand safety.** This gate requires no pending-demand mechanism. *If* a provider retains or reserves capacity for a waiting demand, that retention mints no capacity, releases or invalidates no other owner's lease, blocks no surplus beyond what that demand itself requires absent an explicit named isolation policy, creates no admission guarantee against nonreclaimable admitted pressure, and ends when the demand ends without a timer. A provider that never retains satisfies this vacuously and is not thereby nonconforming. Exact-charge reservation, selected turns, cooperative entry, and drop-cancellation are concrete provider policy and are gated below, not here.
 - **No basal cardinality.** No `unlimited` sentinel, default grant, hidden default cardinality, or basal maximum Mesh, peer, attempt, session, or flow count exists; the process grant carries no weights, quotas, reserved shares, or partitions.
 - **Time is not resource truth.** No timer creates, releases, or reclaims capacity, and no valid slow lease expires by elapsed time alone.
-- **Honest limits.** No admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup; every dimension the implementation does not charge is a named residual, not silence.
+- **Honest limits.** No admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup; every dimension the implementation does not charge is a named residual, not silence. **How a named residual becomes an enforced charge is an open Slice C question.** Adapter hook, external isolation boundary, conservative over-charge, and permanent disclosed non-enforcement are not equivalent answers. This gate does not choose among them and does not assert that every residual is enforceable in principle; it requires only that residuals be named rather than omitted.
 - **Optional ceilings stay optional.** Every local ceiling is owner-selected and separable; removing all of them leaves a conforming system, and no ceiling is reported as a protocol bound or a provider structural limit.
 - Normal connection and media performance remains owner-acceptable under measured workloads.
 
@@ -682,8 +703,12 @@ This is the transition gate. It is stated as properties of ownership, and any co
 
 These are properties of the installed provider, verified against that provider. They are not basal architecture. Installing a different conforming provider changes what is verified here and does not reopen the property gate above.
 
+- the provider retains capacity for a pending demand, so the property gate's conditional clause applies to it non-vacuously;
 - one move-only pending demand exists per scope;
-- arbitration selects `Cleanup > Admitted > Speculative`, with equal-class rotation across process-local scope identities. Because those identities are mintable, this rotation does not satisfy the P6 claimant-share obligation in the property gate above; the provider is fairness-nonconforming until Slice D binds demands to a non-multipliable fairness root;
+- a selected pending demand reserves only its exact charge; surplus remains borrowable, including surplus in an overlapping dimension;
+- plain scope bookkeeping cannot consume the charge reserved for that demand;
+- a demand that cannot fit enters the turn only through the cooperative API, and dropping it cancels the turn without releasing another owner's capacity;
+- arbitration selects `Cleanup > Admitted > Speculative`, with equal-class rotation across process-local AttributionChildScope identities. Because those identities are mintable and are not FairnessRoots, this rotation does not satisfy the P6 obligation in the property gate above; the provider is fairness-nonconforming until Slice D binds demands to a FairnessRoot selected by the trusted provider or ingress owner;
 - reclaim requests are published only after the provider proves the selected victim set can satisfy the deficit;
 - the provider requests retirement only from exact reclaimable Speculative owners and never releases their claims;
 - arbitration is deterministic: identical claim sequences over identical grants produce identical admission outcomes, with no clock, entropy, or host probe in the decision;
@@ -932,7 +957,9 @@ The playbook does not invent:
 - the final protocol/profile identifier;
 - the Closed governance proof and recovery rule;
 - local-principal authentication per platform;
-- the installed resource provider, the origin of its capacity, and its arbitration policy;
+- the installed resource provider, the origin of its capacity, its retention behavior, and its arbitration policy;
+- the FairnessRoot selection rule, including which trusted provider or ingress owner selects a root and how roots are separated;
+- the disposition of each named residual: adapter hook, external isolation boundary, conservative over-charge, or disclosed non-enforcement;
 - whether the optional local ceiling set is absent or enabled, and every value in it when enabled;
 - optional local resource, queue, retry, timeout, cache, cost, isolation, and bandwidth policy values;
 - required restrictive-network connector profiles;
@@ -941,4 +968,4 @@ The playbook does not invent:
 - performance regression tolerances;
 - release cohort and rollback policy.
 
-Each optional policy is surfaced with measurements and concrete alternatives for owner review. Measurements do not define basal product cardinality.
+Each optional policy is surfaced with measurements and concrete alternatives for owner review. Measurements do not define basal product cardinality. Structural counts are not deployment-capacity recommendations, universal protocol limits, or evidence of exact physical resource quantity.

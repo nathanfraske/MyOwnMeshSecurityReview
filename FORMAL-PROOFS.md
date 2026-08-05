@@ -569,15 +569,20 @@ A deterministic selection policy yields a defined service order, not eventual ad
 
 Theorems 14.1 through 14.5c constrain any conforming resource provider: conservation of `sum(R) <= G`, explicit owner-held cleanup, honest retention of unreleasable charges, typed pressure rather than authorization, and fallible admission. They deliberately fix no scheduling algorithm.
 
-A concrete provider — for example the `FiniteResourceProvider` used by the reference implementation — may additionally adopt an exact pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes. Such a rule is one provider policy. It is not a universal mesh semantic, is not a proof obligation of this model, and no result above becomes unsound if a different conforming provider selects demands differently.
+A concrete provider may additionally adopt an exact pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes. Such a rule is one provider policy. It is not a universal mesh semantic, is not a proof obligation of this model, and no result above becomes unsound if a different conforming provider selects demands differently.
 
-### Note 14.5e. Fairness against a mintable claimant is a separate, currently unsatisfied obligation
+### Note 14.5e. Fairness against a mintable claimant is a separate provider obligation
 
-Provider conformance also requires that a claimant cannot manufacture service weight by creating attribution child scopes: creating or rotating any number of child scopes for one claimant or fairness root must not improve that claimant's service share against another root. That is a fairness obligation on the provider, not a corollary of any theorem above.
+Provider conformance also requires that a claimant cannot manufacture service weight by creating attribution beneath its own fairness root. The terms are the closed architectural definitions:
 
-It is unproven and, at the current disposition, unsatisfied. The reference `FiniteResourceProvider` rotates equal-class turns over mintable process-local scope identities, so a claimant holding N child scopes receives N turns against another claimant's one. Review 4865297956 §8 defers the correction to Slice D, which must bind pending demands to a non-multipliable fairness root.
+- a `FairnessRoot` is the unit of scheduling attribution a provider serves. It is selected locally by the trusted provider or ingress owner that installs the grant, is process-local, is not mintable by the claimant it attributes, and is neither a semantic or durable identity nor an authentication or authorization root or capability. It may be a local scheduling identity within its own process, but it is not a Device ID, Mesh ID, durable semantic identity, endpoint identity, or wire value.
+- an `AttributionChildScope` refines accounting beneath exactly one `FairnessRoot` and creates no additional share, turn, or service weight.
 
-The conservation and impossibility results are unaffected in both directions. Theorems 14.1 through 14.5c neither prove this fairness obligation nor depend on it: `sum(R) <= G` holds regardless of which demand is served next, because selection and rotation do not change `R`. Conversely, satisfying this fairness obligation later cannot strengthen any liveness claim disclaimed in 14.5b and 14.5c. No safety result in this document may be cited as evidence that the fairness obligation holds.
+The obligation is: for any two distinct fairness roots, creating or rotating any number of attribution child scopes beneath one of them must not improve that root's service share against the other.
+
+This is a fairness obligation on a provider, not a corollary of any theorem above. This document does not prove it and supplies no scheduler, root taxonomy, weighting, or turn mapping that would.
+
+The conservation and impossibility results are independent of it in both directions. Theorems 14.1 through 14.5c neither prove the obligation nor depend on it: `sum(R) <= G` holds regardless of which demand is served next, because selection and rotation do not change `R`. Conversely, discharging the obligation cannot strengthen any liveness claim disclaimed in 14.5b and 14.5c. No safety result in this document may be cited as evidence that the obligation holds.
 
 ### Theorem 14.6. Optional ceiling confinement
 

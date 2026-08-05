@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -20,6 +21,11 @@ DAEMON = REPO / "crates" / "myownmesh"
 COMPILER_TARGET = tempfile.TemporaryDirectory(
     prefix="myownmesh-v4-arc03-compiler-target-"
 )
+# Probes compile outside the workspace and therefore inherit no root
+# `[patch.crates-io]` table. These pinned vendor sources must be re-declared in
+# every temporary manifest, or `cargo check --offline` fails on dependency
+# resolution before it can emit an expected diagnostic.
+REQUIRED_VENDOR_PATCHES = ("webrtc", "webrtc-ice")
 
 
 @dataclass(frozen=True)
@@ -245,9 +251,71 @@ fn main() { let _ = std::mem::size_of::<LegacyV1Runtime>(); }
 )
 
 
+def toml_string(value: str) -> str:
+    """Quote one TOML basic string."""
+
+    return json.dumps(value)
+
+
+@functools.lru_cache(maxsize=1)
+def vendor_patch_entries() -> tuple[tuple[str, str], ...]:
+    """Return the repository `[patch.crates-io]` overrides as absolute paths.
+
+    External probes are compiled outside the workspace, so they do not inherit
+    the root patch table. Without it, `cargo check --offline` tries to resolve
+    the unpatched registry dependency and fails before any expected diagnostic
+    is produced. The entries are read from the repository manifest so the
+    probes cannot drift from the pinned vendor sources.
+    """
+
+    manifest = (REPO / "Cargo.toml").read_text(encoding="utf-8")
+    section = re.search(
+        r"^\[patch\.crates-io\][^\n]*\n(.*?)(?=^\[|\Z)",
+        manifest,
+        re.MULTILINE | re.DOTALL,
+    )
+    if section is None:
+        raise SystemExit(
+            "harness precondition failed: root Cargo.toml has no "
+            "[patch.crates-io] table for the pinned vendor sources"
+        )
+    entries: list[tuple[str, str]] = []
+    for name, relative in re.findall(
+        r'^\s*([A-Za-z0-9_-]+)\s*=\s*\{[^}\n]*\bpath\s*=\s*"([^"]+)"',
+        section.group(1),
+        re.MULTILINE,
+    ):
+        resolved = (REPO / relative).resolve()
+        if not (resolved / "Cargo.toml").is_file():
+            raise SystemExit(
+                "harness precondition failed: patched dependency "
+                f"{name} has no manifest at {resolved.as_posix()}"
+            )
+        entries.append((name, resolved.as_posix()))
+    patched = {name for name, _ in entries}
+    missing = [name for name in REQUIRED_VENDOR_PATCHES if name not in patched]
+    if missing:
+        raise SystemExit(
+            "harness precondition failed: root [patch.crates-io] is missing "
+            f"{', '.join(missing)}; external probes would resolve unpinned "
+            "registry sources"
+        )
+    return tuple(entries)
+
+
+def patch_section() -> str:
+    """Emit the `[patch.crates-io]` table shared by every temporary probe."""
+
+    lines = [
+        f"{name} = {{ path = {toml_string(path)} }}"
+        for name, path in vendor_patch_entries()
+    ]
+    return "[patch.crates-io]\n" + "\n".join(lines) + "\n"
+
+
 def cargo_toml() -> str:
-    core_path = CORE.as_posix().replace('"', '\\"')
-    bins = [
+    core_path = toml_string(CORE.as_posix())
+    bins: list[str] = [
         "[[bin]]\n" f'name = "{probe.name}"\n' f'path = "src/{probe.name}.rs"\n'
         for probe in REJECTED
     ]
@@ -262,13 +330,15 @@ def cargo_toml() -> str:
         'version = "0.0.0"\n'
         'edition = "2021"\n\n'
         "[dependencies]\n"
-        f'myownmesh-core = {{ path = "{core_path}" }}\n\n'
+        f"myownmesh-core = {{ path = {core_path} }}\n\n"
         + "\n".join(bins)
+        + "\n"
+        + patch_section()
     )
 
 
 def authority_cargo_toml(name: str, features: tuple[str, ...]) -> str:
-    core_path = CORE.as_posix().replace('"', '\\"')
+    core_path = toml_string(CORE.as_posix())
     feature_clause = ""
     if features:
         selected = ", ".join(json.dumps(feature) for feature in features)
@@ -279,11 +349,24 @@ def authority_cargo_toml(name: str, features: tuple[str, ...]) -> str:
         'version = "0.0.0"\n'
         'edition = "2021"\n\n'
         "[dependencies]\n"
-        f'myownmesh-core = {{ path = "{core_path}"{feature_clause} }}\n\n'
+        f"myownmesh-core = {{ path = {core_path}{feature_clause} }}\n\n"
         "[[bin]]\n"
         f'name = "{name}"\n'
-        f'path = "src/{name}.rs"\n'
+        f'path = "src/{name}.rs"\n\n'
+        + patch_section()
     )
+
+
+def write_manifest(project: Path, manifest: str) -> None:
+    """Write one probe manifest after checking it carries the vendor patches."""
+
+    for name, path in vendor_patch_entries():
+        if f"{name} = {{ path = {toml_string(path)} }}" not in manifest:
+            raise SystemExit(
+                "harness self-check failed: generated manifest in "
+                f"{project.as_posix()} does not patch {name}"
+            )
+    (project / "Cargo.toml").write_text(manifest, encoding="utf-8", newline="\n")
 
 
 def run_check(project: Path, binary: str) -> tuple[int, list[dict], str]:
@@ -822,7 +905,7 @@ def main() -> int:
         project = Path(temporary)
         source_dir = project / "src"
         source_dir.mkdir()
-        (project / "Cargo.toml").write_text(cargo_toml(), encoding="utf-8", newline="\n")
+        write_manifest(project, cargo_toml())
         shutil.copyfile(REPO / "Cargo.lock", project / "Cargo.lock")
         for probe in REJECTED:
             (source_dir / f"{probe.name}.rs").write_text(
@@ -864,9 +947,7 @@ def main() -> int:
             project = Path(temporary)
             source_dir = project / "src"
             source_dir.mkdir()
-            (project / "Cargo.toml").write_text(
-                authority_cargo_toml(name, features), encoding="utf-8", newline="\n"
-            )
+            write_manifest(project, authority_cargo_toml(name, features))
             shutil.copyfile(REPO / "Cargo.lock", project / "Cargo.lock")
             (source_dir / f"{name}.rs").write_text(
                 source, encoding="utf-8", newline="\n"
@@ -883,11 +964,7 @@ def main() -> int:
             project = Path(temporary)
             source_dir = project / "src"
             source_dir.mkdir()
-            (project / "Cargo.toml").write_text(
-                authority_cargo_toml(probe.name, features),
-                encoding="utf-8",
-                newline="\n",
-            )
+            write_manifest(project, authority_cargo_toml(probe.name, features))
             shutil.copyfile(REPO / "Cargo.lock", project / "Cargo.lock")
             (source_dir / f"{probe.name}.rs").write_text(
                 probe.source, encoding="utf-8", newline="\n"

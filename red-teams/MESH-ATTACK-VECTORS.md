@@ -6,6 +6,8 @@ This catalog supersedes architecture-dependent pass conditions that required eve
 
 The current-source findings remain source findings. Their target interpretation is updated to match [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
+Reviews `4865297956` at `378dd82` and `4869373979` at `f58dab6` are cited in this catalog as provenance for wording corrections. A review identifier is never execution evidence, and no pass condition here is satisfied by citing one.
+
 ## 1. Target security boundary
 
 The target permits bounded useful networking work before endpoint admission:
@@ -455,7 +457,7 @@ Let one Mesh scope borrow the last grantable units with reclaimable speculative 
 
 **Pass:** The provider creates no weight, quota, share, or new capacity. It requests retirement from the exact speculative owner but does not release the claim. The selected demand acquires only after the owner drops the exact lease. Those are the basal properties. The shipped `FiniteResourceProvider` implements them by giving `Cleanup`, then `Admitted`, then `Speculative` the next turn and rotating equal-authority scope identities, so that under this provider no scope reacquires indefinitely ahead of an equal-authority scope's outstanding demand. That exact order, that rotation, and the non-reacquisition behavior they produce are this provider's concrete policy, and the control asserts them as provider evidence rather than as universal provider conformance.
 
-**Not covered — disclosed nonconformance.** This vector submits demands from distinct scope identities, so it exercises rotation between scopes. It does not exercise one claimant minting several attribution child scopes to collect several turns against a claimant holding one. The shipped `FiniteResourceProvider` fails that case: rotation is keyed to mintable process-local scope identities rather than to a non-multipliable fairness root, so service share scales with scopes minted. No control asserts that case and no pass is claimed for it. Per-scope rotation evidence must not be presented as claimant fairness. Review 4865297956 §8 defers the correction to Slice D.
+**Not covered — disclosed nonconformance.** This vector submits demands from distinct scope identities, so it exercises rotation between scopes. It does not exercise one claimant creating several attribution child scopes beneath its own `FairnessRoot` to collect several turns against a claimant holding one. The shipped `FiniteResourceProvider` fails that case: rotation is keyed to mintable process-local scope identities rather than to a `FairnessRoot`, so service share scales with the scopes a claimant creates. `FairnessRoot` and attribution child scope are used here with the closed definitions in [`../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md): a `FairnessRoot` is the trusted local attribution a provider schedules against and is not mintable by the claimant it attributes; an attribution child scope refines accounting beneath exactly one `FairnessRoot` and creates no additional root, share, or turn. No control asserts that case and no pass is claimed for it. Per-scope rotation evidence must not be presented as claimant fairness. Review 4865297956 §8 defers the correction to Slice D.
 
 ### HYB-050. Slow valid lease
 

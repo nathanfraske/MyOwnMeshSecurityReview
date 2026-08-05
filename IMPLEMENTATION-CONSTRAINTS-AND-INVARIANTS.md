@@ -685,11 +685,42 @@ P8 Time is not resource truth
     nothing
 ```
 
+P6 uses one closed term, used with the same meaning everywhere it appears:
+
+```text
+FairnessRoot
+    the trusted local attribution a provider schedules against: a
+    process-local scheduling identity for one principal or ingress
+    source, assigned by the local process and never supplied, chosen,
+    or created by the claimant it attributes
+
+    it is not a Device ID, Mesh Context, durable fact author, endpoint
+    identity, authentication or authorization root or capability, or
+    any wire-visible or peer-supplied value, and it carries no authority
+    of any kind
+
+    an attribution child scope refines accounting beneath exactly one
+    FairnessRoot; creating, cloning, or rotating child scopes cannot
+    create a second root, a second share, or a second turn
+```
+
+A scope is an accounting subdivision. It is never itself a claimant or a FairnessRoot, and no wording in this document may be read as making it one.
+
+Which local values a deployment maps onto a FairnessRoot is provider and deployment policy. This document fixes no universal scheduler model, root taxonomy, or principal enumeration, and P6 requires none. P6 requires only that whatever the provider actually schedules against is not mintable by the claimant.
+
 Pending-demand cardinality, selection order, and rotation are concrete provider policy. The provider implementation selects them, and any policy preserving P1 through P8 is conforming. No other component may depend on a particular selection order or rotation rule, and conformance tests must assert the properties rather than the schedule.
 
 The provider shipped with basal MyOwnMesh implements one policy of this kind, and that policy does not yet satisfy P6: shared and work-conserving, with no weights, quotas, reserved shares, or partitions; unused process capacity borrowable across child scopes; at most one exact move-only pending demand per scope; pending demands selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotating across scopes after a demand resolves. Replacing that policy is a provider decision, not a semantic change.
 
-**Disclosed P6 nonconformance of the shipped provider.** Equal-class rotation is keyed to process-local `ResourceScopeId`, and attribution child scopes are mintable by the claimant they attribute to. A claimant holding N child scopes receives N rotation turns against another claimant's one, which is the manufactured service weight P6 forbids. The shipped provider is therefore not conforming today, and no statement in this document may be read as claiming that it is. Review 4865297956 §8 defers the correction to Slice D, which must bind a pending demand to a non-multipliable fairness root rather than to a mintable scope identity.
+**Disclosed P6 nonconformance of the shipped provider.**
+
+*Mechanism.* The shipped provider's equal-class rotation cursor is keyed to `ResourceScopeId`. That identifier is derived from the allocation address of a fresh process-local scope identity at each scope construction, so any claimant that can create an attribution child scope can create another rotation key. The provider therefore schedules against a mintable scope identity, not against a FairnessRoot. Nothing binds the several scope identities of one claimant back to a single root.
+
+*Consequence.* A claimant holding N attribution child scopes receives N rotation turns against another claimant's one. That is exactly the manufactured service weight P6 forbids. The shipped provider is therefore not a conforming provider today, and no statement in this document may be read as claiming that it is.
+
+*Evidence status.* No control in this repository proves the claimant-share obligation, and none may be cited as if it did. The existing rotation and yield tests demonstrate that a scope's outstanding demand is eventually served; they say nothing about the share of a claimant that holds several scopes. Connector-local scheduling metadata is a separate claim about capacity authority and does not discharge P6. Disclosure of this gap is not evidence that the gap is closed.
+
+*Remediation destination.* The correction belongs to the resource provider's fairness slice, which must bind a pending demand to a FairnessRoot as defined above rather than to a mintable scope identity, and must supply a control that a claimant cannot improve its share by creating child scopes. Until that control exists and passes, this obligation stays open and must be reported as failing.
 
 P6 is unchanged and remains basal. The shortfall is in the provider, not in the property; a claimant is not redefined as a scope, and P6 is not relaxed to a per-scope guarantee. The shipped provider's standing under P1 through P5, P7, and P8 is asserted only where separately supported and is not implied by this paragraph.
 
@@ -946,7 +977,7 @@ A release must pass at least the following groups.
 - claims never exceed the actual provider domain in any resource dimension;
 - unused capacity is work-conservingly borrowable;
 - the basal provider has no weights, quotas, reserved shares, or partitions;
-- creating or rotating any number of attribution child scopes for one claimant or fairness root cannot improve that claimant's service share against another root;
+- creating, cloning, or rotating any number of attribution child scopes beneath one FairnessRoot cannot improve that claimant's service share against another FairnessRoot — **open and failing against the shipped provider; see the P6 status note at the end of this subsection**;
 - pressure and refusal never become an authorization result in either direction;
 - elapsed time alone creates, releases, expires, and validates nothing;
 - a retirement request never releases the claim it targets;
@@ -960,7 +991,7 @@ A release must pass at least the following groups.
 - media and packets remain quarantined before promotion;
 - cleanup completes at every failure point.
 
-P6 status at this disposition: the shipped provider does not satisfy the claimant-share obligation above, and no named control in this repository proves it. Its equal-class rotation is keyed to mintable process-local scope identities, so one claimant can manufacture turns by creating child scopes. This is a blocking Slice D obligation under review 4865297956 §8. It must not be reported as passing, and no existing control may be cited as evidence for it. The connector-local scheduling-metadata obligation is a separate claim about capacity authority and does not discharge P6.
+P6 status at this disposition: the shipped provider does not satisfy the claimant-share obligation above, and no named control in this repository proves it. Its equal-class rotation is keyed to `ResourceScopeId`, which is derived from the allocation address of a fresh process-local scope identity at each scope construction, so one claimant can manufacture turns by creating attribution child scopes. The provider schedules against a mintable scope identity rather than a FairnessRoot. This is a blocking obligation on the resource provider's fairness slice. It must not be reported as passing, no existing control may be cited as evidence for it, and the gate must not be reworded into something the current provider already satisfies. The connector-local scheduling-metadata obligation is a separate claim about capacity authority and does not discharge P6.
 
 ### 16.4 Promotion
 
