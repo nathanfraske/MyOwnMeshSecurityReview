@@ -86,10 +86,13 @@ cargo run -p myownmesh -- serve
 just serve                                    # MYOWNMESH_LOG=debug cargo run -p myownmesh -- serve
 ```
 
-Arc 03 connector-capable daemon startup requires the complete owner-selected
-process, per-Mesh, callback, real-time-flow, and close policy vector. No numeric
-defaults are supplied. See [the quickstart policy input list](docs/QUICKSTART.md#2-open-the-mesh).
-An explicitly non-participating infrastructure host needs no connector policy.
+Arc 03 connector-capable daemon startup requires an explicit finite process
+resource grant. The owner also selects whether optional local ceilings and
+codec-neutral real-time ownership are enabled. Ordinary elastic construction
+does not require static Mesh, peer, attempt, queue, or flow counts. Native close
+has no timeout or owner-selected close-policy input. See
+[the quickstart policy input list](docs/QUICKSTART.md#2-open-the-mesh). An
+explicitly non-participating infrastructure host needs no connector policy.
 
 ### 2. Run the desktop GUI
 
@@ -145,7 +148,7 @@ async fn run(
         network_id: "my-cool-mesh".into(),
         label: "Home mesh".into(),
         kind: Default::default(),                 // Open governance
-        topology: TopologyMode::default(),       // Ring
+        topology: TopologyMode::default(),       // FullMesh
         signaling: Default::default(),            // Nostr + mDNS defaults
         stun_servers: Default::default(),
         turn_servers: Default::default(),
@@ -224,7 +227,7 @@ protocol-message checklist, and the topology-mode checklist.
 - **Trystero-wire-compatible Nostr signaling.** Same room-handle derivation as JS Trystero v0.24 (`SHA-256(app_id || ":" || network_id)`), same deterministic relay shuffle. Eight published-fix patches against `@trystero-p2p/core` are baked in natively — catalogued in [`crates/myownmesh-signaling/src/upstream.rs`](crates/myownmesh-signaling/src/upstream.rs) so upstream-tracking is a code-level diff, not a patches/ folder.
 - **Zeroconf LAN discovery, on by default.** An mDNS/DNS-SD driver runs alongside Nostr: each network registers a `_myownmesh._tcp.local.` instance with the room handle in TXT, browses for peers in the same room, and exchanges SDP over a unicast TCP port advertised in SRV. Pure Rust (`mdns-sd` — no Avahi/Bonjour binding; coexists with system daemons on 5353) and clock-free, so it works on a device whose RTC still reads the epoch. Outbound signals fan out to both drivers and an inbound gate drops cross-transport duplicates, so co-located peers mesh even with every relay unreachable. Set `signaling.strategy = "none"` and keep `mdns = true` for a fully air-gapped mesh — zero remote infrastructure. Details in [`crates/myownmesh-signaling/README.md`](crates/myownmesh-signaling/README.md).
 - **Host your own infrastructure.** A device can be any combination of a mesh node and hosted services: a relay (roster-gated routing), an **intelligent signaling relay** (a NIP-01 server the built-in driver speaks to unchanged — with live presence, instant-departure coordination, and flood limits, so it's safe to run publicly), and STUN / TURN servers (RFC 5389 / 5766, the latter with a per-connection bandwidth cap). Turn off the node role for a **pure-infrastructure box**. Toggle everything from the GUI (Settings → Services), the CLI (`myownmesh ctl services …`), or `config.json`; hosts advertise their roles + endpoints so the fleet self-discovers them. This is what makes a **fully internet-isolated network** trivial — no Google STUN, no Cloudflare TURN, no public relay. See [`docs/SERVICES.md`](docs/SERVICES.md).
-- **Selectable topologies.** Ring (default — sorted-lex with 2 neighbours + shortcuts), Star (explicit hub), FullMesh (everyone to everyone). All built on the same shelving primitive; both sides of every pair run the same pure-function selector over the same sorted input, so the result is symmetric without coordination.
+- **Selectable topologies.** FullMesh is the default. Ring uses sorted peers with 2 neighbours and shortcuts, while Star uses an explicit hub. All use the same shelving primitive; both sides of every pair run the same pure-function selector over the same sorted input, so the result is symmetric without coordination.
 - **Typed pub/sub + generic RPC over one data channel.** `Channel<T>` is a typed publish/subscribe channel keyed by name. `Rpc::call` / `serve` / `call_stream` / `serve_stream` is the generic request/response surface. Embedders define their own message types — the mesh treats payloads opaquely.
 - **Embed without the GUI or updater.** The daemon, the library, and the desktop GUI are separate crates. An app embedding `myownmesh-core` doesn't pull in the HTTP self-updater or the Tauri stack. The GUI itself is a *client* of the daemon (over a local control socket) so crashing the UI never disturbs the running mesh.
 - **Appliance-ready daemon builds.** Every release ships two daemon-only, fully static musl tarballs — `myownmesh-linux-riscv64.tar.gz` (NanoKVM) and `myownmesh-linux-aarch64-musl.tar.gz` (NanoKVM-Pro) — one binary, no glibc. See [`docs/NANOKVM.md`](docs/NANOKVM.md).

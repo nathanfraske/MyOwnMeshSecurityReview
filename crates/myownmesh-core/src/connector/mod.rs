@@ -73,6 +73,10 @@ impl ConnectedChannelCapability {
     pub(crate) fn retain_after_cleanup_failure(&mut self) {
         self.candidate.retain_after_cleanup_failure();
     }
+
+    pub(crate) fn release_after_cleanup_success(&mut self) {
+        self.candidate.release_after_cleanup_success();
+    }
 }
 
 /// Compatibility-only, process-local authority for connector-native
@@ -89,16 +93,38 @@ impl ConnectedChannelCapability {
 /// serializable. Runtime owners may share the exact instance through `Arc`.
 pub(crate) struct ConnectorRealtimeFlowCapability {
     incarnation: Arc<WebRtcConnectorIncarnation>,
+    _resources: crate::resource::ResourceLease,
 }
 
 impl ConnectorRealtimeFlowCapability {
-    pub(super) fn new(incarnation: Arc<WebRtcConnectorIncarnation>) -> Self {
-        Self { incarnation }
+    pub(super) fn new(
+        incarnation: Arc<WebRtcConnectorIncarnation>,
+        resources: crate::resource::ResourceLease,
+    ) -> Self {
+        Self {
+            incarnation,
+            _resources: resources,
+        }
     }
 
     pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
         Arc::ptr_eq(&self.incarnation, incarnation) && incarnation.is_active()
     }
+}
+
+pub(super) fn realtime_flow_capability_claim(
+) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    let bytes =
+        u64::try_from(std::mem::size_of::<ConnectorRealtimeFlowCapability>()).map_err(|_| {
+            crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            }
+        })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+        (crate::resource::ResourceClass::StorageObject, 1),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+    ])
 }
 
 /// Temporary adapter for the existing live channel object.

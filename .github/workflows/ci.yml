@@ -46,7 +46,7 @@ jobs:
       - name: Tests
         run: cargo test --workspace --no-fail-fast
 
-      - name: Arc 03J desktop compatibility artifact
+      - name: Arc 03 final desktop compatibility artifact
         run: |
           cargo check -p myownmesh-core --all-targets --features "legacy-v1"
           cargo check -p myownmesh-core --all-targets --features "legacy-media"
@@ -91,7 +91,7 @@ jobs:
       - name: Arc 03 compiler boundary controls
         run: python3 scripts/check-v4-arc03-compiler-boundaries.py
 
-      - name: Arc 03J native lifecycle, cleanup, restart, and provider controls
+      - name: Arc 03 final native lifecycle, cleanup, restart, and provider controls
         run: |
           set -euo pipefail
           for control in \
@@ -104,7 +104,7 @@ jobs:
             v4_arc03j_native_local_ice_restart_failure_retires_connector \
             v4_arc03h_close_wins_before_open_promotion \
             v4_arc03h_close_wins_before_legacy_realtime_admission \
-            v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks \
+            v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks \
             v4_arc03g_close_fence_rejects_endpoint_send_realtime_write_and_lane_open \
             v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner \
             v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops

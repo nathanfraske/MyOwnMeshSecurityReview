@@ -1,6 +1,6 @@
 {
   "schema": "myownmesh-v4-ownership-delta/v1",
-  "arc": "03J",
+  "arc": "03",
   "status": "elastic-resource-correction-draft-unmerged",
   "historical_base": {
     "document": "arc-01-inventory.json",
@@ -9,28 +9,53 @@
   "changes": [
     {
       "owner": "ProcessResourceRoot",
-      "responsibility": "owns one process resource-provider port and issues accounting and fairness child scopes without multiplying the process grant",
+      "responsibility": "owns one process resource-provider port and issues shared accounting and attribution child scopes without multiplying the process grant; it assigns no basal weight, quota, share, or partition",
       "source": "crates/myownmesh-core/src/resource/mod.rs"
     },
     {
       "owner": "ResourceProvider",
-      "responsibility": "grants finite composite claims by actual resource dimension and returns typed pressure or unavailability without a basal product-object ceiling",
-      "source": "target of the Arc 03 elastic resource correction"
+      "responsibility": "defines the connector-neutral port for finite composite acquisition, transition, observation, child attribution, and cooperative demand without granting cleanup, protocol, or authentication authority",
+      "source": "crates/myownmesh-core/src/resource/provider.rs"
+    },
+    {
+      "owner": "FiniteResourceProvider",
+      "responsibility": "implements one shared finite process grant, typed pressure without a basal product-object ceiling, Cleanup then Admitted then Speculative cooperative demand ordering, and equal-authority rotation across process-local scope identities",
+      "source": "crates/myownmesh-core/src/resource/provider.rs"
     },
     {
       "owner": "ResourceLease",
-      "responsibility": "retains exact resource ownership through allocation, queueing, scheduled work, native lifetime, transfer, cleanup, and final release",
-      "source": "target of the Arc 03 elastic resource correction"
+      "responsibility": "retains its declared finite claim through allocation, queueing, scheduled work, native lifetime, transfer, cleanup, and final release; it does not prove unclaimed native or OS use",
+      "source": "crates/myownmesh-core/src/resource/provider.rs"
     },
     {
       "owner": "MeshConnectorResourceScope",
-      "responsibility": "attributes descendant claims to one Mesh runtime, participates in work-conserving fairness, and cannot mint or reserve a fixed share by default",
+      "responsibility": "attributes descendant claims to one Mesh runtime, borrows unused shared capacity, participates in structural pressure turns, and cannot mint or reserve a fixed share by default",
       "source": "crates/myownmesh-core/src/runtime/attempt/resource_owner.rs"
     },
     {
-      "owner": "OptionalLocalCeilingPolicy",
-      "responsibility": "may refuse otherwise grantable claims for explicit isolation, Closed deployment, appliance, cost, compatibility, or test policy but cannot create capacity or mesh authority",
-      "source": "target of the Arc 03 elastic resource correction"
+      "owner": "ResourceReclaimTarget",
+      "responsibility": "lets the provider request retirement from one exact reclaimable speculative owner without granting release, transfer, cleanup, protocol, or authentication authority",
+      "source": "crates/myownmesh-core/src/resource/provider.rs"
+    },
+    {
+      "owner": "ResourceAcquireDemand",
+      "responsibility": "owns one move-only pending fairness turn for a provider scope; cancellation removes the turn, and retry can acquire only after the exact conflicting claim has actually been released",
+      "source": "crates/myownmesh-core/src/resource/provider.rs"
+    },
+    {
+      "owner": "ConnectorCallbackPolicy",
+      "responsibility": "may add explicit local callback and service-shape ceilings without creating process capacity or mesh authority",
+      "source": "crates/myownmesh-core/src/runtime/attempt/policy.rs"
+    },
+    {
+      "owner": "PendingRemoteCandidateLocalCeiling",
+      "responsibility": "may add an explicit attempt-local candidate ceiling without creating process capacity, renewing an attempt, or changing ICE authority",
+      "source": "crates/myownmesh-core/src/transport/webrtc/policy.rs"
+    },
+    {
+      "owner": "ConnectorRealtimeFlowPolicy",
+      "responsibility": "may add explicit connector-local real-time shape and byte ceilings without selecting codecs, creating process capacity, or granting session authority",
+      "source": "crates/myownmesh-core/src/runtime/attempt/policy.rs"
     },
     {
       "owner": "ConnectorCloseOwner",
@@ -44,13 +69,18 @@
     },
     {
       "owner": "RemoteCandidateState",
-      "responsibility": "owns current and provisional ICE candidate attempts, exact remote ICE credentials, transactional restart commit, and terminal attempt exhaustion",
+      "responsibility": "owns current and provisional WebRTC ICE candidate envelopes, exact remote ICE credentials, transactional restart commit, and paired retirement of the WebRTC operation fence and provider-backed candidate attempt",
       "source": "crates/myownmesh-core/src/transport/webrtc.rs"
     },
     {
-      "owner": "RemoteCandidateAttemptIdentity",
-      "responsibility": "provides the process-local retirement fence for queued and in-flight work belonging to one exact candidate attempt",
+      "owner": "transport::webrtc::RemoteCandidateAttemptIdentity",
+      "responsibility": "provides the process-local active-operation and retirement fence for queued and in-flight WebRTC work belonging to one exact ICE attempt",
       "source": "crates/myownmesh-core/src/transport/webrtc.rs"
+    },
+    {
+      "owner": "runtime::attempt::remote_candidate::RemoteCandidateAttemptIdentity",
+      "responsibility": "identifies the provider-backed candidate-attempt owner that admits hashing, retained content, application work, terminal pressure, and exact lease release",
+      "source": "crates/myownmesh-core/src/runtime/attempt/remote_candidate.rs"
     },
     {
       "owner": "RealtimeFlowRegistry",
@@ -65,7 +95,7 @@
     {
       "owner": "LegacyV1Network",
       "responsibility": "owns typed topology-routed compatibility frames on __mesh_route__/v1",
-      "source": "crates/myownmesh-core/src/legacy_v1/routing.rs"
+      "source": "crates/myownmesh-core/src/legacy_v1.rs"
     },
     {
       "owner": "RelayService",

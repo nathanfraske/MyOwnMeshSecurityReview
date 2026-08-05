@@ -51,11 +51,14 @@ pub enum Error {
 
     /// A network-capable operation was attempted through a Mesh runtime that
     /// was deliberately opened without a connector resource owner.
-    #[error("connector resource policy is required for network-capable mesh operations")]
+    #[error("a process resource provider is required for network-capable mesh operations")]
     ConnectorPolicyRequired,
 
-    #[error("connector resource policy: {0}")]
-    ConnectorResourcePolicy(#[from] Box<crate::runtime::attempt::ConnectorResourcePolicyConflict>),
+    #[error("process resource provider: {0}")]
+    ResourceProvider(#[from] crate::resource::ResourceProviderConflict),
+
+    #[error("resource unavailable: {0}")]
+    ResourceUnavailable(#[from] crate::resource::ResourceUnavailable),
 
     #[error("mesh connector resource scope: {0}")]
     MeshConnectorResourceScope(
@@ -87,12 +90,6 @@ pub enum Error {
     /// call sites should prefer a typed variant where one exists.
     #[error("{0}")]
     Other(String),
-}
-
-impl From<crate::runtime::attempt::ConnectorResourcePolicyConflict> for Error {
-    fn from(conflict: crate::runtime::attempt::ConnectorResourcePolicyConflict) -> Self {
-        Box::new(conflict).into()
-    }
 }
 
 impl Error {

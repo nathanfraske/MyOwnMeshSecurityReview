@@ -122,8 +122,7 @@ fn connector_policy_with_legacy_media(
         .webrtc()
         .with_legacy_webrtc_media(media_profile)?;
     Ok(myownmesh_core::WebRtcConnectorCapablePolicy::new(
-        connector_policy.process(),
-        connector_policy.mesh(),
+        connector_policy.resources(),
         webrtc,
     ))
 }
@@ -301,22 +300,18 @@ mod tests {
         let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
             myownmesh_core::ConnectorCallbackMailboxCapacities::new(nz(4), nz(4)),
             myownmesh_core::ConnectorCallbackServiceWeights::new(nz(1), nz(1), nz(1)),
-            myownmesh_core::RealtimeConnectorPolicy::enabled(nz(16_384), realtime)
-                .expect("legacy-media deployment fixture is internally consistent"),
+            myownmesh_core::RealtimeConnectorPolicy::enabled_with_local_ceiling(
+                nz(16_384),
+                realtime,
+            )
+            .expect("legacy-media deployment fixture is internally consistent"),
         )
         .expect("legacy-media callback fixture is internally consistent");
         let webrtc = myownmesh_core::WebRtcConnectorProfile::new(
             callbacks,
             myownmesh_core::PendingRemoteCandidatePolicy::new(nz(8), nz(16_384), nz(8), nz(8)),
         );
-        myownmesh_core::WebRtcConnectorCapablePolicy::new(
-            myownmesh_core::ConnectorResourcePolicy::new(nz(
-                crate::TEST_PROCESS_CONNECTOR_CAPACITY,
-            ))
-            .expect("legacy-media cleanup fixture fits Tokio's queue bound"),
-            myownmesh_core::MeshConnectorResourcePolicy::new(nz(2)),
-            webrtc,
-        )
+        myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), webrtc)
     }
 
     #[tokio::test]

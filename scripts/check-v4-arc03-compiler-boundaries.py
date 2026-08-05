@@ -83,6 +83,36 @@ fn main() { let _ = std::mem::size_of::<LegacyV1Runtime>(); }
         ("legacy_v1", "could not find"),
     ),
     RejectedProbe(
+        "transport_lab_fixture_grant_is_not_in_default_v4_api",
+        """use myownmesh_core::transport_lab_connector_fixture_grant; // expected-error
+fn main() { let _ = transport_lab_connector_fixture_grant; }
+""",
+        "E0432",
+        ("transport_lab_connector_fixture_grant", "no `transport_lab_connector_fixture_grant`"),
+    ),
+    RejectedProbe(
+        "transport_lab_candidate_fixture_grant_is_not_in_default_v4_api",
+        """use myownmesh_core::transport_lab_remote_candidate_fixture_grant; // expected-error
+fn main() { let _ = transport_lab_remote_candidate_fixture_grant; }
+""",
+        "E0432",
+        (
+            "transport_lab_remote_candidate_fixture_grant",
+            "no `transport_lab_remote_candidate_fixture_grant`",
+        ),
+    ),
+    RejectedProbe(
+        "transport_lab_sdp_fixture_grant_is_not_in_default_v4_api",
+        """use myownmesh_core::transport_lab_remote_description_fixture_grant; // expected-error
+fn main() { let _ = transport_lab_remote_description_fixture_grant; }
+""",
+        "E0432",
+        (
+            "transport_lab_remote_description_fixture_grant",
+            "no `transport_lab_remote_description_fixture_grant`",
+        ),
+    ),
+    RejectedProbe(
         "raw_peer_constructor_is_not_production_api",
         """use myownmesh_core::transport::{Role, Transport};
 async fn bypass(transport: &Transport) {
@@ -103,14 +133,36 @@ fn main() { let _ = std::mem::size_of::<ConnectorRealtimeFlowCapability>(); }
     ),
     RejectedProbe(
         "resource_owner_cannot_be_minted_externally",
-        """use myownmesh_core::{ConnectorResourceOwnerPort, ConnectorResourcePolicy};
-fn bypass(policy: ConnectorResourcePolicy) {
-    let _ = ConnectorResourceOwnerPort::new(policy); // expected-error
+        """use myownmesh_core::{ConnectorResourceOwnerPort, ResourceProviderPort};
+fn bypass(provider: ResourceProviderPort) {
+    let _ = ConnectorResourceOwnerPort::new(provider); // expected-error
 }
 fn main() {}
 """,
         "E0624",
         ("new", "private"),
+    ),
+    RejectedProbe(
+        "resource_provider_authority_cannot_be_forged",
+        """use myownmesh_core::ResourceProviderAuthority;
+fn bypass() {
+    let _ = ResourceProviderAuthority { _private: () }; // expected-error
+}
+fn main() {}
+""",
+        "E0451",
+        ("_private", "private"),
+    ),
+    RejectedProbe(
+        "resource_lease_cannot_be_duplicated_for_stale_release",
+        """use myownmesh_core::ResourceLease;
+fn bypass(lease: ResourceLease) {
+    let _: ResourceLease = lease.clone(); // expected-error
+}
+fn main() {}
+""",
+        "E0599",
+        ("clone", "ResourceLease"),
     ),
     RejectedProbe(
         "ambiguous_mesh_open_is_removed",
@@ -237,7 +289,7 @@ def authority_cargo_toml(name: str, features: tuple[str, ...]) -> str:
 def run_check(project: Path, binary: str) -> tuple[int, list[dict], str]:
     environment = os.environ.copy()
     environment["CARGO_TERM_COLOR"] = "never"
-    environment["CARGO_TARGET_DIR"] = COMPILER_TARGET.name
+    environment.setdefault("CARGO_TARGET_DIR", COMPILER_TARGET.name)
     result = subprocess.run(
         [
             "cargo",
@@ -289,6 +341,14 @@ def matches(probe: RejectedProbe, diagnostics: list[dict]) -> bool:
             for span in diagnostic.get("spans", [])
         )
         if (
+            probe.name == "resource_provider_authority_cannot_be_forged"
+            and code in (None, "E0451")
+            and "ResourceProviderAuthority" in rendered
+            and "private fields" in rendered
+            and (primary_span_matches or code is None)
+        ):
+            return True
+        if (
             code == probe.code
             and all(fragment in rendered for fragment in probe.fragments)
             and primary_span_matches
@@ -317,7 +377,11 @@ def main() -> int:
         CORE / "src" / "runtime" / "attempt" / "lifetime.rs",
         CORE / "src" / "runtime" / "attempt" / "policy.rs",
         CORE / "src" / "runtime" / "attempt" / "resource_owner.rs",
+        CORE / "src" / "runtime" / "attempt" / "remote_candidate.rs",
     )
+    provider_source = (
+        CORE / "src" / "resource" / "provider.rs"
+    ).read_text(encoding="utf-8")
     attempt_policy_source = (
         CORE / "src" / "runtime" / "attempt" / "policy.rs"
     ).read_text(encoding="utf-8")
@@ -389,8 +453,8 @@ def main() -> int:
 
     if not (
         "let root = ProcessResourceRoot::global();" in webrtc_source
-        and "root.install_connector_policy(policy.process())?;" in webrtc_source
-        and "root.issue_mesh_connector_scope(policy.mesh())?;" in webrtc_source
+        and "root.install_resource_provider(policy.resources())?;" in webrtc_source
+        and "root.issue_mesh_connector_scope()?;" in webrtc_source
     ):
         failures.append("public transport policy path does not use the process resource root")
     if "ProcessResourceRoot::global().mesh_runtime_scope()" not in engine_source:
@@ -409,15 +473,38 @@ def main() -> int:
             failures.append(
                 f"WebRTC-specific policy module is missing {transport_policy_type}"
             )
-    process_policy = re.search(
-        r"pub struct ConnectorResourcePolicy\s*\{(?P<body>.*?)\}",
-        attempt_policy_source,
-        flags=re.DOTALL,
-    )
-    if process_policy is None:
-        failures.append("connector-neutral process policy type is missing")
-    elif re.search(r"WebRtc|ICE|CandidatePolicy|Media|Codec", process_policy.group("body")):
-        failures.append("process connector resource policy contains transport-specific fields")
+    for resource_type in (
+        "pub struct ResourceClaim",
+        "pub trait ResourceProvider",
+        "pub struct ResourceLease",
+        "pub enum ResourceClass",
+        "pub struct ResourcePressure",
+        "pub enum ResourceUnavailable",
+        "pub enum ReclaimResult",
+    ):
+        if resource_type not in provider_source:
+            failures.append(f"elastic resource contract is missing {resource_type}")
+    for forbidden_cardinality in (
+        "MAX_MESHES",
+        "MAX_PEERS",
+        "MAX_ATTEMPTS",
+        "MAX_FLOWS",
+        "ConnectorResourcePolicy",
+        "MeshConnectorResourcePolicy",
+    ):
+        if forbidden_cardinality in attempt_source or forbidden_cardinality in provider_source:
+            failures.append(
+                f"basal resource contract still contains product cardinality {forbidden_cardinality}"
+            )
+    if not (
+        "local_mailboxes: Option<ConnectorCallbackMailboxCapacities>" in attempt_policy_source
+        and "local_service_weights: Option<ConnectorCallbackServiceWeights>" in attempt_policy_source
+        and "local_ceiling: Option<PendingRemoteCandidateLocalCeiling>" in webrtc_policy_source
+        and "pub const fn elastic_data_only()" in attempt_policy_source
+        and "pub const fn elastic_realtime()" in attempt_policy_source
+        and "pub const fn elastic()" in webrtc_policy_source
+    ):
+        failures.append("cardinality and queue ceilings are not explicit optional wrappers")
 
     capacity_shape = re.search(
         r"pub struct ConnectorCallbackMailboxCapacities\s*\{(?P<body>.*?)\}",
@@ -436,7 +523,7 @@ def main() -> int:
         if re.search(r"\brealtime\s*:", body):
             failures.append("generic callback mailbox still contains one shared realtime queue")
         if "queue_capacity_per_flow" not in attempt_source:
-            failures.append("codec-neutral per-flow realtime queue bound is missing")
+            failures.append("optional local per-flow real-time queue ceiling is missing")
         for structural_bound in (
             "max_inbound_fragment_bytes",
             "max_inbound_fragments_per_unit",
@@ -474,8 +561,13 @@ def main() -> int:
             failures.append(f"connector lifecycle owner is missing {lifecycle_phase}")
     if not (
         "lifecycle: Arc<ConnectorLifecycleOwner>" in webrtc_source
-        and "self.events.lifecycle.record_open()" in webrtc_source
-        and "self.events.lifecycle.record_close()" in webrtc_source
+        and re.search(
+            r"self\.events\s*\.lifecycle\s*\.record_open\(\)", webrtc_source
+        )
+        and re.search(
+            r"self\.events\s*\.lifecycle\s*\.record_close\(self\.callback_gate\.is_active\(\)\)",
+            webrtc_source,
+        )
         and "self.raw.lifecycle.commit_open()" in webrtc_source
     ):
         failures.append("open and close are not owned by the fixed connector lifecycle owner")
@@ -493,12 +585,10 @@ def main() -> int:
         "ConnectorCloseStatus::Closing" in webrtc_source
         and "match native.close().await" in webrtc_source
         and "ConnectorCleanupExecutor" in attempt_source
-        and re.search(
-            r"tokio::sync::mpsc::channel(?:::<ConnectorCleanupJob>)?\(self\.capacity\.get\(\)\)",
-            attempt_source,
-        )
+        and "unbounded_channel::<ConnectorCleanupJob>()" in attempt_source
+        and "_capability: ConnectorCleanupCapability" in attempt_source
     ):
-        failures.append("native close is not owned by the bounded process cleanup executor")
+        failures.append("native close is not owned by the lease-backed process cleanup executor")
 
     recv_queued = re.search(
         r"async fn recv_queued\s*\(&mut self\).*?\n\s*\}",
@@ -511,7 +601,7 @@ def main() -> int:
         failures.append("callback receiver still uses permanently biased selection")
     if "reserve().await" in webrtc_source or ".reserve(\n" in webrtc_source:
         failures.append("connector callback producer can still await mailbox capacity")
-    if "match mailbox.try_send(queued)" not in webrtc_source:
+    if "match mailbox.try_insert(queued)" not in webrtc_source:
         failures.append("connector callback insertion does not use typed nonblocking admission")
     if not (
         "struct RemoteCandidateAttemptIdentity" in webrtc_source
@@ -641,6 +731,87 @@ def main() -> int:
     ):
         if "LegacyV1Marker" in source or "LegacyV1Runtime" in source or "legacy_v1::" in source:
             failures.append(f"{name} path can reach the LegacyV1 runtime")
+
+    candidate_callback_start = webrtc_source.find("pc.on_ice_candidate")
+    candidate_callback_end = webrtc_source.find(
+        "pc.on_ice_connection_state_change", candidate_callback_start
+    )
+    candidate_callback = webrtc_source[candidate_callback_start:candidate_callback_end]
+    conversion_order = [
+        candidate_callback.find("begin_native_callback_operation"),
+        candidate_callback.find(".to_json()"),
+        candidate_callback.find("account_executing_payload"),
+        candidate_callback.find("Box::pin(async move"),
+    ]
+    if candidate_callback_start < 0 or candidate_callback_end < 0 or any(
+        position < 0 for position in conversion_order
+    ) or conversion_order != sorted(conversion_order):
+        failures.append(
+            "local ICE conversion is not structurally reserved and measured before async retention"
+        )
+
+    remote_sdp_owner_start = webrtc_source.find("fn sdp_ice_credentials_owned")
+    remote_sdp_owner_end = webrtc_source.find(
+        "pub struct PeerSession", remote_sdp_owner_start
+    )
+    remote_sdp_owner = webrtc_source[remote_sdp_owner_start:remote_sdp_owner_end]
+    remote_sdp_order = [
+        remote_sdp_owner.find(".acquire("),
+        remote_sdp_owner.find("plan_sdp_ice_credential_allocations"),
+        remote_sdp_owner.find(".transition(planned_claim)"),
+        remote_sdp_owner.find("parse_sdp_ice_credential_bindings"),
+        remote_sdp_owner.find(".transition(retained_claim)"),
+        remote_sdp_owner.find("RemoteIceCredentials::new"),
+    ]
+    if remote_sdp_owner_start < 0 or remote_sdp_owner_end < 0 or any(
+        position < 0 for position in remote_sdp_order
+    ) or remote_sdp_order != sorted(remote_sdp_order):
+        failures.append(
+            "remote SDP parsing or retention can occur before its finite operation lease"
+        )
+
+    remote_sdp_ingress_start = webrtc_source.find("pub(crate) async fn apply_remote_sdp")
+    remote_sdp_ingress_end = webrtc_source.find(
+        "pub(crate) async fn apply_remote_description", remote_sdp_ingress_start
+    )
+    remote_sdp_ingress = webrtc_source[
+        remote_sdp_ingress_start:remote_sdp_ingress_end
+    ]
+    remote_sdp_ingress_order = [
+        remote_sdp_ingress.find("sdp_ice_credentials_owned"),
+        remote_sdp_ingress.find("RTCSessionDescription::offer"),
+        remote_sdp_ingress.find("apply_remote_description_owned"),
+    ]
+    if (
+        remote_sdp_ingress_start < 0
+        or remote_sdp_ingress_end < 0
+        or any(position < 0 for position in remote_sdp_ingress_order)
+        or remote_sdp_ingress_order != sorted(remote_sdp_ingress_order)
+        or "RTCSessionDescription::offer" in engine_source
+        or "RTCSessionDescription::answer" in engine_source
+    ):
+        failures.append(
+            "V4 remote SDP can enter dependency parsing before connector resource admission"
+        )
+
+    remote_sdp_apply_start = webrtc_source.find(
+        "async fn apply_remote_description_owned"
+    )
+    remote_sdp_apply_end = webrtc_source.find(
+        "async fn apply_remote_candidate", remote_sdp_apply_start
+    )
+    remote_sdp_apply = webrtc_source[remote_sdp_apply_start:remote_sdp_apply_end]
+    remote_sdp_apply_order = [
+        remote_sdp_apply.find("retain_remote_description_resources"),
+        remote_sdp_apply.find("set_remote_description(description)"),
+        remote_sdp_apply.find("finish_native_commit"),
+    ]
+    if remote_sdp_apply_start < 0 or remote_sdp_apply_end < 0 or any(
+        position < 0 for position in remote_sdp_apply_order
+    ) or remote_sdp_apply_order != sorted(remote_sdp_apply_order):
+        failures.append(
+            "remote SDP residual ownership is not transferred before native application"
+        )
 
     if "LegacyPayloadRelayForbidden" not in services_source:
         failures.append("V4 daemon service policy does not reject the legacy payload relay")

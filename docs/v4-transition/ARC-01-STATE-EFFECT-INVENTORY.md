@@ -1,6 +1,6 @@
 # V4 Arc 01 state and effect inventory
 
-Status: historical Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`. It is not a current Arc 03J source inventory.
+Status: historical Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`. It is not a current Arc 03 source inventory.
 
 The current source check intentionally fails against this record. The record contains 106 production Rust units and 1,792 declaration members from its fixed baseline. Later Arc 03 source has different units, declarations, module paths, and markers. Do not use this file or its JSON as current source coverage. The machine-readable Arc 03 ownership delta records the bounded current owner changes without rewriting this historical inventory.
 
@@ -17,7 +17,7 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The baseline commit remains fixed. These recorded fingerprints describe an earlier transition snapshot and do not cover the Arc 03J implementation:
+The baseline commit remains fixed. These recorded fingerprints describe an earlier transition snapshot and do not cover the current Arc 03 implementation:
 
 | Historical input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|

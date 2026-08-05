@@ -80,8 +80,8 @@ The source baseline and source evidence remain those recorded in the preceding c
 
 | ID | Source observation | Restored target interpretation | Priority |
 |---|---|---|---|
-| RTM-001 | Legacy shaped-topology code can route application payload through ordinary mesh members | Arc 03J keeps the source under the `legacy_v1` subtree and requires the `legacy-v1` feature plus deprecated, explicit `LegacyV1Runtime` and `LegacyV1Network` construction. Each joined Mesh gets one routing owner on the typed `__mesh_route__/v1` wire. Malformed input does not stop the owner. Normal V4 source is checked with deprecated use denied. This is structural isolation, not a hard type-level exclusion proof. It remains open until Arc 12 deletes the frozen compatibility source | Critical |
-| RTM-002 | Optional `RelayService` forwards application payload through an ordinary mesh member | Arc 03J keeps the service behind the same explicit LegacyV1 runtime and gives each joined Mesh a separate optional member-relay owner on `__mesh_relay__/v1`. Plain relay payload remains opaque except for recognition and rejection of the exact historical routed-wrapper shape, so old routing control cannot be reinterpreted as application data. No arbitrary application payload field infers corrected routing behavior. The source advertisement remains `LegacyV1MemberRelay`. Normal V4 daemon startup and live reconfiguration reject it. It remains open until Arc 12 deletes the frozen compatibility source. Any application payload through a mesh member violates the endpoint-only data invariant | Critical |
+| RTM-001 | Legacy shaped-topology code can route application payload through ordinary mesh members | Arc 03 keeps the source under the `legacy_v1` subtree and requires the `legacy-v1` feature plus deprecated, explicit `LegacyV1Runtime` and `LegacyV1Network` construction. Each joined Mesh gets one routing owner on the typed `__mesh_route__/v1` wire. Malformed input does not stop the owner. Normal V4 source is checked with deprecated use denied. This is structural isolation, not a hard type-level exclusion proof. It remains open until Arc 12 deletes the frozen compatibility source | Critical |
+| RTM-002 | Optional `RelayService` forwards application payload through an ordinary mesh member | Arc 03 keeps the service behind the same explicit LegacyV1 runtime and gives each joined Mesh a separate optional member-relay owner on `__mesh_relay__/v1`. Plain relay payload remains opaque except for recognition and rejection of the exact historical routed-wrapper shape, so old routing control cannot be reinterpreted as application data. No arbitrary application payload field infers corrected routing behavior. The source advertisement remains `LegacyV1MemberRelay`. Normal V4 daemon startup and live reconfiguration reject it. It remains open until Arc 12 deletes the frozen compatibility source. Any application payload through a mesh member violates the endpoint-only data invariant | Critical |
 | RTM-003 | Carrier input allocates transport before Device validation | Not automatically a defect. It fails only if work is unbounded, mutates durable authority, delivers application data, or promotes a session | High conditional |
 | RTM-004 | Closed auto-approve admits a fresh unrostered key | Still a defect | Critical |
 | RTM-005 | Directed application sends bypass admission | Still a defect | Critical |
@@ -221,7 +221,7 @@ Supply raw mDNS, address, incoming socket, offer, candidate, and relay hints fro
 
 Use many fresh keys and unauthenticated hints to create candidate work.
 
-**Pass:** Global limits dominate per-identity limits. Cleanup returns the runtime below the selected steady-state bound.
+**Pass:** The one process resource grant dominates per-identity attribution. Every admitted unit owns a finite lease, typed pressure stops new work when the applicable dimension is unavailable, and cleanup releases only its exact claims.
 
 ### HYB-016. Candidate racing
 
@@ -449,6 +449,36 @@ Run identical local traces where a newer durable fact or better path exists but 
 
 **Pass:** The runtime does not falsely claim to distinguish the worlds. It still rejects forged authority and unauthenticated sessions.
 
+### HYB-049. Cooperative shared-grant pressure
+
+Let one Mesh scope borrow the last grantable units with reclaimable speculative work. Submit overlapping cooperative demands from another scope and from each authority class.
+
+**Pass:** The provider creates no weight, quota, share, or new capacity. It gives `Cleanup`, then `Admitted`, then `Speculative` the next turn and rotates equal-authority scopes. It requests retirement from the exact speculative owner but does not release the claim. The selected demand acquires only after the owner drops the exact lease.
+
+### HYB-050. Slow valid lease
+
+Keep a valid lease live without completing its operation while other scopes request the same exhausted dimension.
+
+**Pass:** Elapsed time does not expire or revoke the lease. Without real pressure, no reclaim request occurs. Under overlapping cooperative pressure, only an explicit request to the registered speculative owner may begin cleanup. The test does not use a timeout as resource truth.
+
+### HYB-051. Cleanup reservation under full pressure
+
+Admit a connector with its cleanup obligation reserved, fill the remaining shared grant with speculative work, then force connector close.
+
+**Pass:** The exact connector cleanup is submitted without acquiring a new speculative permit. A cleanup-class demand gets the next structural turn ahead of admitted and speculative demand, but provider notification never releases another owner's live lease.
+
+### HYB-052. Reclaim completion and retained failure
+
+Saturate a dimension with one registered speculative owner. Request the same dimension from another scope, then exercise successful cleanup, demand cancellation, ignored retirement, and failed cleanup separately.
+
+**Pass:** Successful cleanup releases only the exact selected claim and lets the pending demand retry. Cancellation removes the demand without releasing the owner. Ignored retirement leaves the demand pending. Failed cleanup retains the exact charge and returns typed pressure. No timer, provider-side release, or fabricated capacity appears.
+
+### HYB-053. Native and OS residual denial
+
+Set a modeled native or OS dimension to deny new use, then exercise native WebRTC construction, ICE sockets, TURN selection, cleanup-executor startup, and dependency-created tasks separately.
+
+**Pass:** Each operation is either blocked by an actual claim in that dimension or reported as an explicit residual with its isolation boundary. A configured grant field that the adapter never consumes is not accepted as enforcement evidence.
+
 ## 16. Cross-case proof obligations
 
 A conformance claim must also show:
@@ -465,7 +495,9 @@ A conformance claim must also show:
 10. relays have exact destinations and finite resources;
 11. delayed callbacks and stale local capabilities are rejected;
 12. store opening reconstructs no live networking authority;
-13. every numeric bound is measured and owner-approved.
+13. every numeric bound is classified as protocol shape, provider structure, runtime grant, or explicit owner policy;
+14. every cross-scope progress claim is limited to registered reclaimable speculative pressure whose exact owner completes cleanup;
+15. every claimed native or OS dimension has an exercised adapter hook, otherwise it remains an explicit residual.
 
 ## 17. Evidence bundle
 

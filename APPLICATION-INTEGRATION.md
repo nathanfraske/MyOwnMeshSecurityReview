@@ -508,7 +508,9 @@ The application owns:
 
 The component that allocates or retains a protected resource acquires its finite lease before allocation or retention. Basal MyOwnMesh does not expose or require a fixed maximum number of Mesh runtimes, peers, attempts, sessions, or flows. A request succeeds while the process resource provider grants its exact claim. Otherwise the application receives typed pressure or unavailability.
 
-The application does not choose low-level connector counters. It may install an explicit local policy for a locked-down appliance, Closed deployment, carrier cost boundary, or product-specific isolation requirement. Such a policy can be stricter than current host availability but cannot create resources or mesh authority.
+The application does not choose low-level connector counters, resource weights, quotas, or shares. One finite process grant is shared by all Mesh scopes, and unused capacity is borrowable. Under pressure, each scope may own one move-only pending demand. The provider selects `Cleanup > Admitted > Speculative` and rotates equal-class selection across scopes after each resolved demand.
+
+The provider may ask an exact reclaimable Speculative owner to retire, but it cannot release that owner's claim. The owner releases by Drop after cleanup or transfers the exact charge into failed-cleanup retention. No timer expires the demand, completes retirement, or releases the claim. This creates no guarantee against nonreclaimable admitted pressure, an ignored retirement request, or failed cleanup. The application receives typed pressure or unavailability rather than an authorization result. It may still install a stricter local ceiling or isolation policy for a locked-down appliance, Closed deployment, carrier cost boundary, or product requirement. Such policy cannot create resources or mesh authority.
 
 Reliable streams, interactive real-time flows, delayed satellite delivery, and storage-backed transport do not share one queue rule. Each uses the pressure contract appropriate to its provider. Every retained unit still owns storage and scheduled-work leases. Time passage alone does not expire a slow operation or release its resources.
 
@@ -535,6 +537,12 @@ The application integration passes only when:
 - another object is admitted whenever the provider grants its exact claim, without a basal product-count ceiling;
 - resource refusal identifies pressure or unavailability, never Open or Closed authorization;
 - Mesh scopes share one process grant and cannot multiply capacity;
+- no basal weights, quotas, reserved shares, or partitions exist;
+- pending demand uses `Cleanup > Admitted > Speculative` authority order and equal-class per-scope rotation;
+- only exact reclaimable Speculative owners receive retirement requests;
+- a retirement request does not release its claim;
+- owner Drop or explicit failed-cleanup retention preserves exact release accounting;
+- admission is not guaranteed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
 - optional local ceilings remain explicit deployment policy.
 
 ## 16. Owner decisions
@@ -551,5 +559,6 @@ The owner must select:
 8. diagnostic detail;
 9. headless consumer connector types;
 10. resource-provider and host-isolation integration for each deployment form;
-11. any optional local ceilings, cost policies, or isolation policy;
-12. measurements used for performance, cost, fairness, regression, and opaque-resource characterization.
+11. any optional local ceilings, cost policies, or isolation requirements;
+12. acceptance or isolation of native WebRTC, allocator, runtime, kernel, driver, and external-provider residuals;
+13. measurements used for performance, cost, scheduling, regression, and opaque-resource characterization.

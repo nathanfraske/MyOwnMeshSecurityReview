@@ -17,6 +17,12 @@ use crate::runtime::attempt::ConnectorCallbackPolicy;
 /// connector attempt or an explicit ICE restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingRemoteCandidatePolicy {
+    local_ceiling: Option<PendingRemoteCandidateLocalCeiling>,
+}
+
+/// Explicit optional deployment/test envelope for one ICE attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingRemoteCandidateLocalCeiling {
     max_unique_items: NonZeroUsize,
     max_content_bytes: NonZeroUsize,
     max_duplicate_submissions: NonZeroUsize,
@@ -31,13 +37,28 @@ impl PendingRemoteCandidatePolicy {
         max_application_work: NonZeroUsize,
     ) -> Self {
         Self {
-            max_unique_items,
-            max_content_bytes,
-            max_duplicate_submissions,
-            max_application_work,
+            local_ceiling: Some(PendingRemoteCandidateLocalCeiling {
+                max_unique_items,
+                max_content_bytes,
+                max_duplicate_submissions,
+                max_application_work,
+            }),
         }
     }
 
+    /// Provider-backed candidate work with no product item ceiling.
+    pub const fn elastic() -> Self {
+        Self {
+            local_ceiling: None,
+        }
+    }
+
+    pub const fn local_ceiling(self) -> Option<PendingRemoteCandidateLocalCeiling> {
+        self.local_ceiling
+    }
+}
+
+impl PendingRemoteCandidateLocalCeiling {
     pub const fn max_unique_items(self) -> NonZeroUsize {
         self.max_unique_items
     }
@@ -160,6 +181,8 @@ impl LegacyWebRtcMediaProfile {
 pub enum WebRtcConnectorProfileError {
     #[error("legacy WebRTC media compatibility requires enabled generic real-time ownership")]
     LegacyMediaRequiresRealtime,
+    #[error("legacy WebRTC media compatibility requires an explicit local compatibility ceiling")]
+    LegacyMediaRequiresLocalCeiling,
     #[error("legacy WebRTC media pre-provisioned flow count overflowed")]
     LegacyMediaFlowCountOverflow,
     #[error(
@@ -176,7 +199,7 @@ pub enum WebRtcConnectorProfileError {
 /// WebRTC-specific construction and work policy for one Mesh runtime.
 ///
 /// The process resource owner never inspects this profile. It owns only the
-/// connector-neutral candidate cardinality. WebRTC callback, ICE candidate,
+/// connector-neutral resource ownership. WebRTC callback, ICE candidate,
 /// and temporary compatibility-provider choices stay at the transport edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WebRtcConnectorProfile {
@@ -227,7 +250,10 @@ impl WebRtcConnectorProfile {
             crate::runtime::attempt::RealtimeConnectorPolicy::Disabled => {
                 return Err(WebRtcConnectorProfileError::LegacyMediaRequiresRealtime)
             }
-            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(enabled) => enabled,
+            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(Some(enabled)) => enabled,
+            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(None) => {
+                return Err(WebRtcConnectorProfileError::LegacyMediaRequiresLocalCeiling)
+            }
         };
         let required_flows = profile
             .preprovisioned_outbound_flows()
@@ -307,7 +333,7 @@ mod tests {
             ConnectorRealtimeByteBudgets::new(nz(2), nz(1)),
             RealtimeQueueOverflowRule::DropNewest,
         );
-        let realtime = RealtimeConnectorPolicy::enabled(nz(1), flows)
+        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(nz(1), flows)
             .expect("test policy is otherwise structurally valid");
         let callbacks = ConnectorCallbackPolicy::new(
             ConnectorCallbackMailboxCapacities::new(nz(1), nz(1)),

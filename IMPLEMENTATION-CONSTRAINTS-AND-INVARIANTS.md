@@ -615,10 +615,13 @@ The resource interface must provide equivalent responsibilities to:
 
 ```text
 ResourceProvider
-    reserve(ResourceClaim) -> ResourceLease
-                            | ResourcePressure(ResourceClass)
-                            | ResourceUnavailable(ResourceClass)
-    reclaim(ResourceClass) -> ReclaimResult
+    acquire(ResourceClaim, ResourceAuthorityClass)
+        -> ResourceLease
+         | move-only PendingDemand
+         | ResourcePressure(ResourceClass)
+         | ResourceUnavailable(ResourceClass)
+    request_speculative_retirement(exact owner)
+        -> owner notification only
 
 ResourceClaim
     finite quantities by ResourceClass
@@ -642,9 +645,15 @@ ResourceClass
 
 A claim may combine several resource classes. An admitted object's count emerges from the claims and current provider grant. There is no `unlimited` sentinel. Admission is always fallible.
 
-The process resource root owns the process grant. Each Mesh runtime receives an accounting and fairness child scope, not a new grant. Attempt, candidate, session, and flow owners receive descendant leases. Creating another scope cannot multiply capacity.
+The process resource root owns the process grant. Each Mesh runtime receives an accounting and attribution child scope, not a new grant. Attempt, candidate, session, and flow owners receive descendant leases. Creating another scope cannot multiply capacity.
 
-The basal provider is work-conserving. Unused process capacity is borrowable across child scopes while preserving bounded service opportunities. Cleanup and release work is protected under pressure. Already admitted and higher-authority work is protected from new unauthenticated speculative work. Speculative work may be backpressured, refused, or reclaimed when its exact contract permits reclamation.
+The basal finite provider is shared and work-conserving. It has no weights, quotas, reserved shares, or partitions. Unused process capacity is borrowable across child scopes. Each scope may own at most one exact move-only pending demand. Pending demands are selected in `Cleanup > Admitted > Speculative` authority order, with equal-class selection rotating across scopes after a demand resolves.
+
+When the selected demand cannot fit, the provider may request retirement from exact owners of reclaimable `Speculative` leases. The provider does not release, revoke, replace, or reuse those claims. The notified owner performs cleanup and releases through lease Drop. If cleanup cannot be proven, the owner explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth.
+
+This scheduling and cooperative retirement model does not guarantee later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. Cleanup authority receives the first pending-demand opportunity, but that ordering does not manufacture capacity and is not a promise that cleanup can start without its exact claim.
+
+The current resource classes describe an accounting vocabulary, not proof that every dependency exposes that dimension. Exactness is limited to the quantity actually charged. Allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, and external provider allocations must remain named residuals until the responsible adapter can conservatively claim or isolate them.
 
 ### 14.2 Limit classification
 
@@ -698,7 +707,7 @@ raw storage or removable media
     storage-object and storage-byte leases
 ```
 
-Elapsed time does not create or release a lease. A slow operation may retain its finite claim until an explicit owner transition releases, replaces, reclaims, or fails it.
+Elapsed time does not create or release a lease. A slow operation may retain its finite claim until an explicit owner transition releases or replaces it. A provider retirement request changes no claim. The exact owner releases through Drop after cleanup, or transfers the charge into failed-cleanup retention when release cannot be proven.
 
 ### 14.6 Opaque native and operating-system resources
 
@@ -768,9 +777,9 @@ Every protected parser, candidate, socket, relay, handshake, queue entry, task, 
 
 Basal MyOwnMesh defines no fixed maximum for Mesh runtimes, peers, connector attempts, sessions, or real-time flows. Each new object is admitted by its actual composite claim and may fail with typed resource pressure or unavailability.
 
-### I10b. Child scopes do not multiply grants
+### I10b. Child scopes share one cooperative process grant
 
-Mesh and descendant scopes share the process grant. Default scheduling is work-conserving and unused capacity is borrowable. A stricter partition requires an explicit optional local policy.
+Mesh and descendant scopes share one finite process grant. No basal weights, quotas, shares, or partitions exist. Unused capacity is borrowable. Pending demand follows `Cleanup > Admitted > Speculative` authority order and equal-class per-scope rotation. The provider may request exact reclaimable Speculative owners to retire, but it never releases their claims. Admission remains fallible under nonreclaimable admitted pressure, ignored retirement, or failed-cleanup retention.
 
 ### I10c. Time is not resource authority
 
@@ -889,6 +898,13 @@ A release must pass at least the following groups.
 - refusal names the unavailable resource class rather than a basal object-count ceiling;
 - multiple Mesh scopes cannot multiply the process grant;
 - unused capacity is borrowable under the basal provider;
+- the basal provider has no weights, quotas, reserved shares, or partitions;
+- one move-only pending demand exists per scope;
+- pending demand is selected in `Cleanup > Admitted > Speculative` order with equal-class per-scope rotation;
+- pressure requests retirement only from exact reclaimable Speculative owners;
+- a retirement request never releases the claim it targets;
+- release occurs through owner Drop after cleanup, or the exact charge enters failed-cleanup retention;
+- no admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
 - optional local ceilings remain explicit wrappers;
 - malformed and unauthorized inputs cannot cross promotion;
 - media and packets remain quarantined before promotion;
@@ -971,4 +987,4 @@ The owner must select:
 - application data-operation set;
 - optional durable application contract domains.
 
-Every numeric protocol or provider limit requires proof from that protocol or provider. Every optional local policy value requires owner review. Measurements characterize performance, cost, fairness, regression, and opaque residuals. They do not define universal semantic cardinality.
+Every numeric protocol or provider limit requires proof from that protocol or provider. Every optional local policy value requires owner review. Measurements characterize performance, cost, scheduling, regression, and opaque residuals. They do not define universal semantic cardinality.

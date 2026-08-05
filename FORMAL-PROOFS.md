@@ -17,7 +17,8 @@ L      live runtime state
 I      one explicit typed input
 G      the finite resource grant currently assigned to one provider domain
 Q      one finite resource claim vector
-R      the multiset of live resource leases in that provider domain
+R      the multiset of live lease claims and failed-cleanup-retained claims
+       in that provider domain
 E      one bounded effect set
 ```
 
@@ -510,7 +511,9 @@ If every parser, candidate, socket, relay, handshake, media quarantine, session,
 
 #### Proof
 
-The provider grants claim `q` only when component-wise checked addition proves `sum(R) + q <= G`. Release removes exactly the claim held by that lease. Failed subtraction or addition cannot create capacity and instead poisons the affected accounting domain. Induction over grant and release transitions preserves `sum(R) <= G`.
+The provider grants claim `q` only when component-wise checked addition proves `sum(R) + q <= G`. Owner Drop after proven cleanup removes exactly the claim held by that lease. Failed-cleanup retention replaces the live lease claim with the same exact retained claim, so it does not reduce `sum(R)`. Failed subtraction or addition cannot create capacity and instead poisons the affected accounting domain. Induction over grant, release, and failed-cleanup-retention transitions preserves `sum(R) <= G`.
+
+This theorem covers only quantities actually charged to `R`. It does not prove that allocator slack, native WebRTC allocations, OS handles, runtime internals, driver state, or external provider allocations are represented. Those require a conservative claim, an isolation boundary, or an explicit residual report.
 
 ### Theorem 14.2. Pre-authentication and post-authentication separation
 
@@ -530,7 +533,35 @@ If every child scope reserves from the same process provider and scope creation 
 
 ### Theorem 14.5. Work-conserving borrowing preserves safety
 
-Allowing one child to consume capacity unused by another preserves `sum(R) <= G` because both claims are charged to the same process grant. Fair scheduling and protected cleanup classes affect service order, not the resource inequality.
+Allowing one child to consume capacity unused by another preserves `sum(R) <= G` because both claims are charged to the same finite process grant. No basal weight, quota, reserved share, or partition is needed for this inequality. This theorem proves resource safety only. It does not prove eventual admission.
+
+### Theorem 14.5a. Cooperative demand arbitration preserves safety
+
+Assume each scope owns at most one move-only pending demand. The provider selects pending demand in `Cleanup > Admitted > Speculative` authority order and rotates equal-class selection across scopes after each resolved demand. Selecting or moving a demand does not change `R`. A successful grant adds its exact claim only after proving the resulting sum does not exceed `G`. Therefore arbitration changes service order without creating capacity or weakening `sum(R) <= G`.
+
+### Theorem 14.5b. Indefinite leases, unrestricted borrowing, and guaranteed later admission are incompatible
+
+Assume a valid lease may remain live indefinitely, the provider may not revoke
+it, and one scope may borrow every currently unused unit. The provider cannot
+also guarantee that a later request from another scope will be admitted.
+
+#### Proof
+
+Let scope A borrow the remaining grant and retain every lease. Let scope B then
+request a nonzero claim in any exhausted dimension. Admitting B would violate
+`sum(R) <= G`. Releasing A would revoke a valid lease. Waiting for A provides no
+bounded admission guarantee because A may remain valid indefinitely. At least
+one premise must change. A deployment that requires guaranteed cross-scope
+admission must reserve capacity, isolate scopes, or use an owner contract that
+explicitly makes borrowed work reclaimable.
+
+This impossibility result is a prerequisite for the cooperative model. The implemented model changes the nonrevocation premise only for leases whose exact `Speculative` owner contract is reclaimable. It does not claim that every live lease is reclaimable.
+
+### Theorem 14.5c. Cooperative speculative retirement cannot forge release
+
+Suppose a selected demand does not fit. The provider may notify exact owners of reclaimable `Speculative` leases whose claims contribute to the deficit. Notification changes no member of `R`. Capacity becomes reusable only after an owner finishes cleanup and drops the exact lease. If cleanup cannot be proven, transferring the exact claim into failed-cleanup retention keeps that claim charged. Therefore a retirement request cannot make `sum(R)` understate known live or unreleased resources.
+
+The authority order and equal-class rotation provide deterministic demand selection, not eventual admission. A nonreclaimable admitted lease may retain capacity indefinitely. A speculative owner may ignore a retirement request. Failed cleanup may retain the exact charge indefinitely. No timer resolves any of these cases, so the model makes no stronger liveness claim.
 
 ### Theorem 14.6. Optional ceiling confinement
 
@@ -615,5 +646,5 @@ A concrete implementation must provide:
 11. crash tests for reservations and effect intents;
 12. compaction equivalence tests for each adopted durable domain;
 13. eclipse controls that preserve the impossibility boundary;
-14. elastic-provider controls for grant, pressure, exact release, borrowing, child-scope sharing, optional ceilings, cleanup priority, slow work, and storage-backed work;
+14. elastic-provider controls for grant, pressure, exact release, child-scope borrowing, move-only pending demand, authority ordering, equal-class scope rotation, cooperative Speculative retirement, ignored retirement, failed-cleanup retention, slow work, and storage-backed work;
 15. resource characterization and opaque-residual reports on every supported target.

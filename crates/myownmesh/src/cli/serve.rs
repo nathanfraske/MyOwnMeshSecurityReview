@@ -200,140 +200,228 @@ fn connector_policy_from_lookup(
             .ok_or_else(|| anyhow!("{name} must be a nonzero integer"))
     }
 
-    let process_candidates = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES")?;
-    let mesh_candidates = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES")?;
-    let pending_candidate_items =
-        nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS")?;
-    let pending_candidate_content_bytes = nonzero(
-        &mut lookup,
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
+    fn finite(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Result<u64> {
+        let raw = lookup(name).ok_or_else(|| {
+            anyhow!("connector-capable serve requires owner-selected environment value {name}")
+        })?;
+        raw.parse::<u64>()
+            .map_err(|_| anyhow!("{name} must be a finite nonnegative integer"))
+    }
+
+    let provider_grant = myownmesh_core::ResourceClaim::try_from_entries([
+        (
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_ACCOUNTED_MEMORY_BYTES")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::QueuedBytes,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_QUEUED_BYTES")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::SocketOrHandle,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_SOCKET_OR_HANDLE")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::NativeTransportObject,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::WorkerOrTask,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_WORKER_OR_TASK")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::CallbackOrScheduledWork,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_CALLBACK_OR_SCHEDULED_WORK")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::StorageBytes,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_STORAGE_BYTES")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::StorageObject,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_STORAGE_OBJECT")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::RelayOrProviderAllocation,
+            finite(
+                &mut lookup,
+                "MYOWNMESH_RESOURCE_RELAY_OR_PROVIDER_ALLOCATION",
+            )?,
+        ),
+        (
+            myownmesh_core::ResourceClass::ParsingOrCpuWork,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_PARSING_OR_CPU_WORK")?,
+        ),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            finite(&mut lookup, "MYOWNMESH_RESOURCE_OPAQUE_DEPENDENCY_RESIDUAL")?,
+        ),
+    ])?;
+    let resources = myownmesh_core::ResourceProviderPort::new(
+        myownmesh_core::FiniteResourceProvider::new(provider_grant),
     )?;
-    let pending_candidate_duplicates = nonzero(
-        &mut lookup,
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
-    )?;
-    let pending_candidate_application_work = nonzero(
-        &mut lookup,
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK",
-    )?;
-    let control_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY")?;
-    let endpoint_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY")?;
-    let control_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT")?;
-    let endpoint_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT")?;
+    let local_ceiling_mode = lookup("MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY").ok_or_else(|| {
+        anyhow!(
+            "connector-capable serve requires MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=none or enabled"
+        )
+    })?;
     let realtime_mode = lookup("MYOWNMESH_CONNECTOR_REALTIME_POLICY").ok_or_else(|| {
         anyhow!(
             "connector-capable serve requires owner-selected environment value MYOWNMESH_CONNECTOR_REALTIME_POLICY"
         )
     })?;
-    let (service_weights, realtime) = match realtime_mode.trim().to_ascii_lowercase().as_str() {
-        "disabled" => (
-            myownmesh_core::ConnectorCallbackServiceWeights::data_only(
-                control_weight,
-                endpoint_weight,
-            ),
-            myownmesh_core::RealtimeConnectorPolicy::Disabled,
-        ),
-        "enabled" => {
-            let realtime_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT")?;
-            let max_realtime_unit_bytes =
-                nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES")?;
-            let max_inbound_flows = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS",
-            )?;
-            let max_outbound_flows = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS",
-            )?;
-            let queue_capacity_per_flow = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW",
-            )?;
-            let max_inbound_fragment_bytes = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES",
-            )?;
-            let max_inbound_fragments_per_unit = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT",
-            )?;
-            let max_in_progress_units_per_flow = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
-            )?;
-            let max_pre_auth_packets = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS",
-            )?;
-            let max_pre_auth_content_bytes = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_CONTENT_BYTES",
-            )?;
-            let max_inbound_accounted_bytes = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
-            )?;
-            let max_outbound_accounted_bytes = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
-            )?;
-            let flows = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
-                myownmesh_core::ConnectorRealtimeFlowCapacities::new(
-                    max_inbound_flows,
-                    max_outbound_flows,
-                    queue_capacity_per_flow,
-                ),
-                myownmesh_core::ConnectorRealtimeInboundLimits::new(
-                    max_inbound_fragment_bytes,
-                    max_inbound_fragments_per_unit,
-                    max_in_progress_units_per_flow,
-                    max_pre_auth_packets,
-                    max_pre_auth_content_bytes,
-                ),
-                myownmesh_core::ConnectorRealtimeByteBudgets::new(
-                    max_inbound_accounted_bytes,
-                    max_outbound_accounted_bytes,
-                ),
-                myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
-            );
-            (
-                myownmesh_core::ConnectorCallbackServiceWeights::new(
-                    control_weight,
-                    endpoint_weight,
-                    realtime_weight,
-                ),
-                myownmesh_core::RealtimeConnectorPolicy::enabled(max_realtime_unit_bytes, flows)?,
-            )
-        }
+    let realtime_enabled = match realtime_mode.trim().to_ascii_lowercase().as_str() {
+        "disabled" => false,
+        "enabled" => true,
         _ => {
             return Err(anyhow!(
                 "MYOWNMESH_CONNECTOR_REALTIME_POLICY must be disabled or enabled"
             ))
         }
     };
+    let (callbacks, remote_candidates) = match local_ceiling_mode
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" => (
+            if realtime_enabled {
+                myownmesh_core::ConnectorCallbackPolicy::elastic_realtime()
+            } else {
+                myownmesh_core::ConnectorCallbackPolicy::elastic_data_only()
+            },
+            myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
+        ),
+        "enabled" => {
+            let pending_candidate_items =
+                nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS")?;
+            let pending_candidate_content_bytes = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
+            )?;
+            let pending_candidate_duplicates = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
+            )?;
+            let pending_candidate_application_work = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK",
+            )?;
+            let control_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY")?;
+            let endpoint_capacity =
+                nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY")?;
+            let control_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT")?;
+            let endpoint_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT")?;
+            let (service_weights, realtime) = if realtime_enabled {
+                let realtime_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT")?;
+                let max_realtime_unit_bytes =
+                    nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES")?;
+                let max_inbound_flows = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS",
+                )?;
+                let max_outbound_flows = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS",
+                )?;
+                let queue_capacity_per_flow = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW",
+                )?;
+                let max_inbound_fragment_bytes = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES",
+                )?;
+                let max_inbound_fragments_per_unit = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT",
+                )?;
+                let max_in_progress_units_per_flow = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
+                )?;
+                let max_pre_auth_packets = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS",
+                )?;
+                let max_pre_auth_content_bytes = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_CONTENT_BYTES",
+                )?;
+                let max_inbound_accounted_bytes = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
+                )?;
+                let max_outbound_accounted_bytes = nonzero(
+                    &mut lookup,
+                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
+                )?;
+                let flows = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
+                    myownmesh_core::ConnectorRealtimeFlowCapacities::new(
+                        max_inbound_flows,
+                        max_outbound_flows,
+                        queue_capacity_per_flow,
+                    ),
+                    myownmesh_core::ConnectorRealtimeInboundLimits::new(
+                        max_inbound_fragment_bytes,
+                        max_inbound_fragments_per_unit,
+                        max_in_progress_units_per_flow,
+                        max_pre_auth_packets,
+                        max_pre_auth_content_bytes,
+                    ),
+                    myownmesh_core::ConnectorRealtimeByteBudgets::new(
+                        max_inbound_accounted_bytes,
+                        max_outbound_accounted_bytes,
+                    ),
+                    myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
+                );
+                (
+                    myownmesh_core::ConnectorCallbackServiceWeights::new(
+                        control_weight,
+                        endpoint_weight,
+                        realtime_weight,
+                    ),
+                    myownmesh_core::RealtimeConnectorPolicy::enabled_with_local_ceiling(
+                        max_realtime_unit_bytes,
+                        flows,
+                    )?,
+                )
+            } else {
+                (
+                    myownmesh_core::ConnectorCallbackServiceWeights::data_only(
+                        control_weight,
+                        endpoint_weight,
+                    ),
+                    myownmesh_core::RealtimeConnectorPolicy::Disabled,
+                )
+            };
+            (
+                myownmesh_core::ConnectorCallbackPolicy::new(
+                    myownmesh_core::ConnectorCallbackMailboxCapacities::new(
+                        control_capacity,
+                        endpoint_capacity,
+                    ),
+                    service_weights,
+                    realtime,
+                )?,
+                myownmesh_core::PendingRemoteCandidatePolicy::new(
+                    pending_candidate_items,
+                    pending_candidate_content_bytes,
+                    pending_candidate_duplicates,
+                    pending_candidate_application_work,
+                ),
+            )
+        }
+        _ => {
+            return Err(anyhow!(
+                "MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY must be none or enabled"
+            ))
+        }
+    };
 
-    let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
-        myownmesh_core::ConnectorCallbackMailboxCapacities::new(
-            control_capacity,
-            endpoint_capacity,
-        ),
-        service_weights,
-        realtime,
-    )?;
-    let process = myownmesh_core::ConnectorResourcePolicy::new(process_candidates)?;
-    let webrtc = myownmesh_core::WebRtcConnectorProfile::new(
-        callbacks,
-        myownmesh_core::PendingRemoteCandidatePolicy::new(
-            pending_candidate_items,
-            pending_candidate_content_bytes,
-            pending_candidate_duplicates,
-            pending_candidate_application_work,
-        ),
-    );
+    let webrtc = myownmesh_core::WebRtcConnectorProfile::new(callbacks, remote_candidates);
     Ok(myownmesh_core::WebRtcConnectorCapablePolicy::new(
-        process,
-        myownmesh_core::MeshConnectorResourcePolicy::new(mesh_candidates),
-        webrtc,
+        resources, webrtc,
     ))
 }
 
@@ -371,9 +459,23 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const BASE_POLICY_KEYS: [&str; 11] = [
-        "MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES",
-        "MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES",
+    const BASE_POLICY_KEYS: [&str; 13] = [
+        "MYOWNMESH_RESOURCE_ACCOUNTED_MEMORY_BYTES",
+        "MYOWNMESH_RESOURCE_QUEUED_BYTES",
+        "MYOWNMESH_RESOURCE_SOCKET_OR_HANDLE",
+        "MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT",
+        "MYOWNMESH_RESOURCE_WORKER_OR_TASK",
+        "MYOWNMESH_RESOURCE_CALLBACK_OR_SCHEDULED_WORK",
+        "MYOWNMESH_RESOURCE_STORAGE_BYTES",
+        "MYOWNMESH_RESOURCE_STORAGE_OBJECT",
+        "MYOWNMESH_RESOURCE_RELAY_OR_PROVIDER_ALLOCATION",
+        "MYOWNMESH_RESOURCE_PARSING_OR_CPU_WORK",
+        "MYOWNMESH_RESOURCE_OPAQUE_DEPENDENCY_RESIDUAL",
+        "MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY",
+        "MYOWNMESH_CONNECTOR_REALTIME_POLICY",
+    ];
+
+    const LOCAL_CEILING_KEYS: [&str; 8] = [
         "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS",
         "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
         "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
@@ -382,7 +484,6 @@ mod tests {
         "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY",
         "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT",
         "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT",
-        "MYOWNMESH_CONNECTOR_REALTIME_POLICY",
     ];
 
     const ENABLED_REALTIME_KEYS: [&str; 12] = [
@@ -400,13 +501,24 @@ mod tests {
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
     ];
 
-    fn fixture_values(realtime: &str) -> HashMap<&'static str, String> {
+    fn fixture_values(realtime: &str, local_ceiling: bool) -> HashMap<&'static str, String> {
         let mut values: HashMap<_, _> = BASE_POLICY_KEYS
             .into_iter()
             .map(|key| (key, "1".to_string()))
             .collect();
+        values.insert(
+            "MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY",
+            if local_ceiling { "enabled" } else { "none" }.to_string(),
+        );
         values.insert("MYOWNMESH_CONNECTOR_REALTIME_POLICY", realtime.to_string());
-        if realtime == "enabled" {
+        if local_ceiling {
+            values.extend(
+                LOCAL_CEILING_KEYS
+                    .into_iter()
+                    .map(|key| (key, "1".to_string())),
+            );
+        }
+        if local_ceiling && realtime == "enabled" {
             values.extend(
                 ENABLED_REALTIME_KEYS
                     .into_iter()
@@ -421,49 +533,67 @@ mod tests {
     }
 
     #[test]
-    fn connector_capable_serve_requires_every_owner_value() {
-        let mut values = fixture_values("enabled");
-        values.remove("MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS");
+    fn connector_capable_serve_requires_every_provider_dimension() {
+        let mut values = fixture_values("disabled", false);
+        values.remove("MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT");
         let error = connector_policy_from_lookup(|name| values.get(name).cloned())
             .expect_err("an omitted owner value is rejected");
         assert!(error
             .to_string()
-            .contains("MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS"));
+            .contains("MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT"));
     }
 
     #[test]
-    fn connector_capable_serve_rejects_zero_instead_of_inventing_a_value() {
-        let mut values = fixture_values("disabled");
-        values.insert(
-            "MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES",
-            "0".to_string(),
-        );
+    fn optional_local_ceiling_rejects_zero_instead_of_inventing_a_value() {
+        let mut values = fixture_values("disabled", true);
+        values.insert("MYOWNMESH_CONNECTOR_CONTROL_CAPACITY", "0".to_string());
         let error = connector_policy_from_lookup(|name| values.get(name).cloned())
-            .expect_err("zero cannot become a connector limit");
+            .expect_err("zero cannot become an optional local queue limit");
         assert!(error.to_string().contains("must be a nonzero integer"));
     }
 
     #[test]
-    fn connector_capable_serve_builds_only_from_the_complete_owner_vector() {
-        let values = fixture_values("enabled");
+    fn optional_local_ceiling_is_present_only_when_explicitly_selected() {
+        let values = fixture_values("enabled", true);
         let policy = connector_policy_from_lookup(|name| values.get(name).cloned())
             .expect("the complete explicit test vector is accepted");
-        assert_eq!(policy.process().max_active_candidates().get(), 1);
-        assert_eq!(policy.mesh().max_active_candidates().get(), 1);
+        assert!(policy.webrtc().callbacks().local_mailboxes().is_some());
+        assert!(policy
+            .webrtc()
+            .remote_candidates()
+            .local_ceiling()
+            .is_some());
         assert!(matches!(
             policy.webrtc().callbacks().realtime(),
-            myownmesh_core::RealtimeConnectorPolicy::Enabled(_)
+            myownmesh_core::RealtimeConnectorPolicy::Enabled(Some(_))
         ));
     }
 
     #[test]
-    fn data_only_connector_policy_requires_no_realtime_values() {
-        let values = fixture_values("disabled");
+    fn elastic_data_only_connector_requires_no_cardinality_values() {
+        let values = fixture_values("disabled", false);
         let policy = connector_policy_from_lookup(|name| values.get(name).cloned())
-            .expect("an explicit data-only policy needs no real-time limits");
+            .expect("elastic data-only construction needs no cardinality limits");
+        assert!(policy.webrtc().callbacks().local_mailboxes().is_none());
+        assert!(policy
+            .webrtc()
+            .remote_candidates()
+            .local_ceiling()
+            .is_none());
         assert!(matches!(
             policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Disabled
+        ));
+    }
+
+    #[test]
+    fn elastic_realtime_connector_requires_no_flow_or_queue_count() {
+        let values = fixture_values("enabled", false);
+        let policy = connector_policy_from_lookup(|name| values.get(name).cloned())
+            .expect("elastic generic real-time construction needs no local count vector");
+        assert!(matches!(
+            policy.webrtc().callbacks().realtime(),
+            myownmesh_core::RealtimeConnectorPolicy::Enabled(None)
         ));
     }
 

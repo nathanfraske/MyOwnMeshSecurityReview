@@ -387,8 +387,8 @@ mod tests {
     use myownmesh_core::transport::Transport;
     use myownmesh_core::{
         ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-        ConnectorCallbackServiceWeights, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
-        PendingRemoteCandidatePolicy, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+        ConnectorCallbackServiceWeights, PendingRemoteCandidatePolicy,
+        WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
     };
     use myownmesh_signaling::local::LocalBroker;
     use std::num::NonZeroUsize;
@@ -450,8 +450,6 @@ mod tests {
     }
 
     fn test_transport() -> Transport {
-        let connector_count = NonZeroUsize::new(crate::TEST_PROCESS_CONNECTOR_CAPACITY)
-            .expect("shared test process connector count is explicitly nonzero");
         let callback_capacity =
             NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
@@ -460,22 +458,10 @@ mod tests {
             myownmesh_core::RealtimeConnectorPolicy::Disabled,
         )
         .expect("test data-only callback policy is valid");
-        let process_policy = ConnectorResourcePolicy::new(connector_count)
-            .expect("test cleanup queue capacity is supported");
-        let webrtc_profile = WebRtcConnectorProfile::new(
-            callbacks,
-            PendingRemoteCandidatePolicy::new(
-                connector_count,
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-                connector_count,
-                connector_count,
-            ),
-        );
-        let policy = WebRtcConnectorCapablePolicy::new(
-            process_policy,
-            MeshConnectorResourcePolicy::new(connector_count),
-            webrtc_profile,
-        );
+        let webrtc_profile =
+            WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
+        let policy =
+            WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), webrtc_profile);
         Transport::new()
             .expect("transport")
             .with_connector_resource_policy(policy)

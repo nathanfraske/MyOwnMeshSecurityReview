@@ -671,18 +671,12 @@ mod tests {
             myownmesh_core::RealtimeConnectorPolicy::Disabled,
         )
         .expect("fixture data-only callback policy is valid");
-        let process = myownmesh_core::ConnectorResourcePolicy::new(
-            NonZeroUsize::new(crate::TEST_PROCESS_CONNECTOR_CAPACITY)
-                .expect("shared test process connector count is nonzero"),
-        )
-        .expect("fixture cleanup queue capacity is supported");
         let webrtc = myownmesh_core::WebRtcConnectorProfile::new(
             callbacks,
             myownmesh_core::PendingRemoteCandidatePolicy::new(one, one, one, one),
         );
         let policy = myownmesh_core::WebRtcConnectorCapablePolicy::new(
-            process,
-            myownmesh_core::MeshConnectorResourcePolicy::new(one),
+            crate::test_resource_provider(),
             webrtc,
         );
         let mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(

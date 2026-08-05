@@ -33,11 +33,6 @@ impl AttemptLifetime {
         // take its own authority mutex, so this prevents a reverse nested edge.
         self.attempt.retired.send_replace(true);
     }
-
-    #[cfg(test)]
-    pub(crate) fn is_active(&self) -> bool {
-        self.attempt.active.load(Ordering::Acquire)
-    }
 }
 
 /// Cloneable, non-retiring witness for work owned by one attempt.

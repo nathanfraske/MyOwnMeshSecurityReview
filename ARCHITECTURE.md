@@ -233,11 +233,15 @@ host or process resource provider
         -> Mesh resource scope
             -> attempt, candidate, callback, cleanup, and flow owners
 
-sum of live claims in each resource dimension
+sum of live and failed-cleanup-retained claims in each resource dimension
     <= resource grant currently assigned to the process
 ```
 
-Mesh scopes are accounting and fairness children of one process grant. Creating another Mesh scope does not create capacity. Unused capacity is borrowable under the basal work-conserving provider. An optional local policy may impose isolation or cardinality ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test, but that wrapper is not basal mesh semantics.
+Mesh scopes attribute use to one finite process grant. Creating another Mesh scope does not create capacity. The basal provider is shared and work-conserving, with no weights, quotas, reserved shares, or partitions. Outside a selected pending turn, unused capacity is borrowable by any scope. During that turn, the provider reserves the selected demand's exact charge and leaves any capacity beyond that charge borrowable, including surplus in an overlapping resource dimension.
+
+Under pressure, a scope may own one exact move-only pending demand. Pending demand selection follows `Cleanup > Admitted > Speculative`; after a demand resolves, equal-class selection rotates across scopes. If the selected demand cannot fit, the provider may request retirement from exact owners of reclaimable `Speculative` leases. That request is sticky and contains no timer. It does not release, revoke, or alter a claim. The speculative owner must finish cleanup and drop its lease, or explicitly transfer the unreleased claim into failed-cleanup retention when cleanup cannot be proven.
+
+This cooperative mechanism does not guarantee admission while capacity is held by nonreclaimable admitted work, while a speculative owner ignores its retirement request, or after cleanup failure retains the claim. Optional local policy may impose stricter cardinality or isolation ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test, but that wrapper is not basal mesh semantics.
 
 Resource limits have four distinct sources:
 
@@ -256,6 +260,8 @@ Optional local policy ceiling
 ```
 
 One category cannot be presented as another. Measurements characterize cost and help select optional local policy. They do not establish a universal peer, Mesh, attempt, session, or flow count.
+
+An exact lease is exact only for the resource units named by its claim. Native WebRTC, allocator, runtime, kernel, driver, and external relay state that the adapter cannot count remains an explicit residual. A conforming implementation must conservatively claim, isolate, or report that residual. It must not describe a visible Rust allocation or a connector-count proxy as complete native or OS accounting.
 
 ```text
 one connection attempt
@@ -492,7 +498,7 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
 14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
 15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability.
-16. **Resource scopes do not mint capacity.** Child scopes share one process grant, use work-conserving fairness, and may borrow unused capacity unless an explicit local isolation policy says otherwise.
+16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. A selected pending turn reserves only its exact charge, and surplus capacity remains borrowable. Pending demand uses `Cleanup > Admitted > Speculative` authority order and equal-class per-scope rotation. The provider may request exact reclaimable Speculative owners to retire, but the request changes no claim. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
 17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
 18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
 19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.

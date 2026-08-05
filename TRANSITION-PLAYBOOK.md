@@ -296,7 +296,7 @@ cancel(...)
     -> ConnectorCandidateEvent | ConnectedChannelCapability | Failure
 ```
 
-The first WebRTC implementation uses this exact cardinality:
+The first WebRTC implementation uses this ownership relationship:
 
 ```text
 one connection attempt
@@ -626,12 +626,13 @@ DataChannelOpen
 
 1. Define the process resource provider, finite claim vector, exact lease, typed pressure results, and explicit residual classification.
 2. Make every protected allocation, retained value, task, queue entry, native object, and scheduled work unit hold a live lease.
-3. Issue accounting and fairness child scopes without multiplying the process grant.
+3. Issue accounting and attribution child scopes without multiplying the process grant.
 4. Replace unleased channels, maps, task spawns, queues, retries, and storage with typed admission and pressure results.
-5. Use work-conserving fairness, borrowable unused capacity, protected cleanup, and lower priority for reclaimable speculative work.
+5. Keep one basal finite process grant shared and work-conserving, with no weights, quotas, reserved shares, or partitions. Represent one exact move-only pending demand per scope. Reserve only the selected demand's exact charge so surplus stays borrowable. Select `Cleanup > Admitted > Speculative`, then rotate equal-class selection across scopes after each resolved demand.
 6. Keep protocol bounds, provider structural limits, runtime availability, and optional local ceilings distinct.
-7. Test identity rotation, many-source pressure, unequal claim sizes, exact release, child-scope sharing, optional ceilings, slow work, and storage-backed work.
-8. Measure performance, provider cost, fairness, regression, and opaque residuals without deriving universal object counts.
+7. Let the provider request retirement only from exact reclaimable Speculative owners. Keep disposition with owner Drop after cleanup or explicit failed-cleanup retention. Add no timer and claim no guarantee against nonreclaimable admitted pressure, ignored retirement, or failed cleanup.
+8. Test identity rotation, many-source pressure, unequal claim sizes, exact release, child-scope borrowing, move-only pending demand, authority ordering, equal-class rotation, cooperative retirement, ignored retirement, failed-cleanup retention, optional ceilings, slow work, and storage-backed work.
+9. Measure performance, provider cost, scheduling, regression, and opaque residuals without deriving universal object counts.
 
 **Gate**
 
@@ -640,8 +641,15 @@ DataChannelOpen
 - Open overload is reported as resource pressure, never unauthorized identity;
 - no `unlimited` sentinel or hidden default cardinality exists;
 - no basal maximum Mesh, peer, attempt, session, or flow count exists;
-- unused capacity is borrowable unless an explicit local isolation policy forbids it;
-- cleanup remains admissible under pressure;
+- outside a selected pending charge, unused capacity is borrowable unless an explicit local isolation policy forbids it;
+- a selected pending turn reserves only its exact charge, and surplus remains borrowable;
+- the basal provider has no weights, quotas, reserved shares, or partitions;
+- one move-only pending demand exists per scope;
+- authority selection is `Cleanup > Admitted > Speculative`, with equal-class per-scope rotation;
+- the provider requests retirement only from exact reclaimable Speculative owners and never releases their claims;
+- disposition remains owner Drop after cleanup or explicit failed-cleanup retention;
+- no timer creates resource truth;
+- no admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
 - normal connection and media performance remains owner-acceptable under measured workloads.
 
 **Delete:** unleased production work and legacy ad hoc caps presented as basal semantic limits.

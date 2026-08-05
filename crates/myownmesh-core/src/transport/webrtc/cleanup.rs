@@ -17,6 +17,18 @@ enum ConnectedClaimRetention {
 }
 
 impl ConnectedClaimRetention {
+    fn release_after_cleanup_success(&mut self) {
+        match self {
+            Self::Empty => {}
+            Self::One(capability) => capability.release_after_cleanup_success(),
+            Self::Multiple(capabilities) => {
+                for capability in capabilities {
+                    capability.release_after_cleanup_success();
+                }
+            }
+        }
+    }
+
     fn retain_after_cleanup_failure(&mut self) {
         match self {
             Self::Empty => {}
@@ -78,14 +90,19 @@ impl NativeConnectorClosePort for WebRtcNativeCloseErrorPort {
 pub(super) struct ConnectorCloseOwner {
     pub(super) ownership: ConnectorOwnership,
     resource_owner: MeshConnectorResourceScope,
+    cleanup_capability: SyncMutex<Option<crate::runtime::attempt::ConnectorCleanupCapability>>,
     native: SyncMutex<Option<Arc<dyn NativeConnectorClosePort>>>,
     remote_candidates: SyncMutex<Option<Arc<SyncMutex<RemoteCandidateState>>>>,
     realtime_flows: SyncMutex<Option<Arc<RealtimeFlowRegistry>>>,
+    native_allocation_started: AtomicBool,
     started: AtomicBool,
+    cleanup_submitted: AtomicBool,
     cleanup_complete: AtomicBool,
     status: watch::Sender<ConnectorCloseStatus>,
     status_transition: SyncMutex<()>,
     connected_claims: SyncMutex<ConnectedClaimRetention>,
+    remote_description_resources:
+        SyncMutex<std::collections::LinkedList<Arc<RemoteDescriptionResourceOwner>>>,
     #[cfg(test)]
     fail_background_start: AtomicBool,
     #[cfg(test)]
@@ -96,19 +113,24 @@ impl ConnectorCloseOwner {
     pub(super) fn new(
         ownership: ConnectorOwnership,
         resource_owner: MeshConnectorResourceScope,
+        cleanup_capability: crate::runtime::attempt::ConnectorCleanupCapability,
     ) -> Arc<Self> {
         let (status, _receiver) = watch::channel(ConnectorCloseStatus::Open);
         Arc::new(Self {
             ownership,
             resource_owner: resource_owner.clone(),
+            cleanup_capability: SyncMutex::new(Some(cleanup_capability)),
             native: SyncMutex::new(None),
             remote_candidates: SyncMutex::new(None),
             realtime_flows: SyncMutex::new(None),
+            native_allocation_started: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            cleanup_submitted: AtomicBool::new(false),
             cleanup_complete: AtomicBool::new(false),
             status,
             status_transition: SyncMutex::new(()),
             connected_claims: SyncMutex::new(ConnectedClaimRetention::Empty),
+            remote_description_resources: SyncMutex::new(std::collections::LinkedList::new()),
             #[cfg(test)]
             fail_background_start: AtomicBool::new(false),
             #[cfg(test)]
@@ -116,19 +138,50 @@ impl ConnectorCloseOwner {
         })
     }
 
-    pub(super) fn attach_native(&self, native: Arc<RTCPeerConnection>) -> bool {
+    pub(super) fn attach_native(self: &Arc<Self>, native: Arc<RTCPeerConnection>) -> bool {
         self.attach_native_port(Arc::new(WebRtcNativeClosePort { peer: native }))
     }
 
-    pub(super) fn attach_native_port(&self, native: Arc<dyn NativeConnectorClosePort>) -> bool {
+    /// Marks the point after which dependency-owned constructor work may have
+    /// allocated native resources that MyOwnMesh cannot individually close.
+    ///
+    /// This is set before entering the native constructor. If construction is
+    /// cancelled before a close port is returned, cleanup retains the exact
+    /// connector claim instead of proving a release it cannot observe.
+    pub(super) fn mark_native_allocation_started(&self) {
+        self.native_allocation_started
+            .store(true, Ordering::Release);
+    }
+
+    /// Records that native construction returned without a closeable port.
+    /// The exact connector claim remains retained because dependency-owned
+    /// allocation cannot be disproved.
+    pub(super) fn finish_native_allocation_without_close_port(&self, reason: String) {
+        self.fail_cleanup(reason);
+    }
+
+    pub(super) fn attach_native_port(
+        self: &Arc<Self>,
+        native: Arc<dyn NativeConnectorClosePort>,
+    ) -> bool {
         let mut current = self.native.lock();
-        if current.is_some() || self.started.load(Ordering::Acquire) {
+        if current.is_some() {
             drop(current);
             self.resource_owner.poison_accounting();
-            self.fail_cleanup("duplicate or late native peer installation".to_string());
+            self.fail_cleanup("duplicate native peer installation".to_string());
+            return false;
+        }
+        if matches!(
+            *self.status.borrow(),
+            ConnectorCloseStatus::Closed | ConnectorCloseStatus::Failed(_)
+        ) {
             return false;
         }
         *current = Some(native);
+        drop(current);
+        if self.started.load(Ordering::Acquire) {
+            self.submit_cleanup_if_ready();
+        }
         true
     }
 
@@ -157,6 +210,20 @@ impl ConnectorCloseOwner {
         true
     }
 
+    pub(super) fn retain_remote_description_resources(
+        &self,
+        resources: Arc<RemoteDescriptionResourceOwner>,
+    ) {
+        let mut retained = self.remote_description_resources.lock();
+        if retained
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &resources))
+        {
+            return;
+        }
+        retained.push_back(resources);
+    }
+
     pub(super) fn retire_local(&self) {
         self.ownership.retire();
         if let Some(candidates) = self.remote_candidates.lock().as_ref() {
@@ -172,12 +239,12 @@ impl ConnectorCloseOwner {
         mut capability: crate::connector::ConnectedChannelCapability,
     ) {
         let mut retained = self.connected_claims.lock();
+        if self.ownership.cleanup_failed.load(Ordering::Acquire) {
+            capability.retain_after_cleanup_failure();
+        }
         if self.cleanup_complete.load(Ordering::Acquire) {
             drop(capability);
             return;
-        }
-        if self.ownership.cleanup_failed.load(Ordering::Acquire) {
-            capability.retain_after_cleanup_failure();
         }
         *retained = match std::mem::replace(&mut *retained, ConnectedClaimRetention::Empty) {
             ConnectedClaimRetention::Empty => ConnectedClaimRetention::One(Box::new(capability)),
@@ -210,17 +277,47 @@ impl ConnectorCloseOwner {
                 }
             }
         }
+        self.submit_cleanup_if_ready();
+    }
+
+    /// Submit cleanup only after either no native allocation was started or an
+    /// exact native close port has arrived. A close request racing a native
+    /// constructor remains `Closing` and keeps its finite claim. Late port
+    /// attachment then wakes this same owner and completes the one close.
+    fn submit_cleanup_if_ready(self: &Arc<Self>) {
+        let native_ready = self.native.lock().is_some();
+        if !native_ready && self.native_allocation_started.load(Ordering::Acquire) {
+            return;
+        }
+        if self.cleanup_submitted.swap(true, Ordering::AcqRel) {
+            return;
+        }
         #[cfg(test)]
         if self.fail_background_start.load(Ordering::Acquire) {
             self.fail_cleanup("cleanup background task failed to start".to_string());
             return;
         }
+        let Some(mut cleanup_capability) = self.cleanup_capability.lock().take() else {
+            self.fail_cleanup("connector cleanup capability is missing".to_string());
+            return;
+        };
+        if let Err(error) = cleanup_capability.begin_cleanup() {
+            self.fail_cleanup(format!(
+                "resource provider refused the cleanup transition: {error}"
+            ));
+            return;
+        }
         let owner = Arc::clone(self);
+        let completion_owner = Arc::clone(self);
         let failure_owner = Arc::clone(self);
         if self
             .resource_owner
             .submit_cleanup(
+                cleanup_capability,
                 Box::pin(async move { owner.run().await }),
+                Box::new(move || {
+                    completion_owner.publish_cleanup_job_completion();
+                }),
                 Box::new(move |reason| {
                     failure_owner.fail_cleanup(reason);
                 }),
@@ -238,7 +335,13 @@ impl ConnectorCloseOwner {
         }
         let native = self.native.lock().clone();
         let Some(native) = native else {
-            self.finish_closed();
+            if self.native_allocation_started.load(Ordering::Acquire) {
+                self.fail_cleanup(
+                    "native construction ended without an observable close owner".to_string(),
+                );
+            } else {
+                self.finish_closed();
+            }
             return;
         };
         self.ownership.incarnation.retire();
@@ -251,16 +354,38 @@ impl ConnectorCloseOwner {
 
     fn finish_closed(&self) {
         let _transition = self.status_transition.lock();
-        if matches!(*self.status.borrow(), ConnectorCloseStatus::Failed(_)) {
-            return;
-        }
+        let terminal_failure = matches!(*self.status.borrow(), ConnectorCloseStatus::Failed(_));
         self.cleanup_complete.store(true, Ordering::Release);
-        self.ownership.complete_cleanup();
+        if terminal_failure {
+            // A failure recorded before start remains authoritative, but a
+            // later successful native close still retires all subordinate
+            // connector objects. Their exact failed claims were already moved
+            // into provider retention and are not made reusable here.
+            self.connected_claims.lock().retain_after_cleanup_failure();
+            for resources in self.remote_description_resources.lock().iter() {
+                resources.retain_after_cleanup_failure();
+            }
+        } else {
+            self.ownership.complete_cleanup();
+            self.connected_claims.lock().release_after_cleanup_success();
+        }
         self.native.lock().take();
         self.remote_candidates.lock().take();
         self.realtime_flows.lock().take();
+        self.remote_description_resources.lock().clear();
         *self.connected_claims.lock() = ConnectedClaimRetention::Empty;
-        self.status.send_replace(ConnectorCloseStatus::Closed);
+    }
+
+    fn publish_cleanup_job_completion(&self) {
+        let _transition = self.status_transition.lock();
+        if self.cleanup_complete.load(Ordering::Acquire)
+            && matches!(
+                *self.status.borrow(),
+                ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing
+            )
+        {
+            self.status.send_replace(ConnectorCloseStatus::Closed);
+        }
     }
 
     /// Retain this connector's exact cleanup claims after a known native
@@ -278,6 +403,9 @@ impl ConnectorCloseOwner {
         self.retire_local();
         self.ownership.retain_after_cleanup_failure();
         self.connected_claims.lock().retain_after_cleanup_failure();
+        for resources in self.remote_description_resources.lock().iter() {
+            resources.retain_after_cleanup_failure();
+        }
         self.status
             .send_replace(ConnectorCloseStatus::Failed(reason));
     }

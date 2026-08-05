@@ -13,8 +13,8 @@ use super::*;
 /// retransmit fills it out of order and the unit still emits — and a
 /// unit whose hole never fills is dropped whole when the next timestamp
 /// arrives. Late retransmits of an abandoned unit can't clobber the
-/// live one. Depacketization runs per-unit in sequence order, so FU-A
-/// fragment state never straddles a loss.
+/// live one. Exact Annex-B planning and assembly run per unit in sequence
+/// order, so FU-A fragment state never straddles a loss.
 #[derive(Default)]
 pub(super) struct H264AuAssembler {
     /// RTP timestamp of the unit being collected.
@@ -42,6 +42,138 @@ pub(super) struct GuardedVideoSample {
 /// More packets than any sane unit (a 40 Mbps keyframe is ~400): a unit
 /// this size means the stream is wedged — drop it rather than balloon.
 pub(super) const MAX_AU_PARTS: usize = super::LEGACY_H264_MAX_FRAGMENTS_PER_UNIT;
+const ANNEXB_START_CODE: [u8; 4] = [0, 0, 0, 1];
+
+fn output_length_overflow() -> Error {
+    Error::Transport("video unit output length overflowed".into())
+}
+
+fn add_output_len(total: usize, bytes: usize) -> Result<usize> {
+    total.checked_add(bytes).ok_or_else(output_length_overflow)
+}
+
+/// Validate the exact webrtc-rs H.264 compatibility shape and compute the
+/// complete Annex-B output length without allocating output storage.
+fn annexb_output_len(
+    parts: &std::collections::BTreeMap<i64, Bytes>,
+    start: i64,
+    end: i64,
+) -> Result<usize> {
+    let mut output_len = 0usize;
+    let mut fua_content_bytes = None;
+    for (_, payload) in parts.range(start..=end) {
+        if payload.len() <= 2 {
+            return Err(Error::Transport("h264 depacketize: short packet".into()));
+        }
+        match payload[0] & 0x1f {
+            1..=23 => {
+                output_len = add_output_len(output_len, ANNEXB_START_CODE.len())?;
+                output_len = add_output_len(output_len, payload.len())?;
+            }
+            24 => {
+                let mut offset = 1usize;
+                while offset < payload.len() {
+                    let length_end = offset.checked_add(2).ok_or_else(output_length_overflow)?;
+                    if length_end > payload.len() {
+                        return Err(Error::Transport(
+                            "h264 depacketize: truncated STAP-A length".into(),
+                        ));
+                    }
+                    let nalu_len =
+                        (usize::from(payload[offset]) << 8) | usize::from(payload[offset + 1]);
+                    let nalu_end = length_end
+                        .checked_add(nalu_len)
+                        .ok_or_else(output_length_overflow)?;
+                    if nalu_end > payload.len() {
+                        return Err(Error::Transport(
+                            "h264 depacketize: STAP-A unit exceeds packet".into(),
+                        ));
+                    }
+                    output_len = add_output_len(output_len, ANNEXB_START_CODE.len())?;
+                    output_len = add_output_len(output_len, nalu_len)?;
+                    offset = nalu_end;
+                }
+            }
+            28 => {
+                let accumulated = fua_content_bytes
+                    .unwrap_or(0usize)
+                    .checked_add(payload.len() - 2)
+                    .ok_or_else(output_length_overflow)?;
+                if payload[1] & 0x40 != 0 {
+                    output_len = add_output_len(output_len, ANNEXB_START_CODE.len())?;
+                    output_len = add_output_len(output_len, 1)?;
+                    output_len = add_output_len(output_len, accumulated)?;
+                    fua_content_bytes = None;
+                } else {
+                    fua_content_bytes = Some(accumulated);
+                }
+            }
+            nalu_type => {
+                return Err(Error::Transport(format!(
+                    "h264 depacketize: NAL type {nalu_type} is not handled"
+                )));
+            }
+        }
+    }
+    Ok(output_len)
+}
+
+/// Build the exact output validated by `annexb_output_len`. FU-A contents are
+/// copied only when their end fragment is encountered, matching webrtc-rs
+/// ordering without retaining a second dependency-owned assembly buffer.
+fn write_annexb_output(
+    parts: &std::collections::BTreeMap<i64, Bytes>,
+    start: i64,
+    end: i64,
+    output_len: usize,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(output_len);
+    let mut fua_start = None;
+    for (&sequence, payload) in parts.range(start..=end) {
+        match payload[0] & 0x1f {
+            1..=23 => {
+                output.extend_from_slice(&ANNEXB_START_CODE);
+                output.extend_from_slice(payload);
+            }
+            24 => {
+                let mut offset = 1usize;
+                while offset < payload.len() {
+                    let nalu_len =
+                        (usize::from(payload[offset]) << 8) | usize::from(payload[offset + 1]);
+                    offset += 2;
+                    let nalu_end = offset + nalu_len;
+                    output.extend_from_slice(&ANNEXB_START_CODE);
+                    output.extend_from_slice(&payload[offset..nalu_end]);
+                    offset = nalu_end;
+                }
+            }
+            28 => {
+                let chain_start = *fua_start.get_or_insert(sequence);
+                if payload[1] & 0x40 != 0 {
+                    output.extend_from_slice(&ANNEXB_START_CODE);
+                    output.push((payload[0] & 0x60) | (payload[1] & 0x1f));
+                    for (_, fragment) in parts.range(chain_start..=sequence) {
+                        if fragment[0] & 0x1f == 28 {
+                            output.extend_from_slice(&fragment[2..]);
+                        }
+                    }
+                    fua_start = None;
+                }
+            }
+            _ => {
+                return Err(Error::Transport(
+                    "validated H.264 payload changed during assembly".into(),
+                ));
+            }
+        }
+    }
+    if output.len() != output_len {
+        return Err(Error::Transport(
+            "validated H.264 output length changed during assembly".into(),
+        ));
+    }
+    Ok(output)
+}
 
 impl H264AuAssembler {
     pub(super) fn guarded(flow: RealtimeFlowPort) -> Self {
@@ -106,7 +238,7 @@ impl H264AuAssembler {
                 self.clear_current();
                 return Ok(None);
             };
-            if !assembly.retain_fragment(pkt.payload.len()) {
+            if !assembly.retain_ordered_fragment(pkt.payload.len()) {
                 self.clear_current();
                 self.prev_end = None;
                 return Err(Error::Transport(
@@ -153,11 +285,20 @@ impl H264AuAssembler {
         if self.parts.range(start..=end).count() < need {
             return Ok(None); // a hole — wait for the retransmit
         }
-        // Reserve the full owner-selected output ceiling before the
-        // depacketizer allocates. The reservation shrinks to the exact output
-        // length before it enters the flow queue.
-        let mut output = match self.flow.as_ref() {
-            Some(flow) => match flow.reserve_output(flow.lifetime.registry.max_unit_bytes) {
+        let output_len = match annexb_output_len(&self.parts, start, end) {
+            Ok(output_len) => output_len,
+            Err(error) => {
+                self.prev_end = Some(end);
+                self.clear_current();
+                self.marker_seq = None;
+                return Err(error);
+            }
+        };
+        // Acquire the exact complete-output claim before allocating any output
+        // storage. The provider owns the logical bytes and one opaque residual
+        // covers allocator-managed storage beyond that logical length.
+        let output = match self.flow.as_ref() {
+            Some(flow) if output_len != 0 => match flow.reserve_output(output_len) {
                 Some(output) => Some(output),
                 None => {
                     self.clear_current();
@@ -166,54 +307,17 @@ impl H264AuAssembler {
                     return Ok(None);
                 }
             },
-            None => None,
+            _ => None,
         };
-        // Complete: depacketize in sequence order with fresh FU state.
-        use webrtc::rtp::packetizer::Depacketizer;
-        let mut depacketizer = webrtc::rtp::codecs::h264::H264Packet::default();
-        let mut data = Vec::new();
-        let mut failed = None;
-        let output_limit = self
-            .flow
-            .as_ref()
-            .map_or(usize::MAX, |flow| flow.lifetime.registry.max_unit_bytes);
-        for (_, payload) in self.parts.range(start..=end) {
-            match depacketizer.depacketize(payload) {
-                Ok(part) => {
-                    let Some(next_len) = data.len().checked_add(part.len()) else {
-                        failed = Some("video unit output length overflowed".to_string());
-                        break;
-                    };
-                    if next_len > output_limit {
-                        failed =
-                            Some("video unit exceeded its owner-selected output limit".to_string());
-                        break;
-                    }
-                    data.extend_from_slice(&part);
-                }
-                Err(e) => {
-                    failed = Some(format!("h264 depacketize: {e}"));
-                    break;
-                }
-            }
-        }
+        let data = write_annexb_output(&self.parts, start, end, output_len);
         // Either way this unit is consumed and the next one anchors
         // right after it.
         self.prev_end = Some(end);
         self.clear_current();
         self.marker_seq = None;
-        if let Some(e) = failed {
-            return Err(Error::Transport(e));
-        }
+        let data = data?;
         if data.is_empty() {
             return Ok(None);
-        }
-        if let Some(output) = output.as_mut() {
-            if !output.shrink_to(data.len()) {
-                return Err(Error::Transport(
-                    "video output reservation could not represent the assembled unit".into(),
-                ));
-            }
         }
         let data = Bytes::from(data);
         Ok(Some(GuardedVideoSample {
@@ -309,4 +413,54 @@ pub(super) fn annexb_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
         }
         None
     })
+}
+
+#[cfg(test)]
+mod exact_output_tests {
+    use super::*;
+    use webrtc::rtp::packetizer::Depacketizer;
+
+    #[test]
+    fn planned_output_exactly_matches_single_stap_and_fu_assembly() {
+        let mut parts = std::collections::BTreeMap::new();
+        parts.insert(1, Bytes::from_static(&[0x65, 0x11, 0x12]));
+        parts.insert(
+            2,
+            Bytes::from_static(&[0x78, 0x00, 0x02, 0x67, 0x21, 0x00, 0x03, 0x68, 0x31, 0x32]),
+        );
+        parts.insert(3, Bytes::from_static(&[0x7c, 0x85, 0x41]));
+        parts.insert(4, Bytes::from_static(&[0x7c, 0x45, 0x42]));
+
+        let planned = annexb_output_len(&parts, 1, 4).expect("the test unit is valid");
+        let output =
+            write_annexb_output(&parts, 1, 4, planned).expect("the validated unit is stable");
+        let mut dependency = webrtc::rtp::codecs::h264::H264Packet::default();
+        let mut dependency_output = Vec::new();
+        for payload in parts.values() {
+            dependency_output.extend_from_slice(
+                &dependency
+                    .depacketize(payload)
+                    .expect("the dependency accepts the test unit"),
+            );
+        }
+        assert_eq!(output.len(), planned);
+        assert_eq!(output, dependency_output);
+        assert_eq!(
+            output,
+            [
+                &[0, 0, 0, 1, 0x65, 0x11, 0x12][..],
+                &[0, 0, 0, 1, 0x67, 0x21][..],
+                &[0, 0, 0, 1, 0x68, 0x31, 0x32][..],
+                &[0, 0, 0, 1, 0x65, 0x41, 0x42][..],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn malformed_stap_is_rejected_before_output_allocation() {
+        let mut parts = std::collections::BTreeMap::new();
+        parts.insert(1, Bytes::from_static(&[0x78, 0x00, 0x04, 0x67]));
+        assert!(annexb_output_len(&parts, 1, 1).is_err());
+    }
 }

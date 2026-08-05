@@ -169,11 +169,47 @@ pub(super) fn make_media_track(kind: LaneKind, lane: u8) -> Arc<TrackLocalStatic
 /// Attach a local track to the connection and drain its sender's RTCP
 /// so the interceptors (NACK responder, reports) actually run; the
 /// drain task ends with the connection.
+const LEGACY_RTCP_DRAIN_BUFFER_BYTES: usize = 1_500;
+
+pub(super) fn legacy_rtcp_drain_claim() -> Result<crate::resource::ResourceClaim> {
+    let retained_bytes = std::mem::size_of::<Vec<u8>>()
+        .checked_add(LEGACY_RTCP_DRAIN_BUFFER_BYTES)
+        .ok_or_else(|| Error::Transport("RTCP drain claim size overflowed".to_string()))?;
+    let retained_bytes = u64::try_from(retained_bytes)
+        .map_err(|_| Error::Transport("RTCP drain claim is not representable".to_string()))?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            retained_bytes,
+        ),
+        (crate::resource::ResourceClass::WorkerOrTask, 1),
+        // The runtime task allocation and dependency-owned sender allocation
+        // are not exposed as exact byte quantities.
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])
+    .map_err(|error| Error::Transport(format!("RTCP drain claim overflowed: {error}")))
+}
+
 pub(super) async fn attach_track(
     pc: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticSample>,
     resource_scope: Option<&PeerConnectionResourceScope>,
+    work_resources: Option<&ConnectorWorkResourceScope>,
 ) -> Result<()> {
+    let task_lease = match work_resources {
+        Some(resources) => Some(
+            resources
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    legacy_rtcp_drain_claim()?,
+                )
+                .map_err(Error::from)?,
+        ),
+        #[cfg(any(test, feature = "transport-lab"))]
+        None => None,
+        #[cfg(not(any(test, feature = "transport-lab")))]
+        None => return Err(Error::ConnectorPolicyRequired),
+    };
     let sender = pc
         .add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>)
         .await
@@ -181,8 +217,9 @@ pub(super) async fn attach_track(
     let task_observation =
         observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Task, 1, 1);
     tokio::spawn(async move {
+        let _task_lease = task_lease;
         let _task_observation = task_observation;
-        let mut buf = vec![0u8; 1500];
+        let mut buf = vec![0u8; LEGACY_RTCP_DRAIN_BUFFER_BYTES];
         while sender.read(&mut buf).await.is_ok() {}
     });
     Ok(())
@@ -191,11 +228,21 @@ pub(super) async fn attach_track(
 /// Exact ownership retained by one temporary compatibility track pump.
 pub(super) struct LegacyInboundTrackOwner {
     pub(super) task_observation: Option<ObservationLease>,
-    pub(super) remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
-    pub(super) track_key: (bool, u8),
+    pub(super) registration: LegacyRemoteTrackRegistration,
     pub(super) flow: RealtimeFlowPort,
     pub(super) transceiver: Arc<webrtc::rtp_transceiver::RTCRtpTransceiver>,
     pub(super) lane: u8,
+}
+
+pub(super) struct LegacyRemoteTrackRegistration {
+    pub(super) remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
+    pub(super) track_key: (bool, u8),
+}
+
+impl Drop for LegacyRemoteTrackRegistration {
+    fn drop(&mut self) {
+        self.remote_tracks.lock().remove(&self.track_key);
+    }
 }
 
 /// Drain one remote audio track: every RTP packet carries exactly one
@@ -209,13 +256,19 @@ pub(super) async fn pump_audio_track(
 ) {
     let LegacyInboundTrackOwner {
         task_observation: _task_observation,
-        remote_tracks,
-        track_key,
+        registration: _registration,
         flow,
         transceiver,
         lane,
     } = owner;
     loop {
+        let native_read = match flow.lifetime.registry.begin_native_read_checked() {
+            Ok(read) => read,
+            Err(_) => {
+                let _ = transceiver.stop().await;
+                break;
+            }
+        };
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
             Err(_) => break, // track ended with its connection
@@ -224,14 +277,20 @@ pub(super) async fn pump_audio_track(
             continue; // padding / probe
         }
         let promoted = tx.realtime_delivery.load(Ordering::Acquire);
-        if !flow
+        let _pre_auth_work = match flow
             .lifetime
             .registry
-            .admit_pre_auth_packet(pkt.payload.len(), promoted)
+            .admit_pre_auth_packet_checked(pkt.payload.len(), promoted)
         {
-            let _ = transceiver.stop().await;
-            break;
-        }
+            Ok(work) => work,
+            Err(_) => {
+                let _ = transceiver.stop().await;
+                break;
+            }
+        };
+        // The exact content-byte work lease now owns the returned packet. The
+        // opaque native-read lease no longer has to cover dependency output.
+        drop(native_read);
         if !promoted {
             continue;
         }
@@ -255,7 +314,6 @@ pub(super) async fn pump_audio_track(
             break;
         }
     }
-    remote_tracks.lock().remove(&track_key);
 }
 
 /// Drain one remote video track: depacketize H.264 RTP into access
@@ -268,27 +326,39 @@ pub(super) async fn pump_video_track(
 ) {
     let LegacyInboundTrackOwner {
         task_observation: _task_observation,
-        remote_tracks,
-        track_key,
+        registration: _registration,
         flow,
         transceiver,
         lane,
     } = owner;
     let mut assembler = H264AuAssembler::guarded(flow.clone());
     loop {
+        let native_read = match flow.lifetime.registry.begin_native_read_checked() {
+            Ok(read) => read,
+            Err(_) => {
+                let _ = transceiver.stop().await;
+                break;
+            }
+        };
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
             Err(_) => break, // track ended with its connection
         };
         let promoted = tx.realtime_delivery.load(Ordering::Acquire);
-        if !flow
+        let _pre_auth_work = match flow
             .lifetime
             .registry
-            .admit_pre_auth_packet(pkt.payload.len(), promoted)
+            .admit_pre_auth_packet_checked(pkt.payload.len(), promoted)
         {
-            let _ = transceiver.stop().await;
-            break;
-        }
+            Ok(work) => work,
+            Err(_) => {
+                let _ = transceiver.stop().await;
+                break;
+            }
+        };
+        // The exact content-byte work lease now owns the returned packet. The
+        // opaque native-read lease no longer has to cover dependency output.
+        drop(native_read);
         if !promoted {
             continue;
         }
@@ -310,7 +380,6 @@ pub(super) async fn pump_video_track(
             Err(e) => trace!("video depacketize: {e}"),
         }
     }
-    remote_tracks.lock().remove(&track_key);
 }
 
 impl PeerSession {
@@ -501,7 +570,13 @@ impl PeerSession {
                 "injected native track attachment failure".to_string(),
             ));
         }
-        attach_track(&self.pc, &track, self.resource_scope.as_ref()).await?;
+        attach_track(
+            &self.pc,
+            &track,
+            self.resource_scope.as_ref(),
+            self.work_resource_scope.as_ref(),
+        )
+        .await?;
         // First writer wins if two racers opened the same lane; the
         // loser's track was attached too, but the slot's track is the
         // one everyone writes — the duplicate is harmless and gone on

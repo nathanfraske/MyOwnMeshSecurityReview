@@ -1,6 +1,10 @@
 # Arc 03 WebRTC connector ownership red team
 
-Status: Arc 03 executable review record for draft fork PR #5 on `arc/03i-final-connector-boundary`. The accepted Arc 03J connector controls remain required. The elastic resource controls below are pending implementation. Passing this record does not authorize merge or select an optional local policy value.
+Status: Arc 03 executable review record for draft fork PR #5 on
+`arc/03i-final-connector-boundary`. The accepted Arc 03 connector controls and
+the elastic resource controls below remain required. Source presence is not
+exact-head execution evidence. Passing this record does not authorize merge or
+select an optional local policy value.
 
 ## 1. Isolation and exact-head commands
 
@@ -8,7 +12,7 @@ Run socket-bearing checks only inside Ubuntu 24.04 WSL. Do not run Windows test 
 
 ```powershell
 $repo = (Resolve-Path "C:\Users\Admin\MyOwnMesh Security Audit\MyOwnMeshV4Transition").Path
-$target = "/tmp/mom-arc03j-red-team"
+$target = "/root/.cache/codex/mom-arc03-red-team"
 
 wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target /root/.cargo/bin/cargo fmt --all -- --check
 wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target /root/.cargo/bin/cargo check --workspace --all-targets -j 16
@@ -24,7 +28,7 @@ wsl.exe -d Ubuntu-24.04 --cd $repo env CARGO_TARGET_DIR=$target PATH=/root/.carg
 After retaining the logs, remove only this target:
 
 ```powershell
-wsl.exe -d Ubuntu-24.04 -- rm -rf /tmp/mom-arc03j-red-team
+wsl.exe -d Ubuntu-24.04 -- rm -rf /root/.cache/codex/mom-arc03-red-team
 ```
 
 ## 2. RT-03-01: manufacture connector resource authority
@@ -41,15 +45,22 @@ Controls:
 - non-multiplying Mesh scope and exact-release restoration controls
 - work-conserving borrowing and optional local ceiling controls
 - cause-matched compiler rejections for private resource and worker constructors
+- `foreign_port_authority_cannot_release_or_reuse_a_live_reservation`
+- `one_finite_provider_cannot_back_two_distinct_authority_roots`
+- `provider_rejects_an_unknown_scope_even_with_port_authority`
+- `releasing_a_scope_with_a_live_reservation_poisons_later_admission`
+- `accounting_mutex_poison_becomes_an_explicit_provider_invariant`
 
 ## 3. RT-03-02: cancel native construction
 
-Attack: cancel after native allocation, after delivery, during caller runtime shutdown, or after a construction failure.
+Attack: cancel after native allocation, race close before the native port attaches, cancel after delivery, shut down the caller runtime, or fail construction.
 
 Required result: one close owner owns every partial or delivered result. Successful close releases the claim. A returned close error retains the exact claim. Caller cancellation cannot cancel cleanup ownership.
 
 Controls:
 
+- `v4_arc03_native_constructor_without_close_port_retains_exact_claim`
+- `v4_arc03_close_before_native_attach_closes_late_port_and_releases_claim`
 - `v4_arc03_cancelled_construction_closes_partial_native_peer`
 - `v4_arc03_cancelled_construction_with_native_close_error_retains_exact_claim`
 - `v4_arc03_cancelled_delivered_result_closes_native_peer_before_release`
@@ -74,13 +85,15 @@ Residual: this proves the enumerated Arc 03 connector paths. It is not repositor
 
 Attack: fill the control and endpoint mailboxes, queue open and close together, place endpoint data ahead of open in the scheduler, and emit callback observations after close.
 
-Required result: open and close use their fixed lifecycle owner instead of an ordinary mailbox. Close may supersede an uncommitted open. Close is exposed once. No event after close reaches Endpoint Auth or application dispatch. Renegotiation remains a sticky coalesced obligation, while ICE and peer-connection state retain only the latest observation.
+Required result: open and close use their fixed lifecycle owner instead of an ordinary mailbox. Close may supersede an uncommitted open. A close recorded while the connector is authoritative survives the retirement it causes and is exposed once. A close inserted only after retirement is discarded. No event after close reaches Endpoint Auth or application dispatch. Renegotiation remains a sticky coalesced obligation, while ICE and peer-connection state retain only the latest observation.
 
 Controls:
 
 - `v4_arc03i_close_supersedes_prequeued_endpoint_data_without_hidden_producers`
 - `v4_arc03i_open_and_close_do_not_depend_on_control_mailbox_capacity`
 - `v4_arc03i_close_supersedes_an_uncommitted_open_exactly_once`
+- `v4_arc03_recorded_close_survives_connector_retirement_to_engine_delivery`
+- `v4_arc03_retirement_stops_event_pump_before_stale_callback_queueing`
 - `v4_arc03i_candidate_and_gathering_overload_retires_the_connector`
 - `v4_arc03i_renegotiation_and_state_observations_are_coalesced`
 
@@ -92,17 +105,19 @@ Required result: every retained callback carries queued-byte and scheduled-work 
 
 Controls:
 
-- `v4_arc03h_full_mailbox_does_not_hide_a_producer_before_close`
+- `v4_arc03i_close_supersedes_prequeued_endpoint_data_without_hidden_producers`
 - `v4_arc03h_callback_producer_flood_cannot_queue_behind_full_mailbox`
+- `producer_overload_is_typed_and_creates_no_hidden_work`
 - source rejection of callback `reserve().await`
 
-The native callback surface has a separate structural bound. Data-only mode admits one application data channel and no media tracks. The temporary legacy profile admits one application data channel and only its finite, exact H.264 and Opus track set. The first shape violation retires the connector, and later violations coalesce into that one action.
+The native callback surface has a separate structural bound. Native ICE conversion first acquires structural work and a named opaque dependency residual. The pinned dependency allocates the callback wrapper before MyOwnMesh runs and exposes no allocation plan for `to_json`, so wrapper and formatting allocations are not exact byte claims. MyOwnMesh measures returned String content and capacities and transitions the lease before any asynchronous retention. A refusal drops the result and retires the connector. Data-only mode admits one application data channel and no media tracks. The temporary legacy profile admits one application data channel and only its finite, exact H.264 and Opus track set. The first shape violation retires the connector, and later violations coalesce into that one action.
 
 Additional controls:
 
 - `v4_arc03i_native_data_channel_shape_is_fixed_and_violation_work_is_coalesced`
 - `v4_arc03i_legacy_track_shape_bounds_duplicates_codecs_and_track_count`
 - `v4_arc03i_first_structural_violation_retires_once`
+- `executing_callback_accounts_converted_payload_before_async_retention`
 
 ## 6. RT-03-05: reorder channel-open and endpoint protocol data
 
@@ -122,9 +137,11 @@ Attack: submit unique and duplicate candidates on both sides of remote SDP, dela
 
 Required result: one ICE-attempt owner holds every candidate storage, byte, parsing, hashing, and native-work lease. The first provider or optional local-policy refusal retires the exact attempt. Later submissions return the terminal result before hashing or logging unique candidate content. Application does not reset the owner.
 
-A local restart creates a provisional attempt, retires the old attempt, waits for admitted old work, and commits only after native restart succeeds. Native failure does not publish the replacement and retires the connector when rollback is not proven. A remote restart is detected from changed effective ICE credentials on an existing MID, or media-line index when MID is absent. Media reordering or addition cannot manufacture a fresh candidate envelope. The replacement stays provisional until the exact remote description commits. The DTLS fingerprint does not stand in for ICE credentials.
+A local restart creates a provisional attempt, retires the old attempt, waits for admitted old work, and commits only after native restart succeeds. Native failure does not publish the replacement and retires the connector when rollback is not proven. A remote restart is detected from changed effective ICE credentials on an existing MID, or media-line index when MID is absent. Media reordering or addition cannot manufacture a fresh candidate envelope. The replacement stays provisional until the exact remote description commits. The DTLS fingerprint does not stand in for ICE credentials. Both mutation paths arm a process-local drop guard before their first suspension. Dropping either future retires the exact affected attempt and starts the existing close owner, so cancellation cannot strand provisional or in-flight state.
 
 A replacement candidate may arrive before the replacement SDP. It must consume finite ingress capacity without reaching the old native ICE agent, then move only when it explicitly declares the replacement username fragment and any declared media location matches the replacement binding. A location-only candidate owned by the old attempt is dropped. A location-only candidate admitted after the provisional replacement exists remains owned by that replacement. Delayed old-attempt work cannot mutate the replacement. Concurrent local restart and remote-description transactions fail closed instead of creating two candidate owners.
+
+V4 remote SDP must enter the connector as raw input. An allocation-free pass computes its media-section, credential-record, and String shape. The input, parsing work, conservative input-bounded parser storage, and named hash-table, allocator, and native-description residuals must be leased before either the credential parser or the native SDP constructor allocates output. The measured credential owner is shared across preparation and commit and transfers to the close owner before native application. Every retained owner charges its close-registry Arc pointer, owner struct, reference counters, storage object, and allocator residuals. Native success releases only its scheduled-work unit. Dependency-queued description work keeps successful renegotiation owners charged until connector close. Cancellation, native error, commit mismatch, or failed native close cannot release that residual or leave reusable candidate state.
 
 Attack: omit MID, media-line index, and username fragment, provide conflicting MID and index values, reuse one username fragment for different effective credential pairs, conflict the structured username fragment with the candidate-line `ufrag`, repeat the line extension, omit its value, or continue sending malformed bindings after the first refusal.
 
@@ -135,11 +152,15 @@ Controls:
 - `v4_arc03g_candidate_queue_deduplicates_before_retention_and_enforces_both_bounds`
 - `v4_arc03h_candidate_digest_is_structurally_unambiguous`
 - `v4_arc03h_candidate_content_bytes_cover_every_candidate_content_field`
+- `v4_arc03_candidate_queue_reserves_actual_string_capacity_before_node_insertion`
 - `v4_arc03h_candidate_attempt_envelope_survives_delayed_apply_and_cancellation`
 - `v4_arc03h_post_sdp_candidates_share_one_cumulative_attempt_envelope`
 - `v4_arc03h_new_attempt_gets_a_fresh_candidate_envelope`
 - `v4_arc03i_candidate_digest_distinguishes_absent_and_maximum_mline_index`
 - `v4_arc03j_local_ice_restart_is_provisional_until_explicit_commit`
+- `v4_arc03_local_restart_overlap_charge_releases_on_commit_and_failure`
+- `v4_arc03_dropped_ice_transaction_fences_attempt_and_starts_exact_close_owner`
+- `v4_arc03_dropped_remote_description_cannot_leave_reusable_inflight_state`
 - `v4_arc03j_local_restart_failure_discards_replacement_without_rollback`
 - `v4_arc03j_native_local_ice_restart_commits_exact_replacement` in WSL
 - `v4_arc03j_native_local_ice_restart_failure_retires_connector` in WSL
@@ -147,14 +168,21 @@ Controls:
 - `v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt`
 - `v4_arc03j_terminal_candidate_exhaustion_stops_later_hash_and_work_admission`
 - `v4_arc03j_sdp_ice_credentials_apply_session_inheritance_and_media_overrides`
+- `v4_arc03_remote_sdp_credentials_share_one_exact_retention_lease`
+- `v4_arc03_remote_sdp_residual_survives_failed_native_close`
 - `v4_arc03j_remote_candidates_require_an_exact_or_unambiguous_binding`
 - `v4_arc03j_candidate_username_fragment_declarations_must_agree`
 - `v4_arc03j_invalid_candidate_bindings_terminally_retire_the_attempt`
 - `v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates`
 - `v4_arc03j_restart_transactions_reject_ambiguous_interleavings`
 - `v4_arc03j_corrupt_restart_migration_leaves_no_viable_attempt`
+- vendored `test_add_remote_candidate_return_proves_internal_insertion`
+- vendored `test_disabled_mdns_candidate_is_not_reported_as_applied`
 
-The content-byte limit is not an exact retained-memory limit. Candidate retained-memory observations must remain inexact.
+The content-byte limit is not an exact retained-memory limit. The production
+queue separately reserves the Rust wrapper and actual retained String slack
+before node insertion. Allocator metadata and dependency-native retention remain
+explicit residuals.
 
 ## 8. RT-03-07: start codec work from generic real-time enablement
 
@@ -164,9 +192,8 @@ Required result: no compatibility codecs or tracks are provisioned. An inbound t
 
 Controls:
 
-- `v4_arc03g_generic_realtime_policy_does_not_request_media_tracks`
-- `v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks` in WSL
-- `v4_arc03f_data_only_connector_allocates_no_realtime_tracks` in WSL
+- `v4_arc03_generic_realtime_policy_does_not_request_media_tracks`
+- `v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks` in WSL
 
 Residual: the no-provider native control proves the current WebRTC construction and callback path. It is not a claim that arbitrary future provider code cannot be added.
 
@@ -197,7 +224,7 @@ Controls:
 
 Attack: underflow or overflow the inbound or outbound connector-owned byte and unit counters.
 
-Required result: the damaged provider domain is poisoned or conservatively retains every unproven claim. Corruption cannot create capacity. Independent ownership prevents one damaged domain from fabricating capacity in another.
+Required result: a damaged connector-local counter becomes explicitly inexact and cannot create capacity. With an optional local ceiling, that domain is conservatively charged to its full ceiling and refuses later local admission. Without a local ceiling, the finite provider remains authoritative and live leases remain charged. Independent ownership prevents one damaged domain from fabricating capacity in another.
 
 Controls:
 
@@ -251,7 +278,8 @@ Required result: connector admission reserves cleanup execution ownership. New s
 
 Controls:
 
-- `v4_arc03h_cleanup_queue_capacity_is_validated_at_policy_construction`
+- `v4_arc03_cleanup_queue_cannot_outgrow_pre_reserved_connector_claims`
+- `v4_arc03_cleanup_submission_consumes_one_exact_reservation_capability`
 - `v4_arc03h_cleanup_future_panic_marks_exact_owner_failed`
 - `v4_arc03h_cleanup_executor_failure_refuses_job_and_fails_exact_owner`
 - `v4_arc03_cleanup_owner_outlives_caller_runtime_shutdown`
@@ -289,13 +317,17 @@ Controls:
 
 Attack: use a TURN-selected pair as endpoint identity, Endpoint Auth, application admission, or real-time admission.
 
-Required result: TURN remains an ICE carrier for the same endpoint session. Positive and negative controls cross the same Endpoint Auth boundary as a direct path.
+Required result: TURN remains an ICE carrier for the same endpoint session. Positive and negative controls preserve the retained endpoint-authentication and application-admission boundary used by a direct path. Arc 04 transcript verification is not claimed.
 
 Controls:
 
 - `loopback_handshake_opens_data_channel`
 - `v4_arc03_relay_selection_is_not_authentication_or_session_admission`
 - `turn_selected_session_authenticates_endpoints_before_bidirectional_data` in WSL
+
+The TURN control uses one process provider shared by both concurrent Mesh scopes in each scenario. Its `transport-lab`-only helpers fund four connector profiles and four Mesh scope records across two sequential scenarios, with at most two active concurrently. The same helpers derive conservative candidate and remote-SDP claims, including concurrent digest work, from explicit signaling-frame fixture bounds. The control requires a relay-to-relay selected-pair report, bidirectional endpoint data after mutual authentication and admission, and endpoint-data refusal after authentication without mutual admission. Its legacy-media failures prove only that relay selection cannot add the frozen media surface to a data-only profile. They are not a separate real-time admission control. One selected-pair callback is sufficient because it identifies the negotiated pair shared by both endpoints; the dependency does not promise to emit that diagnostic callback on both sides. Arc 03 does not claim a live failed-transcript Endpoint Auth control.
+
+The fixture helper is not a production constructor and is absent from the default V4 API. Its explicit callback, candidate, and remote-SDP values prove only this test workload. They do not select a deployment policy.
 
 ## 19. RT-03-18: reach LegacyV1 from normal V4 source
 
@@ -347,12 +379,12 @@ Controls:
 - `infrastructure_start_requires_node_participation_disabled`
 - `ownerless_mesh_rejects_network_join_with_typed_policy_error`
 - `infrastructure_runtime_rejects_later_node_enable_without_mutation`
-- `data_only_connector_policy_requires_no_realtime_values`
+- `elastic_data_only_connector_requires_no_cardinality_values`
 - compiler rejection for ambiguous Mesh open
 
 ## 22. Elastic resource controls
 
-Attack: impose a hidden object count, multiply capacity with child scopes, starve cleanup with speculative work, retain an object after releasing its lease, expire a slow operation by time, or treat storage-backed delivery like a live packet queue.
+Attack: impose a hidden object count, multiply capacity with child scopes, let one Mesh repeatedly reacquire shared capacity ahead of another, starve cleanup with speculative work, forge release from a reclaim notification, retain an object after releasing its lease, expire a slow operation by time, or treat storage-backed delivery like a live packet queue.
 
 Required result:
 
@@ -363,14 +395,66 @@ Required result:
 - many small objects coexist while resources remain;
 - Mesh scopes cannot multiply the process grant;
 - exact release restores capacity;
-- unused capacity is borrowable under the basal provider;
+- a selected pending turn reserves its exact charge while leaving surplus capacity borrowable;
+- cooperative pressure orders `Cleanup`, `Admitted`, then `Speculative` and rotates equal-authority scopes without configured weights or shares;
+- a selected speculative owner receives one exact retirement request, while the provider retains no release or cleanup authority;
+- a demand cancelled before acquisition loses its turn and releases no victim;
+- nonwaiting acquisition returns typed pressure without creating a hidden demand or requesting cleanup;
+- release or failed-cleanup retention remains attributable to the exact selected claim;
 - an optional local ceiling can restrict a deployment without minting capacity;
-- speculative work is reclaimed or refused before cleanup or admitted higher-authority work is starved;
+- cooperative `Cleanup` and `Admitted` demands are selected before `Speculative`; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
 - slow work retains its finite lease without timer-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
 
-These controls are pending until the elastic provider implementation lands.
+Exact source controls:
+
+- `increasing_one_granted_dimension_admits_exactly_one_more_claim`
+- `unequal_claim_cost_not_object_count_controls_admission`
+- `one_process_grant_is_conserved_across_unequal_scopes_and_authorities`
+- `scope_creation_grants_no_capacity_and_unknown_scopes_are_rejected`
+- `v4_arc03_mesh_scopes_share_one_grant_and_creation_does_not_multiply_it`
+- `v4_arc03_concurrent_mesh_children_cannot_oversubscribe_shared_provider`
+- `v4_arc03_successful_drop_releases_the_exact_provider_claim`
+- `unused_capacity_is_borrowable_across_mesh_attribution_scopes`
+- `cooperative_pressure_requests_exact_speculation_and_prevents_reacquisition`
+- `active_turn_fences_plain_scope_bookkeeping`
+- `active_demander_cannot_reacquire_ahead_of_its_exact_turn`
+- `insufficient_reclaim_set_is_not_published`
+- `dropping_pending_demand_cancels_its_turn_without_releasing_a_victim`
+- `nonwaiting_reclaimable_admission_returns_pressure_without_requesting_cleanup`
+- `pending_turn_blocks_only_overlapping_resource_dimensions`
+- `cleanup_demand_supersedes_a_speculative_turn_without_reclaiming_cleanup`
+- `slow_speculation_has_no_elapsed_time_reclaim_semantics`
+- `reclaim_and_promotion_are_linearized_in_both_orders`
+- `failed_reclaim_cleanup_retains_charge_and_reports_exact_pressure`
+- `cooperative_child_scope_and_first_lease_remain_one_transaction`
+- `equal_authority_demands_rotate_without_cross_scope_reacquisition`
+- `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
+- `arc03_remote_candidate_local_ceiling_is_explicit_and_attempt_scoped`
+- `slow_storage_work_retains_only_its_finite_lease_until_explicit_drop`
+- `arc03_remote_candidate_apply_releases_exact_retention`
+- `arc03_remote_candidate_drop_releases_exact_retention`
+- `v4_arc03_provider_pressure_names_the_exhausted_dimension`
+- `v4_arc03_cleanup_submission_consumes_one_exact_reservation_capability`
+- `v4_arc03_connector_operations_require_and_release_exact_work_claims`
+- `v4_arc03_legacy_realtime_capability_holds_its_exact_resource_lease`
+- `v4_arc03_candidate_queue_reserves_actual_string_capacity_before_node_insertion`
+- `v4_arc03_native_constructor_without_close_port_retains_exact_claim`
+- `v4_arc03_cancelled_pending_native_constructor_retains_exact_claim`
+- `composite_request_overflow_is_not_reported_as_exact_pressure`
+- vendored `test_add_remote_candidate_return_proves_internal_insertion`
+
+The compiler-boundary checker separately rejects the listed basal cardinality
+names and requires the elastic constructors and optional local wrappers. These
+controls are claims to execute on the exact pushed head, not a statement that
+the current working tree has passed them.
+
+The progress claim is intentionally conditional. It covers registered
+reclaimable speculative conflicts when the selected owner completes cleanup.
+It does not promise admission while nonreclaimable admitted work owns the
+resource, while an owner ignores retirement, or after cleanup failure retains
+the exact charge.
 
 ## 23. Measurement and approval boundary
 

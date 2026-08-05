@@ -139,20 +139,31 @@ pub use network_state::{
     SIGN_DOMAIN_TAG_STATE,
 };
 pub use protocol::CapabilityAdvert;
-pub use resource::ProcessResourceRoot;
+pub use resource::{
+    FiniteResourceProvider, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
+    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourcePressure,
+    ResourceProvider, ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
+    ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
+    RESOURCE_CLASS_COUNT,
+};
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
-    ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackPolicyError,
-    ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities,
-    ConnectorRealtimeFlowPolicy, ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort,
-    ConnectorResourceOwnerReport, ConnectorResourcePolicy, ConnectorResourcePolicyConflict,
-    EnabledRealtimeConnectorPolicy, MeshConnectorResourcePolicy, MeshConnectorResourceReport,
+    connector_resource_structural_claims, ConnectorCallbackMailboxCapacities,
+    ConnectorCallbackPolicy, ConnectorCallbackPolicyError, ConnectorCallbackServiceWeights,
+    ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
+    ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
+    ConnectorResourceStructuralClaims, EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport,
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
     WebRtcConnectorCapablePolicy,
 };
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
+#[cfg(feature = "transport-lab")]
+pub use transport::{
+    transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
+    transport_lab_remote_description_fixture_grant,
+};
 #[cfg(feature = "legacy-media")]
 #[allow(
     deprecated,

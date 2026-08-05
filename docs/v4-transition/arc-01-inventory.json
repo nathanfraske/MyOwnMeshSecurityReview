@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "baseline_commit": "2a04e29e0a4c09b95a4914972018850ddb2cbacb",
-  "scope": "Historical Arc 01 transition snapshot. This record is not current for Arc 03J and its checker intentionally reports source, declaration, surface, marker, and resource drift. The separate Arc 03 ownership delta records bounded current owner changes without rewriting this provenance. Test-only code is excluded from the recorded snapshot.",
+  "scope": "Historical Arc 01 transition snapshot. This record is not current for Arc 03 and its checker intentionally reports source, declaration, surface, marker, and resource drift. The separate Arc 03 ownership delta records bounded current owner changes without rewriting this provenance. Test-only code is excluded from the recorded snapshot.",
   "node_targets": [
     "Semantic Node",
     "Signaling Node",

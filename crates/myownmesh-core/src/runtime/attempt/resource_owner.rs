@@ -1,437 +1,157 @@
-//! Process and per-Mesh connector resource ownership.
+//! Provider-backed process and per-Mesh connector resource ownership.
 
 use super::*;
+use crate::resource::{
+    ReclaimResult, ResourceAdmission, ResourceAuthorityClass, ResourceClaim, ResourceClass,
+    ResourceLease, ResourceProviderPort, ResourceReclaimSubscription, ResourceReclaimTarget,
+    ResourceScope, ResourceUnavailable,
+};
 use futures_util::FutureExt;
 
-/// Point-in-time report for one exact live Mesh connector scope.
+/// Point-in-time diagnostics for one exact live Mesh connector scope.
+///
+/// These values report ownership events. They never grant capacity or reject
+/// provider-approved work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshConnectorResourceReport {
-    pub max_active_candidates: NonZeroUsize,
     pub active_candidates: usize,
-    /// Exact claims retained after native cleanup failure in this Mesh scope.
     pub failed_cleanup_candidates: usize,
-    /// The process and this exact child can no longer prove their aggregate.
     pub accounting_poisoned: bool,
 }
 
-/// A process owner could not issue a new Mesh connector scope.
+/// The selected resource provider could not issue a Mesh attribution scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MeshConnectorResourceScopeIssueError {
-    #[error("the process connector resource policy is not installed")]
-    ProcessPolicyMissing,
-    #[error("connector resource accounting is unavailable")]
-    AccountingUnavailable,
-    #[error("the process exhausted its local Mesh connector scope identities")]
-    ScopeIdentityExhausted,
+    #[error("the process resource provider is not installed")]
+    ResourceProviderMissing,
+    #[error("the connector resource provider refused the Mesh scope: {0}")]
+    ResourceUnavailable(#[from] ResourceUnavailable),
 }
 
-struct ConnectorResourceOwnerState {
-    active: PreAuthResourceClaim,
+#[derive(Default)]
+struct ConnectorResourceDiagnosticsState {
     active_candidates: usize,
     failed_cleanup_candidates: usize,
     accounting_poisoned: bool,
-    next_mesh_scope_id: Option<NonZeroU64>,
-    mesh_scopes: HashMap<NonZeroU64, MeshConnectorResourceOwnerState>,
 }
 
-struct MeshConnectorResourceOwnerState {
-    policy: MeshConnectorResourcePolicy,
-    active: PreAuthResourceClaim,
-    active_candidates: usize,
-    failed_cleanup_candidates: usize,
-    accounting_poisoned: bool,
-    report: Arc<MeshConnectorResourceReportState>,
+#[derive(Default)]
+pub(super) struct ConnectorResourceDiagnostics {
+    state: Mutex<ConnectorResourceDiagnosticsState>,
 }
 
-struct MeshConnectorResourceReportState {
-    active_candidates: AtomicUsize,
-    failed_cleanup_candidates: AtomicUsize,
-    accounting_poisoned: AtomicBool,
+impl ConnectorResourceDiagnostics {
+    fn note_acquired(&self) {
+        let mut state = self.lock();
+        match state.active_candidates.checked_add(1) {
+            Some(active) => state.active_candidates = active,
+            None => state.accounting_poisoned = true,
+        }
+    }
+
+    fn note_released(&self) {
+        let mut state = self.lock();
+        match state.active_candidates.checked_sub(1) {
+            Some(active) => state.active_candidates = active,
+            None => state.accounting_poisoned = true,
+        }
+    }
+
+    fn note_failed_cleanup(&self) {
+        let mut state = self.lock();
+        match state.failed_cleanup_candidates.checked_add(1) {
+            Some(failed) => state.failed_cleanup_candidates = failed,
+            None => state.accounting_poisoned = true,
+        }
+    }
+
+    fn poison(&self) {
+        self.lock().accounting_poisoned = true;
+    }
+
+    fn report(&self) -> MeshConnectorResourceReport {
+        let state = self.lock();
+        MeshConnectorResourceReport {
+            active_candidates: state.active_candidates,
+            failed_cleanup_candidates: state.failed_cleanup_candidates,
+            accounting_poisoned: state.accounting_poisoned,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ConnectorResourceDiagnosticsState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            let mut state = poisoned.into_inner();
+            state.accounting_poisoned = true;
+            state
+        })
+    }
+}
+
+pub(super) fn poison_reservation_diagnostics(
+    process_diagnostics: &ConnectorResourceDiagnostics,
+    mesh_diagnostics: &ConnectorResourceDiagnostics,
+) {
+    process_diagnostics.poison();
+    mesh_diagnostics.poison();
 }
 
 pub(super) struct ConnectorResourceOwnerInner {
-    policy: ConnectorResourcePolicy,
-    state: Mutex<ConnectorResourceOwnerState>,
+    provider: ResourceProviderPort,
+    process_scope: ResourceScope,
+    diagnostics: Arc<ConnectorResourceDiagnostics>,
     cleanup_executor: ConnectorCleanupExecutor,
 }
 
 impl ConnectorResourceOwnerInner {
-    fn new(policy: ConnectorResourcePolicy) -> Self {
+    fn new(provider: ResourceProviderPort) -> Self {
+        let process_scope = provider.process_scope();
         Self {
-            policy,
-            state: Mutex::new(ConnectorResourceOwnerState {
-                active: PreAuthResourceClaim::ZERO,
-                active_candidates: 0,
-                failed_cleanup_candidates: 0,
-                accounting_poisoned: false,
-                next_mesh_scope_id: NonZeroU64::new(1),
-                mesh_scopes: HashMap::new(),
-            }),
-            cleanup_executor: ConnectorCleanupExecutor::new(policy.max_active_candidates()),
+            provider,
+            process_scope,
+            diagnostics: Arc::new(ConnectorResourceDiagnostics::default()),
+            cleanup_executor: ConnectorCleanupExecutor::new(),
         }
     }
 
     fn issue_mesh_scope(
         self: &Arc<Self>,
-        policy: MeshConnectorResourcePolicy,
     ) -> Result<MeshConnectorResourceScope, MeshConnectorResourceScopeIssueError> {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_all_locked(&mut state);
-                return Err(MeshConnectorResourceScopeIssueError::AccountingUnavailable);
-            }
-        };
-        if state.accounting_poisoned {
-            return Err(MeshConnectorResourceScopeIssueError::AccountingUnavailable);
-        }
-        let id = state
-            .next_mesh_scope_id
-            .ok_or(MeshConnectorResourceScopeIssueError::ScopeIdentityExhausted)?;
-        state.next_mesh_scope_id = id.get().checked_add(1).and_then(NonZeroU64::new);
-        let report = Arc::new(MeshConnectorResourceReportState {
-            active_candidates: AtomicUsize::new(0),
-            failed_cleanup_candidates: AtomicUsize::new(0),
-            accounting_poisoned: AtomicBool::new(false),
-        });
-        state.mesh_scopes.insert(
-            id,
-            MeshConnectorResourceOwnerState {
-                policy,
-                active: PreAuthResourceClaim::ZERO,
-                active_candidates: 0,
-                failed_cleanup_candidates: 0,
-                accounting_poisoned: false,
-                report: Arc::clone(&report),
-            },
-        );
-        drop(state);
+        self.cleanup_executor
+            .prepare(&self.provider, &self.process_scope)?;
+        let scope = self.provider.create_scope(&self.process_scope)?;
         Ok(MeshConnectorResourceScope {
             token: Arc::new(MeshConnectorResourceScopeToken {
-                id,
                 owner: Arc::clone(self),
-                policy,
-                report,
+                scope,
+                diagnostics: Arc::new(ConnectorResourceDiagnostics::default()),
             }),
         })
     }
 
-    pub(super) fn reserve(
-        self: &Arc<Self>,
-        mesh_scope: Arc<MeshConnectorResourceScopeToken>,
-        claim: PreAuthResourceClaim,
-    ) -> Option<ConnectorCandidateReservation> {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_locked(&mut state, mesh_scope.id);
-                return None;
-            }
-        };
-        if state.accounting_poisoned {
-            return None;
-        }
-        if state.active_candidates >= self.policy.max_active_candidates().get() {
-            return None;
-        }
-        let Some(child) = state.mesh_scopes.get(&mesh_scope.id) else {
-            Self::poison_all_locked(&mut state);
-            return None;
-        };
-        if child.accounting_poisoned
-            || child.active_candidates >= child.policy.max_active_candidates().get()
-        {
-            return None;
-        }
-        let next_process = state.active.checked_add(claim)?;
-        let next_process_candidates = state.active_candidates.checked_add(1)?;
-        let next_child = child.active.checked_add(claim)?;
-        let next_child_candidates = child.active_candidates.checked_add(1)?;
-        state.active = next_process;
-        state.active_candidates = next_process_candidates;
-        let Some(child) = state.mesh_scopes.get_mut(&mesh_scope.id) else {
-            Self::poison_all_locked(&mut state);
-            return None;
-        };
-        child.active = next_child;
-        child.active_candidates = next_child_candidates;
-        child
-            .report
-            .active_candidates
-            .store(next_child_candidates, Ordering::Release);
-        Some(ConnectorCandidateReservation {
-            owner: Arc::clone(self),
-            mesh_scope,
-            claim,
-            release_on_drop: true,
-        })
-    }
-
-    /// Replace one live child's claim without exposing an unreserved gap.
-    /// Inconsistent subtraction poisons the aggregate and preserves its last
-    /// conservative value. Capacity refusal leaves the old claim live.
-    pub(super) fn transition(
-        &self,
-        mesh_scope_id: NonZeroU64,
-        old: PreAuthResourceClaim,
-        new: PreAuthResourceClaim,
-    ) -> bool {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_locked(&mut state, mesh_scope_id);
-                return false;
-            }
-        };
-        if state.accounting_poisoned {
-            return false;
-        }
-        let Some(child) = state.mesh_scopes.get(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return false;
-        };
-        if child.accounting_poisoned {
-            return false;
-        }
-        let Some(process_without_old) = state.active.checked_sub(old) else {
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return false;
-        };
-        let Some(child_without_old) = child.active.checked_sub(old) else {
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return false;
-        };
-        let Some(next_process) = process_without_old.checked_add(new) else {
-            return false;
-        };
-        let Some(next_child) = child_without_old.checked_add(new) else {
-            return false;
-        };
-        state.active = next_process;
-        let Some(child) = state.mesh_scopes.get_mut(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return false;
-        };
-        child.active = next_child;
-        true
-    }
-
-    pub(super) fn retain_after_cleanup_failure(&self, mesh_scope_id: NonZeroU64) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_locked(&mut state, mesh_scope_id);
-                return;
-            }
-        };
-        if state.accounting_poisoned {
-            return;
-        }
-        let Some(child) = state.mesh_scopes.get(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return;
-        };
-        let Some(process_retained) = state.failed_cleanup_candidates.checked_add(1) else {
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return;
-        };
-        let Some(child_retained) = child.failed_cleanup_candidates.checked_add(1) else {
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return;
-        };
-        state.failed_cleanup_candidates = process_retained;
-        let Some(child) = state.mesh_scopes.get_mut(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return;
-        };
-        child.failed_cleanup_candidates = child_retained;
-        child
-            .report
-            .failed_cleanup_candidates
-            .store(child_retained, Ordering::Release);
-    }
-
-    pub(super) fn release(&self, mesh_scope_id: NonZeroU64, claim: PreAuthResourceClaim) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_locked(&mut state, mesh_scope_id);
-                return;
-            }
-        };
-        if state.accounting_poisoned {
-            return;
-        }
-        let Some(child) = state.mesh_scopes.get(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return;
-        };
-        let next_process = state.active.checked_sub(claim);
-        let next_child = child.active.checked_sub(claim);
-        let next_process_candidates = state.active_candidates.checked_sub(1);
-        let next_child_candidates = child.active_candidates.checked_sub(1);
-        let (
-            Some(next_process),
-            Some(next_child),
-            Some(next_process_candidates),
-            Some(next_child_candidates),
-        ) = (
-            next_process,
-            next_child,
-            next_process_candidates,
-            next_child_candidates,
-        )
-        else {
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return;
-        };
-        state.active = next_process;
-        state.active_candidates = next_process_candidates;
-        let Some(child) = state.mesh_scopes.get_mut(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return;
-        };
-        child.active = next_child;
-        child.active_candidates = next_child_candidates;
-        child
-            .report
-            .active_candidates
-            .store(next_child_candidates, Ordering::Release);
-    }
-
-    fn retire_mesh_scope(&self, mesh_scope_id: NonZeroU64) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_locked(&mut state, mesh_scope_id);
-                return;
-            }
-        };
-        let Some(child) = state.mesh_scopes.get(&mesh_scope_id) else {
-            Self::poison_all_locked(&mut state);
-            return;
-        };
-        if child.failed_cleanup_candidates > 0 {
-            if child.active_candidates == child.failed_cleanup_candidates
-                && child.active != PreAuthResourceClaim::ZERO
-            {
-                // Every remaining claim is deliberately process-owned after a
-                // native close failure. Retain the child record so its exact
-                // accounting remains attributable without poisoning healthy
-                // process capacity or unrelated Mesh scopes.
-                return;
-            }
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return;
-        }
-        if child.active_candidates != 0 || child.active != PreAuthResourceClaim::ZERO {
-            Self::poison_locked(&mut state, mesh_scope_id);
-            return;
-        }
-        state.mesh_scopes.remove(&mesh_scope_id);
-    }
-
-    fn poison_mesh_accounting(&self, mesh_scope_id: NonZeroU64) {
-        match self.state.lock() {
-            Ok(mut state) => Self::poison_locked(&mut state, mesh_scope_id),
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                Self::poison_locked(&mut state, mesh_scope_id);
-            }
-        }
-    }
-
-    fn poison_locked(state: &mut ConnectorResourceOwnerState, mesh_scope_id: NonZeroU64) {
-        if let Some(child) = state.mesh_scopes.get_mut(&mesh_scope_id) {
-            child.accounting_poisoned = true;
-        }
-        Self::poison_all_locked(state);
-    }
-
-    fn poison_all_locked(state: &mut ConnectorResourceOwnerState) {
-        state.accounting_poisoned = true;
-        for child in state.mesh_scopes.values_mut() {
-            child.accounting_poisoned = true;
-            child
-                .report
-                .accounting_poisoned
-                .store(true, Ordering::Release);
-        }
-    }
-
     fn report(&self) -> ConnectorResourceOwnerReport {
-        let (active_candidates, failed_cleanup_candidates, accounting_poisoned) =
-            match self.state.lock() {
-                Ok(state) => (
-                    state.active_candidates,
-                    state.failed_cleanup_candidates,
-                    state.accounting_poisoned,
-                ),
-                Err(poisoned) => {
-                    let mut state = poisoned.into_inner();
-                    Self::poison_all_locked(&mut state);
-                    (
-                        state.active_candidates,
-                        state.failed_cleanup_candidates,
-                        true,
-                    )
-                }
-            };
+        let diagnostics = self.diagnostics.report();
         ConnectorResourceOwnerReport {
-            max_active_candidates: self.policy.max_active_candidates(),
-            active_candidates,
-            failed_cleanup_candidates,
-            accounting_poisoned,
+            active_candidates: diagnostics.active_candidates,
+            failed_cleanup_candidates: diagnostics.failed_cleanup_candidates,
+            accounting_poisoned: diagnostics.accounting_poisoned,
             cleanup: self.cleanup_executor.report(),
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn active(&self) -> PreAuthResourceClaim {
-        match self.state.lock() {
-            Ok(state) => state.active,
-            Err(poisoned) => poisoned.into_inner().active,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_poisoned(&self) -> bool {
-        match self.state.lock() {
-            Ok(state) => state.accounting_poisoned,
-            Err(_) => true,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn corrupt_active_for_test(&self, active: PreAuthResourceClaim) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("test corruption fixture requires an unpoisoned mutex");
-        state.active = active;
-    }
 }
 
-/// Cloneable administrative port into the one process connector owner.
+/// Cloneable administrative port into one process resource provider.
 ///
-/// This port reports the process aggregate but cannot be used as an attempt
-/// capability. The process root uses it to issue unforgeable per-Mesh child
-/// scopes, and only those child scopes can admit connector candidates.
+/// It cannot admit work directly. It only issues attribution scopes that draw
+/// from the exact provider identity supplied by the process owner.
 #[derive(Clone)]
 pub struct ConnectorResourceOwnerPort {
     inner: Arc<ConnectorResourceOwnerInner>,
 }
 
 impl ConnectorResourceOwnerPort {
-    pub(crate) fn new(policy: ConnectorResourcePolicy) -> Self {
+    pub(crate) fn new(provider: ResourceProviderPort) -> Self {
         Self {
-            inner: Arc::new(ConnectorResourceOwnerInner::new(policy)),
+            inner: Arc::new(ConnectorResourceOwnerInner::new(provider)),
         }
     }
 
@@ -441,35 +161,76 @@ impl ConnectorResourceOwnerPort {
 
     pub(crate) fn issue_mesh_scope(
         &self,
-        policy: MeshConnectorResourcePolicy,
     ) -> Result<MeshConnectorResourceScope, MeshConnectorResourceScopeIssueError> {
-        self.inner.issue_mesh_scope(policy)
+        self.inner.issue_mesh_scope()
     }
 
-    pub(crate) fn policy(&self) -> ConnectorResourcePolicy {
-        self.inner.policy
+    pub(crate) fn same_provider(&self, provider: &ResourceProviderPort) -> bool {
+        self.inner.provider.same_provider(provider)
     }
+}
+
+/// One-shot proof that an exact connector reservation has entered cleanup.
+///
+/// The capability retains the reservation state, including its move-only
+/// provider lease, until the queued or running cleanup job is destroyed. It
+/// cannot be cloned and one reservation can mint it only once.
+pub(crate) struct ConnectorCleanupCapability {
+    pub(super) reservation: Arc<ConnectorCandidateReservationState>,
 }
 
 pub(super) struct MeshConnectorResourceScopeToken {
-    pub(super) id: NonZeroU64,
     pub(super) owner: Arc<ConnectorResourceOwnerInner>,
-    policy: MeshConnectorResourcePolicy,
-    report: Arc<MeshConnectorResourceReportState>,
+    pub(super) scope: ResourceScope,
+    diagnostics: Arc<ConnectorResourceDiagnostics>,
 }
 
-impl Drop for MeshConnectorResourceScopeToken {
-    fn drop(&mut self) {
-        self.owner.retire_mesh_scope(self.id);
+/// Exact process-local resource scope for work owned by one connector.
+///
+/// Cloning this port preserves attribution to the same connector. It does not
+/// grant capacity. Every successful acquisition still creates a distinct,
+/// finite provider lease.
+#[derive(Clone)]
+pub(crate) struct ConnectorWorkResourceScope {
+    provider: ResourceProviderPort,
+    scope: ResourceScope,
+    reclaim_target: Option<ResourceReclaimTarget>,
+}
+
+impl ConnectorWorkResourceScope {
+    pub(crate) fn scope_id(&self) -> crate::resource::ResourceScopeId {
+        self.scope.id()
+    }
+
+    pub(crate) fn acquire(
+        &self,
+        authority: ResourceAuthorityClass,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        match (authority, self.reclaim_target.as_ref()) {
+            (ResourceAuthorityClass::Speculative, Some(target)) => self
+                .provider
+                .acquire_reclaimable_now(&self.scope, claim, target.clone()),
+            _ => self.provider.acquire(&self.scope, authority, claim),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pressure(
+        &self,
+        authority: ResourceAuthorityClass,
+        dimension: ResourceClass,
+    ) -> Result<crate::resource::ResourcePressure, ResourceUnavailable> {
+        self.provider.pressure(&self.scope, authority, dimension)
     }
 }
 
-/// Unforgeable admission and accounting scope for one live [`crate::Mesh`]
+/// Unforgeable attribution and admission scope for one live [`crate::Mesh`]
 /// runtime.
 ///
-/// Only [`crate::ProcessResourceRoot`] can issue this scope. Clones retain the
-/// same exact local scope. The value is not serializable and has no public
-/// constructor.
+/// Scope creation grants no capacity. Clones retain the same provider child
+/// scope, and every connector candidate acquires a separate child lease from
+/// the process owner's shared finite grant.
 #[derive(Clone)]
 pub struct MeshConnectorResourceScope {
     pub(super) token: Arc<MeshConnectorResourceScopeToken>,
@@ -477,20 +238,7 @@ pub struct MeshConnectorResourceScope {
 
 impl MeshConnectorResourceScope {
     pub fn report(&self) -> MeshConnectorResourceReport {
-        MeshConnectorResourceReport {
-            max_active_candidates: self.token.policy.max_active_candidates(),
-            active_candidates: self.token.report.active_candidates.load(Ordering::Acquire),
-            failed_cleanup_candidates: self
-                .token
-                .report
-                .failed_cleanup_candidates
-                .load(Ordering::Acquire),
-            accounting_poisoned: self
-                .token
-                .report
-                .accounting_poisoned
-                .load(Ordering::Acquire),
-        }
+        self.token.diagnostics.report()
     }
 
     pub(crate) fn process_report(&self) -> ConnectorResourceOwnerReport {
@@ -499,17 +247,37 @@ impl MeshConnectorResourceScope {
 
     pub(crate) fn submit_cleanup(
         &self,
+        capability: ConnectorCleanupCapability,
         cleanup: ConnectorCleanupFuture,
+        on_complete: ConnectorCleanupCompletion,
         on_failure: ConnectorCleanupFailure,
     ) -> std::result::Result<(), ConnectorCleanupJob> {
+        if !Arc::ptr_eq(
+            &capability.reservation.process_diagnostics,
+            &self.token.owner.diagnostics,
+        ) {
+            return Err(ConnectorCleanupJob::new(
+                capability,
+                cleanup,
+                on_complete,
+                on_failure,
+            ));
+        }
         self.token
             .owner
             .cleanup_executor
-            .submit(ConnectorCleanupJob::new(cleanup, on_failure))
+            .submit(ConnectorCleanupJob::new(
+                capability,
+                cleanup,
+                on_complete,
+                on_failure,
+            ))
     }
 
+    /// Mark the diagnostics inexact without replacing provider truth.
     pub(crate) fn poison_accounting(&self) {
-        self.token.owner.poison_mesh_accounting(self.token.id);
+        self.token.owner.diagnostics.poison();
+        self.token.diagnostics.poison();
     }
 
     #[cfg(test)]
@@ -519,50 +287,166 @@ impl MeshConnectorResourceScope {
 
     pub(super) fn reserve(
         &self,
-        claim: PreAuthResourceClaim,
-    ) -> Option<ConnectorCandidateReservation> {
-        self.token.owner.reserve(Arc::clone(&self.token), claim)
+        claim: ResourceClaim,
+    ) -> Result<ConnectorCandidateReservation, ResourceUnavailable> {
+        let (connector_scope, lease) = self.token.owner.provider.create_scope_with_lease(
+            &self.token.scope,
+            ResourceAuthorityClass::Speculative,
+            claim,
+        )?;
+        let work_scope = ConnectorWorkResourceScope {
+            provider: self.token.owner.provider.clone(),
+            scope: connector_scope,
+            reclaim_target: None,
+        };
+        self.token.owner.diagnostics.note_acquired();
+        self.token.diagnostics.note_acquired();
+        Ok(ConnectorCandidateReservation {
+            state: Arc::new(ConnectorCandidateReservationState {
+                lease: Mutex::new(Some(lease)),
+                work_scope,
+                process_diagnostics: Arc::clone(&self.token.owner.diagnostics),
+                mesh_diagnostics: Arc::clone(&self.token.diagnostics),
+                cleanup_capability_issued: AtomicBool::new(false),
+                cleanup_lifecycle: Mutex::new(Default::default()),
+            }),
+        })
+    }
+
+    /// Wait for one fair process turn, then atomically install the child scope
+    /// and its first reclaimable speculative lease.
+    ///
+    /// No time limit applies. The pending demand is move-only and cancellation
+    /// drops its fairness turn without installing an empty child scope.
+    pub(super) async fn reserve_cooperatively(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<(ConnectorCandidateReservation, ResourceReclaimSubscription), ResourceUnavailable>
+    {
+        let (reclaim_target, reclaim_subscription) = ResourceReclaimSubscription::channel();
+        let work_reclaim_target = reclaim_target.clone();
+        let mut admission = self
+            .token
+            .owner
+            .provider
+            .create_scope_with_reclaimable_lease_cooperatively(
+                &self.token.scope,
+                claim,
+                reclaim_target,
+            )?;
+        let lease = loop {
+            match admission {
+                ResourceAdmission::Acquired(lease) => break lease,
+                ResourceAdmission::Pending(demand) => {
+                    demand.ready().await?;
+                    admission = demand.retry()?;
+                }
+            }
+        };
+        let work_scope = ConnectorWorkResourceScope {
+            provider: self.token.owner.provider.clone(),
+            scope: lease.scope(),
+            reclaim_target: Some(work_reclaim_target),
+        };
+        self.token.owner.diagnostics.note_acquired();
+        self.token.diagnostics.note_acquired();
+        Ok((
+            ConnectorCandidateReservation {
+                state: Arc::new(ConnectorCandidateReservationState {
+                    lease: Mutex::new(Some(lease)),
+                    work_scope,
+                    process_diagnostics: Arc::clone(&self.token.owner.diagnostics),
+                    mesh_diagnostics: Arc::clone(&self.token.diagnostics),
+                    cleanup_capability_issued: AtomicBool::new(false),
+                    cleanup_lifecycle: Mutex::new(Default::default()),
+                }),
+            },
+            reclaim_subscription,
+        ))
     }
 
     #[cfg(test)]
-    pub(super) fn active(&self) -> Option<PreAuthResourceClaim> {
-        let state = match self.token.owner.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state
-            .mesh_scopes
-            .get(&self.token.id)
-            .map(|scope| scope.active)
+    pub(super) fn same_provider(&self, other: &Self) -> bool {
+        self.token
+            .owner
+            .provider
+            .same_provider(&other.token.owner.provider)
     }
 }
 
 pub(crate) type ConnectorCleanupFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub(crate) type ConnectorCleanupCompletion = Box<dyn FnOnce() + Send + 'static>;
 pub(crate) type ConnectorCleanupFailure = Box<dyn FnOnce(String) + Send + 'static>;
 
+/// Exact connector-owned claim reserved before one cleanup job can exist.
+/// Inline bytes cover the queued record and its two linked queue pointers.
+/// Four residual units name the boxed close future, boxed completion callback,
+/// boxed failure callback, and channel-node allocator metadata whose byte
+/// sizes are dependency-owned.
+pub(crate) fn cleanup_job_claim(
+) -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    let links = std::mem::size_of::<usize>().checked_mul(2).ok_or(
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let bytes = std::mem::size_of::<ConnectorCleanupJob>()
+        .checked_add(links)
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    let bytes = u64::try_from(bytes).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::WorkerOrTask, 1),
+        (ResourceClass::CallbackOrScheduledWork, 1),
+        (ResourceClass::OpaqueDependencyResidual, 4),
+    ])
+}
+
 pub(crate) struct ConnectorCleanupJob {
+    _capability: ConnectorCleanupCapability,
     future: Option<ConnectorCleanupFuture>,
+    on_complete: Option<ConnectorCleanupCompletion>,
     on_failure: Option<ConnectorCleanupFailure>,
 }
 
 impl ConnectorCleanupJob {
-    fn new(future: ConnectorCleanupFuture, on_failure: ConnectorCleanupFailure) -> Self {
+    fn new(
+        capability: ConnectorCleanupCapability,
+        future: ConnectorCleanupFuture,
+        on_complete: ConnectorCleanupCompletion,
+        on_failure: ConnectorCleanupFailure,
+    ) -> Self {
         Self {
+            _capability: capability,
             future: Some(future),
+            on_complete: Some(on_complete),
             on_failure: Some(on_failure),
         }
     }
 
     fn fail(&mut self, reason: String) {
         self.future = None;
+        self.on_complete = None;
         if let Some(on_failure) = self.on_failure.take() {
             on_failure(reason);
         }
     }
 
-    fn complete(&mut self) {
+    fn complete(mut self) -> ConnectorCleanupCompletion {
         self.future = None;
         self.on_failure = None;
+        let completion = self
+            .on_complete
+            .take()
+            .expect("a successful cleanup job owns one completion callback");
+        drop(self);
+        completion
     }
 }
 
@@ -583,24 +467,25 @@ struct ConnectorCleanupHealthState {
 }
 
 struct ConnectorCleanupExecutorState {
-    sender: Option<tokio::sync::mpsc::Sender<ConnectorCleanupJob>>,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<ConnectorCleanupJob>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// One bounded, single-purpose cleanup executor for the process connector
-/// owner. It is started lazily and multiplexes all close futures on one Tokio
-/// runtime and one OS thread. Queue capacity is the already owner-selected
-/// process candidate ceiling, so cleanup does not introduce another value.
+/// One process-local cleanup executor.
+///
+/// Submission does not wait and has no second producer queue. The channel is
+/// intentionally unbounded because each one-shot job is already backed by the
+/// connector lease's pre-reserved `CallbackOrScheduledWork` cleanup claim.
 struct ConnectorCleanupExecutor {
-    capacity: NonZeroUsize,
     state: Mutex<ConnectorCleanupExecutorState>,
     health: Arc<ConnectorCleanupHealthState>,
+    #[cfg(test)]
+    forced_termination: Arc<tokio::sync::Notify>,
 }
 
 impl ConnectorCleanupExecutor {
-    fn new(capacity: NonZeroUsize) -> Self {
+    fn new() -> Self {
         Self {
-            capacity,
             state: Mutex::new(ConnectorCleanupExecutorState {
                 sender: None,
                 thread: None,
@@ -612,7 +497,130 @@ impl ConnectorCleanupExecutor {
                 failed_jobs: std::sync::atomic::AtomicU64::new(0),
                 executor_failed: AtomicBool::new(false),
             }),
+            #[cfg(test)]
+            forced_termination: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Reserve the process cleanup infrastructure before constructing its
+    /// runtime, channel, or OS thread. The lease moves into the executor
+    /// thread and remains live until every submitted cleanup future ends.
+    fn prepare(
+        &self,
+        provider: &ResourceProviderPort,
+        process_scope: &ResourceScope,
+    ) -> Result<(), ResourceUnavailable> {
+        if self.health.executor_failed.load(Ordering::Acquire) {
+            return Err(ResourceUnavailable::ProviderInvariant {
+                dimension: ResourceClass::WorkerOrTask,
+            });
+        }
+        let mut state = self.state.lock().map_err(|_| {
+            self.health.executor_failed.store(true, Ordering::Release);
+            ResourceUnavailable::ProviderInvariant {
+                dimension: ResourceClass::WorkerOrTask,
+            }
+        })?;
+        if state.sender.is_some() {
+            return Ok(());
+        }
+
+        let infrastructure_lease = provider.acquire(
+            process_scope,
+            ResourceAuthorityClass::Cleanup,
+            cleanup_executor_infrastructure_claim().map_err(|error| match error {
+                crate::resource::ResourceClaimArithmeticError::Overflow { dimension }
+                | crate::resource::ResourceClaimArithmeticError::Underflow { dimension } => {
+                    ResourceUnavailable::ProviderInvariant { dimension }
+                }
+            })?,
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ResourceUnavailable::ProviderInvariant {
+                dimension: ResourceClass::WorkerOrTask,
+            })?;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ConnectorCleanupJob>();
+        let health = Arc::clone(&self.health);
+        #[cfg(test)]
+        let forced_termination = Arc::clone(&self.forced_termination);
+        let thread = std::thread::Builder::new()
+            .name("myownmesh-connector-cleanup".to_string())
+            .spawn(move || {
+                let _infrastructure_lease = infrastructure_lease;
+                let loop_health = Arc::clone(&health);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(async move {
+                        let mut jobs = tokio::task::JoinSet::new();
+                        let mut receiver_open = true;
+                        let forced_failure = async move {
+                            #[cfg(test)]
+                            forced_termination.notified().await;
+                            #[cfg(not(test))]
+                            std::future::pending::<()>().await;
+                        };
+                        tokio::pin!(forced_failure);
+                        loop {
+                            if !receiver_open && jobs.is_empty() {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = &mut forced_failure => {
+                                    panic!("injected cleanup executor termination");
+                                }
+                                received = receiver.recv(), if receiver_open => {
+                                    match received {
+                                        Some(mut cleanup) => {
+                                            loop_health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
+                                            let job_health = Arc::clone(&loop_health);
+                                            jobs.spawn(async move {
+                                                job_health.active_jobs.fetch_add(1, Ordering::AcqRel);
+                                                let future = cleanup
+                                                    .future
+                                                    .take()
+                                                    .expect("queued cleanup job owns one future");
+                                                let outcome = std::panic::AssertUnwindSafe(future)
+                                                    .catch_unwind()
+                                                    .await;
+                                                match outcome {
+                                                    Ok(()) => {
+                                                        let completion = cleanup.complete();
+                                                        completion();
+                                                        job_health.completed_jobs.fetch_add(1, Ordering::AcqRel);
+                                                    }
+                                                    Err(_) => {
+                                                        cleanup.fail("cleanup future panicked".to_string());
+                                                        drop(cleanup);
+                                                        job_health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                                                    }
+                                                }
+                                                job_health.active_jobs.fetch_sub(1, Ordering::AcqRel);
+                                            });
+                                        }
+                                        None => receiver_open = false,
+                                    }
+                                }
+                                completed = jobs.join_next(), if !jobs.is_empty() => {
+                                    if completed.is_some_and(|result| result.is_err()) {
+                                        loop_health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }));
+                if outcome.is_err() {
+                    health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                }
+                health.executor_failed.store(true, Ordering::Release);
+            })
+            .map_err(|_| ResourceUnavailable::ProviderInvariant {
+                dimension: ResourceClass::WorkerOrTask,
+            })?;
+        state.sender = Some(sender);
+        state.thread = Some(thread);
+        Ok(())
     }
 
     fn submit(
@@ -624,7 +632,7 @@ impl ConnectorCleanupExecutor {
             cleanup.fail("cleanup executor is unavailable".to_string());
             return Err(cleanup);
         }
-        let mut state = match self.state.lock() {
+        let state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
                 self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
@@ -632,93 +640,24 @@ impl ConnectorCleanupExecutor {
                 return Err(cleanup);
             }
         };
-        if state.sender.is_none() {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(_) => {
-                    self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
-                    cleanup.fail("cleanup runtime construction failed".to_string());
-                    return Err(cleanup);
-                }
-            };
-            let (sender, mut receiver) =
-                tokio::sync::mpsc::channel::<ConnectorCleanupJob>(self.capacity.get());
-            let health = Arc::clone(&self.health);
-            let thread = match std::thread::Builder::new()
-                .name("myownmesh-connector-cleanup".to_string())
-                .spawn(move || {
-                    let loop_health = Arc::clone(&health);
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(async move {
-                            while let Some(mut cleanup) = receiver.recv().await {
-                                loop_health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
-                                let job_health = Arc::clone(&loop_health);
-                                tokio::spawn(async move {
-                                    job_health.active_jobs.fetch_add(1, Ordering::AcqRel);
-                                    let future = cleanup
-                                        .future
-                                        .take()
-                                        .expect("queued cleanup job owns one future");
-                                    let outcome =
-                                        std::panic::AssertUnwindSafe(future).catch_unwind().await;
-                                    match outcome {
-                                        Ok(()) => {
-                                            cleanup.complete();
-                                            job_health
-                                                .completed_jobs
-                                                .fetch_add(1, Ordering::AcqRel);
-                                        }
-                                        Err(_) => {
-                                            cleanup.fail("cleanup future panicked".to_string());
-                                            job_health.failed_jobs.fetch_add(1, Ordering::AcqRel);
-                                        }
-                                    }
-                                    job_health.active_jobs.fetch_sub(1, Ordering::AcqRel);
-                                });
-                            }
-                        });
-                    }));
-                    health.executor_failed.store(true, Ordering::Release);
-                }) {
-                Ok(thread) => thread,
-                Err(_) => {
-                    self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
-                    cleanup.fail("cleanup executor thread construction failed".to_string());
-                    return Err(cleanup);
-                }
-            };
-            state.sender = Some(sender);
-            state.thread = Some(thread);
-        }
         let Some(sender) = state.sender.as_ref() else {
             self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
             cleanup.fail("cleanup executor has no submission port".to_string());
             return Err(cleanup);
         };
         self.health.queued_jobs.fetch_add(1, Ordering::AcqRel);
-        match sender.try_send(cleanup) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(mut cleanup)) => {
-                self.health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
-                self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
-                cleanup.fail("cleanup executor queue is full".to_string());
-                Err(cleanup)
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(mut cleanup)) => {
-                self.health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
-                self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
-                cleanup.fail("cleanup executor queue is closed".to_string());
-                Err(cleanup)
-            }
+        if let Err(error) = sender.send(cleanup) {
+            self.health.queued_jobs.fetch_sub(1, Ordering::AcqRel);
+            self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+            let mut cleanup = error.0;
+            cleanup.fail("cleanup executor queue is closed".to_string());
+            return Err(cleanup);
         }
+        Ok(())
     }
 
     fn report(&self) -> ConnectorCleanupHealth {
         ConnectorCleanupHealth {
-            queue_capacity: self.capacity.get(),
             queued_jobs: self.health.queued_jobs.load(Ordering::Acquire),
             active_jobs: self.health.active_jobs.load(Ordering::Acquire),
             completed_jobs: self.health.completed_jobs.load(Ordering::Acquire),
@@ -730,47 +669,72 @@ impl ConnectorCleanupExecutor {
     #[cfg(test)]
     fn fail_for_test(&self) {
         self.health.executor_failed.store(true, Ordering::Release);
+        self.forced_termination.notify_one();
         if let Ok(mut state) = self.state.lock() {
             state.sender.take();
         }
     }
 }
 
-#[cfg(test)]
-impl From<PreAuthResourceClaim> for ConnectorResourceOwnerPort {
-    fn from(capacity: PreAuthResourceClaim) -> Self {
-        let candidates = usize::try_from(
-            capacity.by_family[PreAuthResourceFamily::TransportObject.index()].items(),
-        )
-        .ok()
-        .and_then(NonZeroUsize::new)
-        .expect("test owner capacity includes at least one connector");
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("test data-only callback policy is valid");
-        let _ = callbacks;
-        let policy = ConnectorResourcePolicy::new(candidates)
-            .expect("test connector resource policy is valid");
-        Self::new(policy)
-    }
+/// Mechanically derived process claim for the persistent cleanup owner.
+///
+/// Inline bytes cover the runtime value, channel sender, thread handle, and
+/// health state. Four residual units name the runtime heap, channel heap,
+/// native thread stack, and platform runtime internals that Rust does not
+/// expose as exact byte quantities.
+pub(crate) fn cleanup_executor_infrastructure_claim(
+) -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    let bytes = std::mem::size_of::<tokio::runtime::Runtime>()
+        .checked_add(std::mem::size_of::<
+            tokio::sync::mpsc::UnboundedSender<ConnectorCleanupJob>,
+        >())
+        .and_then(|value| value.checked_add(std::mem::size_of::<std::thread::JoinHandle<()>>()))
+        .and_then(|value| value.checked_add(std::mem::size_of::<ConnectorCleanupHealthState>()))
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    let bytes = u64::try_from(bytes).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::SocketOrHandle, 1),
+        (ResourceClass::WorkerOrTask, 1),
+        (ResourceClass::CallbackOrScheduledWork, 1),
+        (ResourceClass::OpaqueDependencyResidual, 4),
+    ])
 }
 
-#[cfg(test)]
-impl From<PreAuthResourceClaim> for MeshConnectorResourceScope {
-    fn from(capacity: PreAuthResourceClaim) -> Self {
-        let process_owner = ConnectorResourceOwnerPort::from(capacity);
-        let candidates = usize::try_from(
-            capacity.by_family[PreAuthResourceFamily::TransportObject.index()].items(),
-        )
-        .ok()
-        .and_then(NonZeroUsize::new)
-        .expect("test Mesh capacity includes at least one connector");
-        process_owner
-            .issue_mesh_scope(MeshConnectorResourcePolicy::new(candidates))
-            .expect("test process owner issues one explicit Mesh scope")
+pub(super) fn release_reservation(
+    lease: ResourceLease,
+    process_diagnostics: &ConnectorResourceDiagnostics,
+    mesh_diagnostics: &ConnectorResourceDiagnostics,
+) {
+    drop(lease);
+    process_diagnostics.note_released();
+    mesh_diagnostics.note_released();
+}
+
+pub(super) fn retain_failed_reservation(
+    lease: ResourceLease,
+    process_diagnostics: &ConnectorResourceDiagnostics,
+    mesh_diagnostics: &ConnectorResourceDiagnostics,
+) {
+    let expected = lease.claim();
+    match lease.retain_after_failed_cleanup() {
+        ReclaimResult::Retained(retained) if retained == expected => {
+            process_diagnostics.note_failed_cleanup();
+            mesh_diagnostics.note_failed_cleanup();
+        }
+        ReclaimResult::NotNeeded
+        | ReclaimResult::Reclaimed(_)
+        | ReclaimResult::Retained(_)
+        | ReclaimResult::Deferred(_)
+        | ReclaimResult::ProviderInvariant { .. } => {
+            process_diagnostics.poison();
+            mesh_diagnostics.poison();
+        }
     }
 }

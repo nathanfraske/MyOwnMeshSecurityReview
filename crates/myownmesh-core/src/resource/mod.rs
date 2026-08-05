@@ -1,7 +1,19 @@
-//! Observation-only resource accounting for the V4 transition.
+//! Resource ownership and observation for the V4 transition.
 //!
-//! This module measures current resource use. It does not reserve capacity,
-//! enforce limits, authorize work, or create a permit. See `BOUNDARY.md`.
+//! The provider submodule grants finite resource leases. The existing
+//! accountant below remains observation-only and cannot authorize work.
+//! Keeping those roles distinct prevents measurements from becoming permits.
+
+pub mod provider;
+
+pub use provider::{
+    FiniteResourceProvider, ReclaimResult, ResourceAcquireDemand, ResourceAdmission,
+    ResourceAuthorityClass, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceLease, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
+    ResourceProviderConflict, ResourceProviderPort, ResourceReclaimSubscription,
+    ResourceReclaimTarget, ResourceReservationState, ResourceScope, ResourceScopeId,
+    ResourceUnavailable, RESOURCE_CLASS_COUNT,
+};
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -270,7 +282,7 @@ pub struct ResourceReport {
 
 /// The one resource root shared by all MyOwnMesh runtime objects in this
 /// process. Its accountant remains observation-only. Its separate connector
-/// owner slot binds the owner-selected admission policy once for the process.
+/// owner slot binds one owner-selected resource-provider identity.
 static PROCESS_RESOURCE_ROOT: OnceLock<ProcessResourceRoot> = OnceLock::new();
 
 /// Return a process-wide observation snapshot.
@@ -298,7 +310,7 @@ impl std::fmt::Debug for ProcessResourceRoot {
             .debug_struct("ProcessResourceRoot")
             .field("accountant", &self.accountant)
             .field(
-                "connector_policy_installed",
+                "resource_provider_installed",
                 &self.connector_owner.get().is_some(),
             )
             .finish()
@@ -316,31 +328,25 @@ impl ProcessResourceRoot {
             .clone()
     }
 
-    /// Install or reuse the one connector admission owner for this process
-    /// resource root.
+    /// Install or reuse the one resource provider for this process root.
     ///
-    /// The first owner-selected policy wins. A later Mesh runtime can share
-    /// it only when it requests the exact same policy.
-    pub fn install_connector_policy(
+    /// The first owner-selected provider identity wins. A later Mesh runtime
+    /// can share it only by cloning the exact same port. Replacing it while
+    /// leases may exist would split the process grant.
+    pub fn install_resource_provider(
         &self,
-        policy: crate::runtime::attempt::ConnectorResourcePolicy,
+        provider: ResourceProviderPort,
     ) -> std::result::Result<
         crate::runtime::attempt::ConnectorResourceOwnerPort,
-        Box<crate::runtime::attempt::ConnectorResourcePolicyConflict>,
+        ResourceProviderConflict,
     > {
-        let installed = self
-            .connector_owner
-            .get_or_init(|| crate::runtime::attempt::ConnectorResourceOwnerPort::new(policy));
-        let installed_policy = installed.policy();
-        if installed_policy == policy {
+        let installed = self.connector_owner.get_or_init(|| {
+            crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider.clone())
+        });
+        if installed.same_provider(&provider) {
             Ok(installed.clone())
         } else {
-            Err(Box::new(
-                crate::runtime::attempt::ConnectorResourcePolicyConflict {
-                    installed: installed_policy,
-                    requested: policy,
-                },
-            ))
+            Err(ResourceProviderConflict)
         }
     }
 
@@ -355,20 +361,18 @@ impl ProcessResourceRoot {
     /// Issue one unforgeable connector admission scope for an exact live
     /// [`crate::Mesh`] runtime.
     ///
-    /// The process policy must already be installed. The caller supplies the
-    /// per-Mesh hard ceiling explicitly; no value is inferred from the process
-    /// ceiling or from other live Mesh runtimes.
+    /// The process provider must already be installed. Scope creation grants
+    /// no capacity and all Mesh scopes draw from the same process grant.
     pub fn issue_mesh_connector_scope(
         &self,
-        policy: crate::runtime::attempt::MeshConnectorResourcePolicy,
     ) -> Result<
         crate::runtime::attempt::MeshConnectorResourceScope,
         crate::runtime::attempt::MeshConnectorResourceScopeIssueError,
     > {
         let owner = self.connector_owner.get().ok_or(
-            crate::runtime::attempt::MeshConnectorResourceScopeIssueError::ProcessPolicyMissing,
+            crate::runtime::attempt::MeshConnectorResourceScopeIssueError::ResourceProviderMissing,
         )?;
-        owner.issue_mesh_scope(policy)
+        owner.issue_mesh_scope()
     }
 
     /// Read the process aggregate without changing it.

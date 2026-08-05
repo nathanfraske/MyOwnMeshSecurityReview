@@ -19,17 +19,20 @@ use std::future::Future;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "transport-lab"))]
+use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::Semaphore;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 use tracing::{debug, info, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
@@ -45,6 +48,7 @@ use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -60,13 +64,23 @@ use webrtc::track::track_remote::TrackRemote;
 use crate::error::{Error, Result};
 use crate::resource::{
     ObservationLease, PeerConnectionResourceScope, PreAuthResourceFamily, ProcessResourceRoot,
-    ResourceMeasurement, ResourceUse,
+    ResourceMeasurement, ResourceReclaimSubscription, ResourceUnavailable, ResourceUse,
 };
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness, ConnectorCallbackPolicy,
-    ConnectorCallbackServiceWeights, ConnectorCandidateCapability, ConnectorResourceOwnerReport,
-    EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport, MeshConnectorResourceScope,
-    RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
+    ConnectorCandidateCapability, ConnectorResourceOwnerReport, ConnectorWorkResourceScope,
+    EnabledRealtimeConnectorPolicy, MaxCumulativeRemoteCandidateApplications,
+    MaxCumulativeRemoteCandidateContentBytes, MaxCumulativeRemoteCandidateSubmissions,
+    MeshConnectorResourceReport, MeshConnectorResourceScope,
+    OwnedRemoteCandidate as ElasticRemoteCandidateLease, RealtimeConnectorPolicy,
+    RemoteCandidateAdmission as ElasticRemoteCandidateAdmission,
+    RemoteCandidateAdmissionError as ElasticRemoteCandidateAdmissionError,
+    RemoteCandidateApplyError as ElasticRemoteCandidateApplyError,
+    RemoteCandidateAttempt as ElasticRemoteCandidateAttempt,
+    RemoteCandidateDigestDecision as ElasticRemoteCandidateDigestDecision,
+    RemoteCandidateInput as ElasticRemoteCandidateInput, RemoteCandidateLocalCeilings,
+    RemoteCandidateTerminalReason as ElasticRemoteCandidateTerminalReason,
+    WebRtcConnectorCapablePolicy,
 };
 
 use super::ice::build_rtc_configuration;
@@ -234,11 +248,33 @@ pub struct WebRtcConnectorEvent {
     incarnation: Arc<WebRtcConnectorIncarnation>,
     event: TransportEvent,
     _queue_observation: Option<ObservationLease>,
+    _callback_work: Option<CallbackWorkLease>,
+}
+
+/// Resource ownership retained while the engine handles one accepted native
+/// callback. The fields are intentionally opaque outside this module.
+pub(crate) struct AcceptedWebRtcConnectorEventResources {
+    _queue_observation: Option<ObservationLease>,
+    _callback_work: Option<CallbackWorkLease>,
+}
+
+/// One stale-owner-checked callback and the resources that remain owned until
+/// its engine handler completes.
+pub(crate) struct AcceptedWebRtcConnectorEvent {
+    event: TransportEvent,
+    resources: AcceptedWebRtcConnectorEventResources,
+}
+
+impl AcceptedWebRtcConnectorEvent {
+    pub(crate) fn into_parts(self) -> (TransportEvent, AcceptedWebRtcConnectorEventResources) {
+        (self.event, self.resources)
+    }
 }
 
 struct QueuedTransportEvent {
     event: TransportEvent,
     observation: Option<ObservationLease>,
+    callback_work: Option<CallbackWorkLease>,
 }
 
 impl QueuedTransportEvent {
@@ -269,25 +305,109 @@ fn callback_payload_limit(
         ConnectorCallbackClass::EndpointData => Some(crate::engine::MAX_ENDPOINT_FRAME_BYTES),
         ConnectorCallbackClass::Realtime => match policy.realtime() {
             RealtimeConnectorPolicy::Disabled => None,
-            RealtimeConnectorPolicy::Enabled(enabled) => Some(enabled.max_unit_bytes().get()),
+            RealtimeConnectorPolicy::Enabled(Some(enabled)) => Some(enabled.max_unit_bytes().get()),
+            RealtimeConnectorPolicy::Enabled(None) => None,
         },
     }
 }
 
 #[derive(Clone)]
 struct ConnectorEventMailboxes {
-    control: mpsc::Sender<QueuedTransportEvent>,
-    endpoint_data: mpsc::Sender<QueuedTransportEvent>,
+    control: Arc<ResourceBackedCallbackMailbox>,
+    endpoint_data: Arc<ResourceBackedCallbackMailbox>,
     lifecycle: Arc<ConnectorLifecycleOwner>,
+    #[cfg(test)]
+    callback_producer: CallbackProducerOwner,
 }
 
 impl ConnectorEventMailboxes {
-    fn sender(&self, class: ConnectorCallbackClass) -> Option<&mpsc::Sender<QueuedTransportEvent>> {
+    fn mailbox(&self, class: ConnectorCallbackClass) -> Option<&ResourceBackedCallbackMailbox> {
         match class {
-            ConnectorCallbackClass::Control => Some(&self.control),
-            ConnectorCallbackClass::EndpointData => Some(&self.endpoint_data),
+            ConnectorCallbackClass::Control => Some(self.control.as_ref()),
+            ConnectorCallbackClass::EndpointData => Some(self.endpoint_data.as_ref()),
             ConnectorCallbackClass::Realtime => None,
         }
+    }
+
+    #[cfg(test)]
+    fn try_insert_for_test(
+        &self,
+        event: TransportEvent,
+        observation: Option<ObservationLease>,
+    ) -> std::result::Result<(), ConnectorCallbackInsertResult> {
+        if matches!(&event, TransportEvent::DataChannelOpen) {
+            return self
+                .lifecycle
+                .record_open()
+                .accepted()
+                .then_some(())
+                .ok_or(ConnectorCallbackInsertResult::PolicyRefused);
+        }
+        if matches!(&event, TransportEvent::DataChannelClosed) {
+            return self
+                .lifecycle
+                .record_close(false)
+                .accepted()
+                .then_some(())
+                .ok_or(ConnectorCallbackInsertResult::PolicyRefused);
+        }
+        let class = ConnectorCallbackClass::for_event(&event);
+        let (payload_bytes, retained_slack) = match &event {
+            TransportEvent::Message(bytes) => (bytes.len(), 0),
+            TransportEvent::VideoSample(sample) => (sample.data.len(), 0),
+            TransportEvent::AudioSample(sample) => (sample.data.len(), 0),
+            TransportEvent::LocalIceCandidate(candidate) => {
+                let Some(sizes) = candidate_callback_sizes(candidate) else {
+                    return Err(ConnectorCallbackInsertResult::PolicyRefused);
+                };
+                sizes
+            }
+            _ => (0, 0),
+        };
+        let work = self
+            .callback_producer
+            .try_admit_with_accounted_slack(class, payload_bytes, retained_slack)
+            .map_err(|_| ConnectorCallbackInsertResult::Overloaded)?;
+        let result = match event {
+            TransportEvent::DataChannelOpen | TransportEvent::DataChannelClosed => unreachable!(
+                "data-channel lifecycle events return before ordinary callback admission"
+            ),
+            TransportEvent::RenegotiationNeeded => self.lifecycle.record_renegotiation(work),
+            TransportEvent::IceConnectionStateChanged(state) => {
+                self.lifecycle.record_ice_state(state, work)
+            }
+            TransportEvent::PeerConnectionStateChanged(state) => {
+                self.lifecycle.record_peer_state(state, work)
+            }
+            event => {
+                let Some(mailbox) = self.mailbox(class) else {
+                    return Err(ConnectorCallbackInsertResult::WrongOwnerPath);
+                };
+                return mailbox
+                    .try_insert(QueuedTransportEvent {
+                        event,
+                        observation,
+                        callback_work: Some(work),
+                    })
+                    .map_err(|error| match error.kind() {
+                        CallbackMailboxInsertErrorKind::Closed => {
+                            ConnectorCallbackInsertResult::ReceiverClosed
+                        }
+                        CallbackMailboxInsertErrorKind::LocalItemCeiling => {
+                            ConnectorCallbackInsertResult::Overloaded
+                        }
+                        CallbackMailboxInsertErrorKind::MissingLease
+                        | CallbackMailboxInsertErrorKind::WrongClass
+                        | CallbackMailboxInsertErrorKind::WrongPhase => {
+                            ConnectorCallbackInsertResult::PolicyRefused
+                        }
+                    });
+            }
+        };
+        result
+            .accepted()
+            .then_some(())
+            .ok_or(ConnectorCallbackInsertResult::PolicyRefused)
     }
 }
 
@@ -302,7 +422,9 @@ struct ConnectorEventSink {
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     callback_violation_reported: Arc<AtomicBool>,
     callback_policy: ConnectorCallbackPolicy,
+    callback_producer: CallbackProducerOwner,
     operation_fence: Arc<ConnectorOperationFence>,
+    close_owner: Option<Weak<ConnectorCloseOwner>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,7 +443,54 @@ impl ConnectorCallbackInsertResult {
     }
 }
 
+fn callback_admission_error(context: &'static str, error: CallbackProducerOverload) -> Error {
+    match error {
+        CallbackProducerOverload::ResourceUnavailable { unavailable, .. } => {
+            Error::ResourceUnavailable(unavailable)
+        }
+        other => Error::Transport(format!("{context}: {other:?}")),
+    }
+}
+
+fn realtime_flow_admission_error(context: &'static str, error: RealtimeFlowDropReason) -> Error {
+    match error {
+        RealtimeFlowDropReason::ResourceUnavailable(unavailable) => {
+            Error::ResourceUnavailable(unavailable)
+        }
+        other => Error::Transport(format!("{context}: {other:?}")),
+    }
+}
+
 impl ConnectorEventSink {
+    fn begin_native_callback_operation(
+        &self,
+        class: ConnectorCallbackClass,
+    ) -> std::result::Result<CallbackWorkLease, CallbackProducerOverload> {
+        self.begin_native_callback_operation_with_payload(class, 0, 0)
+    }
+
+    fn begin_native_callback_operation_with_payload(
+        &self,
+        class: ConnectorCallbackClass,
+        payload_bytes: usize,
+        retained_slack: usize,
+    ) -> std::result::Result<CallbackWorkLease, CallbackProducerOverload> {
+        let mut work = self.callback_producer.try_admit_with_accounted_slack(
+            class,
+            payload_bytes,
+            retained_slack,
+        )?;
+        work.begin_execution()?;
+        Ok(work)
+    }
+
+    fn open_inbound_realtime_flow_checked(
+        &self,
+    ) -> std::result::Result<RealtimeFlowPort, RealtimeFlowDropReason> {
+        self.realtime_flows.open_inbound_flow_checked()
+    }
+
+    #[cfg(test)]
     fn open_inbound_realtime_flow(&self) -> Option<RealtimeFlowPort> {
         self.realtime_flows.open_inbound_flow()
     }
@@ -332,14 +501,15 @@ impl ConnectorEventSink {
 
     fn observe_realtime_payload(&self, payload_bytes: usize) -> Option<ObservationLease> {
         self.resource_scope.as_ref().map(|scope| {
+            let measurement = match u64::try_from(payload_bytes) {
+                Ok(bytes) => {
+                    ResourceMeasurement::inexact(ResourceUse::observed(1, bytes, bytes, 0))
+                }
+                Err(_) => ResourceMeasurement::inexact(ResourceUse::ZERO),
+            };
             scope.observe_pre_authentication_measurement(
                 PreAuthResourceFamily::MediaQuarantine,
-                ResourceMeasurement::inexact(ResourceUse::observed(
-                    1,
-                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
-                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
-                    0,
-                )),
+                measurement,
             )
         })
     }
@@ -362,7 +532,14 @@ impl ConnectorEventSink {
             _ => return false,
         };
         let observation = self.observe_realtime_payload(payload_bytes);
-        flow.enqueue(QueuedTransportEvent { event, observation }, reservation)
+        flow.enqueue(
+            QueuedTransportEvent {
+                event,
+                observation,
+                callback_work: None,
+            },
+            reservation,
+        )
     }
 
     async fn emit_data_channel(&self, event: TransportEvent) -> bool {
@@ -386,7 +563,10 @@ impl ConnectorEventSink {
             self.realtime_delivery.store(false, Ordering::Release);
             self.operation_fence.begin_close();
             self.realtime_flows.retire();
-            return self.events.lifecycle.record_close();
+            return self
+                .events
+                .lifecycle
+                .record_close(self.callback_gate.is_active());
         }
         self.emit_inner(event, true).await
     }
@@ -411,7 +591,12 @@ impl ConnectorEventSink {
         self.realtime_delivery.store(false, Ordering::Release);
         self.operation_fence.begin_close();
         self.realtime_flows.retire();
-        self.events.lifecycle.record_close();
+        self.events
+            .lifecycle
+            .record_close(self.callback_gate.is_active());
+        if let Some(owner) = self.close_owner.as_ref().and_then(Weak::upgrade) {
+            owner.start();
+        }
     }
 
     fn structural_violation(&self, reason: &'static str) {
@@ -446,25 +631,55 @@ impl ConnectorEventSink {
                 return self.events.lifecycle.record_open();
             }
             TransportEvent::DataChannelClosed => {
-                return self.events.lifecycle.record_close();
+                return self
+                    .events
+                    .lifecycle
+                    .record_close(self.callback_gate.is_active());
             }
             TransportEvent::RenegotiationNeeded => {
-                return self.events.lifecycle.record_renegotiation();
+                let work = match self
+                    .callback_producer
+                    .try_admit(ConnectorCallbackClass::Control, 0)
+                {
+                    Ok(work) => work,
+                    Err(_) => return ConnectorCallbackInsertResult::Overloaded,
+                };
+                return self.events.lifecycle.record_renegotiation(work);
             }
             TransportEvent::IceConnectionStateChanged(state) => {
-                return self.events.lifecycle.record_ice_state(state);
+                let work = match self
+                    .callback_producer
+                    .try_admit(ConnectorCallbackClass::Control, 0)
+                {
+                    Ok(work) => work,
+                    Err(_) => return ConnectorCallbackInsertResult::Overloaded,
+                };
+                return self.events.lifecycle.record_ice_state(state, work);
             }
             TransportEvent::PeerConnectionStateChanged(state) => {
-                return self.events.lifecycle.record_peer_state(state);
+                let work = match self
+                    .callback_producer
+                    .try_admit(ConnectorCallbackClass::Control, 0)
+                {
+                    Ok(work) => work,
+                    Err(_) => return ConnectorCallbackInsertResult::Overloaded,
+                };
+                return self.events.lifecycle.record_peer_state(state, work);
             }
             event => event,
         };
         let callback_class = ConnectorCallbackClass::for_event(&event);
-        let payload_bytes = match &event {
-            TransportEvent::Message(bytes) => bytes.len(),
-            TransportEvent::VideoSample(sample) => sample.data.len(),
-            TransportEvent::AudioSample(sample) => sample.data.len(),
-            _ => 0,
+        let (payload_bytes, retained_slack) = match &event {
+            TransportEvent::Message(bytes) => (bytes.len(), 0),
+            TransportEvent::VideoSample(sample) => (sample.data.len(), 0),
+            TransportEvent::AudioSample(sample) => (sample.data.len(), 0),
+            TransportEvent::LocalIceCandidate(candidate) => {
+                let Some(sizes) = candidate_callback_sizes(candidate) else {
+                    return ConnectorCallbackInsertResult::PolicyRefused;
+                };
+                sizes
+            }
+            _ => (0, 0),
         };
         if matches!(
             &event,
@@ -483,6 +698,21 @@ impl ConnectorEventSink {
             );
             return ConnectorCallbackInsertResult::PolicyRefused;
         }
+        let callback_work = match self.callback_producer.try_admit_with_accounted_slack(
+            callback_class,
+            payload_bytes,
+            retained_slack,
+        ) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                warn!(
+                    ?error,
+                    ?callback_class,
+                    "connector callback resource pressure"
+                );
+                return ConnectorCallbackInsertResult::Overloaded;
+            }
+        };
         let family = match &event {
             TransportEvent::Message(_) => PreAuthResourceFamily::FrameBytes,
             TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_) => {
@@ -491,18 +721,28 @@ impl ConnectorEventSink {
             _ => PreAuthResourceFamily::ConnectorSpecificWork,
         };
         let observation = self.resource_scope.as_ref().map(|scope| {
-            scope.observe_pre_authentication_measurement(
-                family,
-                ResourceMeasurement::inexact(ResourceUse::observed(
-                    1,
-                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
-                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
-                    0,
-                )),
-            )
+            let measurement = payload_bytes
+                .checked_add(retained_slack)
+                .and_then(|retained| {
+                    Some((
+                        u64::try_from(payload_bytes).ok()?,
+                        u64::try_from(retained).ok()?,
+                    ))
+                })
+                .map_or_else(
+                    || ResourceMeasurement::inexact(ResourceUse::ZERO),
+                    |(logical, retained)| {
+                        ResourceMeasurement::inexact(ResourceUse::observed(1, logical, retained, 0))
+                    },
+                );
+            scope.observe_pre_authentication_measurement(family, measurement)
         });
-        let queued = QueuedTransportEvent { event, observation };
-        let Some(mailbox) = self.events.sender(callback_class) else {
+        let queued = QueuedTransportEvent {
+            event,
+            observation,
+            callback_work,
+        };
+        let Some(mailbox) = self.events.mailbox(callback_class) else {
             // Real-time units must enter through an exact RealtimeFlowPort.
             // A connector-wide compatibility mailbox would let one flow
             // consume or reorder another flow's admitted queue.
@@ -518,12 +758,21 @@ impl ConnectorEventSink {
         {
             return ConnectorCallbackInsertResult::ReceiverClosed;
         }
-        match mailbox.try_send(queued) {
+        match mailbox.try_insert(queued) {
             Ok(()) => ConnectorCallbackInsertResult::Queued,
-            Err(mpsc::error::TrySendError::Full(_)) => ConnectorCallbackInsertResult::Overloaded,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                ConnectorCallbackInsertResult::ReceiverClosed
-            }
+            Err(error) => match error.kind() {
+                CallbackMailboxInsertErrorKind::Closed => {
+                    ConnectorCallbackInsertResult::ReceiverClosed
+                }
+                CallbackMailboxInsertErrorKind::LocalItemCeiling => {
+                    ConnectorCallbackInsertResult::Overloaded
+                }
+                CallbackMailboxInsertErrorKind::MissingLease
+                | CallbackMailboxInsertErrorKind::WrongClass
+                | CallbackMailboxInsertErrorKind::WrongPhase => {
+                    ConnectorCallbackInsertResult::PolicyRefused
+                }
+            },
         }
     }
 }
@@ -537,6 +786,7 @@ pub(crate) struct WebRtcConnectorEventReceiver {
     attempt_lifetime: Option<AttemptLifetime>,
     remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
     close_owner: Option<Arc<ConnectorCloseOwner>>,
+    reclaim: Option<ResourceReclaimSubscription>,
     data_channel_open_committed: bool,
     data_channel_closed: bool,
     operation_fence: Arc<ConnectorOperationFence>,
@@ -545,27 +795,41 @@ pub(crate) struct WebRtcConnectorEventReceiver {
 /// Lab/test receiver for raw WebRTC behavior. Production wraps it in the
 /// connector owner before any event can reach the engine.
 pub struct TransportEventReceiver {
-    control: mpsc::Receiver<QueuedTransportEvent>,
-    endpoint_data: mpsc::Receiver<QueuedTransportEvent>,
+    control: Arc<ResourceBackedCallbackMailbox>,
+    endpoint_data: Arc<ResourceBackedCallbackMailbox>,
     lifecycle: Arc<ConnectorLifecycleOwner>,
     lifecycle_closed: bool,
+    callback_ready: Arc<tokio::sync::Notify>,
+    callback_failed: bool,
     realtime_flows: Arc<RealtimeFlowRegistry>,
     scheduler: ConnectorCallbackScheduler,
+    control_cursor: ConnectorControlSourceCursor,
 }
 
 impl TransportEventReceiver {
+    fn begin_callback_execution(
+        &mut self,
+        mut event: QueuedTransportEvent,
+    ) -> Option<QueuedTransportEvent> {
+        if let Some(work) = event.callback_work.as_mut() {
+            if let Err(error) = work.begin_execution() {
+                warn!(
+                    ?error,
+                    "connector callback execution resource transition failed"
+                );
+                self.callback_failed = true;
+                return None;
+            }
+        }
+        Some(event)
+    }
+
     fn try_scheduled_filtered(
         &mut self,
         allow_endpoint_data: bool,
     ) -> Option<QueuedTransportEvent> {
         if self.lifecycle_closed {
             return None;
-        }
-        if let Some(event) = self.lifecycle.try_take_event() {
-            if matches!(event.event, TransportEvent::DataChannelClosed) {
-                self.lifecycle_closed = true;
-            }
-            return Some(event);
         }
         for _ in 0..3 {
             let class = self.scheduler.current();
@@ -577,15 +841,23 @@ impl TransportEventReceiver {
                 self.realtime_flows.try_recv()
             } else {
                 match class {
-                    ConnectorCallbackClass::Control => self.control.try_recv().ok(),
-                    ConnectorCallbackClass::EndpointData => self.endpoint_data.try_recv().ok(),
+                    ConnectorCallbackClass::Control => {
+                        self.control_cursor.try_take(&self.lifecycle, &self.control)
+                    }
+                    ConnectorCallbackClass::EndpointData => self.endpoint_data.try_take(),
                     ConnectorCallbackClass::Realtime => unreachable!(),
                 }
             };
             match event {
                 Some(event) => {
+                    if matches!(event.event, TransportEvent::DataChannelClosed) {
+                        self.lifecycle_closed = true;
+                    }
                     self.scheduler.delivered(class);
-                    return Some(event);
+                    if let Some(event) = self.begin_callback_execution(event) {
+                        return Some(event);
+                    }
+                    continue;
                 }
                 None => {
                     self.scheduler.skip_current();
@@ -593,6 +865,15 @@ impl TransportEventReceiver {
             }
         }
         None
+    }
+
+    fn try_terminal_close(&mut self) -> Option<QueuedTransportEvent> {
+        if self.lifecycle_closed {
+            return None;
+        }
+        let event = self.lifecycle.try_take_close_event()?;
+        self.lifecycle_closed = true;
+        self.begin_callback_execution(event)
     }
 
     #[cfg(any(test, feature = "transport-lab"))]
@@ -605,6 +886,9 @@ impl TransportEventReceiver {
         allow_endpoint_data: bool,
     ) -> Option<QueuedTransportEvent> {
         loop {
+            if self.callback_failed {
+                return None;
+            }
             if let Some(event) = self.try_scheduled_filtered(allow_endpoint_data) {
                 return Some(event);
             }
@@ -621,18 +905,7 @@ impl TransportEventReceiver {
                 _ = self.lifecycle.notified() => {
                     continue;
                 }
-                event = self.control.recv(), if !self.control.is_closed() || !self.control.is_empty() => {
-                    if let Some(event) = event {
-                        self.scheduler.delivered(ConnectorCallbackClass::Control);
-                        return Some(event);
-                    }
-                }
-                event = self.endpoint_data.recv(), if allow_endpoint_data && (!self.endpoint_data.is_closed() || !self.endpoint_data.is_empty()) => {
-                    if let Some(event) = event {
-                        self.scheduler.delivered(ConnectorCallbackClass::EndpointData);
-                        return Some(event);
-                    }
-                }
+                _ = self.callback_ready.notified() => { continue; }
                 _ = self.realtime_flows.ready.notified() => {
                     continue;
                 }
@@ -667,11 +940,51 @@ impl TransportEventReceiver {
     }
 }
 
+impl Drop for TransportEventReceiver {
+    fn drop(&mut self) {
+        self.control.close();
+        self.endpoint_data.close();
+    }
+}
+
 impl WebRtcConnectorEventReceiver {
+    fn expose_queued(&mut self, queued: QueuedTransportEvent) -> Option<WebRtcConnectorEvent> {
+        let terminal_close = matches!(&queued.event, TransportEvent::DataChannelClosed);
+        if self.operation_fence.is_closed() && !terminal_close {
+            return None;
+        }
+        let incarnation_active = self.ownership.incarnation.is_active();
+        if terminal_close && !incarnation_active && !self.raw.lifecycle.close_survives_retirement()
+        {
+            self.data_channel_closed = true;
+            return None;
+        }
+        if !terminal_close && !incarnation_active {
+            return None;
+        }
+        if terminal_close {
+            self.data_channel_closed = true;
+        }
+        Some(WebRtcConnectorEvent {
+            incarnation: Arc::clone(&self.ownership.incarnation),
+            event: queued.event,
+            _queue_observation: queued.observation,
+            _callback_work: queued.callback_work,
+        })
+    }
+
+    fn expose_recorded_close(&mut self) -> Option<WebRtcConnectorEvent> {
+        let queued = self.raw.try_terminal_close()?;
+        self.expose_queued(queued)
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<WebRtcConnectorEvent> {
         loop {
             if self.data_channel_closed {
                 return None;
+            }
+            if let Some(close) = self.expose_recorded_close() {
+                return Some(close);
             }
             if *self.retirement.borrow() {
                 return None;
@@ -684,9 +997,30 @@ impl WebRtcConnectorEventReceiver {
             {
                 return None;
             }
+            if self
+                .reclaim
+                .as_ref()
+                .is_some_and(ResourceReclaimSubscription::is_requested)
+            {
+                if let Some(close_owner) = self.close_owner.as_ref() {
+                    close_owner.start();
+                }
+                return None;
+            }
             let queued = tokio::select! {
                 biased;
-                _ = self.retirement.changed() => return None,
+                _ = self.retirement.changed() => {
+                    if let Some(close) = self.expose_recorded_close() {
+                        return Some(close);
+                    }
+                    return None;
+                },
+                _ = wait_for_optional_reclaim(self.reclaim.as_ref()) => {
+                    if let Some(close_owner) = self.close_owner.as_ref() {
+                        close_owner.start();
+                    }
+                    return None;
+                },
                 _ = wait_for_optional_retirement(&mut self.attempt_retirement) => {
                     if self.reclaim_retired_attempt_candidate() {
                         return None;
@@ -696,21 +1030,10 @@ impl WebRtcConnectorEventReceiver {
                 queued = self.raw.recv_queued_filtered(self.data_channel_open_committed) => queued,
             };
             if let Some(queued) = queued {
-                if self.operation_fence.is_closed()
-                    && !matches!(&queued.event, TransportEvent::DataChannelClosed)
-                {
-                    continue;
+                if let Some(event) = self.expose_queued(queued) {
+                    return Some(event);
                 }
-                if self.ownership.incarnation.is_active() {
-                    if matches!(&queued.event, TransportEvent::DataChannelClosed) {
-                        self.data_channel_closed = true;
-                    }
-                    return Some(WebRtcConnectorEvent {
-                        incarnation: Arc::clone(&self.ownership.incarnation),
-                        event: queued.event,
-                        _queue_observation: queued.observation,
-                    });
-                }
+                continue;
             }
             return None;
         }
@@ -773,16 +1096,19 @@ async fn wait_for_optional_retirement(retirement: &mut Option<watch::Receiver<bo
     }
 }
 
+async fn wait_for_optional_reclaim(reclaim: Option<&ResourceReclaimSubscription>) {
+    match reclaim {
+        Some(reclaim) => reclaim.requested().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn drain_remote_candidates(remote_candidates: &SyncMutex<RemoteCandidateState>) {
     let mut state = remote_candidates.lock();
-    let current = state.current.pending.take();
-    let provisional = state
-        .provisional
-        .as_mut()
-        .map(|attempt| attempt.envelope.pending.take());
-    drop(state);
-    drop(current);
-    drop(provisional);
+    state.current.retire();
+    if let Some(provisional) = state.provisional.as_mut() {
+        provisional.envelope.retire();
+    }
 }
 
 /// Result of applying an inbound candidate through the connector owner.
@@ -829,7 +1155,7 @@ enum DataChannelOpenTransition {
 /// the connector-owned pre-SDP queue.
 pub(crate) struct RemoteDescriptionApplyReport {
     pub(crate) queued_candidate_count: usize,
-    pub(crate) candidate_failures: Vec<Error>,
+    pub(crate) candidate_failure_count: usize,
 }
 
 /// One remote candidate paired with the observation that follows its owner.
@@ -840,6 +1166,8 @@ struct PendingRemoteCandidate {
     attempt: Arc<RemoteCandidateAttemptIdentity>,
     observation: CandidateObservationLease,
     _queue_reservation: Option<PendingRemoteCandidateReservation>,
+    _elastic_lease: Option<ElasticRemoteCandidateLease>,
+    _production_queue_lease: Option<crate::resource::ResourceLease>,
 }
 
 impl PendingRemoteCandidate {
@@ -859,6 +1187,8 @@ impl PendingRemoteCandidate {
             attempt,
             observation,
             _queue_reservation: None,
+            _elastic_lease: None,
+            _production_queue_lease: None,
         }
     }
 
@@ -867,9 +1197,13 @@ impl PendingRemoteCandidate {
         attempt: Arc<RemoteCandidateAttemptIdentity>,
         resource_scope: &PeerConnectionResourceScope,
         queue_reservation: PendingRemoteCandidateReservation,
+        elastic_lease: ElasticRemoteCandidateLease,
+        production_queue_lease: crate::resource::ResourceLease,
     ) -> Self {
         let mut pending = Self::observe(candidate, attempt, resource_scope);
         pending._queue_reservation = Some(queue_reservation);
+        pending._elastic_lease = Some(elastic_lease);
+        pending._production_queue_lease = Some(production_queue_lease);
         pending
     }
 }
@@ -887,7 +1221,10 @@ where
         attempt: _,
         observation,
         _queue_reservation,
+        _elastic_lease,
+        _production_queue_lease,
     } = pending;
+    let _elastic_application = _elastic_lease.and_then(|lease| lease.begin_apply().ok());
     let result = apply(candidate).await;
     drop(observation);
     drop(_queue_reservation);
@@ -901,7 +1238,7 @@ struct CandidateObservationLease {
 
 #[derive(Debug)]
 struct PendingRemoteCandidateQueue {
-    entries: Vec<PendingRemoteCandidate>,
+    entries: std::collections::LinkedList<PendingRemoteCandidate>,
     container_observation: Option<ObservationLease>,
     budget: Arc<PendingRemoteCandidateBudget>,
 }
@@ -909,13 +1246,73 @@ struct PendingRemoteCandidateQueue {
 impl PendingRemoteCandidateQueue {
     fn new(policy: PendingRemoteCandidatePolicy) -> Self {
         Self {
-            entries: Vec::new(),
+            entries: std::collections::LinkedList::new(),
             container_observation: None,
             budget: Arc::new(PendingRemoteCandidateBudget::new(policy)),
         }
     }
 
     fn push(
+        &mut self,
+        candidate: LocalIceCandidate,
+        attempt: Arc<RemoteCandidateAttemptIdentity>,
+        resource_scope: &PeerConnectionResourceScope,
+        work_resources: &ConnectorWorkResourceScope,
+        reservation: PendingRemoteCandidateReservation,
+        elastic_lease: ElasticRemoteCandidateLease,
+    ) -> PendingRemoteCandidateQueuePush {
+        let production_queue_claim = match pending_remote_candidate_queue_claim(&candidate) {
+            Ok(claim) => claim,
+            Err(error) => {
+                warn!(?error, "remote-candidate queue ownership claim overflowed");
+                return PendingRemoteCandidateQueuePush::ResourceUnavailable(
+                    ResourceUnavailable::ProviderInvariant {
+                        dimension: match error {
+                            crate::resource::ResourceClaimArithmeticError::Overflow {
+                                dimension,
+                            }
+                            | crate::resource::ResourceClaimArithmeticError::Underflow {
+                                dimension,
+                            } => dimension,
+                        },
+                    },
+                );
+            }
+        };
+        let production_queue_lease = match work_resources.acquire(
+            crate::resource::ResourceAuthorityClass::Speculative,
+            production_queue_claim,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                warn!(?error, "remote-candidate queue wrapper was refused");
+                return PendingRemoteCandidateQueuePush::ResourceUnavailable(error);
+            }
+        };
+        self.entries.push_back(PendingRemoteCandidate::retained(
+            candidate,
+            attempt,
+            resource_scope,
+            reservation,
+            elastic_lease,
+            production_queue_lease,
+        ));
+        let measurement = queue_container_resource_measurement(&self.entries);
+        match self.container_observation.as_mut() {
+            Some(observation) => observation.replace_measurement(measurement),
+            None => {
+                self.container_observation =
+                    Some(resource_scope.observe_pre_authentication_measurement(
+                        PreAuthResourceFamily::CandidateObject,
+                        measurement,
+                    ));
+            }
+        }
+        PendingRemoteCandidateQueuePush::Queued
+    }
+
+    #[cfg(test)]
+    fn push_observed_for_test(
         &mut self,
         candidate: LocalIceCandidate,
         attempt: Arc<RemoteCandidateAttemptIdentity>,
@@ -928,12 +1325,9 @@ impl PendingRemoteCandidateQueue {
         let Some(reservation) = self.budget.reserve(content_bytes) else {
             return PendingRemoteCandidateQueuePush::Refused;
         };
-        self.entries.push(PendingRemoteCandidate::retained(
-            candidate,
-            attempt,
-            resource_scope,
-            reservation,
-        ));
+        let mut pending = PendingRemoteCandidate::observe(candidate, attempt, resource_scope);
+        pending._queue_reservation = Some(reservation);
+        self.entries.push_back(pending);
         let measurement = queue_container_resource_measurement(&self.entries);
         match self.container_observation.as_mut() {
             Some(observation) => observation.replace_measurement(measurement),
@@ -958,7 +1352,13 @@ impl PendingRemoteCandidateQueue {
     }
 
     fn retain_candidates(&mut self, mut keep: impl FnMut(&PendingRemoteCandidate) -> bool) {
-        self.entries.retain(|pending| keep(pending));
+        let mut retained = std::collections::LinkedList::new();
+        while let Some(pending) = self.entries.pop_front() {
+            if keep(&pending) {
+                retained.push_back(pending);
+            }
+        }
+        self.entries = retained;
         if self.entries.is_empty() {
             self.container_observation = None;
         } else if let Some(observation) = self.container_observation.as_mut() {
@@ -983,8 +1383,7 @@ impl PendingRemoteCandidateQueue {
         &mut self,
         resource_scope: &PeerConnectionResourceScope,
     ) -> Option<PendingRemoteCandidate> {
-        let pending = self.entries.pop()?;
-        self.entries.shrink_to_fit();
+        let pending = self.entries.pop_back()?;
         if self.entries.is_empty() {
             self.container_observation = None;
         } else if let Some(observation) = self.container_observation.as_mut() {
@@ -1005,6 +1404,7 @@ enum PendingRemoteCandidateQueuePush {
     Queued,
     Duplicate,
     InvalidBinding(CandidateUsernameFragmentError),
+    ResourceUnavailable(ResourceUnavailable),
     Refused,
     Retired,
 }
@@ -1042,27 +1442,37 @@ impl PendingRemoteCandidateBudget {
         self: &Arc<Self>,
         content_bytes: usize,
     ) -> Option<PendingRemoteCandidateReservation> {
+        let Some(local) = self.policy.local_ceiling() else {
+            return Some(PendingRemoteCandidateReservation {
+                budget: Arc::clone(self),
+                application: None,
+            });
+        };
         let mut state = self.state.lock();
         if state.accounting_poisoned {
             return None;
         }
-        let Some(items) = state.items.checked_add(1) else {
+        let Some(remaining_content) = local
+            .max_content_bytes()
+            .get()
+            .checked_sub(state.content_bytes)
+        else {
             state.accounting_poisoned = true;
             return None;
         };
+        if state.items >= local.max_unique_items().get() || content_bytes > remaining_content {
+            return None;
+        }
+        let items = state.items + 1;
         let Some(bytes) = state.content_bytes.checked_add(content_bytes) else {
             state.accounting_poisoned = true;
             return None;
         };
-        if items > self.policy.max_unique_items().get()
-            || bytes > self.policy.max_content_bytes().get()
-        {
-            return None;
-        }
         state.items = items;
         state.content_bytes = bytes;
         Some(PendingRemoteCandidateReservation {
             budget: Arc::clone(self),
+            application: None,
         })
     }
 
@@ -1071,33 +1481,33 @@ impl PendingRemoteCandidateBudget {
     }
 
     fn record_duplicate(&self) -> bool {
+        let Some(local) = self.policy.local_ceiling() else {
+            return true;
+        };
         let mut state = self.state.lock();
         if state.accounting_poisoned {
             return false;
         }
-        let Some(duplicates) = state.duplicate_submissions.checked_add(1) else {
-            state.accounting_poisoned = true;
-            return false;
-        };
-        if duplicates > self.policy.max_duplicate_submissions().get() {
+        if state.duplicate_submissions >= local.max_duplicate_submissions().get() {
             return false;
         }
+        let duplicates = state.duplicate_submissions + 1;
         state.duplicate_submissions = duplicates;
         true
     }
 
     fn reserve_application_work(&self) -> bool {
+        let Some(local) = self.policy.local_ceiling() else {
+            return true;
+        };
         let mut state = self.state.lock();
         if state.accounting_poisoned {
             return false;
         }
-        let Some(work) = state.application_work.checked_add(1) else {
-            state.accounting_poisoned = true;
-            return false;
-        };
-        if work > self.policy.max_application_work().get() {
+        if state.application_work >= local.max_application_work().get() {
             return false;
         }
+        let work = state.application_work + 1;
         state.application_work = work;
         true
     }
@@ -1118,6 +1528,72 @@ impl PendingRemoteCandidateBudget {
 #[derive(Debug)]
 struct PendingRemoteCandidateReservation {
     budget: Arc<PendingRemoteCandidateBudget>,
+    application: Option<crate::runtime::attempt::ApplyingRemoteCandidate>,
+}
+
+/// Exact Rust-owned production queue contribution for one candidate.
+///
+/// The connector-neutral elastic lease owns its digest state. This separate
+/// lease moves with the `LocalIceCandidate` and owns the production wrapper,
+/// exact retained String capacities, logical queued content bytes, the second
+/// digest key, and the two allocator domains used by LinkedList and BTreeSet.
+/// Allocator metadata remains an explicit opaque residual.
+fn pending_remote_candidate_queue_claim(
+    candidate: &LocalIceCandidate,
+) -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let string_capacity = candidate
+        .candidate
+        .capacity()
+        .checked_add(candidate.sdp_mid.as_ref().map_or(0, String::capacity))
+        .and_then(|bytes| {
+            let username = candidate
+                .username_fragment
+                .as_ref()
+                .map_or(0, String::capacity);
+            bytes.checked_add(username)
+        })
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let string_capacity = u64::try_from(string_capacity).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    let content_bytes = candidate_content_bytes(candidate)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::QueuedBytes,
+        })?;
+    pending_remote_candidate_queue_claim_with_content(string_capacity, content_bytes)
+}
+
+fn pending_remote_candidate_queue_claim_with_content(
+    string_capacity: u64,
+    content_bytes: u64,
+) -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let accounted_bytes = std::mem::size_of::<PendingRemoteCandidate>()
+        .checked_add(std::mem::size_of::<[u8; 32]>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| bytes.checked_add(string_capacity))
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            accounted_bytes,
+        ),
+        (crate::resource::ResourceClass::QueuedBytes, content_bytes),
+        (crate::resource::ResourceClass::StorageObject, 2),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])
 }
 
 fn candidate_content_bytes(candidate: &LocalIceCandidate) -> Option<usize> {
@@ -1133,16 +1609,40 @@ fn candidate_content_bytes(candidate: &LocalIceCandidate) -> Option<usize> {
     )
 }
 
+fn candidate_callback_sizes(candidate: &Option<LocalIceCandidate>) -> Option<(usize, usize)> {
+    let Some(candidate) = candidate.as_ref() else {
+        return Some((0, 0));
+    };
+    let content = candidate_content_bytes(candidate)?;
+    let slack = candidate
+        .candidate
+        .capacity()
+        .checked_sub(candidate.candidate.len())?
+        .checked_add(
+            candidate
+                .sdp_mid
+                .as_ref()
+                .map_or(0, |value| value.capacity().saturating_sub(value.len())),
+        )?
+        .checked_add(
+            candidate
+                .username_fragment
+                .as_ref()
+                .map_or(0, |value| value.capacity().saturating_sub(value.len())),
+        )?;
+    Some((content, slack))
+}
+
 #[derive(Debug)]
 struct PendingRemoteCandidateDrain {
-    entries: std::vec::IntoIter<PendingRemoteCandidate>,
+    entries: std::collections::linked_list::IntoIter<PendingRemoteCandidate>,
     _container_observation: Option<ObservationLease>,
 }
 
 impl Default for PendingRemoteCandidateDrain {
     fn default() -> Self {
         Self {
-            entries: Vec::new().into_iter(),
+            entries: std::collections::LinkedList::new().into_iter(),
             _container_observation: None,
         }
     }
@@ -1170,25 +1670,62 @@ impl ExactSizeIterator for PendingRemoteCandidateDrain {}
 
 struct RemoteCandidateAttemptEnvelope {
     attempt: Arc<RemoteCandidateAttemptIdentity>,
+    elastic_attempt: ElasticRemoteCandidateAttempt,
+    work_resources: ConnectorWorkResourceScope,
     remote_description_set: bool,
     pending: PendingRemoteCandidateQueue,
-    seen: std::collections::HashSet<[u8; 32]>,
-    retained_reservations: Vec<PendingRemoteCandidateReservation>,
+    seen: std::collections::BTreeSet<[u8; 32]>,
+    retained_reservations: std::collections::LinkedList<PendingRemoteCandidateReservation>,
     remote_ice_credentials: Option<RemoteIceCredentials>,
     remote_description_in_flight: bool,
+    /// A provisional replacement owns a second root claim until commit drops
+    /// the retiring root. The connector floor then resumes ownership of the
+    /// one current root.
+    provisional_root_lease: Option<crate::resource::ResourceLease>,
 }
 
 impl RemoteCandidateAttemptEnvelope {
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
+    fn new(
+        policy: PendingRemoteCandidatePolicy,
+        work_resources: ConnectorWorkResourceScope,
+    ) -> Self {
+        let elastic_attempt = ElasticRemoteCandidateAttempt::new(
+            work_resources.clone(),
+            elastic_remote_candidate_ceilings(policy),
+        );
         Self {
             attempt: Arc::new(RemoteCandidateAttemptIdentity::default()),
+            elastic_attempt,
+            work_resources,
             remote_description_set: false,
             pending: PendingRemoteCandidateQueue::new(policy),
-            seen: std::collections::HashSet::new(),
-            retained_reservations: Vec::new(),
+            seen: std::collections::BTreeSet::new(),
+            retained_reservations: std::collections::LinkedList::new(),
             remote_ice_credentials: None,
             remote_description_in_flight: false,
+            provisional_root_lease: None,
         }
+    }
+
+    fn new_provisional(
+        policy: PendingRemoteCandidatePolicy,
+        work_resources: ConnectorWorkResourceScope,
+    ) -> Result<Self> {
+        let root_lease = work_resources
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Speculative,
+                crate::runtime::attempt::remote_candidate_attempt_root_claim().map_err(
+                    |error| {
+                        Error::Transport(format!(
+                            "replacement candidate-attempt root claim overflowed: {error}"
+                        ))
+                    },
+                )?,
+            )
+            .map_err(Error::from)?;
+        let mut replacement = Self::new(policy, work_resources);
+        replacement.provisional_root_lease = Some(root_lease);
+        Ok(replacement)
     }
 
     #[cfg(test)]
@@ -1211,33 +1748,136 @@ impl RemoteCandidateAttemptEnvelope {
         if !self.attempt.is_active() {
             return (PendingRemoteCandidateQueuePush::Retired, None);
         }
-        let kind = super::ice::classify_candidate_sdp(&candidate.candidate);
-        if let Err(error) = candidate_username_fragment(&candidate) {
-            self.attempt.retire();
+        let elastic_input = ElasticRemoteCandidateInput {
+            candidate: candidate.candidate.as_bytes(),
+            sdp_mid: candidate.sdp_mid.as_deref().map(str::as_bytes),
+            sdp_mline_index: candidate.sdp_mline_index,
+            username_fragment: candidate.username_fragment.as_deref().map(str::as_bytes),
+        };
+        let Some(content_bytes) = candidate_content_bytes(&candidate) else {
+            self.pending.budget.poison();
+            self.retire();
+            return (PendingRemoteCandidateQueuePush::Refused, None);
+        };
+        let mut kind = None;
+        let mut binding = None;
+        let mut local_reservation = None;
+        let seen = &self.seen;
+        let duplicate_budget = Arc::clone(&self.pending.budget);
+        let unique_budget = Arc::clone(&self.pending.budget);
+        let admitted = self.elastic_attempt.admit_with_digest_decision(
+            elastic_input,
+            || {
+                kind = Some(super::ice::classify_candidate_sdp(&candidate.candidate));
+                let parsed = candidate_username_fragment(&candidate);
+                let valid = parsed.is_ok();
+                binding = Some(parsed);
+                valid
+            },
+            |digest| {
+                if seen.contains(&digest) {
+                    if duplicate_budget.record_duplicate() {
+                        ElasticRemoteCandidateDigestDecision::Duplicate
+                    } else {
+                        ElasticRemoteCandidateDigestDecision::Refuse
+                    }
+                } else if let Some(reservation) = unique_budget.reserve(content_bytes) {
+                    local_reservation = Some(reservation);
+                    ElasticRemoteCandidateDigestDecision::Retain
+                } else {
+                    ElasticRemoteCandidateDigestDecision::Refuse
+                }
+            },
+        );
+        if let Some(Err(error)) = binding {
+            self.retire();
+            return (PendingRemoteCandidateQueuePush::InvalidBinding(error), kind);
+        }
+        let elastic_lease = match admitted {
+            Ok(ElasticRemoteCandidateAdmission::Retained(lease)) => lease,
+            Ok(ElasticRemoteCandidateAdmission::Duplicate) => {
+                return (PendingRemoteCandidateQueuePush::Duplicate, kind);
+            }
+            Err(ElasticRemoteCandidateAdmissionError::Provider(error))
+            | Err(ElasticRemoteCandidateAdmissionError::Terminal(
+                ElasticRemoteCandidateTerminalReason::Provider(error),
+            )) => {
+                warn!(?error, "remote-candidate provider retired the ICE attempt");
+                self.retire();
+                return (
+                    PendingRemoteCandidateQueuePush::ResourceUnavailable(error),
+                    kind,
+                );
+            }
+            Err(ElasticRemoteCandidateAdmissionError::Terminal(
+                ElasticRemoteCandidateTerminalReason::AccountingInexact,
+            )) => {
+                self.retire();
+                return (
+                    PendingRemoteCandidateQueuePush::ResourceUnavailable(
+                        ResourceUnavailable::ProviderInvariant {
+                            dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+                        },
+                    ),
+                    kind,
+                );
+            }
+            Err(ElasticRemoteCandidateAdmissionError::Terminal(
+                ElasticRemoteCandidateTerminalReason::Retired,
+            )) => {
+                self.retire();
+                return (PendingRemoteCandidateQueuePush::Retired, kind);
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "remote-candidate local wrapper retired the ICE attempt"
+                );
+                self.retire();
+                return (PendingRemoteCandidateQueuePush::Refused, kind);
+            }
+        };
+        let kind = kind.expect("successful candidate validation records its classification");
+        let Some(digest) = elastic_lease.digest() else {
+            self.retire();
             return (
-                PendingRemoteCandidateQueuePush::InvalidBinding(error),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(
+                    ResourceUnavailable::ProviderInvariant {
+                        dimension: crate::resource::ResourceClass::StorageObject,
+                    },
+                ),
                 Some(kind),
             );
-        }
-        let digest = candidate_content_digest(&candidate);
-        if self.seen.contains(&digest) {
-            let disposition = if self.pending.budget.record_duplicate() {
-                PendingRemoteCandidateQueuePush::Duplicate
-            } else {
-                self.attempt.retire();
-                PendingRemoteCandidateQueuePush::Refused
-            };
-            return (disposition, Some(kind));
-        }
-        let result = self
-            .pending
-            .push(candidate, Arc::clone(&self.attempt), resource_scope);
+        };
+        let result = self.pending.push(
+            candidate,
+            Arc::clone(&self.attempt),
+            resource_scope,
+            &self.work_resources,
+            local_reservation
+                .take()
+                .expect("retained candidate owns its pre-retention local reservation"),
+            elastic_lease,
+        );
         if result == PendingRemoteCandidateQueuePush::Queued {
             self.seen.insert(digest);
-        } else if result == PendingRemoteCandidateQueuePush::Refused {
-            self.attempt.retire();
+        } else if matches!(
+            result,
+            PendingRemoteCandidateQueuePush::Refused
+                | PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+        ) {
+            self.retire();
         }
         (result, Some(kind))
+    }
+
+    fn retire(&mut self) {
+        self.attempt.retire();
+        self.elastic_attempt.retire();
+        self.pending.entries.clear();
+        self.pending.container_observation = None;
+        self.seen.clear();
+        self.retained_reservations.clear();
     }
 
     fn owns_attempt(&self, attempt: &Arc<RemoteCandidateAttemptIdentity>) -> bool {
@@ -1248,7 +1888,7 @@ impl RemoteCandidateAttemptEnvelope {
         let Some(credentials) = self.remote_ice_credentials.as_ref() else {
             return true;
         };
-        self.pending.entries.last().is_none_or(|pending| {
+        self.pending.entries.back().is_none_or(|pending| {
             candidate_matches_remote_credentials(&pending.candidate, credentials)
         })
     }
@@ -1260,23 +1900,52 @@ impl RemoteCandidateAttemptEnvelope {
     ) -> bool {
         self.pending.entries = std::mem::take(&mut source.pending.entries);
         self.pending.container_observation = source.pending.container_observation.take();
+        // The retiring set no longer owns any queued candidate after the list
+        // moves. Release those digest nodes before the replacement set is
+        // populated so migration never retains two uncharged copies.
+        source.seen.clear();
         self.pending
             .retain_remote_restart_migratable_candidates(credentials);
 
         for pending in &mut self.pending.entries {
             let Some(content_bytes) = candidate_content_bytes(&pending.candidate) else {
-                self.attempt.retire();
+                self.retire();
                 self.pending.budget.poison();
                 return false;
             };
             let Some(reservation) = self.pending.budget.reserve(content_bytes) else {
-                self.attempt.retire();
+                self.retire();
+                return false;
+            };
+            let input = ElasticRemoteCandidateInput {
+                candidate: pending.candidate.candidate.as_bytes(),
+                sdp_mid: pending.candidate.sdp_mid.as_deref().map(str::as_bytes),
+                sdp_mline_index: pending.candidate.sdp_mline_index,
+                username_fragment: pending
+                    .candidate
+                    .username_fragment
+                    .as_deref()
+                    .map(str::as_bytes),
+            };
+            let elastic_lease = match self.elastic_attempt.admit(input) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "replacement ICE attempt refused migrated candidate work"
+                    );
+                    self.retire();
+                    return false;
+                }
+            };
+            let Some(digest) = elastic_lease.digest() else {
+                self.retire();
                 return false;
             };
             pending.attempt = Arc::clone(&self.attempt);
             pending._queue_reservation = Some(reservation);
-            self.seen
-                .insert(candidate_content_digest(&pending.candidate));
+            pending._elastic_lease = Some(elastic_lease);
+            self.seen.insert(digest);
         }
         true
     }
@@ -1293,17 +1962,186 @@ struct ProvisionalRemoteCandidateAttempt {
     envelope: RemoteCandidateAttemptEnvelope,
 }
 
+fn elastic_remote_candidate_ceilings(
+    policy: PendingRemoteCandidatePolicy,
+) -> RemoteCandidateLocalCeilings {
+    let Some(policy) = policy.local_ceiling() else {
+        return RemoteCandidateLocalCeilings::none();
+    };
+    let unique = u64::try_from(policy.max_unique_items().get())
+        .expect("usize candidate item ceiling fits u64 on supported platforms");
+    let duplicates = u64::try_from(policy.max_duplicate_submissions().get())
+        .expect("usize duplicate ceiling fits u64 on supported platforms");
+    // The two optional wrappers remain independently enforced below the
+    // primitive. If their sum cannot be represented, omit the redundant
+    // aggregate ceiling instead of panicking or inventing a smaller bound.
+    let submissions = unique
+        .checked_add(duplicates)
+        .and_then(std::num::NonZeroU64::new);
+    let content = std::num::NonZeroU64::new(
+        u64::try_from(policy.max_content_bytes().get())
+            .expect("usize candidate content ceiling fits u64 on supported platforms"),
+    )
+    .expect("candidate content ceiling is nonzero");
+    let applications = std::num::NonZeroU64::new(
+        u64::try_from(policy.max_application_work().get())
+            .expect("usize candidate application ceiling fits u64 on supported platforms"),
+    )
+    .expect("candidate application ceiling is nonzero");
+    RemoteCandidateLocalCeilings::new(
+        submissions.map(MaxCumulativeRemoteCandidateSubmissions::new),
+        Some(MaxCumulativeRemoteCandidateContentBytes::new(content)),
+        Some(MaxCumulativeRemoteCandidateApplications::new(applications)),
+    )
+}
+
+#[cfg(test)]
+fn elastic_remote_candidate_test_scope(
+    policy: PendingRemoteCandidatePolicy,
+) -> ConnectorWorkResourceScope {
+    elastic_remote_candidate_test_scope_with_additional(
+        policy,
+        crate::resource::ResourceClaim::ZERO,
+    )
+}
+
+#[cfg(test)]
+fn elastic_remote_candidate_test_scope_with_restart_overlap(
+    policy: PendingRemoteCandidatePolicy,
+) -> ConnectorWorkResourceScope {
+    let local = policy
+        .local_ceiling()
+        .expect("raw candidate-state tests declare an explicit local fixture ceiling");
+    let unique =
+        u64::try_from(local.max_unique_items().get()).expect("fixture candidate count fits u64");
+    let reservation_records = unique
+        .checked_add(1)
+        .expect("fixture restart reservation records fit");
+    let overlap = crate::runtime::attempt::remote_candidate_attempt_root_claim()
+        .and_then(|claim| {
+            claim.checked_add(
+                crate::runtime::attempt::remote_candidate_digest_retention_aggregate_claim(unique)?,
+            )
+        })
+        .and_then(|claim| {
+            claim.checked_add(crate::resource::ResourceClaim::single(
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                reservation_records,
+            ))
+        })
+        .expect("fixture restart overlap claim is representable");
+    elastic_remote_candidate_test_scope_with_additional(policy, overlap)
+}
+
+#[cfg(test)]
+fn elastic_remote_candidate_test_scope_with_additional(
+    policy: PendingRemoteCandidatePolicy,
+    additional: crate::resource::ResourceClaim,
+) -> ConnectorWorkResourceScope {
+    let (_provider, _owner, _candidate, _lifetime, work_scope) =
+        elastic_remote_candidate_test_resources_with_additional(policy, additional);
+    work_scope
+}
+
+#[cfg(test)]
+fn elastic_remote_candidate_test_resources_with_additional(
+    policy: PendingRemoteCandidatePolicy,
+    additional: crate::resource::ResourceClaim,
+) -> (
+    crate::resource::FiniteResourceProvider,
+    crate::runtime::attempt::ConnectorResourceOwnerPort,
+    crate::runtime::attempt::ConnectorCandidateCapability,
+    AttemptLifetime,
+    ConnectorWorkResourceScope,
+) {
+    let policy = policy
+        .local_ceiling()
+        .expect("raw candidate-state tests declare an explicit local fixture ceiling");
+    let unique =
+        u64::try_from(policy.max_unique_items().get()).expect("fixture candidate count fits u64");
+    let content = u64::try_from(policy.max_content_bytes().get())
+        .expect("fixture candidate content fits u64");
+    let parsing = content
+        .checked_add(crate::runtime::attempt::REMOTE_CANDIDATE_MAX_DIGEST_OVERHEAD_BYTES)
+        .expect("fixture parsing work fits");
+    let candidate_work =
+        crate::runtime::attempt::remote_candidate_digest_retention_aggregate_claim(unique)
+            .and_then(|claim| {
+                claim.checked_add(crate::resource::ResourceClaim::try_from_entries([
+                    (crate::resource::ResourceClass::ParsingOrCpuWork, parsing),
+                    (
+                        crate::resource::ResourceClass::OpaqueDependencyResidual,
+                        unique
+                            .checked_add(1)
+                            .expect("fixture reservation records fit"),
+                    ),
+                ])?)
+            })
+            .and_then(|claim| {
+                let queue = pending_remote_candidate_queue_claim_with_content(0, 0)?
+                    .checked_scale(unique)?
+                    .checked_add(crate::resource::ResourceClaim::single(
+                        crate::resource::ResourceClass::AccountedMemoryBytes,
+                        content,
+                    ))?
+                    .checked_add(crate::resource::ResourceClaim::single(
+                        crate::resource::ResourceClass::QueuedBytes,
+                        content,
+                    ))?
+                    .checked_add(crate::resource::ResourceClaim::single(
+                        crate::resource::ResourceClass::OpaqueDependencyResidual,
+                        unique,
+                    ))?;
+                claim.checked_add(queue)
+            })
+            .expect("fixture candidate-work grant is representable");
+    let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
+        .checked_add(candidate_work)
+        .and_then(|grant| grant.checked_add(additional))
+        .expect("fixture resource grant is representable");
+    let provider = crate::resource::FiniteResourceProvider::new(grant);
+    let port = crate::resource::ResourceProviderPort::new(provider.clone())
+        .expect("fixture provider admits its process scope");
+    let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(port);
+    let mesh = owner
+        .issue_mesh_scope()
+        .expect("fixture provider admits its Mesh scope");
+    let (permit, lifetime, claim) =
+        admit_single_connector_candidate(crate::runtime::runtime_for_test(), mesh);
+    let candidate = permit
+        .reserve_connector_candidate(claim)
+        .expect("fixture provider admits its connector candidate");
+    let work_scope = candidate.work_resource_scope();
+    (provider, owner, candidate, lifetime, work_scope)
+}
+
 struct RemoteCandidateState {
     current: RemoteCandidateAttemptEnvelope,
     provisional: Option<ProvisionalRemoteCandidateAttempt>,
 }
 
 impl RemoteCandidateState {
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
+    fn with_resources(
+        policy: PendingRemoteCandidatePolicy,
+        work_resources: ConnectorWorkResourceScope,
+    ) -> Self {
         Self {
-            current: RemoteCandidateAttemptEnvelope::new(policy),
+            current: RemoteCandidateAttemptEnvelope::new(policy, work_resources),
             provisional: None,
         }
+    }
+
+    #[cfg(test)]
+    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
+        Self::with_resources(policy, elastic_remote_candidate_test_scope(policy))
+    }
+
+    #[cfg(test)]
+    fn new_with_restart_overlap(policy: PendingRemoteCandidatePolicy) -> Self {
+        Self::with_resources(
+            policy,
+            elastic_remote_candidate_test_scope_with_restart_overlap(policy),
+        )
     }
 
     fn admission_target(&mut self) -> &mut RemoteCandidateAttemptEnvelope {
@@ -1352,8 +2190,11 @@ impl RemoteCandidateState {
         }
         let policy = self.current.pending.budget.policy;
         let retiring = Arc::clone(&self.current.attempt);
-        retiring.retire();
-        let replacement = RemoteCandidateAttemptEnvelope::new(policy);
+        let replacement = RemoteCandidateAttemptEnvelope::new_provisional(
+            policy,
+            self.current.work_resources.clone(),
+        )?;
+        self.current.retire();
         let replacement_attempt = Arc::clone(&replacement.attempt);
         self.provisional = Some(ProvisionalRemoteCandidateAttempt {
             direction: IceRestartDirection::Local,
@@ -1394,29 +2235,56 @@ impl RemoteCandidateState {
         &mut self,
         attempt: &Arc<RemoteCandidateAttemptIdentity>,
     ) -> Result<()> {
-        let provisional = self.provisional.take().ok_or_else(|| {
+        let mut provisional = self.provisional.take().ok_or_else(|| {
             Error::Transport("local ICE restart lost its provisional attempt".to_string())
         })?;
         if provisional.direction != IceRestartDirection::Local
             || !provisional.envelope.owns_attempt(attempt)
         {
-            provisional.envelope.attempt.retire();
+            provisional.envelope.retire();
             return Err(Error::Transport(
                 "local ICE restart provisional attempt was replaced".to_string(),
             ));
         }
-        self.current = provisional.envelope;
+        let mut replacement = provisional.envelope;
+        let provisional_root_lease = replacement.provisional_root_lease.take();
+        self.current = replacement;
+        drop(provisional_root_lease);
         Ok(())
     }
 
+    #[cfg(test)]
     fn fail_provisional(&mut self, attempt: &Arc<RemoteCandidateAttemptIdentity>) {
         if self
             .provisional
             .as_ref()
             .is_some_and(|provisional| Arc::ptr_eq(&provisional.envelope.attempt, attempt))
         {
-            if let Some(provisional) = self.provisional.take() {
-                provisional.envelope.attempt.retire();
+            if let Some(mut provisional) = self.provisional.take() {
+                provisional.envelope.retire();
+            }
+        }
+    }
+
+    /// Abort an ICE transaction whose native outcome was never proven and
+    /// leave no reusable candidate-attempt state behind.
+    ///
+    /// This method is intentionally synchronous so a dropped async operation
+    /// can fence its exact process-local attempt before the connector close
+    /// owner drains the remaining native state.
+    fn abort_unproven_transaction(&mut self, attempt: &Arc<RemoteCandidateAttemptIdentity>) {
+        if Arc::ptr_eq(&self.current.attempt, attempt) {
+            self.current.remote_description_in_flight = false;
+            self.current.retire();
+            return;
+        }
+        if self
+            .provisional
+            .as_ref()
+            .is_some_and(|provisional| Arc::ptr_eq(&provisional.envelope.attempt, attempt))
+        {
+            if let Some(mut provisional) = self.provisional.take() {
+                provisional.envelope.retire();
             }
         }
     }
@@ -1447,7 +2315,7 @@ impl RemoteCandidateState {
             }
             if let Some(expected) = provisional.envelope.remote_ice_credentials.as_ref() {
                 if expected != &credentials {
-                    provisional.envelope.attempt.retire();
+                    provisional.envelope.retire();
                     return Err(Error::Transport(
                         "replacement remote description changed ICE credentials during the provisional transaction"
                             .to_string(),
@@ -1487,13 +2355,16 @@ impl RemoteCandidateState {
         }
 
         let policy = self.current.pending.budget.policy;
-        let mut replacement = RemoteCandidateAttemptEnvelope::new(policy);
+        let mut replacement = RemoteCandidateAttemptEnvelope::new_provisional(
+            policy,
+            self.current.work_resources.clone(),
+        )?;
         replacement.remote_ice_credentials = Some(credentials.clone());
         replacement.remote_description_in_flight = true;
         let migrated =
             replacement.adopt_queued_candidates_for_remote_restart(&mut self.current, &credentials);
         let retiring = Arc::clone(&self.current.attempt);
-        retiring.retire();
+        self.current.retire();
         let attempt = Arc::clone(&replacement.attempt);
         self.provisional = Some(ProvisionalRemoteCandidateAttempt {
             direction: IceRestartDirection::Remote,
@@ -1518,23 +2389,26 @@ impl RemoteCandidateState {
         prepared: &RemoteDescriptionAttempt,
     ) -> Result<PendingRemoteCandidateDrain> {
         if prepared.provisional {
-            let provisional = self.provisional.take().ok_or_else(|| {
+            let mut provisional = self.provisional.take().ok_or_else(|| {
                 Error::Transport("remote description lost its provisional ICE attempt".to_string())
             })?;
             if !provisional.envelope.owns_attempt(&prepared.attempt) {
-                provisional.envelope.attempt.retire();
+                provisional.envelope.retire();
                 return Err(Error::Transport(
                     "remote description provisional ICE attempt was replaced".to_string(),
                 ));
             }
-            self.current = provisional.envelope;
+            let mut replacement = provisional.envelope;
+            let provisional_root_lease = replacement.provisional_root_lease.take();
+            self.current = replacement;
+            drop(provisional_root_lease);
         } else if !self.current.owns_attempt(&prepared.attempt) {
             return Err(Error::Transport(
                 "remote description belongs to a retired ICE attempt".to_string(),
             ));
         }
         if !self.current.remote_description_in_flight {
-            self.current.attempt.retire();
+            self.current.retire();
             return Err(Error::Transport(
                 "remote description commit lost its in-flight transaction".to_string(),
             ));
@@ -1548,6 +2422,19 @@ impl RemoteCandidateState {
         Ok(self.current.pending.take())
     }
 
+    fn retire_attempt(&mut self, attempt: &Arc<RemoteCandidateAttemptIdentity>) {
+        if Arc::ptr_eq(&self.current.attempt, attempt) {
+            self.current.retire();
+            return;
+        }
+        if let Some(provisional) = self.provisional.as_mut() {
+            if Arc::ptr_eq(&provisional.envelope.attempt, attempt) {
+                provisional.envelope.retire();
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn fail_remote_description(&mut self, prepared: &RemoteDescriptionAttempt) {
         if prepared.provisional {
             self.fail_provisional(&prepared.attempt);
@@ -1557,11 +2444,62 @@ impl RemoteCandidateState {
     }
 }
 
+impl Drop for RemoteCandidateState {
+    fn drop(&mut self) {
+        self.current.retire();
+        if let Some(provisional) = self.provisional.as_mut() {
+            provisional.envelope.retire();
+        }
+    }
+}
+
 struct RemoteDescriptionAttempt {
     attempt: Arc<RemoteCandidateAttemptIdentity>,
     provisional: bool,
     retiring: Option<Arc<RemoteCandidateAttemptIdentity>>,
     credentials: RemoteIceCredentials,
+}
+
+/// Drop guard for an ICE mutation that has changed process-local ownership but
+/// has not yet proven both native success and the exact state commit.
+struct UncommittedIceTransaction {
+    state: Arc<SyncMutex<RemoteCandidateState>>,
+    close_owner: Arc<ConnectorCloseOwner>,
+    attempt: Arc<RemoteCandidateAttemptIdentity>,
+    armed: bool,
+}
+
+impl UncommittedIceTransaction {
+    fn new(
+        state: Arc<SyncMutex<RemoteCandidateState>>,
+        close_owner: Arc<ConnectorCloseOwner>,
+        attempt: Arc<RemoteCandidateAttemptIdentity>,
+    ) -> Self {
+        Self {
+            state,
+            close_owner,
+            attempt,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UncommittedIceTransaction {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            self.state.lock().abort_unproven_transaction(&self.attempt);
+        }
+        // `start` drains the candidate state, so it must run after the state
+        // lock above has been released.
+        self.close_owner.start();
+    }
 }
 
 #[derive(Debug)]
@@ -1654,6 +2592,7 @@ impl Drop for RemoteCandidateAttemptPermit {
     }
 }
 
+#[cfg(test)]
 fn candidate_content_digest(candidate: &LocalIceCandidate) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash_candidate_string(&mut hash, Some(&candidate.candidate));
@@ -1669,6 +2608,7 @@ fn candidate_content_digest(candidate: &LocalIceCandidate) -> [u8; 32] {
     hash.finalize().into()
 }
 
+#[cfg(test)]
 fn hash_candidate_string(hash: &mut Sha256, value: Option<&String>) {
     match value {
         Some(value) => {
@@ -1709,6 +2649,7 @@ struct ConnectorOwnership {
     authority: Arc<SyncMutex<ConnectorAuthorityState>>,
     realtime_delivery: Arc<AtomicBool>,
     operation_fence: Arc<ConnectorOperationFence>,
+    work_resource_scope: ConnectorWorkResourceScope,
     candidate_promoted: Arc<AtomicBool>,
     cleanup_complete: Arc<AtomicBool>,
     cleanup_failed: Arc<AtomicBool>,
@@ -1719,6 +2660,7 @@ impl ConnectorOwnership {
         candidate: ConnectorCandidateCapability,
         realtime_delivery: Arc<AtomicBool>,
         operation_fence: Arc<ConnectorOperationFence>,
+        work_resource_scope: ConnectorWorkResourceScope,
         candidate_promoted: Arc<AtomicBool>,
         incarnation: Arc<WebRtcConnectorIncarnation>,
     ) -> Self {
@@ -1731,6 +2673,7 @@ impl ConnectorOwnership {
             })),
             realtime_delivery,
             operation_fence,
+            work_resource_scope,
             candidate_promoted,
             cleanup_complete: Arc::new(AtomicBool::new(false)),
             cleanup_failed: Arc::new(AtomicBool::new(false)),
@@ -1773,10 +2716,22 @@ impl ConnectorOwnership {
         capability.belongs_to(&self.incarnation)
     }
 
-    fn enter_operation(&self) -> Result<ConnectorOperationPermit> {
-        self.operation_fence
+    fn enter_operation(&self) -> Result<ConnectorOwnedOperationPermit> {
+        let resources = self
+            .work_resource_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Speculative,
+                crate::runtime::attempt::connector_operation_claim(),
+            )
+            .map_err(Error::from)?;
+        let fence = self
+            .operation_fence
             .try_enter()
-            .ok_or_else(|| Error::Transport("connector close fence has committed".to_string()))
+            .ok_or_else(|| Error::Transport("connector close fence has committed".to_string()))?;
+        Ok(ConnectorOwnedOperationPermit {
+            _fence: fence,
+            _resources: resources,
+        })
     }
 
     fn begin_close(&self) {
@@ -1946,6 +2901,9 @@ impl ConnectorOwnership {
 
     fn release_cleanup_candidate_locked(authority: &mut ConnectorAuthorityState) {
         if let ConnectorAuthorityState::Retired { candidate } = authority {
+            if let Some(candidate) = candidate.as_mut() {
+                candidate.release_after_cleanup_success();
+            }
             drop(candidate.take());
         }
     }
@@ -1959,6 +2917,11 @@ impl ConnectorOwnership {
             _ => false,
         }
     }
+}
+
+struct ConnectorOwnedOperationPermit {
+    _fence: ConnectorOperationPermit,
+    _resources: crate::resource::ResourceLease,
 }
 
 fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeasurement {
@@ -1986,21 +2949,23 @@ fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeas
 }
 
 fn queue_container_resource_measurement(
-    entries: &Vec<PendingRemoteCandidate>,
+    entries: &std::collections::LinkedList<PendingRemoteCandidate>,
 ) -> ResourceMeasurement {
     let bytes = entries
-        .capacity()
+        .len()
         .checked_mul(size_of::<PendingRemoteCandidate>());
     let (retained_bytes, _) = measured_usize(bytes);
     let observed = ResourceUse::observed(0, 0, retained_bytes, 0);
-    // Vec capacity is observable, but allocator overhead is not.
+    // Each linked-list node is paired with the candidate's provider-backed
+    // storage-object claim. Allocator overhead remains observationally
+    // inexact.
     ResourceMeasurement::inexact(observed)
 }
 
 fn measured_usize(value: Option<usize>) -> (u64, bool) {
     match value.and_then(|value| u64::try_from(value).ok()) {
         Some(value) => (value, false),
-        None => (u64::MAX, true),
+        None => (0, true),
     }
 }
 
@@ -2013,7 +2978,7 @@ fn measured_sum<const N: usize>(values: [usize; N]) -> (u64, bool) {
         match sum.checked_add(value) {
             Some(next) => sum = next,
             None => {
-                sum = u64::MAX;
+                sum = 0;
                 inexact = true;
             }
         }
@@ -2098,8 +3063,10 @@ struct AdmittedConnectorOwnership {
     attempt_liveness: AttemptLiveness,
     close_owner: Arc<ConnectorCloseOwner>,
     resource_scope: PeerConnectionResourceScope,
+    work_resource_scope: ConnectorWorkResourceScope,
     transport_observation: ObservationLease,
     remote_candidate_policy: PendingRemoteCandidatePolicy,
+    reclaim: ResourceReclaimSubscription,
 }
 
 impl WebRtcConnectorWorker {
@@ -2114,13 +3081,16 @@ impl WebRtcConnectorWorker {
             attempt_liveness,
             close_owner,
             resource_scope,
+            work_resource_scope,
             transport_observation,
             remote_candidate_policy,
+            reclaim,
         } = admitted;
         let attempt_retirement = attempt_liveness.subscribe_retirement();
         let session = Arc::new(session);
-        let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::new(
+        let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::with_resources(
             remote_candidate_policy,
+            work_resource_scope,
         )));
         if !close_owner.attach_remote_candidates(Arc::clone(&remote_candidates)) {
             close_owner.start();
@@ -2142,6 +3112,7 @@ impl WebRtcConnectorWorker {
             attempt_lifetime: Some(attempt_lifetime),
             remote_candidates: Arc::clone(&remote_candidates),
             close_owner: Some(Arc::clone(&close_owner)),
+            reclaim: Some(reclaim),
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -2160,8 +3131,19 @@ impl WebRtcConnectorWorker {
     }
 
     /// Consume an event only when it came from this still-active worker.
-    pub(crate) fn accept_event(&self, event: WebRtcConnectorEvent) -> Option<TransportEvent> {
-        self.ownership.accepts(&event).then_some(event.event)
+    pub(crate) fn accept_event(
+        &self,
+        event: WebRtcConnectorEvent,
+    ) -> Option<AcceptedWebRtcConnectorEvent> {
+        self.ownership
+            .accepts(&event)
+            .then_some(AcceptedWebRtcConnectorEvent {
+                event: event.event,
+                resources: AcceptedWebRtcConnectorEventResources {
+                    _queue_observation: event._queue_observation,
+                    _callback_work: event._callback_work,
+                },
+            })
     }
 
     #[cfg(test)]
@@ -2170,6 +3152,7 @@ impl WebRtcConnectorWorker {
             incarnation: Arc::clone(&self.ownership.incarnation),
             event,
             _queue_observation: None,
+            _callback_work: None,
         }
     }
 
@@ -2211,6 +3194,9 @@ impl WebRtcConnectorWorker {
                     PendingRemoteCandidateQueuePush::InvalidBinding(error) => {
                         RemoteCandidateDisposition::InvalidBinding(error)
                     }
+                    PendingRemoteCandidateQueuePush::ResourceUnavailable(error) => {
+                        return Err(Error::ResourceUnavailable(error));
+                    }
                     PendingRemoteCandidateQueuePush::Refused => {
                         RemoteCandidateDisposition::RefusedByOwner
                     }
@@ -2241,6 +3227,9 @@ impl WebRtcConnectorWorker {
                         kind,
                     })
                 }
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(error) => {
+                    return Err(Error::ResourceUnavailable(error));
+                }
                 PendingRemoteCandidateQueuePush::Refused => {
                     return Ok(RemoteCandidateAdmissionReport {
                         disposition: RemoteCandidateDisposition::RefusedByOwner,
@@ -2263,8 +3252,46 @@ impl WebRtcConnectorWorker {
         })
     }
 
-    /// Apply remote SDP, transfer queue ownership into the async drain, and
-    /// apply every retained candidate through the connector-private raw API.
+    /// Admit raw remote SDP before the native dependency parses or retains it.
+    pub(crate) async fn apply_remote_sdp(
+        &self,
+        sdp_type: RTCSdpType,
+        sdp: String,
+    ) -> Result<RemoteDescriptionApplyReport> {
+        let _operation = self.ownership.enter_operation()?;
+        if !self.ownership.incarnation.is_active() {
+            return Err(Error::Transport("connector worker is retired".to_string()));
+        }
+        let _work_observation = observe_inexact_item(
+            &self.resource_scope,
+            PreAuthResourceFamily::ConnectorSpecificWork,
+            1,
+            0,
+        );
+        let work_resources = self
+            .remote_candidates
+            .lock()
+            .admission_target()
+            .work_resources
+            .clone();
+        let credentials = sdp_ice_credentials_owned(&sdp, sdp.capacity(), &work_resources)?;
+        let description = match sdp_type {
+            RTCSdpType::Offer => RTCSessionDescription::offer(sdp),
+            RTCSdpType::Answer => RTCSessionDescription::answer(sdp),
+            _ => {
+                return Err(Error::Transport(
+                    "only offer and answer remote descriptions are supported".to_string(),
+                ));
+            }
+        }
+        .map_err(|error| Error::Transport(format!("parse remote SDP: {error}")))?;
+        self.apply_remote_description_owned(description, credentials)
+            .await
+    }
+
+    /// Temporary LegacyV1/test entry point. V4 ingress uses `apply_remote_sdp`
+    /// so native parsing cannot precede provider admission.
+    #[cfg(all(test, feature = "legacy-v1"))]
     pub(crate) async fn apply_remote_description(
         &self,
         description: RTCSessionDescription,
@@ -2279,7 +3306,29 @@ impl WebRtcConnectorWorker {
             1,
             0,
         );
-        let credentials = sdp_ice_credentials(&description.sdp)?;
+        let work_resources = self
+            .remote_candidates
+            .lock()
+            .admission_target()
+            .work_resources
+            .clone();
+        let credentials = sdp_ice_credentials_owned(
+            &description.sdp,
+            description.sdp.capacity(),
+            &work_resources,
+        )?;
+        self.apply_remote_description_owned(description, credentials)
+            .await
+    }
+
+    /// Apply remote SDP, transfer queue ownership into the async drain, and
+    /// apply every retained candidate through the connector-private raw API.
+    /// The caller must retain the exact connector operation permit.
+    async fn apply_remote_description_owned(
+        &self,
+        description: RTCSessionDescription,
+        credentials: RemoteIceCredentials,
+    ) -> Result<RemoteDescriptionApplyReport> {
         let prepared = {
             let mut state = self.remote_candidates.lock();
             match state.prepare_remote_description(credentials) {
@@ -2294,6 +3343,19 @@ impl WebRtcConnectorWorker {
                 }
             }
         };
+        let mut transaction = UncommittedIceTransaction::new(
+            Arc::clone(&self.remote_candidates),
+            Arc::clone(&self.close_owner),
+            Arc::clone(&prepared.attempt),
+        );
+        if let Some(resources) = prepared.credentials.resource_owner() {
+            // The native dependency may retain a parsed description even when
+            // its future is cancelled or returns an error. Transfer the exact
+            // residual owner to the connector close owner before entering the
+            // native operation.
+            self.close_owner
+                .retain_remote_description_resources(resources);
+        }
         if let Some(retiring) = prepared.retiring.as_ref() {
             retiring.wait_for_operations().await;
         }
@@ -2314,15 +3376,8 @@ impl WebRtcConnectorWorker {
         )
         .await
         .ok_or_else(|| Error::Transport("connector worker retired during SDP apply".to_string()))?;
-        if let Err(error) = native_result {
-            self.remote_candidates
-                .lock()
-                .fail_remote_description(&prepared);
-            if prepared.provisional {
-                self.close_owner.start();
-            }
-            return Err(error);
-        }
+        native_result?;
+        prepared.credentials.finish_native_commit()?;
         let pending = {
             let mut state = self.remote_candidates.lock();
             if !self.ownership.incarnation.is_active() {
@@ -2339,21 +3394,32 @@ impl WebRtcConnectorWorker {
                 }
             }
         };
+        transaction.disarm();
         let queued_candidate_count = pending.len();
-        let mut candidate_failures = Vec::new();
+        let mut candidate_failure_count = 0_usize;
         for candidate in pending {
             if let Err(error) = self.apply_remote_candidate(candidate).await {
-                candidate_failures.push(error);
+                candidate_failure_count =
+                    candidate_failure_count
+                        .checked_add(1)
+                        .ok_or(Error::ResourceUnavailable(
+                            ResourceUnavailable::ProviderInvariant {
+                                dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+                            },
+                        ))?;
+                warn!(?error, "queued remote-candidate application failed");
             }
         }
         Ok(RemoteDescriptionApplyReport {
             queued_candidate_count,
-            candidate_failures,
+            candidate_failure_count,
         })
     }
 
     async fn apply_remote_candidate(&self, pending: PendingRemoteCandidate) -> Result<()> {
-        let _operation = self.ownership.enter_operation()?;
+        // Both callers already hold the exact connector operation lease. This
+        // helper remains private so one native candidate application cannot
+        // manufacture a nested claim or bypass the outer close fence.
         if !self.ownership.incarnation.is_active() {
             return Err(Error::Transport("connector worker is retired".to_string()));
         }
@@ -2366,20 +3432,30 @@ impl WebRtcConnectorWorker {
                 && state.candidate_matches_attempt(&pending.attempt, &pending.candidate)
         };
         if !candidate_matches_attempt {
-            pending.attempt.retire();
+            self.remote_candidates
+                .lock()
+                .retire_attempt(&pending.attempt);
             return Err(Error::Transport(
                 "remote candidate does not match the exact current ICE attempt".to_string(),
             ));
         }
-        let budget = pending
+        let Some(budget) = pending
             ._queue_reservation
             .as_ref()
-            .map(|reservation| Arc::clone(&reservation.budget));
-        if budget
-            .as_ref()
-            .is_some_and(|budget| !budget.reserve_application_work())
-        {
-            pending.attempt.retire();
+            .map(|reservation| Arc::clone(&reservation.budget))
+        else {
+            self.remote_candidates
+                .lock()
+                .retire_attempt(&pending.attempt);
+            return Err(Error::Transport(
+                "remote candidate reached production application without queue ownership"
+                    .to_string(),
+            ));
+        };
+        if !budget.reserve_application_work() {
+            self.remote_candidates
+                .lock()
+                .retire_attempt(&pending.attempt);
             return Err(Error::Transport(
                 "remote-candidate application work exceeded the owner-selected ICE-attempt envelope"
                     .to_string(),
@@ -2392,26 +3468,82 @@ impl WebRtcConnectorWorker {
             attempt,
             observation,
             _queue_reservation,
+            _elastic_lease,
+            _production_queue_lease,
         } = pending;
+        let mut elastic_application = match _elastic_lease {
+            Some(lease) => lease.begin_apply().map_err(|error| {
+                self.remote_candidates.lock().retire_attempt(&attempt);
+                match error {
+                    ElasticRemoteCandidateApplyError::Provider(unavailable) => {
+                        Error::ResourceUnavailable(unavailable)
+                    }
+                    other => Error::Transport(format!(
+                        "remote-candidate application ownership transition failed: {other}"
+                    )),
+                }
+            })?,
+            None => {
+                self.remote_candidates.lock().retire_attempt(&attempt);
+                return Err(Error::Transport(
+                    "remote candidate reached production application without elastic ownership"
+                        .to_string(),
+                ));
+            }
+        };
         let result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.add_ice_candidate(candidate),
         )
         .await
         .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?;
+        result?;
         if !attempt.is_active() || !self.remote_candidates.lock().owns_attempt(&attempt) {
             return Err(Error::Transport(
                 "remote candidate completed after its ICE attempt retired".to_string(),
             ));
         }
         drop(observation);
-        if let Some(reservation) = _queue_reservation {
+        if let Some(mut reservation) = _queue_reservation {
+            let retained_bytes = std::mem::size_of::<PendingRemoteCandidateReservation>()
+                .checked_add(std::mem::size_of::<[u8; 32]>())
+                .ok_or_else(|| {
+                    Error::Transport(
+                        "applied remote-candidate ownership size overflowed".to_string(),
+                    )
+                })?;
+            let retained_bytes = u64::try_from(retained_bytes).map_err(|_| {
+                Error::Transport(
+                    "applied remote-candidate ownership size is not representable".to_string(),
+                )
+            })?;
+            let retained_claim = crate::resource::ResourceClaim::try_from_entries([
+                (
+                    crate::resource::ResourceClass::AccountedMemoryBytes,
+                    retained_bytes,
+                ),
+                (crate::resource::ResourceClass::StorageObject, 2),
+                // One ordered-set node, one linked-list node, and the native
+                // ICE-agent copy whose byte shape is hidden by webrtc-rs. The
+                // residual remains owned until this exact attempt retires.
+                (crate::resource::ResourceClass::OpaqueDependencyResidual, 3),
+            ])
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "applied remote-candidate ownership claim overflowed: {error}"
+                ))
+            })?;
+            if let Err(error) = elastic_application.transition_after_application(retained_claim) {
+                self.remote_candidates.lock().retire_attempt(&attempt);
+                return Err(Error::ResourceUnavailable(error));
+            }
+            reservation.application = Some(elastic_application);
             let mut state = self.remote_candidates.lock();
             if state.current.owns_attempt(&attempt) {
-                state.current.retained_reservations.push(reservation);
+                state.current.retained_reservations.push_back(reservation);
             }
         }
-        result
+        Ok(())
     }
 
     pub(crate) fn observe_owned_task(&self) -> ObservationLease {
@@ -2449,7 +3581,7 @@ impl WebRtcConnectorWorker {
     }
 
     pub(crate) async fn remote_fingerprint(&self) -> Option<String> {
-        let _operation = self.ownership.operation_fence.try_enter()?;
+        let _operation = self.ownership.enter_operation().ok()?;
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.remote_fingerprint(),
@@ -2459,7 +3591,7 @@ impl WebRtcConnectorWorker {
     }
 
     pub(crate) async fn local_fingerprint(&self) -> Option<String> {
-        let _operation = self.ownership.operation_fence.try_enter()?;
+        let _operation = self.ownership.enter_operation().ok()?;
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.local_fingerprint(),
@@ -2577,7 +3709,7 @@ impl WebRtcConnectorWorker {
         &self,
         capability: &crate::connector::ConnectorRealtimeFlowCapability,
     ) -> usize {
-        let Some(_operation) = self.ownership.operation_fence.try_enter() else {
+        let Ok(_operation) = self.ownership.enter_operation() else {
             return 0;
         };
         if !self.owns_realtime_flow(capability) {
@@ -2607,6 +3739,11 @@ impl WebRtcConnectorWorker {
         let _operation = self.ownership.enter_operation()?;
         let (retiring_attempt, replacement_attempt) =
             self.remote_candidates.lock().begin_local_ice_restart()?;
+        let mut transaction = UncommittedIceTransaction::new(
+            Arc::clone(&self.remote_candidates),
+            Arc::clone(&self.close_owner),
+            Arc::clone(&replacement_attempt),
+        );
         retiring_attempt.wait_for_operations().await;
         let native_result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
@@ -2616,27 +3753,24 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| {
             Error::Transport("connector worker retired during ICE restart".to_string())
         })?;
-        if let Err(error) = native_result {
+        native_result?;
+        let commit_result = {
             self.remote_candidates
                 .lock()
-                .fail_provisional(&replacement_attempt);
+                .commit_local_ice_restart(&replacement_attempt)
+        };
+        if let Err(error) = commit_result {
             self.close_owner.start();
             return Err(error);
         }
-        if let Err(error) = self
-            .remote_candidates
-            .lock()
-            .commit_local_ice_restart(&replacement_attempt)
-        {
-            self.close_owner.start();
-            return Err(error);
-        }
+        transaction.disarm();
         Ok(())
     }
 
     pub(crate) async fn selected_candidate_pair(
         &self,
     ) -> Option<super::diag::SelectedCandidatePair> {
+        let _operation = self.ownership.enter_operation().ok()?;
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.selected_candidate_pair(),
@@ -2646,6 +3780,9 @@ impl WebRtcConnectorWorker {
     }
 
     pub(crate) async fn ice_check_snapshot(&self) -> super::diag::IceCheckSnapshot {
+        let Ok(_operation) = self.ownership.enter_operation() else {
+            return super::diag::IceCheckSnapshot::default();
+        };
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.ice_check_snapshot(),
@@ -2682,20 +3819,29 @@ impl WebRtcConnectorWorker {
         &self,
         task: &crate::endpoint_auth::EndpointAuthTask,
     ) -> Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>> {
-        let _operation = self.ownership.operation_fence.try_enter()?;
+        let _operation = self.ownership.enter_operation().ok()?;
         if !self.owns_endpoint_auth(task)
             || !self.ownership.incarnation.is_active()
             || !self.session.realtime_enabled()
         {
             return None;
         }
+        let resources = self
+            .ownership
+            .work_resource_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                crate::connector::realtime_flow_capability_claim().ok()?,
+            )
+            .ok()?;
         self.ownership
             .realtime_delivery
             .store(true, Ordering::Release);
         Some(Arc::new(
-            crate::connector::ConnectorRealtimeFlowCapability::new(Arc::clone(
-                &self.ownership.incarnation,
-            )),
+            crate::connector::ConnectorRealtimeFlowCapability::new(
+                Arc::clone(&self.ownership.incarnation),
+                resources,
+            ),
         ))
     }
 
@@ -2756,6 +3902,7 @@ pub struct Transport {
 
 struct PeerOpenOwnership {
     resource_scope: Option<PeerConnectionResourceScope>,
+    work_resource_scope: Option<ConnectorWorkResourceScope>,
     realtime_delivery: Arc<AtomicBool>,
     attempt_liveness: Option<AttemptLiveness>,
     candidate_promoted: Arc<AtomicBool>,
@@ -2769,6 +3916,7 @@ struct PeerOpenOwnership {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConstructionPause {
+    BeforeNativeConstructor,
     AfterNativeAllocation,
     AfterNativeAllocationWithCloseError,
     AfterResultDelivery,
@@ -2806,6 +3954,19 @@ impl ConstructionTestHook {
         ) {
             self.pause_at(pc).await;
         }
+    }
+
+    async fn pause_before_native_constructor(&self) {
+        if self.pause != ConstructionPause::BeforeNativeConstructor {
+            return;
+        }
+        self.created.add_permits(1);
+        let permit = self
+            .resume
+            .acquire()
+            .await
+            .expect("construction test hook remains open");
+        permit.forget();
     }
 
     async fn pause_after_result_delivery(&self, pc: &Arc<RTCPeerConnection>) {
@@ -2869,6 +4030,38 @@ impl Drop for StartConnectorCleanupOnDrop {
     fn drop(&mut self) {
         if let Some(owner) = self.0.take() {
             owner.start();
+        }
+    }
+}
+
+/// Retains an exact failed connector claim if dependency construction is
+/// cancelled or panics after native allocation may have begun but before a
+/// close port is returned. Successful return disarms the guard before the
+/// native object is handed to its ordinary construction owner.
+struct PendingNativeConstructorGuard(Option<Arc<ConnectorCloseOwner>>);
+
+impl PendingNativeConstructorGuard {
+    fn new(owner: Option<Arc<ConnectorCloseOwner>>) -> Self {
+        Self(owner)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    fn fail(mut self, reason: String) {
+        if let Some(owner) = self.0.take() {
+            owner.finish_native_allocation_without_close_port(reason);
+        }
+    }
+}
+
+impl Drop for PendingNativeConstructorGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() {
+            owner.finish_native_allocation_without_close_port(
+                "native construction was cancelled before returning a close port".to_string(),
+            );
         }
     }
 }
@@ -3097,16 +4290,16 @@ impl Transport {
         self
     }
 
-    /// Bind this transport to the one connector admission owner held by the
-    /// process resource root. A second Mesh runtime shares the same owner and
-    /// cannot multiply the process limit.
+    /// Bind this transport to the one resource provider held by the process
+    /// root. A second Mesh runtime shares the same provider grant and scope
+    /// creation cannot multiply capacity.
     pub fn with_connector_resource_policy(
         self,
         policy: WebRtcConnectorCapablePolicy,
     ) -> Result<Self> {
         let root = ProcessResourceRoot::global();
-        root.install_connector_policy(policy.process())?;
-        let scope = root.issue_mesh_connector_scope(policy.mesh())?;
+        root.install_resource_provider(policy.resources())?;
+        let scope = root.issue_mesh_connector_scope()?;
         Ok(self.with_connector_resource_scope(scope, policy.webrtc()))
     }
 
@@ -3174,10 +4367,18 @@ impl Transport {
         config.ice_transport_policy = self.ice_transport_policy;
         let (permit, attempt_lifetime, claim) =
             admit_single_connector_candidate(self.runtime.clone(), resource_owner.clone());
-        let candidate = permit.reserve_connector_candidate(claim).ok_or_else(|| {
-            Error::Transport("connector candidate reservation refused".to_string())
-        })?;
+        let (mut candidate, reclaim_subscription) = permit
+            .reserve_connector_candidate_cooperatively(claim)
+            .await?
+            .ok_or_else(|| {
+                Error::Transport("connector attempt retired before admission".to_string())
+            })?;
+        let cleanup_capability = candidate
+            .issue_cleanup_capability()
+            .map_err(|error| Error::Transport(error.to_string()))?;
         let liveness = candidate.liveness();
+        let work_resource_scope = candidate.work_resource_scope();
+        let construction_work_resource_scope = work_resource_scope.clone();
         let transport = self.clone();
         let construction_scope = resource_scope.clone();
         let realtime_delivery = Arc::new(AtomicBool::new(false));
@@ -3193,31 +4394,48 @@ impl Transport {
             candidate,
             Arc::clone(&realtime_delivery),
             Arc::clone(&operation_fence),
+            work_resource_scope.clone(),
             Arc::clone(&candidate_promoted),
             Arc::clone(&incarnation),
         );
-        let close_owner = ConnectorCloseOwner::new(ownership.clone(), resource_owner.clone());
+        let close_owner = ConnectorCloseOwner::new(
+            ownership.clone(),
+            resource_owner.clone(),
+            cleanup_capability,
+        );
         let mut outer_cleanup = StartConnectorCleanupOnDrop::new(Arc::clone(&close_owner));
         let construction_close_owner = Arc::clone(&close_owner);
+        let construction_reclaim = reclaim_subscription.clone();
+        let reclaim_scope_id = work_resource_scope.scope_id();
         let (construction_tx, construction_rx) = oneshot::channel();
         let construction_task = AbortConstructionOnDrop(tokio::spawn(async move {
-            let result = transport
-                .open_peer_with_config_observed(
-                    role,
-                    config,
-                    PeerOpenOwnership {
-                        resource_scope: Some(construction_scope),
-                        realtime_delivery: construction_realtime_delivery,
-                        attempt_liveness: Some(construction_liveness),
-                        candidate_promoted: construction_candidate_promoted,
-                        callback_gate: construction_incarnation,
-                        callback_policy: webrtc_profile.callbacks(),
-                        operation_fence,
-                        legacy_media_profile: webrtc_profile.legacy_media_internal(),
-                        close_owner: Some(Arc::clone(&construction_close_owner)),
-                    },
-                )
-                .await;
+            let construction = transport.open_peer_with_config_observed(
+                role,
+                config,
+                PeerOpenOwnership {
+                    resource_scope: Some(construction_scope),
+                    work_resource_scope: Some(construction_work_resource_scope),
+                    realtime_delivery: construction_realtime_delivery,
+                    attempt_liveness: Some(construction_liveness),
+                    candidate_promoted: construction_candidate_promoted,
+                    callback_gate: construction_incarnation,
+                    callback_policy: webrtc_profile.callbacks(),
+                    operation_fence,
+                    legacy_media_profile: webrtc_profile.legacy_media_internal(),
+                    close_owner: Some(Arc::clone(&construction_close_owner)),
+                },
+            );
+            tokio::pin!(construction);
+            let result = tokio::select! {
+                result = &mut construction => result,
+                _ = construction_reclaim.requested() => {
+                    Err(Error::ResourceUnavailable(
+                        ResourceUnavailable::ReclaimRequested {
+                            scope_id: reclaim_scope_id,
+                        },
+                    ))
+                }
+            };
             match result {
                 Ok((session, events)) if result_liveness.is_active() => {
                     let _ = construction_tx.send(Ok(ConstructedConnectorResult::new(
@@ -3265,8 +4483,10 @@ impl Transport {
                 attempt_liveness: liveness,
                 close_owner,
                 resource_scope,
+                work_resource_scope,
                 transport_observation,
                 remote_candidate_policy: webrtc_profile.remote_candidates(),
+                reclaim: reclaim_subscription,
             },
         );
         if admitted.is_ok() {
@@ -3290,6 +4510,7 @@ impl Transport {
             config,
             PeerOpenOwnership {
                 resource_scope: None,
+                work_resource_scope: None,
                 realtime_delivery: Arc::new(AtomicBool::new(false)),
                 attempt_liveness: None,
                 candidate_promoted: Arc::new(AtomicBool::new(true)),
@@ -3297,32 +4518,6 @@ impl Transport {
                 callback_policy,
                 operation_fence: Arc::new(ConnectorOperationFence::default()),
                 legacy_media_profile: None,
-                close_owner: None,
-            },
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn open_peer_with_config_and_legacy_media_profile(
-        &self,
-        role: Role,
-        config: RTCConfiguration,
-        legacy_media_profile: LegacyWebRtcMediaProfile,
-        callback_policy: ConnectorCallbackPolicy,
-    ) -> Result<(PeerSession, TransportEventReceiver)> {
-        self.open_peer_with_config_observed(
-            role,
-            config,
-            PeerOpenOwnership {
-                resource_scope: None,
-                realtime_delivery: Arc::new(AtomicBool::new(true)),
-                attempt_liveness: None,
-                candidate_promoted: Arc::new(AtomicBool::new(true)),
-                callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-                callback_policy,
-                operation_fence: Arc::new(ConnectorOperationFence::default()),
-                legacy_media_profile: Some(legacy_media_profile),
                 close_owner: None,
             },
         )
@@ -3337,6 +4532,7 @@ impl Transport {
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         let PeerOpenOwnership {
             resource_scope,
+            work_resource_scope,
             realtime_delivery,
             attempt_liveness,
             candidate_promoted,
@@ -3365,10 +4561,28 @@ impl Transport {
             debug_assert!(legacy_media_profile.is_none());
             Arc::clone(&self.api)
         };
-        let pc = api
-            .new_peer_connection(config)
-            .await
-            .map_err(|e| Error::Transport(format!("new_peer_connection: {e}")))?;
+        if let Some(owner) = close_owner.as_ref() {
+            owner.mark_native_allocation_started();
+        }
+        let mut pending_native_constructor =
+            PendingNativeConstructorGuard::new(close_owner.as_ref().map(Arc::clone));
+        #[cfg(test)]
+        if let Some(hook) = self.construction_hook.as_ref() {
+            hook.pause_before_native_constructor().await;
+        }
+        let callback_close_owner = close_owner.as_ref().map(Arc::downgrade);
+        let pc = match api.new_peer_connection(config).await {
+            Ok(pc) => {
+                pending_native_constructor.disarm();
+                pc
+            }
+            Err(error) => {
+                pending_native_constructor.fail(format!(
+                    "native construction returned without a close port: {error}"
+                ));
+                return Err(Error::Transport(format!("new_peer_connection: {error}")));
+            }
+        };
         let pc = Arc::new(pc);
         let attached_close_owner = match close_owner {
             Some(owner)
@@ -3415,17 +4629,86 @@ impl Transport {
                 hook.pause_after_native_allocation(&pc).await;
             }
 
-            let mailboxes = callback_policy.mailboxes();
-            let (control_tx, control_rx) = mpsc::channel(mailboxes.control().get());
-            let (endpoint_data_tx, endpoint_data_rx) =
-                mpsc::channel(mailboxes.endpoint_data().get());
-            let realtime_flows = RealtimeFlowRegistry::new(callback_policy);
-            let lifecycle = Arc::new(ConnectorLifecycleOwner::default());
+            let callback_producer = match work_resource_scope.clone() {
+                Some(scope) => CallbackProducerOwner::new(
+                    scope,
+                    crate::resource::ResourceAuthorityClass::Speculative,
+                    CallbackProducerClaims::structural_only(),
+                ),
+                #[cfg(any(test, feature = "transport-lab"))]
+                None => CallbackProducerOwner::for_local_lab_policy(callback_policy).map_err(
+                    |error| {
+                        Error::Transport(format!(
+                            "raw transport callback resource policy is unavailable: {error:?}"
+                        ))
+                    },
+                )?,
+                #[cfg(not(any(test, feature = "transport-lab")))]
+                None => return Err(Error::ConnectorPolicyRequired),
+            };
+            let callback_ready = Arc::new(tokio::sync::Notify::new());
+            let local_mailboxes = callback_policy.local_mailboxes();
+            let control = callback_producer
+                .create_mailbox(
+                    ConnectorCallbackClass::Control,
+                    local_mailboxes.map(|mailboxes| mailboxes.control()),
+                    Arc::clone(&callback_ready),
+                )
+                .map_err(|error| {
+                    callback_admission_error(
+                        "control callback mailbox resource admission failed",
+                        error,
+                    )
+                })?;
+            let endpoint_data = callback_producer
+                .create_mailbox(
+                    ConnectorCallbackClass::EndpointData,
+                    local_mailboxes.map(|mailboxes| mailboxes.endpoint_data()),
+                    Arc::clone(&callback_ready),
+                )
+                .map_err(|error| {
+                    callback_admission_error(
+                        "endpoint callback mailbox resource admission failed",
+                        error,
+                    )
+                })?;
+            let reserved_open_work =
+                callback_producer
+                    .reserve_lifecycle_delivery()
+                    .map_err(|error| {
+                        callback_admission_error(
+                            "connector open callback resource admission failed",
+                            error,
+                        )
+                    })?;
+            let reserved_close_work =
+                callback_producer
+                    .reserve_lifecycle_delivery()
+                    .map_err(|error| {
+                        callback_admission_error(
+                            "connector close callback resource admission failed",
+                            error,
+                        )
+                    })?;
+            let (realtime_resources, realtime_local_ceiling) = match callback_policy.realtime() {
+                RealtimeConnectorPolicy::Disabled => (None, None),
+                RealtimeConnectorPolicy::Enabled(local_ceiling) => {
+                    (work_resource_scope.clone(), local_ceiling)
+                }
+            };
+            let realtime_flows =
+                RealtimeFlowRegistry::new(realtime_resources, realtime_local_ceiling);
+            let lifecycle = Arc::new(ConnectorLifecycleOwner::with_reserved_lifecycle_work(
+                reserved_open_work,
+                reserved_close_work,
+            ));
             let event_sink = ConnectorEventSink {
                 events: ConnectorEventMailboxes {
-                    control: control_tx,
-                    endpoint_data: endpoint_data_tx,
+                    control: Arc::clone(&control),
+                    endpoint_data: Arc::clone(&endpoint_data),
                     lifecycle: Arc::clone(&lifecycle),
+                    #[cfg(test)]
+                    callback_producer: callback_producer.clone(),
                 },
                 realtime_flows: Arc::clone(&realtime_flows),
                 resource_scope: resource_scope.clone(),
@@ -3435,7 +4718,9 @@ impl Transport {
                 callback_gate: Arc::clone(&callback_gate),
                 callback_violation_reported: Arc::new(AtomicBool::new(false)),
                 callback_policy,
+                callback_producer,
                 operation_fence: Arc::clone(&operation_fence),
+                close_owner: callback_close_owner,
             };
             let data_channel = Arc::new(SyncMutex::new(None::<Arc<RTCDataChannel>>));
 
@@ -3469,12 +4754,15 @@ impl Transport {
                 ] {
                     for lane in 0..preprovisioned {
                         let key = (kind == LaneKind::Video, lane as u8);
-                        let flow = realtime_flows.open_outbound_flow().ok_or_else(|| {
-                            Error::Transport(
-                                "enabled real-time policy cannot own every pre-provisioned compatibility flow"
-                                    .to_string(),
-                            )
-                        })?;
+                        let flow =
+                            realtime_flows
+                                .open_outbound_flow_checked()
+                                .map_err(|error| {
+                                    realtime_flow_admission_error(
+                                        "pre-provisioned compatibility flow admission failed",
+                                        error,
+                                    )
+                                })?;
                         outbound_realtime_flows.insert(key, flow);
                         let _operation = operation_fence.try_enter().ok_or_else(|| {
                             Error::Transport(
@@ -3483,7 +4771,13 @@ impl Transport {
                             )
                         })?;
                         let track = make_media_track(kind, lane as u8);
-                        attach_track(&pc, &track, resource_scope.as_ref()).await?;
+                        attach_track(
+                            &pc,
+                            &track,
+                            resource_scope.as_ref(),
+                            work_resource_scope.as_ref(),
+                        )
+                        .await?;
                         match kind {
                             LaneKind::Video => video_tracks[lane] = Some(LaneSlot::Open(track)),
                             LaneKind::Audio => audio_tracks[lane] = Some(LaneSlot::Open(track)),
@@ -3538,16 +4832,20 @@ impl Transport {
                 callback_gate,
                 role,
                 resource_scope,
+                work_resource_scope,
             };
             Ok((
                 session,
                 TransportEventReceiver {
-                    control: control_rx,
-                    endpoint_data: endpoint_data_rx,
+                    control,
+                    endpoint_data,
                     lifecycle,
                     lifecycle_closed: false,
+                    callback_ready,
+                    callback_failed: false,
                     realtime_flows,
-                    scheduler: ConnectorCallbackScheduler::new(callback_policy.service_weights()),
+                    scheduler: ConnectorCallbackScheduler::new(callback_policy),
+                    control_cursor: ConnectorControlSourceCursor::default(),
                 },
             ))
         }
@@ -3661,24 +4959,54 @@ fn register_callbacks(
         );
         pc.on_ice_candidate(Box::new(move |cand| {
             let _keep_callback_observation = &callback_observation;
+            let mut callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native ICE callback before candidate conversion"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
+            let candidate = match cand {
+                Some(candidate) => match candidate.to_json() {
+                    Ok(init) => Some(LocalIceCandidate {
+                        candidate: init.candidate,
+                        sdp_mid: init.sdp_mid,
+                        sdp_mline_index: init.sdp_mline_index,
+                        username_fragment: init.username_fragment,
+                    }),
+                    Err(error) => {
+                        warn!("ice_candidate to_json: {error}");
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                },
+                None => None,
+            };
+            let Some((payload_bytes, retained_slack)) = candidate_callback_sizes(&candidate) else {
+                tx.retire_after_callback_violation();
+                return Box::pin(async {});
+            };
+            if let Err(error) = tx.callback_producer.account_executing_payload(
+                &mut callback_work,
+                payload_bytes,
+                retained_slack,
+            ) {
+                warn!(
+                    ?error,
+                    "refusing converted native ICE callback under resource pressure"
+                );
+                tx.retire_after_callback_violation();
+                return Box::pin(async {});
+            }
             let tx = tx.clone();
             Box::pin(async move {
-                let msg = match cand {
-                    Some(c) => match c.to_json() {
-                        Ok(init) => Some(LocalIceCandidate {
-                            candidate: init.candidate,
-                            sdp_mid: init.sdp_mid,
-                            sdp_mline_index: init.sdp_mline_index,
-                            username_fragment: init.username_fragment,
-                        }),
-                        Err(e) => {
-                            warn!("ice_candidate to_json: {e}");
-                            return;
-                        }
-                    },
-                    None => None,
-                };
-                tx.emit(TransportEvent::LocalIceCandidate(msg)).await;
+                let _callback_work = callback_work;
+                tx.emit(TransportEvent::LocalIceCandidate(candidate)).await;
             })
         }));
     }
@@ -3694,8 +5022,21 @@ fn register_callbacks(
         );
         pc.on_ice_connection_state_change(Box::new(move |state| {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native ICE-state callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 tx.emit(TransportEvent::IceConnectionStateChanged(state))
                     .await;
             })
@@ -3713,8 +5054,21 @@ fn register_callbacks(
         );
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native peer-state callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 tx.emit(TransportEvent::PeerConnectionStateChanged(state))
                     .await;
             })
@@ -3734,10 +5088,23 @@ fn register_callbacks(
         );
         pc.on_data_channel(Box::new(move |dc| {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native data-channel callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             let dc_slot = dc_slot.clone();
             let handler_scope = handler_scope.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 let Some(_operation) = tx.operation_fence.try_enter() else {
                     return;
                 };
@@ -3773,11 +5140,24 @@ fn register_callbacks(
         );
         pc.on_track(Box::new(move |track, _receiver, transceiver| {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Realtime) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native track callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             let remote_tracks = Arc::clone(&remote_tracks);
             let task_observation =
                 observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
             Box::pin(async move {
+                let _callback_work = callback_work;
                 let Some(_operation) = tx.operation_fence.try_enter() else {
                     return;
                 };
@@ -3808,17 +5188,24 @@ fn register_callbacks(
                     }
                 };
                 let (_, lane) = key;
-                let Some(flow) = tx.open_inbound_realtime_flow() else {
-                    remote_tracks.lock().remove(&key);
-                    tx.structural_violation(
-                        "compatibility media track exceeds admitted flow capacity",
-                    );
-                    return;
+                let flow = match tx.open_inbound_realtime_flow_checked() {
+                    Ok(flow) => flow,
+                    Err(error) => {
+                        remote_tracks.lock().remove(&key);
+                        warn!(
+                            ?error,
+                            "compatibility media track was refused by its real-time resource owner"
+                        );
+                        tx.retire_after_callback_violation();
+                        return;
+                    }
                 };
                 let owner = LegacyInboundTrackOwner {
                     task_observation,
-                    remote_tracks,
-                    track_key: key,
+                    registration: LegacyRemoteTrackRegistration {
+                        remote_tracks,
+                        track_key: key,
+                    },
                     flow,
                     transceiver: Arc::clone(&transceiver),
                     lane,
@@ -3848,8 +5235,21 @@ fn install_data_channel_handlers(
             observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_open(Box::new(move || {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native data-channel-open callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 tx.emit_data_channel(TransportEvent::DataChannelOpen).await;
             })
         }));
@@ -3860,8 +5260,21 @@ fn install_data_channel_handlers(
             observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_close(Box::new(move || {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native data-channel-close callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 tx.emit_data_channel(TransportEvent::DataChannelClosed)
                     .await;
             })
@@ -3873,8 +5286,31 @@ fn install_data_channel_handlers(
             observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let _keep_callback_observation = &callback_observation;
+            let payload_bytes = msg.data.len();
+            if callback_payload_limit(tx.callback_policy, ConnectorCallbackClass::EndpointData)
+                .is_some_and(|limit| payload_bytes > limit)
+            {
+                tx.retire_after_callback_violation();
+                return Box::pin(async {});
+            }
+            let callback_work = match tx.begin_native_callback_operation_with_payload(
+                ConnectorCallbackClass::EndpointData,
+                payload_bytes,
+                0,
+            ) {
+                Ok(work) => work,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "refusing native endpoint-data callback under resource pressure"
+                    );
+                    tx.retire_after_callback_violation();
+                    return Box::pin(async {});
+                }
+            };
             let tx = tx.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 tx.emit_data_channel(TransportEvent::Message(msg.data))
                     .await;
             })
@@ -3886,8 +5322,21 @@ fn install_data_channel_handlers(
             observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_error(Box::new(move |err| {
             let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing native data-channel-error callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
             let tx = tx.clone();
             Box::pin(async move {
+                let _callback_work = callback_work;
                 warn!("data channel error: {err}");
                 tx.emit_data_channel(TransportEvent::DataChannelClosed)
                     .await;
@@ -4000,10 +5449,95 @@ struct RemoteIceCredentialBinding {
 /// identifies an existing ICE transport across renegotiation. Adding or
 /// removing a media section does not manufacture an ICE restart. A changed
 /// credential pair on the same transport does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteIceCredentials {
+#[derive(Debug)]
+struct RemoteIceCredentialsInner {
     bindings: Vec<RemoteIceCredentialBinding>,
+    resources: Option<Arc<RemoteDescriptionResourceOwner>>,
 }
+
+#[derive(Debug)]
+struct RemoteDescriptionResourceOwner {
+    lease: SyncMutex<Option<crate::resource::ResourceLease>>,
+    post_native_claim: crate::resource::ResourceClaim,
+}
+
+impl RemoteDescriptionResourceOwner {
+    fn new(
+        lease: crate::resource::ResourceLease,
+        post_native_claim: crate::resource::ResourceClaim,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            lease: SyncMutex::new(Some(lease)),
+            post_native_claim,
+        })
+    }
+
+    fn finish_native_commit(&self) -> Result<()> {
+        let mut lease = self.lease.lock();
+        let Some(lease) = lease.as_mut() else {
+            return Err(Error::ResourceUnavailable(
+                ResourceUnavailable::ProviderInvariant {
+                    dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+                },
+            ));
+        };
+        lease
+            .transition(self.post_native_claim)
+            .map_err(Error::ResourceUnavailable)
+    }
+
+    fn retain_after_cleanup_failure(&self) {
+        if let Some(lease) = self.lease.lock().take() {
+            let _ = lease.retain_after_failed_cleanup();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteIceCredentials {
+    inner: Arc<RemoteIceCredentialsInner>,
+}
+
+impl RemoteIceCredentials {
+    fn new(
+        bindings: Vec<RemoteIceCredentialBinding>,
+        resources: Option<Arc<RemoteDescriptionResourceOwner>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RemoteIceCredentialsInner {
+                bindings,
+                resources,
+            }),
+        }
+    }
+
+    fn finish_native_commit(&self) -> Result<()> {
+        let Some(resources) = self.resources.as_ref() else {
+            return Ok(());
+        };
+        resources.finish_native_commit()
+    }
+
+    fn resource_owner(&self) -> Option<Arc<RemoteDescriptionResourceOwner>> {
+        self.resources.as_ref().map(Arc::clone)
+    }
+}
+
+impl std::ops::Deref for RemoteIceCredentials {
+    type Target = RemoteIceCredentialsInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl PartialEq for RemoteIceCredentials {
+    fn eq(&self, other: &Self) -> bool {
+        self.bindings == other.bindings
+    }
+}
+
+impl Eq for RemoteIceCredentials {}
 
 impl RemoteIceCredentials {
     fn has_unambiguous_credential_pair(&self, username_fragment: &str) -> bool {
@@ -4173,6 +5707,195 @@ fn candidate_matches_remote_credentials(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteIceCredentialAllocationPlan {
+    media_count: usize,
+    binding_count: usize,
+    string_bytes: usize,
+}
+
+#[derive(Default)]
+struct PlannedIceMediaSection<'a> {
+    media_index: usize,
+    rejected: bool,
+    mid: Option<&'a str>,
+    username_fragment: Option<&'a str>,
+    password: Option<&'a str>,
+}
+
+fn finish_planned_ice_media_section(
+    section: PlannedIceMediaSection<'_>,
+    session_username_fragment: Option<&str>,
+    session_password: Option<&str>,
+    binding_count: &mut usize,
+    string_bytes: &mut usize,
+) -> Result<()> {
+    if section.rejected {
+        return Ok(());
+    }
+    let username_fragment = section
+        .username_fragment
+        .or(session_username_fragment)
+        .ok_or_else(|| {
+            Error::Transport(format!(
+                "remote SDP media section {} has no effective ICE username fragment",
+                section.media_index
+            ))
+        })?;
+    let password = section.password.or(session_password).ok_or_else(|| {
+        Error::Transport(format!(
+            "remote SDP media section {} has no effective ICE password",
+            section.media_index
+        ))
+    })?;
+    *binding_count = binding_count.checked_add(1).ok_or_else(|| {
+        Error::Transport("remote SDP credential binding count overflowed".to_string())
+    })?;
+    *string_bytes = string_bytes
+        .checked_add(section.mid.map_or(0, str::len))
+        .and_then(|total| total.checked_add(username_fragment.len()))
+        .and_then(|total| total.checked_add(password.len()))
+        .ok_or_else(|| {
+            Error::Transport("remote SDP credential string size overflowed".to_string())
+        })?;
+    Ok(())
+}
+
+/// Inspect the exact retained credential shape without allocating parser
+/// records or credential strings. The retained output claim is acquired from
+/// this plan before the allocating parser runs. Parser scratch, allocator
+/// slack, and the dependency-owned native description remain named opaque
+/// residual domains.
+fn plan_sdp_ice_credential_allocations(sdp: &str) -> Result<RemoteIceCredentialAllocationPlan> {
+    let mut session_username_fragment = None;
+    let mut session_password = None;
+    let mut current = None::<PlannedIceMediaSection<'_>>;
+    let mut media_count = 0_usize;
+    let mut binding_count = 0_usize;
+    let mut string_bytes = 0_usize;
+
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim().trim_end_matches('\r');
+        if let Some(media) = line.strip_prefix("m=") {
+            if let Some(section) = current.take() {
+                finish_planned_ice_media_section(
+                    section,
+                    session_username_fragment,
+                    session_password,
+                    &mut binding_count,
+                    &mut string_bytes,
+                )?;
+            }
+            let media_index = media_count;
+            media_count = media_count.checked_add(1).ok_or_else(|| {
+                Error::Transport("remote SDP media section count overflowed".to_string())
+            })?;
+            let rejected = media
+                .split_ascii_whitespace()
+                .nth(1)
+                .and_then(|port| port.split('/').next())
+                .is_some_and(|port| port == "0");
+            current = Some(PlannedIceMediaSection {
+                media_index,
+                rejected,
+                ..Default::default()
+            });
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=mid:") {
+            if let Some(section) = current.as_mut() {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(Error::Transport(
+                        "remote SDP carries an empty MID".to_string(),
+                    ));
+                }
+                if section.mid.replace(value).is_some() {
+                    return Err(Error::Transport(
+                        "remote SDP media section carries more than one MID".to_string(),
+                    ));
+                }
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=ice-ufrag:") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(Error::Transport(
+                    "remote SDP carries an empty ICE username fragment".to_string(),
+                ));
+            }
+            match current.as_mut() {
+                Some(section) => {
+                    if section.username_fragment.replace(value).is_some() {
+                        return Err(Error::Transport(
+                            "remote SDP media section carries more than one ICE username fragment"
+                                .to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    if session_username_fragment.replace(value).is_some() {
+                        return Err(Error::Transport(
+                            "remote SDP session carries more than one ICE username fragment"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=ice-pwd:") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(Error::Transport(
+                    "remote SDP carries an empty ICE password".to_string(),
+                ));
+            }
+            match current.as_mut() {
+                Some(section) => {
+                    if section.password.replace(value).is_some() {
+                        return Err(Error::Transport(
+                            "remote SDP media section carries more than one ICE password"
+                                .to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    if session_password.replace(value).is_some() {
+                        return Err(Error::Transport(
+                            "remote SDP session carries more than one ICE password".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(section) = current else {
+        return Err(Error::Transport(
+            "remote SDP has no media section for exact ICE credentials".to_string(),
+        ));
+    };
+    finish_planned_ice_media_section(
+        section,
+        session_username_fragment,
+        session_password,
+        &mut binding_count,
+        &mut string_bytes,
+    )?;
+    if binding_count == 0 {
+        return Err(Error::Transport(
+            "remote SDP has no active media section with exact ICE credentials".to_string(),
+        ));
+    }
+    Ok(RemoteIceCredentialAllocationPlan {
+        media_count,
+        binding_count,
+        string_bytes,
+    })
+}
+
 #[derive(Default)]
 struct ParsedIceMediaSection {
     rejected: bool,
@@ -4181,10 +5904,13 @@ struct ParsedIceMediaSection {
     password: Option<String>,
 }
 
-fn sdp_ice_credentials(sdp: &str) -> Result<RemoteIceCredentials> {
+fn parse_sdp_ice_credential_bindings_with_plan(
+    sdp: &str,
+    plan: RemoteIceCredentialAllocationPlan,
+) -> Result<Vec<RemoteIceCredentialBinding>> {
     let mut session_username_fragment = None;
     let mut session_password = None;
-    let mut sections = Vec::<ParsedIceMediaSection>::new();
+    let mut sections = Vec::<ParsedIceMediaSection>::with_capacity(plan.media_count);
 
     for raw_line in sdp.lines() {
         let line = raw_line.trim().trim_end_matches('\r');
@@ -4273,8 +5999,8 @@ fn sdp_ice_credentials(sdp: &str) -> Result<RemoteIceCredentials> {
         ));
     }
 
-    let mut bindings = Vec::with_capacity(sections.len());
-    let mut active_mids = std::collections::HashSet::new();
+    let mut bindings = Vec::with_capacity(plan.binding_count);
+    let mut active_mids = std::collections::HashSet::with_capacity(plan.binding_count);
     for (media_index, section) in sections.into_iter().enumerate() {
         if section.rejected {
             continue;
@@ -4314,7 +6040,284 @@ fn sdp_ice_credentials(sdp: &str) -> Result<RemoteIceCredentials> {
             "remote SDP has no active media section with exact ICE credentials".to_string(),
         ));
     }
-    Ok(RemoteIceCredentials { bindings })
+    Ok(bindings)
+}
+
+#[cfg(test)]
+fn parse_sdp_ice_credential_bindings(sdp: &str) -> Result<Vec<RemoteIceCredentialBinding>> {
+    let plan = plan_sdp_ice_credential_allocations(sdp)?;
+    parse_sdp_ice_credential_bindings_with_plan(sdp, plan)
+}
+
+#[cfg(test)]
+fn sdp_ice_credentials(sdp: &str) -> Result<RemoteIceCredentials> {
+    parse_sdp_ice_credential_bindings(sdp).map(|bindings| RemoteIceCredentials::new(bindings, None))
+}
+
+fn remote_description_operation_claim(
+    input_capacity: usize,
+) -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let input_capacity = u64::try_from(input_capacity).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            input_capacity,
+        ),
+        (crate::resource::ResourceClass::CallbackOrScheduledWork, 1),
+        (
+            crate::resource::ResourceClass::ParsingOrCpuWork,
+            input_capacity,
+        ),
+        // Credential-extraction scratch and the dependency-owned parsed/native
+        // remote-description tree are explicit non-byte residual domains.
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])
+}
+
+fn remote_description_registry_entry_claim() -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let arc_counters = std::mem::size_of::<usize>().checked_mul(2).ok_or(
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let accounted = std::mem::size_of::<Arc<RemoteDescriptionResourceOwner>>()
+        .checked_add(std::mem::size_of::<RemoteDescriptionResourceOwner>())
+        .and_then(|value| value.checked_add(arc_counters))
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let accounted = u64::try_from(accounted).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            accounted,
+        ),
+        (crate::resource::ResourceClass::StorageObject, 1),
+        // Arc and linked-list allocation metadata, padding, and allocator
+        // behavior are two named residual domains.
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])
+}
+
+#[cfg(any(test, feature = "transport-lab"))]
+fn retained_remote_description_claim_from_plan(
+    plan: RemoteIceCredentialAllocationPlan,
+    input_capacity: usize,
+    native_work_in_flight: bool,
+) -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let binding_records = plan
+        .binding_count
+        .checked_mul(std::mem::size_of::<RemoteIceCredentialBinding>())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let accounted = std::mem::size_of::<RemoteIceCredentialsInner>()
+        .checked_add(std::mem::size_of::<Vec<RemoteIceCredentialBinding>>())
+        .and_then(|total| total.checked_add(binding_records))
+        .and_then(|total| total.checked_add(plan.string_bytes))
+        .and_then(|total| total.checked_add(input_capacity))
+        .and_then(|total| u64::try_from(total).ok())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let mut claim = crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            accounted,
+        ),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])?
+    .checked_add(remote_description_registry_entry_claim()?)?;
+    if native_work_in_flight {
+        claim = claim.checked_add(crate::resource::ResourceClaim::single(
+            crate::resource::ResourceClass::CallbackOrScheduledWork,
+            1,
+        ))?;
+    }
+    Ok(claim)
+}
+
+fn retained_remote_description_claim(
+    bindings: &[RemoteIceCredentialBinding],
+    binding_capacity: usize,
+    input_capacity: usize,
+    native_work_in_flight: bool,
+) -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let binding_records = binding_capacity
+        .checked_mul(std::mem::size_of::<RemoteIceCredentialBinding>())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let string_capacities = bindings.iter().try_fold(0_usize, |total, binding| {
+        total
+            .checked_add(binding.mid.as_ref().map_or(0, String::capacity))
+            .and_then(|total| total.checked_add(binding.username_fragment.capacity()))
+            .and_then(|total| total.checked_add(binding.password.capacity()))
+    });
+    let accounted = std::mem::size_of::<RemoteIceCredentialsInner>()
+        .checked_add(std::mem::size_of::<Vec<RemoteIceCredentialBinding>>())
+        .and_then(|total| total.checked_add(binding_records))
+        .and_then(|total| total.checked_add(string_capacities?))
+        .and_then(|total| total.checked_add(input_capacity))
+        .and_then(|total| u64::try_from(total).ok())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let mut claim = crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            accounted,
+        ),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])?
+    .checked_add(remote_description_registry_entry_claim()?)?;
+    if native_work_in_flight {
+        claim = claim.checked_add(crate::resource::ResourceClaim::single(
+            crate::resource::ResourceClass::CallbackOrScheduledWork,
+            1,
+        ))?;
+    }
+    Ok(claim)
+}
+
+fn planned_remote_description_claim(
+    plan: RemoteIceCredentialAllocationPlan,
+    input_capacity: usize,
+) -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let binding_records = plan
+        .binding_count
+        .checked_mul(std::mem::size_of::<RemoteIceCredentialBinding>())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let parser_sections = plan
+        .media_count
+        .checked_mul(std::mem::size_of::<ParsedIceMediaSection>())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let parser_mid_keys = plan
+        .binding_count
+        .checked_mul(std::mem::size_of::<String>())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    let parser_string_copies = input_capacity.checked_mul(2).ok_or(
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let accounted = std::mem::size_of::<RemoteIceCredentialsInner>()
+        .checked_add(std::mem::size_of::<Vec<RemoteIceCredentialBinding>>())
+        .and_then(|total| total.checked_add(std::mem::size_of::<Vec<ParsedIceMediaSection>>()))
+        .and_then(|total| {
+            total.checked_add(std::mem::size_of::<std::collections::HashSet<String>>())
+        })
+        .and_then(|total| total.checked_add(binding_records))
+        .and_then(|total| total.checked_add(parser_sections))
+        .and_then(|total| total.checked_add(parser_mid_keys))
+        .and_then(|total| total.checked_add(plan.string_bytes))
+        .and_then(|total| total.checked_add(parser_string_copies))
+        .and_then(|total| total.checked_add(input_capacity))
+        .and_then(|total| u64::try_from(total).ok())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            accounted,
+        ),
+        (crate::resource::ResourceClass::CallbackOrScheduledWork, 1),
+        (
+            crate::resource::ResourceClass::ParsingOrCpuWork,
+            u64::try_from(input_capacity).map_err(|_| {
+                crate::resource::ResourceClaimArithmeticError::Overflow {
+                    dimension: crate::resource::ResourceClass::ParsingOrCpuWork,
+                }
+            })?,
+        ),
+        // One unit protects HashSet and allocator slack. The other protects
+        // the dependency-owned parsed/native remote description.
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+    ])?
+    .checked_add(remote_description_registry_entry_claim()?)
+}
+
+fn sdp_ice_credentials_owned(
+    sdp: &str,
+    input_capacity: usize,
+    work_resources: &ConnectorWorkResourceScope,
+) -> Result<RemoteIceCredentials> {
+    let initial_claim = remote_description_operation_claim(input_capacity).map_err(|error| {
+        Error::Transport(format!(
+            "remote-description operation claim overflowed: {error}"
+        ))
+    })?;
+    let mut lease = work_resources
+        .acquire(
+            crate::resource::ResourceAuthorityClass::Speculative,
+            initial_claim,
+        )
+        .map_err(Error::ResourceUnavailable)?;
+    let plan = plan_sdp_ice_credential_allocations(sdp)?;
+    let planned_claim =
+        planned_remote_description_claim(plan, input_capacity).map_err(|error| {
+            Error::Transport(format!(
+                "remote-description planned claim overflowed: {error}"
+            ))
+        })?;
+    lease
+        .transition(planned_claim)
+        .map_err(Error::ResourceUnavailable)?;
+    let bindings = parse_sdp_ice_credential_bindings_with_plan(sdp, plan)?;
+    let retained_claim =
+        retained_remote_description_claim(&bindings, bindings.capacity(), input_capacity, true)
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "remote-description retained claim overflowed: {error}"
+                ))
+            })?;
+    lease
+        .transition(retained_claim)
+        .map_err(Error::ResourceUnavailable)?;
+    let post_native_claim =
+        retained_remote_description_claim(&bindings, bindings.capacity(), input_capacity, false)
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "remote-description post-native claim overflowed: {error}"
+                ))
+            })?;
+    Ok(RemoteIceCredentials::new(
+        bindings,
+        Some(RemoteDescriptionResourceOwner::new(
+            lease,
+            post_native_claim,
+        )),
+    ))
 }
 
 pub struct PeerSession {
@@ -4367,6 +6370,7 @@ pub struct PeerSession {
         allow(dead_code, reason = "frozen legacy-media compatibility state")
     )]
     resource_scope: Option<PeerConnectionResourceScope>,
+    work_resource_scope: Option<ConnectorWorkResourceScope>,
 }
 
 impl PeerSession {
@@ -4725,19 +6729,380 @@ impl PeerSession {
     }
 }
 
+#[cfg(any(test, feature = "transport-lab"))]
+fn realtime_fixture_provider_grant(
+    local: crate::runtime::attempt::EnabledRealtimeConnectorPolicy,
+) -> Result<crate::resource::ResourceClaim> {
+    use crate::resource::FiniteResourceProvider;
+
+    fn add_lease(
+        total: &mut crate::resource::ResourceClaim,
+        claim: crate::resource::ResourceClaim,
+    ) -> Result<()> {
+        *total = total
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(claim).map_err(Error::from)?,
+            )
+            .map_err(|error| {
+                Error::Transport(format!("fixture real-time claim overflowed: {error}"))
+            })?;
+        Ok(())
+    }
+
+    let flows = local.flows();
+    let inbound_flows = flows.max_inbound_active_flows().get();
+    let outbound_flows = flows.max_outbound_active_flows().get();
+    let total_flows = inbound_flows
+        .checked_add(outbound_flows)
+        .ok_or_else(|| Error::Transport("fixture flow total overflowed".to_string()))?;
+    let queue_slots = total_flows
+        .checked_mul(flows.queue_capacity_per_flow().get())
+        .ok_or_else(|| Error::Transport("fixture queue-slot total overflowed".to_string()))?;
+    let inbound_units = inbound_flows
+        .checked_mul(flows.max_in_progress_units_per_flow().get())
+        .ok_or_else(|| Error::Transport("fixture assembly total overflowed".to_string()))?;
+    let fragments = inbound_units
+        .checked_mul(flows.max_inbound_fragments_per_unit().get())
+        .ok_or_else(|| Error::Transport("fixture fragment total overflowed".to_string()))?;
+
+    let mut grant = crate::resource::ResourceClaim::ZERO;
+    for _ in 0..total_flows {
+        add_lease(&mut grant, RealtimeFlowRegistry::flow_claim()?)?;
+        add_lease(&mut grant, RealtimeFlowRegistry::ready_claim()?)?;
+    }
+    for _ in 0..inbound_flows {
+        add_lease(&mut grant, RealtimeFlowRegistry::native_read_claim()?)?;
+    }
+    for _ in 0..inbound_units {
+        add_lease(&mut grant, RealtimeFlowRegistry::assembly_claim()?)?;
+    }
+    for _ in 0..fragments {
+        add_lease(
+            &mut grant,
+            RealtimeFlowRegistry::ordered_fragment_claim(flows.max_inbound_fragment_bytes().get())?,
+        )?;
+    }
+    for _ in 0..queue_slots {
+        add_lease(
+            &mut grant,
+            RealtimeFlowRegistry::output_claim(local.max_unit_bytes().get())?,
+        )?;
+        add_lease(
+            &mut grant,
+            RealtimeFlowRegistry::queue_claim(local.max_unit_bytes().get())?,
+        )?;
+    }
+    add_lease(
+        &mut grant,
+        RealtimeFlowRegistry::pre_auth_work_claim(flows.max_pre_auth_content_bytes().get())?,
+    )?;
+    Ok(grant)
+}
+
+/// Derive a finite resource grant for an explicit transport-lab fixture.
+///
+/// The caller supplies the exact connector profiles and concurrent Mesh scope
+/// count exercised by the fixture. This function selects no production value
+/// and is unavailable without the `transport-lab` feature.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn transport_lab_connector_fixture_grant(
+    profiles: &[WebRtcConnectorProfile],
+    mesh_scope_count: std::num::NonZeroU64,
+) -> Result<crate::resource::ResourceClaim> {
+    use crate::resource::FiniteResourceProvider;
+
+    fn add(
+        total: &mut crate::resource::ResourceClaim,
+        claim: crate::resource::ResourceClaim,
+        context: &'static str,
+    ) -> Result<()> {
+        *total = total.checked_add(claim).map_err(|error| {
+            Error::Transport(format!(
+                "fixture resource claim overflowed while adding {context}: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    let structural = crate::runtime::attempt::connector_resource_structural_claims();
+    let mut grant = FiniteResourceProvider::scope_record_charge_for_test();
+    add(
+        &mut grant,
+        FiniteResourceProvider::reservation_charge_for_test(structural.process_infrastructure())
+            .map_err(Error::from)?,
+        "process cleanup infrastructure",
+    )?;
+    for _ in 0..mesh_scope_count.get() {
+        add(
+            &mut grant,
+            FiniteResourceProvider::scope_record_charge_for_test(),
+            "Mesh resource scope",
+        )?;
+    }
+
+    for profile in profiles {
+        add(
+            &mut grant,
+            FiniteResourceProvider::child_scope_with_reservation_charge_for_test(
+                structural.connector_opening(),
+            )
+            .map_err(Error::from)?,
+            "connector opening scope and reservation",
+        )?;
+        add(
+            &mut grant,
+            FiniteResourceProvider::reservation_charge_for_test(structural.connector_operation())
+                .map_err(Error::from)?,
+            "one fixture connector operation",
+        )?;
+        for callback_claim in callback::connector_construction_claims().map_err(|error| {
+            Error::Transport(format!("fixture callback claim overflowed: {error}"))
+        })? {
+            add(
+                &mut grant,
+                FiniteResourceProvider::reservation_charge_for_test(callback_claim)
+                    .map_err(Error::from)?,
+                "connector callback construction",
+            )?;
+        }
+
+        let native_realtime_surfaces = profile
+            .legacy_media_internal()
+            .map(|legacy| {
+                legacy
+                    .max_lanes_per_kind()
+                    .get()
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        Error::Transport(
+                            "fixture native real-time callback surface overflowed".to_string(),
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        for callback_claim in callback::connector_fixture_operation_claims(
+            profile.callbacks(),
+            native_realtime_surfaces,
+        )
+        .map_err(|error| {
+            Error::Transport(format!(
+                "fixture callback operation claim overflowed: {error}"
+            ))
+        })? {
+            add(
+                &mut grant,
+                FiniteResourceProvider::reservation_charge_for_test(callback_claim)
+                    .map_err(Error::from)?,
+                "connector callback operation",
+            )?;
+        }
+
+        if let RealtimeConnectorPolicy::Enabled(Some(local)) = profile.callbacks().realtime() {
+            add(
+                &mut grant,
+                realtime_fixture_provider_grant(local)?,
+                "connector real-time fixture envelope",
+            )?;
+        }
+
+        if profile.legacy_media_internal().is_some() {
+            let outbound_flow_ceiling = match profile.callbacks().realtime() {
+                RealtimeConnectorPolicy::Enabled(Some(local)) => {
+                    local.flows().max_outbound_active_flows().get()
+                }
+                RealtimeConnectorPolicy::Disabled | RealtimeConnectorPolicy::Enabled(None) => {
+                    return Err(Error::Transport(
+                        "fixture legacy profile lacks its validated outbound flow ceiling"
+                            .to_string(),
+                    ));
+                }
+            };
+            for _ in 0..outbound_flow_ceiling {
+                add(
+                    &mut grant,
+                    FiniteResourceProvider::reservation_charge_for_test(
+                        media::legacy_rtcp_drain_claim()?,
+                    )
+                    .map_err(Error::from)?,
+                    "legacy RTCP drain",
+                )?;
+            }
+        }
+    }
+    Ok(grant)
+}
+
+/// Derive a conservative finite grant for an explicit remote-candidate fixture.
+///
+/// Every bound comes from the caller's test workload. The result covers the
+/// connector-neutral digest owner, production queue owner, parsing work, and
+/// each provider reservation record. It selects no production value.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn transport_lab_remote_candidate_fixture_grant(
+    max_unique_candidates: std::num::NonZeroU64,
+    max_concurrent_digest_work: std::num::NonZeroU64,
+    max_total_string_capacity: std::num::NonZeroU64,
+    max_total_content_bytes: std::num::NonZeroU64,
+    max_single_candidate_content_bytes: std::num::NonZeroU64,
+) -> Result<crate::resource::ResourceClaim> {
+    use crate::resource::{FiniteResourceProvider, ResourceClaim, ResourceClass};
+
+    let unique = max_unique_candidates.get();
+    let digest_retention =
+        crate::runtime::attempt::remote_candidate_digest_retention_aggregate_claim(unique)
+            .and_then(|claim| {
+                claim.checked_add(ResourceClaim::single(
+                    ResourceClass::OpaqueDependencyResidual,
+                    unique,
+                ))
+            })
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "fixture candidate digest retention overflowed: {error}"
+                ))
+            })?;
+    let digest_work = FiniteResourceProvider::reservation_charge_for_test(
+        crate::runtime::attempt::remote_candidate_max_digest_work_claim(
+            max_single_candidate_content_bytes.get(),
+        )
+        .map_err(|error| {
+            Error::Transport(format!("fixture candidate digest work overflowed: {error}"))
+        })?,
+    )
+    .map_err(Error::from)?
+    .checked_scale(max_concurrent_digest_work.get())
+    .map_err(|error| {
+        Error::Transport(format!(
+            "fixture concurrent candidate digest work overflowed: {error}"
+        ))
+    })?;
+    let queue = pending_remote_candidate_queue_claim_with_content(0, 0)
+        .and_then(|claim| claim.checked_scale(unique))
+        .and_then(|claim| {
+            claim.checked_add(ResourceClaim::single(
+                ResourceClass::AccountedMemoryBytes,
+                max_total_string_capacity.get(),
+            ))
+        })
+        .and_then(|claim| {
+            claim.checked_add(ResourceClaim::single(
+                ResourceClass::QueuedBytes,
+                max_total_content_bytes.get(),
+            ))
+        })
+        .and_then(|claim| {
+            claim.checked_add(ResourceClaim::single(
+                ResourceClass::OpaqueDependencyResidual,
+                unique,
+            ))
+        })
+        .map_err(|error| {
+            Error::Transport(format!("fixture candidate queue claim overflowed: {error}"))
+        })?;
+    digest_retention
+        .checked_add(digest_work)
+        .and_then(|claim| claim.checked_add(queue))
+        .map_err(|error| Error::Transport(format!("fixture candidate grant overflowed: {error}")))
+}
+
+/// Derive a conservative finite grant for explicit remote-SDP fixture shapes.
+///
+/// The caller supplies the maximum raw input, media-section, active-binding,
+/// and retained credential-string shape for each concurrent connector. This
+/// helper is unavailable from the default V4 API and selects no production
+/// value.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn transport_lab_remote_description_fixture_grant(
+    concurrent_connectors: std::num::NonZeroU64,
+    max_input_capacity: std::num::NonZeroU64,
+    max_media_sections: std::num::NonZeroU64,
+    max_active_bindings: std::num::NonZeroU64,
+    max_retained_credential_string_bytes: std::num::NonZeroU64,
+) -> Result<crate::resource::ResourceClaim> {
+    use crate::resource::{FiniteResourceProvider, ResourceClaim, ResourceClass};
+
+    let input_capacity = usize::try_from(max_input_capacity.get()).map_err(|_| {
+        Error::Transport("fixture remote-SDP input capacity does not fit usize".to_string())
+    })?;
+    let media_count = usize::try_from(max_media_sections.get()).map_err(|_| {
+        Error::Transport("fixture remote-SDP media count does not fit usize".to_string())
+    })?;
+    let binding_count = usize::try_from(max_active_bindings.get()).map_err(|_| {
+        Error::Transport("fixture remote-SDP binding count does not fit usize".to_string())
+    })?;
+    if binding_count > media_count {
+        return Err(Error::Transport(
+            "fixture active remote-SDP bindings exceed its media sections".to_string(),
+        ));
+    }
+    let string_bytes =
+        usize::try_from(max_retained_credential_string_bytes.get()).map_err(|_| {
+            Error::Transport(
+                "fixture remote-SDP credential string size does not fit usize".to_string(),
+            )
+        })?;
+    let plan = RemoteIceCredentialAllocationPlan {
+        media_count,
+        binding_count,
+        string_bytes,
+    };
+    let claims = [
+        remote_description_operation_claim(input_capacity),
+        planned_remote_description_claim(plan, input_capacity),
+        retained_remote_description_claim_from_plan(plan, input_capacity, true),
+        retained_remote_description_claim_from_plan(plan, input_capacity, false),
+    ];
+    let mut peak = ResourceClaim::ZERO;
+    for claim in claims {
+        let claim = claim.map_err(|error| {
+            Error::Transport(format!("fixture remote-SDP claim overflowed: {error}"))
+        })?;
+        peak = ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|dimension| {
+            (
+                dimension,
+                peak.amount(dimension).max(claim.amount(dimension)),
+            )
+        }))
+        .map_err(|error| {
+            Error::Transport(format!("fixture remote-SDP peak overflowed: {error}"))
+        })?;
+    }
+    FiniteResourceProvider::reservation_charge_for_test(peak)
+        .map_err(Error::from)?
+        .checked_scale(concurrent_connectors.get())
+        .map_err(|error| Error::Transport(format!("fixture remote-SDP grant overflowed: {error}")))
+}
+
+#[cfg(test)]
+pub(crate) fn one_mesh_connector_fixture_grant(
+    profiles: &[WebRtcConnectorProfile],
+) -> Result<crate::resource::ResourceClaim> {
+    transport_lab_connector_fixture_grant(
+        profiles,
+        std::num::NonZeroU64::new(1).expect("one Mesh fixture scope is nonzero"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resource::{
-        ProcessResourceRoot, ResourceFamilyReport, PRE_AUTH_RESOURCE_FAMILY_COUNT,
+        FiniteResourceProvider, ProcessResourceRoot, ResourceFamilyReport, ResourceProviderPort,
+        PRE_AUTH_RESOURCE_FAMILY_COUNT,
     };
     use crate::runtime::attempt::{
-        ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-        ConnectorRealtimeInboundLimits,
+        ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets,
+        ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
+        ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort,
     };
     use std::future::Future;
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll, Waker};
+
+    // Explicit fixture input shared by the native loopback controls. It is
+    // not a production default or an operational sufficiency claim.
+    const NATIVE_LOOPBACK_CALLBACK_CAPACITY: usize = 32;
 
     fn test_resource_owner(
         max_active_candidates: usize,
@@ -4745,28 +7110,29 @@ mod tests {
     ) -> MeshConnectorResourceScope {
         let max_active_candidates = std::num::NonZeroUsize::new(max_active_candidates)
             .expect("fixture has a nonzero candidate bound");
-        let callback_capacity = std::num::NonZeroUsize::new(callback_capacity)
-            .expect("fixture has nonzero callback bounds");
-        let _callbacks = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                callback_capacity,
-                callback_capacity,
-            ),
-            ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
-            RealtimeConnectorPolicy::Disabled,
+        let profiles = vec![test_webrtc_profile(callback_capacity); max_active_candidates.get()];
+        let connector_grant = transport_lab_connector_fixture_grant(
+            &profiles,
+            std::num::NonZeroU64::new(1).expect("the fixture Mesh scope count is nonzero"),
         )
-        .expect("fixture callback policy is valid");
-        let candidate_content_bytes = candidate_content_bytes(&observed_candidate())
-            .and_then(|bytes| bytes.checked_mul(max_active_candidates.get()))
-            .and_then(NonZeroUsize::new)
-            .expect("fixture candidate-byte ceiling is representable and nonzero");
-        let _ = candidate_content_bytes;
-        let policy = crate::runtime::attempt::ConnectorResourcePolicy::new(max_active_candidates)
-            .expect("fixture connector resource policy is valid");
-        crate::runtime::attempt::ConnectorResourceOwnerPort::new(policy)
-            .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
-                max_active_candidates,
-            ))
+        .expect("fixture connector and callback claims are representable");
+        // Several frozen compatibility controls acquire one independently
+        // owned real-time capability per fixture connector. Keep that test
+        // authority separate from the codec-neutral connector profile.
+        let compatibility_grant = FiniteResourceProvider::reservation_charge_for_test(
+            crate::connector::realtime_flow_capability_claim()
+                .expect("the compatibility capability claim is representable"),
+        )
+        .expect("the compatibility reservation charge is representable")
+        .checked_scale(max_active_candidates.get() as u64)
+        .expect("the fixture compatibility grant is representable");
+        let grant = connector_grant
+            .checked_add(compatibility_grant)
+            .expect("the complete fixture grant is representable");
+        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+            .expect("fixture provider accounts for its process scope");
+        crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider)
+            .issue_mesh_scope()
             .expect("fixture process owner issues one explicit Mesh scope")
     }
 
@@ -4782,28 +7148,13 @@ mod tests {
             RealtimeConnectorPolicy::Disabled,
         )
         .expect("fixture callback policy is valid");
-        WebRtcConnectorProfile::new(
-            callbacks,
-            PendingRemoteCandidatePolicy::new(
-                callback_capacity,
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-                callback_capacity,
-                callback_capacity,
-            ),
-        )
+        WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic())
     }
 
-    fn test_generic_realtime_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
-        let callback_capacity =
-            NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero");
+    fn test_generic_realtime_webrtc_profile(_callback_capacity: usize) -> WebRtcConnectorProfile {
         WebRtcConnectorProfile::new(
             explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16),
-            PendingRemoteCandidatePolicy::new(
-                callback_capacity,
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-                callback_capacity,
-                callback_capacity,
-            ),
+            PendingRemoteCandidatePolicy::elastic(),
         )
     }
 
@@ -4822,11 +7173,17 @@ mod tests {
     ) -> (Arc<ConnectorCloseOwner>, AttemptLifetime) {
         let (permit, lifetime, claim) =
             admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
-        let candidate = permit
+        let mut candidate = permit
             .reserve_connector_candidate(claim)
             .expect("fixture owner admits one candidate");
+        let cleanup_capability = candidate
+            .issue_cleanup_capability()
+            .expect("fixture candidate issues one cleanup capability");
         let ownership = admitted_ownership(candidate);
-        (ConnectorCloseOwner::new(ownership, owner.clone()), lifetime)
+        (
+            ConnectorCloseOwner::new(ownership, owner.clone(), cleanup_capability),
+            lifetime,
+        )
     }
 
     fn connected_claim_fixture(
@@ -4920,7 +7277,16 @@ mod tests {
     }
 
     fn test_pending_candidate_policy() -> PendingRemoteCandidatePolicy {
-        let candidate_bytes = candidate_content_bytes(&observed_candidate())
+        test_pending_candidate_policy_for(&[])
+    }
+
+    fn test_pending_candidate_policy_for(
+        additional_inputs: &[LocalIceCandidate],
+    ) -> PendingRemoteCandidatePolicy {
+        let candidate_bytes = std::iter::once(observed_candidate())
+            .chain(additional_inputs.iter().cloned())
+            .filter_map(|candidate| candidate_content_bytes(&candidate))
+            .max()
             .and_then(NonZeroUsize::new)
             .expect("fixture candidate has nonzero representable content");
         PendingRemoteCandidatePolicy::new(
@@ -4933,6 +7299,96 @@ mod tests {
 
     fn test_remote_candidate_state() -> RemoteCandidateState {
         RemoteCandidateState::new(test_pending_candidate_policy())
+    }
+
+    /// Build a finite test provider from the local fixture envelope. This is
+    /// test accounting only. It is not a product cardinality or a production
+    /// policy value.
+    fn test_realtime_resource_scope(
+        local: EnabledRealtimeConnectorPolicy,
+    ) -> ConnectorWorkResourceScope {
+        let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
+            .checked_add(
+                realtime_fixture_provider_grant(local)
+                    .expect("fixture real-time envelope is representable"),
+            )
+            .expect("fixture provider grant is representable");
+
+        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+            .expect("the derived fixture grant accounts for its process scope");
+        let mesh = ConnectorResourceOwnerPort::new(provider)
+            .issue_mesh_scope()
+            .expect("the derived fixture grant accounts for its Mesh scope");
+        let (permit, _attempt, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), mesh);
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("the derived fixture grant admits its connector candidate");
+        candidate.work_resource_scope()
+    }
+
+    fn test_realtime_registry(policy: ConnectorCallbackPolicy) -> Arc<RealtimeFlowRegistry> {
+        match policy.realtime() {
+            RealtimeConnectorPolicy::Disabled => RealtimeFlowRegistry::new(None, None),
+            RealtimeConnectorPolicy::Enabled(Some(local)) => {
+                RealtimeFlowRegistry::new(Some(test_realtime_resource_scope(local)), Some(local))
+            }
+            RealtimeConnectorPolicy::Enabled(None) => {
+                panic!("an elastic real-time test must supply its exact provider fixture")
+            }
+        }
+    }
+
+    fn test_realtime_registry_with_observer(
+        policy: ConnectorCallbackPolicy,
+        observer: Arc<dyn RealtimeFlowObserver>,
+    ) -> Arc<RealtimeFlowRegistry> {
+        let RealtimeConnectorPolicy::Enabled(Some(local)) = policy.realtime() else {
+            panic!("an observed real-time test requires an explicit local fixture envelope");
+        };
+        RealtimeFlowRegistry::with_observer(
+            Some(test_realtime_resource_scope(local)),
+            Some(local),
+            Some(observer),
+        )
+    }
+
+    fn test_callback_policy(capacity: NonZeroUsize) -> ConnectorCallbackPolicy {
+        let unit_bytes = b"video-fixture".len();
+        let flow_domains = 2usize;
+        let accounted_bytes = unit_bytes
+            .checked_mul(capacity.get())
+            .and_then(|bytes| bytes.checked_mul(flow_domains))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(NonZeroUsize::new)
+            .expect("fixture retained-byte envelope is representable and nonzero");
+        let flows = ConnectorRealtimeFlowPolicy::new(
+            ConnectorRealtimeFlowCapacities::new(
+                NonZeroUsize::new(flow_domains).expect("fixture has two flow kinds"),
+                NonZeroUsize::new(flow_domains).expect("fixture has two flow kinds"),
+                capacity,
+            ),
+            ConnectorRealtimeInboundLimits::new(
+                NonZeroUsize::new(unit_bytes).expect("fixture unit is nonempty"),
+                NonZeroUsize::new(1).expect("fixture uses complete units"),
+                NonZeroUsize::new(1).expect("fixture uses one in-progress unit"),
+                NonZeroUsize::new(1).expect("fixture admits one pre-authentication packet"),
+                NonZeroUsize::new(unit_bytes).expect("fixture packet is nonempty"),
+            ),
+            ConnectorRealtimeByteBudgets::new(accounted_bytes, accounted_bytes),
+            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
+        );
+        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(
+            NonZeroUsize::new(unit_bytes).expect("fixture unit is nonempty"),
+            flows,
+        )
+        .expect("fixture real-time envelope is internally consistent");
+        ConnectorCallbackPolicy::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+            ConnectorCallbackServiceWeights::new(capacity, capacity, capacity),
+            realtime,
+        )
+        .expect("fixture callback policy is valid")
     }
 
     fn retained_realtime_bytes(state: &RealtimeFlowRegistryState) -> usize {
@@ -4948,42 +7404,90 @@ mod tests {
     }
 
     fn admitted_ownership(candidate: ConnectorCandidateCapability) -> ConnectorOwnership {
+        let work_resource_scope = candidate.work_resource_scope();
         ConnectorOwnership::admitted(
             candidate,
             Arc::new(AtomicBool::new(false)),
             Arc::new(ConnectorOperationFence::default()),
+            work_resource_scope,
             Arc::new(AtomicBool::new(false)),
             Arc::new(WebRtcConnectorIncarnation::new()),
+        )
+    }
+
+    fn test_realtime_capability(
+        ownership: &ConnectorOwnership,
+    ) -> crate::connector::ConnectorRealtimeFlowCapability {
+        let resources = ownership
+            .work_resource_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                crate::connector::realtime_flow_capability_claim()
+                    .expect("fixture capability claim is representable"),
+            )
+            .expect("fixture provider admits one compatibility capability");
+        crate::connector::ConnectorRealtimeFlowCapability::new(
+            Arc::clone(&ownership.incarnation),
+            resources,
         )
     }
 
     fn test_event_mailboxes(capacity: usize) -> (ConnectorEventMailboxes, TransportEventReceiver) {
         let capacity =
             std::num::NonZeroUsize::new(capacity).expect("fixture callback capacity is nonzero");
-        test_event_mailboxes_with_policy(ConnectorCallbackPolicy::unrestricted_lab(capacity))
+        test_event_mailboxes_with_policy(test_callback_policy(capacity))
     }
 
     fn test_event_mailboxes_with_policy(
         policy: ConnectorCallbackPolicy,
     ) -> (ConnectorEventMailboxes, TransportEventReceiver) {
-        let capacities = policy.mailboxes();
-        let (control, control_rx) = mpsc::channel(capacities.control().get());
-        let (endpoint_data, endpoint_data_rx) = mpsc::channel(capacities.endpoint_data().get());
-        let realtime_flows = RealtimeFlowRegistry::new(policy);
-        let lifecycle = Arc::new(ConnectorLifecycleOwner::default());
+        let capacities = policy
+            .local_mailboxes()
+            .expect("fixture callback mailboxes are explicit");
+        let callback_producer = CallbackProducerOwner::for_local_lab_policy(policy)
+            .expect("fixture callback resources are derivable from its local policy");
+        let realtime_flows = test_realtime_registry(policy);
+        let callback_ready = Arc::new(tokio::sync::Notify::new());
+        let control = callback_producer
+            .create_mailbox(
+                ConnectorCallbackClass::Control,
+                Some(capacities.control()),
+                Arc::clone(&callback_ready),
+            )
+            .expect("fixture control mailbox is admitted");
+        let endpoint_data = callback_producer
+            .create_mailbox(
+                ConnectorCallbackClass::EndpointData,
+                Some(capacities.endpoint_data()),
+                Arc::clone(&callback_ready),
+            )
+            .expect("fixture endpoint mailbox is admitted");
+        let open_work = callback_producer
+            .reserve_lifecycle_delivery()
+            .expect("fixture open lifecycle work is reserved");
+        let close_work = callback_producer
+            .reserve_lifecycle_delivery()
+            .expect("fixture close lifecycle work is reserved");
+        let lifecycle = Arc::new(ConnectorLifecycleOwner::with_reserved_lifecycle_work(
+            open_work, close_work,
+        ));
         (
             ConnectorEventMailboxes {
-                control,
-                endpoint_data,
+                control: Arc::clone(&control),
+                endpoint_data: Arc::clone(&endpoint_data),
                 lifecycle: Arc::clone(&lifecycle),
+                callback_producer,
             },
             TransportEventReceiver {
-                control: control_rx,
-                endpoint_data: endpoint_data_rx,
+                control,
+                endpoint_data,
                 lifecycle,
                 lifecycle_closed: false,
+                callback_ready,
+                callback_failed: false,
                 realtime_flows,
-                scheduler: ConnectorCallbackScheduler::new(policy.service_weights()),
+                scheduler: ConnectorCallbackScheduler::new(policy),
+                control_cursor: ConnectorControlSourceCursor::default(),
             },
         )
     }
@@ -4993,9 +7497,10 @@ mod tests {
         policy: ConnectorCallbackPolicy,
         resource_scope: Option<PeerConnectionResourceScope>,
     ) -> ConnectorEventSink {
+        let callback_producer = events.callback_producer.clone();
         ConnectorEventSink {
             events,
-            realtime_flows: RealtimeFlowRegistry::new(policy),
+            realtime_flows: test_realtime_registry(policy),
             resource_scope,
             realtime_delivery: Arc::new(AtomicBool::new(true)),
             attempt_liveness: None,
@@ -5003,7 +7508,9 @@ mod tests {
             callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
             callback_violation_reported: Arc::new(AtomicBool::new(false)),
             callback_policy: policy,
+            callback_producer,
             operation_fence: Arc::new(ConnectorOperationFence::default()),
+            close_owner: None,
         }
     }
 
@@ -5018,24 +7525,121 @@ mod tests {
         sink
     }
 
+    struct LegacyPeerOwnerGuard {
+        close_owner: Arc<ConnectorCloseOwner>,
+        _lifetime: AttemptLifetime,
+    }
+
+    impl Drop for LegacyPeerOwnerGuard {
+        fn drop(&mut self) {
+            self.close_owner.start();
+        }
+    }
+
     async fn open_explicit_legacy_media_peer(
         transport: &Transport,
         role: Role,
-    ) -> Result<(PeerSession, TransportEventReceiver)> {
+        fixture_unit_bytes: NonZeroUsize,
+    ) -> Result<(PeerSession, TransportEventReceiver, LegacyPeerOwnerGuard)> {
         let mut config = build_rtc_configuration(&[], &[]);
         config.ice_transport_policy = transport.ice_transport_policy;
-        let profile = LegacyWebRtcMediaProfile::h264_opus(
+        let legacy_profile = LegacyWebRtcMediaProfile::h264_opus(
             NonZeroUsize::new(MEDIA_LANES).expect("legacy test lane ceiling is nonzero"),
             PRE_PROVISIONED_LANES,
             PRE_PROVISIONED_LANES,
         )
         .expect("legacy test profile is structurally valid");
-        let callback_policy = ConnectorCallbackPolicy::unrestricted_lab(
-            NonZeroUsize::new(32).expect("native compatibility fixture capacity is nonzero"),
+        let required_flows = legacy_profile
+            .max_lanes_per_kind()
+            .get()
+            .checked_mul(2)
+            .expect("fixture legacy video and audio flow count is representable");
+        let fixture_accounted_bytes = fixture_unit_bytes.get().checked_mul(2).ok_or_else(|| {
+            Error::Transport("fixture real-time byte envelope overflowed".to_string())
+        })?;
+        let realtime = explicit_realtime_callback_policy(
+            fixture_unit_bytes.get(),
+            required_flows,
+            1,
+            fixture_unit_bytes.get(),
+            1,
+            fixture_accounted_bytes,
+        )
+        .realtime();
+        let callback_capacity = NonZeroUsize::new(NATIVE_LOOPBACK_CALLBACK_CAPACITY)
+            .expect("native loopback callback capacity is nonzero");
+        let callbacks = ConnectorCallbackPolicy::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
+                callback_capacity,
+                callback_capacity,
+            ),
+            ConnectorCallbackServiceWeights::new(
+                NonZeroUsize::new(1).expect("fixture control weight is nonzero"),
+                NonZeroUsize::new(1).expect("fixture endpoint weight is nonzero"),
+                NonZeroUsize::new(1).expect("fixture real-time weight is nonzero"),
+            ),
+            realtime,
+        )
+        .expect("native loopback callback policy is valid");
+        let profile = WebRtcConnectorProfile::new(callbacks, test_pending_candidate_policy())
+            .with_legacy_webrtc_media(legacy_profile)
+            .expect("fixture real-time ownership admits its exact legacy lanes");
+        let grant = one_mesh_connector_fixture_grant(&[profile])?;
+        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))?;
+        let resource_owner = ConnectorResourceOwnerPort::new(provider)
+            .issue_mesh_scope()
+            .map_err(|error| Error::Transport(format!("legacy fixture Mesh scope: {error}")))?;
+        let (permit, lifetime, claim) = admit_single_connector_candidate(
+            crate::runtime::runtime_for_test(),
+            resource_owner.clone(),
         );
-        transport
-            .open_peer_with_config_and_legacy_media_profile(role, config, profile, callback_policy)
-            .await
+        let mut candidate = permit
+            .reserve_connector_candidate_checked(claim)?
+            .ok_or_else(|| Error::Transport("legacy fixture attempt retired".to_string()))?;
+        let work_resource_scope = candidate.work_resource_scope();
+        let attempt_liveness = candidate.liveness();
+        let cleanup_capability = candidate
+            .issue_cleanup_capability()
+            .map_err(|error| Error::Transport(format!("legacy fixture cleanup owner: {error}")))?;
+        let realtime_delivery = Arc::new(AtomicBool::new(true));
+        let candidate_promoted = Arc::new(AtomicBool::new(true));
+        let operation_fence = Arc::new(ConnectorOperationFence::default());
+        let callback_gate = Arc::new(WebRtcConnectorIncarnation::new());
+        let ownership = ConnectorOwnership::admitted(
+            candidate,
+            Arc::clone(&realtime_delivery),
+            Arc::clone(&operation_fence),
+            work_resource_scope.clone(),
+            Arc::clone(&candidate_promoted),
+            Arc::clone(&callback_gate),
+        );
+        let close_owner = ConnectorCloseOwner::new(ownership, resource_owner, cleanup_capability);
+        let (session, events) = transport
+            .open_peer_with_config_observed(
+                role,
+                config,
+                PeerOpenOwnership {
+                    resource_scope: None,
+                    work_resource_scope: Some(work_resource_scope),
+                    realtime_delivery,
+                    attempt_liveness: Some(attempt_liveness),
+                    candidate_promoted,
+                    callback_gate,
+                    callback_policy: profile.callbacks(),
+                    operation_fence,
+                    legacy_media_profile: Some(legacy_profile),
+                    close_owner: Some(Arc::clone(&close_owner)),
+                },
+            )
+            .await?;
+        Ok((
+            session,
+            events,
+            LegacyPeerOwnerGuard {
+                close_owner,
+                _lifetime: lifetime,
+            },
+        ))
     }
 
     fn explicit_callback_policy(
@@ -5096,9 +7700,11 @@ mod tests {
             ),
             crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
         );
-        let realtime =
-            RealtimeConnectorPolicy::enabled(nonzero(max_unit_bytes, "unit limit"), flows)
-                .expect("fixture real-time policy can carry one guarded assembly");
+        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(
+            nonzero(max_unit_bytes, "unit limit"),
+            flows,
+        )
+        .expect("fixture real-time policy can carry one guarded assembly");
         explicit_callback_policy(1, 1, 1, 1, realtime)
     }
 
@@ -5113,6 +7719,14 @@ mod tests {
         }
     }
 
+    struct PanickingRealtimeObserver;
+
+    impl RealtimeFlowObserver for PanickingRealtimeObserver {
+        fn observe(&self, _observation: RealtimeFlowObservation) {
+            panic!("injected observation-only callback failure");
+        }
+    }
+
     fn stamped_event(
         ownership: &ConnectorOwnership,
         event: TransportEvent,
@@ -5121,6 +7735,7 @@ mod tests {
             incarnation: Arc::clone(&ownership.incarnation),
             event,
             _queue_observation: None,
+            _callback_work: None,
         }
     }
 
@@ -5129,7 +7744,7 @@ mod tests {
         second: TransportEvent,
     ) {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+        let policy = test_callback_policy(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
@@ -5199,7 +7814,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_endpoint_data_and_realtime_callback_capacity_are_independent() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+        let policy = test_callback_policy(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
@@ -5324,9 +7939,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_close_supersedes_an_uncommitted_open_exactly_once() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
-            NonZeroUsize::new(1).expect("one is nonzero"),
-        );
+        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert_eq!(
@@ -5385,9 +7998,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_renegotiation_and_state_observations_are_coalesced() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
-            NonZeroUsize::new(1).expect("one is nonzero"),
-        );
+        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(sink.emit(TransportEvent::RenegotiationNeeded).await);
@@ -5424,9 +8035,7 @@ mod tests {
     #[test]
     fn v4_arc03i_first_structural_violation_retires_once() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
-            NonZeroUsize::new(1).expect("one is nonzero"),
-        );
+        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         sink.structural_violation("first fixture violation");
@@ -5441,6 +8050,80 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn v4_arc03_structural_violation_starts_native_cleanup_without_receiver_polling() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&close_calls),
+            }))
+        );
+        let (events, receiver) = test_event_mailboxes(1);
+        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let mut sink = test_event_sink_for_receiver(events, policy, None, &receiver);
+        sink.close_owner = Some(Arc::downgrade(&close_owner));
+
+        sink.structural_violation("fixture violation");
+        tokio::time::timeout(Duration::from_secs(1), close_owner.wait())
+            .await
+            .expect("cleanup completes without consuming the lifecycle event")
+            .expect("the deterministic native close succeeds");
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            receiver.lifecycle.phase(),
+            ConnectorLifecyclePhase::ClosedPending,
+            "the proof does not depend on polling the close event"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_recorded_close_survives_connector_retirement_to_engine_delivery() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, lifetime) = close_owner_fixture(&owner);
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&close_calls),
+            }))
+        );
+        let ownership = close_owner.ownership.clone();
+        let (events, raw) = test_event_mailboxes(1);
+        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let mut sink = test_event_sink_for_receiver(events, policy, None, &raw);
+        sink.close_owner = Some(Arc::downgrade(&close_owner));
+        let mut receiver = WebRtcConnectorEventReceiver {
+            ownership: ownership.clone(),
+            retirement: ownership.incarnation.subscribe_retirement(),
+            attempt_retirement: None,
+            raw,
+            attempt_lifetime: Some(lifetime),
+            remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
+            close_owner: Some(Arc::clone(&close_owner)),
+            reclaim: None,
+            data_channel_open_committed: false,
+            data_channel_closed: false,
+            operation_fence: Arc::clone(&ownership.operation_fence),
+        };
+
+        sink.structural_violation("fixture violation");
+        tokio::time::timeout(Duration::from_secs(1), close_owner.wait())
+            .await
+            .expect("cleanup reaches its terminal state")
+            .expect("the deterministic native close succeeds");
+        assert!(!ownership.incarnation.is_active());
+        let delivered = receiver
+            .recv()
+            .await
+            .expect("the recorded close survives retirement");
+        assert!(matches!(delivered.event, TransportEvent::DataChannelClosed));
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert!(receiver.recv().await.is_none());
+    }
+
     #[test]
     fn v4_arc03i_native_data_channel_shape_is_fixed_and_violation_work_is_coalesced() {
         assert_eq!(
@@ -5453,9 +8136,7 @@ mod tests {
         );
 
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
-            NonZeroUsize::new(1).expect("one is nonzero"),
-        );
+        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         for _ in 0..32 {
             let NativeDataChannelAdmission::Violation(reason) =
@@ -5570,6 +8251,7 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
+            reclaim: None,
             data_channel_open_committed: true,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -5587,30 +8269,31 @@ mod tests {
     fn v4_arc03_scheduler_gives_each_ready_class_a_bounded_service_turn() {
         let capacity = 3;
         let (events, mut receiver) = test_event_mailboxes(capacity);
-        receiver.scheduler = ConnectorCallbackScheduler::new(ConnectorCallbackServiceWeights::new(
-            std::num::NonZeroUsize::new(2).expect("fixture weight is nonzero"),
-            std::num::NonZeroUsize::new(1).expect("fixture weight is nonzero"),
-            std::num::NonZeroUsize::new(1).expect("fixture weight is nonzero"),
+        receiver.scheduler = ConnectorCallbackScheduler::new(explicit_callback_policy(
+            capacity,
+            2,
+            1,
+            1,
+            RealtimeConnectorPolicy::enabled(),
         ));
-        for event in [
-            TransportEvent::DataChannelOpen,
-            TransportEvent::DataChannelClosed,
-            TransportEvent::RenegotiationNeeded,
-        ] {
+        for candidate in ["candidate-1", "candidate-2", "candidate-3"] {
             events
-                .control
-                .try_send(QueuedTransportEvent {
-                    event,
-                    observation: None,
-                })
+                .try_insert_for_test(
+                    TransportEvent::LocalIceCandidate(Some(LocalIceCandidate {
+                        candidate: candidate.to_string(),
+                        sdp_mid: Some("0".to_string()),
+                        sdp_mline_index: Some(0),
+                        username_fragment: Some("fixture".to_string()),
+                    })),
+                    None,
+                )
                 .expect("fixture control mailbox has capacity");
         }
         events
-            .endpoint_data
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::Message(Bytes::from_static(b"endpoint")),
-                observation: None,
-            })
+            .try_insert_for_test(
+                TransportEvent::Message(Bytes::from_static(b"endpoint")),
+                None,
+            )
             .expect("fixture endpoint-data mailbox has capacity");
         let realtime_flow = receiver
             .realtime_flows
@@ -5629,17 +8312,18 @@ mod tests {
                     _reservation: None,
                 }),
                 observation: None,
+                callback_work: None,
             },
             reservation,
         ));
 
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::DataChannelOpen)
+            Ok(TransportEvent::LocalIceCandidate(_))
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::DataChannelClosed)
+            Ok(TransportEvent::LocalIceCandidate(_))
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -5651,7 +8335,7 @@ mod tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::RenegotiationNeeded)
+            Ok(TransportEvent::LocalIceCandidate(_))
         ));
     }
 
@@ -5677,18 +8361,10 @@ mod tests {
             .expect("fixture Hello serializes"),
         );
         events
-            .endpoint_data
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::Message(first_handshake.clone()),
-                observation: None,
-            })
+            .try_insert_for_test(TransportEvent::Message(first_handshake.clone()), None)
             .expect("fixture endpoint mailbox has capacity");
         events
-            .control
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::DataChannelOpen,
-                observation: None,
-            })
+            .try_insert_for_test(TransportEvent::DataChannelOpen, None)
             .expect("fixture control mailbox has capacity");
 
         let before_commit = receiver
@@ -5716,18 +8392,13 @@ mod tests {
         receiver.scheduler.cursor = ConnectorCallbackClass::EndpointData.index();
         receiver.scheduler.remaining = 1;
         events
-            .endpoint_data
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::Message(Bytes::from_static(b"stale-handshake")),
-                observation: None,
-            })
+            .try_insert_for_test(
+                TransportEvent::Message(Bytes::from_static(b"stale-handshake")),
+                None,
+            )
             .expect("fixture endpoint mailbox has capacity");
         events
-            .control
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::DataChannelClosed,
-                observation: None,
-            })
+            .try_insert_for_test(TransportEvent::DataChannelClosed, None)
             .expect("fixture control mailbox has capacity");
 
         let event = receiver
@@ -5736,8 +8407,8 @@ mod tests {
             .expect("close remains deliverable before open commitment");
         assert!(matches!(event.event, TransportEvent::DataChannelClosed));
         assert!(matches!(
-            receiver.endpoint_data.try_recv(),
-            Ok(QueuedTransportEvent {
+            receiver.endpoint_data.try_take(),
+            Some(QueuedTransportEvent {
                 event: TransportEvent::Message(bytes),
                 ..
             }) if bytes == Bytes::from_static(b"stale-handshake")
@@ -5777,23 +8448,19 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
+            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
         };
         events
-            .endpoint_data
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::Message(Bytes::from_static(b"stale-handshake")),
-                observation: Some(observation),
-            })
+            .try_insert_for_test(
+                TransportEvent::Message(Bytes::from_static(b"stale-handshake")),
+                Some(observation),
+            )
             .expect("fixture endpoint mailbox has capacity");
         events
-            .control
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::DataChannelClosed,
-                observation: None,
-            })
+            .try_insert_for_test(TransportEvent::DataChannelClosed, None)
             .expect("fixture control mailbox has capacity");
 
         let close = receiver
@@ -5810,12 +8477,29 @@ mod tests {
     }
 
     #[test]
+    fn v4_arc03_observer_panic_cannot_poison_realtime_resource_ownership() {
+        let registry = test_realtime_registry_with_observer(
+            explicit_realtime_callback_policy(16, 1, 1, 16, 1, 32),
+            Arc::new(PanickingRealtimeObserver) as Arc<dyn RealtimeFlowObserver>,
+        );
+        let first = registry
+            .open_inbound_flow()
+            .expect("observation failure cannot refuse an admitted flow");
+        drop(first);
+        let second = registry
+            .open_inbound_flow()
+            .expect("the exact released flow claim remains reusable");
+        drop(second);
+        assert!(realtime_accounting_is_clean(&registry.state.lock()));
+    }
+
+    #[test]
     fn v4_arc03_realtime_flows_have_independent_bounded_queues() {
         let policy = explicit_realtime_callback_policy(16, 2, 1, 16, 2, 32);
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = RealtimeFlowRegistry::with_observer(
+        let registry = test_realtime_registry_with_observer(
             policy,
-            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+            observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let video = registry
             .open_inbound_flow()
@@ -5844,6 +8528,7 @@ mod tests {
             QueuedTransportEvent {
                 event: video_unit(1),
                 observation: None,
+                callback_work: None,
             },
             video.reserve_output(5).expect("video unit is reserved"),
         ));
@@ -5851,6 +8536,7 @@ mod tests {
             QueuedTransportEvent {
                 event: video_unit(2),
                 observation: None,
+                callback_work: None,
             },
             video
                 .reserve_output(5)
@@ -5860,6 +8546,7 @@ mod tests {
             QueuedTransportEvent {
                 event: audio_unit,
                 observation: None,
+                callback_work: None,
             },
             audio.reserve_output(5).expect("audio unit is reserved"),
         ));
@@ -5891,7 +8578,7 @@ mod tests {
     #[test]
     fn v4_arc03f_inbound_and_outbound_flow_slots_cannot_starve_each_other() {
         let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
-        let registry = RealtimeFlowRegistry::new(policy);
+        let registry = test_realtime_registry(policy);
 
         let inbound = registry
             .open_inbound_flow()
@@ -5911,7 +8598,7 @@ mod tests {
     #[test]
     fn v4_arc03f_realtime_bytes_follow_payload_clones_through_downstream_queues() {
         let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
-        let registry = RealtimeFlowRegistry::new(policy);
+        let registry = test_realtime_registry(policy);
         let flow = registry
             .open_inbound_flow()
             .expect("fixture inbound flow is admitted");
@@ -5924,6 +8611,7 @@ mod tests {
                     _reservation: None,
                 }),
                 observation: None,
+                callback_work: None,
             },
             flow.reserve_output(5).expect("payload bytes are reserved"),
         ));
@@ -5944,9 +8632,9 @@ mod tests {
     async fn v4_arc03f_complete_realtime_unit_has_no_wall_clock_expiry() {
         let policy = explicit_realtime_callback_policy(16, 1, 2, 16, 1, 32);
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = RealtimeFlowRegistry::with_observer(
+        let registry = test_realtime_registry_with_observer(
             policy,
-            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+            observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         assert!(flow.enqueue(
@@ -5958,6 +8646,7 @@ mod tests {
                     _reservation: None,
                 }),
                 observation: None,
+                callback_work: None,
             },
             flow.reserve_output(5).expect("unit is reserved"),
         ));
@@ -5982,7 +8671,7 @@ mod tests {
     #[test]
     fn v4_arc03_realtime_byte_claims_precede_fragment_and_output_retention() {
         let policy = explicit_realtime_callback_policy(4, 1, 1, 4, 1, 8);
-        let registry = RealtimeFlowRegistry::new(policy);
+        let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembly = flow.begin_unit().expect("first unit is admitted");
         assert!(flow.begin_unit().is_none(), "in-progress limit is exact");
@@ -6037,7 +8726,7 @@ mod tests {
             ConnectorRealtimeByteBudgets::new(nonzero(8), nonzero(4)),
             crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
         );
-        let realtime = RealtimeConnectorPolicy::enabled(nonzero(4), flows)
+        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(nonzero(4), flows)
             .expect("fixture can hold one guarded input and output");
         let policy = ConnectorCallbackPolicy::new(
             crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
@@ -6048,7 +8737,7 @@ mod tests {
             realtime,
         )
         .expect("fixture callback policy is valid");
-        let registry = RealtimeFlowRegistry::new(policy);
+        let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembly = flow.begin_unit().expect("unit is admitted");
 
@@ -6066,7 +8755,7 @@ mod tests {
     #[test]
     fn v4_arc03_realtime_accounting_corruption_fails_closed() {
         let policy = explicit_realtime_callback_policy(4, 1, 1, 4, 1, 8);
-        let registry = RealtimeFlowRegistry::new(policy);
+        let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let reservation = flow.reserve_output(4).expect("output is admitted");
         registry.state.lock().retained_bytes_by_domain
@@ -6094,8 +8783,7 @@ mod tests {
 
     #[test]
     fn v4_arc03h_sustained_pre_auth_rtp_exhausts_a_finite_cumulative_envelope() {
-        let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
         let _flow = registry
             .open_inbound_flow()
             .expect("explicit provider owns one speculative inbound flow");
@@ -6113,8 +8801,7 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03_cancelled_realtime_output_work_releases_its_claim() {
-        let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -6136,8 +8823,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_realtime_flow_retirement_drains_its_owned_queue() {
-        let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(8, 1, 2, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 2, 8, 1, 16));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         assert!(flow.enqueue(
             QueuedTransportEvent {
@@ -6148,6 +8834,7 @@ mod tests {
                     _reservation: None,
                 }),
                 observation: None,
+                callback_work: None,
             },
             flow.reserve_output(5).expect("unit is admitted"),
         ));
@@ -6247,6 +8934,65 @@ mod tests {
         assert_eq!(owner.report().active_candidates, 0);
         assert_eq!(owner.report().failed_cleanup_candidates, 0);
         assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_close_before_native_attach_closes_late_port_and_releases_claim() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        close_owner.mark_native_allocation_started();
+
+        close_owner.start();
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 0);
+
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+        close_owner
+            .wait()
+            .await
+            .expect("the exact late close port completes the pending close owner");
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert_eq!(owner.report().failed_cleanup_candidates, 0);
+        assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_native_constructor_without_close_port_retains_exact_claim() {
+        let owner = test_resource_owner(2, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        close_owner.mark_native_allocation_started();
+        close_owner.finish_native_allocation_without_close_port(
+            "native construction ended without an observable close owner".to_string(),
+        );
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("unobservable constructor cleanup must retain its exact claim");
+        assert!(error
+            .to_string()
+            .contains("native construction ended without an observable close owner"));
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 1);
+        assert!(!owner.report().accounting_poisoned);
+
+        let (permit, _lifetime, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
+        let unrelated = permit
+            .reserve_connector_candidate(claim)
+            .expect("the failed constructor retains only its own exact claim");
+        assert_eq!(owner.report().active_candidates, 2);
+        drop(unrelated);
     }
 
     #[tokio::test]
@@ -6681,9 +9427,7 @@ mod tests {
         assert!(first_close_owner.ownership.owns_endpoint_auth(&first_task));
         assert!(!second_close_owner.ownership.owns_endpoint_auth(&first_task));
 
-        let first_flow = crate::connector::ConnectorRealtimeFlowCapability::new(Arc::clone(
-            &first_close_owner.ownership.incarnation,
-        ));
+        let first_flow = test_realtime_capability(&first_close_owner.ownership);
         assert!(first_close_owner.ownership.owns_realtime_flow(&first_flow));
         assert!(!second_close_owner.ownership.owns_realtime_flow(&first_flow));
 
@@ -6691,6 +9435,56 @@ mod tests {
         assert!(!first_close_owner.ownership.owns_endpoint_auth(&first_task));
         assert!(!first_close_owner.ownership.owns_realtime_flow(&first_flow));
         drop((first_task, first_flow));
+    }
+
+    #[test]
+    fn v4_arc03_connector_operations_require_and_release_exact_work_claims() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+
+        let first = close_owner
+            .ownership
+            .enter_operation()
+            .expect("fixture provider grants one connector operation");
+        let pressure = match close_owner.ownership.enter_operation() {
+            Ok(_) => panic!("a second operation has no unowned work capacity"),
+            Err(error) => error,
+        };
+        assert!(pressure.to_string().contains("resource pressure"));
+
+        drop(first);
+        let replacement = close_owner
+            .ownership
+            .enter_operation()
+            .expect("dropping the exact operation restores its work capacity");
+        drop(replacement);
+    }
+
+    #[test]
+    fn v4_arc03_legacy_realtime_capability_holds_its_exact_resource_lease() {
+        let owner = test_resource_owner(1, 1);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let first = test_realtime_capability(&close_owner.ownership);
+        let claim = crate::connector::realtime_flow_capability_claim()
+            .expect("fixture capability claim is representable");
+
+        let pressure = close_owner
+            .ownership
+            .work_resource_scope
+            .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
+            .expect_err("a live compatibility capability retains its finite claim");
+        assert!(matches!(
+            pressure,
+            crate::resource::ResourceUnavailable::Pressure(_)
+        ));
+
+        drop(first);
+        let replacement = close_owner
+            .ownership
+            .work_resource_scope
+            .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
+            .expect("dropping the capability restores its exact capacity");
+        drop(replacement);
     }
 
     #[tokio::test]
@@ -6729,7 +9523,7 @@ mod tests {
         let candidate_use = candidate_resource_measurement(&candidate).observed();
         let mut queue = PendingRemoteCandidateQueue::new(test_pending_candidate_policy());
         assert_eq!(
-            queue.push(
+            queue.push_observed_for_test(
                 candidate,
                 Arc::new(RemoteCandidateAttemptIdentity::default()),
                 &scope,
@@ -6760,6 +9554,48 @@ mod tests {
         let completed = candidate_report(&context.report().pre_authentication);
         assert_eq!(completed.active, ResourceUse::ZERO);
         assert_eq!(completed.completed_lease_count, 2);
+    }
+
+    #[test]
+    fn v4_arc03_candidate_queue_reserves_actual_string_capacity_before_node_insertion() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let mut candidate = observed_candidate();
+        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let pressure = state
+            .current
+            .work_resources
+            .pressure(
+                crate::resource::ResourceAuthorityClass::Speculative,
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+            )
+            .expect("fixture provider reports its exact remaining capacity");
+        let remaining = pressure
+            .capacity
+            .checked_sub(pressure.in_use)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .expect("fixture remaining capacity is representable");
+        let mut inflated = String::with_capacity(
+            candidate
+                .candidate
+                .len()
+                .checked_add(remaining)
+                .and_then(|capacity| capacity.checked_add(1))
+                .expect("fixture capacity is representable"),
+        );
+        inflated.push_str(&candidate.candidate);
+        candidate.candidate = inflated;
+
+        assert!(matches!(
+            state.admit(candidate, &scope),
+            PendingRemoteCandidateQueuePush::ResourceUnavailable(ResourceUnavailable::Pressure(_))
+        ));
+        assert!(state.current.pending.entries.is_empty());
+        assert!(state.current.seen.is_empty());
+        assert!(!state.current.attempt.is_active());
     }
 
     #[test]
@@ -6901,7 +9737,7 @@ mod tests {
         let mut queue = PendingRemoteCandidateQueue::new(policy);
         let budget = Arc::clone(&queue.budget);
         assert_eq!(
-            queue.push(
+            queue.push_observed_for_test(
                 candidate,
                 Arc::new(RemoteCandidateAttemptIdentity::default()),
                 &scope,
@@ -6936,7 +9772,7 @@ mod tests {
         let mut state = RemoteCandidateState::new(policy);
         let displaced_budget = Arc::clone(&state.current.pending.budget);
         assert_eq!(
-            state.current.pending.push(
+            state.current.pending.push_observed_for_test(
                 observed_candidate(),
                 Arc::clone(&state.current.attempt),
                 &scope,
@@ -6995,7 +9831,13 @@ mod tests {
             .expect("replacement remains provisional");
         assert_eq!(provisional.envelope.pending.entries.len(), 1);
         assert!(Arc::ptr_eq(
-            &provisional.envelope.pending.entries[0].attempt,
+            &provisional
+                .envelope
+                .pending
+                .entries
+                .front()
+                .expect("replacement queue contains its candidate")
+                .attempt,
             &replacement
         ));
         assert!(
@@ -7020,6 +9862,121 @@ mod tests {
         assert!(state.provisional.is_none());
         assert!(Arc::ptr_eq(&state.current.attempt, &replacement));
         assert_eq!(state.current.pending.entries.len(), 1);
+        assert!(
+            state.current.provisional_root_lease.is_none(),
+            "steady state cannot retain the provisional overlap root"
+        );
+    }
+
+    #[test]
+    fn v4_arc03_local_restart_overlap_charge_releases_on_commit_and_failure() {
+        let policy = test_pending_candidate_policy();
+        let root_claim = crate::runtime::attempt::remote_candidate_attempt_root_claim()
+            .expect("fixture restart root claim is representable");
+        let overlap_charge = FiniteResourceProvider::reservation_charge_for_test(root_claim)
+            .expect("fixture restart reservation charge is representable");
+        let (provider, _owner, _candidate, _lifetime, work_scope) =
+            elastic_remote_candidate_test_resources_with_additional(policy, overlap_charge);
+        let mut state = RemoteCandidateState::with_resources(policy, work_scope);
+        let baseline = provider.in_use();
+
+        let (_, replacement) = state
+            .begin_local_ice_restart()
+            .expect("the exact overlap charge admits one provisional restart");
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(overlap_charge)
+                .expect("fixture overlap total is representable")
+        );
+        state
+            .commit_local_ice_restart(&replacement)
+            .expect("commit installs the replacement attempt");
+        assert_eq!(provider.in_use(), baseline);
+
+        let (_, failed_replacement) = state
+            .begin_local_ice_restart()
+            .expect("the restored capacity admits another provisional restart");
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(overlap_charge)
+                .expect("fixture overlap total is representable")
+        );
+        state.fail_provisional(&failed_replacement);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_dropped_ice_transaction_fences_attempt_and_starts_exact_close_owner() {
+        let policy = test_pending_candidate_policy();
+        let state = Arc::new(SyncMutex::new(
+            RemoteCandidateState::new_with_restart_overlap(policy),
+        ));
+        let resource_owner = test_resource_owner(1, 1);
+        let (close_owner, _attempt_lifetime) = close_owner_fixture(&resource_owner);
+        assert!(close_owner.attach_remote_candidates(Arc::clone(&state)));
+
+        let replacement = {
+            let mut candidate_state = state.lock();
+            let (_, replacement) = candidate_state
+                .begin_local_ice_restart()
+                .expect("fixture local restart becomes provisional");
+            replacement
+        };
+        let transaction = UncommittedIceTransaction::new(
+            Arc::clone(&state),
+            Arc::clone(&close_owner),
+            Arc::clone(&replacement),
+        );
+
+        drop(transaction);
+
+        {
+            let candidate_state = state.lock();
+            assert!(candidate_state.provisional.is_none());
+            assert!(!candidate_state.current.attempt.is_active());
+            assert!(!replacement.is_active());
+        }
+        close_owner
+            .wait()
+            .await
+            .expect("the exact close owner completes after cancellation");
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_dropped_remote_description_cannot_leave_reusable_inflight_state() {
+        let state = Arc::new(SyncMutex::new(RemoteCandidateState::new(
+            test_pending_candidate_policy(),
+        )));
+        let resource_owner = test_resource_owner(1, 1);
+        let (close_owner, _attempt_lifetime) = close_owner_fixture(&resource_owner);
+        assert!(close_owner.attach_remote_candidates(Arc::clone(&state)));
+        let prepared = state
+            .lock()
+            .prepare_remote_description(
+                sdp_ice_credentials(&exact_ice_sdp("cancel-u", "cancel-p", "AA:BB:CC:DD"))
+                    .expect("fixture remote credentials are exact"),
+            )
+            .expect("fixture remote description enters its transaction");
+        assert!(state.lock().current.remote_description_in_flight);
+        let transaction = UncommittedIceTransaction::new(
+            Arc::clone(&state),
+            Arc::clone(&close_owner),
+            Arc::clone(&prepared.attempt),
+        );
+
+        drop(transaction);
+
+        {
+            let candidate_state = state.lock();
+            assert!(!candidate_state.current.remote_description_in_flight);
+            assert!(!candidate_state.current.attempt.is_active());
+        }
+        close_owner
+            .wait()
+            .await
+            .expect("remote-description cancellation closes the exact connector");
     }
 
     #[test]
@@ -7117,7 +10074,13 @@ mod tests {
             .as_ref()
             .expect("replacement stays provisional");
         assert!(Arc::ptr_eq(
-            &provisional.envelope.pending.entries[0].attempt,
+            &provisional
+                .envelope
+                .pending
+                .entries
+                .front()
+                .expect("replacement queue contains its candidate")
+                .attempt,
             &prepared.attempt
         ));
 
@@ -7160,7 +10123,8 @@ mod tests {
     #[test]
     fn v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates() {
         fn initialized_state() -> RemoteCandidateState {
-            let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+            let mut state =
+                RemoteCandidateState::new_with_restart_overlap(test_pending_candidate_policy());
             let initial = state
                 .prepare_remote_description(
                     sdp_ice_credentials(&exact_ice_sdp("old-u", "old-p", "AA:BB:CC:DD"))
@@ -7224,7 +10188,13 @@ mod tests {
             .pending
             .entries;
         assert_eq!(migrated.len(), 1);
-        assert!(Arc::ptr_eq(&migrated[0].attempt, &prepared.attempt));
+        assert!(Arc::ptr_eq(
+            &migrated
+                .front()
+                .expect("replacement queue contains its candidate")
+                .attempt,
+            &prepared.attempt
+        ));
         state.fail_remote_description(&prepared);
 
         let mut state = initialized_state();
@@ -7267,7 +10237,13 @@ mod tests {
             .expect("replacement stays provisional");
         assert_eq!(provisional.envelope.pending.entries.len(), 1);
         assert!(Arc::ptr_eq(
-            &provisional.envelope.pending.entries[0].attempt,
+            &provisional
+                .envelope
+                .pending
+                .entries
+                .front()
+                .expect("replacement queue contains its candidate")
+                .attempt,
             &prepared.attempt
         ));
         assert_eq!(
@@ -7328,13 +10304,14 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut over_limit = observed_candidate();
+        over_limit.candidate.push_str(" distinct");
+        let mut state =
+            RemoteCandidateState::new(test_pending_candidate_policy_for(&[over_limit.clone()]));
         assert_eq!(
             state.admit(observed_candidate(), &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        let mut over_limit = observed_candidate();
-        over_limit.candidate.push_str(" distinct");
         assert_eq!(
             state.admit(over_limit, &scope),
             PendingRemoteCandidateQueuePush::Refused
@@ -7387,7 +10364,10 @@ mod tests {
             ._queue_reservation
             .expect("unique candidate carries the attempt budget");
         assert!(first_reservation.budget.reserve_application_work());
-        state.current.retained_reservations.push(first_reservation);
+        state
+            .current
+            .retained_reservations
+            .push_back(first_reservation);
 
         assert_eq!(
             state.admit(first.clone(), &scope),
@@ -7470,7 +10450,7 @@ mod tests {
         for (index, candidate) in candidates.iter().cloned().enumerate() {
             let pushed_at = Instant::now();
             assert_eq!(
-                queue.push(
+                queue.push_observed_for_test(
                     candidate,
                     Arc::new(RemoteCandidateAttemptIdentity::default()),
                     &scope,
@@ -7485,7 +10465,7 @@ mod tests {
         }
         let duplicate_at = Instant::now();
         assert_eq!(
-            queue.push(
+            queue.push_observed_for_test(
                 candidates[0].clone(),
                 Arc::new(RemoteCandidateAttemptIdentity::default()),
                 &scope,
@@ -7620,6 +10600,7 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
+            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -7627,11 +10608,7 @@ mod tests {
 
         ownership.retire();
         events_tx
-            .control
-            .try_send(QueuedTransportEvent {
-                event: TransportEvent::DataChannelClosed,
-                observation: None,
-            })
+            .try_insert_for_test(TransportEvent::DataChannelClosed, None)
             .expect("retained callback sender still has a bounded raw receiver");
 
         assert!(receiver.recv().await.is_none());
@@ -7639,7 +10616,7 @@ mod tests {
 
     fn assert_callback_class_backpressure(first: TransportEvent, second: TransportEvent) {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+        let policy = test_callback_policy(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink(events, policy, None);
@@ -7665,9 +10642,9 @@ mod tests {
     fn assert_realtime_flow_backpressure(first: TransportEvent, second: TransportEvent) {
         let policy = explicit_realtime_callback_policy(16, 1, 1, 16, 1, 32);
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = RealtimeFlowRegistry::with_observer(
+        let registry = test_realtime_registry_with_observer(
             policy,
-            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+            observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let flow = registry
             .open_inbound_flow()
@@ -7684,6 +10661,7 @@ mod tests {
             QueuedTransportEvent {
                 event: first,
                 observation: None,
+                callback_work: None,
             },
             first_reservation,
         ));
@@ -7694,6 +10672,7 @@ mod tests {
             QueuedTransportEvent {
                 event: second,
                 observation: None,
+                callback_work: None,
             },
             second_reservation,
         ));
@@ -7716,9 +10695,8 @@ mod tests {
     #[test]
     fn v4_arc03i_lifecycle_control_does_not_compete_for_mailbox_capacity() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
-            NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
-        );
+        let policy =
+            test_callback_policy(NonZeroUsize::new(1).expect("fixture capacity is nonzero"));
         let sink = test_event_sink(events, policy, None);
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -7804,7 +10782,7 @@ mod tests {
         // This raw laboratory envelope is derived only to hold the requested
         // finite observation workload. It is not a production policy or a
         // proposed default.
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(callback_capacity);
+        let policy = test_callback_policy(callback_capacity);
 
         for class in [
             ConnectorCallbackClass::Control,
@@ -7839,9 +10817,9 @@ mod tests {
         }
 
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = RealtimeFlowRegistry::with_observer(
+        let registry = test_realtime_registry_with_observer(
             policy,
-            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+            observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let mut admitted_flows = Vec::with_capacity(flows.get());
         for _ in 0..flows.get() {
@@ -7867,6 +10845,7 @@ mod tests {
                             _reservation: None,
                         }),
                         observation: None,
+                        callback_work: None,
                     },
                     reservation,
                 ));
@@ -7916,7 +10895,7 @@ mod tests {
             1,
             retained_bytes,
         );
-        let registry = RealtimeFlowRegistry::new(policy);
+        let registry = test_realtime_registry(policy);
         let saturated = registry
             .open_inbound_flow()
             .expect("observation admits the saturated flow");
@@ -7942,6 +10921,7 @@ mod tests {
                         _reservation: None,
                     }),
                     observation: None,
+                    callback_work: None,
                 },
                 reservation,
             ));
@@ -7961,6 +10941,7 @@ mod tests {
                         _reservation: None,
                     }),
                     observation: None,
+                    callback_work: None,
                 },
                 reservation,
             ));
@@ -8004,7 +10985,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03h_callback_producer_flood_cannot_queue_behind_full_mailbox() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+        let policy = test_callback_policy(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink(events, policy, None);
@@ -8052,26 +11033,17 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
+            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
         };
         events_tx
-            .control
-            .send(QueuedTransportEvent {
-                event: TransportEvent::DataChannelOpen,
-                observation: None,
-            })
-            .await
+            .try_insert_for_test(TransportEvent::DataChannelOpen, None)
             .expect("first callback is queued");
         let first = receiver.recv().await.expect("first event reaches engine");
         events_tx
-            .control
-            .send(QueuedTransportEvent {
-                event: TransportEvent::DataChannelClosed,
-                observation: None,
-            })
-            .await
+            .try_insert_for_test(TransportEvent::DataChannelClosed, None)
             .expect("second callback is queued behind the engine handoff");
 
         let mut second_receive = Box::pin(receiver.recv());
@@ -8098,10 +11070,11 @@ mod tests {
         {
             let mut candidates = remote_candidates.lock();
             let attempt = Arc::clone(&candidates.current.attempt);
-            candidates
-                .current
-                .pending
-                .push(observed_candidate(), attempt, &resource_scope);
+            candidates.current.pending.push_observed_for_test(
+                observed_candidate(),
+                attempt,
+                &resource_scope,
+            );
         }
         let (_events_tx, events) = test_event_mailboxes(1);
         let mut receiver = WebRtcConnectorEventReceiver {
@@ -8112,6 +11085,7 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
+            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -8133,7 +11107,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
     async fn v4_arc03j_native_local_ice_restart_commits_exact_replacement() {
-        let owner = test_resource_owner(1, 4);
+        // Transactional restart retains the old candidate-attempt claim until
+        // the replacement attempt commits.
+        let owner = test_resource_owner(2, 4);
         let scope = ProcessResourceRoot::isolated()
             .mesh_runtime_scope()
             .network_instance_scope()
@@ -8172,7 +11148,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
     async fn v4_arc03j_native_local_ice_restart_failure_retires_connector() {
-        let owner = test_resource_owner(1, 4);
+        // The failure interleaving exercises the same provisional two-attempt
+        // ownership overlap as the successful restart.
+        let owner = test_resource_owner(2, 4);
         let scope = ProcessResourceRoot::isolated()
             .mesh_runtime_scope()
             .network_instance_scope()
@@ -8212,6 +11190,43 @@ mod tests {
             .retire_and_close()
             .await
             .expect("idempotent final cleanup owns the already closed native peer");
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_cancelled_pending_native_constructor_retains_exact_claim() {
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let owner = test_resource_owner(1, 4);
+        let mut transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner.clone(), test_webrtc_profile(4));
+        let hook = ConstructionTestHook::new(ConstructionPause::BeforeNativeConstructor);
+        transport.construction_hook = Some(Arc::clone(&hook));
+        let construction_scope = context.peer_connection_scope();
+        let construction = tokio::spawn(async move {
+            transport
+                .open_connector_peer(Role::Answerer, &[], &[], construction_scope)
+                .await
+        });
+
+        let entered = hook
+            .created
+            .acquire()
+            .await
+            .expect("construction hook remains open");
+        entered.forget();
+        construction.abort();
+        assert!(construction.await.is_err());
+
+        for _ in 0..32 {
+            if owner.report().failed_cleanup_candidates == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 1);
+        assert!(!owner.report().accounting_poisoned);
     }
 
     #[tokio::test]
@@ -8685,7 +11700,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_unsupported_candidate_measurement_is_inexact_not_a_panic() {
-        assert_eq!(measured_usize(None), (u64::MAX, true));
+        assert_eq!(measured_usize(None), (0, true));
     }
 
     #[test]
@@ -8983,7 +11998,8 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state =
+            RemoteCandidateState::new(test_pending_candidate_policy_for(&[conflicting.clone()]));
         assert_eq!(
             state.admit(conflicting, &scope),
             PendingRemoteCandidateQueuePush::InvalidBinding(
@@ -9017,6 +12033,168 @@ mod tests {
             &duplicate_line,
             &credentials
         ));
+    }
+
+    #[test]
+    fn v4_arc03_remote_sdp_credentials_share_one_exact_retention_lease() {
+        let sdp = exact_ice_sdp("shared-u", "shared-p", "AA:BB:CC:DD");
+        let bindings = parse_sdp_ice_credential_bindings(&sdp)
+            .expect("fixture SDP has one exact credential binding");
+        let initial_claim = remote_description_operation_claim(sdp.capacity())
+            .expect("fixture operation claim is representable");
+        let plan = plan_sdp_ice_credential_allocations(&sdp)
+            .expect("fixture allocation plan is representable");
+        let planned_claim = planned_remote_description_claim(plan, sdp.capacity())
+            .expect("fixture planned claim is representable");
+        let retained_claim =
+            retained_remote_description_claim(&bindings, bindings.capacity(), sdp.capacity(), true)
+                .expect("fixture retained claim is representable");
+        let post_native_claim = retained_remote_description_claim(
+            &bindings,
+            bindings.capacity(),
+            sdp.capacity(),
+            false,
+        )
+        .expect("fixture post-native claim is representable");
+        let additional = FiniteResourceProvider::reservation_charge_for_test(initial_claim)
+            .expect("fixture operation reservation is representable")
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(planned_claim)
+                    .expect("fixture planned reservation is representable"),
+            )
+            .and_then(|claim| {
+                claim.checked_add(
+                    FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+                        .expect("fixture retained reservation is representable"),
+                )
+            })
+            .expect("fixture description grant is representable");
+        let policy = test_pending_candidate_policy_for(&[observed_candidate()]);
+        let (provider, _owner, _candidate, _lifetime, work_scope) =
+            elastic_remote_candidate_test_resources_with_additional(policy, additional);
+        let baseline = provider.in_use();
+
+        let credentials = sdp_ice_credentials_owned(&sdp, sdp.capacity(), &work_scope)
+            .expect("the exact remote-description claim is admitted");
+        assert_eq!(
+            provider
+                .in_use()
+                .checked_sub(baseline)
+                .expect("the live description charge includes the baseline"),
+            FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+                .expect("fixture retained reservation is representable")
+        );
+
+        let shared_charge = provider.in_use();
+        let clone = credentials.clone();
+        assert_eq!(
+            provider.in_use(),
+            shared_charge,
+            "a process-local credential clone shares the original lease"
+        );
+
+        credentials
+            .finish_native_commit()
+            .expect("native commit releases only the scheduled-work claim");
+        let post_native_charge = provider.in_use();
+        assert_eq!(
+            post_native_charge
+                .checked_sub(baseline)
+                .expect("the post-native charge includes the baseline"),
+            FiniteResourceProvider::reservation_charge_for_test(post_native_claim)
+                .expect("fixture post-native reservation is representable")
+        );
+        drop(credentials);
+        assert_eq!(
+            provider.in_use(),
+            post_native_charge,
+            "dropping one shared owner cannot release the credential lease"
+        );
+        drop(clone);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_remote_sdp_residual_survives_failed_native_close() {
+        let sdp = exact_ice_sdp("failure-u", "failure-p", "AA:BB:CC:DD");
+        let bindings = parse_sdp_ice_credential_bindings(&sdp)
+            .expect("fixture SDP has one exact credential binding");
+        let plan = plan_sdp_ice_credential_allocations(&sdp)
+            .expect("fixture allocation plan is representable");
+        let initial_claim = remote_description_operation_claim(sdp.capacity())
+            .expect("fixture operation claim is representable");
+        let planned_claim = planned_remote_description_claim(plan, sdp.capacity())
+            .expect("fixture planned claim is representable");
+        let retained_claim =
+            retained_remote_description_claim(&bindings, bindings.capacity(), sdp.capacity(), true)
+                .expect("fixture retained claim is representable");
+        let post_native_claim = retained_remote_description_claim(
+            &bindings,
+            bindings.capacity(),
+            sdp.capacity(),
+            false,
+        )
+        .expect("fixture post-native claim is representable");
+        let additional = [initial_claim, planned_claim, retained_claim]
+            .into_iter()
+            .map(|claim| {
+                FiniteResourceProvider::reservation_charge_for_test(claim)
+                    .expect("fixture description reservation is representable")
+            })
+            .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+                total.checked_add(claim)
+            })
+            .expect("fixture description grant is representable");
+        let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
+            .checked_add(additional)
+            .expect("fixture process grant is representable");
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone())
+            .expect("fixture provider admits its process scope");
+        let process_owner = ConnectorResourceOwnerPort::new(port);
+        let mesh = process_owner
+            .issue_mesh_scope()
+            .expect("fixture process owner issues one Mesh scope");
+        let (close_owner, _lifetime) = close_owner_fixture(&mesh);
+        let credentials = sdp_ice_credentials_owned(
+            &sdp,
+            sdp.capacity(),
+            &close_owner.ownership.work_resource_scope,
+        )
+        .expect("the exact remote-description claim is admitted");
+        close_owner.retain_remote_description_resources(
+            credentials
+                .resource_owner()
+                .expect("owned credentials expose one residual owner"),
+        );
+        credentials
+            .finish_native_commit()
+            .expect("native commit releases only the scheduled-work claim");
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Error,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+        );
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("injected native close failure remains terminal");
+        assert!(error.to_string().contains("retained its exact claim"));
+        let expected = crate::runtime::attempt::connector_resource_structural_claims()
+            .connector_opening()
+            .checked_add(post_native_claim)
+            .expect("fixture retained claims are representable");
+        assert_eq!(provider.retained_after_failed_cleanup(), expected);
+
+        drop(credentials);
+        drop(close_owner);
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            expected,
+            "no external owner drop can make failed native state reusable"
+        );
     }
 
     #[test]
@@ -9054,7 +12232,8 @@ mod tests {
                 .mesh_runtime_scope()
                 .network_instance_scope()
                 .peer_connection_scope();
-            let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+            let mut state =
+                RemoteCandidateState::new(test_pending_candidate_policy_for(&[invalid.clone()]));
             assert_eq!(
                 state.admit(observed_candidate(), &scope),
                 PendingRemoteCandidateQueuePush::Queued,
@@ -9152,13 +12331,22 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
+        let corrupt_candidates = ["one", "two"].map(|suffix| {
+            let mut candidate = observed_candidate();
+            candidate.username_fragment = Some("replacement-fragment".to_string());
+            candidate.candidate.push_str(suffix);
+            candidate
+        });
+        let candidate_bytes = corrupt_candidates
+            .iter()
+            .filter_map(candidate_content_bytes)
+            .max()
+            .and_then(NonZeroUsize::new)
+            .expect("corrupt fixture candidates have finite nonzero content");
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let mut state = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
-            one,
-            NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-            one,
-            one,
-        ));
+        let mut state = RemoteCandidateState::new_with_restart_overlap(
+            PendingRemoteCandidatePolicy::new(one, candidate_bytes, one, one),
+        );
         let initial_credentials = sdp_ice_credentials(&exact_ice_sdp(
             "initial-fragment",
             "initial-password",
@@ -9174,15 +12362,12 @@ mod tests {
                 .expect("initial remote description commits"),
         );
 
-        for suffix in ["one", "two"] {
-            let mut candidate = observed_candidate();
-            candidate.username_fragment = Some("replacement-fragment".to_string());
-            candidate.candidate.push_str(suffix);
+        for candidate in corrupt_candidates {
             state
                 .current
                 .pending
                 .entries
-                .push(PendingRemoteCandidate::observe(
+                .push_back(PendingRemoteCandidate::observe(
                     candidate,
                     Arc::clone(&state.current.attempt),
                     &scope,
@@ -9407,8 +12592,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_guarded_video_refuses_fragment_before_retention() {
-        let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(8, 1, 1, 2, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 2, 1, 16));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembler = H264AuAssembler::guarded(flow);
         assert!(assembler
@@ -9423,8 +12607,7 @@ mod tests {
 
     #[test]
     fn v4_arc03f_silent_partial_unit_retains_only_its_finite_claim_until_owner_drop() {
-        let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembler = H264AuAssembler::guarded(flow);
         assert!(assembler
@@ -9447,7 +12630,7 @@ mod tests {
     #[test]
     fn v4_arc03_guarded_video_reordered_unit_transfers_exact_output_claim() {
         let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(32, 1, 1, 8, 1, 64));
+            test_realtime_registry(explicit_realtime_callback_policy(32, 1, 1, 8, 1, 64));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembler = H264AuAssembler::guarded(flow);
         let anchor = assembler
@@ -9482,7 +12665,7 @@ mod tests {
     #[test]
     fn v4_arc03f_guarded_video_in_progress_limit_is_independent_per_flow() {
         let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
+            test_realtime_registry(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
         let first_flow = registry
             .open_inbound_flow()
             .expect("first flow is admitted");
@@ -9519,7 +12702,7 @@ mod tests {
     #[test]
     fn v4_arc03f_in_progress_unit_limit_is_enforced_per_flow() {
         let registry =
-            RealtimeFlowRegistry::new(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
+            test_realtime_registry(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
         let first_flow = registry
             .open_inbound_flow()
             .expect("first flow is admitted");
@@ -9687,7 +12870,7 @@ mod tests {
         let observed_at = Instant::now();
         let transport = Transport::new().expect("transport");
         let cfg = RTCConfiguration::default();
-        let callback_policy = test_webrtc_profile(32).callbacks();
+        let callback_policy = test_webrtc_profile(NATIVE_LOOPBACK_CALLBACK_CAPACITY).callbacks();
         let (offerer, mut off_rx) = transport
             .open_peer_with_config(Role::Offerer, cfg.clone(), callback_policy)
             .await
@@ -9858,6 +13041,13 @@ mod tests {
     #[tokio::test]
     async fn loopback_video_lane_carries_h264_samples() {
         let observed_at = Instant::now();
+        let planned_au: Vec<u8> = {
+            let mut value = vec![0u8, 0, 0, 1, 0x65];
+            value.extend((0..400u32).map(|i| (i % 251) as u8));
+            value
+        };
+        let fixture_unit_bytes = NonZeroUsize::new(planned_au.len())
+            .expect("the native video fixture access unit is nonempty");
         // Same loopback bring-up as the data-channel test, but the
         // assertion is on the provisioned video lane: an Annex-B access
         // unit written on the offerer's track arrives at the answerer as
@@ -9865,12 +13055,14 @@ mod tests {
         // the negotiation-without-renegotiation property end to end:
         // m-line in the one offer/answer, RTP, depacketize, reassembly.
         let transport = Transport::new().expect("transport");
-        let (offerer, mut off_rx) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
-            .await
-            .expect("offerer");
-        let (answerer, mut ans_rx) = open_explicit_legacy_media_peer(&transport, Role::Answerer)
-            .await
-            .expect("answerer");
+        let (offerer, mut off_rx, _offerer_owner) =
+            open_explicit_legacy_media_peer(&transport, Role::Offerer, fixture_unit_bytes)
+                .await
+                .expect("offerer");
+        let (answerer, mut ans_rx, _answerer_owner) =
+            open_explicit_legacy_media_peer(&transport, Role::Answerer, fixture_unit_bytes)
+                .await
+                .expect("answerer");
 
         // Lifecycle era: lane 3 doesn't exist until someone asks for
         // it. Prime it with one pre-negotiation write — the write
@@ -9899,11 +13091,7 @@ mod tests {
 
         // One synthetic IDR access unit. The H264 payloader parses
         // Annex-B, so the bytes must be a plausible NAL stream.
-        let au: Vec<u8> = {
-            let mut v = vec![0u8, 0, 0, 1, 0x65];
-            v.extend((0..400u32).map(|i| (i % 251) as u8));
-            v
-        };
+        let au = planned_au;
 
         // The track binds only once negotiation + ICE complete, and
         // writes before that are silent no-ops — so keep (re)sending
@@ -9957,18 +13145,27 @@ mod tests {
     #[tokio::test]
     async fn loopback_audio_lane_carries_opus_frames() {
         let observed_at = Instant::now();
+        let planned_frame: Vec<u8> = {
+            let mut value = vec![0x78u8];
+            value.extend((0..160u32).map(|i| (i % 251) as u8));
+            value
+        };
+        let fixture_unit_bytes = NonZeroUsize::new(planned_frame.len())
+            .expect("the native audio fixture frame is nonempty");
         // The audio twin of the video lane test: an Opus frame written
         // on the offerer's audio track arrives at the answerer as one
         // AudioSample, byte-equal — the same single offer/answer
         // negotiates both lanes, and no reassembly exists to get wrong
         // (one frame per RTP packet, RFC 7587).
         let transport = Transport::new().expect("transport");
-        let (offerer, mut off_rx) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
-            .await
-            .expect("offerer");
-        let (answerer, mut ans_rx) = open_explicit_legacy_media_peer(&transport, Role::Answerer)
-            .await
-            .expect("answerer");
+        let (offerer, mut off_rx, _offerer_owner) =
+            open_explicit_legacy_media_peer(&transport, Role::Offerer, fixture_unit_bytes)
+                .await
+                .expect("offerer");
+        let (answerer, mut ans_rx, _answerer_owner) =
+            open_explicit_legacy_media_peer(&transport, Role::Answerer, fixture_unit_bytes)
+                .await
+                .expect("answerer");
 
         // Lifecycle era: lane 5 doesn't exist until someone asks for
         // it. Prime it with one pre-negotiation write — the write
@@ -9997,11 +13194,7 @@ mod tests {
 
         // One synthetic Opus frame: a valid TOC byte then arbitrary
         // payload — the lane ships bytes, it never parses them.
-        let frame: Vec<u8> = {
-            let mut v = vec![0x78u8];
-            v.extend((0..160u32).map(|i| (i % 251) as u8));
-            v
-        };
+        let frame = planned_frame;
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut received: Option<AudioSample> = None;
@@ -10053,62 +13246,75 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
-    async fn v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks() {
-        let observed_at = Instant::now();
-        let owner = test_resource_owner(1, 4);
-        let process = ProcessResourceRoot::isolated();
-        let scope = process
-            .mesh_runtime_scope()
-            .network_instance_scope()
-            .peer_connection_scope();
-        let transport = Transport::new()
-            .expect("test transport")
-            .with_connector_resource_scope(owner, test_generic_realtime_webrtc_profile(4));
-        assert!(
-            transport.legacy_media_api.lock().is_none(),
-            "generic construction does not register compatibility codecs"
-        );
-        let (worker, _events) = transport
-            .open_connector_peer(Role::Offerer, &[], &[], scope)
-            .await
-            .expect("data-only connector is constructed");
-
-        let offer = worker
-            .create_offer()
-            .await
-            .expect("data-only connector creates an offer");
-        assert!(offer
-            .sdp
-            .lines()
-            .any(|line| line.starts_with("m=application")));
-        assert!(!offer.sdp.lines().any(|line| line.starts_with("m=audio")));
-        assert!(!offer.sdp.lines().any(|line| line.starts_with("m=video")));
-        assert!(
-            transport.legacy_media_api.lock().is_none(),
-            "opening a provider-free connector keeps codec registration absent"
-        );
-
-        assert_eq!(worker.session.open_lane_count(LaneKind::Video), 0);
-        assert_eq!(worker.session.open_lane_count(LaneKind::Audio), 0);
-        assert!(worker.session.legacy_media_profile.is_none());
-        assert!(worker
-            .session
-            .send_video(0, Bytes::from_static(b"unit"), Duration::ZERO)
-            .await
-            .expect_err("codec-neutral policy has no compatibility provider")
-            .to_string()
-            .contains("no video lane"));
-        if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
-            println!(
-                "arc03_data_only_raw constructed_ns={} video_tracks=0 audio_tracks=0",
-                observed_at.elapsed().as_nanos()
+    async fn v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks() {
+        for (profile_name, profile) in [
+            ("disabled", test_webrtc_profile(4)),
+            (
+                "generic-without-provider",
+                test_generic_realtime_webrtc_profile(4),
+            ),
+        ] {
+            let observed_at = Instant::now();
+            let grant = one_mesh_connector_fixture_grant(&[profile])
+                .expect("the codec-neutral fixture claim is representable");
+            let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+                .expect("the codec-neutral fixture accounts for its process scope");
+            let owner = ConnectorResourceOwnerPort::new(provider)
+                .issue_mesh_scope()
+                .expect("the codec-neutral fixture accounts for its Mesh scope");
+            let process = ProcessResourceRoot::isolated();
+            let scope = process
+                .mesh_runtime_scope()
+                .network_instance_scope()
+                .peer_connection_scope();
+            let transport = Transport::new()
+                .expect("test transport")
+                .with_connector_resource_scope(owner, profile);
+            assert!(
+                transport.legacy_media_api.lock().is_none(),
+                "{profile_name} construction does not register compatibility codecs"
             );
-        }
+            let (worker, _events) = transport
+                .open_connector_peer(Role::Offerer, &[], &[], scope)
+                .await
+                .expect("data-only connector is constructed");
 
-        worker
-            .retire_and_close()
-            .await
-            .expect("native peer closes through its exact owner");
+            let offer = worker
+                .create_offer()
+                .await
+                .expect("data-only connector creates an offer");
+            assert!(offer
+                .sdp
+                .lines()
+                .any(|line| line.starts_with("m=application")));
+            assert!(!offer.sdp.lines().any(|line| line.starts_with("m=audio")));
+            assert!(!offer.sdp.lines().any(|line| line.starts_with("m=video")));
+            assert!(
+                transport.legacy_media_api.lock().is_none(),
+                "opening {profile_name} keeps codec registration absent"
+            );
+
+            assert_eq!(worker.session.open_lane_count(LaneKind::Video), 0);
+            assert_eq!(worker.session.open_lane_count(LaneKind::Audio), 0);
+            assert!(worker.session.legacy_media_profile.is_none());
+            let _media_error = worker
+                .session
+                .send_video(0, Bytes::from_static(b"unit"), Duration::ZERO)
+                .await
+                .expect_err("codec-neutral policy has no compatibility provider");
+            if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
+                println!(
+                    "arc03_data_only_raw profile={} constructed_ns={} video_tracks=0 audio_tracks=0",
+                    profile_name,
+                    observed_at.elapsed().as_nanos()
+                );
+            }
+
+            worker
+                .retire_and_close()
+                .await
+                .expect("native peer closes through its exact owner");
+        }
     }
 
     #[tokio::test]
@@ -10127,9 +13333,7 @@ mod tests {
             .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
             .expect("data-only connector is constructed");
-        let realtime = crate::connector::ConnectorRealtimeFlowCapability::new(Arc::clone(
-            &worker.ownership.incarnation,
-        ));
+        let realtime = test_realtime_capability(&worker.ownership);
 
         worker.retire();
 
@@ -10221,9 +13425,13 @@ mod tests {
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
     async fn v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner() {
         let transport = Transport::new().expect("transport");
-        let (session, _events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
-            .await
-            .expect("open");
+        let (session, _events, _owner) = open_explicit_legacy_media_peer(
+            &transport,
+            Role::Offerer,
+            NonZeroUsize::new(b"unit".len()).expect("fixture unit is nonempty"),
+        )
+        .await
+        .expect("open");
         let baseline = session.outbound_realtime_flows.lock().len();
         session
             .fail_next_track_attach
@@ -10247,9 +13455,13 @@ mod tests {
     #[tokio::test]
     async fn lanes_are_lifecycle_managed_not_pre_pooled() {
         let transport = Transport::new().expect("transport");
-        let (session, mut events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
-            .await
-            .expect("open");
+        let (session, mut events, _owner) = open_explicit_legacy_media_peer(
+            &transport,
+            Role::Offerer,
+            NonZeroUsize::new(b"x".len()).expect("fixture unit is nonempty"),
+        )
+        .await
+        .expect("open");
 
         // Setup provisions lane 0 only — no 8-lane SDP tax.
         assert_eq!(
@@ -10376,9 +13588,13 @@ mod tests {
     #[tokio::test]
     async fn pinned_lane_suspends_until_explicit_finalization() {
         let transport = Transport::new().expect("transport");
-        let (session, mut events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
-            .await
-            .expect("open");
+        let (session, mut events, _owner) = open_explicit_legacy_media_peer(
+            &transport,
+            Role::Offerer,
+            NonZeroUsize::new(b"x".len()).expect("fixture unit is nonempty"),
+        )
+        .await
+        .expect("open");
 
         // Lane 0 is pre-provisioned. Suspending it keeps its track and explicit
         // finalization leaves it pinned. A reopen therefore always revives
@@ -10447,9 +13663,13 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03h_failed_remove_track_retains_exact_lane_owner_and_blocks_reuse() {
         let transport = Transport::new().expect("transport");
-        let (session, mut events) = open_explicit_legacy_media_peer(&transport, Role::Offerer)
-            .await
-            .expect("open");
+        let (session, mut events, _owner) = open_explicit_legacy_media_peer(
+            &transport,
+            Role::Offerer,
+            NonZeroUsize::new(b"x".len()).expect("fixture unit is nonempty"),
+        )
+        .await
+        .expect("open");
         session
             .send_video(
                 1,

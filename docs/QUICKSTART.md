@@ -48,11 +48,44 @@ println!("device id: {}", mesh.identity().display_id());
 
 For the headless daemon, `myownmesh serve` uses the infrastructure-only form
 when node participation is disabled. A participating node requires every
-owner-selected value below before startup:
+provider resource dimension below before startup:
 
 ```text
-MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES
-MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES
+MYOWNMESH_RESOURCE_ACCOUNTED_MEMORY_BYTES
+MYOWNMESH_RESOURCE_QUEUED_BYTES
+MYOWNMESH_RESOURCE_SOCKET_OR_HANDLE
+MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT
+MYOWNMESH_RESOURCE_WORKER_OR_TASK
+MYOWNMESH_RESOURCE_CALLBACK_OR_SCHEDULED_WORK
+MYOWNMESH_RESOURCE_STORAGE_BYTES
+MYOWNMESH_RESOURCE_STORAGE_OBJECT
+MYOWNMESH_RESOURCE_RELAY_OR_PROVIDER_ALLOCATION
+MYOWNMESH_RESOURCE_PARSING_OR_CPU_WORK
+MYOWNMESH_RESOURCE_OPAQUE_DEPENDENCY_RESIDUAL
+MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY
+MYOWNMESH_CONNECTOR_REALTIME_POLICY
+```
+
+Every dimension is required so the process grant is explicit, including a
+deliberate zero. The current WebRTC connector does not yet charge
+`SocketOrHandle` when native ICE sockets or handles are created, and it does
+not charge `RelayOrProviderAllocation` for a native TURN allocation. Supplying
+either value does not enforce that native resource today. Those allocations
+remain dependency or provider residuals until the adapter exposes an exact
+claim. See the
+[Arc 03 resource ownership report](v4-transition/ARC-03-RESOURCE-OWNERSHIP-REPORT.md#4-current-resource-ownership-and-residual-matrix).
+
+Set `MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=none` for ordinary elastic
+construction. In that mode no Mesh, peer, connector, flow, or queue-item count
+is required. Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only
+connector, or `enabled` for codec-neutral real-time resource ownership.
+
+An administrator may select
+`MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=enabled` for an appliance, carrier,
+test fixture, or other deliberately restricted deployment. That optional
+wrapper requires:
+
+```text
 MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS
 MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES
 MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES
@@ -61,11 +94,10 @@ MYOWNMESH_CONNECTOR_CONTROL_CAPACITY
 MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY
 MYOWNMESH_CONNECTOR_CONTROL_WEIGHT
 MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT
-MYOWNMESH_CONNECTOR_REALTIME_POLICY
 ```
 
-Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only connector.
-That form requires no media values. The `enabled` form additionally requires:
+Within that optional wrapper, the `enabled` real-time form additionally
+requires:
 
 ```text
 MYOWNMESH_CONNECTOR_REALTIME_WEIGHT
@@ -82,15 +114,16 @@ MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES
 MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES
 ```
 
-Candidate content bytes cover the candidate fields submitted during one ICE
-attempt. They are not an exact retained-memory limit. The duplicate and
-application-work ceilings are cumulative for that attempt and renew only on a
-new attempt or an explicit ICE restart.
+Candidate content bytes in the optional wrapper cover the candidate fields
+submitted during one ICE attempt. They are not an exact retained-memory limit.
+The duplicate and application-work ceilings are cumulative for that attempt
+and renew only on a new attempt or an explicit ICE restart.
 
-MyOwnMesh supplies no numeric fallback. Missing, zero, or invalid values stop
-the connector-capable daemon before it joins a mesh. Native close has no
-timeout policy. It stays in the `Closing` state until the WebRTC dependency
-returns success or an error.
+MyOwnMesh supplies no numeric fallback. Missing or invalid provider values stop
+the connector-capable daemon before it joins a mesh. A provider dimension may
+be zero when the deployment intentionally grants none of that resource. Native
+close has no timeout policy. It stays in the `Closing` state until the WebRTC
+dependency returns success or an error.
 
 The returned `MeshHandle` is cheap to clone. Multiple subsystems in
 your app can hold one.
@@ -105,7 +138,7 @@ let net = mesh.join(NetworkConfig {
     network_id: "my-cool-mesh".into(),          // wire-level rendezvous handle
     label: "Home mesh".into(),
     kind: Default::default(),                   // Open governance
-    topology: TopologyMode::default(),          // Ring
+    topology: TopologyMode::default(),          // FullMesh
     signaling: Default::default(),
     stun_servers: Default::default(),
     turn_servers: Default::default(),

@@ -17,9 +17,10 @@ use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
-    Channel, ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-    ConnectorCallbackServiceWeights, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
-    MeshEvent, PeerEvent, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy,
+    transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
+    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackMailboxCapacities,
+    ConnectorCallbackPolicy, ConnectorCallbackServiceWeights, FiniteResourceProvider, MeshEvent,
+    PeerEvent, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy, ResourceProviderPort,
     WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
@@ -48,8 +49,8 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
 }
 
 fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
-    let two = std::num::NonZeroUsize::new(2)
-        .expect("the two-endpoint fixture candidate bound is nonzero");
+    let four = std::num::NonZeroUsize::new(4)
+        .expect("the four-connector fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
         ConnectorCallbackMailboxCapacities::new(callback, callback),
@@ -57,24 +58,66 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
         RealtimeConnectorPolicy::Disabled,
     )
     .expect("fixture data-only callback policy is valid");
-    let process =
-        ConnectorResourcePolicy::new(two).expect("fixture cleanup queue capacity is supported");
-    let webrtc = WebRtcConnectorProfile::new(
-        callbacks,
-        PendingRemoteCandidatePolicy::new(
-            two,
-            std::num::NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-            two,
-            two,
-        ),
-    );
-    WebRtcConnectorCapablePolicy::new(process, MeshConnectorResourcePolicy::new(two), webrtc)
+    let webrtc = WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
+    let connectors = std::num::NonZeroU64::new(
+        u64::try_from(four.get()).expect("fixture connector count fits u64"),
+    )
+    .expect("the fixture connector count is nonzero");
+    let frame_bytes = std::num::NonZeroU64::new(
+        u64::try_from(myownmesh_signaling::mdns::wire::MAX_FRAME_BYTES)
+            .expect("the signaling frame limit fits u64"),
+    )
+    .expect("the signaling frame limit is nonzero");
+    let candidate_total_content = std::num::NonZeroU64::new(
+        frame_bytes
+            .get()
+            .checked_mul(connectors.get())
+            .expect("fixture candidate content envelope fits u64"),
+    )
+    .expect("the fixture candidate content envelope is nonzero");
+    let candidate_total_string_capacity = std::num::NonZeroU64::new(
+        candidate_total_content
+            .get()
+            .checked_mul(3)
+            .expect("the three candidate string fields fit the fixture envelope"),
+    )
+    .expect("the fixture candidate string envelope is nonzero");
+    // A retained candidate has at least one content byte, so this is the
+    // conservative item bound implied by the cumulative content envelope.
+    let max_unique_candidates = candidate_total_content;
+    let candidate_workload = transport_lab_remote_candidate_fixture_grant(
+        max_unique_candidates,
+        connectors,
+        candidate_total_string_capacity,
+        candidate_total_content,
+        frame_bytes,
+    )
+    .expect("fixture candidate claims are representable");
+    let remote_descriptions = transport_lab_remote_description_fixture_grant(
+        connectors,
+        frame_bytes,
+        std::num::NonZeroU64::new(1).expect("the data-only profile has one media section"),
+        std::num::NonZeroU64::new(1).expect("the data-only profile has one active binding"),
+        frame_bytes,
+    )
+    .expect("fixture remote-SDP claims are representable");
+    let profiles = vec![webrtc; four.get()];
+    let mesh_scopes =
+        std::num::NonZeroU64::new(4).expect("the two-scenario fixture Mesh scope count is nonzero");
+    let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes)
+        .expect("fixture structural and callback claims are representable")
+        .checked_add(candidate_workload)
+        .and_then(|claim| claim.checked_add(remote_descriptions))
+        .expect("the fixture provider grant is representable");
+    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("the fixture provider accounts for its process scope");
+    WebRtcConnectorCapablePolicy::new(resources, webrtc)
 }
 
-fn relay_only_test_transport() -> Transport {
+fn relay_only_test_transport(policy: &WebRtcConnectorCapablePolicy) -> Transport {
     Transport::new_relay_only_for_lab()
         .expect("relay-only test transport")
-        .with_connector_resource_policy(test_connector_resource_policy())
+        .with_connector_resource_policy(policy.clone())
         .expect("fixture process connector policy is consistent")
 }
 
@@ -98,7 +141,11 @@ async fn wait_for_authenticated_then_approved(
                     );
                     return;
                 }
-                _ => {}
+                event => {
+                    if std::env::var_os("MYOWNMESH_ARC03_DEBUG_EVENTS").is_some() {
+                        eprintln!("arc03 TURN event while awaiting approval: {event:?}");
+                    }
+                }
             }
         }
     })
@@ -108,11 +155,21 @@ async fn wait_for_authenticated_then_approved(
 
 async fn receive_string(
     channel: &mut myownmesh_core::channels::ChannelSubscription<String>,
+    events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
 ) -> (String, String) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
-            if let Some(Ok(message)) = channel.recv().await {
-                return (message.from, message.body);
+            tokio::select! {
+                message = channel.recv() => {
+                    if let Some(Ok(message)) = message {
+                        return (message.from, message.body);
+                    }
+                }
+                event = events.recv(), if std::env::var_os("MYOWNMESH_ARC03_DEBUG_EVENTS").is_some() => {
+                    if let Ok(event) = event {
+                        eprintln!("arc03 TURN event while awaiting endpoint data: {event:?}");
+                    }
+                }
             }
         }
     })
@@ -138,16 +195,18 @@ async fn wait_for_authenticated(
     .expect("endpoint authentication timed out");
 }
 
-async fn wait_for_relay_pair(state: &myownmesh_core::engine::NetworkState, peer_id: &str) {
+async fn wait_for_reported_relay_pair(peers: [(&myownmesh_core::engine::NetworkState, &str); 2]) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
-            if state
-                .peer_info(peer_id)
-                .and_then(|peer| peer.selected_pair)
-                .is_some_and(|pair| {
-                    pair.local == IceCandidateKind::Relay && pair.remote == IceCandidateKind::Relay
-                })
-            {
+            if peers.iter().any(|(state, peer_id)| {
+                state
+                    .peer_info(peer_id)
+                    .and_then(|peer| peer.selected_pair)
+                    .is_some_and(|pair| {
+                        pair.local == IceCandidateKind::Relay
+                            && pair.remote == IceCandidateKind::Relay
+                    })
+            }) {
                 return;
             }
             tokio::task::yield_now().await;
@@ -185,19 +244,20 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     .expect("real TURN server starts");
     let turn_url = format!("turn:{}?transport=udp", turn.local_addr());
 
+    let test_resources = test_connector_resource_policy();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
     let (alice, alice_driver) = spawn_network(
         network_config("alice", turn_url.clone(), true),
         Arc::clone(&alice_id),
-        relay_only_test_transport(),
+        relay_only_test_transport(&test_resources),
     )
     .await
     .expect("Alice engine starts");
     let (bob, bob_driver) = spawn_network(
         network_config("bob", turn_url.clone(), true),
         Arc::clone(&bob_id),
-        relay_only_test_transport(),
+        relay_only_test_transport(&test_resources),
     )
     .await
     .expect("Bob engine starts");
@@ -218,7 +278,10 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
             observed_at.elapsed().as_nanos()
         );
     }
+    wait_for_reported_relay_pair([(&alice, bob_id.public_id()), (&bob, alice_id.public_id())])
+        .await;
 
+    let mut reported_relay_pair = false;
     for (state, peer_id) in [(&alice, bob_id.public_id()), (&bob, alice_id.public_id())] {
         let peer = state
             .peer_info(peer_id)
@@ -227,10 +290,13 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         assert!(peer.authenticated);
         assert!(peer.local_approve_sent);
         assert!(peer.remote_approve_seen);
-        let pair = peer.selected_pair.expect("ICE reports the selected pair");
-        assert_eq!(pair.local, IceCandidateKind::Relay);
-        assert_eq!(pair.remote, IceCandidateKind::Relay);
+        if let Some(pair) = peer.selected_pair {
+            assert_eq!(pair.local, IceCandidateKind::Relay);
+            assert_eq!(pair.remote, IceCandidateKind::Relay);
+            reported_relay_pair = true;
+        }
     }
+    assert!(reported_relay_pair, "ICE reports the selected relay pair");
 
     let alice_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&alice));
     let bob_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&bob));
@@ -242,7 +308,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         .await
         .expect("authenticated Alice send");
     assert_eq!(
-        receive_string(&mut bob_receive).await,
+        receive_string(&mut bob_receive, &mut bob_events).await,
         (
             alice_id.public_id().to_string(),
             "alice-over-turn".to_string()
@@ -254,7 +320,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         .await
         .expect("authenticated Bob send");
     assert_eq!(
-        receive_string(&mut alice_receive).await,
+        receive_string(&mut alice_receive, &mut alice_events).await,
         (bob_id.public_id().to_string(), "bob-over-turn".to_string())
     );
 
@@ -277,23 +343,25 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     drop((alice, bob));
     tokio::task::yield_now().await;
 
-    // Negative control on the same real TURN service. A relay-selected and
-    // endpoint-authenticated channel that has not received mutual application
-    // admission cannot send endpoint data, open a real-time lane, or send a
-    // real-time sample.
+    // Negative controls on the same real TURN service. A relay-selected and
+    // endpoint-authenticated channel without mutual application admission
+    // cannot send endpoint data. The codec-neutral data-only profile also
+    // cannot acquire the frozen legacy-media surface merely because TURN was
+    // selected. The latter is a profile-exclusion control, not a separate
+    // real-time admission control.
     let carol_id = Arc::new(Identity::ephemeral());
     let dave_id = Arc::new(Identity::ephemeral());
     let (carol, carol_driver) = spawn_network(
         network_config("carol", turn_url.clone(), false),
         Arc::clone(&carol_id),
-        relay_only_test_transport(),
+        relay_only_test_transport(&test_resources),
     )
     .await
     .expect("Carol engine starts");
     let (dave, dave_driver) = spawn_network(
         network_config("dave", turn_url, false),
         Arc::clone(&dave_id),
-        relay_only_test_transport(),
+        relay_only_test_transport(&test_resources),
     )
     .await
     .expect("Dave engine starts");
@@ -307,10 +375,8 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         wait_for_authenticated(&mut carol_events, dave_id.public_id()),
         wait_for_authenticated(&mut dave_events, carol_id.public_id())
     );
-    tokio::join!(
-        wait_for_relay_pair(&carol, dave_id.public_id()),
-        wait_for_relay_pair(&dave, carol_id.public_id())
-    );
+    wait_for_reported_relay_pair([(&carol, dave_id.public_id()), (&dave, carol_id.public_id())])
+        .await;
     for (state, peer_id) in [(&carol, dave_id.public_id()), (&dave, carol_id.public_id())] {
         let peer = state
             .peer_info(peer_id)
@@ -334,7 +400,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
             Duration::from_millis(1),
         )
         .await
-        .expect_err("relay selection cannot bypass real-time-flow admission");
+        .expect_err("relay selection cannot add legacy media to a data-only profile");
     let (lane_reply, lane_result) = tokio::sync::oneshot::channel();
     carol
         .cmd_tx
@@ -347,7 +413,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     lane_result
         .await
         .expect("engine returns the negative lane result")
-        .expect_err("worker possession cannot bypass real-time-flow admission");
+        .expect_err("a data-only profile cannot open a legacy media lane");
 
     carol
         .cmd_tx

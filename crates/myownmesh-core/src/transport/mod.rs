@@ -23,8 +23,6 @@ pub use diag::{
     SelectedCandidatePair,
 };
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
-#[cfg(feature = "transport-lab")]
-pub use webrtc::TransportEvent;
 #[cfg(not(feature = "transport-lab"))]
 pub(crate) use webrtc::TransportEvent;
 #[cfg(feature = "legacy-media")]
@@ -39,6 +37,11 @@ pub(crate) use webrtc::TransportEvent;
 pub use webrtc::{
     resolved_media_lanes, AudioSample, LaneKind, LegacyWebRtcMediaProfile,
     LegacyWebRtcMediaProfileError, VideoSample, MEDIA_LANES,
+};
+#[cfg(feature = "transport-lab")]
+pub use webrtc::{
+    transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
+    transport_lab_remote_description_fixture_grant, TransportEvent,
 };
 pub(crate) use webrtc::{
     DataChannelOpenOwnership, EndpointAuthHandoff, RemoteCandidateDisposition,

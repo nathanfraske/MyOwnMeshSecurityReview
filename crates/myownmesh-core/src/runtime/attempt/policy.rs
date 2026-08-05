@@ -84,8 +84,8 @@ impl ConnectorCallbackServiceWeights {
 /// because an encoded access unit is not an endpoint message frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCallbackPolicy {
-    mailboxes: ConnectorCallbackMailboxCapacities,
-    service_weights: ConnectorCallbackServiceWeights,
+    local_mailboxes: Option<ConnectorCallbackMailboxCapacities>,
+    local_service_weights: Option<ConnectorCallbackServiceWeights>,
     realtime: RealtimeConnectorPolicy,
 }
 
@@ -97,7 +97,7 @@ pub struct ConnectorCallbackPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RealtimeConnectorPolicy {
     Disabled,
-    Enabled(EnabledRealtimeConnectorPolicy),
+    Enabled(Option<EnabledRealtimeConnectorPolicy>),
 }
 
 /// Validated resource and queue policy for enabled real-time work.
@@ -165,12 +165,12 @@ impl ConnectorRealtimeInboundLimits {
     }
 }
 
-/// Owner-selected resource envelope for connector-local real-time flows.
+/// Optional owner-selected local ceiling for connector-local real-time flows.
 ///
-/// The envelope is codec-neutral. It bounds independent flow queues and the
-/// bytes retained by all real-time work on one connector. No production
-/// default exists. Omitting this policy leaves real-time flow admission
-/// disabled while control and endpoint-data connector work remains usable.
+/// The ceiling is codec-neutral. It can restrict independent flow queues and
+/// bytes retained by real-time work on one connector. No production default
+/// exists. Omitting this ceiling leaves provider-backed elastic real-time
+/// admission available when the generic connector policy enables it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorRealtimeFlowPolicy {
     max_inbound_active_flows: NonZeroUsize,
@@ -304,14 +304,6 @@ pub enum ConnectorCallbackPolicyError {
     DisabledRealtimeHasServiceWeight,
     #[error("enabled real-time callback policy requires an explicit real-time service weight")]
     EnabledRealtimeMissingServiceWeight,
-    #[error(
-        "{class} callback mailbox capacity {requested} exceeds Tokio's supported maximum {maximum}"
-    )]
-    MailboxCapacityExceedsRuntimeLimit {
-        class: &'static str,
-        requested: usize,
-        maximum: usize,
-    },
 }
 
 impl ConnectorCallbackPolicy {
@@ -329,86 +321,52 @@ impl ConnectorCallbackPolicy {
             }
             _ => {}
         }
-        for (class, requested) in [
-            ("control", mailboxes.control().get()),
-            ("endpoint-data", mailboxes.endpoint_data().get()),
-        ] {
-            if requested > tokio::sync::Semaphore::MAX_PERMITS {
-                return Err(
-                    ConnectorCallbackPolicyError::MailboxCapacityExceedsRuntimeLimit {
-                        class,
-                        requested,
-                        maximum: tokio::sync::Semaphore::MAX_PERMITS,
-                    },
-                );
-            }
-        }
         Ok(Self {
-            mailboxes,
-            service_weights,
+            local_mailboxes: Some(mailboxes),
+            local_service_weights: Some(service_weights),
             realtime,
         })
     }
 
-    pub const fn mailboxes(self) -> ConnectorCallbackMailboxCapacities {
-        self.mailboxes
+    /// Resource-backed data-only callbacks without a product item ceiling or
+    /// owner-selected scheduler weights.
+    pub const fn elastic_data_only() -> Self {
+        Self {
+            local_mailboxes: None,
+            local_service_weights: None,
+            realtime: RealtimeConnectorPolicy::Disabled,
+        }
     }
 
-    pub const fn service_weights(self) -> ConnectorCallbackServiceWeights {
-        self.service_weights
+    /// Resource-backed generic real-time callbacks with structurally fair,
+    /// work-conserving service and no codec or flow meaning.
+    pub const fn elastic_realtime() -> Self {
+        Self {
+            local_mailboxes: None,
+            local_service_weights: None,
+            realtime: RealtimeConnectorPolicy::Enabled(None),
+        }
+    }
+
+    pub const fn local_mailboxes(self) -> Option<ConnectorCallbackMailboxCapacities> {
+        self.local_mailboxes
+    }
+
+    pub const fn local_service_weights(self) -> Option<ConnectorCallbackServiceWeights> {
+        self.local_service_weights
     }
 
     pub const fn realtime(self) -> RealtimeConnectorPolicy {
         self.realtime
     }
-
-    #[cfg(test)]
-    pub(crate) fn unrestricted_lab(mailbox_capacity: NonZeroUsize) -> Self {
-        Self {
-            mailboxes: ConnectorCallbackMailboxCapacities::new(mailbox_capacity, mailbox_capacity),
-            service_weights: ConnectorCallbackServiceWeights::new(
-                mailbox_capacity,
-                mailbox_capacity,
-                mailbox_capacity,
-            ),
-            realtime: RealtimeConnectorPolicy::Enabled(EnabledRealtimeConnectorPolicy {
-                // Leave arithmetic headroom for simultaneous guarded input
-                // and output observations in the raw compatibility lab.
-                max_unit_bytes: NonZeroUsize::new(usize::MAX / 4)
-                    .expect("quarter of usize::MAX is nonzero"),
-                flows: ConnectorRealtimeFlowPolicy::new(
-                    ConnectorRealtimeFlowCapacities::new(
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                        mailbox_capacity,
-                    ),
-                    ConnectorRealtimeInboundLimits::new(
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX / 4)
-                            .expect("quarter of usize::MAX is nonzero"),
-                    ),
-                    ConnectorRealtimeByteBudgets::new(
-                        NonZeroUsize::new(usize::MAX / 2).expect("half of usize::MAX is nonzero"),
-                        NonZeroUsize::new(usize::MAX / 2).expect("half of usize::MAX is nonzero"),
-                    ),
-                    RealtimeQueueOverflowRule::DropNewest,
-                ),
-            }),
-        }
-    }
 }
 
 impl RealtimeConnectorPolicy {
-    pub fn enabled(
+    pub const fn enabled() -> Self {
+        Self::Enabled(None)
+    }
+
+    pub fn enabled_with_local_ceiling(
         max_unit_bytes: NonZeroUsize,
         flows: ConnectorRealtimeFlowPolicy,
     ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
@@ -439,10 +397,10 @@ impl RealtimeConnectorPolicy {
                 },
             );
         }
-        Ok(Self::Enabled(EnabledRealtimeConnectorPolicy {
+        Ok(Self::Enabled(Some(EnabledRealtimeConnectorPolicy {
             max_unit_bytes,
             flows,
-        }))
+        })))
     }
 }
 
@@ -456,60 +414,9 @@ impl EnabledRealtimeConnectorPolicy {
     }
 }
 
-/// Explicit policy supplied by the process resource owner.
-///
-/// Arc 03 deliberately provides no `Default`. This process policy contains
-/// only the global active-connector-candidate ceiling. WebRTC work policy lives
-/// in `WebRtcConnectorProfile`; both are explicit owner inputs to the combined
-/// connector-capable policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorResourcePolicy {
-    max_active_candidates: NonZeroUsize,
-}
-
-impl ConnectorResourcePolicy {
-    pub fn new(
-        max_active_candidates: NonZeroUsize,
-    ) -> std::result::Result<Self, ConnectorResourcePolicyError> {
-        if max_active_candidates.get() > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(
-                ConnectorResourcePolicyError::CleanupQueueCapacityExceedsRuntimeLimit {
-                    requested: max_active_candidates.get(),
-                    maximum: tokio::sync::Semaphore::MAX_PERMITS,
-                },
-            );
-        }
-        Ok(Self {
-            max_active_candidates,
-        })
-    }
-
-    pub const fn max_active_candidates(self) -> NonZeroUsize {
-        self.max_active_candidates
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ConnectorResourcePolicyError {
-    #[error("cleanup queue capacity {requested} exceeds Tokio's supported maximum {maximum}")]
-    CleanupQueueCapacityExceedsRuntimeLimit { requested: usize, maximum: usize },
-}
-
-/// A process resource root already owns a different connector policy.
-///
-/// Reusing the installed policy is safe. Replacing it while live claims may
-/// exist would split the process limit, so the root refuses the change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("the process connector resource policy is already installed with different values")]
-pub struct ConnectorResourcePolicyConflict {
-    pub installed: ConnectorResourcePolicy,
-    pub requested: ConnectorResourcePolicy,
-}
-
 /// Point-in-time report from the connector resource owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorResourceOwnerReport {
-    pub max_active_candidates: NonZeroUsize,
     pub active_candidates: usize,
     /// Exact candidate claims retained after a native cleanup failure. These
     /// slots remain consumed until process exit and cannot be reused.
@@ -522,7 +429,6 @@ pub struct ConnectorResourceOwnerReport {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectorCleanupHealth {
-    pub queue_capacity: usize,
     pub queued_jobs: usize,
     pub active_jobs: usize,
     pub completed_jobs: u64,
@@ -530,81 +436,30 @@ pub struct ConnectorCleanupHealth {
     pub executor_failed: bool,
 }
 
-/// Explicit owner-selected connector ceiling for one live [`crate::Mesh`]
-/// runtime.
-///
-/// This value has no `Default` and is not derived from the process ceiling or
-/// the number of Mesh runtimes. Arc 03E implements a hard child ceiling only.
-/// It does not reserve capacity for a child and does not borrow capacity from
-/// another child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MeshConnectorResourcePolicy {
-    max_active_candidates: NonZeroUsize,
-}
-
 /// Complete connector admission policy for one connector-capable [`crate::Mesh`].
 ///
-/// The process component is installed once and shared across Mesh runtimes.
-/// The Mesh component is an independent hard ceiling for this exact runtime.
-/// Both values are owner-selected. Neither is inferred from the other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The resource port refers to one owner-selected, process-local provider.
+/// Cloning this policy does not create capacity. Every Mesh and connector
+/// scope created through a clone still draws from the same provider grant.
+#[derive(Clone, Debug)]
 pub struct WebRtcConnectorCapablePolicy {
-    process: ConnectorResourcePolicy,
-    mesh: MeshConnectorResourcePolicy,
+    resources: crate::resource::ResourceProviderPort,
     webrtc: WebRtcConnectorProfile,
 }
 
 impl WebRtcConnectorCapablePolicy {
-    pub const fn new(
-        process: ConnectorResourcePolicy,
-        mesh: MeshConnectorResourcePolicy,
+    pub fn new(
+        resources: crate::resource::ResourceProviderPort,
         webrtc: WebRtcConnectorProfile,
     ) -> Self {
-        Self {
-            process,
-            mesh,
-            webrtc,
-        }
+        Self { resources, webrtc }
     }
 
-    pub const fn process(self) -> ConnectorResourcePolicy {
-        self.process
+    pub fn resources(&self) -> crate::resource::ResourceProviderPort {
+        self.resources.clone()
     }
 
-    pub const fn mesh(self) -> MeshConnectorResourcePolicy {
-        self.mesh
-    }
-
-    pub const fn webrtc(self) -> WebRtcConnectorProfile {
+    pub const fn webrtc(&self) -> WebRtcConnectorProfile {
         self.webrtc
-    }
-}
-
-impl MeshConnectorResourcePolicy {
-    pub const fn new(max_active_candidates: NonZeroUsize) -> Self {
-        Self {
-            max_active_candidates,
-        }
-    }
-
-    pub const fn max_active_candidates(self) -> NonZeroUsize {
-        self.max_active_candidates
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn v4_arc03h_cleanup_queue_capacity_is_validated_at_policy_construction() {
-        let unsupported = tokio::sync::Semaphore::MAX_PERMITS
-            .checked_add(1)
-            .and_then(NonZeroUsize::new)
-            .expect("Tokio maximum leaves one representable unsupported value");
-        assert!(matches!(
-            ConnectorResourcePolicy::new(unsupported),
-            Err(ConnectorResourcePolicyError::CleanupQueueCapacityExceedsRuntimeLimit { .. })
-        ));
     }
 }

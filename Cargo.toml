@@ -7,6 +7,10 @@ members = [
     "crates/myownmesh-updater",
     "crates/myownmesh",
 ]
+exclude = [
+    "vendor/webrtc-0.13.0",
+    "vendor/webrtc-ice-0.13.0",
+]
 
 [workspace.package]
 version = "0.3.2"
@@ -159,3 +163,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.bytes]
 opt-level = 3
+
+[patch.crates-io]
+webrtc = { path = "vendor/webrtc-0.13.0" }
+webrtc-ice = { path = "vendor/webrtc-ice-0.13.0" }

@@ -1,6 +1,10 @@
 # Arc 03 resource ownership report
 
-Status: normative target and current-to-target map for the elastic resource correction. The connector behavior at `8a2351d` remains accepted. Its static resource policy does not yet satisfy this report.
+Status: normative target and draft working-tree disposition for the elastic
+resource correction. The connector lifecycle and authority behavior at
+`8a2351d` remains accepted. This report is not exact-head execution evidence and
+does not claim that the current branch accounts for every native or OS
+allocation.
 
 ## 1. Contract
 
@@ -16,12 +20,14 @@ ResourceProvider
 
 ProcessResourceRoot
     -> one process grant
-    -> work-conserving Mesh child scopes
+    -> shared Mesh accounting scopes
     -> attempt and connector owners
     -> callback, cleanup, candidate, and real-time descendants
 ```
 
-Creating a Mesh scope does not create capacity. Unused capacity is borrowable under the basal provider. Optional local policy may impose stricter isolation or cardinality ceilings without becoming basal semantics.
+Creating a Mesh scope does not create capacity. The current `FiniteResourceProvider` is shared and work-conserving. It assigns no basal weights, quotas, fixed shares, or partitions. Unused capacity remains borrowable. During an exact pending reclamation turn, only the charge still needed by that demand is reserved; surplus capacity remains borrowable even in an overlapping dimension. Every immediate acquisition path applies that gate to its full charge, including child-scope and reservation bookkeeping. Under overlapping pressure, the provider selects `Cleanup`, then `Admitted`, then `Speculative`, and rotates equal-authority turns across process-local scope identities.
+
+A pending demand may request retirement from the exact owner of a reclaimable speculative lease. That notification does not release, transfer, or invalidate the lease. The owner must finish concrete cleanup and drop the exact lease, or retain the exact charge through its failed-cleanup state. Time passage creates neither a reclaim request nor a release. This provides a bounded service opportunity only when the conflicting capacity is held by registered reclaimable speculation and its owner completes cleanup. It does not promise admission against nonreclaimable admitted work, ignored retirement, or failed cleanup.
 
 ## 2. Limit classes
 
@@ -34,55 +40,93 @@ Creating a Mesh scope does not create capacity. Unused capacity is borrowable un
 
 No class may silently stand in for another.
 
-## 3. Current-to-target static policy map
+## 3. Field-by-field static policy disposition
 
-| Current Arc 03 field | Target disposition | Reason |
+The current source has two distinct policy surfaces. The process provider grant is runtime capacity. The WebRTC profile contains either optional local restrictions or explicit temporary compatibility shape. Neither surface creates mesh authority.
+
+| Current field | Current disposition | Basal meaning |
 | --- | --- | --- |
-| Process maximum connector candidates | Remove from basal construction | Connector count emerges from composite claims and process availability |
-| Per-Mesh maximum connector candidates | Remove from basal construction | Mesh scopes share the process grant and use work-conserving fairness |
-| Cleanup queue capacity derived from connector count | Replace with connector-reserved cleanup work | Cleanup must remain admissible under pressure |
-| Remote candidate unique-item count | Replace with queue-storage, accounted-memory, and work leases; allow an optional local ceiling | An item count is not transport-independent resource truth |
-| Remote candidate content bytes | Retain as a claim source, not a universal ceiling | Visible content contributes to conservative memory and queue claims |
-| Duplicate candidate submissions | Replace with scheduled parsing and hash work leases; allow an optional local ceiling | Repeated work consumes work capacity, not product cardinality |
-| Native candidate application work | Replace with scheduled-work and native-operation leases | Admission follows actual work capacity |
-| Control callback mailbox items | Replace with per-entry bytes and scheduled-work leases | Queue growth remains owned without a universal count |
-| Endpoint-data callback mailbox items | Replace with per-entry bytes and scheduled-work leases plus typed backpressure | Reliable endpoint pressure is byte and work based |
-| Control and endpoint scheduler weights | Remove as mandatory inputs | Basal scheduling is structurally fair and work-conserving |
-| Real-time scheduler weight | Remove as a mandatory input | Optional application or provider policy may refine fairness later |
-| Maximum complete real-time unit bytes | Provider structural limit or later application flow contract | It is not a basal session cardinality |
-| Inbound and outbound active-flow counts | Replace with per-flow composite leases | Flow count emerges from resource cost |
-| Complete-unit queue items per flow | Replace with per-unit storage and work leases plus provider pressure semantics | Interactive flow policy is provider or application specific |
-| Inbound fragment bytes | Retain only when proven as a provider or compatibility parser limit; otherwise claim actual bytes | Shape validity and resource availability are distinct |
-| Fragments per unit | Retain only as a provider or compatibility structural limit | The temporary H.264 adapter has a proven fixed hard stop |
-| In-progress units per flow | Replace with storage and work leases; optional local ceiling permitted | Simultaneous unit count is not basal cardinality |
-| Cumulative pre-authentication RTP packets | Replace with scheduled-work leases; compatibility or local policy may add a ceiling | Time and current product media shape cannot define basal correctness |
-| Cumulative pre-authentication RTP content bytes | Replace with accounted-memory and work leases | The provider controls actual live resource use |
-| Inbound and outbound accounted-byte ceilings | Replace with provider byte claims and separate ownership domains | Actual byte use remains a resource dimension |
-| Legacy lanes per codec kind | Retain in the temporary compatibility adapter | It is a fixed identity and provider shape, not basal MyOwnMesh |
-| Pre-provisioned H.264 and Opus lanes | Retain in the temporary compatibility adapter | Explicit compatibility deployment choice |
+| `WebRtcConnectorCapablePolicy.resources` | Required process-backed provider port | Shares one process grant; cloning the policy creates no capacity |
+| `ConnectorCallbackPolicy.local_mailboxes.control` | Optional local item ceiling; absent from `elastic_data_only` and `elastic_realtime` | Not a basal callback count |
+| `ConnectorCallbackPolicy.local_mailboxes.endpoint_data` | Optional local item ceiling; absent from elastic constructors | Not a basal callback count |
+| `ConnectorCallbackServiceWeights.control` | Optional connector-local scheduling quantum | Does not reserve provider capacity or guarantee cross-scope admission |
+| `ConnectorCallbackServiceWeights.endpoint_data` | Optional connector-local scheduling quantum | Does not reserve provider capacity or guarantee cross-scope admission |
+| `ConnectorCallbackServiceWeights.realtime` | Optional connector-local scheduling quantum when real-time work is enabled | Does not reserve provider capacity or select a codec |
+| `RealtimeConnectorPolicy::Disabled` | Explicitly disables generic real-time ownership | Valid data-only profile |
+| `RealtimeConnectorPolicy::Enabled(None)` | Enables generic provider-backed real-time ownership without the static local envelope below | Does not install H.264, Opus, tracks, or application flow meaning |
+| `EnabledRealtimeConnectorPolicy.max_unit_bytes` | Optional local or compatibility ceiling | Not a basal endpoint-frame limit |
+| `ConnectorRealtimeFlowPolicy.max_inbound_active_flows` | Optional local or compatibility ceiling | Live flow admission otherwise follows provider claims |
+| `ConnectorRealtimeFlowPolicy.max_outbound_active_flows` | Optional local or compatibility ceiling | Live flow admission otherwise follows provider claims |
+| `ConnectorRealtimeFlowPolicy.queue_capacity_per_flow` | Optional local or compatibility item ceiling | Queued content and work still require provider leases |
+| `ConnectorRealtimeFlowPolicy.max_inbound_fragment_bytes` | Optional local ceiling; may also be constrained by an active compatibility provider | Not a generic codec rule |
+| `ConnectorRealtimeFlowPolicy.max_inbound_fragments_per_unit` | Optional local ceiling; checked against the temporary H.264 hard stop when that adapter is selected | Not basal MyOwnMesh semantics |
+| `ConnectorRealtimeFlowPolicy.max_in_progress_units_per_flow` | Optional local or compatibility ceiling | Live storage and work claims remain required |
+| `ConnectorRealtimeFlowPolicy.max_pre_auth_packets` | Optional cumulative compatibility or deployment envelope | Not a time or rate authority |
+| `ConnectorRealtimeFlowPolicy.max_pre_auth_content_bytes` | Optional cumulative compatibility or deployment envelope | Not a claim of exact retained memory |
+| `ConnectorRealtimeByteBudgets.max_inbound_bytes` | Optional connector-local inbound partition | Covers connector-visible retained bytes only |
+| `ConnectorRealtimeByteBudgets.max_outbound_bytes` | Optional connector-local outbound partition | Covers connector-visible retained bytes only |
+| `ConnectorRealtimeFlowPolicy.overflow_rule` | Explicit connector-local complete-unit pressure behavior; the current closed set accepts only `DropNewest` | Not a codec choice, application delivery guarantee, or numeric capacity |
+| `PendingRemoteCandidateLocalCeiling.max_unique_items` | Optional per-attempt ingress ceiling; absent from `PendingRemoteCandidatePolicy::elastic` | Not a basal candidate count |
+| `PendingRemoteCandidateLocalCeiling.max_content_bytes` | Optional per-attempt visible-content ceiling | Not exact retained memory |
+| `PendingRemoteCandidateLocalCeiling.max_duplicate_submissions` | Optional per-attempt work ceiling | Not a provider capacity grant |
+| `PendingRemoteCandidateLocalCeiling.max_application_work` | Optional per-attempt native-application ceiling | Not a provider capacity grant |
+| `LegacyWebRtcMediaProfile.max_lanes_per_kind` | Temporary feature-gated compatibility shape, validated against the adapter hard stop | Not a basal flow or session limit |
+| `LegacyWebRtcMediaProfile.preprovisioned_video_lanes` | Explicit temporary compatibility deployment choice | No video meaning enters basal authority |
+| `LegacyWebRtcMediaProfile.preprovisioned_audio_lanes` | Explicit temporary compatibility deployment choice | No audio meaning enters basal authority |
+| `LEGACY_H264_MAX_FRAGMENTS_PER_UNIT` | Fixed hard stop of the temporary H.264 adapter | Provider structural limit, not a production policy recommendation |
+| `LEGACY_MEDIA_MAX_LANES_PER_KIND` | Fixed identity-space limit of the temporary H.264 and Opus adapter | Compatibility structural limit, not a basal Mesh limit |
+
+The daemon requires the owner to select whether the optional local ceiling set is `none` or `enabled`. It does not invent values. Selecting `none` removes the listed product-count ceilings, but it does not make native or OS resources exact. Basal provider fairness remains structural and conditional on the exact reclaimability and cleanup conditions above.
 
 The terminal candidate-attempt, lifecycle, cleanup, close, restart, codec-neutrality, and compatibility authority semantics remain unchanged. A provider refusal retires the exact speculative attempt where the accepted Arc 03 owner already requires terminal refusal.
 
-## 4. Resource ownership matrix
+## 4. Current resource ownership and residual matrix
 
-| Resource dimension | Claim source | Lease owner | Admission point | Release point | Pressure behavior | Reclaimability | Exactness or residual | Structural limit | Optional local hook |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Accounted memory | Owned Rust values and conservative visible capacity | Exact object owner | Before protected allocation or retention | Final owned drop or explicit transfer | Typed pressure | Speculative state only when its owner contract permits | Exact for declared claim, allocator overhead residual | None basal | Byte ceiling or isolation wrapper |
-| Queued bytes | Candidate, callback, endpoint, or complete-unit content | Queue entry or payload lease | Before insertion | Final consumer drop or drain | Backpressure, typed refusal, or connector failure by operation contract | Speculative entries may be dropped by contract | Exact content, container and allocator residual recorded separately | Provider queue primitive if proven | Queue or cost policy |
-| Socket or handle | Socket, file, event, or provider handle request | Connector or storage owner | Before or atomically with native acquisition | Proven native close | Typed unavailable or pressure | Only through provider close semantics | OS allocation may be isolatable but not exactly observable in process | OS or provider limit | Job, cgroup, rlimit, or administrator guard |
-| Native transport object | Peer connection, ICE agent, relay allocation, transceiver, track | Connector cleanup owner | Before construction | Proven native cleanup; failed cleanup retains claim | Typed unavailable; cleanup remains protected | Not reclaimable while native ownership is unresolved | Conservatively claimable with opaque dependency residual | WebRTC or provider shape | Provider isolation wrapper |
-| Worker or task | Construction, connector worker, cleanup worker | Exact lifecycle owner | Before spawn | Join, cancellation completion, or terminal cleanup | Typed pressure | Speculative work may be cancelled through its owner | Task count exact; runtime internals residual | Runtime structural limits if documented | Priority or isolation policy |
-| Callback or scheduled work | Candidate parse, hash, native application, callback dispatch | Exact attempt, connector, or flow owner | Before enqueue or execution | Completion, drain, or retirement | Backpressure or typed refusal | Speculative work may be refused before admitted work | Work unit exact, CPU cost observed or conservative | None basal | Work budget or cost policy |
-| Storage bytes and objects | Durable fact, delayed spool, removable-media object | Store or delayed-delivery owner | Before retention | Deletion or transfer | Typed storage pressure | Policy and semantic owner determine reclamation | Provider-reported allocation; filesystem overhead residual | Filesystem or device limit | Quota or appliance policy |
-| Relay or provider allocation | TURN, future opaque relay, provider-native reservation | Exact connector or relay owner | Before or atomically with provider allocation | Proven release | Typed provider unavailable or cost pressure | Provider contract only | Provider-reported, external residual explicit | Exact endpoint-pair or provider limit | Carrier cost policy |
-| Parsing or CPU work | Canonical parse, candidate validation, hashing, codec assembly | Exact input or flow owner | Before protected work | Work completion | Backpressure or typed work pressure | Pending speculative work may be refused | Work permits exact; CPU cost observational unless isolated | Protocol parser shape | CPU or ingress policy |
-| Opaque dependency residual | Unreported webrtc-rs, runtime, allocator, kernel, driver, or codec state | Narrow connector or process isolation owner | Before dependency use through conservative guard | Proven dependency teardown | Typed unavailable where enforceable; otherwise explicit residual | Isolation-domain termination only when permitted | Conservatively claimable, isolatable, observable only, or unobservable | Dependency-specific | Process or job isolation |
+| Resource dimension | Current Arc 03 charge | Exact current boundary | Explicit residual or gap |
+| --- | --- | --- | --- |
+| Accounted memory | Selected Rust-visible records, payload lengths, and conservative capacities | Exact only for the charged byte quantity | Allocator headers, slack, shared allocation layout, and native dependency memory are not complete |
+| Queued bytes | Visible candidate, callback, endpoint, and real-time content while queue-owned | Exact logical content for the live queue lease; the production candidate wrapper separately charges its actual retained String capacities before node insertion | Allocator metadata and native internal queues remain separate residuals |
+| Socket or handle | Exposed in the provider grant vocabulary | The current WebRTC connector floor does not charge this dimension before native peer construction | ICE, UDP, TURN, event, and other native handles are an OS or dependency residual until an adapter hook or isolation boundary owns them |
+| Native transport object | One unit in the connector candidate floor for the native peer connection | Retained through the close owner; failed close retains the connector claim | ICE-agent internals, transceivers, tracks, and dependency-created children are not each counted as native objects |
+| Worker or task | One connector-worker unit in the connector floor, explicit scheduled-work claims, and one process cleanup-infrastructure claim acquired before constructing its runtime and OS thread | Exact for the charged connector and persistent cleanup obligations | The cleanup runtime heap, native thread-stack size, and dependency-created tasks remain opaque residuals rather than exact byte charges |
+| Callback or scheduled work | Connector cleanup is reserved in the opening floor; callback, candidate, and real-time operations acquire specific work leases | Exact for each charged obligation | A work unit is not CPU time and does not imply scheduler fairness |
+| Storage bytes | Provider primitive exists; Arc 03 connector ownership does not add a durable byte-storage path | Exact only where a store adapter acquires this class | Filesystem allocation units, metadata, journals, and device caches remain provider or filesystem residuals |
+| Storage objects | Applied remote-candidate retention charges the ownership records it keeps for attempt lifetime | Exact for the charged retained-record count | The class does not describe allocator bytes or native ICE storage |
+| Relay or provider allocation | Exposed in the provider grant vocabulary | The current WebRTC and TURN connector path does not charge this dimension for each native relay allocation | TURN server allocation state, provider quotas, and external cost remain unaccounted by the connector until an adapter hook exists |
+| Parsing or CPU work | Candidate, callback, and real-time paths acquire discrete work units | Exact for admitted work-unit count | CPU duration, runtime scheduling, and native-library work are observational unless isolated |
+| Opaque dependency residual | Conservative units accompany connector, scope, callback, candidate, and flow ownership | Exact only as a named ownership domain | It is not bytes, handles, native-object count, or proof of complete dependency accounting |
 
-## 5. Pressure and fairness
+Local ICE conversion owns one structural work lease and one named opaque residual before `to_json`. Returned String content and capacities are charged before MyOwnMesh retains the result. `RTCIceCandidate::from`, `to_ice`, `CandidateBase`, formatting temporaries, allocator metadata, and the initial output allocation remain dependency residuals because the pinned API exposes no allocation plan or caller-owned fallible output buffer. The pre-conversion claim bounds concurrent conversion work, not bytes consumed by one dependency call.
 
-The process provider checks the composite claim before admission. Child scopes do not receive fixed shares by default. Scheduling is work-conserving, gives each admitted class a bounded service opportunity, and permits unused capacity to be borrowed.
+Remote candidate retention is split by owner. The connector-neutral attempt owns the digest and application record. The production pending value owns the `LocalIceCandidate` String capacities, logical queued content, wrapper, queue node, and production digest node. After native application, String ownership is released. The retained application record then charges two storage-object units for its ordered and linked attempt records plus three opaque residual units for their backing nodes and the native ICE-agent copy that `webrtc-rs` does not expose. These are ownership-domain counts, not retained-byte claims.
 
-Cleanup and exact release work has reserved execution ownership. Already admitted and higher-authority work is protected from new unauthenticated speculative work. Resource refusal is an availability result and never an Open or Closed authorization denial.
+V4 remote SDP handling begins from the raw input String. It acquires that String capacity, parsing work, one scheduled-work unit, and named parser, allocator, and native-description residuals before credential extraction or the pinned native SDP constructor. An allocation-free pass computes the media-section, binding-record, and credential-string shape. The lease transitions to a conservative input-bounded claim for preallocated parser sections, bindings, String copies, and location keys before the parser runs. Hash-table buckets and allocator metadata remain named residuals. The lease then transitions to measured Rust-visible records and String capacities before retention. Native success releases the scheduled-work unit. One shared credential resource owner transfers to the connector close owner before native application. Each retained owner charges its close-registry Arc pointer, owner struct, Arc reference counters, one storage object, and two named Arc and linked-list allocation residuals. The pinned dependency can queue description work after the call returns, so successful renegotiation owners remain charged until connector close. Provider pressure bounds that accumulation. Cancellation, native error, state-commit mismatch, and failed native close keep the native-description residual charged. Process-local credential clones do not duplicate retained Strings or capacity. Signaling bridge queues, fanout, and duplicate hashing before connector entry are an explicit hostile-ingress residual outside Arc 03.
+
+The pinned `webrtc-ice 0.13.0` adapter is locally patched so remote-candidate
+application awaits the dependency's internal insertion and mDNS resolution.
+The MyOwnMesh attempt operation lease therefore remains live until that
+dependency work returns. Failed or disabled mDNS resolution returns an error;
+it cannot be recorded as a successfully applied candidate. This closes the old
+detached-task gap across ICE restart without changing ICE selection, STUN, or
+TURN.
+
+Native peer construction remains an opaque dependency boundary. The close
+owner marks native allocation before entering the constructor. If cancellation
+requests close before a returned native port attaches, that owner remains
+`Closing`, accepts the exact late port, and releases the lease only after close
+succeeds. A constructor that definitively returns without a closeable port
+retains the exact connector claim and reports terminal failure. It does not
+claim that hidden constructor tasks stopped or make the capacity reusable.
+
+The daemon currently asks the owner for every provider dimension. A supplied `SocketOrHandle` or `RelayOrProviderAllocation` grant does not by itself make the WebRTC adapter consume that dimension. Those fields are forward-compatible policy inputs and must not be reported as enforced native limits until the corresponding adapter claim exists.
+
+The `transport-lab` feature exposes fixture-only grant derivation helpers. They sum production structural claims for the connector profiles and Mesh scopes supplied by a test, then add conservative candidate and remote-SDP claims from explicit fixture bounds. Candidate strings, content, concurrent parsing work, queue records, digest records, provider bookkeeping, remote-SDP parser storage, and remote-description retention are separate components. The helpers select no profile, workload, or production value and are absent from the default V4 API. The TURN control funds four data-only profiles and four Mesh scope records for its two sequential scenarios. At most two are active concurrently. It adds signaling-frame-derived candidate and remote-SDP bounds to one process provider. This proves shared-provider enforcement for that finite test workload. It does not claim exact native WebRTC allocation accounting or recommend a deployment grant.
+
+## 5. Pressure and admission order
+
+The process provider checks the composite claim before admission. Child scopes receive no fixed share. Outside a selected pending turn they may borrow all currently unused capacity. During a turn, the selected demand's exact charge is reserved and surplus remains borrowable, including surplus in an overlapping dimension. A demand that cannot fit enters a provider-owned turn only through the cooperative API. The turn is move-only, scoped to overlapping resource dimensions, ordered by `Cleanup`, `Admitted`, then `Speculative`, and rotated across equal-authority scope identities. Dropping the demand cancels the turn without releasing another owner's capacity.
+
+Connector cleanup work is reserved with the connector before pressure, so native close does not need a new speculative permit after failure. When pressure selects a reclaimable speculative connector, the provider requests retirement through its opaque target and the connector's existing close owner performs cleanup. The provider never reuses the charge until the exact lease is dropped. If cleanup fails, the failed owner keeps that claim charged and later admission receives typed pressure. Resource refusal is an availability result and never an Open or Closed authorization denial.
 
 One large claim may consume more capacity than many small claims. Tests must compare resource quantities, not object counts.
 
@@ -112,15 +156,24 @@ No queue may grow without leases. A slow operation is not invalid merely because
 The implementation must prove:
 
 - no basal `MAX_MESHES`, `MAX_PEERS`, `MAX_ATTEMPTS`, or `MAX_FLOWS`;
-- one more object is admitted whenever the mock provider grants its claim;
+- one more object is admitted whenever its claim fits the shared grant and provider bookkeeping;
 - refusal names a resource dimension rather than an object count;
 - one large claim may cost more than many small claims;
 - many small peers or flows coexist while resources remain;
 - more Mesh scopes do not multiply the process grant;
 - exact lease release restores capacity;
-- unused capacity is borrowable under the basal provider;
+- a selected pending turn reserves its exact charge while leaving surplus capacity borrowable;
+- plain scope bookkeeping cannot consume the charge reserved for that turn;
+- the selected requester's scope cannot reacquire capacity ahead of its own turn;
+- reclaim requests are published only after the provider proves the selected victim set can satisfy the deficit;
+- a pending demand selects structural authority before equal-class per-scope rotation;
+- cooperative pressure wakes the exact reclaimable speculative owner without releasing its lease;
+- a released speculative claim lets the selected demand retry, while failed cleanup retains the charge;
+- a nonwaiting acquisition returns typed pressure without requesting another owner's cleanup;
+- no valid slow lease is expired or reclaimed merely by elapsed time;
 - an optional local ceiling can deliberately restrict a deployment;
-- speculative work is reclaimed or refused before cleanup or admitted higher-authority work is starved;
+- connector cleanup can proceed from its pre-reserved claim even after the shared grant is full;
+- the fairness claim is limited to reclaimable speculative conflicts whose owner completes cleanup, and does not cover nonreclaimable admitted pressure;
 - slow work retains its finite lease without time-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
@@ -129,6 +182,6 @@ The accepted lifecycle, cleanup, malformed-candidate, restart, direct WebRTC, TU
 
 ## 8. Measurements
 
-Measurements remain useful for performance characterization, provider-cost estimation, regression detection, fairness validation, opaque-allocation discovery, and choosing optional deployment policy. They do not define universal correctness or product cardinality.
+Measurements remain useful for performance characterization, provider-cost estimation, regression detection, scheduler validation, opaque-allocation discovery, and choosing optional deployment policy. They do not define universal correctness or product cardinality.
 
 For every run, retain the exact commit, platform and target, input workload, raw logs, failures, CPU and RSS observations, queue occupancy, service delay, candidate distribution, close result, and every sample. Do not infer a production ceiling from those observations.

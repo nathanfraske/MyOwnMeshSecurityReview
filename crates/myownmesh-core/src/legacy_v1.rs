@@ -164,6 +164,7 @@ mod tests {
                 event = left_events.recv() => {
                     let event = event.expect("left connector remains live");
                     if let Some(event) = left.accept_event(event) {
+                        let (event, _callback_resources) = event.into_parts();
                         match event {
                             TransportEvent::LocalIceCandidate(Some(candidate)) => {
                                 right.add_remote_candidate(candidate).await.expect("right accepts candidate");
@@ -183,6 +184,7 @@ mod tests {
                 event = right_events.recv() => {
                     let event = event.expect("right connector remains live");
                     if let Some(event) = right.accept_event(event) {
+                        let (event, _callback_resources) = event.into_parts();
                         match event {
                             TransportEvent::LocalIceCandidate(Some(candidate)) => {
                                 left.add_remote_candidate(candidate).await.expect("left accepts candidate");

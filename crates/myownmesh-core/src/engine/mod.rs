@@ -65,7 +65,6 @@ use tracing::{debug, trace, warn};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::config::NetworkConfig;
 use crate::error::{Error, Result};
@@ -868,7 +867,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                             crate::events::DiagLevel::Warn,
                             "ice",
                             format!(
-                                "remote {kind:?} candidate from {} exceeded the owner-selected pending queue",
+                                "remote {kind:?} candidate from {} reached an owner-selected candidate-attempt ceiling",
                                 short_peer(&device_id)
                             ),
                             serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
@@ -1596,13 +1595,8 @@ async fn apply_remote_sdp(
         reoffer_after_failed_answer(state, device_id).await;
         return;
     }
-    let desc = match sdp_type {
-        RTCSdpType::Offer => RTCSessionDescription::offer(sdp).ok(),
-        RTCSdpType::Answer => RTCSessionDescription::answer(sdp).ok(),
-        _ => None,
-    };
-    if let Some(desc) = desc {
-        match session.apply_remote_description(desc).await {
+    if matches!(sdp_type, RTCSdpType::Offer | RTCSdpType::Answer) {
+        match session.apply_remote_sdp(sdp_type, sdp).await {
             Err(e) => {
                 state.log_diag_with(
                     crate::events::DiagLevel::Error,
@@ -1646,10 +1640,15 @@ async fn apply_remote_sdp(
                         serde_json::json!({
                             "peer": device_id,
                             "count": report.queued_candidate_count,
+                            "failure_count": report.candidate_failure_count,
                         }),
                     );
-                    for error in report.candidate_failures {
-                        warn!(peer = %device_id, "queued add_ice_candidate failed: {error}");
+                    if report.candidate_failure_count != 0 {
+                        warn!(
+                            peer = %device_id,
+                            failure_count = report.candidate_failure_count,
+                            "queued remote-candidate application failures were retained only as a count"
+                        );
                     }
                 }
             }
@@ -1757,6 +1756,7 @@ async fn handle_transport_event(
         trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
         return false;
     };
+    let (event, _callback_resources) = event.into_parts();
     match event {
         TransportEvent::RenegotiationNeeded => {
             // A lane opened/closed. Don't offer inline — a burst of lane
@@ -3320,22 +3320,66 @@ fn build_test_state_parts(
         crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
     )
     .expect("engine fixture data-only callback policy is valid");
-    let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(max_connectors)
-        .expect("engine fixture connector policy is valid");
     let webrtc_profile = crate::WebRtcConnectorProfile::new(
         callbacks,
-        crate::PendingRemoteCandidatePolicy::new(
-            max_connectors,
-            std::num::NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-            max_connectors,
-            max_connectors,
-        ),
+        crate::PendingRemoteCandidatePolicy::elastic(),
     );
-    let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(connector_policy);
+    let profiles = vec![webrtc_profile; max_connectors.get()];
+    let connectors = std::num::NonZeroU64::new(max_connectors.get() as u64)
+        .expect("engine fixture connector count is nonzero");
+    let frame_bytes = std::num::NonZeroU64::new(
+        u64::try_from(myownmesh_signaling::mdns::wire::MAX_FRAME_BYTES)
+            .expect("the signaling frame limit fits u64"),
+    )
+    .expect("the signaling frame limit is nonzero");
+    let candidate_content = std::num::NonZeroU64::new(
+        frame_bytes
+            .get()
+            .checked_mul(connectors.get())
+            .expect("engine fixture candidate content is representable"),
+    )
+    .expect("engine fixture candidate content is nonzero");
+    let candidate_strings = std::num::NonZeroU64::new(
+        candidate_content
+            .get()
+            .checked_mul(3)
+            .expect("engine fixture candidate strings are representable"),
+    )
+    .expect("engine fixture candidate strings are nonzero");
+    // Every candidate admitted by the fixture has at least one content byte.
+    // Therefore the cumulative content envelope is also a conservative upper
+    // bound on the number of distinct retained candidates.
+    let max_unique_candidates = candidate_content;
+    let candidate_grant = crate::transport::webrtc::transport_lab_remote_candidate_fixture_grant(
+        max_unique_candidates,
+        connectors,
+        candidate_strings,
+        candidate_content,
+        frame_bytes,
+    )
+    .expect("engine fixture remote-candidate grant is mechanically representable");
+    let remote_description_grant =
+        crate::transport::webrtc::transport_lab_remote_description_fixture_grant(
+            connectors,
+            frame_bytes,
+            std::num::NonZeroU64::new(1).expect("the data-only fixture has one media section"),
+            std::num::NonZeroU64::new(1).expect("the data-only fixture has one active binding"),
+            frame_bytes,
+        )
+        .expect("engine fixture remote-SDP grant is mechanically representable");
+    let grant = crate::transport::webrtc::one_mesh_connector_fixture_grant(&profiles)
+        .expect("engine fixture construction grant is mechanically representable");
+    let grant = grant
+        .checked_add(candidate_grant)
+        .and_then(|claim| claim.checked_add(remote_description_grant))
+        .expect("engine fixture connector and signaling grant is representable");
+    let provider = crate::resource::ResourceProviderPort::new(
+        crate::resource::FiniteResourceProvider::new(grant),
+    )
+    .expect("engine fixture provider admits its process scope");
+    let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider);
     let scope = owner
-        .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
-            max_connectors,
-        ))
+        .issue_mesh_scope()
         .expect("engine fixture process owner issues one explicit Mesh scope");
     let transport = crate::transport::Transport::new()
         .expect("transport")
@@ -3404,8 +3448,11 @@ pub(crate) fn spawn_admitted_legacy_test_pump(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            if let Some(TransportEvent::Message(bytes)) = worker.accept_event(event) {
-                handle_inbound_frame(&state, &device_id, bytes).await;
+            if let Some(event) = worker.accept_event(event) {
+                let (event, _callback_resources) = event.into_parts();
+                if let TransportEvent::Message(bytes) = event {
+                    handle_inbound_frame(&state, &device_id, bytes).await;
+                }
             }
         }
     })
