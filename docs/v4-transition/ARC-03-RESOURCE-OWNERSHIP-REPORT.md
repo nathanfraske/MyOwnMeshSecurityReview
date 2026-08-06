@@ -439,7 +439,7 @@ Their authorities differ and must not be interchanged:
 
 - **`O` is optional and inert.** An observation or measurement changes no grant, no admission result, and no contraction state, and it **never automatically sets anything**. It is not required to exist at all: a deployment with no observation whatsoever is fully conforming. `O` creates no provider class — observing a number does not make a provider isolated or backed.
 - **`T` is set by named owner policy.** A `T` arises in exactly one of two ways: **set directly** by a named owner policy, or **derived** by a named owner policy that considers `O` among its inputs. Both are named policy decisions. What may not happen is `O` becoming a `T` on its own. `T < Gc` *requests* contraction; `Gc` follows `T` downward only after owner-driven release lowers `S`, and never below `S`.
-- **P4 fit is computed by provider class, and the classes differ correctly.** Fit is always against the committed domain net of the committed charge, with P5 policy applied — and then bounded by whatever that class can actually substantiate:
+- **P4 fit uses two exact steps and independently proved premises.** `AccountingFit` starts from the committed accounting domain after the committed charge and explicit P5 policy; `EffectiveFit` then intersects it with `E` only where `E` is proved and with `B` only where `B` is proved, independently per dimension:
 
 Fit has two distinct meanings, and conflating them is the error this section exists to prevent:
 
