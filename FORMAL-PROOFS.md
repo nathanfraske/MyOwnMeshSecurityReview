@@ -705,8 +705,10 @@ B    backing: capacity actually reserved for or owned by this process,
      contract there is no B, and a provider must not synthesize one
      from an envelope, an observation, or an assumption
 
-Gc   committed grant: what the provider has actually committed, and
-     against which every live claim was admitted
+Gc   committed grant: an accounting commitment against which every
+     live claim was admitted. It is bookkeeping. It is not proof that
+     substrate capacity exists, and not a promise that an allocation
+     will succeed
 
 S    charged sum: live claims plus failed-cleanup-retained claims
 ```
@@ -720,10 +722,34 @@ Gc moves toward T downward only after owner release has lowered S;
 a provider that claims isolation proves Gc <= E
 a provider that claims backing proves Gc <= B at the moment of
     admission
-P4 fit is evaluated against the committed domain, together with E and
-    B where those are actually claimed and proved, and with any
-    explicit P5 policy; never against O
+P4 fit is EffectiveFit, defined below; O and T are never inputs to it
 ```
+
+**Admission fit.** Fit is computed in two named steps, per resource dimension.
+
+```text
+AccountingFit
+    the remaining committed accounting grant in a dimension: Gc, after
+    subtracting the live and failed-cleanup-retained charge S, and
+    after applying any explicit P5 isolation or optional local policy
+
+EffectiveFit
+    AccountingFit, intersected with E in each dimension where E is
+    proved, and intersected with B in each dimension where B is proved
+```
+
+The two intersections are independent, and each applies only where its premise is proved in that dimension:
+
+```text
+neither proved     EffectiveFit = AccountingFit
+E proved only      EffectiveFit = AccountingFit intersect E
+B proved only      EffectiveFit = AccountingFit intersect B
+both proved        EffectiveFit = AccountingFit intersect E intersect B
+```
+
+`O` and `T` never participate in either step. An observation is not a bound, and a contraction target is not a bound; admitting against either would admit against a quantity no one committed.
+
+Admission remains fallible in every case. A successful `AccountingFit` admission does not guarantee that the allocator, kernel, runtime, transport, external relay, or hardware will succeed. Where `E` or `B` is proved, `EffectiveFit` narrows the domain further, but narrowing an accounting result does not convert it into a guarantee of execution.
 
 **Provider labels.** `E` and `B` are distinct and orthogonal premises. Containment does not imply reservation, and reservation does not imply containment. The labels below name which premises a provider has proved. They are not a ladder, and a provider need not fit exactly one of them.
 
@@ -748,6 +774,21 @@ backed
 A provider may hold both claims, and may hold them per dimension: `E` proved in one resource dimension and `B` proved in another is an ordinary configuration, not a contradiction. Any combination is permitted exactly where each premise it names is separately proved. Claiming `E` never licenses a `B` claim, and claiming `B` never licenses an `E` claim.
 
 A provider that cannot prove `E` must not describe itself as isolated, and a provider that cannot prove `B` must not describe itself as backed. Establishing `E` or `B` for a real substrate is an obligation discharged outside this document; nothing here is evidence that any provider has established either.
+
+**What proving `E` or `B` requires.** A claim of `Gc <= E` or `Gc <= B` in a dimension requires a mapping between the `ResourceClaim` quantity this model charges and the substrate quantity actually contained or reserved. That mapping must be:
+
+```text
+dimension-specific   established for that resource dimension, not
+                     inferred from another dimension
+unit-correct         relating the charged unit to the substrate unit
+                     without silent conversion or reinterpretation
+monotone             a larger charged quantity never maps to a smaller
+                     substrate quantity
+```
+
+Where no such mapping exists for a dimension, that dimension remains accounting-only, or an explicit named residual, and no `E` or `B` claim may be made for it. An `OpaqueDependencyResidual` does not become `E` or `B` by being given a number: a quantity that is merely recorded is neither contained nor reserved. Establishing these mappings for a real substrate is an obligation discharged outside this document.
+
+Accounting-only is a coherent provider label, and a provider bearing it can satisfy the accounting model and theorems of this section. That is a claim about this model alone. It is not a claim that such a provider satisfies P1 through P8, or P6, which are established separately and are not discharged by bearing this label. Accounting alone is in any case not sufficient for final production closure, which additionally requires the containment or reservation premises that accounting does not supply.
 
 **Claim.** `S <= Gc` is invariant across every transition, including arbitrary change in `O`, `T`, `E`, or `B`. No change in observation, target, envelope, or backing releases, reduces, or reattributes any claim.
 
