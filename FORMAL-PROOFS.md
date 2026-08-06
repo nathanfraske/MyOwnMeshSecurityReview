@@ -571,18 +571,83 @@ Theorems 14.1 through 14.5c constrain any conforming resource provider: conserva
 
 A concrete provider may additionally adopt an exact pending-demand cardinality, an authority ordering over demand classes, and a rotation rule among equal-class scopes. Such a rule is one provider policy. It is not a universal mesh semantic, is not a proof obligation of this model, and no result above becomes unsound if a different conforming provider selects demands differently.
 
-### Note 14.5e. Fairness against a mintable claimant is a separate provider obligation
+### Note 14.5e. Finite-trace partition invariance beneath a fixed FairnessRoot is a separate provider obligation
 
-Provider conformance also requires that a claimant cannot manufacture service weight by creating attribution beneath its own fairness root. The terms are the closed architectural definitions:
+Provider conformance also requires that repartitioning one fixed fairness root's identical demand trace across attribution child scopes beneath it cannot give that root earlier eligibility, additional selections or turns, or a larger admitted quantity, and cannot delay a competing fixed root. The requirement is one-way and imposes no equality of outcome. The terms are the closed architectural definitions:
 
-- a `FairnessRoot` is the unit of scheduling attribution a provider serves. It is selected locally by the trusted provider or ingress owner that installs the grant, is process-local, is not mintable by the claimant it attributes, and is neither a semantic or durable identity nor an authentication or authorization root or capability. It may be a local scheduling identity within its own process, but it is not a Device ID, Mesh ID, durable semantic identity, endpoint identity, or wire value.
+- a `FairnessRoot` is the unit of scheduling attribution a provider serves. It is selected locally by the trusted provider or ingress owner that installs the grant, and is process-local and opaque. It is not mintable by the claimant it attributes: no unverified claimant, peer, or wire assertion may directly name, select, split, rotate, or multiply one. The trusted local owner may use facts it has itself verified or authenticated, including an authenticated local principal or an isolated ingress domain, as mapping input; mere submission over the wire is never sufficient. It is neither a semantic or durable identity nor an authentication or authorization root or capability. It may be a local scheduling identity within its own process, but it is not a Device ID, Mesh ID, durable semantic identity, endpoint identity, or wire value.
 - an `AttributionChildScope` refines accounting beneath exactly one `FairnessRoot` and creates no additional share, turn, or service weight.
 
-The obligation is: for any two distinct fairness roots, creating or rotating any number of attribution child scopes beneath one of them must not improve that root's service share against the other.
+**The obligation, as finite-trace partition invariance.** Let `A` and `B` be two fairness roots. Fix a finite ordered demand trace for each, in which every demand carries its exact claim, its authority class, and its reclaimability under its owner contract, and in which every arrival and release event and their ordering are fixed. Fix the initial provider state and the grant.
+
+Let `T` be `A`'s trace attributed to `A` alone, and let `T'` be that same trace repartitioned across any number of attribution child scopes beneath `A`. `T'` differs from `T` only in attribution: the demands, their claims, their authority, their reclaimability, and their arrival and release events are identical.
+
+The obligation is one-way. For every such `T'`, with everything above held fixed:
+
+```text
+eligibility(A, T')   never earlier than  eligibility(A, T)
+selections(A, T')    never more than     selections(A, T)
+admitted(A, T', d)   never more than     admitted(A, T, d)
+                         for every resource dimension d
+
+eligibility(B, T')   never later than    eligibility(B, T)
+select_pos(b, T')    never later than    select_pos(b, T)
+                         for every demand b of B selected under T
+```
+
+Here `select_pos(b, T)` is the position of demand `b`'s selection event within the finite ordered sequence of selection events under `T`, and is `+infinity` when `b` is not selected under `T` at all. The last two lines are one obligation, not two: they jointly express *do not delay the competing root*. `B` may not be made eligible later, and no selection of a `B` demand may be pushed to a later position in the selection order. Eligibility alone would not capture delay, because a demand can remain eligible at the same moment and still be selected later.
+
+The `+infinity` convention is what makes this a single observable. If a demand of `B` is selected under `T` but not under `T'`, its position has moved from a finite value to `+infinity`, so it has been delayed without bound and the comparison forbids it. That case is excluded by the delay bound itself, not by any separate rule about how many demands of `B` are selected.
+
+The obligation remains one-way and imposes no equality. Additional selections of `B` under `T'` are permitted, since a demand not selected under `T` is outside the comparison entirely. `B`'s admitted quantity is unconstrained in either direction. What is excluded is exactly this: a demand of `B` being served later than it was under `T`, or not at all.
+
+These comparisons are the entire obligation, and each bounds one direction only. Nothing here requires equality of service outcomes. `A` faring worse under `T'` is permitted, `B` faring better under `T'` is permitted, and `B`'s admitted quantity is unconstrained in either direction. `B`'s selection count is not constrained upward either; it is bounded only in the sense that the delay comparison forbids a baseline selection from vanishing. The obligation bounds only amplification of `A` and delay of `B`.
+
+Repartitioning may therefore change how charges are labelled, measured, and reported. What it may not do is obtain earlier eligibility, additional selections, or a larger admitted quantity for `A`, or push `B` later.
 
 This is a fairness obligation on a provider, not a corollary of any theorem above. This document does not prove it and supplies no scheduler, root taxonomy, weighting, or turn mapping that would.
 
+**Nonclaims.** The obligation is an invariance over attribution, not an identity property over the world.
+
+- it does not bind apparent ingress sources into one real-world claimant;
+- it is not a proof of Sybil resistance, and no Sybil-resistance claim may be derived from it;
+- it does not determine how many fairness roots an actor should receive.
+
+If a provider maps two apparent sources to two fairness roots, the obligation says nothing about whether those sources are one actor. It constrains only what re-attribution beneath an already-selected root can achieve. Selecting roots is a local trust decision outside this model: a trusted local provider or ingress owner may derive roots from facts it has itself verified or authenticated, including an authenticated local principal or an isolated ingress domain, while no unverified claimant, peer, or wire assertion may directly name, select, split, rotate, or multiply a root. Mere submission over the wire is never sufficient; a locally verified or authenticated input is permitted.
+
+The obligation is also not a progress property. It says nothing about progress, throughput, latency, or backpressure, and nothing about behavior under hostile ingress. Those are separate concerns of ingress admission and backpressure design. Satisfying the obligation neither implies nor requires progress under hostile ingress, and no liveness claim follows from it.
+
 The conservation and impossibility results are independent of it in both directions. Theorems 14.1 through 14.5c neither prove the obligation nor depend on it: `sum(R) <= G` holds regardless of which demand is served next, because selection and rotation do not change `R`. Conversely, discharging the obligation cannot strengthen any liveness claim disclaimed in 14.5b and 14.5c. No safety result in this document may be cited as evidence that the obligation holds.
+
+### Theorem 14.5f. External capacity loss does not reduce a committed grant, and conservation is never suspended
+
+Distinguish three quantities in each resource dimension:
+
+```text
+H    external observed or desired host capacity
+Gc   committed grant, against which every live claim was admitted
+S    charged sum: live claims plus failed-cleanup-retained claims
+```
+
+Contraction of `Gc` is permitted only to a value greater than or equal to `S`. A provider may never set `Gc` below `S`, and a fall in `H` is an observation, not a reduction of `Gc`.
+
+**Claim.** `S <= Gc` is invariant across every transition, including arbitrary external capacity loss. There is no reachable state in which conservation is suspended, momentarily false, or restored later.
+
+#### Proof
+
+Initially `S <= Gc`, since every admitted claim was checked against `Gc`. Consider each transition.
+
+Admission grants `q` only when `S + q <= Gc`, so it preserves the invariant. Owner release after proven cleanup reduces `S` by exactly the released claim and leaves `Gc` unchanged, so it preserves the invariant. Failed-cleanup retention replaces a live claim with the identical retained claim, leaving `S` unchanged. Grant expansion raises `Gc` and preserves the invariant trivially. Grant contraction is permitted only to some `Gc'` with `S <= Gc'`, so it preserves the invariant by construction. An external observation `H < S` changes no member of `R` and does not change `Gc`, so `S` and `Gc` are both unchanged and the invariant is preserved; it constrains only which future admissions are allowed, and it may prompt retirement requests, which by Theorem 14.5c change no member of `R`.
+
+Every transition preserves `S <= Gc`, so by induction it holds in every reachable state.
+
+**Why the excluded state is excluded.** Setting `Gc` below `S` would require either releasing claims the provider does not own, which contradicts P2 and Theorem 14.5c, or leaving a charge unattributed, which contradicts P1 and Theorem 14.1. The rule that contraction may not pass `S` is exactly what forbids both.
+
+The excluded state is *internal* overcommitment, `S > Gc`, which is unreachable. It must not be confused with *external* overcommitment, `H < S`, which is a different condition entirely: it is reachable at any time because `H` is outside the provider's control, it is a required typed provider state rather than a defect in the model, and it is modelled immediately below. Excluding `S > Gc` does not exclude, weaken, or dispense with the typed overcommitted state relative to `H`.
+
+**Behavior when `H` falls below `S`.** The provider reports a typed degraded or overcommitted state relative to `H`, and `S <= Gc` remains invariant throughout. `Gc` remains at or above `S` and may contract only as owner-driven release lowers `S`, and only as far as the current `S`, so contraction trails release and never causes it. Reporting the condition is required. The report names `H`; it never presents a reduced `Gc`, never describes `S` as exceeding `Gc`, and never claims capacity was taken back. New conflicting admission is refused with typed pressure or unavailability. The provider may request retirement only from exact owners whose contracts declare their leases reclaimable, and it releases nothing itself. Every unreleased charge stays charged and exactly attributed. `H` is never equated with `Gc`.
+
+**Safety, not liveness.** Nothing here bounds how long `Gc` remains above `H`. `Gc` can follow `S` downward only as owners release, and no timer, notification, or external pressure compels an owner to release. If owners never release, `Gc` never reaches `H`. This is consistent with Theorems 14.5b and 14.5c and adds no progress claim. A deployment that must be able to honor a fall in `H` immediately reserves or isolates in advance under Theorem 14.6; it cannot obtain that guarantee afterwards by revoking. Every result of external capacity loss is a typed resource event and never an authorization result.
 
 ### Theorem 14.6. Optional ceiling confinement
 

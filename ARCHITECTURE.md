@@ -1,6 +1,6 @@
 # MyOwnMesh fundamental hybrid networking architecture
 
-Status: owner-adopted V4 architecture, source revision `2a04e29e0a4c09b95a4914972018850ddb2cbacb`.
+Status: owner-adopted V4 architecture, as amended by owner review.
 
 This document defines the smallest common architecture for MyOwnMesh discovery, durable mesh semantics, signaling, transport path construction, endpoint authentication, session recovery, and application data delivery.
 
@@ -256,17 +256,28 @@ P3 No minting
     no scope, child scope, or identity creates capacity
 
 P4 Work conservation
-    capacity that is neither live nor reserved for an in-flight admission
-    is borrowable by any scope that can use it
+    capacity that is neither live nor reserved for an in-flight
+    admission is borrowable by any scope that can use it. A provider
+    may return immediate typed pressure instead of retaining a demand
+    only when the claim does not currently fit. A claim that does fit
+    is admitted, unless the refusal is justified by a proven structural
+    limit of the provider, by an explicit isolation policy or optional
+    local ceiling under P5, or by accounting that is unavailable,
+    poisoned, or otherwise unable to prove the admission safe. Every
+    such reason is declared. Arbitrary refusal is prohibited and can
+    never stand as a hidden limit
 
 P5 Explicit isolation
     every partition, reserved share, or isolation ceiling is explicit
     local policy, never a basal guarantee
 
-P6 Non-multipliable scheduling weight
-    scheduling gives mintable child identities no way to manufacture
-    service weight; creating scopes or rotating identities cannot
-    improve a claimant's share
+P6 Partition invariance of scheduling
+    one-way non-amplification. Repartitioning one fixed fairness root's
+    identical demand trace across more attribution child scopes beneath
+    it must not give that root earlier eligibility, additional
+    selections or turns, or a larger admitted quantity, and must not
+    delay a competing fixed root. It requires no equality of outcome
+    and constrains nothing else. Stated precisely below
 
 P7 Pressure is not authorization
     refusal, pressure, and unavailability are typed resource results,
@@ -284,11 +295,18 @@ FairnessRoot
     the unit of scheduling attribution that a provider serves
     selected locally by the trusted provider or ingress owner that
         installs the grant
-    process-local: it has meaning only within one process's scheduling.
-        It is never transmitted, never compared across processes, and
-        never derived from a wire value
-    not mintable by the claimant it attributes: a claimant cannot
-        create, split, name, rotate, or multiply its own FairnessRoot
+    process-local and opaque: it has meaning only within one process's
+        scheduling. The root value itself is never transmitted and never
+        compared across processes
+    not mintable by the claimant it attributes: no unverified claimant,
+        peer, or wire assertion may directly name, select, split,
+        rotate, or multiply a FairnessRoot
+    mapped from locally trusted input: the trusted provider or ingress
+        owner may use facts it has itself verified or authenticated,
+        including an authenticated local principal or an isolated
+        ingress domain, as input to the mapping. Mere submission over
+        the wire is never sufficient; local verification is what makes
+        an input usable
     not a semantic or durable identity, and not an authentication or
         authorization root or capability: it is not a Device ID, Mesh
         ID, durable semantic identity, endpoint identity, or wire value,
@@ -304,13 +322,134 @@ AttributionChildScope
         number of attribution child scopes beneath it
 ```
 
+**P6 stated precisely, as finite-trace partition invariance.** Consider two fairness roots, `A` and `B`. Hold all of the following fixed:
+
+```text
+the two fairness roots
+one finite ordered demand trace for each root
+    each demand's exact resource claim
+    each demand's authority class
+    each demand's reclaimability under its owner contract
+    the arrival event and ordering of every demand
+    the release event and ordering of every completed demand
+the initial provider state and the grant
+```
+
+Now take root `A`'s trace and repartition it across any number of attribution child scopes beneath `A`. The repartitioning changes only how the same demands are attributed. It does not change what any demand asks for, its authority, its reclaimability, or when it arrives or releases.
+
+P6 is a one-way non-amplification requirement. It requires that for every such repartitioning of that identical trace:
+
+```text
+no earlier eligibility
+    no demand of A becomes eligible for selection sooner than it was in
+    the unpartitioned trace
+no additional selections or turns
+    A receives no more selection opportunities, turns, or service
+    events than in the unpartitioned trace
+no larger admitted quantity
+    A is admitted no greater quantity in any resource dimension than in
+    the unpartitioned trace
+no delay imposed on the competing root
+    no demand of B becomes eligible later or is selected later than in
+    the unpartitioned trace, where a demand that is not selected at all
+    counts as selected at an unbounded position
+```
+
+These four comparisons are the whole of P6, and each bounds one direction only. P6 does not require that service outcomes be identical. It does not forbid the repartitioned root from faring worse, and it does not forbid the competing root from faring better. It bounds only amplification of the repartitioned root and delay of the competitor.
+
+Delay of the competitor covers both when its demands become eligible and where its selections fall in the selection order, because a demand can remain eligible at the same moment and still be selected later. Selection position uses the convention that a demand which is not selected at all sits at an unbounded position. A selection the competitor held in the unpartitioned trace and loses under repartitioning has therefore moved from a finite position to an unbounded one: it has been delayed without bound, and the same delay bound excludes it. No separate rule about how many of the competitor's demands are selected is needed or implied.
+
+Additional selections for the competitor remain permitted, since a demand it did not hold in the unpartitioned trace is outside the comparison. How much the competitor is admitted remains unconstrained in either direction.
+
+Repartitioning may therefore change how charges are labelled, measured, and reported. What it may not do is win the repartitioned root earlier eligibility, extra turns, or a larger admitted quantity, or push the competitor later.
+
+**What P6 does not claim.** P6 is an invariance property over attribution. It is not an identity property over the world, and it is deliberately silent about who a claimant really is.
+
+```text
+P6 does not bind apparent ingress sources into one real-world claimant
+P6 is not a proof of Sybil resistance
+P6 does not decide how many fairness roots an actor should receive
+```
+
+If a provider maps two apparent sources to two fairness roots, P6 says nothing about whether those sources are one actor. It constrains only what re-attribution beneath an already-selected root can achieve.
+
+Selecting roots is a local trust decision that sits outside P6. A trusted local provider or ingress owner may derive fairness roots from facts it has itself verified or authenticated, including an authenticated local principal or an isolated ingress domain. What is prohibited is unverified influence: no unverified claimant, peer, or wire assertion may directly name, select, split, rotate, or multiply a fairness root. Mere submission over the wire is never sufficient to move a partition; a locally verified or authenticated input is a permitted mapping input.
+
+**P6 is not a progress property.** P6 says nothing about progress, throughput, latency, or backpressure, and nothing about behavior under hostile ingress. Whether a system keeps making progress while an adversary floods ingress is a separate concern, addressed by ingress admission, authentication placement, and backpressure design. Satisfying P6 neither implies nor requires progress under hostile ingress, and no liveness claim follows from P6.
+
 Selection order, rotation rule, and pending-demand cardinality are concrete provider policy, not basal architecture. A resource-provider implementation chooses them and may replace them with any policy that preserves P1 through P8. No other subsystem may depend on a particular choice.
 
-This architecture selects no scheduler, no fairness-root taxonomy, no weights or quotas, and no mapping from fairness roots to service turns. It requires only that whatever a provider selects, a claimant cannot improve its own share by creating attribution beneath its root.
+This architecture selects no scheduler, no fairness-root taxonomy, no weights or quotas, and no mapping from fairness roots to service turns. It requires only that whatever a provider selects, subdividing attribution beneath a fixed fairness root cannot give that root earlier eligibility, additional selections or turns, or a larger admitted quantity, and cannot delay a competing fixed root.
 
 A conforming provider satisfies P1 through P8. Whether any particular provider does so is recorded in the implementation and transition documents, not here.
 
 Under any such policy, when a selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Which leases are reclaimable is part of the owner contract, not a provider decision. That request is sticky and contains no timer. It does not release, revoke, or alter a claim. The notified owner must finish cleanup and drop its lease, or explicitly transfer the unreleased claim into failed-cleanup retention when cleanup cannot be proven.
+
+**Committed grant and external capacity change.** The grant is not required to be constant, but three quantities must never be conflated:
+
+```text
+H   external observed or desired host capacity
+        what the host, operating system, container, or embedding owner
+        currently reports, offers, or wishes to allow
+
+Gc  committed grant
+        what the provider has actually committed to this process, and
+        against which every live claim was admitted
+
+S   charged sum
+        live claims plus failed-cleanup-retained claims
+```
+
+`S <= Gc` holds at all times. A provider may raise `Gc`, and it may lower `Gc`, but it may never lower `Gc` below `S`. A committed grant reduced below what is already charged would have to either forge a release, which P2 forbids, or leave a charge unattributed, which P1 forbids. Neither is available, so `S > Gc` is unreachable.
+
+Two different conditions share the word overcommitment and must not be confused:
+
+```text
+external overcommitment, relative to H
+    H < S: the host currently offers or desires less than is already
+    charged. This is a real condition, it is required to be reported as
+    a typed degraded or overcommitted state relative to H, and it is
+    reachable at any time because H is outside the provider's control
+
+internal overcommitment, S > Gc
+    charges exceeding the committed grant. This is unreachable. It
+    would require a forged release or an unattributed charge, and no
+    conforming provider can enter it
+```
+
+When `H` falls below `S`, the provider reports a typed degraded or overcommitted state relative to `H`, while `S <= Gc` remains invariant. It behaves as follows:
+
+```text
+Gc stays at or above S
+    the committed grant is never reduced below the charged sum. It
+    contracts only as owner-driven release lowers S, and only as far as
+    the current S. Contraction trails release; it never causes it
+
+typed degraded or overcommitted reporting
+    the provider reports a typed degraded or overcommitted state
+    relative to H. Reporting it is required, not optional. The report
+    names H. It never presents a reduced Gc, never describes S as
+    exceeding Gc, and never claims capacity was taken back
+
+no new conflicting work
+    admission of work that would conflict with the external constraint
+    is refused with typed pressure or unavailability
+
+retirement requests only
+    the provider may request retirement from exact owners whose
+    contracts declare their leases reclaimable, exactly as elsewhere.
+    It releases nothing itself and compels nothing
+
+all unreleased charges retained
+    every live and failed-cleanup-retained charge stays charged and
+    exactly attributed. Nothing is written off to close the gap
+
+H is never Gc
+    an observed or desired host capacity is never presented as the
+    committed grant and never silently becomes one
+```
+
+External capacity loss is therefore an observation and a constraint on future admission, never a reduction of what is already committed. Conservation is never suspended and is never momentarily false. A deployment that must be able to honor a fall in `H` immediately reserves or isolates in advance under P5; it cannot obtain that guarantee afterwards by revoking.
 
 No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. Optional local policy may impose stricter cardinality or isolation ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
 
@@ -569,7 +708,7 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
 14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
 15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result in either direction.
-16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and scheduling gives a claimant no way to manufacture service weight, because attribution child scopes refine accounting beneath one fairness root without creating another share or turn. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
+16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and subdividing attribution beneath a fixed fairness root cannot give that root earlier eligibility, additional selections or turns, or a larger admitted quantity, and cannot delay a competing fixed root, because attribution child scopes refine accounting beneath one fairness root without creating another share or turn. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
 17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
 18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
 19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.

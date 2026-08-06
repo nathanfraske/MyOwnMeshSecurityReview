@@ -468,8 +468,10 @@ Required result — basal properties, provider independent:
 - release or failed-cleanup retention remains attributable to the exact selected claim;
 - an optional local ceiling can restrict a deployment without minting capacity, and remains absent from the elastic constructors;
 - `Cleanup` and `Admitted` leases are never reclamation victims; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
-- connector-local scheduling metadata is not capacity: connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant. This is a capacity-authority claim and does not discharge the claimant-share obligation below;
-- service weight is not multipliable: creating, cloning, or rotating any number of attribution child scopes beneath one claimant's `FairnessRoot` cannot improve that claimant's service share against another `FairnessRoot`. `FairnessRoot` and attribution child scope are used here with the closed definitions in [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md): a `FairnessRoot` is the trusted local attribution a provider schedules against and is not mintable by the claimant it attributes; an attribution child scope refines accounting beneath exactly one `FairnessRoot` and creates no additional root, share, or turn. **No control below implements this, and the shipped provider does not satisfy it. See the missing-control note in this section;**
+- connector-local scheduling metadata is not capacity: connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant. This is a capacity-authority claim and does not discharge P6 below;
+- P6 finite-trace partition invariance, in its one-way non-amplification form: scheduling is non-amplifying under repartition, on any finite trace of a fixed set of `FairnessRoot` values. Fix the roots and a finite trace of demands, grants, releases, and refusals, repartition one fixed root's identical demand trace across any number of `AttributionChildScope` values beneath that same root, change nothing else, and against the unpartitioned trace that root must not become eligible earlier, must not receive more selections or turns, must not have more quantity admitted to it, and must not delay a competing fixed root. The bound is over those four observables; it does not require whole-outcome equality and does not claim that partitioning is undetectable. `FairnessRoot` and `AttributionChildScope` are used here with the closed definitions in [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md): a `FairnessRoot` is the trusted local attribution a provider schedules against and is not mintable by the claimant it attributes; an `AttributionChildScope` refines accounting beneath exactly one `FairnessRoot`. **No control below implements P6, and the shipped provider does not satisfy it. See the missing-control note in this section;**
+- a nonwaiting acquisition returns typed pressure instead of retaining a demand only for a claim that does not fit, meaning one that cannot be met from capacity that is neither live nor reserved for an in-flight admission, in every dimension the claim requires. A fitting claim is admitted, except under a proven structural limit, under an explicit local isolation policy or optional local ceiling, or when the accounting needed to admit it safely is unavailable, unsafe, or poisoned. Refusal may not hold capacity for an anticipated demand, smooth a demand rate, or enforce an undeclared share, because any such reservation is a partition and is conforming only as an explicit local isolation policy;
+- committed charges never exceed the provider-owned committed grant, in every dimension and at every moment, so a grant may be contracted only down to the charges already committed, applies only to later admission decisions, and releases, revokes, invalidates, or reuses nothing. External observed capacity is separate: when the environment reports or imposes less than the committed charges, the provider records a typed degraded or over-committed result relative to that observation, keeps holding every charge, does not lower the committed grant below the charges, does not forge or force a release, does not admit conflicting new work, and issues only exact retirement requests to owners whose contracts declare those leases reclaimable. **The shipped provider fixes its grant at construction, exposes no contraction API, and models no external observed capacity. No control below exercises either, and none may be cited as if it did;**
 - slow work retains its finite lease without timer-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
@@ -482,7 +484,10 @@ Required result — concrete policy of the shipped `FiniteResourceProvider`:
 - each provider scope owns at most one move-only pending demand, and a cancelled demand loses that turn;
 - a pending turn blocks only the resource dimensions the selected demand requires;
 - scope and reservation bookkeeping passes the same admission gate as ordinary claims;
-- a reclaim request is published only after the selected victim set can satisfy the deficit.
+- a reclaim request is published only after the selected victim set can satisfy the deficit;
+- the determinism of this policy is narrow and positive. Given identical already-issued `ResourceScopeId` values, identical provider state, and the same ordered sequence of provider operations, arbitration is deterministic: the same demand is selected and the same result is produced. Nothing beyond that is claimed. `ResourceScopeId` is the allocation address of the scope identity, so which identities are issued, and therefore the equal-authority rotation order, is not reproducible across runs, processes, allocators, builds, platforms, or thread schedules, and an address may be reused once its scope identity drops. A control may assert that arbitration is reproducible under those identical conditions, that rotation occurs, and that no scope reacquires ahead of an equal-authority scope's outstanding demand. No control, caller, or diagnostic may assert cross-run or cross-process reproducibility, a particular rotation sequence, or a scope identity that is stable, meaningfully ordered, comparable across time, or unique over the life of the process.
+
+Scope of P6, the finite-trace partition property. Which local values map onto a `FairnessRoot` is provider and deployment policy: one root for the whole process, or one per local principal, listener, ingress class, or Mesh runtime. The mapping may take verified inputs. A trusted local provider or ingress owner may use facts it has itself verified or authenticated, including an authenticated local principal, an authenticated remote identity, or an isolated ingress path. The hard boundary is that no claimant-supplied or wire-visible value may directly name, select, split, or multiply a root, and no party may increase the number of roots it is attributed to by asserting something. Verification and assignment stay with the local owner: the mapping need not be independent of verified facts, but it must be independent of unverified assertion. This record fixes no scheduler model, root taxonomy, or principal enumeration. Because P6 is stated on finite traces of a fixed root set, three results are explicitly not claimed here and may not be inferred from any control below. It claims nothing about infinite runs, eventual admission, throughput, or latency, since a provider that refuses every demand in a trace is still non-amplifying. It claims no correspondence between a `FairnessRoot` and a real-world claimant or actor, so it is not Sybil resistance, rests on no real-world claimant identity premise, and if one actor legitimately holds several roots nothing bounds the total share that actor obtains; that belongs to deployment admission and root-assignment policy. It is not the hostile-ingress obligation: progress, backpressure, and bounded admission for unknown remote input are proved, where they are proved at all, by the ingress and callback controls in sections 5, 6, 7, and 10 of this record, and neither set of controls is evidence for the other.
 
 Exact source controls — basal properties:
 
@@ -537,23 +542,33 @@ fairness-domain liveness is not settled here.
 
 Missing control — blocking, no source control exists:
 
-- claimant-share fairness: creating, cloning, or rotating any number of
-  attribution child scopes beneath one claimant's `FairnessRoot` must not
-  improve that claimant's service share against another `FairnessRoot`.
+- P6 finite-trace partition invariance, in its one-way non-amplification form:
+  on a finite trace of a fixed set of `FairnessRoot` values, replay one fixed
+  root's identical demand trace twice, once under a single
+  `AttributionChildScope` and once repartitioned across several
+  `AttributionChildScope` values beneath that same root, and compare four
+  observables —
+  when that root becomes eligible, how many selections or turns it receives, how
+  much quantity is admitted to it, and how far a competing fixed root is
+  delayed. The repartitioned replay must not improve any of the first three for
+  that root and must not increase the fourth for the competing root.
 
 No control in this record implements that obligation, and none of the controls
 listed above may be cited as evidence for it. `equal_authority_demands_rotate_without_cross_scope_reacquisition`
 and `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
 exercise rotation between scope identities, which is the mechanism at issue
-rather than a proof of fairness between claimants. The shipped
-`FiniteResourceProvider` does not satisfy the obligation: its rotation is keyed
-to process-local scope identities, which are mintable, so a claimant can create
-attribution child scopes to manufacture turns and the provider schedules against
-a mintable identity rather than a `FairnessRoot`. This is a disclosed
-nonconformance, not a pending pass, and it must never be reported as passing.
-Review 4865297956 §8 defers the fix to Slice D, which must bind a pending demand
-to a `FairnessRoot` that the claimant cannot create, split, name, rotate, or
-multiply, and must add the control this record is missing.
+rather than a comparison of the two replays. The shipped
+`FiniteResourceProvider` does not satisfy P6: its rotation is keyed to
+process-local scope identities, so several `AttributionChildScope` values
+beneath one fixed `FairnessRoot` act as several distinct rotation keys. The
+repartitioned replay therefore obtains extra rotation turns for that root and
+delays the competing fixed root, which is exactly the amplification the bound
+forbids. This is a disclosed nonconformance, not a pending pass, and it must
+never be reported as passing. Closing it is also not a Sybil, hostile-ingress
+progress, or backpressure result, and no future control may be written as if it
+were. Review 4865297956 §8 defers the fix to Slice D, which must bind each
+pending demand to the fixed `FairnessRoot` that owns it rather than to a
+per-scope identity, and must add the control this record is missing.
 
 The compiler-boundary checker separately rejects the listed basal cardinality
 names and requires the elastic constructors and optional local wrappers. These
