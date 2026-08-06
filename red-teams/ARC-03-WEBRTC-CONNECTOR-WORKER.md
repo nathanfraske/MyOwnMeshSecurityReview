@@ -13,9 +13,21 @@ required. The separation changes only what a passing control is allowed to
 claim.
 
 Review `4869373979` at `f58dab6` is cited here as provenance for the wording and
-harness corrections below. A review identifier is provenance only. It is never
-execution evidence, and no control in this record may be reported as passing
-because a review exists.
+harness corrections below. Review `4870701740` is cited as provenance for P6
+partition non-amplification over a fixed input workload, for the prefix-inequality
+control form, and for the `S`/`Gc`/`O`/`T`/`B` contraction model. A review
+identifier is provenance only. It is never execution evidence, and no control in
+this record may be reported as passing because a review exists.
+
+Accepted CI at exact head `6a22911` establishes runtime non-regression only. It
+shows that the retained connector, lifecycle, cleanup, ICE-restart,
+codec-neutrality, compatibility, and TURN behavior still runs as accepted at
+that head. It is not proof of P6 partition non-amplification, not proof of any
+contraction behavior over `S`, `Gc`, `O`, `T`, or `B`, not proof of the
+hostile-ingress progress and backpressure obligation, not proof of substrate
+backing, and not a resolution of the Slice C unproved-backing residual. None of
+those has a control at that head, so a passing run cannot have exercised them,
+and no part of that result may be cited toward them.
 
 ## 1. Isolation and exact-head commands
 
@@ -466,12 +478,12 @@ Required result — basal properties, provider independent:
 - a demand cancelled before acquisition releases no victim;
 - nonwaiting acquisition returns typed pressure without creating a hidden demand or requesting cleanup;
 - release or failed-cleanup retention remains attributable to the exact selected claim;
-- an optional local ceiling can restrict a deployment without minting capacity, and remains absent from the elastic constructors;
+- an optional local ceiling can restrict a deployment without minting capacity, remains absent from the elastic constructors, and is explicit, named, and recorded rather than derived from a transient observation `O`;
 - `Cleanup` and `Admitted` leases are never reclamation victims; victim cleanup and eventual admission remain conditional on the exact owner completing cleanup;
 - connector-local scheduling metadata is not capacity: connector-local service weights and quanta reserve no provider capacity and cannot multiply the process grant. This is a capacity-authority claim and does not discharge P6 below;
-- P6 finite-trace partition invariance, in its one-way non-amplification form: scheduling is non-amplifying under repartition, on any finite trace of a fixed set of `FairnessRoot` values. Fix the roots and a finite trace of demands, grants, releases, and refusals, repartition one fixed root's identical demand trace across any number of `AttributionChildScope` values beneath that same root, change nothing else, and against the unpartitioned trace that root must not become eligible earlier, must not receive more selections or turns, must not have more quantity admitted to it, and must not delay a competing fixed root. The bound is over those four observables; it does not require whole-outcome equality and does not claim that partitioning is undetectable. `FairnessRoot` and `AttributionChildScope` are used here with the closed definitions in [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md): a `FairnessRoot` is the trusted local attribution a provider schedules against and is not mintable by the claimant it attributes; an `AttributionChildScope` refines accounting beneath exactly one `FairnessRoot`. **No control below implements P6, and the shipped provider does not satisfy it. See the missing-control note in this section;**
-- a nonwaiting acquisition returns typed pressure instead of retaining a demand only for a claim that does not fit, meaning one that cannot be met from capacity that is neither live nor reserved for an in-flight admission, in every dimension the claim requires. A fitting claim is admitted, except under a proven structural limit, under an explicit local isolation policy or optional local ceiling, or when the accounting needed to admit it safely is unavailable, unsafe, or poisoned. Refusal may not hold capacity for an anticipated demand, smooth a demand rate, or enforce an undeclared share, because any such reservation is a partition and is conforming only as an explicit local isolation policy;
-- committed charges never exceed the provider-owned committed grant, in every dimension and at every moment, so a grant may be contracted only down to the charges already committed, applies only to later admission decisions, and releases, revokes, invalidates, or reuses nothing. External observed capacity is separate: when the environment reports or imposes less than the committed charges, the provider records a typed degraded or over-committed result relative to that observation, keeps holding every charge, does not lower the committed grant below the charges, does not forge or force a release, does not admit conflicting new work, and issues only exact retirement requests to owners whose contracts declare those leases reclaimable. **The shipped provider fixes its grant at construction, exposes no contraction API, and models no external observed capacity. No control below exercises either, and none may be cited as if it did;**
+- P6 partition non-amplification, also called subdivision monotonicity. What is fixed is the input workload, not a trace of outcomes: a finite set of `FairnessRoot` values, one initial provider state including the committed grant `Gc` in every dimension, one identical finite sequence of demand arrivals, each arrival's exact claim by dimension, authority class, and reclaimability under its owner contract, and one deterministic owner response rule fixed in advance. Releases are derived from that rule applied to the work actually admitted, never supplied as inputs, so no control may script releases to manufacture or suppress a difference. Run the workload once with one fixed root `A` unsubdivided, then again with `A`'s arrivals spread across any number of `AttributionChildScope` values beneath that same root and nothing else changed. The bound is a set of prefix inequalities over the provider's ordered decision points `k`: at every `k`, `A`'s cumulative selections in the subdivided run must not exceed baseline; at every `k` and in every resource dimension `d`, `A`'s cumulative admitted quantity must not exceed baseline; and for every competitor root `B` other than `A` and every demand of `B`, that demand's selection position in the subdivided run must be no later than its baseline position, where a selection that never occurs takes position infinity. The bound is one-way: no equality of outcome, no share ratio, and no scheduler is implied, and a subdivision that leaves `A` worse off or a competitor better off conforms. [`FORMAL-PROOFS.md`](../FORMAL-PROOFS.md) Note 14.5e states the model and comparison canonically and governs. `FairnessRoot` and `AttributionChildScope` are used here with the closed architectural definitions owned by [`ARCHITECTURE.md`](../ARCHITECTURE.md), which governs them: a `FairnessRoot` is the unit of scheduling attribution a provider serves, selected locally by the trusted provider or ingress owner and not mintable by the claimant it attributes; an `AttributionChildScope` refines accounting beneath exactly one `FairnessRoot` and creates no additional share, turn, or service weight. [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md) owns the trusted local mapping and the typed provider status that make those definitions checkable. **No control below implements P6, and the shipped provider does not satisfy it. See the missing-control note in this section;**
+- a nonwaiting acquisition returns typed pressure instead of retaining a demand only for a claim that does not fit, meaning one that cannot be met from capacity that is neither live nor reserved for an in-flight admission, in every dimension the claim requires. Fit is computed against the committed and actually backed admission domain with P5 policy applied — `Gc` net of `S`, additionally bounded by `B` wherever backing is claimed, and narrowed by an explicit local isolation policy or optional local ceiling — and never against a transient observation `O` or a contraction target `T`. A fitting claim is admitted, except under a proven structural limit, under an explicit local isolation policy or optional local ceiling, or when the accounting needed to admit it safely is unavailable, unsafe, or poisoned. Refusal may not hold capacity for an anticipated demand, smooth a demand rate, or enforce an undeclared share, because any such reservation is a partition and is conforming only as an explicit local isolation policy;
+- contraction is modeled over five distinct per-dimension quantities that may never be conflated: `S` the committed charge, `Gc` the provider-owned committed grant admission is checked against, `B` the capacity actually backing the dimension that the provider can prove, `T` an owner-selected contraction target, and `O` an external observation. `S <= Gc` holds at every instant, so `S > Gc` is not a reachable state and no control may exhibit or describe one, and a grant contracts only down to the charges already committed. `O` is inert: it grants nothing, limits nothing, is never a fit test, and no refusal is justified by it. Only a named, recorded owner policy converts `O` into `T`, and `T` is a request that by itself lowers no grant, releases no charge, and refuses no admission. `Gc` descends toward `T` only after owner-driven release lowers `S`, one safe step at a time. A provider claiming backing proves `Gc <= B` at admission; `B < Gc` reports typed backing loss and `B < S` reports typed external overcommitment, and in both the charges are retained, no release is forged or inferred, conflicting work is refused with a typed dimension-naming result, and `Gc` is still not lowered below `S`. Those states are conservative accounting, never an assurance that physical backing still exists; substrate availability may genuinely have failed. Backing that cannot be proved is a named Slice C residual and is never counted as backed. **The shipped provider fixes its grant at construction, exposes no contraction entry point, and models no `O`, `T`, or `B`. No control below exercises any of them, and none may be cited as if it did;**
 - slow work retains its finite lease without timer-derived expiry;
 - storage-backed work consumes storage leases;
 - no hidden default cardinality exists.
@@ -487,7 +499,7 @@ Required result — concrete policy of the shipped `FiniteResourceProvider`:
 - a reclaim request is published only after the selected victim set can satisfy the deficit;
 - the determinism of this policy is narrow and positive. Given identical already-issued `ResourceScopeId` values, identical provider state, and the same ordered sequence of provider operations, arbitration is deterministic: the same demand is selected and the same result is produced. Nothing beyond that is claimed. `ResourceScopeId` is the allocation address of the scope identity, so which identities are issued, and therefore the equal-authority rotation order, is not reproducible across runs, processes, allocators, builds, platforms, or thread schedules, and an address may be reused once its scope identity drops. A control may assert that arbitration is reproducible under those identical conditions, that rotation occurs, and that no scope reacquires ahead of an equal-authority scope's outstanding demand. No control, caller, or diagnostic may assert cross-run or cross-process reproducibility, a particular rotation sequence, or a scope identity that is stable, meaningfully ordered, comparable across time, or unique over the life of the process.
 
-Scope of P6, the finite-trace partition property. Which local values map onto a `FairnessRoot` is provider and deployment policy: one root for the whole process, or one per local principal, listener, ingress class, or Mesh runtime. The mapping may take verified inputs. A trusted local provider or ingress owner may use facts it has itself verified or authenticated, including an authenticated local principal, an authenticated remote identity, or an isolated ingress path. The hard boundary is that no claimant-supplied or wire-visible value may directly name, select, split, or multiply a root, and no party may increase the number of roots it is attributed to by asserting something. Verification and assignment stay with the local owner: the mapping need not be independent of verified facts, but it must be independent of unverified assertion. This record fixes no scheduler model, root taxonomy, or principal enumeration. Because P6 is stated on finite traces of a fixed root set, three results are explicitly not claimed here and may not be inferred from any control below. It claims nothing about infinite runs, eventual admission, throughput, or latency, since a provider that refuses every demand in a trace is still non-amplifying. It claims no correspondence between a `FairnessRoot` and a real-world claimant or actor, so it is not Sybil resistance, rests on no real-world claimant identity premise, and if one actor legitimately holds several roots nothing bounds the total share that actor obtains; that belongs to deployment admission and root-assignment policy. It is not the hostile-ingress obligation: progress, backpressure, and bounded admission for unknown remote input are proved, where they are proved at all, by the ingress and callback controls in sections 5, 6, 7, and 10 of this record, and neither set of controls is evidence for the other.
+Scope of P6, partition non-amplification. Which local values map onto a `FairnessRoot` is provider and deployment policy: one root for the whole process, or one per local principal, listener, ingress class, or Mesh runtime. The mapping may take verified inputs. A trusted local provider or ingress owner may use facts it has itself verified or authenticated, including an authenticated local principal, an authenticated remote identity, or an isolated ingress path. The hard boundary is that no claimant-supplied or wire-visible value may directly name, select, split, or multiply a root, and no party may increase the number of roots it is attributed to by asserting something. Verification and assignment stay with the local owner: the mapping need not be independent of verified facts, but it must be independent of unverified assertion. This record fixes no scheduler model, root taxonomy, or principal enumeration. Because P6 is stated over one fixed input workload and compared prefix-wise, four results are explicitly not claimed here and may not be inferred from any control below. It asserts no equality of outcome, no share ratio, no scheduling policy, and no timer or elapsed-time behavior. It claims nothing about infinite runs, eventual admission, throughput, or latency, since a provider that refuses every arrival in the workload is still non-amplifying. It claims no correspondence between a `FairnessRoot` and a real-world claimant or actor, so it is not Sybil resistance, rests on no real-world claimant identity premise, and if one actor legitimately holds several roots nothing bounds the total share that actor obtains; that belongs to deployment admission and root-assignment policy. It is not the hostile-ingress obligation: progress, backpressure, and bounded admission for unknown remote input are proved, where they are proved at all, by the ingress and callback controls in sections 5, 6, 7, and 10 of this record, and neither set of controls is evidence for the other.
 
 Exact source controls — basal properties:
 
@@ -542,28 +554,40 @@ fairness-domain liveness is not settled here.
 
 Missing control — blocking, no source control exists:
 
-- P6 finite-trace partition invariance, in its one-way non-amplification form:
-  on a finite trace of a fixed set of `FairnessRoot` values, replay one fixed
-  root's identical demand trace twice, once under a single
-  `AttributionChildScope` and once repartitioned across several
-  `AttributionChildScope` values beneath that same root, and compare four
-  observables —
-  when that root becomes eligible, how many selections or turns it receives, how
-  much quantity is admitted to it, and how far a competing fixed root is
-  delayed. The repartitioned replay must not improve any of the first three for
-  that root and must not increase the fourth for the competing root.
+- P6 partition non-amplification, also called subdivision monotonicity: run one
+  fixed input workload twice — a finite set of `FairnessRoot` values, one
+  initial provider state including `Gc`, one identical arrival sequence, each
+  arrival's exact claim, authority class, and reclaimability, and one
+  deterministic owner response rule, with releases derived rather than scripted
+  — once with root `A` unsubdivided and once with `A`'s arrivals spread across
+  several `AttributionChildScope` values beneath that same root. Compare
+  prefix-wise at every provider decision point `k`: `A`'s cumulative selections
+  must not exceed baseline, `A`'s cumulative admitted quantity must not exceed
+  baseline in every dimension `d`, and every competitor demand's selection
+  position must be no later than its baseline position, with absence counted as
+  infinity. The first control fixes a bounded decision prefix in which none of
+  the compared newly admitted demands releases, which makes the comparison well
+  defined without depending on release timing; it is a genuine conformance
+  result for the decisions it covers, never globally sufficient, and never a
+  whole-model proof. A later generalization may carry a deterministic owner
+  automaton instead. Either form isolates the bookkeeping that subdivision
+  itself creates by exactly one of two methods — charge it to a dimension shown
+  non-binding in both executions, or prefund equivalent bookkeeping in both
+  executions before the comparison begins. Merely stating that charge, or
+  netting it against `A`'s admitted quantity, is not isolation.
 
 No control in this record implements that obligation, and none of the controls
 listed above may be cited as evidence for it. `equal_authority_demands_rotate_without_cross_scope_reacquisition`
 and `v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn`
 exercise rotation between scope identities, which is the mechanism at issue
-rather than a comparison of the two replays. The shipped
+rather than a prefix-wise comparison of the two executions. The shipped
 `FiniteResourceProvider` does not satisfy P6: its rotation is keyed to
-process-local scope identities, so several `AttributionChildScope` values
-beneath one fixed `FairnessRoot` act as several distinct rotation keys. The
-repartitioned replay therefore obtains extra rotation turns for that root and
-delays the competing fixed root, which is exactly the amplification the bound
-forbids. This is a disclosed nonconformance, not a pending pass, and it must
+process-local scope identities, so each `AttributionChildScope` created beneath
+one `FairnessRoot` introduces another distinct rotation key and nothing relates
+those keys back to the root. At some decision prefix the subdivided execution
+gives that root strictly more cumulative selections than baseline and moves a
+competitor's selection to a later position, violating both inequalities. This
+is a disclosed nonconformance, not a pending pass, and it must
 never be reported as passing. Closing it is also not a Sybil, hostile-ingress
 progress, or backpressure result, and no future control may be written as if it
 were. Review 4865297956 §8 defers the fix to Slice D, which must bind each
