@@ -580,23 +580,52 @@ Provider conformance also requires that subdividing one fixed fairness root's at
 **The model.** The comparison is made in a causally closed model, so that attribution is the only difference between the two runs.
 
 ```text
-Roots      a fixed finite set of FairnessRoots, the same in both runs
-Initial    one initial provider state, including the committed grant Gc
-Arrivals   one finite sequence of demand arrivals, identical in both
-           runs in content and in order
-Demand     each arrival carries its exact claim by dimension, its
-           authority class, and its reclaimability under its owner
-           contract
-Owners     one deterministic owner response rule, fixed in advance,
-           mapping work actually admitted to that owner's subsequent
-           actions
-Releases   not free inputs: every release is derived by applying the
-           owner response rule to the work actually admitted
+Roots        a fixed finite set of FairnessRoots, the same in both runs
+
+Topology     a fixed AttributionChildScope topology beneath those
+             roots, identical in both runs, created before the
+             measured prefix begins
+
+Bookkeeping  the provider's own scope-record claims for that topology,
+             identical in both runs, already charged before the
+             measured prefix begins
+
+Initial      one initial provider state, including Gc in every
+             resource dimension
+
+Demands      a finite set of demands under stable DemandIds; each
+             carries its exact claim by dimension, its authority class,
+             and its reclaimability under its owner contract
+
+Schedule     one deterministic, clock-free environment and reducer rule
+             fixing the interleaving of exogenous arrivals with
+             owner-derived actions
+
+Owners       one deterministic owner response rule, fixed in advance,
+             mapping work actually admitted to that owner's subsequent
+             actions
+
+Releases     not free inputs: every release is derived by applying the
+             owner response rule to the work actually admitted
 ```
 
 Nothing outside this list may differ between the runs. Because releases are derived rather than supplied, the model is causally closed: the comparison cannot invent a release and then charge the provider for its consequences.
 
-Let `A` be the subdivided root. The baseline run attributes `A`'s arrivals to `A` alone. The subdivided run attributes the same arrivals across any number of `AttributionChildScope`s beneath `A`, changing nothing else.
+An ordered sequence of arrivals is not by itself sufficient. Ordering the arrivals leaves free how they interleave with the actions owners take in response to admitted work, and that freedom alone can move a selection. The deterministic clock-free schedule rule fixes that interleaving. It is clock-free because a wall-clock dependence would reintroduce a difference that is neither attribution nor workload.
+
+**Construction A.** Both executions begin from the same already-created structure: the same fairness roots, the same attribution child-scope topology beneath `A`, the same bookkeeping claims already charged for that topology, and the same demands under stable `DemandId`s. All of it exists before the measured prefix begins.
+
+The two runs then differ in exactly one function:
+
+```text
+baseline     every demand of A maps to one already-created child scope
+             beneath A
+
+subdivided   the same demands map across the same already-created child
+             scopes beneath A
+```
+
+Only the `DemandId -> AttributionChildScope` mapping differs. No scope is created, destroyed, or charged inside the measured prefix. This is what isolates subdivision as the variable: were scopes created during the prefix, a difference could be explained by scope-creation cost or by a different topology rather than by attribution, and the comparison would not be measuring P6.
 
 **The comparison.** Comparison is prefix-wise. Let `k` index decision prefixes, that is the provider's decision points in order, and let `d` range over resource dimensions.
 
@@ -622,22 +651,15 @@ The infinity convention keeps delay a single observable. A demand selected in th
 
 The obligation is one-way throughout. `A` faring worse is permitted. A competitor faring better is permitted, including additional selections, since a demand unselected in the baseline sits at `infinity` and no position exceeds it. Competitor admitted quantity is unconstrained in either direction. Subdivision may freely change how charges are labelled, measured, and reported.
 
+**Terminal stuttering.** The two runs need not have the same length. Comparison is still made at every prefix index `k`, under the convention that once a run terminates its cumulative values remain constant at their final values, and a demand never selected in that run remains at `infinity`. A shorter run therefore stutters at its terminal state rather than becoming undefined, so no comparison is ill-formed or vacuous merely because one run ended first.
+
 **First conformance control.** Take a finite decision prefix over which none of the compared newly admitted demands release. Check the comparisons above across that prefix, for `A` and for every other root. Excluding releases of the compared work removes the confound in which a release, rather than the partition, explains a difference. A later generalization may lift the restriction by carrying the deterministic owner automaton through the prefix, so that releases remain derived rather than free.
 
-**Scope-bookkeeping cost.** Subdivision may create additional provider scope records, and those records may themselves cost something. That cost must not turn subdivision into an apparent violation, and must not become a hidden ceiling on subdivision. Exactly one of two methods is used:
+**Scope-bookkeeping cost.** A provider scope record is a real resource. It is finite, it is charged, and acquiring it may fail. Nothing in this note says otherwise, and nothing here promises that a provider can support unlimited scopes.
 
-```text
-honest charging
-    the extra bookkeeping is charged, and charged in a dimension that
-    does not bind admission of the compared work
+Construction A does not make that cost disappear; it holds it equal. The topology and its bookkeeping claims are identical in both runs and already charged before the measured prefix, so bookkeeping cannot explain any difference the comparison observes. That normalization exists solely to isolate attribution within this comparison. It is not a claim that bookkeeping is free, unbounded, or exempt from admission.
 
-equivalent prefunding
-    the bookkeeping is prefunded, and prefunded identically in BOTH
-    runs, so the baseline and subdivided runs start from the same
-    accounted position
-```
-
-Prefunding only the subdivided run, or only the baseline run, is not equivalent prefunding and invalidates the comparison. Prohibited in either method are an unaccounted bookkeeping cost, and a bookkeeping charge placed in a binding dimension so that subdivision appears to amplify or to be refused.
+Outside the comparison, a scope record is charged like any other claim under P1 through P5. A provider may refuse to create one exactly as it may refuse any other claim, and that refusal is an ordinary typed resource result, not a P6 violation. A comparison whose two runs start from different topologies or different accounted bookkeeping positions is not Construction A and does not test P6.
 
 This is a fairness obligation on a provider, not a corollary of any theorem above. This document does not prove it and supplies no scheduler, root taxonomy, weighting, or turn mapping that would.
 
@@ -655,25 +677,33 @@ The conservation and impossibility results are independent of it in both directi
 
 ### Theorem 14.5f. Arbitrary capacity loss preserves conservative accounting, not necessarily physical backing
 
-Five quantities are distinguished in each resource dimension. Conflating any two of them is the error this theorem exists to exclude.
+Six quantities are distinguished in each resource dimension. Conflating any two of them is the error this theorem exists to exclude, and the sharpest of those confusions is between an envelope that merely contains and a backing that actually reserves.
 
 ```text
-O    observation: an inert measurement of the environment. It is a
-     reading and nothing else. O alone changes nothing: it sets no
-     grant, authorizes nothing, and causes no transition
+O    observation: an inert measurement. It is a reading and nothing
+     else. O alone changes nothing: it sets no grant, authorizes
+     nothing, and causes no transition. O may be absent entirely, and
+     a provider is complete without it
 
-T    target: an explicit owner-selected contraction target. T changes
-     only by a named, recorded policy action of the process or
-     deployment owner; it is never inferred, and an observation never
-     sets it. When T < Gc, that records a request for gradual
-     contraction, which proceeds only as owner releases lower S
+T    target: an explicit owner-selected contraction target, set by a
+     named, recorded owner policy. T may be set directly, or derived
+     by a named policy that considers O among its inputs. It is never
+     set automatically merely because O changed, and T does not
+     require O to exist. When T < Gc, that records a request for
+     gradual contraction, which proceeds only as owner releases lower S
 
-B    backing: enforceable substrate backing, or an assigned hard domain
-     that actually enforces it, such as a cgroup, job object, process
-     limit, appliance boundary, or provider allocation class. B is
-     what will actually be honored, not a wish and not a reading. It
-     is not necessarily outside the provider's control: a provider may
-     itself hold or be assigned the enforcing domain
+E    envelope: an enforceable isolation ceiling, such as a cgroup, job
+     object, process limit, appliance boundary, or provider allocation
+     class. E is containment, not availability: it bounds what the
+     process may consume, and exceeding it is prevented from outside.
+     E does not reserve anything and does not promise that capacity
+     within it can be obtained
+
+B    backing: capacity actually reserved for or owned by this process,
+     asserted only where an exact substrate contract genuinely
+     guarantees it. B is availability, not containment. Absent such a
+     contract there is no B, and a provider must not synthesize one
+     from an envelope, an observation, or an assumption
 
 Gc   committed grant: what the provider has actually committed, and
      against which every live claim was admitted
@@ -687,13 +717,39 @@ The rules relating them are:
 S <= Gc always
 Gc moves toward T downward only after owner release has lowered S;
     Gc is never set below S
-a provider that claims its grant is backed proves Gc <= B at the
-    moment of admission
-P4 fit is evaluated against the committed and actually backed domain,
-    together with any explicit P5 policy, and never against O
+a provider that claims isolation proves Gc <= E
+a provider that claims backing proves Gc <= B at the moment of
+    admission
+P4 fit is evaluated against the committed domain, together with E and
+    B where those are actually claimed and proved, and with any
+    explicit P5 policy; never against O
 ```
 
-**Claim.** `S <= Gc` is invariant across every transition, including arbitrary change in `O`, `T`, or `B`. No change in observation, target, or backing releases, reduces, or reattributes any claim.
+**Provider labels.** `E` and `B` are distinct and orthogonal premises. Containment does not imply reservation, and reservation does not imply containment. The labels below name which premises a provider has proved. They are not a ladder, and a provider need not fit exactly one of them.
+
+```text
+accounting-only
+    proves S <= Gc, and claims neither E nor B
+    the grant is a bookkeeping commitment this process respects by its
+    own arithmetic
+
+isolated
+    proves S <= Gc, and additionally claims E: an enforceable envelope
+    contains the process. Containment is not availability, so an E
+    claim says nothing about whether capacity within it can be obtained
+
+backed
+    proves S <= Gc, and additionally claims B: an exact substrate
+    contract genuinely reserves the capacity. Reservation is not
+    containment, so a B claim says nothing about whether consumption
+    beyond it is prevented
+```
+
+A provider may hold both claims, and may hold them per dimension: `E` proved in one resource dimension and `B` proved in another is an ordinary configuration, not a contradiction. Any combination is permitted exactly where each premise it names is separately proved. Claiming `E` never licenses a `B` claim, and claiming `B` never licenses an `E` claim.
+
+A provider that cannot prove `E` must not describe itself as isolated, and a provider that cannot prove `B` must not describe itself as backed. Establishing `E` or `B` for a real substrate is an obligation discharged outside this document; nothing here is evidence that any provider has established either.
+
+**Claim.** `S <= Gc` is invariant across every transition, including arbitrary change in `O`, `T`, `E`, or `B`. No change in observation, target, envelope, or backing releases, reduces, or reattributes any claim.
 
 #### Proof
 
@@ -701,21 +757,23 @@ Initially `S <= Gc`, since every admitted claim was checked against `Gc`. Consid
 
 Admission grants `q` only when `S + q <= Gc`, and, where the provider claims backing, only when `Gc <= B` at that moment; both checks precede the charge, so admission preserves the invariant. Owner release after proven cleanup reduces `S` by exactly the released claim and leaves `Gc` unchanged. Failed-cleanup retention replaces a live claim with the identical retained claim, leaving `S` unchanged. Raising `Gc` preserves the invariant trivially. Lowering `Gc` is permitted only to some `Gc'` with `S <= Gc'`, so it preserves the invariant by construction.
 
-A change in `O` changes no member of `R`, no `Gc`, and no `T`: it is inert by definition, so the invariant is untouched. A change in `T` changes no member of `R` and does not itself move `Gc`; it records an owner-selected contraction target that `Gc` may approach later, and downward only as owner release lowers `S`. A fall in `B` changes no member of `R` and no `Gc`; it changes what will actually be honored or enforced, not what has been committed or charged.
+A change in `O` changes no member of `R`, no `Gc`, no `T`, no `E`, and no `B`: it is inert by definition, so the invariant is untouched. A change in `T` changes no member of `R` and does not itself move `Gc`; it records an owner-selected contraction target that `Gc` may approach later, and downward only as owner release lowers `S`. A fall in `E` changes no member of `R` and no `Gc`; it narrows what the process is permitted to consume. A fall in `B` changes no member of `R` and no `Gc`; it reduces what is actually reserved. Neither `E` nor `B` is a charge, so neither can alter one.
 
 Every transition preserves `S <= Gc`, so by induction it holds in every reachable state.
 
 **Why the excluded state is excluded.** Setting `Gc` below `S` would require either releasing claims the provider does not own, contradicting P2 and Theorem 14.5c, or leaving a charge unattributed, contradicting P1 and Theorem 14.1. The rule that `Gc` is never set below `S` forbids both.
 
-**Backing loss.** When `B < Gc`, or `B < S`, the provider reports a typed backing-loss or external-overcommitment result. Reporting it is required. Accounting remains conservative throughout: every charge stays charged and exactly attributed, `Gc` is not lowered below `S`, nothing is written off, and no release is inferred or forced. New work that would conflict with the shortfall is refused with typed pressure or unavailability. The provider may request retirement only from exact owners whose contracts declare their leases reclaimable, and it releases nothing itself. Above all it does not pretend the backing exists: no part of the shortfall is reported as available capacity.
+**Backing and isolation loss.** When `B < Gc` or `B < S` for a provider claiming backing, or `E < Gc` for a provider claiming isolation, the provider reports a typed backing-loss or isolation-loss result. Accounting remains conservative throughout: every charge stays charged and exactly attributed, `Gc` is not lowered below `S`, nothing is written off, and no release is inferred or forced. New work that would conflict with the shortfall is refused with typed pressure or unavailability. The provider may request retirement only from exact owners whose contracts declare their leases reclaimable, and it releases nothing itself. Above all it does not pretend the capacity exists: no part of the shortfall is reported as available.
 
-Backing loss has a consequence the accounting cannot repair. Substrate availability may fail: work already admitted against a grant that is no longer enforceably backed may fail in execution even though its claim remains correctly charged. This model does not promise otherwise. Conservative accounting guarantees the books never lie about what is held; it does not guarantee the substrate will supply it. That is the exact sense in which arbitrary capacity loss preserves conservative accounting and not physical backing.
+**What reporting can and cannot cover.** Reporting is required exactly while the process is alive and the condition is observable to it. Those two qualifications are not evasions; they mark the boundary of what any in-process report can claim.
 
-A provider that cannot prove `B` must not claim its grant is backed. Establishing `B` for a real substrate is a separate obligation, discharged outside this document; nothing here may be read as evidence that any particular provider has established it.
+A fail-stop event is outside that boundary. If the substrate terminates the process, as an out-of-memory kill does, there is no report: the process does not survive to make one, its live capabilities are destroyed with it, and recovery is ordinary restart semantics rather than a resource transition in this model. No obligation here is discharged by reporting after such an event, and none is violated by failing to report one.
 
-**`O` is never a grant.** An observation is not `T`, not `B`, and not `Gc`. It may inform an owner's explicit policy action, and that action may set `T`. It may not set `T`, `Gc`, or admission fit by itself. In particular, P4 fit is never evaluated against `O`: a claim fits when it fits the committed and actually backed domain together with any explicit P5 policy, and a measurement showing apparent headroom is not evidence that a claim fits.
+Backing loss also has a consequence the accounting cannot repair. Substrate availability may fail: work already admitted against a grant that is no longer reserved may fail in execution even though its claim remains correctly charged. This model does not promise otherwise. Conservative accounting guarantees that charges remain exactly attributed to the accounting commitment; it does not turn that commitment into a physical guarantee or promise that the substrate will supply it. That is the exact sense in which arbitrary capacity loss preserves conservative accounting and not physical backing.
 
-**Safety, not liveness.** Nothing here bounds how long `Gc` remains above `T` or above `B`. `Gc` follows `S` downward only as owners release, and no timer, notification, or external pressure compels an owner to release. If owners never release, `Gc` never reaches `T`. This is consistent with Theorems 14.5b and 14.5c and adds no progress claim. A deployment that must be able to honor a fall in `B` immediately reserves or isolates in advance under Theorem 14.6; it cannot obtain that guarantee afterwards by revoking. Every result of observation, target change, or backing loss is a typed resource event and never an authorization result.
+**`O` is never a grant.** An observation is not `T`, not `E`, not `B`, and not `Gc`, and it sets none of them. A named owner policy may consider `O` among its inputs when choosing `T`, but nothing is set automatically because `O` changed, and no path from `O` to `T` is required to exist: a provider with no observation at all is complete, and `T` may be set directly. In particular, P4 fit is never evaluated against `O`. A claim fits when it fits the committed domain, together with `E` and `B` where those are actually claimed and proved, and with any explicit P5 policy. A measurement showing apparent headroom is not evidence that a claim fits.
+
+**Safety, not liveness.** Nothing here bounds how long `Gc` remains above `T`, above `E`, or above `B`. `Gc` follows `S` downward only as owners release, and no timer, notification, or external pressure compels an owner to release. If owners never release, `Gc` never reaches `T`. This is consistent with Theorems 14.5b and 14.5c and adds no progress claim. A deployment that must be able to honor a fall in `E` or `B` immediately reserves or isolates in advance under Theorem 14.6; it cannot obtain that guarantee afterwards by revoking. Every result of observation, target change, envelope loss, or backing loss is a typed resource event and never an authorization result.
 
 ### Theorem 14.6. Optional ceiling confinement
 

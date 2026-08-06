@@ -708,14 +708,42 @@ Two consequences of that model bind every control written here. Releases are der
 
 The obligation is one-directional. A control must not require that the subdivided root fare no worse, or that a competing root fare no better; a subdivision that disadvantages the subdivided root or advantages a competitor is conforming. Equality of outcome must never be asserted. A test showing only that some scope is eventually served does not discharge P6.
 
-**First control: a bounded decision prefix.** The first required control fixes a finite decision prefix — a bounded number of selection decisions — chosen so that none of the newly admitted demands under comparison releases within that prefix. The comparison is then well defined without depending on release timing. Within that prefix it is a conformance control: it establishes the three conditions for the decisions it covers, and that is a genuine positive result for the case it covers. It is honestly scoped rather than demoted — it claims nothing about decisions beyond its prefix, is not defined as the longest such prefix, and is not merely a device for exhibiting a failure. It is not globally sufficient, is not a proof of the whole model, and must never be reported as either.
+**Construction A is how the two runs are set up.** A control that compares a baseline run against a subdivided run must build both runs this way, so that attribution mapping is the only difference between them:
 
-**Bookkeeping isolation uses one of exactly two methods.** Subdivision creates additional scope records and bookkeeping charges, and those charges must not distort the comparison. A control isolates them by exactly one of:
+```text
+Construction A
+    identical FairnessRoot set in both runs
 
-1. charge the extra bookkeeping to a dimension, and establish that this dimension is non-binding in both executions, so it cannot affect any selection or admission being compared; or
-2. prefund equivalent bookkeeping in both executions, so baseline and repart carry the same bookkeeping charge before the comparison begins.
+    identical AttributionChildScope topology, pre-created in both runs
+        before the measured prefix begins
 
-Merely stating the charge, or netting it against A's admitted quantity, is not sufficient and must not be offered as isolation.
+    identical bookkeeping claims, already charged in both runs before
+        the measured prefix begins
+
+    stable DemandIds: one demand carries the same identifier in both
+        runs
+
+    identical initial provider state at the start of the measured
+        prefix
+
+    baseline    maps every demand of A to one already-created
+                AttributionChildScope beneath A
+
+    subdivided  maps the same demands across the same already-created
+                AttributionChildScopes beneath A
+
+    only the DemandId-to-child-scope mapping differs
+```
+
+Because the scope topology and its bookkeeping already exist in both runs before measurement starts, subdivision creates no scope and charges no additional bookkeeping inside the measured prefix. Scope creation is deliberately moved outside the comparison rather than compensated for inside it.
+
+**That normalization is a property of the comparison, not a claim about the world.** Bookkeeping is real, finite, and fallible. Creating an AttributionChildScope consumes resources, is charged like any other work, and can fail. Construction A does not promise unlimited scopes, does not make scope creation free, and must never be read as establishing that bookkeeping can never become a binding constraint. It establishes only that, within the measured prefix, the two runs carry the same bookkeeping and therefore differ solely in attribution.
+
+**The fixed workload includes the environment.** The workload fixes a deterministic, clock-free environment and reducer that interleaves exogenous arrivals with owner-derived actions in a fixed order. No wall-clock time, timer, or scheduler nondeterminism participates. Because releases are owner-derived rather than supplied, this interleaving is what makes the two runs comparable at all.
+
+**Terminal stuttering.** After the last exogenous arrival, the environment continues to step the provider with no new input until both runs reach a terminal state in which no further decision changes anything. The comparison is therefore well defined at every decision index, including indices past the final arrival, and neither run can appear to win merely by ending sooner.
+
+**First control: a bounded decision prefix.** The first required control fixes a finite decision prefix — a bounded number of selection decisions — chosen so that none of the newly admitted demands under comparison releases within that prefix, and it starts from the identical topology and bookkeeping that Construction A requires. The comparison is then well defined without depending on release timing. Within that prefix it is a conformance control: it establishes the three conditions for the decisions it covers, and that is a genuine positive result for the case it covers. It is honestly scoped rather than demoted — it claims nothing about decisions beyond its prefix, is not defined as the longest such prefix, and is not merely a device for exhibiting a failure. It is not globally sufficient, is not a proof of the whole model, and must never be reported as either.
 
 **What P6 does not claim.** Partition non-amplification concerns attribution beneath one FairnessRoot. It is not a real-world identity or claimant-count claim. It does not assert that a real adversary is confined to one FairnessRoot, that distinct roots correspond to distinct people, organizations, devices, or tenants, or that an adversary able to obtain several genuine roots is limited by this property. Sybil resistance, principal admission, and ingress identity are separate problems. P6 does not address them, no P6 control may be cited as evidence about them, and no Sybil or admission control may be cited as evidence for P6.
 
@@ -739,7 +767,7 @@ The provider shipped with basal MyOwnMesh implements one policy of this kind, an
 
 *Evidence status.* No control in this repository runs the baseline and subdivided runs of one causally closed model and compares them prefix-wise, and none may be cited as if it did. The existing rotation and yield tests show only that a scope's outstanding demand is eventually served; they compare no cumulative selections, no cumulative admitted quantity per dimension, and no competing root's selection index, at any decision prefix. Connector-local scheduling metadata is a separate claim about capacity authority and does not discharge P6. Disclosure of this gap is not evidence that the gap is closed.
 
-*Remediation destination.* The correction belongs to the resource provider's fairness slice, which must bind each pending demand to its FairnessRoot rather than to a mintable scope identity, and must supply a control meeting the obligations above: the causally closed model of Note 14.5e with derived releases, a bounded decision prefix in which none of the compared newly admitted demands releases, and one of the two permitted bookkeeping isolation methods. A control conforming within its bounded prefix is a real positive result for that case and not a whole-model proof. Until such a control exists and passes, this obligation stays open and must be reported as failing.
+*Remediation destination.* The correction belongs to the resource provider's fairness slice, which must bind each pending demand to its FairnessRoot rather than to a mintable scope identity, and must supply a control meeting the obligations above: the causally closed model of Note 14.5e with derived releases, Construction A's identical pre-created topology and already-charged bookkeeping, and a bounded decision prefix in which none of the compared newly admitted demands releases. A control conforming within its bounded prefix is a real positive result for that case and not a whole-model proof. Until such a control exists and passes, this obligation stays open and must be reported as failing.
 
 P6 is unchanged and remains basal. The shortfall is in the provider, not in the property; an AttributionChildScope is not redefined as a FairnessRoot, and P6 is not relaxed to a per-scope guarantee. The shipped provider's standing under P1 through P5, P7, and P8 is asserted only where separately supported and is not implied by this paragraph.
 
@@ -747,42 +775,74 @@ When the selected demand cannot fit, the provider may request retirement from an
 
 No scheduling or cooperative retirement model guarantees later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. A policy that gives cleanup authority the first pending-demand opportunity does not thereby manufacture capacity, and it is not a promise that cleanup can start without its exact claim.
 
-**Immediate pressure only for a non-fitting claim.** Fit is evaluated against the committed and actually backed domain restricted by any explicit P5 policy, as defined under backing above; it is never evaluated against an external observation `O` or a contraction target `T`. An immediate, nonwaiting acquisition may return typed pressure without creating a pending demand, but only when the exact claim cannot be met from that domain, in every dimension the claim requires, from capacity that is neither live nor reserved for an in-flight admission. A claim that fits must be admitted unless one of exactly three stated conditions holds: a proven structural limit forbids it; an explicit isolation policy or optional local ceiling refuses it; or the accounting needed to prove the admission safe is unavailable, poisoned, or cannot be proven safe. Each of those must be reported as itself, not as ordinary pressure.
+**Immediate pressure only for a non-fitting claim.** Fit is evaluated against `Gc` net of `S`, additionally bounded by `E` in any dimension where containment is substantiated and by `B` in any dimension where backing is substantiated, and further restricted by any explicit P5 policy; it is never evaluated against an external observation `O` or a target `T`. An immediate, nonwaiting acquisition may return typed pressure without creating a pending demand, but only when the exact claim cannot be met from that domain, in every dimension the claim requires, from capacity that is neither live nor reserved for an in-flight admission. A claim that fits must be admitted unless one of exactly three stated conditions holds: a proven structural limit forbids it; an explicit isolation policy or optional local ceiling refuses it; or the accounting needed to prove the admission safe is unavailable, poisoned, or cannot be proven safe. Each of those must be reported as itself, not as ordinary pressure.
 
 Work conservation constrains refusal in the other direction. An immediate path may not refuse a fitting claim in order to hold capacity for an anticipated demand, to smooth one demand source's request rate, or to enforce an undeclared share. Any such withholding is a partition and is conforming only as explicit local isolation policy under P5.
 
 **Narrow provider determinism.** The provider is deterministic only in this exact sense: given identical already-issued `ResourceScopeId` values, identical provider state, and the same operations applied in the same order, it produces the same decisions. Nothing stronger is claimed. Because a `ResourceScopeId` is derived from the allocation address of a fresh process-local scope identity at construction, the identifiers issued by a fresh run generally differ from those of a previous run, and any behavior keyed to their values or ordering may differ with them. Cross-run, cross-process, cross-allocator, and cross-schedule reproducibility is therefore not claimed, and no test may assume it. A determinism control must fix the already-issued identities rather than re-deriving them.
 
-**Committed grant, backing, and external observation.** Five quantities are distinct and must never be conflated:
+**Committed grant, envelope, backing, and external observation.** Six quantities are distinct and must never be conflated:
 
 ```text
 S    the sum of live claims and failed-cleanup-retained charges in one
      resource dimension
 Gc   the provider-owned committed grant in that dimension
-B    the capacity actually backing that dimension: resource the host
-     has in fact made available and the provider can prove
-T    the contraction target in that dimension, produced from O by a
-     recorded local policy conversion
+E    an enforceable envelope: an isolation ceiling the provider or host
+     can actually enforce against this domain
+B    actual reserved or owned backing in that dimension, claimable only
+     under an exact guarantee that the resource is held for this domain
+T    an explicit owner-selected target in that dimension
 O    an external observation of host capacity
 ```
 
-*`O` is non-authoritative.* `O` is an input, never a grant, never a limit, and never a fit test. It may be stale, wrong, adversarially influenced, in foreign units, or absent. No admission decision reads `O`, and no refusal may be justified by `O` alone.
+*`E` is containment, not availability.* An enforceable envelope bounds what this domain can consume. It proves that the domain is contained, so it cannot exceed `E`. It proves nothing whatever about whether capacity up to `E` is available, reserved, or obtainable. An envelope is a ceiling, never a promise, and `E` must never be read as, reported as, or substituted for `B`.
 
-*Named recorded policy converts `O` into `T`.* A named, recorded local policy may convert `O` into an explicit owner-selected target `T`. The requirement is that the policy is named and recorded and that `T` is owner-selected; this document prescribes no schema for it. A deployment may of course record headroom, hysteresis, units, or how far it trusts the observation source, but those are non-normative examples and none is required here.
+*`B` requires an exact guarantee.* `B` may be claimed only where the resource is actually reserved or owned for this domain under an exact guarantee. An owner-supplied configuration vector, a measurement, a quota, or an envelope is not backing. Absent that exact guarantee, `B` is not claimed at all, and the shortfall is a named Slice C residual.
+
+**Isolation and backing are orthogonal capabilities.** They are not exclusive, and they are not a hierarchy. A provider may claim isolation, or backing, or both, or neither, and it may do so independently per resource dimension. Each claim is licensed only by its own exact proof:
+
+```text
+accounting-only
+    the baseline: proves S <= Gc, and claims neither isolation nor
+        backing
+    allocation remains fallible: admission does not imply that the
+        underlying resource can actually be obtained
+
+isolation claim, per dimension
+    licensed only by an exact E containment proof for that dimension
+    establishes containment within E
+    establishes nothing about availability within E
+
+backing claim, per dimension
+    licensed only by the exact B premise for that dimension
+    establishes that the resource is reserved or owned for this domain
+```
+
+Neither claim implies the other in either direction, and neither is a prerequisite for the other. A provider may be backed in one dimension and merely contained in another, or contained in a dimension it does not back. Where a provider makes no claim for a dimension, that dimension is accounting-only regardless of what it claims elsewhere, and the unproved case is a named Slice C residual rather than an assumption. Absent a backing claim, an admission proves bookkeeping and not physical success; absent an isolation claim, it proves neither containment nor success.
+
+*The shipped `FiniteResourceProvider` is accounting-only in every dimension.* Its grant is an owner-supplied vector, and an owner-supplied vector is not host backing. It therefore proves `S <= Gc` and nothing more. It claims no `B`, proves no `E`, and its admissions carry no assurance that the underlying allocation will succeed. Any report that treats its admission as evidence of available or reserved capacity is incorrect.
+
+*What P4 fit means for each claim.* Fit is always evaluated against `Gc` net of `S`, and doing so alone implies nothing about physical success. In a dimension where a provider substantiates containment, fit is additionally bounded by `E`; where it substantiates backing, fit is additionally bounded by `B`. The two premises are independent and both bounds apply when both are proved. An explicit P5 isolation policy may restrict the resulting domain further. `O` creates no fit constraint of any kind and is never part of the test.
+
+*`O` is inert.* `O` is optional, is a policy input only, and carries no authority. It may be stale, wrong, adversarially influenced, in foreign units, or absent, and a deployment may have no `O` at all. No admission decision reads `O`, no refusal is justified by `O`, and no value derives from `O` automatically.
+
+*`T` is owner-selected.* `T` is an explicit, named owner-policy target. An owner may set `T` directly, with no observation involved. An owner may instead derive `T` through a named policy that consults `O`. There is no mandatory path from `O` to `T` and no control that requires one. A change in `O` never changes `T` by itself: absent an owner decision or an explicitly named policy acting on the owner's behalf, `T` is unchanged.
 
 *`T` requests gradual contraction.* `T` is a request, not an act. It asks `Gc` to descend toward it over time. `T` never lowers `Gc` by itself, never releases a charge, and never refuses an admission on its own authority.
 
 *`Gc` follows only after owner release lowers `S`.* `Gc` is never installed or reduced below `S`. `Gc` descends toward `T` only as owner-driven release reduces `S` enough to make each step safe, one safe step at a time. `S <= Gc` holds at every instant, without exception or window.
 
-*Backing proof is conditional on claiming backing.* A provider that claims backing for a dimension proves `Gc <= B` in that dimension at admission. A provider that makes no backing claim proves nothing of the kind, and admission does not universally require a backing proof. Where backing is not proved, it is a named Slice C residual and must be reported as such.
+*Loss of `B` or `E` is a typed state, and the shortfall is real.* A provider that claimed backing and finds it gone reports typed backing loss for that dimension; a provider whose envelope no longer contains reports typed isolation loss. In both cases every charge is retained, no release is forged or inferred, conflicting admission is refused with a typed result naming the dimension, and `Gc` is still not lowered below `S`.
 
-*`B < Gc` or `B < S` is a typed state, and the shortfall is real.* If backing falls below the committed grant, the provider reports typed backing loss for that dimension. If backing falls below current charges, it reports typed external overcommitment. In both cases every charge is retained, no release is forged or inferred, conflicting admission is refused with a typed result naming the dimension, and `Gc` is still not lowered below `S`.
+A backing proof taken at admission is historical. It does not make physical backing exist later. When backing is lost, substrate availability may genuinely have failed, and this document must not pretend otherwise: charges remain charged and commitments remain owed, but the underlying resource may simply not be there. The typed state names that condition honestly. It must never be read, or reported, as an assurance that every charge is still physically backed.
 
-A backing proof taken at admission is historical. It does not make physical backing exist later. When `B` falls below `Gc` or `S`, substrate availability may genuinely have failed, and this document must not pretend otherwise: charges remain charged and commitments remain owed, but the underlying resource may simply not be there. The typed state names that condition honestly. It must never be read, or reported, as an assurance that every charge is still physically backed.
+*Typed reporting requires a live, observing provider.* Every typed state above can be reported only while the process is alive and able to observe its own condition. A fail-stop outcome reports nothing. If the host kills the process — an out-of-memory kill is the ordinary case — there is no typed backing-loss or isolation-loss result, because there is no longer anything to emit it. No obligation here may be written or read as a guarantee that resource exhaustion will be observed and reported rather than simply ending the process.
+
+Process death destroys the live in-process capabilities, leases, and accounting state held in that process, and recovery follows ordinary restart semantics rather than any contract in this subsection. That boundary is exactly as wide as the process and no wider. It is not a claim that resources outside the process are released. An external relay or TURN allocation, a peer's view of a session, a file or directory on disk, a kernel object the OS does not reclaim, or any reservation held by another party may outlive the process that charged it. Whether such a resource is reclaimed is a property of that external owner, not of this contract, and no cleanup of external or substrate-owned resources may be claimed on the strength of process death alone.
 
 *Unproved backing is a residual, not an assumption.* Where an adapter cannot prove what actually backs a dimension — allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, external provider allocations — that shortfall is a named Slice C residual. It must not be silently treated as backed, and it must not be counted into `B`.
 
-*P4 fit is computed against committed and actually backed domain.* The fit test that P4 governs uses the intersection of what is committed and what is actually backed, further restricted by any explicit P5 isolation policy or optional local ceiling. It never uses `O`, and it never uses `T`. A claim fits when it fits that domain; observation of host capacity is not part of the test.
+*P4 fit applies only substantiated premises.* Fit is always evaluated against `Gc` net of `S`, and admission on that accounting basis alone implies nothing about physical success. In a dimension where containment is substantiated it is additionally bounded by `E`; where backing is substantiated it is additionally bounded by `B`; where both are proved both bounds apply. An explicit P5 isolation policy or optional local ceiling may narrow the result further. The test never uses `O` and never uses `T`; observation creates no fit constraint.
 
 Contraction releases, revokes, invalidates, and reuses nothing. It never forges a release and never admits a conflicting claim to make room. It may request retirement only from the exact owners whose lease contract declares those leases reclaimable, and such a request releases nothing. It applies only to admission decisions taken after it.
 
@@ -790,7 +850,7 @@ Contraction releases, revokes, invalidates, and reuses nothing. It never forges 
 
 A contraction is not an instantaneous probe of current use, and the two must never be substituted for each other. A probe reports `S` at an instant and changes nothing; a contraction lowers `Gc`, subject to `S <= Gc`, and changes the admission ceiling going forward. A typed backing-loss or external-overcommit report is caused by `B` falling, not by the contraction itself, and it never indicates that `Gc` fell below `S`. Reporting a probe as a contraction would let a transient measurement appear to authorize a permanent ceiling change; reporting a contraction as a probe would let a ceiling change appear to be a mere observation.
 
-*Status of these obligations in the shipped provider.* The shipped provider takes its grant at construction and exposes no contraction entry point, models no external observation `O`, derives no target `T`, and proves no backing `B`. It therefore exercises none of the obligations in this subsection: there is no `O`-to-`T` conversion to record, no gradual descent of `Gc` to control, and no backing claim at admission. Every clause above constrains work that has not been built. None may be reported as a satisfied property, and the absence of a contraction path is not evidence that contraction is safe.
+*Status of these obligations in the shipped provider.* The shipped provider is accounting-only. It takes its grant at construction as an owner-supplied vector, exposes no contraction entry point, models no external observation `O`, selects no target `T`, enforces no envelope `E`, and proves no backing `B`. It therefore exercises none of the obligations in this subsection: there is no target selection to record, no gradual descent of `Gc` to control, no envelope containment to enforce, and no backing claim at admission. Every clause above constrains work that has not been built. None may be reported as a satisfied property, the absence of a contraction path is not evidence that contraction is safe, and an admission by this provider is evidence of bookkeeping only — never that the underlying allocation will succeed.
 
 The current resource classes describe an accounting vocabulary, not proof that every dependency exposes that dimension. Exactness is limited to the quantity actually charged. Allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, and external provider allocations must remain named residuals until the responsible adapter can conservatively claim or isolate them.
 
@@ -1042,8 +1102,10 @@ A release must pass at least the following groups.
 - unused capacity is work-conservingly borrowable;
 - the basal provider has no weights, quotas, reserved shares, or partitions;
 - partition non-amplification as defined in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) Note 14.5e: the baseline and subdivided runs of one causally closed model, with releases derived rather than scripted, compared prefix-wise on cumulative selections, on cumulative admitted quantity per dimension, and on each competing root's selection index. The control must exhibit both runs and must not require equality of outcome in either direction — **open and failing against the shipped provider; see the P6 status note at the end of this subsection**;
-- the first partition non-amplification control fixes a bounded decision prefix in which none of the compared newly admitted demands releases; it is a conformance result for the case it covers and is never reported as globally sufficient or as a whole-model proof;
-- bookkeeping created by the subdivision is isolated by exactly one of the two permitted methods — charged to a dimension shown non-binding in both runs, or prefunded equivalently in both runs — and never merely stated or netted out;
+- both runs are built by Construction A: identical FairnessRoot set, identical pre-created AttributionChildScope topology, identical already-charged bookkeeping, stable DemandIds, and identical initial state at the start of the measured prefix, with baseline mapping all of A's demands to one already-created child scope, subdivided mapping the same demands across those same already-created scopes, and only the DemandId-to-child mapping differing;
+- the workload fixes a deterministic clock-free environment and reducer interleaving exogenous arrivals with owner-derived actions, and both runs stutter to a terminal state so the comparison is defined past the final arrival;
+- Construction A's normalization is never reported as a claim that scopes are unlimited, that scope creation is free, or that bookkeeping can never bind; scope creation remains real, finite, charged, and fallible;
+- the first partition non-amplification control fixes a bounded decision prefix in which none of the compared newly admitted demands releases and starts from Construction A's identical topology and bookkeeping; it is a conformance result for the case it covers and is never reported as globally sufficient or as a whole-model proof;
 - the FairnessRoot mapping is performed by trusted local verification, which may take verified local facts such as an authenticated principal as inputs, while no claimant-supplied, peer-supplied, or wire-visible value can directly name, select, split, or multiply a root, and no unverified assertion increases the roots a party is attributed to;
 - no partition non-amplification control is reported as a Sybil, claimant-count, or real-world identity result, and no Sybil or principal-admission control is reported against P6;
 - hostile-ingress progress and backpressure are exercised as their own contract and are never reported as fairness evidence, in either direction;
@@ -1051,14 +1113,20 @@ A release must pass at least the following groups.
 - no immediate path withholds a fitting claim to reserve capacity for anticipated demand, to smooth a rate, or to enforce an undeclared share;
 - determinism is exercised only across identical already-issued `ResourceScopeId` values, identical state, and the same ordered operations, and no control assumes cross-run identifier stability;
 - `Gc` is never installed or reduced below `S`, so `S <= Gc` holds continuously and no control may exhibit or describe `S > Gc`;
-- an external observation `O` is never read by an admission decision, never used as a limit, and never justifies a refusal on its own;
-- any conversion of `O` into a contraction target `T` is made by a named, recorded policy and yields an owner-selected `T`, with no schema required beyond that, and `T` never lowers `Gc`, releases a charge, or refuses an admission by itself;
+- an external observation `O` is inert and optional: a policy input only, never read by an admission decision, never used as a limit, never justifying a refusal, and never producing any value automatically;
+- `T` is an explicit named owner-policy target that an owner may set directly with no observation involved, or derive through a named policy consulting `O`; no path from `O` to `T` is mandatory, no control requires one, and a change in `O` never changes `T` by itself;
+- `T` never lowers `Gc`, releases a charge, or refuses an admission by itself;
 - `Gc` descends toward `T` only as owner-driven release lowers `S`, one safe step at a time;
 - a provider that claims backing for a dimension proves `Gc <= B` in that dimension at admission; a provider making no backing claim is not required to, and the unproved case is reported as a Slice C residual rather than assumed;
 - `B < Gc` reports typed backing loss and `B < S` reports typed external overcommitment; in both, every charge is retained, no release is forged or inferred, conflicting admission is refused with a typed dimension-naming result, and `Gc` is still not lowered below `S`;
 - no control or document treats an admission-time backing proof as evidence that physical backing still exists later, and none asserts that every charge remains backed once `B` has fallen;
 - capacity an adapter cannot prove is backed is a named Slice C residual and is never counted into `B`;
-- P4 fit is evaluated against the committed and actually backed domain restricted by explicit P5 policy, never against `O` or `T`;
+- P4 fit is always evaluated against `Gc` net of `S`, additionally bounded by `E` where containment is substantiated and by `B` where backing is substantiated, independently and per dimension, restricted by explicit P5 policy, and never against `O` or `T`;
+- isolation and backing are orthogonal per-dimension capabilities, not exclusive and not a hierarchy: each is licensed only by its own exact proof, neither implies or requires the other, and a dimension with no claim is accounting-only and reported as a Slice C residual;
+- `E` is never reported as, or substituted for, `B`, and containment is never presented as availability;
+- the shipped `FiniteResourceProvider` is reported as accounting-only, because its owner-supplied grant vector is not host backing;
+- no typed backing-loss or isolation-loss result is claimed for a fail-stop outcome; process death destroys live in-process capabilities, leases, and accounting state and is handled by ordinary restart semantics, not by this contract;
+- no cleanup of external or substrate-owned resources is claimed on the strength of process death; relay and TURN allocations, peer-held session state, on-disk artifacts, and kernel objects the OS does not reclaim may outlive the process that charged them;
 - grant contraction is never exercised as, or substituted for, an instantaneous use probe;
 - pressure and refusal never become an authorization result in either direction;
 - elapsed time alone creates, releases, expires, and validates nothing;

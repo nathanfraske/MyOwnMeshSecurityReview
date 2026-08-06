@@ -8,10 +8,11 @@ allocation.
 
 This revision reframes the report in response to PR #5 review 4865297956,
 anchored at `378dd82`, review 4869373979, anchored at `f58dab6`, and review
-4869979096, anchored at `ea1c7e87bfbd5bab76602d61b863fe8a7e5a8545`. Those
-anchors are cited as provenance for the review text only. They are never
-execution evidence, and this revision records no re-verification at any of
-them.
+4869979096, anchored at `ea1c7e87bfbd5bab76602d61b863fe8a7e5a8545`, review
+4870701740, and controlling owner review 4870850580, anchored at exact head
+`7e2ba9e5ee042d3aa6c39f16670ab9a646b44e41`. Those anchors are cited as
+provenance for the review text only. They are never execution evidence, and
+this revision records no re-verification at any of them.
 
 Property numbering P1 through P8 and the closed FairnessRoot and
 AttributionChildScope definitions are fixed by `ARCHITECTURE.md`. This report
@@ -86,13 +87,25 @@ Layer rules:
   Section 8.
 - A gap disclosed at any layer stays disclosed. Disclosure is not discharge.
 
+**Accepted CI at exact head `7e2ba9e` is runtime non-regression evidence only,
+and becomes prior-head evidence the moment the branch moves.** While `7e2ba9e`
+is the exact head, an accepted run there shows that retained runtime behavior
+still runs as accepted at that head, and nothing more. Once the branch advances
+past it, that run is prior-head evidence: it describes a commit that is no
+longer the head and carries no claim about the current one. In neither case does
+it prove P6 partition non-amplification, grant contraction over `S`, `Gc`, `O`,
+`T`, `E`, or `B`, hostile-ingress progress or backpressure, an enforceable
+isolation envelope, an actual reserved guarantee, or Slice C closure. No control
+for any of those exists at that head, so a passing run cannot have exercised
+them.
+
 **Accepted CI at exact head `6a22911` is runtime non-regression evidence only.**
 It is an L3 result about a narrow question: that retained runtime behavior still
 runs as accepted at that head. It does **not** prove P6 partition
 non-amplification, does not prove grant contraction over `S`, `Gc`, `O`, `T`, or
 `B`, does not prove hostile-ingress progress or backpressure, does not prove
-enforceable substrate backing, and does not close the Slice C
-residual-enforcement question. None of those has a control at that head, so a
+an enforceable isolation envelope, does not prove an actual reserved
+guarantee, and does not close the Slice C residual-enforcement question. None of those has a control at that head, so a
 passing run cannot have exercised them. No part of that CI result may be cited
 toward any of them.
 
@@ -130,20 +143,40 @@ A pending demand may request retirement from the exact owner of a lease whose ow
 
 The provider is an injected port, not a fixed implementation. This document fixes the properties above and writes no capacity value.
 
+**`E` and `B` are orthogonal premises, not a hierarchy.** `E` is an enforceable isolation envelope or ceiling: a cgroup, job object, process limit, or appliance bound that will stop the process from exceeding it. That is *containment*. It says nothing about whether the capacity is available — a process inside a 2 GiB envelope has no guarantee that 2 GiB is obtainable, only that it will be stopped at 2 GiB. `B` is an *actual reserved or owned guarantee*: capacity held for this process.
+
+Neither implies the other, in either direction. Containment without reservation is ordinary: an envelope caps you and guarantees nothing. Reservation without containment is equally possible: capacity may be genuinely held for a process that nothing stops from trying to exceed it. The four combinations are all real, and they are decided **per resource dimension** — a provider may hold `E` in one dimension, `B` in another, both in a third, and neither in a fourth.
+
 ```text
-production
-    host-backed provider   capacity derived from actual host or OS facts
-    isolated provider      capacity bounded by an enforced container, cgroup, or appliance boundary
-    injected provider      capacity supplied by the embedding process owner
-
-tests and explicit local envelopes
-    deterministic finite provider over one explicit finite grant
-
-optional local ceilings
-    explicitly optional, owner-selected, never a basal limit
+E proved?   B proved?   what may be claimed
+no          no          neither containment nor reservation
+yes         no          containment only
+no          yes         reservation only
+yes         yes         both, each on its own proof
 ```
 
-Current state, stated as disposition rather than as verified evidence: the deterministic finite provider is the only implementation in the tree. It derives capacity from one explicit finite grant and computes none of it. Tests install it over fixture grants; the connector-capable daemon path installs it over a grant whose every dimension the deployment owner must supply explicitly, with no default and no fallback. A host-backed or isolated production provider does not exist yet. That absence is a named gap, not a silent one.
+**Provider class names describe which premises are proved, and rank nothing:**
+
+```text
+accounting-only
+    neither E nor B proved for the dimension
+    the grant is a bookkeeping vector the process was told to respect
+    exceeding it is prevented by this process's own arithmetic alone
+
+isolated
+    E proved: something outside stops the process at E
+    says nothing about whether B holds
+
+backed
+    B proved: capacity is actually held for this process
+    says nothing about whether E holds
+```
+
+"Backed" is not a stronger form of "isolated", and neither subsumes the other. A provider proves each premise it wishes to claim, separately and per dimension, and claims nothing it has not proved. Treating `E` as `B` — or inferring either from the other — is the exact overclaim this split exists to prevent.
+
+**Current state, as disposition rather than verified evidence.** The deterministic finite provider is the only implementation in the tree, and it is **accounting-only**. It takes one explicit finite grant vector and computes none of it. The connector-capable daemon path requires the deployment owner to supply every dimension explicitly, with no default and no fallback — and **an owner-supplied vector is not host backing**. It is a number the owner asked this process to respect. It establishes no `E` and no `B`, and it must never be reported as either. No isolated or backed provider exists in the tree. That absence is a named gap, not a silent one.
+
+**Optional local ceilings** remain explicitly optional and owner-selected. Removing all of them leaves a conforming system that still admits work solely through provider claims. An optional ceiling is not an `E`: it is this process's own policy, enforced by the same arithmetic as the grant, not from outside.
 
 **Concrete deterministic-provider policy.** The following describes the installed provider's arbitration. It is that provider's policy, verified against that provider. It is not basal architecture, and a different conforming provider may satisfy Section 1 with different arbitration without reopening the property contract.
 
@@ -164,7 +197,8 @@ fixed input workload
     a finite set of FairnessRoots
     the initial provider state, including Gc in every dimension
     the arrival events: which demand arrives at which point, from which root
-    per demand: its exact claim, its authority class, its reclaimability
+    per demand: a stable DemandId, its exact claim, its authority class,
+        and its reclaimability
     one deterministic owner response rule for admitted work
 
 derived, never fixed
@@ -173,7 +207,15 @@ derived, never fixed
     every observable compared below
 ```
 
-The baseline run is that workload with root `A`'s demand unsubdivided. The subdivided run is the *same* workload with `A`'s demand spread across additional AttributionChildScopes beneath `A`, preserving the demands themselves, their order, their claims, their authority, and their reclaimability, and changing nothing else.
+**The two runs are topology-normalized.** Both runs use the **identical, pre-existing root and child-scope topology** and the **identical bookkeeping claims** for that topology. The scopes already exist in both runs and are charged identically in both. `DemandId`s are stable across the two runs. The *only* difference permitted between baseline and subdivided is the **mapping from `DemandId` to `AttributionChildScope`**.
+
+This normalization is what makes the comparison sound. Earlier revisions tried to neutralize scope-creation cost by choosing a non-binding bookkeeping dimension or by prefunding; normalizing the topology instead removes the confound at its source, because no scope is created inside the comparison at all.
+
+**Bookkeeping is real, finite, and fallible, and this normalization promises nothing otherwise.** Scope and reservation bookkeeping consume actual charged resource, that charge can fail, and scope creation can be refused under pressure like any other claim. Holding the topology fixed for the purpose of a comparison is a property of the *comparison*, not a claim that scopes are free, unbounded, or always creatable. Nothing here promises unlimited scopes.
+
+**A deterministic, clock-free environment drives both runs.** The environment is a reducer over the fixed workload: it interleaves **exogenous** actions (arrivals from the workload) with **derived** owner actions (whatever the deterministic owner response rule produces from work actually admitted). It reads no clock, no entropy, and no host fact, so the interleaving is a function of the workload and the provider's own decisions and nothing else. **Terminal stuttering** is permitted: once a run has no further action, it stutters with no-op steps so both runs remain comparable over the same prefix length rather than one simply ending sooner.
+
+The baseline run maps `A`'s demands onto `A`'s topology unsubdivided. The subdivided run maps the same `DemandId`s onto more of the same pre-existing child scopes beneath `A`. Demands, order, claims, authority, and reclaimability are identical; only the mapping differs.
 
 **The comparison is prefix-wise over decisions.** An end-state comparison is too weak: it permits a provider to amplify `A` early and repay the difference later. Every decision prefix must hold. Let a decision prefix `k` be the first `k` provider decisions in a run:
 
@@ -321,7 +363,7 @@ succeeds. A constructor that definitively returns without a closeable port
 retains the exact connector claim and reports terminal failure. It does not
 claim that hidden constructor tasks stopped or make the capacity reusable.
 
-The daemon currently requires the deployment owner to supply every provider dimension explicitly, with no default and no fallback. This is the explicit-local-envelope case of Section 1.1: the deterministic finite provider enforcing a grant the owner wrote. It is not a host-backed or isolated provider, and it must not be described as one. A supplied `SocketOrHandle` or `RelayOrProviderAllocation` grant does not by itself make the WebRTC adapter consume that dimension. Those fields are forward-compatible policy inputs and must not be reported as enforced native limits until the corresponding adapter claim exists.
+The daemon currently requires the deployment owner to supply every provider dimension explicitly, with no default and no fallback. This is the **accounting-only** case of Section 1.1: the deterministic finite provider respecting a vector the owner wrote. An owner-supplied vector is not host backing — it establishes no `E` and no `B` — and this path must not be described as an isolated or backed provider. A supplied `SocketOrHandle` or `RelayOrProviderAllocation` grant does not by itself make the WebRTC adapter consume that dimension. Those fields are forward-compatible policy inputs and must not be reported as enforced native limits until the corresponding adapter claim exists.
 
 The `transport-lab` feature is the tests case of Section 1.1. It exposes fixture-only grant derivation helpers. They sum production structural claims for the connector profiles and Mesh scopes supplied by a test, then add conservative candidate and remote-SDP claims from explicit fixture bounds. Candidate strings, content, concurrent parsing work, queue records, digest records, provider bookkeeping, remote-SDP parser storage, and remote-description retention are separate components. The helpers select no profile, workload, or production value and are absent from the default V4 API. The TURN control funds four data-only profiles and four Mesh scope records for its two sequential scenarios. At most two are active concurrently. It adds signaling-frame-derived candidate and remote-SDP bounds to one process provider. This proves shared-provider enforcement for that finite test workload. The profile and scope counts it funds are the structural shape of that fixture. Structural counts are not deployment-capacity recommendations, universal protocol limits, or evidence of exact physical resource quantity. It does not claim exact native WebRTC allocation accounting or recommend a deployment grant.
 
@@ -370,35 +412,64 @@ Gc   provider-owned committed grant
          the value admission is actually checked against
 
 O    non-authoritative observation or measurement
-         what something reported; carries no authority whatsoever
+         optional and inert; carries no authority whatsoever
 
 T    explicit owner-selected contraction target
-         a named owner decision to shrink toward a value
+         a named owner policy decision to shrink toward a value
 
-B    enforceable substrate backing or assigned hard domain
-         a cgroup, job object, process limit, appliance bound, or
-         provider allocation that actually enforces
+E    enforceable isolation envelope or ceiling
+         containment only: the process is stopped at E from outside
+         it reserves nothing and guarantees nothing
+
+B    actual reserved or owned guarantee
+         capacity held for this process, not merely permitted to it
 ```
 
 Their authorities differ and must not be interchanged:
 
-- **`O` decides nothing.** An observation or measurement changes no grant, no admission result, and no contraction state by itself. Only a **named, recorded policy action** may convert an observation into a new `T`. Until that action is taken and recorded, `O` has moved nothing. **P4 fit is never computed against `O`**, and a transient observation may never stand in for the admission domain.
-- **What P4 fit *is* computed against.** Fit is evaluated against the **committed and actually backed admission domain, with P5 policy applied**. That means all three together: the committed grant net of the committed charge (`Gc` less `S`); where substrate backing is claimed, the domain additionally bounded by `B`, since a provider may not admit against capacity it asserts is backed but cannot prove is backed; and any explicit P5 isolation policy or optional ceiling narrowing that domain further. A claim fits when it fits that composite domain — not when it fits `Gc` alone, and never when it merely fits an observation.
-- **`T` is an owner decision, and `Gc` follows it gradually.** `T < Gc` *requests* contraction; it does not perform it. `Gc` may follow `T` downward **only after owner-driven release lowers `S`**, and never below `S`. So `T` does influence `Gc` — the rule is gradual follow, not "never".
-- **`B` is the only quantity that enforces.** A provider claiming substrate-backed enforcement must **prove `Gc <= B` at admission**. Absent that proof it may not claim substrate-backed enforcement at all.
+- **`O` is optional and inert.** An observation or measurement changes no grant, no admission result, and no contraction state, and it **never automatically sets anything**. It is not required to exist at all: a deployment with no observation whatsoever is fully conforming. `O` creates no provider class — observing a number does not make a provider isolated or backed.
+- **`T` is set by named owner policy.** A `T` arises in exactly one of two ways: **set directly** by a named owner policy, or **derived** by a named owner policy that considers `O` among its inputs. Both are named policy decisions. What may not happen is `O` becoming a `T` on its own. `T < Gc` *requests* contraction; `Gc` follows `T` downward only after owner-driven release lowers `S`, and never below `S`.
+- **P4 fit is computed by provider class, and the classes differ correctly.** Fit is always against the committed domain net of the committed charge, with P5 policy applied — and then bounded by whatever that class can actually substantiate:
+
+```text
+base              fit against Gc - S, narrowed by P5 policy
+
+then, per dimension, independently:
+    if E is proved   additionally bounded by E
+                     admitting past E would admit work the envelope stops
+    if B is proved   additionally bounded by B
+                     only with B may the capacity be called held
+
+if neither is proved, neither bound applies
+if both are proved, both apply
+```
+
+  The two bounds are applied independently because the premises are independent — an `E` bound is not implied by a proved `B`, and a `B` bound is not implied by a proved `E`. Fit is **never** computed against `O`, under any premise. A provider applies only the bounds it has actually proved for that dimension: it may not bound against an `E` it does not have, and may not bound against a `B` it cannot prove.
 
 The invariants:
 
 - **`S <= Gc` always.** `Gc` is never installed or reduced below the charge already committed. This is a bound the provider may not cross, not a target to approach.
-- **`B < Gc` or `B < S` is a typed backing-loss or external-overcommit state.** The provider reports it as typed, retains every unreleased charge, and refuses conflicting new work in that dimension. It **does not claim that missing physical backing exists**, and it does not silently reinterpret the shortfall as conforming.
+- **`E < Gc` or `E < S` is a typed envelope-shortfall state**, and **`B < Gc` or `B < S` is a typed backing-loss or external-overcommit state.** In either case the provider retains every unreleased charge, refuses conflicting new work in that dimension, and **does not claim that the missing envelope or backing exists**. It does not silently reinterpret the shortfall as conforming. The two are reported distinctly, because losing containment and losing a guarantee are different facts.
 - **No conflicting admission while degraded.** Nothing is admitted that draws on the shortfall.
 - **Requests go only to exact reclaimable owners.** Degradation may prompt retirement requests, only to the exact owner of a lease its own contract declares reclaimable. The request is sticky, carries no timer, and alters no claim.
 - **All unreleased charges stay retained.** Contraction releases, revokes, invalidates, shrinks, and forges nothing (P2). Owner Drop after cleanup, or explicit failed-cleanup retention, remains the only path out of a charge.
 - **`Gc` contracts only after releases.** Contraction is an outcome of owner-driven release, never a cause of it.
 
-**If backing cannot be proved, that is the open Slice C question.** A provider that cannot establish `B` has not thereby failed — it simply may not assert substrate-backed enforcement, and the dimension remains an unproved-backing residual. Section 4 keeps that question open, and nothing in this section closes it.
+**If an envelope or a guarantee cannot be proved, that is the open Slice C question.** A provider that cannot establish `E` or `B` has not thereby failed — it is accounting-only, it may assert neither containment nor reservation, and the dimension remains an unproved-backing residual. Section 4 keeps that question open, and nothing in this section closes it.
 
-Contraction is therefore never a reclamation mechanism. It restricts future admission, it resolves as owners release, and any interval of typed backing loss is disclosed rather than smoothed.
+Contraction is therefore never a reclamation mechanism. It restricts future admission, it resolves as owners release, and any interval of typed envelope shortfall or backing loss is disclosed rather than smoothed.
+
+**Every typed report above is bounded by liveness and observability.** A typed result can only be produced while the process is **alive** and the condition is **observable to it**. That bound is not a detail; it is the limit of what any claim in this section means.
+
+- An out-of-memory kill or other fail-stop **produces no typed result.** The process is gone before it can classify what happened. There is no typed envelope-shortfall or backing-loss result for the case where the environment simply terminates the process.
+- Process death **destroys live in-process capabilities.** Leases, pending demands, and in-memory ownership records cease to exist rather than being released, retired, or reported, and no cleanup path runs for them.
+- Recovery is **ordinary restart**, with no special resource-model path. A restarted process reconstructs no leases, inherits no charges, and replays no prior resource state; it begins from an installed grant exactly as a first start does.
+
+**What happens outside the process is not settled by this model, and this report does not claim it is.** The statements above are scoped to in-process capabilities. They deliberately do **not** assert that every external reservation, provider allocation, retained charge, or cleanup obligation ceases when the process dies. A substrate-owned resource — a TURN or relay allocation held by a server, an assigned hard domain, a provider-side allocation, an OS or filesystem object — may well **survive** process death, and its disposition is determined by whoever owns it, not by anything in this document.
+
+That leaves genuine uncertainty at the boundary, and naming it is more honest than resolving it by assertion. A restarted process does not know what the previous process still holds somewhere else. **Reconciling substrate-owned resources after process death is an open concern**, not something the resource model discharges and not something any control here covers. Assuming such resources vanish with the process would be the convenient answer and is not a supported one.
+
+So the honest scope of the typed states above is: conditions a live process can see and classify, over capabilities it holds in memory. A condition that kills the process is outside them, what survives outside the process is outside them, and no control, report, or CI result may be read as covering either.
 
 **Hostile ingress is a separate obligation.** Progress and backpressure under hostile ingress are their own obligation and are not supplied by P6, by any fairness property, or by the provider alone. P6 governs how a schedule treats subdivision beneath a root; it says nothing about an attacker driving unbounded ingress at a listener.
 
@@ -433,7 +504,7 @@ The authority-class taxonomy is part of the provider port and stays architectura
 
 The failure is in the rotation key, not in any quantity the provider computes. No claim is made here about what binds those scopes together outside the process; the property and the failure are both stated purely over roots, scopes, and one fixed input workload with releases derived.
 
-This is a disclosed gap, not a passing result. Review 4865297956 §8 defers the correction to Slice D, which must bind a pending demand to a FairnessRoot selected by the trusted provider or ingress owner rather than to a mintable scope identity. The gap is fairness-only and does not affect the conservation, exact-release, no-minting, or cleanup-ownership dispositions recorded elsewhere in this report. It is separate from, and does not overlap, the host-backed and isolated provider gap in Section 1.1 or the residual-enforcement question in Section 4.
+This is a disclosed gap, not a passing result. Review 4865297956 §8 defers the correction to Slice D, which must bind a pending demand to a FairnessRoot selected by the trusted provider or ingress owner rather than to a mintable scope identity. The gap is fairness-only and does not affect the conservation, exact-release, no-minting, or cleanup-ownership dispositions recorded elsewhere in this report. It is separate from, and does not overlap, the provider-class gap in Section 1.1 — no isolated or backed provider exists — or the residual-enforcement question in Section 4.
 
 ## 6. Queue contracts
 
@@ -473,9 +544,11 @@ Layer note: the obligations below are L1. A control **passing** is L3, and an L3
 - exact lease release restores exactly that capacity;
 - concurrently held charges never exceed the grant in any dimension;
 - **conditional, pending-demand retention:** if a provider retains or reserves capacity for a pending demand, that retention mints no capacity, releases or invalidates no other owner's lease, and blocks no surplus beyond what that demand itself requires absent an explicit, named local isolation policy. A provider that never retains has nothing to check here — but see the next bullet, which binds it regardless;
-- **P4-constrained immediate refusal:** answering with immediate typed pressure rather than pending retention is available only when the claim does not currently fit; a fitting claim must be admitted, subject only to the three exception classes in Section 5.1 — (1) a proven provider structural limit applies, (2) an explicit local isolation policy or optional ceiling refuses it, (3) provider accounting is unavailable, poisoned, or cannot prove safety. Capacity reserved for an in-flight admission means the claim does not currently fit and is not a separate exception; typed backing loss (`B < Gc` or `B < S`) is covered by class 3 with the fit condition and is not a separate class. A refuse-only provider is nonconforming, not trivially conforming;
-- **safe committed-grant contraction:** with `S` the committed charge, `Gc` the provider-owned committed grant, `O` a non-authoritative observation, `T` an explicit owner-selected contraction target, and `B` enforceable substrate backing — `S <= Gc` holds always; `O` alone changes no grant, admission result, or contraction state, and only a named recorded policy action converts an observation into a new `T`; `T < Gc` requests gradual contraction and `Gc` follows `T` only after owner release lowers `S`, never below `S`; a provider claiming substrate-backed enforcement proves `Gc <= B` at admission; `B < Gc` or `B < S` yields a typed backing-loss or external-overcommit state that retains every charge, refuses conflicting new work, and does not claim missing physical backing exists;
-- **P4 fit is against the committed and actually backed admission domain, with P5 policy applied:** fit is evaluated against `Gc` net of `S`, additionally bounded by `B` wherever substrate backing is claimed, and further narrowed by any explicit P5 isolation policy or optional ceiling. It is never evaluated against `Gc` alone and never against a transient `O`;
+- **P4-constrained immediate refusal:** answering with immediate typed pressure rather than pending retention is available only when the claim does not currently fit; a fitting claim must be admitted, subject only to the three exception classes in Section 5.1 — (1) a proven provider structural limit applies, (2) an explicit local isolation policy or optional ceiling refuses it, (3) provider accounting is unavailable, poisoned, or cannot prove safety. Capacity reserved for an in-flight admission means the claim does not currently fit and is not a separate exception; typed envelope or backing loss (`E < Gc`, `E < S`, `B < Gc`, or `B < S`) is covered by class 3 with the fit condition and is not a separate class. A refuse-only provider is nonconforming, not trivially conforming;
+- **safe committed-grant contraction:** with `S` the committed charge, `Gc` the provider-owned committed grant, `O` an optional inert observation, `T` an explicit owner-selected contraction target, `E` an enforceable isolation envelope providing containment only, and `B` an actual reserved or owned guarantee — `S <= Gc` holds always; `O` sets nothing automatically and creates no provider class; a `T` arises only by being set directly by a named owner policy or derived by a named owner policy that considers `O`; `T < Gc` requests gradual contraction and `Gc` follows `T` only after owner release lowers `S`, never below `S`; `E < Gc` or `E < S` yields a typed envelope shortfall and `B < Gc` or `B < S` a typed backing loss, reported distinctly, each retaining every charge, refusing conflicting new work, and claiming no envelope or backing that is not there;
+- **each premise is proved separately, per dimension:** `E` and `B` are orthogonal and neither implies the other. A provider proves containment and reservation independently, may hold one, both, or neither in any given dimension, and claims only what it has proved. "Backed" is not a stronger "isolated". An owner-supplied grant vector is **not** host backing and establishes neither. The installed provider proves neither and is **accounting-only**;
+- **P4 fit applies the proved bounds, with P5 policy applied:** fit is evaluated against `Gc` net of `S` narrowed by P5 policy, then additionally bounded by `E` where `E` is proved and by `B` where `B` is proved, independently and per dimension. Where neither is proved neither bound applies; where both are, both apply. Fit is never evaluated against `O`, and no provider may bound against an `E` or `B` it does not have;
+- **typed reporting is bounded by liveness and observability:** every typed state above is producible only while the process is alive and the condition observable to it. An OOM kill or other fail-stop produces no typed result, destroys live in-process capabilities, and is recovered by ordinary restart carrying no resource state across. This says nothing about substrate-owned resources: an external reservation, provider allocation, or OS-owned object may survive process death, and reconciling it is an open concern no control here covers;
 - refusal names a resource dimension rather than an object count;
 - refusal is an availability result and never an Open or Closed authorization denial;
 - a nonwaiting acquisition returns typed pressure without requesting another owner's cleanup;
@@ -484,7 +557,7 @@ Layer note: the obligations below are L1. A control **passing** is L3, and an L3
 - connector cleanup can proceed from its pre-reserved claim even after the shared grant is full;
 - a connector-local scheduling weight reserves no provider capacity and multiplying it multiplies no grant (connector-local scheduling metadata is not capacity; this does not discharge P6 non-amplification below);
 - **P6 partition non-amplification (subdivision monotonicity):** over one fixed *input workload* — finite root set, initial provider state including `Gc`, arrival events, per-demand claim, authority and reclaimability, and one deterministic owner response rule, with releases derived rather than fixed — subdividing root `A`'s demand across additional AttributionChildScopes beneath `A` must satisfy, **at every decision prefix `k`**: cumulative selections of `A` no greater than baseline, cumulative admitted quantity of `A` no greater than baseline **in every resource dimension `d`**, and every baseline selection of every competitor `B != A` occurring at a decision index no later than its baseline index, with a selection that never occurs taking index infinity. **No named control implements this, and it is not satisfied at this disposition.** The control must not assert total outcome or share equality, must not fail a subdivision that leaves `A` worse off or a competitor better off, and must not substitute a proof that each scope is eventually served;
-- **P6 first control, bounded release condition with bookkeeping isolated:** the first such control evaluates a finite decision prefix during which **none of the compared newly admitted demands releases**. That is the exact condition, and it is narrower than "no release occurs" — unrelated releases elsewhere in the workload need not be prohibited, and forbidding them would over-constrain the control for no benefit. What must not happen is a compared demand releasing inside the prefix, because then a derived release could mask or explain a difference. Because creating AttributionChildScopes itself consumes bookkeeping resource, that cost must additionally be isolated honestly — either by charging bookkeeping to a dimension that is **non-binding** for the workload, or by **prefunding both runs equally** so the baseline and subdivided runs carry the same bookkeeping charge. The control must state which method it used; silently omitting the isolation makes the result uninterpretable, because a difference could then be bookkeeping cost rather than amplification;
+- **P6 first control, topology-normalized over a bounded prefix:** the first such control uses the **identical pre-existing root and child-scope topology** and **identical bookkeeping claims** in both runs, with **stable `DemandId`s**, so that the only difference is the `DemandId`-to-`AttributionChildScope` mapping. It drives both runs from the deterministic clock-free environment described in Section 1.2, interleaving exogenous arrivals with derived owner actions and permitting terminal stuttering. It evaluates a **bounded decision prefix that starts identical in both runs** and during which **none of the compared newly admitted work releases** — unrelated releases elsewhere in the workload need not be prohibited, and forbidding them would over-constrain the control for no benefit. Normalizing the topology is what removes scope-creation cost from the comparison; it is not a claim that scopes are free, unbounded, or always creatable, and the control must not be read as promising unlimited scopes;
 - **P6 nonclaims are not controls:** no control asserts that a FairnessRoot corresponds to a real-world claimant, and none provides Sybil resistance over the number of roots. These are unsupported claims rather than pending work, and no future P6 correction supplies them;
 - **hostile-ingress progress and backpressure is a separate obligation:** ingress owners bound admission before work is created, apply backpressure or typed refusal at the ingress boundary, and keep unrelated work progressing while a hostile source is active. No property control in this list discharges it, and it remains open;
 - unused capacity is borrowable unless an explicit, named local isolation policy forbids it;

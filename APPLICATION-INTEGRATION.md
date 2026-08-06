@@ -506,7 +506,9 @@ The application owns:
 - application queues, persistence, retries, and fanout;
 - user-visible history and workflow.
 
-The component that allocates or retains a protected resource acquires its finite lease before allocation or retention. Basal MyOwnMesh does not expose or require a fixed maximum number of Mesh runtimes, peers, attempts, sessions, or flows. A request succeeds while the process resource provider grants its exact claim. Otherwise the application receives typed pressure or unavailability.
+The component that allocates or retains a protected resource acquires its finite lease before allocation or retention. Basal MyOwnMesh does not expose or require a fixed maximum number of Mesh runtimes, peers, attempts, sessions, or flows. A request is admitted while the process resource provider grants its exact claim. Otherwise the application receives typed pressure or unavailability.
+
+A granted claim is an admission decision, not a guarantee that the underlying resource can be obtained. Depending on the provider a deployment installs, admission may prove bookkeeping only. Allocation therefore remains fallible: an admitted operation can still fail on the real resource, and an application must handle that failure rather than treat a granted lease as a promise of success.
 
 The application does not choose low-level connector counters, resource weights, quotas, or shares. One finite process grant is shared by all Mesh scopes, and unused capacity is borrowable. Adding scopes cannot multiply that grant.
 
@@ -557,7 +559,8 @@ The application integration passes only when:
 - the selected provider documents its own demand-selection policy and shows that the policy alone mints no capacity;
 - every refusal names the unavailable resource dimension and is never an arbitrary or undeclared limit;
 - no resource result is converted into an authorization, entitlement, or identity decision in either direction;
-- provider-side scheduling attribution, grant contraction, capacity backing, and determinism bounds are asserted against [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md) and are not restated as application gates;
+- an admitted claim is never presented to the application as a guarantee that the underlying allocation will succeed;
+- provider-side resource obligations are asserted against [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md) and are not restated as application gates;
 - only owners of leases their contract declares reclaimable receive retirement requests;
 - a retirement request does not release its claim;
 - owner Drop or explicit failed-cleanup retention preserves exact release accounting;
