@@ -317,9 +317,15 @@ AttributionChildScope
     an accounting and attribution refinement beneath exactly one
         FairnessRoot
     may divide, label, and measure use within that root
-    creates no additional share, turn, or service weight: the
-        scheduling share of a FairnessRoot does not change with the
-        number of attribution child scopes beneath it
+    carries no independent scheduling entitlement: it is not a unit of
+        service in its own right, and it adds no share, turn, or
+        service weight to the root beneath which it sits
+    bounded one way: repartitioning a root's identical demand trace
+        across more attribution child scopes cannot give that parent
+        FairnessRoot earlier eligibility, additional selections or
+        turns, or a larger admitted quantity, and cannot delay a
+        competing FairnessRoot. No equality of outcome is implied, and
+        the precise finite-trace statement below governs
 ```
 
 **P6 stated precisely, as finite-trace partition invariance.** Consider two fairness roots, `A` and `B`. Hold all of the following fixed:
