@@ -3527,6 +3527,11 @@ mod finite {
                     reservation_id,
                     created_scope_id,
                 } => {
+                    // Validate everything first. No removal, free-set insert,
+                    // `in_use` change, trace append, or signal write happens
+                    // until every check has passed, so an invariant failure
+                    // poisons without partially unwinding the grant and without
+                    // recording a cancellation that did not occur.
                     let Some(reservation) = state.reservations.get(&reservation_id) else {
                         Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                         return;
@@ -3550,7 +3555,8 @@ mod finite {
                         Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                         return;
                     };
-                    state.reservations.remove(&reservation_id);
+                    // The created child must exist and be free of a pending
+                    // demand before anything is removed, not after.
                     if let Some(created_scope_id) = created_scope_id {
                         let removable = state
                             .scopes
@@ -3560,12 +3566,27 @@ mod finite {
                             Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                             return;
                         }
+                    }
+
+                    // Commit: every step below is infallible.
+                    state.reservations.remove(&reservation_id);
+                    if let Some(created_scope_id) = created_scope_id {
                         // Cancelling a granted new-child demand truly retires
-                        // that scope.
+                        // that scope, returning its order and clearing any
+                        // cursor that named its root.
                         Self::retire_scope_record(&mut state, created_scope_id);
                     }
                     state.free_reservation_ids.insert(reservation_id);
                     state.in_use = next;
+                    // Recorded after the rollback commits and before
+                    // re-arbitration, so any grant that re-arbitration produces
+                    // follows this cancellation in the trace rather than
+                    // preceding it.
+                    #[cfg(test)]
+                    state.decision_log.push(ProviderDecision::Cancelled {
+                        scope_id,
+                        demand_key: demand_key_of(demand),
+                    });
                     demand.signal.set(DemandOutcome::Cancelled);
                     Self::arbitrate(&mut state);
                 }
@@ -5894,6 +5915,572 @@ mod tests {
             .collect()
     }
 
+    /// Every `ProviderDecision` variant, paired with the exact path that
+    /// produces it and the control that exercises that path.
+    ///
+    /// This is the completeness table for the trace's stated scope. If a
+    /// variant is added without a producing path, or a producing path is
+    /// removed, this list is where the mismatch should be caught rather than
+    /// discovered as a silent hole in a control.
+    ///
+    /// Scope is unchanged: cooperative admission on the non-failing path, plus
+    /// owner cancellation. Fail-closed invariant cancellation inside
+    /// `arbitrate` and teardown cancellation in `release_scope` remain
+    /// deliberately untraced, as does every non-cooperative path.
+    #[test]
+    fn every_decision_variant_has_a_producing_path() {
+        // (variant kind, producing path, exercising control)
+        let table: [(&str, &str, &str); 6] = [
+            (
+                "accepted",
+                "acquire_cooperatively / create_scope_and_acquire_cooperatively, \
+                 when the claim does not fit immediately",
+                "construction_a_against_live_provider_does_not_amplify",
+            ),
+            (
+                "refused",
+                "the same two calls, when the demand's root already holds a turn",
+                "one_pending_demand_per_root_not_per_scope",
+            ),
+            (
+                "immediate",
+                "the same two calls, when the claim fits without arbitration",
+                // Deliberately *not* the P4-surplus control: that one admits
+                // through `acquire`, which is non-cooperative and therefore
+                // untraced, so naming it here would point at a path that
+                // produces no `ImmediateGrant` at all.
+                "reservation_id_failure_rolls_back_exactly_on_cooperative_immediate_creation",
+            ),
+            (
+                "granted",
+                "arbitrate, when a selected pending demand is admitted",
+                "construction_a_against_live_provider_does_not_amplify",
+            ),
+            (
+                "pressured",
+                "arbitrate, when the selected demand cannot be covered",
+                "insufficient_reclaim_set_is_not_published",
+            ),
+            (
+                "cancelled",
+                "cancel_demand, both the Waiting branch and the Granted branch \
+                 that unwinds an uncollected grant",
+                "cancelling_a_granted_existing_scope_demand_records_grant_then_cancellation",
+            ),
+        ];
+
+        // Each kind appears exactly once, and the set is exactly the set
+        // `decision_kind` can return.
+        let kinds: BTreeSet<&str> = table.iter().map(|(kind, _, _)| *kind).collect();
+        assert_eq!(
+            kinds.len(),
+            table.len(),
+            "each decision kind is listed exactly once"
+        );
+        assert_eq!(
+            kinds,
+            BTreeSet::from([
+                "accepted",
+                "refused",
+                "immediate",
+                "granted",
+                "pressured",
+                "cancelled",
+            ]),
+            "the table must cover exactly the kinds `decision_kind` produces; a \
+             new variant without a producing path is a hole in the trace"
+        );
+        for (kind, path, control) in &table {
+            assert!(
+                !path.is_empty() && !control.is_empty(),
+                "{kind}: every variant needs a named producing path and control"
+            );
+        }
+    }
+
+    /// Assert the decision trace is append-only across a before/after pair.
+    ///
+    /// Slicing from `before.decision_log.len()` alone would let a provider that
+    /// rewrote earlier events pass on the strength of a correct suffix, so the
+    /// retained prefix is compared byte-for-byte first.
+    fn assert_trace_prefix_intact(before: &FiniteProviderSnapshot, after: &FiniteProviderSnapshot) {
+        assert!(
+            after.decision_log.len() >= before.decision_log.len(),
+            "the decision trace is append-only and never shrinks"
+        );
+        assert_eq!(
+            after.decision_log[..before.decision_log.len()],
+            before.decision_log[..],
+            "the pre-existing decision-log prefix was rewritten"
+        );
+    }
+
+    /// The `(kind, demand_key)` pairs appended after `before_len`, in order.
+    fn appended_with_keys(
+        before_len: usize,
+        after: &FiniteProviderSnapshot,
+    ) -> Vec<(&'static str, usize)> {
+        after.decision_log[before_len..]
+            .iter()
+            .map(|decision| {
+                let key = match *decision {
+                    ProviderDecision::PendingAccepted { demand_key, .. }
+                    | ProviderDecision::ArbitrationGrant { demand_key, .. }
+                    | ProviderDecision::TerminalPressure { demand_key, .. }
+                    | ProviderDecision::Cancelled { demand_key, .. } => demand_key,
+                    ProviderDecision::PendingRefused { .. }
+                    | ProviderDecision::ImmediateGrant { .. } => 0,
+                };
+                (decision_kind(decision), key)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancelling_a_granted_existing_scope_demand_records_grant_then_cancellation() {
+        // A demand granted by arbitration whose owner drops the handle before
+        // collecting the lease, with a second demand on another root staged
+        // beforehand so re-arbitration has somewhere to go. That second grant
+        // is what proves arbitration resumed *after* the corrected decision
+        // index rather than before it.
+        let grant = claim(&[
+            (ResourceClass::QueuedBytes, 1),
+            (ResourceClass::OpaqueDependencyResidual, 512),
+        ]);
+        let provider = DeterministicGrantProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
+        let holder = port.create_fairness_root_scope().expect("holder root");
+        let first_root = port
+            .create_fairness_root_scope()
+            .expect("first requester root");
+        let later_root = port
+            .create_fairness_root_scope()
+            .expect("later requester root");
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+        let (holder_target, _holder_subscription) = ResourceReclaimSubscription::channel();
+        let holder_lease = port
+            .acquire_reclaimable_now(&holder, one, holder_target)
+            .expect("holder owns the only unit");
+
+        // Both demands are Speculative with live reclaim targets so each can
+        // legitimately pend: the later demand's deficit is coverable by the
+        // first demand's reclaimable grant, which is what keeps it pending
+        // rather than resolving to terminal pressure.
+        let (first_target, _first_subscription) = ResourceReclaimSubscription::channel();
+        let first = pending(
+            port.acquire_cooperatively(
+                &first_root,
+                ResourceAuthorityClass::Speculative,
+                one,
+                Some(first_target),
+            )
+            .expect("first turn"),
+        );
+        let first_key = first.demand_key_for_test();
+        let (later_target, _later_subscription) = ResourceReclaimSubscription::channel();
+        let later = pending(
+            port.acquire_cooperatively(
+                &later_root,
+                ResourceAuthorityClass::Speculative,
+                one,
+                Some(later_target),
+            )
+            .expect("later turn, staged before the first is granted"),
+        );
+        let later_key = later.demand_key_for_test();
+
+        let before = provider.transactional_snapshot_for_test();
+        let before_len = before.decision_log.len();
+
+        // Releasing the holder lets arbitration grant the first demand. Its
+        // owner never retries, so that lease is never collected.
+        drop(holder_lease);
+        let granted = provider.transactional_snapshot_for_test();
+        assert_trace_prefix_intact(&before, &granted);
+        assert_eq!(
+            appended_with_keys(before_len, &granted),
+            vec![("granted", first_key)],
+            "arbitration grants the first demand and records it"
+        );
+
+        // Bind the granted reservation exactly, so the rollback can be checked
+        // against it rather than against counts. Bound by owner rather than by
+        // id-absence from `before`: releasing the holder
+        // returns its reservation id, and the grant's allocator reuses the
+        // smallest free id, so the granted reservation can legitimately carry
+        // an id that already appears in `before`.
+        let owned_by_first = granted
+            .reservations
+            .iter()
+            .filter(|(_, owner, _, _, _)| *owner == first_root.id())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owned_by_first.len(),
+            1,
+            "the grant installed exactly one reservation for the first requester"
+        );
+        let granted_record = owned_by_first[0];
+        let (granted_id, granted_owner, granted_authority, granted_claim, _) = granted_record;
+
+        // Cancel the uncollected grant.
+        drop(first);
+        let after = provider.transactional_snapshot_for_test();
+
+        // Global order: grant, then cancellation, then the later grant.
+        assert_trace_prefix_intact(&granted, &after);
+        assert_eq!(
+            appended_with_keys(before_len, &after),
+            vec![
+                ("granted", first_key),
+                ("cancelled", first_key),
+                ("granted", later_key),
+            ],
+            "the cancellation is recorded before re-arbitration's grant, so the \
+             later grant follows it in the trace"
+        );
+        // Restricted to the first demand key, the appended trace is exactly
+        // its grant and its cancellation, with nothing else attributed to it.
+        assert_eq!(
+            appended_with_keys(before_len, &after)
+                .into_iter()
+                .filter(|(_, key)| *key == first_key)
+                .map(|(kind, _)| kind)
+                .collect::<Vec<_>>(),
+            vec!["granted", "cancelled"],
+            "the first demand contributes exactly one grant and one cancellation"
+        );
+        assert_eq!(after.poisoned, None);
+
+        // Exact rollback of the first grant, against the granted snapshot.
+        assert_eq!(
+            granted_owner,
+            first_root.id(),
+            "the cancelled reservation was owned by the first requester"
+        );
+        assert!(
+            !after
+                .reservations
+                .iter()
+                .any(|(_, owner, _, _, _)| *owner == first_root.id()),
+            "the first requester's reservation record is gone"
+        );
+        // The exact record — id, owner, authority, claim and lifecycle — is
+        // absent, so the lifecycle field is carried into the check rather than
+        // pinned to a value. By this point arbitration may already have marked
+        // it `ReclaimRequested` on the later demand's behalf.
+        assert!(
+            !after.reservations.contains(&granted_record),
+            "the exact granted reservation record is removed, not rewritten"
+        );
+
+        // The cancellation returns the id, then re-arbitration immediately
+        // reallocates from the same free set, so the id does not stay free.
+        // Bind that exact return-and-reallocate rather than asserting it
+        // remains available: the allocator reuses the smallest free id.
+        let mut freed: Vec<u64> = granted.free_reservation_ids.clone();
+        assert!(
+            !freed.contains(&granted_id),
+            "the cancelled id was in use at the granted state"
+        );
+        freed.push(granted_id);
+        freed.sort_unstable();
+        let reused = freed[0];
+        let later_reservation = after
+            .reservations
+            .iter()
+            .find(|(_, owner, _, _, _)| *owner == later_root.id())
+            .copied()
+            .expect("re-arbitration installed the later owner's reservation");
+        let (later_id, _, later_authority, later_claim, _) = later_reservation;
+        assert_eq!(
+            later_id, reused,
+            "the later grant takes the deterministically reused id, evidencing \
+             that the cancelled id was returned before re-arbitration"
+        );
+        assert_eq!(
+            after.free_reservation_ids,
+            freed[1..].to_vec(),
+            "the free set is exactly the granted set plus the returned id, \
+             minus the one re-arbitration consumed"
+        );
+        assert_eq!(
+            after.reservations.len(),
+            granted.reservations.len(),
+            "one reservation out, one in: no duplicate and no leak"
+        );
+        assert_eq!(
+            after.next_reservation_id, granted.next_reservation_id,
+            "cancellation and the reuse mint no reservation id: the frontier \
+             is untouched"
+        );
+        assert_eq!(
+            after.next_scope_order, granted.next_scope_order,
+            "an existing-scope cancellation mints no scope order"
+        );
+        assert_eq!(
+            after.free_scope_orders, granted.free_scope_orders,
+            "an existing-scope cancellation frees no scope order"
+        );
+        assert_eq!(
+            after.scopes.iter().map(|(id, ..)| *id).collect::<Vec<_>>(),
+            granted
+                .scopes
+                .iter()
+                .map(|(id, ..)| *id)
+                .collect::<Vec<_>>(),
+            "an existing-scope cancellation changes no topology"
+        );
+
+        // Charge arithmetic across every dimension, stated as the explicit
+        // whole-claim equation rather than inferred from equal inputs: the
+        // cancelled reservation's charge comes off and the later grant's goes
+        // on. Both are existing-scope grants, so neither carries a scope
+        // bookkeeping charge.
+        let first_charge = FiniteResourceProvider::reservation_charge_for_test(granted_claim)
+            .expect("the cancelled grant's charge is representable");
+        let later_charge = FiniteResourceProvider::reservation_charge_for_test(later_claim)
+            .expect("the later grant's charge is representable");
+        let expected_in_use = granted
+            .in_use
+            .checked_sub(first_charge)
+            .expect("the cancelled charge was in use at the granted state")
+            .checked_add(later_charge)
+            .expect("the later charge is representable");
+        assert_eq!(
+            after.in_use, expected_in_use,
+            "in_use is exactly granted - reservation_charge(first) + \
+             reservation_charge(later), in every dimension: the cancelled \
+             charge is restored exactly once"
+        );
+        assert_eq!(
+            after.retained_after_failed_cleanup, granted.retained_after_failed_cleanup,
+            "a cancellation is not a failed cleanup, so nothing is retained"
+        );
+        assert_eq!(
+            (granted_authority, later_authority),
+            (
+                ResourceAuthorityClass::Speculative,
+                ResourceAuthorityClass::Speculative
+            ),
+            "both grants are Speculative, so the equation above compares like \
+             charges rather than hiding an authority-class difference"
+        );
+        assert!(
+            after
+                .scopes
+                .iter()
+                .all(|(_, _, _, pending)| pending.is_none()),
+            "no pending demand survives"
+        );
+        assert_eq!(after.active_demand, None, "no turn is outstanding");
+
+        // Collecting proves re-arbitration produced a real, usable lease from
+        // the corrected index rather than merely logging a grant.
+        let later_lease = acquired(later.retry().expect("the later demand collects its lease"));
+        assert_eq!(
+            later_lease.claim(),
+            granted_claim,
+            "the later demand takes the exact claim the cancelled grant released"
+        );
+        drop(later_lease);
+    }
+
+    #[test]
+    fn cancelling_a_granted_new_child_demand_retires_the_child_exactly_once() {
+        let grant = claim(&[
+            (ResourceClass::SocketOrHandle, 1),
+            (ResourceClass::OpaqueDependencyResidual, 512),
+        ]);
+        let provider = DeterministicGrantProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
+        let process = port.process_scope();
+        let socket = ResourceClaim::single(ResourceClass::SocketOrHandle, 1);
+
+        let (blocker_target, _blocker_subscription) = ResourceReclaimSubscription::channel();
+        let blocker = acquired(
+            port.create_scope_with_reclaimable_lease_cooperatively(
+                &process,
+                socket,
+                blocker_target,
+            )
+            .expect("blocker holds the only socket"),
+        );
+        let (demand_target, _demand_subscription) = ResourceReclaimSubscription::channel();
+        let demand = pending(
+            port.create_scope_with_reclaimable_lease_cooperatively(&process, socket, demand_target)
+                .expect("a pending new-child demand"),
+        );
+
+        let demand_key = demand.demand_key_for_test();
+
+        let before = provider.transactional_snapshot_for_test();
+        let before_len = before.decision_log.len();
+        drop(blocker);
+        let granted = provider.transactional_snapshot_for_test();
+        assert_trace_prefix_intact(&before, &granted);
+        assert_eq!(
+            appended_with_keys(before_len, &granted),
+            vec![("granted", demand_key)],
+            "arbitration grants the new-child demand"
+        );
+
+        // Derive the exact records the atomic child path created, so the
+        // rollback is checked against those identities rather than counts.
+        // Bound by identity, not by delta against `before`: the blocker's
+        // release returns both its scope order and its reservation id, and
+        // both allocators reuse the smallest free token, so the created child
+        // can legitimately carry tokens that already appear in `before` (and
+        // even a recycled `ResourceScopeId`, whose value derives from an
+        // allocation address). At the granted state the blocker is gone, so
+        // the child is the unique non-process scope.
+        let process_id = process.id();
+        let children = granted
+            .scopes
+            .iter()
+            .filter(|(id, ..)| *id != process_id)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children.len(),
+            1,
+            "the blocker is released, so the granted child is the only non-process scope"
+        );
+        let (created_id, created_root, created_order, _) = children[0];
+        let owned_by_child = granted
+            .reservations
+            .iter()
+            .filter(|(_, owner, ..)| *owner == created_id)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owned_by_child.len(),
+            1,
+            "the atomic child path installed exactly one reservation on the child"
+        );
+        assert_eq!(
+            granted.reservations.len(),
+            1,
+            "no other reservation survives, so the delta below is unambiguous"
+        );
+        let (created_reservation_id, _, _, created_claim, _) = owned_by_child[0];
+
+        // The owner never collects, then drops. Nothing else is pending, so
+        // re-arbitration produces no further grant and the post-cancel state
+        // must be exactly the granted state minus the child it created.
+        drop(demand);
+        let after = provider.transactional_snapshot_for_test();
+        assert_trace_prefix_intact(&granted, &after);
+        assert_eq!(
+            appended_with_keys(before_len, &after),
+            vec![("granted", demand_key), ("cancelled", demand_key)],
+            "grant then exactly one cancellation, both attributed to this demand"
+        );
+        assert_eq!(after.poisoned, None);
+
+        // Whole-vector deltas: exactly the created child and its reservation
+        // are gone, and nothing else moved.
+        assert_eq!(
+            after.scopes,
+            granted
+                .scopes
+                .iter()
+                .copied()
+                .filter(|(id, ..)| *id != created_id)
+                .collect::<Vec<_>>(),
+            "the scope table is the granted table minus exactly the created child"
+        );
+        assert_eq!(
+            after.reservations,
+            granted
+                .reservations
+                .iter()
+                .copied()
+                .filter(|(id, ..)| *id != created_reservation_id)
+                .collect::<Vec<_>>(),
+            "the reservation table is the granted table minus exactly its reservation"
+        );
+
+        // Allocator bookkeeping: both tokens are returned exactly once, and
+        // neither frontier moves.
+        let mut expected_free_orders = granted.free_scope_orders.clone();
+        assert!(
+            !expected_free_orders.contains(&created_order),
+            "the created order was in use at the granted state"
+        );
+        expected_free_orders.push(created_order);
+        expected_free_orders.sort_unstable();
+        assert_eq!(
+            after.free_scope_orders, expected_free_orders,
+            "exactly the created scope order is returned, once"
+        );
+        let mut expected_free_ids = granted.free_reservation_ids.clone();
+        assert!(
+            !expected_free_ids.contains(&created_reservation_id),
+            "the created reservation id was in use at the granted state"
+        );
+        expected_free_ids.push(created_reservation_id);
+        expected_free_ids.sort_unstable();
+        assert_eq!(
+            after.free_reservation_ids, expected_free_ids,
+            "exactly the created reservation id is returned, once"
+        );
+        assert_eq!(
+            (after.next_scope_order, after.next_reservation_id),
+            (granted.next_scope_order, granted.next_reservation_id),
+            "cancellation returns tokens rather than minting, so both frontiers hold"
+        );
+
+        // Charge: the child's bookkeeping and its reservation are both undone,
+        // returning the pre-grant total in every dimension.
+        let child_total =
+            FiniteResourceProvider::child_scope_with_reservation_charge_for_test(created_claim)
+                .expect("the child's combined charge is representable");
+        let expected_in_use = granted
+            .in_use
+            .checked_sub(child_total)
+            .expect("the child's combined charge was in use at the granted state");
+        assert_eq!(
+            after.in_use, expected_in_use,
+            "in_use subtracts exactly the child scope bookkeeping plus the \
+             reservation charge, once, in every dimension"
+        );
+        // Deliberately not compared against `before`: that snapshot was taken
+        // while the blocker's child and reservation were still live, so it
+        // carries the blocker's combined charge and its scope record. The
+        // granted snapshot is the only correct baseline for this rollback.
+        assert_eq!(
+            after.retained_after_failed_cleanup, granted.retained_after_failed_cleanup,
+            "a cancellation is not a failed cleanup, so nothing is retained"
+        );
+        assert!(
+            after
+                .scopes
+                .iter()
+                .all(|(_, _, _, pending)| pending.is_none()),
+            "no pending demand survives the cancellation"
+        );
+        assert_eq!(after.active_demand, None, "no turn is outstanding");
+
+        // The parent root stays live, so nothing justifies a cursor move.
+        let parent_root = after
+            .scopes
+            .iter()
+            .find(|(id, ..)| *id == process_id)
+            .map(|(_, root, ..)| *root)
+            .expect("the process scope outlives the child");
+        assert_eq!(
+            created_root, parent_root,
+            "the retired child belonged to the still-live process root"
+        );
+        assert_eq!(
+            (&after.demand_cursor, after.reclaim_cursor),
+            (&granted.demand_cursor, granted.reclaim_cursor),
+            "retiring a child of a still-live root moves no cursor"
+        );
+    }
+
     #[test]
     fn reclaim_prefers_another_root_before_the_requesters_own_from_an_existing_scope() {
         let fixture = victim_fixture(1);
@@ -6194,7 +6781,7 @@ mod tests {
             (ResourceClass::OpaqueDependencyResidual, 256),
         ]);
         let provider = DeterministicGrantProvider::new(grant);
-        let port = ResourceProviderPort::new(provider).expect("process bookkeeping");
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
         let root = port.create_fairness_root_scope().expect("one root");
         let first_child = port.create_scope(&root).expect("first child");
         let second_child = port.create_scope(&root).expect("second child");
@@ -6223,6 +6810,7 @@ mod tests {
         );
 
         // A sibling beneath the same root cannot mint a second turn.
+        let before = provider.transactional_snapshot_for_test();
         assert!(
             matches!(
                 port.acquire_cooperatively(
@@ -6234,6 +6822,20 @@ mod tests {
                 Err(ResourceUnavailable::DemandPending { .. })
             ),
             "a second child beneath one root must not obtain a second turn"
+        );
+
+        // This control is the named producer of `PendingRefused` in the
+        // completeness table, so it asserts that variant rather than resting on
+        // the typed error alone.
+        let after = provider.transactional_snapshot_for_test();
+        assert_trace_prefix_intact(&before, &after);
+        assert_eq!(
+            after.decision_log[before.decision_log.len()..]
+                .iter()
+                .map(decision_kind)
+                .collect::<Vec<_>>(),
+            vec!["refused"],
+            "the refused sibling turn is recorded exactly once"
         );
 
         // Retire the turn before the blocker. Releasing the blocker first would
@@ -6718,10 +7320,26 @@ mod tests {
         );
 
         provider.fail_reservation_id_allocation_for_test(false);
+        let restored = provider.transactional_snapshot_for_test();
         let (retry_target, _retry_subscription) = ResourceReclaimSubscription::channel();
         let recovered = acquired(
             port.create_scope_with_reclaimable_lease_cooperatively(&process, socket, retry_target)
                 .expect("the transaction succeeds once allocation is restored"),
+        );
+
+        // This control is the named producer of `ImmediateGrant` in the
+        // completeness table, so it asserts that variant rather than leaving
+        // the table pointing at an unexercised path. The cooperative call fit
+        // without arbitration, so exactly one immediate grant is appended.
+        let after = provider.transactional_snapshot_for_test();
+        assert_trace_prefix_intact(&restored, &after);
+        assert_eq!(
+            after.decision_log[restored.decision_log.len()..]
+                .iter()
+                .map(decision_kind)
+                .collect::<Vec<_>>(),
+            vec!["immediate"],
+            "a cooperative claim that fits records exactly one immediate grant"
         );
         drop(recovered);
     }
@@ -6955,7 +7573,7 @@ mod tests {
             (ResourceClass::OpaqueDependencyResidual, 7),
         ]);
         let provider = DeterministicGrantProvider::new(grant);
-        let port = ResourceProviderPort::new(provider).expect("process bookkeeping");
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
         let process = port.process_scope();
         let admitted_scope = port.create_scope(&process).expect("admitted scope");
         let speculative_scope = port.create_scope(&process).expect("speculative scope");
@@ -6969,6 +7587,7 @@ mod tests {
             .acquire_reclaimable_now(&speculative_scope, one, target)
             .expect("one reclaimable speculative unit");
 
+        let before = provider.transactional_snapshot_for_test();
         assert!(matches!(
             port.acquire_cooperatively(
                 &requester_scope,
@@ -6981,6 +7600,21 @@ mod tests {
         assert!(
             !subscription.is_requested(),
             "an insufficient victim set is never published"
+        );
+
+        // This control is the named producer of `TerminalPressure` in the
+        // completeness table, so it asserts that variant rather than resting on
+        // the typed error alone: the turn is accepted, then resolved to
+        // terminal pressure once no sufficient victim set exists.
+        let after = provider.transactional_snapshot_for_test();
+        assert_trace_prefix_intact(&before, &after);
+        assert_eq!(
+            after.decision_log[before.decision_log.len()..]
+                .iter()
+                .map(decision_kind)
+                .collect::<Vec<_>>(),
+            vec!["accepted", "pressured"],
+            "a refused cooperative turn records its acceptance and its terminal pressure"
         );
         drop((speculative, admitted));
     }
