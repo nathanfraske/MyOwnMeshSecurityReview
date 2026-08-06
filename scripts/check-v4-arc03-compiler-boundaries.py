@@ -181,6 +181,81 @@ fn main() {}
         "E0599",
         ("open", "not found"),
     ),
+    # Fairness attribution. The five probes below prove that an ordinary
+    # external caller cannot construct, mint, select, or rebind a fairness
+    # root. Each is paired with a positive source-shape guard in `main`, so a
+    # renamed or deleted implementation fails the guard instead of silently
+    # turning a rejection probe green on E0432 absence.
+    RejectedProbe(
+        # Proves privacy of the containing module, not mere absence: the path
+        # resolves as far as `provider` and is refused at `finite`.
+        "fairness_root_cannot_be_named_or_constructed_externally",
+        """use myownmesh_core::resource::provider::finite::FairnessRoot; // expected-error
+fn main() {
+    let _ = std::mem::size_of::<FairnessRoot>();
+}
+""",
+        "E0603",
+        ("finite", "private"),
+    ),
+    RejectedProbe(
+        # Half of a pair, and it proves absence rather than privacy. The mint is
+        # `#[cfg(test)] pub(crate)` on disk, so it is not in the downstream
+        # non-test API at all and an external caller gets E0599. The other half
+        # is the positive source-shape guard in `main`, which proves the method
+        # really exists with exactly that gate and visibility. Neither half
+        # carries the claim alone, and this probe must never be read as
+        # evidence of privacy.
+        "fairness_root_scope_mint_is_not_public_api",
+        """use myownmesh_core::resource::ResourceProviderPort;
+fn bypass(port: &ResourceProviderPort) {
+    let _ = port.create_fairness_root_scope(); // expected-error
+}
+fn main() {}
+""",
+        "E0599",
+        ("create_fairness_root_scope", "not found"),
+    ),
+    RejectedProbe(
+        # Proves the public scope constructor exposes no root selector: it
+        # takes exactly one argument, the parent scope.
+        "public_scope_creation_takes_no_root_selector",
+        """use myownmesh_core::resource::{ResourceProviderPort, ResourceScope};
+fn bypass(port: &ResourceProviderPort, parent: &ResourceScope, root: u64) {
+    let _ = port.create_scope(parent, root); // expected-error
+}
+fn main() {}
+""",
+        "E0061",
+        ("create_scope", "argument"),
+    ),
+    RejectedProbe(
+        # Proves no ordinary public root mint: the public path requires a
+        # parent scope, so a caller cannot request a parentless scope and
+        # thereby obtain a fresh root.
+        "ordinary_public_api_cannot_mint_a_parentless_root_scope",
+        """use myownmesh_core::resource::ResourceProviderPort;
+fn bypass(port: &ResourceProviderPort) {
+    let _ = port.create_scope(None); // expected-error
+}
+fn main() {}
+""",
+        "E0308",
+        ("&ResourceScope", "Option"),
+    ),
+    RejectedProbe(
+        # Proves an attribution child scope cannot be rebound to another root:
+        # no parent or root mutator exists on the public scope token.
+        "attribution_child_scope_cannot_be_rebound_to_another_root",
+        """use myownmesh_core::resource::ResourceScope;
+fn bypass(scope: &ResourceScope, other: &ResourceScope) {
+    scope.set_parent(other.clone()); // expected-error
+}
+fn main() {}
+""",
+        "E0599",
+        ("set_parent", "not found"),
+    ),
 )
 
 
@@ -596,6 +671,125 @@ def main() -> int:
     ):
         if resource_type not in provider_source:
             failures.append(f"elastic resource contract is missing {resource_type}")
+    # Positive source-shape guards for fairness attribution. Each rejection
+    # probe above proves only that a boundary holds from outside the crate; what
+    # it does not prove is that the guarded surface still exists in the shape the
+    # frozen contract describes. Without these guards a renamed, deleted, or
+    # re-gated implementation would let a probe keep passing on an item that is
+    # simply gone. Which side carries which claim differs per probe: some prove
+    # privacy against a resolvable item, and the test-only root mint proves
+    # absence from the downstream API, with the guard below establishing its real
+    # gate and visibility. Each per-probe comment states its own case.
+    for required_shape, description in (
+        ("mod finite {", "the provider-private finite module"),
+        ("struct ScopeOrder(u64);", "the private ScopeOrder identity"),
+        ("struct FairnessRoot(ScopeOrder);", "the private FairnessRoot attribution"),
+        ("pub fn create_scope(", "the public child-scope constructor"),
+        ("parent: &ResourceScope,", "the mandatory parent argument on public scope creation"),
+        ("Some(parent.id())", "parent inheritance on the public scope path"),
+    ):
+        if required_shape not in provider_source:
+            failures.append(
+                f"fairness attribution surface is missing {description}: "
+                f"{required_shape!r} is absent from provider.rs"
+            )
+    # The trusted root mint is test-only on disk, so its rejection probe can
+    # only prove absence from the downstream API. This guard carries the other
+    # half of that claim: the method exists, is gated by exactly `#[cfg(test)]`,
+    # and is crate-visible rather than public. Removing the gate, widening the
+    # visibility, or deleting the method fails here by name.
+    test_only_root_mint = (
+        r"#\[cfg\(test\)\]\s*"
+        r"(?:(?://[^\n]*|#\[[^\]]*\])\s*)*"
+        r"pub\(crate\)\s+fn\s+create_fairness_root_scope\s*\(\s*&self\s*\)"
+    )
+    if not re.search(test_only_root_mint, provider_source):
+        failures.append(
+            "the trusted root mint must be exactly `#[cfg(test)] pub(crate) fn "
+            "create_fairness_root_scope(&self)` in provider.rs"
+        )
+    for forbidden_shape, reason in (
+        ("pub use finite::FairnessRoot", "FairnessRoot must not be exported"),
+        ("pub use finite::ScopeOrder", "ScopeOrder must not be exported"),
+    ):
+        if forbidden_shape in provider_source:
+            failures.append(f"{reason}: {forbidden_shape!r} is present in provider.rs")
+    # Visibility is checked by pattern rather than by exact string so that
+    # `pub(crate)`, `pub(super)`, and `pub(in ...)` cannot slip past a literal
+    # `pub ` match. The frozen contract is private to provider.rs.
+    serde_derive = (
+        r"#\[derive\([^)]*\b(?:Serialize|Deserialize)\b[^)]*\)\]"
+        r"\s*(?:(?://[^\n]*|#\[[^\]]*\])\s*)*"
+        r"(?:pub(?:\s*\([^)]*\))?\s+)?struct\s+"
+    )
+    for pattern, reason in (
+        (
+            r"pub(?:\s*\([^)]*\))?\s+struct\s+FairnessRoot\b",
+            "FairnessRoot must carry no visibility qualifier",
+        ),
+        (
+            r"pub(?:\s*\([^)]*\))?\s+struct\s+ScopeOrder\b",
+            "ScopeOrder must carry no visibility qualifier",
+        ),
+        (
+            r"pub(?:\s*\([^)]*\))?\s+mod\s+finite\b",
+            "the finite module must carry no visibility qualifier",
+        ),
+        # Serialization is forbidden for these two identities only. Unrelated
+        # serialization elsewhere in provider.rs is not this control's business.
+        (serde_derive + r"FairnessRoot\b", "FairnessRoot must derive no serde codec"),
+        (serde_derive + r"ScopeOrder\b", "ScopeOrder must derive no serde codec"),
+        (
+            r"impl\b[^\n]*\b(?:Serialize|Deserialize)\b[^\n]*\bfor\s+(?:FairnessRoot|ScopeOrder)\b",
+            "fairness attribution must implement no serde codec",
+        ),
+    ):
+        if re.search(pattern, provider_source):
+            failures.append(f"{reason}: provider.rs matches {pattern!r}")
+    # Mutator absence is asserted on the ResourceScope surface itself rather
+    # than file-wide, so unrelated internal helpers are not banned. External
+    # unreachability is proved separately by the rejection probe.
+    # The region is sliced by structural markers, not by brace matching: from a
+    # column-zero `impl ResourceScope {` to the next column-zero `impl` item,
+    # which in valid Rust cannot appear inside the block. A lazy brace regex
+    # would silently stop at the first line-start `}` it met and let a later
+    # method escape the scan, so the self-check below requires the two known
+    # accessors to be inside the extracted region: a truncated slice fails by
+    # name instead of quietly scanning nothing.
+    scope_impl_regions = []
+    for match in re.finditer(
+        r"^impl ResourceScope \{[^\n]*$", provider_source, re.MULTILINE
+    ):
+        remainder = provider_source[match.end() :]
+        next_item = re.search(r"^impl\b", remainder, re.MULTILINE)
+        scope_impl_regions.append(
+            remainder[: next_item.start()] if next_item else remainder
+        )
+    if not scope_impl_regions:
+        failures.append(
+            "fairness attribution surface is missing the inherent ResourceScope impl block"
+        )
+    elif not any(
+        re.search(r"\bfn\s+id\b", region) and re.search(r"\bfn\s+parent_id\b", region)
+        for region in scope_impl_regions
+    ):
+        failures.append(
+            "inherent ResourceScope impl extraction is truncated: the known id and "
+            "parent_id accessors are not both inside the scanned region, so the "
+            "mutator scan below cannot be trusted"
+        )
+    for region in scope_impl_regions:
+        for mutator in ("set_parent", "rebind", "reparent", "set_root", "fairness_root"):
+            if re.search(rf"\bfn\s+{mutator}\b", region):
+                failures.append(
+                    f"ResourceScope must expose no {mutator} accessor or mutator"
+                )
+    resource_mod_source = (CORE / "src" / "resource" / "mod.rs").read_text(encoding="utf-8")
+    for private_identity in ("FairnessRoot", "ScopeOrder"):
+        if private_identity in resource_mod_source or private_identity in lib_source:
+            failures.append(
+                f"{private_identity} must not be re-exported outside the provider module"
+            )
     for forbidden_cardinality in (
         "MAX_MESHES",
         "MAX_PEERS",
