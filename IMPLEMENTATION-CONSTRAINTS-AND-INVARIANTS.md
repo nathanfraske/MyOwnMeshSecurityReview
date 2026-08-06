@@ -775,7 +775,7 @@ When the selected demand cannot fit, the provider may request retirement from an
 
 No scheduling or cooperative retirement model guarantees later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. A policy that gives cleanup authority the first pending-demand opportunity does not thereby manufacture capacity, and it is not a promise that cleanup can start without its exact claim.
 
-**Immediate pressure only for a non-fitting claim.** Fit is `EffectiveFit`, defined below; it is never evaluated against an external observation `O` or a target `T`. An immediate, nonwaiting acquisition may return typed pressure without creating a pending demand, but only when the exact claim cannot be met from `EffectiveFit`, in every dimension the claim requires, from capacity that is neither live nor reserved for an in-flight admission. A claim that fits must be admitted unless one of exactly three stated conditions holds: a proven structural limit forbids it; an explicit isolation policy or optional local ceiling refuses it; or the accounting needed to prove the admission safe is unavailable, poisoned, or cannot be proven safe. Each of those must be reported as itself, not as ordinary pressure.
+**Immediate pressure only for a non-fitting claim.** Fit is `EffectiveFit`, defined below; it is never evaluated against an external observation `O` or a target `T`. An immediate, nonwaiting acquisition may return typed pressure without creating a pending demand, but only when the exact claim exceeds `EffectiveFit` in some dimension the claim requires. `EffectiveFit` already excludes capacity that is live or reserved for an in-flight admission, so no further subtraction is applied on top of it. A claim that fits must be admitted unless one of exactly three stated conditions holds: a proven structural limit forbids it; an explicit isolation policy or optional local ceiling refuses it; or the accounting needed to prove the admission safe is unavailable, poisoned, or cannot be proven safe. Each of those must be reported as itself, not as ordinary pressure.
 
 Work conservation constrains refusal in the other direction. An immediate path may not refuse a fitting claim in order to hold capacity for an anticipated demand, to smooth one demand source's request rate, or to enforce an undeclared share. Any such withholding is a partition and is conforming only as explicit local isolation policy under P5.
 
@@ -803,54 +803,89 @@ O    an external observation of host capacity
 
 ```text
 accounting-only
-    the baseline: proves S <= Gc, and claims neither isolation nor
-        backing
-    allocation remains fallible: admission does not imply that the
-        underlying resource can actually be obtained
+    proves S <= Gc, and claims neither E nor B
+    the grant is a bookkeeping commitment this process respects by its
+    own arithmetic
 
-isolation claim, per dimension
-    licensed only by an exact E containment proof for that dimension
-    establishes containment within E
-    establishes nothing about availability within E
+isolated
+    proves S <= Gc, and additionally claims E: an enforceable envelope
+    contains the process. Containment is not availability, so an E
+    claim says nothing about whether capacity within it can be obtained
 
-backing claim, per dimension
-    licensed only by the exact B premise for that dimension
-    establishes that the resource is reserved or owned for this domain
+backed
+    proves S <= Gc, and additionally claims B: an exact substrate
+    contract genuinely reserves the capacity. Reservation is not
+    containment, so a B claim says nothing about whether consumption
+    beyond it is prevented
 ```
+
+A provider may hold both claims, and may hold them per dimension: `E` proved in one resource dimension and `B` proved in another is an ordinary configuration, not a contradiction. Any combination is permitted exactly where each premise it names is separately proved. Claiming `E` never licenses a `B` claim, and claiming `B` never licenses an `E` claim. Allocation remains fallible under every label: admission does not imply that the underlying resource can actually be obtained.
 
 Neither claim implies the other in either direction, and neither is a prerequisite for the other. A provider may be backed in one dimension and merely contained in another, or contained in a dimension it does not back. Where a provider makes no claim for a dimension, that dimension is accounting-only regardless of what it claims elsewhere, and the unproved case is a named Slice C residual rather than an assumption. Absent a backing claim, an admission proves bookkeeping and not physical success; absent an isolation claim, it proves neither containment nor success.
 
-**AccountingFit and EffectiveFit.** Admission is tested against exactly two derived quantities, both computed per dimension `d`:
+**Capacities, charges, and fit.** The exact arithmetic is stated in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) and is not restated here. This document carries only the obligations an implementation must meet. If the two disagree, FORMAL governs.
+
+Two charge quantities are distinct and are never conflated, per dimension `d`:
 
 ```text
-AccountingFit(d)
-    the capacity remaining in d after subtracting S from Gc, and after
-    applying any explicit P5 isolation policy or optional local policy
-
-EffectiveFit(d)
-    AccountingFit(d)
-        intersected with E(d), where isolation is independently proved
-            for d
-        intersected with B(d), where backing is independently proved
-            for d
-
-    where neither is independently proved for d:
-        EffectiveFit(d) = AccountingFit(d)
+S(d)         live claims plus failed-cleanup-retained charges
+R_flight(d)  the aggregate exact capacity reserved for all admissions
+             currently in flight; zero when there are none
 ```
 
-Each intersection is licensed only by its own independent proof for that exact dimension. An `E` proved for one dimension does not narrow another, and a `B` proved for one dimension does not narrow another.
+`R_flight` is a distinct symbol, deliberately not `R`. [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) already uses `R` for the multiset of live lease claims and failed-cleanup-retained claims, including in the P6 material, and that notation is not disturbed here.
 
-*Accounting-only equality is valid.* Where a provider proves neither isolation nor backing for a dimension, `EffectiveFit(d) = AccountingFit(d)` holds, and stating that equality is correct rather than a defect or an omission. It is an honest description of what an accounting-only dimension admits against. It is not a claim that the two are equivalent in strength, and it never converts accounting into containment or backing.
+`AccountingCapacity(d)` and `EffectiveCapacity(d)` are **absolute** capacities, not remainders. `AccountingCapacity` is the absolute committed grant `Gc` in `d`, narrowed only by an explicit P5 restriction drawn from the closed vocabulary below. `EffectiveCapacity` is `AccountingCapacity` intersected with `E(d)` where `E` is proved for `d`, and with `B(d)` where `B` is proved for `d`, and is still absolute. `EffectiveFit(d)` is the residual actually available to a new claim, clamped at zero.
 
-*`O` and `T` are excluded from both.* Neither an external observation nor a target participates in `AccountingFit` or `EffectiveFit`, in any dimension, under any provider.
+A claim `q` fits in a dimension exactly when `q <= EffectiveFit(d)`. A composite claim fits only when it fits in every dimension it names; headroom in one dimension never compensates for its absence in another.
 
-*Passing the test is not substrate success.* Satisfying `EffectiveFit` is an admission result. A successful `AccountingFit` admission does not guarantee allocator success, kernel success, runtime success, transport success, external-relay success, or hardware success. Where `B` is independently proved for a dimension, the assurance is exactly the `B` premise for that dimension and nothing broader. Everywhere else, and always for the substrate beneath a proved premise, allocation remains fallible: an admitted operation may still fail on the real resource.
+Three ordering and shape obligations follow, and an implementation must honour all of them:
+
+- **Subtract charges last.** `S(d)` and `R_flight(d)` are deducted only after `E` and `B` have been intersected in. `E` and `B` are absolute substrate bounds, so intersecting them against a figure from which charges were already deducted would compare a residual against an absolute and silently understate the bound.
+- **Deduct `R_flight` as well as `S`.** Without it, concurrent admissions each read the same headroom as free and both proceed.
+- **Clamp the residual at zero.** `EffectiveCapacity(d) - S(d) - R_flight(d)` can be negative when a proved premise falls below existing committed use. The clamp keeps `EffectiveFit(d)` well formed and makes the fit test refuse, rather than yielding a negative bound that arithmetic elsewhere might treat as slack.
+
+Each intersection is licensed only by its own independent proof for that exact dimension. An `E` proved for one dimension narrows no other, and a `B` proved for one dimension narrows no other.
+
+*`R_flight` is counted exactly once.* A claim is reserved only after `q(d) <= EffectiveFit(d)` holds in every dimension it names; a failure in any dimension reserves nothing in every dimension. A successful reservation adds the exact `q(d)` to aggregate `R_flight(d)` once per named dimension. Promotion transfers exactly that quantity from `R_flight` into `S`, leaving `S + R_flight` unchanged. Failure or abandonment removes exactly that reservation under the existing ownership and cleanup rules and touches no live charge or other reservation. Owner release after proven cleanup and failed-cleanup retention both leave `R_flight(d)` untouched: release reduces `S(d)` by exactly the released claim, and retention replaces a live claim with the identical retained claim, so neither disturbs a reservation in flight. A reservation is never counted in both `R_flight` and `S`, never counted twice by concurrent admission paths, and never silently dropped from both. A forgotten reservation is a capacity leak, and a double-counted reservation is a spurious refusal; both are defects.
+
+*The closed P5 vocabulary.* An explicit P5 restriction narrowing `AccountingCapacity` is exactly one of:
+
+```text
+named local isolation domain
+    an explicitly named domain confining a scope to part of the
+    dimension
+
+named partition or reserved share
+    an explicitly named division of the dimension, or a quantity
+    withheld from general admission and held for a named scope
+
+named optional local ceiling or cost boundary
+    an explicitly named upper bound below Gc, whether selected for
+    policy, appliance, deployment, or cost reasons
+```
+
+Each is explicit, named, and recorded, and each names the scope it applies to. There is no generic exclusion category: a restriction that does not fall in one of the three above is not a P5 restriction. Nothing outside this list narrows `AccountingCapacity` — no observation, target, measurement, generic owner preference, workload calibration, anticipated future demand, rate smoothing, inferred restriction, or undeclared product policy. A provider may not introduce any further narrowing of its own: no undeclared reserve, headroom, safety margin, or rounding-down that a deployment did not ask for. An undeclared narrowing is an arbitrary refusal, which P4 forbids.
+
+*Accounting-only equality is valid.* Where a provider proves neither isolation nor backing for a dimension, `EffectiveCapacity(d) = AccountingCapacity(d)` holds, and stating that equality is correct rather than a defect or an omission. It is an honest description of what an accounting-only dimension admits against. It is not a claim that the two are equivalent in strength, and it never converts accounting into containment or backing.
+
+*`O` and `T` are excluded throughout.* Neither an external observation nor a target participates in `AccountingCapacity`, `EffectiveCapacity`, or `EffectiveFit`, in any dimension, under any provider.
+
+*Passing the test is not substrate success.* Satisfying `EffectiveFit` is an admission result. A successful admission against an accounting-only dimension does not guarantee allocator success, kernel success, runtime success, transport success, external-relay success, or hardware success. Where `B` is independently proved for a dimension, the assurance is exactly the `B` premise for that dimension and nothing broader. Everywhere else, and always for the substrate beneath a proved premise, allocation remains fallible: an admitted operation may still fail on the real resource.
+
+*Premise loss narrows capacity and stays work-conserving.* When a proved `E` or `B` premise falls, `EffectiveCapacity` narrows accordingly. Within the headroom that remains above `S + R_flight`, the provider stays work-conserving: it continues to admit claims that fit the narrowed `EffectiveCapacity`, and it does not refuse work merely because a premise moved. A narrowed premise reduces what may be admitted; it does not license withholding capacity that is still genuinely free.
+
+*Typed loss is reported only below `S + R_flight`.* A typed containment-loss, backing-loss, or external-overcommitment state is reported only when the premise falls below `S + R_flight` in that dimension — that is, below what is already committed. A premise that falls but remains at or above `S + R_flight` is reduced headroom, not a loss: it narrows future admission and is reported as capacity, not as a loss condition. Reporting loss on any fall would make ordinary contraction indistinguishable from a real shortfall.
 
 *Unproved is never presented as established.* A provider never presents unproved containment or backing as established, in a result, a report, a log, or a document. An accounting-only committed grant is explicitly an accounting commitment. It is not proof that substrate capacity exists, and it is not proof that an allocation will succeed. Describing it as though it were either is a defect in the description, not a stronger provider.
 
-*The shipped `FiniteResourceProvider` is accounting-only in every dimension.* Its grant is an owner-supplied vector, and an owner-supplied vector is not host backing. It therefore proves `S <= Gc` and nothing more, and for every dimension `EffectiveFit = AccountingFit`. It claims no `B`, proves no `E`, and its admissions carry no assurance that the underlying allocation will succeed. Any report that treats its admission as evidence of available or reserved capacity is incorrect.
+*The shipped `FiniteResourceProvider` is accounting-only in every dimension.* Its grant is an owner-supplied vector, and an owner-supplied vector is not host backing. It claims no `B`, proves no `E`, and for every dimension `EffectiveCapacity = AccountingCapacity`. Its admissions carry no assurance that the underlying allocation will succeed, and any report that treats an admission as evidence of available or reserved capacity is incorrect.
 
-That is a correct provider, not a broken one — but it is **not sufficient on its own for final production resource closure**. Production closure additionally requires the independently proved `E` or `B` mappings described below for the dimensions a deployment intends to rely on. Shipping this provider alone must never be reported as having achieved resource closure.
+Being accounting-only is a coherent classification and is not itself a defect. A provider that accounts honestly and claims nothing further is correctly described, not broken, and this section must not be read as faulting it for the absence of `E` or `B` claims it never made.
+
+The shipped provider is nonetheless **nonconforming overall, because P6 fails**. That failure is stated in full in the disclosed P6 nonconformance above and is not softened here: its rotation is keyed to a mintable scope identity rather than to a FairnessRoot, subdividing a root's attribution raises that root's cumulative selections above the baseline at a decision prefix and moves a competing root's selection later, no control evaluates the comparison, and the obligation is open and must be reported as failing. Accounting-only classification does not excuse that, and the two findings are independent: the provider would still be P6-nonconforming if it proved every `E` and `B` mapping in this document.
+
+Separately, it is **not sufficient on its own for final production resource closure**. Production closure additionally requires the independently proved `E` or `B` mappings described below for the dimensions a deployment intends to rely on. Shipping this provider alone must never be reported as having achieved resource closure.
 
 *`O` is inert.* `O` is optional, is a policy input only, and carries no authority. It may be stale, wrong, adversarially influenced, in foreign units, or absent, and a deployment may have no `O` at all. No admission decision reads `O`, no refusal is justified by `O`, and no value derives from `O` automatically.
 
@@ -858,29 +893,25 @@ That is a correct provider, not a broken one — but it is **not sufficient on i
 
 *`T` requests gradual contraction.* `T` is a request, not an act. It asks `Gc` to descend toward it over time. `T` never lowers `Gc` by itself, never releases a charge, and never refuses an admission on its own authority.
 
-*`Gc` follows only after owner release lowers `S`.* `Gc` is never installed or reduced below `S`. `Gc` descends toward `T` only as owner-driven release reduces `S` enough to make each step safe, one safe step at a time. `S <= Gc` holds at every instant, without exception or window.
+*`Gc` follows only after owner release lowers committed use.* `Gc` is never installed or reduced below `S(d) + R_flight(d)`. `Gc` descends toward `T` only as owner-driven release reduces committed use enough to make each step safe, one safe step at a time. `S(d) + R_flight(d) <= Gc(d)` holds at every instant and implies `S <= Gc`, without exception or window.
 
-*Loss of `B` or `E` is a typed state, and the shortfall is real.* A provider that claimed backing and finds it gone reports typed backing loss for that dimension; a provider whose envelope no longer contains reports typed isolation loss. In both cases every charge is retained, no release is forged or inferred, conflicting admission is refused with a typed result naming the dimension, and `Gc` is still not lowered below `S`.
+*Loss of `B` or `E` is a typed state, and the shortfall is real.* A provider that claimed backing and finds it fallen below `S + R_flight` reports typed backing loss for that dimension; a provider whose envelope no longer contains what is already committed reports typed containment loss. External overcommitment is the corresponding typed classification where applicable. In every case each charge and reservation is retained, no release is forged or inferred, conflicting admission is refused with a typed result naming the dimension, and `Gc` is still not lowered below `S(d) + R_flight(d)`. A premise that falls but remains at or above `S + R_flight` is reduced capacity rather than loss, and is reported as capacity.
 
 A backing proof taken at admission is historical. It does not make physical backing exist later. When backing is lost, substrate availability may genuinely have failed, and this document must not pretend otherwise: charges remain charged and commitments remain owed, but the underlying resource may simply not be there. The typed state names that condition honestly. It must never be read, or reported, as an assurance that every charge is still physically backed.
 
-*Typed reporting requires a live, observing provider.* Every typed state above can be reported only while the process is alive and able to observe its own condition. A fail-stop outcome reports nothing. If the host kills the process — an out-of-memory kill is the ordinary case — there is no typed backing-loss or isolation-loss result, because there is no longer anything to emit it. No obligation here may be written or read as a guarantee that resource exhaustion will be observed and reported rather than simply ending the process.
+*Typed reporting requires a live, observing provider.* Every typed state above can be reported only while the process is alive and able to observe its own condition. A fail-stop outcome reports nothing. If the host kills the process — an out-of-memory kill is the ordinary case — there is no typed containment-loss, backing-loss, or external-overcommitment result, because there is no longer anything to emit it. No obligation here may be written or read as a guarantee that resource exhaustion will be observed and reported rather than simply ending the process.
 
 Process death destroys the live in-process capabilities, leases, and accounting state held in that process, and recovery follows ordinary restart semantics rather than any contract in this subsection. That boundary is exactly as wide as the process and no wider. It is not a claim that resources outside the process are released. An external relay or TURN allocation, a peer's view of a session, a file or directory on disk, a kernel object the OS does not reclaim, or any reservation held by another party may outlive the process that charged it. Whether such a resource is reclaimed is a property of that external owner, not of this contract, and no cleanup of external or substrate-owned resources may be claimed on the strength of process death alone.
 
 *Unproved backing is a residual, not an assumption.* Where an adapter cannot prove what actually backs a dimension — allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, external provider allocations — that shortfall is a named Slice C residual. It must not be silently treated as backed, and it must not be counted into `B`.
 
-*P4 fit is `EffectiveFit`.* A claim fits when it fits `EffectiveFit` in every dimension it requires, as defined above. For a dimension where neither containment nor backing is proved, that reduces to `AccountingFit`, and admission on that accounting basis alone implies nothing about physical success. The test never uses `O` and never uses `T`.
+*P4 fit is `EffectiveFit`.* A claim `q` fits when `q <= EffectiveFit(d)` in every dimension `d` it requires, as defined above. For a dimension where neither containment nor backing is proved, `EffectiveCapacity` equals `AccountingCapacity`, and admission on that accounting basis alone implies nothing about physical success. The test never uses `O` and never uses `T`.
 
 **Slice C handoff: what an `E` or `B` claim requires.** This document does not implement Slice C and states no mapping here. It records only what Slice C must deliver before any `Gc <= E` or `Gc <= B` claim may be made.
 
-Every such claim requires, for each dimension it covers, a mapping between the MyOwnMesh `ResourceClaim` quantity and the substrate quantity actually contained or reserved, and that mapping must be:
+Every such claim requires, for each dimension it covers, a mapping between the MyOwnMesh `ResourceClaim` quantity and the substrate quantity actually contained or reserved. The canonical list of what that mapping must satisfy is stated once in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) under "What proving `E` or `B` requires", and FORMAL governs it. The conditions are dimension-specific, unit-correct, monotone, coverage, composition, subject alignment, lifetime and loss, and `B` exclusivity. This document does not restate that list as a competing normative block.
 
-- **dimension-specific** — established for that exact dimension, never inherited from another dimension or from an aggregate;
-- **unit-correct** — the claimed unit and the substrate unit are the same quantity, with any conversion stated, so the comparison is meaningful rather than nominal;
-- **monotone** — a larger claimed quantity corresponds to a not-smaller substrate requirement, so fitting the claimed bound cannot understate the real one.
-
-Examples called out by the owner directive are:
+Dimensions the owner directive calls out are:
 
 ```text
 AccountedMemory
@@ -890,19 +921,29 @@ StorageBytes
 RelayOrProviderAllocation
 ```
 
-The list is illustrative, not exhaustive. Every other `ResourceClass` dimension is governed by the same rule: it needs its own mapping meeting all three conditions before it carries an `E` or `B` claim, and otherwise remains accounting-only and an explicit residual.
+The list is illustrative, not exhaustive. Every other `ResourceClass` dimension is governed by the same rule: it needs its own mapping satisfying every condition before it carries an `E` or `B` claim, and otherwise remains accounting-only and an explicit residual.
+
+The five conditions below are the ones an implementation most often gets wrong, so each is read here in implementation terms. This adds no condition and narrows none; where this reading and FORMAL differ, FORMAL is correct.
+
+- **Coverage.** The mapping accounts for every consumer of that substrate quantity, not only the charged ones. A consumer this model does not charge is included **conservatively**: its use is subtracted from the premise rather than assumed absent. In practice that means a retry, a callback, a buffer grown under load, a dependency's own allocation, and any co-tenant of the same substrate quantity must each be either charged or subtracted. A partially mapped dimension is not a mapped dimension.
+- **Composition.** No two `ResourceClass` dimensions, and no two providers, may claim the same substrate quantity. A quantity counted twice is not thereby contained twice or reserved twice. Two dimensions that both map onto the same bytes, handles, or allocations are double-claiming, and so are two providers each treating the same substrate reservation as its own; in both cases the premise is inflated by exactly the overlap.
+- **Subject alignment.** The contained or reserved subject is exactly the subject `Gc` is committed for: the same process, the same worker, and the same provider, neither broader nor narrower. A premise measured for a broader subject includes consumption that is not ours, and one measured for a narrower subject omits consumption that is.
+- **Lifetime and loss.** The mapping names when it begins, when it ends, and who observes it. Where its loss cannot be observed before a fail-stop, the charge is **retained** and the premise is **not claimed** for that unobservable interval. A substrate may withdraw backing without notice and the process may be killed before detecting it, so a mapping that assumes every loss is seen, or seen early enough to react, is unsound. The charge stays; the premise lapses for exactly the interval that could not be observed.
+- **`B` exclusivity.** Reserved capacity is exclusive to that subject. Competing unaccounted use is **conservatively deducted from `B`**, and a shared pool another party may consume from is not `B`. `B` is what remains exclusively ours after every unaccounted competing consumer is subtracted, not the nominal size of the pool we draw from. Where competing use cannot be bounded, no conservative deduction exists, `B` is not established, and the dimension remains accounting-only.
+
+A mapping that fails any condition is not a weaker mapping; it is not a mapping, and the dimension remains accounting-only.
 
 Where no such mapping exists for a dimension, that dimension stays accounting-only and is carried as an explicit residual.
 
 `OpaqueDependencyResidual` is the case to watch, because it is the dimension most likely to be mistaken for a satisfied one. Assigning it a number is not sufficient: being counted, measured, or reported does not make it contained or reserved, since a quantity is neither a containment proof nor a reservation. Absent a mapping meeting the three conditions above — one that names what a single unit of it means and proves dimension-specific, unit-correct monotonicity against the substrate quantity — it remains accounting-only and an explicit residual, carries no `E` or `B` claim, and is never absorbed silently into an aggregate claim. If such a mapping is later supplied, or the dimension is replaced by one that admits it, it becomes eligible on exactly the same terms as any other dimension; nothing here forecloses that.
 
-Until Slice C supplies a mapping meeting all three conditions for a dimension, that dimension carries no `E` or `B` claim, `EffectiveFit` there equals `AccountingFit`, and any report must say so.
+Until Slice C supplies a mapping satisfying every condition in FORMAL's canonical list for a dimension, that dimension carries no `E` or `B` claim, `EffectiveCapacity` there equals `AccountingCapacity`, and any report must say so.
 
 Contraction releases, revokes, invalidates, and reuses nothing. It never forges a release and never admits a conflicting claim to make room. It may request retirement only from the exact owners whose lease contract declares those leases reclaimable, and such a request releases nothing. It applies only to admission decisions taken after it.
 
-`S > Gc` is not a reachable state and must never be described as one. P1 is not suspended, relaxed, deferred, or evaluated against a historical grant during contraction; conservation holds continuously throughout. Any wording suggesting a window in which charges exceed the committed grant is incorrect and must be corrected rather than explained. Contraction is never a reclamation mechanism.
+`S(d) + R_flight(d) > Gc(d)` is not a reachable state and must never be described as one, and `S > Gc` follows as the weaker consequence. P1 is not suspended, relaxed, deferred, or evaluated against a historical grant during contraction; conservation holds continuously throughout. Any wording suggesting a window in which committed use exceeds the committed grant is incorrect and must be corrected rather than explained. Contraction is never a reclamation mechanism, and it never strands an in-flight reservation.
 
-A contraction is not an instantaneous probe of current use, and the two must never be substituted for each other. A probe reports `S` at an instant and changes nothing; a contraction lowers `Gc`, subject to `S <= Gc`, and changes the admission ceiling going forward. A typed backing-loss or external-overcommit report is caused by `B` falling, not by the contraction itself, and it never indicates that `Gc` fell below `S`. Reporting a probe as a contraction would let a transient measurement appear to authorize a permanent ceiling change; reporting a contraction as a probe would let a ceiling change appear to be a mere observation.
+A contraction is not an instantaneous probe of current use, and the two must never be substituted for each other. A probe reports committed use `S + R_flight` at an instant and changes nothing; a contraction lowers `Gc`, subject to the floor `S(d) + R_flight(d) <= Gc(d)`, and changes the admission ceiling going forward. A typed containment-loss, backing-loss, or external-overcommitment report is caused by a premise falling below committed use, not by the contraction itself, and it never indicates that `Gc` fell below `S(d) + R_flight(d)`. Reporting a probe as a contraction would let a transient measurement appear to authorize a permanent ceiling change; reporting a contraction as a probe would let a ceiling change appear to be a mere observation.
 
 *Status of these obligations in the shipped provider.* The shipped provider is accounting-only. It takes its grant at construction as an owner-supplied vector, exposes no contraction entry point, models no external observation `O`, selects no target `T`, enforces no envelope `E`, and proves no backing `B`. It therefore exercises none of the obligations in this subsection: there is no target selection to record, no gradual descent of `Gc` to control, no envelope containment to enforce, and no backing claim at admission. Every clause above constrains work that has not been built. None may be reported as a satisfied property, the absence of a contraction path is not evidence that contraction is safe, and an admission by this provider is evidence of bookkeeping only — never that the underlying allocation will succeed.
 
@@ -1166,25 +1207,36 @@ A release must pass at least the following groups.
 - an immediate nonwaiting acquisition returns typed pressure only for a claim that does not fit in some required dimension, and a fitting claim is refused only under a stated structural limit, an explicit isolation or optional ceiling policy, or accounting that is unavailable, poisoned, or unprovable-safe;
 - no immediate path withholds a fitting claim to reserve capacity for anticipated demand, to smooth a rate, or to enforce an undeclared share;
 - determinism is exercised only across identical already-issued `ResourceScopeId` values, identical state, and the same ordered operations, and no control assumes cross-run identifier stability;
-- `Gc` is never installed or reduced below `S`, so `S <= Gc` holds continuously and no control may exhibit or describe `S > Gc`;
+- `Gc` is never installed or reduced below `S(d) + R_flight(d)`, so the stronger invariant holds continuously, implies `S <= Gc`, and no control may exhibit or describe `S > Gc` or strand an in-flight reservation;
 - an external observation `O` is inert and optional: a policy input only, never read by an admission decision, never used as a limit, never justifying a refusal, and never producing any value automatically;
 - `T` is an explicit named owner-policy target that an owner may set directly with no observation involved, or derive through a named policy consulting `O`; no path from `O` to `T` is mandatory, no control requires one, and a change in `O` never changes `T` by itself;
 - `T` never lowers `Gc`, releases a charge, or refuses an admission by itself;
-- `Gc` descends toward `T` only as owner-driven release lowers `S`, one safe step at a time;
+- `Gc` descends toward `T` only as owner-driven release lowers committed use `S + R_flight`, one safe step at a time;
 - a provider that claims backing for a dimension proves `Gc <= B` in that dimension at admission; a provider making no backing claim is not required to, and the unproved case is reported as a Slice C residual rather than assumed;
-- `B < Gc` reports typed backing loss and `B < S` reports typed external overcommitment; in both, every charge is retained, no release is forged or inferred, conflicting admission is refused with a typed dimension-naming result, and `Gc` is still not lowered below `S`;
+- typed containment loss, backing loss, or external overcommitment is reported only where the premise falls below `S + R_flight`; in every case all charges and reservations are retained, no release is forged or inferred, conflicting admission is refused with a typed dimension-naming result, and `Gc` is still not lowered below `S + R_flight`;
 - no control or document treats an admission-time backing proof as evidence that physical backing still exists later, and none asserts that every charge remains backed once `B` has fallen;
 - capacity an adapter cannot prove is backed is a named Slice C residual and is never counted into `B`;
-- P4 fit is `EffectiveFit`: `AccountingFit` — the committed accounting grant remaining after `S` and after explicit P5 isolation or optional local policy — intersected with `E` only where `E` is proved and with `B` only where `B` is proved, per dimension and independently; where neither is proved `EffectiveFit` equals `AccountingFit`, and that equality is valid;
-- `O` and `T` never participate in `AccountingFit` or `EffectiveFit`, in any dimension, under any provider;
+- `AccountingCapacity` and `EffectiveCapacity` are absolute capacities, not remainders: `AccountingCapacity` is `Gc` narrowed only by an explicit restriction from the closed P5 vocabulary, and `EffectiveCapacity` narrows it by `E` only where `E` is proved and by `B` only where `B` is proved, per dimension and independently; where neither is proved the two are equal, and that equality is valid;
+- `EffectiveFit` is what `EffectiveCapacity` leaves once `S` and `R_flight` are accounted, and admission requires `q <= EffectiveFit` in every dimension the claim touches;
+- `S` and aggregate `R_flight` are distinct; reservation occurs only after the claim fits every named dimension and is all-or-nothing, promotion transfers the exact quantity from `R_flight` to `S`, and failure or abandonment removes only its own reservation, so the reservation is counted exactly once, never held in both, never double-counted, and never silently dropped;
+- the only narrowings of `AccountingCapacity` are explicit P5 restrictions drawn from the closed three-category vocabulary — named local isolation domain, named partition or reserved share, named optional local ceiling or cost boundary — each naming its scope, with no generic exclusion category and no undeclared reserve, headroom, safety margin, or rounding-down;
+- `S` and `R_flight` are subtracted only after `E` and `B` are intersected in, and the residual is clamped at zero so a fallen premise refuses rather than presenting a negative bound as slack;
+- a composite claim fits only when it fits in every dimension it names; headroom in one dimension never compensates for its absence in another;
+- on loss of a proved `E` or `B` premise the provider narrows `EffectiveCapacity` and remains work-conserving in the headroom above `S + R_flight`, continuing to admit claims that fit;
+- typed containment-loss, backing-loss, or external-overcommitment is reported only where the premise falls below `S + R_flight`; a premise that falls but stays at or above `S + R_flight` is reported as reduced capacity, not as loss;
+- `O` and `T` never participate in `AccountingCapacity`, `EffectiveCapacity`, or `EffectiveFit`, in any dimension, under any provider;
 - isolation and backing are orthogonal per-dimension capabilities, not exclusive and not a hierarchy: each is licensed only by its own exact proof, neither implies or requires the other, and a dimension with no claim is accounting-only and reported as a Slice C residual;
 - `E` is never reported as, or substituted for, `B`, and containment is never presented as availability;
 - the shipped `FiniteResourceProvider` is reported as accounting-only in every dimension, because its owner-supplied grant vector is not host backing, and is never reported as sufficient on its own for final production resource closure;
 - no provider presents unproved containment or backing as established; an accounting-only committed grant is described as an accounting commitment, never as proof that substrate capacity exists or that an allocation will succeed;
-- a successful `AccountingFit` admission is never reported as guaranteeing allocator, kernel, runtime, transport, external-relay, or hardware success;
+- a successful admission against an accounting-only dimension is never reported as guaranteeing allocator, kernel, runtime, transport, external-relay, or hardware success;
+- accounting-only classification is reported as coherent and not itself a defect, while the shipped provider is reported as nonconforming overall because P6 fails, the two findings being independent;
+- every `E` or `B` mapping additionally discharges coverage, composition, subject alignment, lifetime and loss, and `B` exclusivity; a mapping failing any of these is treated as no mapping at all;
+- no mapping assumes premise loss is observable in time; undetectable withdrawal followed by fail-stop is treated as the expected worst case;
+- every unaccounted competing consumer of the same underlying resource is deducted from `B`, and where competing use cannot be bounded `B` is not established and the dimension remains accounting-only;
 - every `Gc <= E` or `Gc <= B` claim rests on a dimension-specific, unit-correct, monotone mapping between the `ResourceClaim` quantity and the substrate quantity contained or reserved; absent that mapping the dimension stays accounting-only and is carried as an explicit residual;
-- `OpaqueDependencyResidual` carries no `E` or `B` claim and is never absorbed into an aggregate one absent a mapping meeting the three conditions — naming what a single unit of it means and proving dimension-specific, unit-correct monotonicity; assigning it a number is not sufficient, since being counted or measured does not make it contained or reserved;
-- no typed backing-loss or isolation-loss result is claimed for a fail-stop outcome; process death destroys live in-process capabilities, leases, and accounting state and is handled by ordinary restart semantics, not by this contract;
+- `OpaqueDependencyResidual` carries no `E` or `B` claim and is never absorbed into an aggregate one absent a mapping satisfying every condition in FORMAL's canonical list, including naming what a single unit of it means; assigning it a number is not sufficient, since being counted or measured does not make it contained or reserved;
+- no typed containment-loss, backing-loss, or external-overcommitment result is claimed for a fail-stop outcome; process death destroys live in-process capabilities, leases, and accounting state and is handled by ordinary restart semantics, not by this contract;
 - no cleanup of external or substrate-owned resources is claimed on the strength of process death; relay and TURN allocations, peer-held session state, on-disk artifacts, and kernel objects the OS does not reclaim may outlive the process that charged them;
 - grant contraction is never exercised as, or substituted for, an instantaneous use probe;
 - pressure and refusal never become an authorization result in either direction;

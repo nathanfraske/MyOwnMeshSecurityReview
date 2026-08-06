@@ -711,45 +711,91 @@ Gc   committed grant: an accounting commitment against which every
      will succeed
 
 S    charged sum: live claims plus failed-cleanup-retained claims
+
+R_flight(d)
+     in-flight admission reservation in dimension d: the aggregate
+     exact capacity reserved for all admissions currently in flight,
+     and zero when none is in flight. This is a distinct symbol from
+     the global `R`
+     used elsewhere in this section for the multiset of live and
+     failed-cleanup-retained lease claims; the two are never
+     interchanged
 ```
 
 The rules relating them are:
 
 ```text
 S <= Gc always
-Gc moves toward T downward only after owner release has lowered S;
-    Gc is never set below S
+Gc moves toward T downward only after owner release has lowered
+    committed use; Gc is never set below S(d) + R_flight(d), so
+    contraction never strands a reservation held for an admission in
+    flight
 a provider that claims isolation proves Gc <= E
 a provider that claims backing proves Gc <= B at the moment of
     admission
 P4 fit is EffectiveFit, defined below; O and T are never inputs to it
 ```
 
-**Admission fit.** Fit is computed in two named steps, per resource dimension.
+Capacity is stated absolutely and reduced to a residual only at the end.
+
+**Capacity and fit.** Both capacities are absolute. Only the final step produces a residual, and every quantity is per resource dimension.
 
 ```text
-AccountingFit
-    the remaining committed accounting grant in a dimension: Gc, after
-    subtracting the live and failed-cleanup-retained charge S, and
-    after applying any explicit P5 isolation or optional local policy
+AccountingCapacity
+    the absolute committed grant Gc in that dimension, narrowed only by
+    an explicit P5 restriction drawn from the closed vocabulary below.
+    It is a capacity, not a residual: no charge has been subtracted
+    from it
 
-EffectiveFit
-    AccountingFit, intersected with E in each dimension where E is
-    proved, and intersected with B in each dimension where B is proved
+EffectiveCapacity
+    AccountingCapacity, intersected with E in that dimension where E is
+    proved, and with B in that dimension where B is proved. Still
+    absolute
+
+EffectiveFit(d)
+    max(0, EffectiveCapacity(d) - S(d) - R_flight(d))
+    the residual actually available to a new claim in dimension d
 ```
 
-The two intersections are independent, and each applies only where its premise is proved in that dimension:
+A claim `q` fits in a dimension exactly when `q <= EffectiveFit` in that dimension. A composite claim fits only when it fits in every dimension it names; headroom in one dimension never compensates for its absence in another.
+
+The intersections are independent, and each applies only where its premise is proved in that dimension:
 
 ```text
-neither proved     EffectiveFit = AccountingFit
-E proved only      EffectiveFit = AccountingFit intersect E
-B proved only      EffectiveFit = AccountingFit intersect B
-both proved        EffectiveFit = AccountingFit intersect E intersect B
+neither proved   EffectiveCapacity = AccountingCapacity
+E proved only    EffectiveCapacity = AccountingCapacity intersect E
+B proved only    EffectiveCapacity = AccountingCapacity intersect B
+both proved      EffectiveCapacity = AccountingCapacity
+                                     intersect E intersect B
 ```
 
-`O` and `T` never participate in either step. An observation is not a bound, and a contraction target is not a bound; admitting against either would admit against a quantity no one committed.
+Subtracting `S(d)` and `R_flight(d)` last is deliberate. `E` and `B` are absolute substrate bounds, so intersecting them with a figure from which charges had already been deducted would compare a residual against an absolute and silently understate the bound.
 
-Admission remains fallible in every case. A successful `AccountingFit` admission does not guarantee that the allocator, kernel, runtime, transport, external relay, or hardware will succeed. Where `E` or `B` is proved, `EffectiveFit` narrows the domain further, but narrowing an accounting result does not convert it into a guarantee of execution.
+`R_flight(d)` is subtracted so that concurrent admissions cannot each read the same headroom as free. It aggregates the exact capacity reserved for every admission currently in flight, so a second admission sees the first one's reservation already deducted, and is zero when none is in flight.
+
+The `max(0, ...)` clamp is not cosmetic. `EffectiveCapacity(d) - S(d) - R_flight(d)` can be negative when a proved premise falls below existing committed use. The clamp keeps `EffectiveFit(d)` a well-formed residual and makes the fit test refuse, rather than yielding a negative bound that arithmetic elsewhere might treat as slack.
+
+`O` and `T` participate nowhere in this computation. An observation is not a bound, and a contraction target is not a bound; admitting against either would admit against a quantity no one committed.
+
+Admission remains fallible in every case. A successful fit does not guarantee that the allocator, kernel, runtime, transport, external relay, or hardware will succeed. Narrowing capacity by a proved premise does not convert an accounting result into a guarantee of execution.
+
+**The closed P5 vocabulary.** An explicit P5 restriction narrowing `AccountingCapacity` is exactly one of:
+
+```text
+named local isolation domain
+    an explicitly named domain confining a scope to part of the
+    dimension
+
+named partition or reserved share
+    an explicitly named division of the dimension, or a quantity
+    withheld from general admission and held for a named scope
+
+named optional local ceiling or cost boundary
+    an explicitly named upper bound below Gc, whether selected for
+    policy, appliance, deployment, or cost reasons
+```
+
+Each is explicit, named, and recorded. Nothing outside this list narrows `AccountingCapacity`: no observation, target, measurement, generic owner preference, workload calibration, anticipated future demand, rate smoothing, inferred restriction, or undeclared product policy. An undeclared narrowing is an arbitrary refusal, which P4 forbids.
 
 **Provider labels.** `E` and `B` are distinct and orthogonal premises. Containment does not imply reservation, and reservation does not imply containment. The labels below name which premises a provider has proved. They are not a ladder, and a provider need not fit exactly one of them.
 
@@ -784,27 +830,88 @@ unit-correct         relating the charged unit to the substrate unit
                      without silent conversion or reinterpretation
 monotone             a larger charged quantity never maps to a smaller
                      substrate quantity
+coverage             the mapping accounts for every consumer of that
+                     substrate quantity, not only the charged ones. A
+                     consumer this model does not charge is included
+                     conservatively, by subtracting its use from the
+                     premise rather than assuming it absent. A
+                     partially mapped dimension is not a mapped
+                     dimension
+composition          no two ResourceClass dimensions, and no two
+                     providers, may claim the same substrate quantity.
+                     A quantity counted twice is not thereby contained
+                     twice or reserved twice
+subject alignment    the contained or reserved subject is exactly the
+                     subject Gc is committed for: the same process,
+                     worker, and provider, neither broader nor narrower
+lifetime and loss    the mapping names when it begins, when it ends,
+                     and who observes it. Where its loss cannot be
+                     observed before a fail-stop, the charge is
+                     retained and the premise is not claimed for that
+                     unobservable interval
+B exclusivity        reserved capacity is exclusive to that subject.
+                     Competing unaccounted use is deducted from B, and
+                     a shared pool another party may consume from is
+                     not B
 ```
 
 Where no such mapping exists for a dimension, that dimension remains accounting-only, or an explicit named residual, and no `E` or `B` claim may be made for it. An `OpaqueDependencyResidual` does not become `E` or `B` by being given a number: a quantity that is merely recorded is neither contained nor reserved. Establishing these mappings for a real substrate is an obligation discharged outside this document.
 
 Accounting-only is a coherent provider label, and a provider bearing it can satisfy the accounting model and theorems of this section. That is a claim about this model alone. It is not a claim that such a provider satisfies P1 through P8, or P6, which are established separately and are not discharged by bearing this label. Accounting alone is in any case not sufficient for final production closure, which additionally requires the containment or reservation premises that accounting does not supply.
 
-**Claim.** `S <= Gc` is invariant across every transition, including arbitrary change in `O`, `T`, `E`, or `B`. No change in observation, target, envelope, or backing releases, reduces, or reattributes any claim.
+**Claim.** `S(d) + R_flight(d) <= Gc(d)` is invariant in every dimension `d`, across every transition, including arbitrary change in `O`, `T`, `E`, or `B`. Since `R_flight(d) >= 0`, this implies `S <= Gc`. No change in observation, target, envelope, or backing releases, reduces, or reattributes any claim or any reservation.
 
 #### Proof
 
-Initially `S <= Gc`, since every admitted claim was checked against `Gc`. Consider each transition.
+Initially `S(d) + R_flight(d) <= Gc(d)` in every dimension, with `R_flight(d)` zero. Consider each transition.
 
-Admission grants `q` only when `S + q <= Gc`, and, where the provider claims backing, only when `Gc <= B` at that moment; both checks precede the charge, so admission preserves the invariant. Owner release after proven cleanup reduces `S` by exactly the released claim and leaves `Gc` unchanged. Failed-cleanup retention replaces a live claim with the identical retained claim, leaving `S` unchanged. Raising `Gc` preserves the invariant trivially. Lowering `Gc` is permitted only to some `Gc'` with `S <= Gc'`, so it preserves the invariant by construction.
+**Reservation.** A claim `q` is reserved only after `q(d) <= EffectiveFit(d)` holds in every dimension `q` names. Where the provider claims containment or backing, `EffectiveCapacity(d)` already incorporates `E` or `B`, so those premises are enforced by the same test rather than by a separate check. Reservation then adds `q(d)` to the aggregate `R_flight(d)` exactly once, in each dimension `q` names. Since
 
-A change in `O` changes no member of `R`, no `Gc`, no `T`, no `E`, and no `B`: it is inert by definition, so the invariant is untouched. A change in `T` changes no member of `R` and does not itself move `Gc`; it records an owner-selected contraction target that `Gc` may approach later, and downward only as owner release lowers `S`. A fall in `E` changes no member of `R` and no `Gc`; it narrows what the process is permitted to consume. A fall in `B` changes no member of `R` and no `Gc`; it reduces what is actually reserved. Neither `E` nor `B` is a charge, so neither can alter one.
+```text
+q(d) <= EffectiveFit(d)
+      = max(0, EffectiveCapacity(d) - S(d) - R_flight(d))
+      <= Gc(d) - S(d) - R_flight(d)
+```
 
-Every transition preserves `S <= Gc`, so by induction it holds in every reachable state.
+because `EffectiveCapacity(d) <= AccountingCapacity(d) <= Gc(d)` and the induction hypothesis makes `Gc(d) - S(d) - R_flight(d)` non-negative. The resulting `S(d) + R_flight(d) + q(d)` therefore does not exceed `Gc(d)`, so the invariant is preserved. A claim failing the test in any dimension it names is reserved in no dimension and adds nothing anywhere.
 
-**Why the excluded state is excluded.** Setting `Gc` below `S` would require either releasing claims the provider does not own, contradicting P2 and Theorem 14.5c, or leaving a charge unattributed, contradicting P1 and Theorem 14.1. The rule that `Gc` is never set below `S` forbids both.
+**Promotion.** When an in-flight admission succeeds, exactly `q(d)` moves from `R_flight(d)` to `S(d)`: `R_flight(d)` decreases by exactly `q(d)` and `S(d)` increases by exactly `q(d)`. Committed use `S(d) + R_flight(d)` is therefore unchanged, and the invariant is preserved with no re-check required. Promotion moves a quantity between two accounts; it does not create one.
 
-**Backing and isolation loss.** When `B < Gc` or `B < S` for a provider claiming backing, or `E < Gc` for a provider claiming isolation, the provider reports a typed backing-loss or isolation-loss result. Accounting remains conservative throughout: every charge stays charged and exactly attributed, `Gc` is not lowered below `S`, nothing is written off, and no release is inferred or forced. New work that would conflict with the shortfall is refused with typed pressure or unavailability. The provider may request retirement only from exact owners whose contracts declare their leases reclaimable, and it releases nothing itself. Above all it does not pretend the capacity exists: no part of the shortfall is reported as available.
+**Failure or abandonment.** When an in-flight admission does not complete, exactly the reserved `q(d)` is released from `R_flight(d)`, and nothing else is touched. Release follows the ownership and cleanup rules already stated: the reservation's own owner releases it, no live claim in `S` is affected, and no other reservation is disturbed. Committed use decreases by exactly `q(d)`, so the invariant is preserved.
+
+**Owner release.** Release after proven cleanup reduces `S(d)` by exactly the released claim and leaves `Gc(d)` and `R_flight(d)` unchanged.
+
+**Failed-cleanup retention.** Replaces a live claim with the identical retained claim, leaving `S(d)` and `R_flight(d)` unchanged.
+
+**Raising `Gc`.** Preserves the invariant trivially.
+
+**Lowering `Gc`.** Permitted only to some `Gc'(d)` with `S(d) + R_flight(d) <= Gc'(d)`, so it preserves the invariant by construction, leaves every in-flight reservation covered, and cannot strand one.
+
+**Observation, target, envelope, backing.** A change in `O` changes no member of `R`, no `S`, no `R_flight`, no `Gc`, no `T`, no `E`, and no `B`: it is inert by definition. A change in `T` changes no member of `R`, no `S`, no `R_flight`, and does not itself move `Gc`; it records an owner-selected contraction target that `Gc` may approach later, and downward only as owner release lowers committed use. A fall in `E` narrows what the process is permitted to consume, and a fall in `B` reduces what is actually reserved by the substrate; neither changes `S`, `R_flight`, or `Gc`, because neither is a charge or a reservation in this model. External premise loss is treated separately below and is not an accounting transition.
+
+Every transition preserves `S(d) + R_flight(d) <= Gc(d)`, so by induction it holds in every reachable state, and `S <= Gc` follows.
+
+**Why the excluded state is excluded.** Setting `Gc` below `S` would require either releasing claims the provider does not own, contradicting P2 and Theorem 14.5c, or leaving a charge unattributed, contradicting P1 and Theorem 14.1. The contraction floor forbids both, and forbids more: `Gc` is never set below `S(d) + R_flight(d)`, which is at or above `S(d)`, so an in-flight reservation cannot be stranded either.
+
+**Premise loss.** A proved premise may fall. What follows depends on where it falls relative to committed use, and the model distinguishes two regimes per dimension.
+
+```text
+premise >= S(d) + R_flight(d)
+    residual headroom remains, and it is usable. EffectiveFit(d) is
+    recomputed against the reduced premise and stays non-negative, so
+    ordinary admission continues within it. This condition alone
+    requires no loss report
+
+premise < S(d) + R_flight(d)
+    the premise is now below committed use. The provider reports a
+    typed containment-loss, backing-loss, or external-overcommitment
+    result, and admits no new work that would conflict with the
+    shortfall in that dimension
+```
+
+In both regimes every charge in `S(d)` and every reservation in `R_flight(d)` is retained. Nothing is released, revoked, reduced, or written off, and no release is inferred or forced: a premise falling is not a release, and `Gc` is not lowered below `S(d) + R_flight(d)`. The provider may request retirement only from exact owners whose contracts declare their leases reclaimable, and it releases nothing itself. Above all it does not pretend the capacity exists, and no part of a shortfall is reported as available.
+
+The first regime matters as much as the second. A premise that falls but still covers committed use has not created a shortfall, and treating every fall as an emergency would refuse work the provider can honor while reporting a loss that has not occurred.
 
 **What reporting can and cannot cover.** Reporting is required exactly while the process is alive and the condition is observable to it. Those two qualifications are not evasions; they mark the boundary of what any in-process report can claim.
 
@@ -812,7 +919,7 @@ A fail-stop event is outside that boundary. If the substrate terminates the proc
 
 Backing loss also has a consequence the accounting cannot repair. Substrate availability may fail: work already admitted against a grant that is no longer reserved may fail in execution even though its claim remains correctly charged. This model does not promise otherwise. Conservative accounting guarantees that charges remain exactly attributed to the accounting commitment; it does not turn that commitment into a physical guarantee or promise that the substrate will supply it. That is the exact sense in which arbitrary capacity loss preserves conservative accounting and not physical backing.
 
-**`O` is never a grant.** An observation is not `T`, not `E`, not `B`, and not `Gc`, and it sets none of them. A named owner policy may consider `O` among its inputs when choosing `T`, but nothing is set automatically because `O` changed, and no path from `O` to `T` is required to exist: a provider with no observation at all is complete, and `T` may be set directly. P4 fit is `EffectiveFit` exactly as defined above: begin with `AccountingFit`, after subtracting `S` from `Gc` and applying explicit P5 isolation or optional local policy, then intersect with `E` only where `E` is proved and with `B` only where `B` is proved. Neither `O` nor `T` participates. A measurement showing apparent headroom is not evidence that a claim fits.
+**`O` is never a grant.** An observation is not `T`, not `E`, not `B`, and not `Gc`, and it sets none of them. A named owner policy may consider `O` among its inputs when choosing `T`, but nothing is set automatically because `O` changed, and no path from `O` to `T` is required to exist: a provider with no observation at all is complete, and `T` may be set directly. P4 fit is `EffectiveFit(d)` exactly as defined above, and is not restated here. Neither `O` nor `T` participates in it at any step. A measurement showing apparent headroom is not evidence that a claim fits.
 
 **Safety, not liveness.** Nothing here bounds how long `Gc` remains above `T`, above `E`, or above `B`. `Gc` follows `S` downward only as owners release, and no timer, notification, or external pressure compels an owner to release. If owners never release, `Gc` never reaches `T`. This is consistent with Theorems 14.5b and 14.5c and adds no progress claim. A deployment that must be able to honor a fall in `E` or `B` immediately reserves or isolates in advance under Theorem 14.6; it cannot obtain that guarantee afterwards by revoking. Every result of observation, target change, envelope loss, or backing loss is a typed resource event and never an authorization result.
 

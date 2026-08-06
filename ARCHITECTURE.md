@@ -321,9 +321,9 @@ A conforming provider satisfies P1 through P8. Whether any particular provider d
 
 **The committed grant is an accounting commitment.** It is not proof that substrate capacity exists, and not a promise that an allocation will succeed. Containment and reservation are separate premises, each proved per resource dimension, and a provider never presents unproved containment or backing as established. An accounting-only commitment is a coherent basis for admission, and it is not by itself sufficient for final production closure.
 
-**Grant change never forges a release.** The committed grant is not required to be constant. A provider may raise it, and may lower it, but never below the charges already held, and no grant change ever releases, revokes, reduces, or reattributes a live claim. Only the exact owner releases, after its own cleanup, exactly as P2 requires. A provider may request retirement from an owner whose contract declares that lease reclaimable; the request is sticky, carries no timer, and alters no claim. A measurement never becomes a grant by being taken. The exact treatment of observation, target, containment, backing, committed grant, charged sum, and admission fit is in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md).
+**Grant change never forges a release.** The committed grant is not required to be constant. A provider may raise it, and may lower it, but never below committed use, which includes both the charges already held and any reservation held for an admission in flight. No grant change ever releases, revokes, reduces, or reattributes a live claim or a reservation. Only the exact owner releases, after its own cleanup, exactly as P2 requires. A provider may request retirement from an owner whose contract declares that lease reclaimable; the request is sticky, carries no timer, and alters no claim. A measurement never becomes a grant by being taken. The exact treatment of observation, target, containment, backing, committed grant, charged sum, in-flight reservation, capacity, and admission fit is in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md).
 
-No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. Optional local policy may impose stricter cardinality or isolation ceilings for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
+No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. An explicit named P5 local isolation domain, partition or reserved share, or optional local ceiling or cost boundary may impose stricter restrictions for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
 
 Resource limits have four distinct sources:
 
@@ -341,7 +341,7 @@ Optional local policy ceiling
     explicit administrator, cost, isolation, or compatibility restriction
 ```
 
-One category cannot be presented as another. Measurements characterize cost and help select optional local policy. They do not establish a universal peer, Mesh, attempt, session, or flow count.
+One category cannot be presented as another. Measurements characterize cost and may inform selection of an explicit named P5 restriction; they do not themselves narrow accounting capacity. They do not establish a universal peer, Mesh, attempt, session, or flow count.
 
 An exact lease is exact only for the resource units named by its claim. Native WebRTC, allocator, runtime, kernel, driver, and external relay state that the adapter cannot count remains an explicit residual. A conforming implementation must conservatively claim, isolate, or report that residual. It must not describe a visible Rust allocation or a connector-count proxy as complete native or OS accounting.
 
