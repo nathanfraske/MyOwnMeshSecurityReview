@@ -1219,6 +1219,10 @@ pub enum ResourceAdmission {
 }
 
 /// Move-only ownership of one scope's bounded pending admission demand.
+///
+/// In test builds this exposes the provider-side demand key, so a control can
+/// bind its own logical demand id at issue time instead of reconstructing an
+/// association afterwards from scope and ordering.
 #[must_use = "dropping the demand cancels its fairness turn"]
 pub struct ResourceAcquireDemand {
     provider: Arc<dyn ResourceProvider>,
@@ -1246,6 +1250,16 @@ impl fmt::Debug for ResourceAcquireDemand {
 impl ResourceAcquireDemand {
     pub fn scope_id(&self) -> ResourceScopeId {
         self.scope.id()
+    }
+
+    /// The provider-side identity of this demand, stable for its lifetime.
+    ///
+    /// Test-only, and deliberately not part of the public surface: it exists so
+    /// a control can bind a logical demand id at issue time. It conveys no
+    /// authority and names no fairness root.
+    #[cfg(test)]
+    pub(crate) fn demand_key_for_test(&self) -> usize {
+        Arc::as_ptr(&self.identity.signal) as usize
     }
 
     pub const fn authority(&self) -> ResourceAuthorityClass {
@@ -1426,6 +1440,105 @@ mod finite {
         scope: ScopeOrder,
     }
 
+    /// One cooperative-admission disposition, recorded in the order it happened.
+    ///
+    /// **Scope, stated exactly.** This is the complete ordered trace of
+    /// *cooperative admission* dispositions on the non-failing path: the
+    /// outcomes reachable through `acquire_cooperatively` and
+    /// `create_scope_and_acquire_cooperatively`, the arbitration that resolves
+    /// the demands they create, and **owner** cancellation through
+    /// `cancel_demand`. Within that scope it is complete — acceptance,
+    /// same-root refusal, immediate grant, arbitration grant, terminal
+    /// pressure, and owner cancellation all appear, so a control cannot be
+    /// blind to immediate admission or to refusals and terminal outcomes the
+    /// way a selection-only log is.
+    ///
+    /// It is deliberately **not** a global provider trace, and two cancellation
+    /// paths are specifically outside it:
+    ///
+    /// - fail-closed invariant cancellation inside `arbitrate`, where an
+    ///   impossible arithmetic or commit failure resolves the demand
+    ///   `Cancelled` and poisons the provider;
+    /// - teardown cancellation in `release_scope`, where retiring a scope
+    ///   cancels any demand it still owns.
+    ///
+    /// Both set the demand's outcome without appending here. That is
+    /// deliberate: neither is part of the controlled Construction A execution,
+    /// and a poisoned or torn-down provider is not producing a trace anyone
+    /// should reason about. It also does not record non-cooperative admission
+    /// through `acquire` or `acquire_reclaimable_now`, scope creation or
+    /// release, reclaim requests, or pre-admission validation failures such as
+    /// an unknown scope, a mismatched reclaim target, a poisoned domain, or a
+    /// claim that can never fit.
+    ///
+    /// Stating this narrowly is the point: claiming completeness over paths the
+    /// trace does not record would replace the selection-only overclaim with a
+    /// broader one.
+    ///
+    /// `requested` is the demand's **exact claim by dimension**, as the
+    /// provider recorded it. `charged` is the internal reservation and
+    /// bookkeeping charge. The two are deliberately distinct: FORMAL 14.5e
+    /// defines `cum_admitted` over the demand's exact claim, so a P6 oracle
+    /// accumulates `requested`. `charged` is diagnostic only and must never be
+    /// accumulated in its place, or the comparison would be inflated by
+    /// internal bookkeeping the model does not define.
+    ///
+    /// `demand_key` is the provider-side identity of the demand, taken at the
+    /// moment the demand is created, so a control binds its own logical id to
+    /// it at issue time rather than reconstructing an association afterwards
+    /// from scope and ordering.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ProviderDecision {
+        /// A demand was accepted as this scope's pending turn.
+        PendingAccepted {
+            scope_id: ResourceScopeId,
+            demand_key: usize,
+            requested: ResourceClaim,
+        },
+        /// A cooperative request was refused because its root already holds a
+        /// turn. `holder` is the exact scope owning that turn.
+        PendingRefused {
+            scope_id: ResourceScopeId,
+            holder: ResourceScopeId,
+            requested: ResourceClaim,
+        },
+        /// A claim fit immediately and was admitted without arbitration.
+        ImmediateGrant {
+            scope_id: ResourceScopeId,
+            requested: ResourceClaim,
+            charged: ResourceClaim,
+        },
+        /// Arbitration selected this demand and granted it.
+        ArbitrationGrant {
+            scope_id: ResourceScopeId,
+            demand_key: usize,
+            requested: ResourceClaim,
+            charged: ResourceClaim,
+        },
+        /// Arbitration resolved this demand to typed pressure.
+        TerminalPressure {
+            scope_id: ResourceScopeId,
+            demand_key: usize,
+            dimension: ResourceClass,
+        },
+        /// The demand's owner cancelled it through `cancel_demand`.
+        ///
+        /// Owner cancellation only. Fail-closed invariant cancellation inside
+        /// `arbitrate` and teardown cancellation in `release_scope` also resolve
+        /// a demand `Cancelled`, but neither is recorded here.
+        Cancelled {
+            scope_id: ResourceScopeId,
+            demand_key: usize,
+        },
+    }
+
+    /// Provider-side identity of one demand, stable for its lifetime.
+    #[cfg(test)]
+    pub(crate) fn demand_key_of(identity: &ResourceDemandIdentity) -> usize {
+        Arc::as_ptr(&identity.signal) as usize
+    }
+
     /// An exactly comparable view of every mutation surface relevant to a
     /// refusal. Deliberately excludes the test-only fail-injection flag.
     #[cfg(test)]
@@ -1456,7 +1569,7 @@ mod finite {
         pub(crate) demand_cursor: Vec<Option<(u64, u64)>>,
         pub(crate) reclaim_cursor: Option<u64>,
         pub(crate) active_demand: Option<(u64, ResourceScopeId)>,
-        pub(crate) selection_log: Vec<ResourceScopeId>,
+        pub(crate) decision_log: Vec<ProviderDecision>,
     }
 
     /// A root and order reserved for a child scope that has not been inserted.
@@ -1543,14 +1656,17 @@ mod finite {
         /// oracle rejects the result. It is never reachable outside `cfg(test)`.
         #[cfg(test)]
         scope_keyed_selection: bool,
-        /// Test-only record of the provider's actual selection order.
+        /// Test-only ordered trace of cooperative-admission dispositions.
         ///
-        /// A control cannot infer grant order from the order it happens to
-        /// retry its own outstanding demands; that would measure the test's
-        /// iteration, not the provider's arbitration. Each granted demand
-        /// appends its owning scope here as it is selected.
+        /// Complete within that scope and no wider; see [`ProviderDecision`]
+        /// for exactly what it covers and what it deliberately does not.
+        ///
+        /// A control cannot infer disposition order from the order it happens
+        /// to retry its own outstanding demands; that would measure the test's
+        /// iteration, not the provider's behaviour. Every disposition in scope
+        /// appends here as it happens.
         #[cfg(test)]
-        selection_log: Vec<ResourceScopeId>,
+        decision_log: Vec<ProviderDecision>,
         /// Test-only forced failure of the scope-order allocator.
         #[cfg(test)]
         fail_scope_order_allocation: bool,
@@ -1596,7 +1712,7 @@ mod finite {
                     #[cfg(test)]
                     scope_keyed_selection: false,
                     #[cfg(test)]
-                    selection_log: Vec::new(),
+                    decision_log: Vec::new(),
                     #[cfg(test)]
                     fail_scope_order_allocation: false,
                     #[cfg(test)]
@@ -1624,10 +1740,12 @@ mod finite {
             state.scope_keyed_selection = scope_keyed;
         }
 
-        /// The provider's actual selection order, oldest first.
+        /// The provider's ordered cooperative-admission disposition trace,
+        /// oldest first. See [`ProviderDecision`] for exactly what it covers
+        /// and what it deliberately does not.
         #[cfg(test)]
-        pub(crate) fn selection_log_for_test(&self) -> Vec<ResourceScopeId> {
-            self.lock_state().selection_log.clone()
+        pub(crate) fn decision_log_for_test(&self) -> Vec<ProviderDecision> {
+            self.lock_state().decision_log.clone()
         }
 
         /// Force the scope-order allocator to fail, or restore it.
@@ -1671,8 +1789,12 @@ mod finite {
         /// changing topology. This captures the actual allocator positions and
         /// free sets, the exact per-scope root, order and pending shape, the
         /// exact reservation shape, all cursors, the active demand, and the
-        /// selection log. The fail-injection flag is deliberately excluded,
-        /// since a control mutates it on purpose.
+        /// cooperative decision trace. The fail-injection flag is deliberately
+        /// excluded, since a control mutates it on purpose.
+        ///
+        /// The trace is append-only, so comparing two snapshots for equality is
+        /// the wrong test wherever a demand was legitimately accepted or
+        /// cancelled; compare the prefix and the appended suffix instead.
         #[cfg(test)]
         pub(crate) fn transactional_snapshot_for_test(&self) -> FiniteProviderSnapshot {
             let state = self.lock_state();
@@ -1725,7 +1847,7 @@ mod finite {
                     .active_demand
                     .as_ref()
                     .map(|active| (active.root.0 .0, active.scope_id)),
-                selection_log: state.selection_log.clone(),
+                decision_log: state.decision_log.clone(),
             }
         }
 
@@ -2276,9 +2398,24 @@ mod finite {
             })
         }
 
+        /// Choose reclaim victims for a deficit.
+        ///
+        /// `requester_root` is supplied already resolved, by the caller, from
+        /// the exact **existing** scope that owns the pending demand. It is
+        /// deliberately not recovered from a scope id here: a `NewChild` demand
+        /// names a prospective child that has not been committed yet, so
+        /// looking it up would yield nothing, silently disabling the
+        /// own-root-last protection and letting a claimant route around it by
+        /// demanding through a child that does not exist yet.
+        ///
+        /// The parameter is non-optional on purpose. Accepting an absent root
+        /// would keep exactly that silent path available: every selected
+        /// pending owner has a scope record and therefore a root, so an
+        /// unresolvable requester is an impossible state, and the caller fails
+        /// closed rather than reclaiming without attribution.
         fn select_reclaim_victims(
             state: &mut State,
-            requester_scope: ResourceScopeId,
+            requester_root: FairnessRoot,
             needed: ResourceClaim,
         ) -> bool {
             let mut deficit = ResourceClaim::ZERO;
@@ -2295,11 +2432,6 @@ mod finite {
             }
 
             let cursor = state.reclaim_cursor;
-            // The requester is identified by its root, never by its exact
-            // scope. Otherwise a claimant could create a child, make the
-            // request from there, and route around the protection that keeps
-            // its own root's reservations last.
-            let requester_root = Self::root_of(state, requester_scope);
             let mut candidates: Vec<(FairnessRoot, ScopeOrder, ResourceScopeId, u64)> = state
                 .reservations
                 .iter()
@@ -2325,7 +2457,7 @@ mod finite {
             // victim.
             candidates.sort_by_key(|(victim_root, victim_order, _, reservation_id)| {
                 (
-                    requester_root.is_some_and(|requester| *victim_root == requester),
+                    *victim_root == requester_root,
                     cursor.is_some_and(|cursor| *victim_root <= cursor),
                     *victim_root,
                     *victim_order,
@@ -2432,10 +2564,11 @@ mod finite {
                     // in `Waiting` with its turn already removed. The demand
                     // owner is the parent, so a new child inherits that scope's
                     // root verbatim.
+                    //
                     // Scope bookkeeping is finite and fallible. Exhaustion is a
-                    // refusal, not a provider bug: leave the pending demand,
-                    // its turn, accounting, topology, cursors, and selection
-                    // log exactly as they are, and return without poisoning so
+                    // refusal, not a provider bug: leave the pending demand, its
+                    // turn, accounting, topology, cursors, and the decision
+                    // trace exactly as they are, and return without poisoning so
                     // the same demand promotes on a later retry once capacity
                     // returns.
                     let prepared = match placement {
@@ -2518,9 +2651,15 @@ mod finite {
                         },
                     );
                     state.in_use = next;
-                    // The provider's own record of selection order.
+                    // Exact requested claim, plus the internal charge kept
+                    // separately so an oracle never accumulates the latter.
                     #[cfg(test)]
-                    state.selection_log.push(scope_id);
+                    state.decision_log.push(ProviderDecision::ArbitrationGrant {
+                        scope_id,
+                        demand_key: demand_key_of(&identity),
+                        requested: claim,
+                        charged: charge,
+                    });
                     // Rotate past the served root, not the served scope, so a
                     // root cannot gain extra turns by holding extra children.
                     state.demand_cursor[Self::authority_index(authority)] = state
@@ -2538,7 +2677,22 @@ mod finite {
                     continue;
                 }
 
-                if Self::select_reclaim_victims(state, lease_scope_id, charge) {
+                // Resolve the requester's root from the scope that actually
+                // owns the pending demand, never from `lease_scope_id`. For a
+                // `NewChild` demand the lease scope is a prospective child that
+                // does not exist yet, so using it would lose the root and
+                // disable the own-root-last ordering.
+                //
+                // Fail closed if it cannot resolve. A scope that owns a pending
+                // demand necessarily has a record and therefore a root, so this
+                // is an impossible state rather than a refusal — and reclaiming
+                // without attribution is precisely the route-around this rule
+                // exists to prevent, so it must never proceed unattributed.
+                let Some(requester_root) = Self::root_of(state, scope_id) else {
+                    Self::poison(state, ResourceClass::OpaqueDependencyResidual);
+                    return;
+                };
+                if Self::select_reclaim_victims(state, requester_root, charge) {
                     return;
                 }
 
@@ -2556,6 +2710,12 @@ mod finite {
                     Self::poison(state, ResourceClass::OpaqueDependencyResidual);
                     return;
                 }
+                #[cfg(test)]
+                state.decision_log.push(ProviderDecision::TerminalPressure {
+                    scope_id,
+                    demand_key: demand_key_of(&identity),
+                    dimension: pressure.dimension,
+                });
                 state.demand_cursor[Self::authority_index(authority)] = state
                     .scopes
                     .get(&scope_id)
@@ -2919,6 +3079,19 @@ mod finite {
                         reclaim_target: Some(reclaim_target),
                     },
                 );
+                // Recorded only here, once the whole atomic transaction has
+                // committed: the child scope exists, `in_use` is updated, and
+                // the reservation is inserted. Appending earlier would put a
+                // grant in the trace that a later failure could still undo.
+                //
+                // The scope recorded is the child that received the admission,
+                // matching the reservation's owner.
+                #[cfg(test)]
+                state.decision_log.push(ProviderDecision::ImmediateGrant {
+                    scope_id,
+                    requested: claim,
+                    charged: charge,
+                });
                 return Ok(ResourceProviderAdmission::Acquired(reservation_id));
             }
 
@@ -2927,6 +3100,12 @@ mod finite {
             // against that root.
             if let Some(root) = Self::root_of(&state, parent_scope_id) {
                 if let Some(holder) = Self::pending_holder(&state, parent_scope_id, root) {
+                    #[cfg(test)]
+                    state.decision_log.push(ProviderDecision::PendingRefused {
+                        scope_id: parent_scope_id,
+                        holder,
+                        requested: claim,
+                    });
                     return Err(ResourceUnavailable::DemandPending { scope_id: holder });
                 }
             }
@@ -2937,6 +3116,12 @@ mod finite {
                     ready: Notify::new(),
                 }),
             };
+            #[cfg(test)]
+            state.decision_log.push(ProviderDecision::PendingAccepted {
+                scope_id: parent_scope_id,
+                demand_key: demand_key_of(&identity),
+                requested: claim,
+            });
             let Some(parent) = state.scopes.get_mut(&parent_scope_id) else {
                 Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                 return Err(ResourceUnavailable::ProviderInvariant {
@@ -3118,6 +3303,12 @@ mod finite {
                         reclaim_target,
                     },
                 );
+                #[cfg(test)]
+                state.decision_log.push(ProviderDecision::ImmediateGrant {
+                    scope_id,
+                    requested: claim,
+                    charged: charge,
+                });
                 return Ok(ResourceProviderAdmission::Acquired(reservation_id));
             }
 
@@ -3129,6 +3320,12 @@ mod finite {
             // turn.
             if let Some(root) = Self::root_of(&state, scope_id) {
                 if let Some(holder) = Self::pending_holder(&state, scope_id, root) {
+                    #[cfg(test)]
+                    state.decision_log.push(ProviderDecision::PendingRefused {
+                        scope_id,
+                        holder,
+                        requested: claim,
+                    });
                     return Err(ResourceUnavailable::DemandPending { scope_id: holder });
                 }
             }
@@ -3139,6 +3336,12 @@ mod finite {
                     ready: Notify::new(),
                 }),
             };
+            #[cfg(test)]
+            state.decision_log.push(ProviderDecision::PendingAccepted {
+                scope_id,
+                demand_key: demand_key_of(&identity),
+                requested: claim,
+            });
             let Some(scope) = state.scopes.get_mut(&scope_id) else {
                 Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                 return Err(ResourceUnavailable::ProviderInvariant {
@@ -3312,6 +3515,11 @@ mod finite {
                     }) {
                         state.active_demand = None;
                     }
+                    #[cfg(test)]
+                    state.decision_log.push(ProviderDecision::Cancelled {
+                        scope_id,
+                        demand_key: demand_key_of(demand),
+                    });
                     demand.signal.set(DemandOutcome::Cancelled);
                     Self::arbitrate(&mut state);
                 }
@@ -3600,7 +3808,7 @@ mod finite {
 pub use finite::FiniteResourceProvider;
 
 #[cfg(test)]
-pub(crate) use finite::FiniteProviderSnapshot;
+pub(crate) use finite::{FiniteProviderSnapshot, ProviderDecision};
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -4608,36 +4816,101 @@ mod tests {
     /// what it expects before drawing conclusions from inequalities over it.
     #[derive(Clone, Debug)]
     struct LiveTrace {
-        decisions: Vec<LiveDecision>,
+        /// The complete ordered disposition sequence. Prefixes are taken over
+        /// **this**, so a decision index counts every disposition — acceptance,
+        /// refusal, immediate grant, arbitration grant, terminal pressure,
+        /// cancellation — not only the grants. Cumulative selections and
+        /// admitted quantities are derived from the grant events inside a
+        /// prefix of this sequence.
+        events: Vec<LiveEvent>,
         /// Offers refused because their scheduling key already held a turn.
         refused: usize,
         /// Offers accepted as pending demands.
         accepted: usize,
     }
 
-    /// One admission recorded against the live provider, in decision order.
-    #[derive(Clone, Debug)]
-    struct LiveDecision {
-        demand_id: u32,
-        root: usize,
-        claim: ResourceClaim,
+    /// One disposition in the compared trace, resolved to logical demand ids
+    /// that were bound at issue time.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LiveEvent {
+        Accepted {
+            demand_id: u32,
+            root: usize,
+            requested: ResourceClaim,
+        },
+        Refused {
+            demand_id: u32,
+            root: usize,
+            requested: ResourceClaim,
+        },
+        ImmediateGrant {
+            demand_id: u32,
+            root: usize,
+            requested: ResourceClaim,
+        },
+        Granted {
+            demand_id: u32,
+            root: usize,
+            requested: ResourceClaim,
+        },
+        Pressured {
+            demand_id: u32,
+            root: usize,
+        },
+        Cancelled {
+            demand_id: u32,
+            root: usize,
+        },
     }
 
     /// Cumulative admitted vector for `root` at prefix `k`, over every
     /// dimension, with terminal stuttering past the end of the run.
-    fn live_cumulative_admitted(
-        decisions: &[LiveDecision],
+    /// The grant events for `root` within the first `prefix` dispositions.
+    ///
+    /// Terminal stuttering is implicit: taking more than the sequence length
+    /// yields the whole sequence, so a shorter run holds its final cumulative
+    /// values while the longer one continues.
+    fn grants_in_prefix(
+        events: &[LiveEvent],
         root: usize,
         prefix: usize,
-    ) -> ResourceClaim {
-        let mut total = ResourceClaim::ZERO;
-        for decision in decisions.iter().take(prefix.min(decisions.len())) {
-            if decision.root == root {
-                for dimension in ResourceClass::ALL {
-                    total.amounts[dimension.index()] = total
-                        .amount(dimension)
-                        .saturating_add(decision.claim.amount(dimension));
+    ) -> impl Iterator<Item = ResourceClaim> + '_ {
+        events
+            .iter()
+            .take(prefix.min(events.len()))
+            .filter_map(move |event| match event {
+                LiveEvent::Granted {
+                    root: grant_root,
+                    requested,
+                    ..
                 }
+                | LiveEvent::ImmediateGrant {
+                    root: grant_root,
+                    requested,
+                    ..
+                } if *grant_root == root => Some(*requested),
+                _ => None,
+            })
+    }
+
+    /// Index in the full disposition sequence at which `demand_id` was granted.
+    fn grant_index(events: &[LiveEvent], demand_id: u32) -> Option<usize> {
+        events.iter().position(|event| {
+            matches!(
+                event,
+                LiveEvent::Granted { demand_id: id, .. }
+                | LiveEvent::ImmediateGrant { demand_id: id, .. } if *id == demand_id
+            )
+        })
+    }
+
+    fn live_cumulative_admitted(events: &[LiveEvent], root: usize, prefix: usize) -> ResourceClaim {
+        let mut total = ResourceClaim::ZERO;
+        for requested in grants_in_prefix(events, root, prefix) {
+            for dimension in ResourceClass::ALL {
+                total.amounts[dimension.index()] = total
+                    .amount(dimension)
+                    .saturating_add(requested.amount(dimension));
             }
         }
         total
@@ -4645,12 +4918,8 @@ mod tests {
 
     /// Cumulative selection count for `root` at prefix `k`, stuttering past the
     /// end of the run.
-    fn live_cumulative_selections(decisions: &[LiveDecision], root: usize, prefix: usize) -> usize {
-        decisions
-            .iter()
-            .take(prefix.min(decisions.len()))
-            .filter(|decision| decision.root == root)
-            .count()
+    fn live_cumulative_selections(events: &[LiveEvent], root: usize, prefix: usize) -> usize {
+        grants_in_prefix(events, root, prefix).count()
     }
 
     /// Run the fixed Construction A workload against the real provider.
@@ -4669,12 +4938,7 @@ mod tests {
         // Every workload claim is nonzero in every dimension, so the
         // per-dimension inequalities in the oracle are not vacuous outside one
         // selected dimension. QueuedBytes stays the constraining dimension.
-        let unit = ResourceClaim::try_from_entries(
-            ResourceClass::ALL
-                .into_iter()
-                .map(|dimension| (dimension, 1u64)),
-        )
-        .expect("finite uniform claim");
+        let unit = unit_claim();
         // Queue capacity 6, matched by a blocker claiming all 6, so the full
         // pending set can be granted once the blocker releases.
         let mut grant_entries: Vec<(ResourceClass, u64)> = ResourceClass::ALL
@@ -4730,9 +4994,22 @@ mod tests {
             (202, B, 2),
         ];
 
-        // Per-scope issue order, so a scope id in the provider's selection log
-        // can be mapped back to the exact logical demand it served.
-        let mut issue_order: BTreeMap<ResourceScopeId, VecDeque<(u32, usize)>> = BTreeMap::new();
+        // Logical ids are bound to provider-side dispositions at issue time, by
+        // two complementary mechanisms, neither of which reconstructs an
+        // association afterwards:
+        //
+        // - `issued_by_key` binds a demand key minted by the provider, taken
+        //   from the returned handle at the moment of acceptance. It resolves
+        //   every later disposition of that demand — arbitration grant,
+        //   terminal pressure, cancellation.
+        // - `bound_by_log_index` binds the exact decision-log indices appended
+        //   during one synchronous call. Refusals and immediate grants carry no
+        //   demand handle, so this is how they are attributed. Keying those by
+        //   scope would be unsound: the baseline offers several demands from one
+        //   child and refuses more than one of them, so a scope-keyed map would
+        //   overwrite and assign every refusal to the last id.
+        let mut issued_by_key: BTreeMap<usize, (u32, usize)> = BTreeMap::new();
+        let mut bound_by_log_index: BTreeMap<usize, (u32, usize)> = BTreeMap::new();
         let mut queued: VecDeque<(u32, usize, ResourceScope)> = VecDeque::new();
         for (demand_id, root, child) in workload {
             let scope = if root == A {
@@ -4740,10 +5017,6 @@ mod tests {
             } else {
                 b_children[child].clone()
             };
-            issue_order
-                .entry(scope.id())
-                .or_default()
-                .push_back((demand_id, root));
             queued.push_back((demand_id, root, scope));
         }
 
@@ -4765,9 +5038,22 @@ mod tests {
         // could not see. This refusal count is precisely what differs between
         // the two policies: under per-root keying root A accepts one demand,
         // under per-scope keying it accepts one per child.
-        for (demand_id, _root, scope) in queued.drain(..) {
-            match port.acquire_cooperatively(&scope, ResourceAuthorityClass::Admitted, unit, None) {
+        for (demand_id, root, scope) in queued.drain(..) {
+            // Every decision-log entry appended by this synchronous call
+            // belongs to this logical demand.
+            let log_before = provider.decision_log_for_test().len();
+            let outcome =
+                port.acquire_cooperatively(&scope, ResourceAuthorityClass::Admitted, unit, None);
+            let log_after = provider.decision_log_for_test().len();
+            for index in log_before..log_after {
+                bound_by_log_index.insert(index, (demand_id, root));
+            }
+            match outcome {
                 Ok(ResourceAdmission::Pending(demand)) => {
+                    // Bind the logical id to the provider's own demand key at
+                    // the moment of issue, so later dispositions of the same
+                    // demand resolve without positional reconstruction.
+                    issued_by_key.insert(demand.demand_key_for_test(), (demand_id, root));
                     outstanding.push((demand_id, scope.id(), demand));
                     accepted += 1;
                 }
@@ -4831,32 +5117,108 @@ mod tests {
             "every accepted pending demand must yield exactly one held lease"
         );
 
-        // Decisions come from the provider's own selection order, not from the
-        // order this test happened to retry its handles. An unmapped entry
-        // means the log and the offered workload disagree, which would let the
-        // oracle compare a trace that does not correspond to the demands.
-        let log = provider.selection_log_for_test();
-        let mut decisions = Vec::new();
-        for scope_id in &log {
-            let (demand_id, root) = issue_order
-                .get_mut(scope_id)
-                .and_then(std::collections::VecDeque::pop_front)
-                .expect("every selection maps to an offered logical demand");
-            decisions.push(LiveDecision {
-                demand_id,
-                root,
-                claim: unit,
-            });
+        // The compared trace is the provider's own complete ordered decision
+        // log, not the order this test retried its handles. Logical ids were
+        // bound to provider-side demand keys at issue time, so nothing is
+        // reconstructed positionally here.
+        let log = provider.decision_log_for_test();
+        let mut events = Vec::new();
+        let mut granted_count = 0usize;
+        for (index, entry) in log.iter().enumerate() {
+            // Resolve by the demand key bound at acceptance where the
+            // disposition carries one; otherwise by the log index bound during
+            // the issuing call. Every entry must resolve by one route or the
+            // other, or the trace and the workload disagree.
+            let by_index = bound_by_log_index.get(&index).copied();
+            let event = match *entry {
+                ProviderDecision::PendingAccepted {
+                    demand_key,
+                    requested,
+                    ..
+                } => {
+                    let (demand_id, root) = issued_by_key
+                        .get(&demand_key)
+                        .copied()
+                        .or(by_index)
+                        .expect("accepted demand bound at issue time");
+                    LiveEvent::Accepted {
+                        demand_id,
+                        root,
+                        requested,
+                    }
+                }
+                ProviderDecision::PendingRefused { requested, .. } => {
+                    let (demand_id, root) =
+                        by_index.expect("refusal bound to its issuing call by log index");
+                    LiveEvent::Refused {
+                        demand_id,
+                        root,
+                        requested,
+                    }
+                }
+                ProviderDecision::ImmediateGrant { requested, .. } => {
+                    let (demand_id, root) =
+                        by_index.expect("immediate grant bound to its issuing call by log index");
+                    LiveEvent::ImmediateGrant {
+                        demand_id,
+                        root,
+                        requested,
+                    }
+                }
+                ProviderDecision::ArbitrationGrant {
+                    demand_key,
+                    requested,
+                    ..
+                } => {
+                    let (demand_id, root) = issued_by_key
+                        .get(&demand_key)
+                        .copied()
+                        .expect("granted demand bound at issue time");
+                    granted_count += 1;
+                    // `requested` is the demand's exact claim as the provider
+                    // recorded it. The internal charge is deliberately unused:
+                    // FORMAL 14.5e accumulates the exact claim.
+                    LiveEvent::Granted {
+                        demand_id,
+                        root,
+                        requested,
+                    }
+                }
+                // Both terminal dispositions can occur *synchronously inside the
+                // issuing call*: a demand is accepted, arbitration runs inline,
+                // resolves it to pressure, and the call returns `Err`. The test
+                // then never receives a handle, so no demand key was ever bound
+                // and the key route alone would panic on a disposition the
+                // trace itself recorded. The per-call log-index binding spans
+                // exactly that window, so it is the correct fallback.
+                ProviderDecision::TerminalPressure { demand_key, .. } => {
+                    let (demand_id, root) = issued_by_key
+                        .get(&demand_key)
+                        .copied()
+                        .or(by_index)
+                        .expect("pressured demand bound by key or by issuing call");
+                    LiveEvent::Pressured { demand_id, root }
+                }
+                ProviderDecision::Cancelled { demand_key, .. } => {
+                    let (demand_id, root) = issued_by_key
+                        .get(&demand_key)
+                        .copied()
+                        .or(by_index)
+                        .expect("cancelled demand bound by key or by issuing call");
+                    LiveEvent::Cancelled { demand_id, root }
+                }
+            };
+            events.push(event);
         }
         assert_eq!(
-            decisions.len(),
+            granted_count,
             held.len(),
-            "every selection must correspond to exactly one held lease"
+            "every arbitration grant must correspond to exactly one held lease"
         );
 
         drop(held);
         LiveTrace {
-            decisions,
+            events,
             refused,
             accepted,
         }
@@ -4872,8 +5234,13 @@ mod tests {
         competitor_roots: &[usize],
         competitor_demand_ids: &[u32],
     ) -> Result<(), String> {
-        let baseline = &baseline_trace.decisions[..];
-        let subdivided = &subdivided_trace.decisions[..];
+        // Prefixes are taken over the complete disposition sequence, not over
+        // grants alone. A decision index therefore counts refusals, immediate
+        // grants, and terminal outcomes too, which is what makes "at every
+        // prefix" mean every decision the provider made rather than every
+        // decision that happened to be a grant.
+        let baseline = &baseline_trace.events[..];
+        let subdivided = &subdivided_trace.events[..];
         let horizon = baseline.len().max(subdivided.len());
         for prefix in 0..=horizon {
             let baseline_selections = live_cumulative_selections(baseline, 0, prefix);
@@ -4909,12 +5276,9 @@ mod tests {
             }
         }
         for demand_id in competitor_demand_ids {
-            let before = baseline
-                .iter()
-                .position(|decision| decision.demand_id == *demand_id);
-            let after = subdivided
-                .iter()
-                .position(|decision| decision.demand_id == *demand_id);
+            // Selection index is a position in the full decision sequence.
+            let before = grant_index(baseline, *demand_id);
+            let after = grant_index(subdivided, *demand_id);
             if let Some(before) = before {
                 // Absence counts as infinity.
                 let after = after.unwrap_or(usize::MAX);
@@ -4937,13 +5301,152 @@ mod tests {
     /// The logical demand ids in the order the provider actually selected them.
     fn decision_ids(trace: &LiveTrace) -> Vec<u32> {
         trace
-            .decisions
+            .events
             .iter()
-            .map(|decision| decision.demand_id)
+            .filter_map(|event| match event {
+                LiveEvent::Granted { demand_id, .. }
+                | LiveEvent::ImmediateGrant { demand_id, .. } => Some(*demand_id),
+                _ => None,
+            })
             .collect()
     }
 
+    /// Every logical demand id that reached a grant, in grant order.
+    fn granted_count(trace: &LiveTrace) -> usize {
+        decision_ids(trace).len()
+    }
+
+    /// One disposition reduced to its comparable signature: what kind it was,
+    /// which logical demand it concerned, and which root that demand belongs to.
+    ///
+    /// Counts and grant order alone do not pin the trace: the six offer
+    /// dispositions could be reordered and still satisfy both. Comparing exact
+    /// signature vectors binds the ordering itself.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct EventSignature {
+        kind: &'static str,
+        demand_id: u32,
+        root: usize,
+    }
+
+    /// The single workload claim used by the Construction A fixture: nonzero in
+    /// every dimension, with `QueuedBytes` the constraining one.
+    fn unit_claim() -> ResourceClaim {
+        ResourceClaim::try_from_entries(
+            ResourceClass::ALL
+                .into_iter()
+                .map(|dimension| (dimension, 1u64)),
+        )
+        .expect("finite uniform claim")
+    }
+
+    fn sig(kind: &'static str, demand_id: u32, root: usize) -> EventSignature {
+        EventSignature {
+            kind,
+            demand_id,
+            root,
+        }
+    }
+
+    fn event_signatures(trace: &LiveTrace) -> Vec<EventSignature> {
+        trace
+            .events
+            .iter()
+            .map(|event| match *event {
+                LiveEvent::Accepted {
+                    demand_id, root, ..
+                } => sig("accepted", demand_id, root),
+                LiveEvent::Refused {
+                    demand_id, root, ..
+                } => sig("refused", demand_id, root),
+                LiveEvent::ImmediateGrant {
+                    demand_id, root, ..
+                } => sig("immediate", demand_id, root),
+                LiveEvent::Granted {
+                    demand_id, root, ..
+                } => sig("granted", demand_id, root),
+                LiveEvent::Pressured { demand_id, root } => sig("pressured", demand_id, root),
+                LiveEvent::Cancelled { demand_id, root } => sig("cancelled", demand_id, root),
+            })
+            .collect()
+    }
+
+    /// Every disposition carrying a claim must carry the exact workload claim.
+    ///
+    /// The signature vectors omit the claim to stay readable; this binds it
+    /// separately, so a trace that reported a different admitted quantity than
+    /// the workload requested would still fail.
+    fn assert_all_requested_claims_are(trace: &LiveTrace, expected: ResourceClaim, label: &str) {
+        for event in &trace.events {
+            let requested = match *event {
+                LiveEvent::Accepted { requested, .. }
+                | LiveEvent::Refused { requested, .. }
+                | LiveEvent::ImmediateGrant { requested, .. }
+                | LiveEvent::Granted { requested, .. } => Some(requested),
+                LiveEvent::Pressured { .. } | LiveEvent::Cancelled { .. } => None,
+            };
+            if let Some(requested) = requested {
+                assert_eq!(
+                    requested, expected,
+                    "{label}: a disposition reported a claim other than the exact \
+                     workload claim"
+                );
+            }
+        }
+    }
+
+    /// Counts of each disposition kind in the full ordered trace.
+    fn event_shape(trace: &LiveTrace) -> (usize, usize, usize, usize, usize, usize) {
+        let mut accepted = 0;
+        let mut refused = 0;
+        let mut immediate = 0;
+        let mut granted = 0;
+        let mut pressured = 0;
+        let mut cancelled = 0;
+        for event in &trace.events {
+            match event {
+                LiveEvent::Accepted { .. } => accepted += 1,
+                LiveEvent::Refused { .. } => refused += 1,
+                LiveEvent::ImmediateGrant { .. } => immediate += 1,
+                LiveEvent::Granted { .. } => granted += 1,
+                LiveEvent::Pressured { .. } => pressured += 1,
+                LiveEvent::Cancelled { .. } => cancelled += 1,
+            }
+        }
+        (accepted, refused, immediate, granted, pressured, cancelled)
+    }
+
     fn assert_trace_shape(trace: &LiveTrace, refused: usize, accepted: usize, label: &str) {
+        // The full ordered trace must agree with the aggregate counts, and must
+        // contain no disposition kind the fixture does not intend. An immediate
+        // grant here would mean the blocker is not forcing arbitration; a
+        // pressure or cancellation would mean a demand died unserved.
+        let (trace_accepted, trace_refused, immediate, granted, pressured, cancelled) =
+            event_shape(trace);
+        assert_eq!(
+            trace_accepted, accepted,
+            "{label}: accepted count disagrees with the ordered trace"
+        );
+        assert_eq!(
+            trace_refused, refused,
+            "{label}: refused count disagrees with the ordered trace"
+        );
+        assert_eq!(
+            immediate, 0,
+            "{label}: an immediate grant means arbitration was bypassed"
+        );
+        assert_eq!(
+            granted, accepted,
+            "{label}: every accepted demand must reach an arbitration grant"
+        );
+        assert_eq!(
+            pressured, 0,
+            "{label}: no demand should end in terminal pressure"
+        );
+        assert_eq!(
+            cancelled, 0,
+            "{label}: no demand should end cancelled inside the compared prefix"
+        );
         assert_eq!(
             trace.refused, refused,
             "{label}: expected {refused} offers refused for already holding a turn"
@@ -4953,13 +5456,20 @@ mod tests {
             "{label}: expected {accepted} offers accepted as pending demands"
         );
         assert_eq!(
-            trace.decisions.len(),
+            granted_count(trace),
             accepted,
-            "{label}: every accepted pending demand must reach a selection"
+            "{label}: every accepted pending demand must reach a grant"
         );
         assert!(
-            !trace.decisions.is_empty(),
+            granted_count(trace) > 0,
             "{label}: an empty trace would satisfy every inequality vacuously"
+        );
+        assert_eq!(
+            trace.events.len(),
+            accepted * 2 + refused,
+            "{label}: the ordered trace must contain exactly one acceptance and \
+             one grant per accepted demand, plus one refusal per refusal, and \
+             nothing else"
         );
     }
 
@@ -4974,27 +5484,46 @@ mod tests {
         assert_trace_shape(&baseline, 4, 2, "production baseline");
         assert_trace_shape(&subdivided, 4, 2, "production subdivided");
 
-        // Exact selected ids and order, which binds the positional
-        // DemandId mapping rather than merely asserting both roots appear.
-        // Root A is created before root B, so A holds the earlier turn key and
-        // is served first; each root accepts exactly one demand, and the other
-        // offers are refused for already holding that root's turn.
+        // Exact ordered dispositions, with logical ids bound at issue time
+        // rather than reconstructed. Counts and grant order alone would let the
+        // six offer dispositions be reordered undetected, so the whole sequence
+        // is pinned. Root A is created before root B, so A holds the earlier
+        // turn key and is served first; offers alternate A, B, A, B, A, B, and
+        // every offer after the first on each root is refused because that root
+        // already holds its single turn.
+        let expected = vec![
+            sig("accepted", 100, 0),
+            sig("accepted", 200, 1),
+            sig("refused", 101, 0),
+            sig("refused", 201, 1),
+            sig("refused", 102, 0),
+            sig("refused", 202, 1),
+            sig("granted", 100, 0),
+            sig("granted", 200, 1),
+        ];
         assert_eq!(
-            decision_ids(&baseline),
-            vec![100, 200],
-            "production baseline serves one demand per root, A before B"
+            event_signatures(&baseline),
+            expected,
+            "production baseline: one turn per root, A before B"
         );
         assert_eq!(
-            decision_ids(&subdivided),
-            vec![100, 200],
-            "subdividing A across children changes neither which demands are \
-             served nor their order"
+            event_signatures(&subdivided),
+            expected,
+            "subdividing A across children changes no disposition, in kind, \
+             order, or which demand it concerned"
         );
+        assert_all_requested_claims_are(&baseline, unit_claim(), "production baseline");
+        assert_all_requested_claims_are(&subdivided, unit_claim(), "production subdivided");
         for trace in [&baseline, &subdivided] {
             let roots: BTreeSet<usize> = trace
-                .decisions
+                .events
                 .iter()
-                .map(|decision| decision.root)
+                .filter_map(|event| match event {
+                    LiveEvent::Granted { root, .. } | LiveEvent::ImmediateGrant { root, .. } => {
+                        Some(*root)
+                    }
+                    _ => None,
+                })
                 .collect();
             assert_eq!(
                 roots,
@@ -5025,20 +5554,52 @@ mod tests {
         assert_trace_shape(&baseline, 2, 4, "scope-keyed baseline");
         assert_trace_shape(&subdivided, 0, 6, "scope-keyed subdivided");
 
-        // Exact ids and order. Turn keys are (root, scope order) here, and the
-        // pre-created children were minted A0, A1, A2 then B0, B1, B2, so the
-        // cursor walks A's children before reaching B's.
+        // Exact ordered dispositions, not merely grant order. Turn keys are
+        // (root, scope order) here, and the pre-created children were minted
+        // A0, A1, A2 then B0, B1, B2, so the cursor walks A's children before
+        // reaching B's. Offers alternate A, B, A, B, A, B.
+        //
+        // Baseline maps all three A demands to A0, so the second and third are
+        // refused for that scope's turn while each distinct B child accepts.
         assert_eq!(
-            decision_ids(&baseline),
-            vec![100, 200, 201, 202],
-            "with A's demands on one child, A still holds only one scope turn"
+            event_signatures(&baseline),
+            vec![
+                sig("accepted", 100, 0),
+                sig("accepted", 200, 1),
+                sig("refused", 101, 0),
+                sig("accepted", 201, 1),
+                sig("refused", 102, 0),
+                sig("accepted", 202, 1),
+                sig("granted", 100, 0),
+                sig("granted", 200, 1),
+                sig("granted", 201, 1),
+                sig("granted", 202, 1),
+            ],
+            "scope-keyed baseline: A holds one scope turn, each B child its own"
         );
+        // Subdivided spreads A across three children, so every offer is
+        // accepted and A takes three consecutive grants before B is served.
         assert_eq!(
-            decision_ids(&subdivided),
-            vec![100, 101, 102, 200, 201, 202],
-            "subdividing A across three children yields A three consecutive \
-             turns before the competitor is served at all"
+            event_signatures(&subdivided),
+            vec![
+                sig("accepted", 100, 0),
+                sig("accepted", 200, 1),
+                sig("accepted", 101, 0),
+                sig("accepted", 201, 1),
+                sig("accepted", 102, 0),
+                sig("accepted", 202, 1),
+                sig("granted", 100, 0),
+                sig("granted", 101, 0),
+                sig("granted", 102, 0),
+                sig("granted", 200, 1),
+                sig("granted", 201, 1),
+                sig("granted", 202, 1),
+            ],
+            "scope-keyed subdivided: subdivision buys A three consecutive turns \
+             ahead of the competitor — the amplification the oracle must reject"
         );
+        assert_all_requested_claims_are(&baseline, unit_claim(), "scope-keyed baseline");
+        assert_all_requested_claims_are(&subdivided, unit_claim(), "scope-keyed subdivided");
 
         let verdict =
             evaluate_live_non_amplification(&baseline, &subdivided, &[1], &[200, 201, 202]);
@@ -5059,12 +5620,9 @@ mod tests {
         assert_trace_shape(&one_child, 4, 2, "one child");
         assert_trace_shape(&three_children, 4, 2, "three children");
         let selections_with_one =
-            live_cumulative_selections(&one_child.decisions, 0, one_child.decisions.len());
-        let selections_with_three = live_cumulative_selections(
-            &three_children.decisions,
-            0,
-            three_children.decisions.len(),
-        );
+            live_cumulative_selections(&one_child.events, 0, one_child.events.len());
+        let selections_with_three =
+            live_cumulative_selections(&three_children.events, 0, three_children.events.len());
         assert_eq!(
             selections_with_one, selections_with_three,
             "extra child scopes create no additional turns"
@@ -5095,6 +5653,476 @@ mod tests {
         // An ordinary child still takes no root argument and inherits.
         let child = port.create_scope(&first_root).expect("ordinary child");
         assert_eq!(child.parent_id(), Some(first_root.id()));
+    }
+
+    /// One reclaimable victim on a named root, with its subscription and lease.
+    struct VictimRoot {
+        scope: ResourceScope,
+        subscription: ResourceReclaimSubscription,
+        /// Held solely to keep the victim's reservation alive for the test's
+        /// duration. Never read, and named with a leading underscore so that
+        /// intent is explicit and no `dead_code` allow is needed.
+        _lease: ResourceLease,
+    }
+
+    /// A requester root plus `competitors` other roots, each holding exactly
+    /// one reclaimable speculative unit.
+    ///
+    /// A struct rather than a tuple so no `clippy::type_complexity` allow is
+    /// needed and each victim stays individually addressable.
+    struct VictimFixture {
+        provider: DeterministicGrantProvider,
+        port: ResourceProviderPort,
+        own: VictimRoot,
+        others: Vec<VictimRoot>,
+    }
+
+    fn victim_fixture(competitors: usize) -> VictimFixture {
+        let roots = competitors + 1;
+        let grant = claim(&[
+            (ResourceClass::QueuedBytes, roots as u64),
+            (ResourceClass::OpaqueDependencyResidual, 1024),
+        ]);
+        let provider = DeterministicGrantProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+        // The requester's own root is created first, so it also holds the
+        // lowest root order. Own-root-last ordering must therefore beat plain
+        // root order, not merely coincide with it.
+        let own_scope = port.create_fairness_root_scope().expect("requester root");
+        let (own_target, own_subscription) = ResourceReclaimSubscription::channel();
+        let own_lease = port
+            .acquire_reclaimable_now(&own_scope, one, own_target)
+            .expect("own-root reclaimable unit");
+        let own = VictimRoot {
+            scope: own_scope,
+            subscription: own_subscription,
+            _lease: own_lease,
+        };
+
+        let others = (0..competitors)
+            .map(|_| {
+                let scope = port.create_fairness_root_scope().expect("competing root");
+                let (target, subscription) = ResourceReclaimSubscription::channel();
+                let lease = port
+                    .acquire_reclaimable_now(&scope, one, target)
+                    .expect("competing reclaimable unit");
+                VictimRoot {
+                    scope,
+                    subscription,
+                    _lease: lease,
+                }
+            })
+            .collect();
+
+        VictimFixture {
+            provider,
+            port,
+            own,
+            others,
+        }
+    }
+
+    /// The kind name of one recorded provider disposition.
+    fn decision_kind(decision: &ProviderDecision) -> &'static str {
+        match decision {
+            ProviderDecision::PendingAccepted { .. } => "accepted",
+            ProviderDecision::PendingRefused { .. } => "refused",
+            ProviderDecision::ImmediateGrant { .. } => "immediate",
+            ProviderDecision::ArbitrationGrant { .. } => "granted",
+            ProviderDecision::TerminalPressure { .. } => "pressured",
+            ProviderDecision::Cancelled { .. } => "cancelled",
+        }
+    }
+
+    /// Bind a before/after pair to "nothing changed except reclaim bookkeeping".
+    ///
+    /// Everything a cancellation could plausibly leak is compared exactly: full
+    /// scope survivor equality, both free sets, both allocator frontiers,
+    /// `in_use`, the demand cursors, and the active demand. Reservations must
+    /// keep their ids, owning scopes, authorities and claims; only a
+    /// `Live -> ReclaimRequested` lifecycle transition is permitted, since that
+    /// is the intentional effect of the reclaim request. `reclaim_cursor` is
+    /// checked against the caller's exact expectation rather than ignored.
+    ///
+    /// The decision trace is append-only, so it is not compared for equality:
+    /// the pre-existing prefix must be byte-equal and the appended suffix must
+    /// be exactly `expected_new_decisions`, which may legitimately contain an
+    /// acceptance and its cancellation but never a grant of any kind.
+    fn assert_no_mutation_except_reclaim(
+        before: &FiniteProviderSnapshot,
+        after: &FiniteProviderSnapshot,
+        expected_reclaim_cursor: Option<u64>,
+        expected_new_decisions: &[&str],
+        label: &str,
+    ) {
+        assert_eq!(
+            after.scopes, before.scopes,
+            "{label}: scope topology changed"
+        );
+        assert_eq!(
+            after.free_scope_orders, before.free_scope_orders,
+            "{label}: free scope orders changed"
+        );
+        assert_eq!(
+            after.free_reservation_ids, before.free_reservation_ids,
+            "{label}: free reservation ids changed"
+        );
+        assert_eq!(
+            after.next_scope_order, before.next_scope_order,
+            "{label}: scope-order frontier advanced"
+        );
+        assert_eq!(
+            after.next_reservation_id, before.next_reservation_id,
+            "{label}: reservation-id frontier advanced"
+        );
+        assert_eq!(after.in_use, before.in_use, "{label}: in_use changed");
+        assert_eq!(
+            after.retained_after_failed_cleanup, before.retained_after_failed_cleanup,
+            "{label}: retention changed"
+        );
+        assert_eq!(after.poisoned, before.poisoned, "{label}: poison changed");
+        assert_eq!(
+            after.demand_cursor, before.demand_cursor,
+            "{label}: a rotation cursor advanced"
+        );
+        assert_eq!(
+            after.active_demand, before.active_demand,
+            "{label}: an active demand was left selected"
+        );
+        // The decision trace is append-only, so equality is the wrong test: a
+        // demand that is accepted and later cancelled legitimately appends
+        // those dispositions. What must hold is that the pre-existing prefix is
+        // byte-equal and the appended suffix is exactly the expected sequence —
+        // in particular containing no grant of any kind, which is what "no
+        // unintended selection" actually means here.
+        assert!(
+            after.decision_log.len() >= before.decision_log.len(),
+            "{label}: the decision trace is append-only and cannot shrink"
+        );
+        assert_eq!(
+            &after.decision_log[..before.decision_log.len()],
+            &before.decision_log[..],
+            "{label}: an existing decision-trace entry was rewritten"
+        );
+        let appended: Vec<&'static str> = after.decision_log[before.decision_log.len()..]
+            .iter()
+            .map(decision_kind)
+            .collect();
+        assert_eq!(
+            appended, expected_new_decisions,
+            "{label}: appended dispositions are not the expected sequence"
+        );
+        assert!(
+            !appended.contains(&"granted") && !appended.contains(&"immediate"),
+            "{label}: no grant of any kind may be recorded here"
+        );
+
+        assert_eq!(
+            after.reservations.len(),
+            before.reservations.len(),
+            "{label}: a reservation was created or destroyed"
+        );
+        let mut reclaim_transitions = 0usize;
+        for (old, new) in before.reservations.iter().zip(after.reservations.iter()) {
+            assert_eq!(new.0, old.0, "{label}: reservation id changed");
+            assert_eq!(new.1, old.1, "{label}: reservation owner changed");
+            assert_eq!(new.2, old.2, "{label}: reservation authority changed");
+            assert_eq!(new.3, old.3, "{label}: reservation claim changed");
+            if new.4 != old.4 {
+                // Qualified through the private `finite` module rather than
+                // re-exported: `ReservationLifecycle` is `pub(crate)` inside it,
+                // and `tests` is a child of this module, so the path resolves
+                // without widening any internal surface.
+                assert_eq!(
+                    (old.4, new.4),
+                    (
+                        super::finite::ReservationLifecycle::Live,
+                        super::finite::ReservationLifecycle::ReclaimRequested
+                    ),
+                    "{label}: the only permitted lifecycle change is Live -> ReclaimRequested"
+                );
+                reclaim_transitions += 1;
+            }
+        }
+        // Both fixtures create a one-unit deficit and therefore claim exactly
+        // one victim. Asserting the count binds the intentional delta rather
+        // than merely tolerating whatever transitions happen to occur: zero
+        // would mean no victim was notified at all, and more than one would
+        // mean the provider swept in reservations the deficit did not require.
+        assert_eq!(
+            reclaim_transitions, 1,
+            "{label}: exactly one reservation should transition to ReclaimRequested"
+        );
+
+        assert_eq!(
+            after.reclaim_cursor, expected_reclaim_cursor,
+            "{label}: reclaim cursor is not where the selected victim's root puts it"
+        );
+    }
+
+    /// Which competitor subscriptions have been notified, in fixture order.
+    fn notified_competitors(fixture: &VictimFixture) -> Vec<bool> {
+        fixture
+            .others
+            .iter()
+            .map(|other| other.subscription.is_requested())
+            .collect()
+    }
+
+    #[test]
+    fn reclaim_prefers_another_root_before_the_requesters_own_from_an_existing_scope() {
+        let fixture = victim_fixture(1);
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+        // One unit of deficit: exactly one victim is needed, so ordering is
+        // observable rather than incidental.
+        let turn = pending(
+            fixture
+                .port
+                .acquire_cooperatively(
+                    &fixture.own.scope,
+                    ResourceAuthorityClass::Admitted,
+                    one,
+                    None,
+                )
+                .expect("a turn that needs one reclaimed unit"),
+        );
+        assert_eq!(
+            notified_competitors(&fixture),
+            vec![true],
+            "the competing root's reservation is victimized first"
+        );
+        assert!(
+            !fixture.own.subscription.is_requested(),
+            "the requester's own root is victimized last, even though it holds \
+             the lowest root order"
+        );
+        drop(turn);
+    }
+
+    #[test]
+    fn a_prospective_child_cannot_route_around_own_root_victim_ordering() {
+        // The same request as a NewChild demand. The prospective child is not
+        // in the scope map yet, so a provider resolving the requester root from
+        // the lease scope would find `None`, lose the own-root-last ordering,
+        // and become willing to victimize the requester's own root first.
+        let fixture = victim_fixture(1);
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+        let (child_target, _child_subscription) = ResourceReclaimSubscription::channel();
+        let turn = pending(
+            fixture
+                .port
+                .create_scope_with_reclaimable_lease_cooperatively(
+                    &fixture.own.scope,
+                    one,
+                    child_target,
+                )
+                .expect("a new-child turn that needs one reclaimed unit"),
+        );
+        assert_eq!(
+            notified_competitors(&fixture),
+            vec![true],
+            "a new-child demand victimizes the competing root first, exactly as \
+             an existing-scope demand does"
+        );
+        assert!(
+            !fixture.own.subscription.is_requested(),
+            "demanding through an uncommitted child must not route around the \
+             own-root-last ordering"
+        );
+        drop(turn);
+    }
+
+    #[test]
+    fn reclaim_notifies_the_exact_victim_owner_only() {
+        let fixture = victim_fixture(2);
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+        let before = fixture.provider.transactional_snapshot_for_test();
+
+        let turn = pending(
+            fixture
+                .port
+                .acquire_cooperatively(
+                    &fixture.own.scope,
+                    ResourceAuthorityClass::Admitted,
+                    one,
+                    None,
+                )
+                .expect("a turn that needs one reclaimed unit"),
+        );
+
+        // Exactly one competitor is notified — the second competitor is not
+        // swept in — and the requester's own root is untouched.
+        assert_eq!(
+            notified_competitors(&fixture),
+            vec![true, false],
+            "only the single victim needed to cover the deficit is notified"
+        );
+        assert!(!fixture.own.subscription.is_requested());
+
+        // While the turn is outstanding the provider legitimately holds a
+        // pending record and may hold an active demand, so the strong
+        // no-residual comparison cannot be made here. Capture only the reclaim
+        // cursor that victim selection set.
+        let during = fixture.provider.transactional_snapshot_for_test();
+        assert!(
+            during.reclaim_cursor.is_some(),
+            "selecting a victim records its root as the reclaim cursor"
+        );
+        assert_eq!(
+            during
+                .scopes
+                .iter()
+                .filter(|(_, _, _, pending)| pending.is_some())
+                .count(),
+            1,
+            "exactly one scope holds the outstanding turn"
+        );
+
+        // Retire the turn, then assert that nothing but the reclaim survives:
+        // the appended dispositions are exactly the acceptance and its
+        // cancellation, with no grant of any kind, and the victim's lifecycle
+        // transition is the only other difference.
+        drop(turn);
+        let after = fixture.provider.transactional_snapshot_for_test();
+        assert_no_mutation_except_reclaim(
+            &before,
+            &after,
+            during.reclaim_cursor,
+            &["accepted", "cancelled"],
+            "reclaim request then cancellation",
+        );
+    }
+
+    #[test]
+    fn cancelling_a_new_child_turn_after_reclaim_leaves_only_the_victim_delta() {
+        let fixture = victim_fixture(1);
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+        let before = fixture.provider.transactional_snapshot_for_test();
+
+        let (child_target, _child_subscription) = ResourceReclaimSubscription::channel();
+        let turn = pending(
+            fixture
+                .port
+                .create_scope_with_reclaimable_lease_cooperatively(
+                    &fixture.own.scope,
+                    one,
+                    child_target,
+                )
+                .expect("a new-child turn"),
+        );
+        assert_eq!(notified_competitors(&fixture), vec![true]);
+        let after_request = fixture.provider.transactional_snapshot_for_test();
+
+        // Cancelling must undo everything the demand introduced. The only
+        // permitted differences from the pre-demand state are the victim's
+        // single lifecycle transition, the reclaim cursor that selecting it
+        // set, and the two appended dispositions recording the acceptance and
+        // its cancellation. No child scope, order, reservation id, free-set
+        // entry, charge, or rotation cursor may survive, and no grant or other
+        // unexpected trace entry may appear.
+        drop(turn);
+        let after_cancel = fixture.provider.transactional_snapshot_for_test();
+        assert_no_mutation_except_reclaim(
+            &before,
+            &after_cancel,
+            after_request.reclaim_cursor,
+            // The demand was accepted and then cancelled: those two
+            // dispositions are required, and no grant may appear.
+            &["accepted", "cancelled"],
+            "new-child turn cancelled after reclaim",
+        );
+
+        // The victim was asked to retire and did not, so its charge is intact
+        // and its notification stands.
+        assert_eq!(notified_competitors(&fixture), vec![true]);
+        // The failure half of this path — an allocator refusal rather than a
+        // cancellation — is covered by
+        // `pending_new_child_promotion_survives_scope_order_failure_and_promotes_exactly_once`
+        // and `reservation_id_failure_during_arbitrate_preserves_pending_new_child`.
+    }
+
+    #[test]
+    fn reclaim_cursor_wrap_selects_the_same_next_victim_for_existing_and_new_child_requests() {
+        // Three competitors, so a wrap is observable rather than degenerate.
+        // The first request fixes the cursor on one competitor's root; the
+        // second must advance to the next competitor, not re-notify the first
+        // and not reach into the requester's own root while competitors remain.
+        // Both request shapes must wrap to the same victim.
+        fn wrap_victim(new_child: bool) -> (Vec<bool>, bool) {
+            let fixture = victim_fixture(3);
+            let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+            let first = pending(
+                fixture
+                    .port
+                    .acquire_cooperatively(
+                        &fixture.own.scope,
+                        ResourceAuthorityClass::Admitted,
+                        one,
+                        None,
+                    )
+                    .expect("first turn fixes the reclaim cursor"),
+            );
+            assert_eq!(
+                notified_competitors(&fixture),
+                vec![true, false, false],
+                "the first request victimizes the first competing root"
+            );
+            drop(first);
+
+            let second = if new_child {
+                let (target, _subscription) = ResourceReclaimSubscription::channel();
+                pending(
+                    fixture
+                        .port
+                        .create_scope_with_reclaimable_lease_cooperatively(
+                            &fixture.own.scope,
+                            one,
+                            target,
+                        )
+                        .expect("second turn as a new-child demand"),
+                )
+            } else {
+                pending(
+                    fixture
+                        .port
+                        .acquire_cooperatively(
+                            &fixture.own.scope,
+                            ResourceAuthorityClass::Admitted,
+                            one,
+                            None,
+                        )
+                        .expect("second turn from an existing scope"),
+                )
+            };
+            let notified = notified_competitors(&fixture);
+            let own_notified = fixture.own.subscription.is_requested();
+            drop(second);
+            (notified, own_notified)
+        }
+
+        let (existing_notified, existing_own) = wrap_victim(false);
+        let (new_child_notified, new_child_own) = wrap_victim(true);
+
+        assert_eq!(
+            existing_notified, new_child_notified,
+            "the wrapped next victim must be the same for an existing-scope and \
+             a new-child request"
+        );
+        assert_eq!(
+            existing_notified,
+            vec![true, true, false],
+            "the cursor advances to the next competing root rather than \
+             re-notifying the first or skipping ahead"
+        );
+        assert!(
+            !existing_own && !new_child_own,
+            "the requester's own root is not reached while competing roots remain"
+        );
     }
 
     #[test]
@@ -5398,9 +6426,12 @@ mod tests {
             after.active_demand, before.active_demand,
             "{label}: the active demand changed"
         );
+        // Equality is correct here, unlike in the cancellation helper: a
+        // refused promotion creates no demand, so it must append nothing at
+        // all — not merely no grant.
         assert_eq!(
-            after.selection_log, before.selection_log,
-            "{label}: a refused promotion recorded a selection"
+            after.decision_log, before.decision_log,
+            "{label}: a refused promotion appended a decision"
         );
     }
 
@@ -5421,7 +6452,7 @@ mod tests {
             provider.transactional_snapshot_for_test(),
             before,
             "a refused root mint adds no scope, advances no allocator, moves no \
-             cursor, touches no selection log, and consumes no capacity"
+             cursor, appends no decision, and consumes no capacity"
         );
 
         provider.fail_scope_order_allocation_for_test(false);
