@@ -5678,6 +5678,23 @@ mod tests {
     }
 
     fn victim_fixture(competitors: usize) -> VictimFixture {
+        victim_fixture_around_requester(0, competitors)
+    }
+
+    /// As above, but with `before` competing roots created **before** the
+    /// requester's root and `after` created after it.
+    ///
+    /// Creation order fixes root order, and root order is what the reclaim sort
+    /// compares. A requester at the lowest root order is a degenerate case: once
+    /// any cursor is set, `victim_root <= cursor` already sorts the requester
+    /// last, so the dedicated own-root component of the sort key becomes
+    /// unobservable. Placing competitors on both sides of the requester is what
+    /// makes that component load-bearing.
+    ///
+    /// `others` is ordered earliest-created first, so indices `0..before` are
+    /// the roots preceding the requester and the rest follow it.
+    fn victim_fixture_around_requester(before: usize, after: usize) -> VictimFixture {
+        let competitors = before + after;
         let roots = competitors + 1;
         let grant = claim(&[
             (ResourceClass::QueuedBytes, roots as u64),
@@ -5687,9 +5704,27 @@ mod tests {
         let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
         let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
 
-        // The requester's own root is created first, so it also holds the
-        // lowest root order. Own-root-last ordering must therefore beat plain
-        // root order, not merely coincide with it.
+        let new_competitor = |port: &ResourceProviderPort| {
+            let scope = port.create_fairness_root_scope().expect("competing root");
+            let (target, subscription) = ResourceReclaimSubscription::channel();
+            let lease = port
+                .acquire_reclaimable_now(&scope, one, target)
+                .expect("competing reclaimable unit");
+            VictimRoot {
+                scope,
+                subscription,
+                _lease: lease,
+            }
+        };
+
+        // Competing roots created before the requester.
+        let mut others: Vec<VictimRoot> = (0..before).map(|_| new_competitor(&port)).collect();
+
+        // The requester's own root. With `before == 0` it holds the lowest root
+        // order, so own-root-last ordering must beat plain root order rather
+        // than coincide with it. With `before > 0` it sits mid-order, which is
+        // what makes the own-root sort component observable once a cursor has
+        // advanced past the earlier competitors.
         let own_scope = port.create_fairness_root_scope().expect("requester root");
         let (own_target, own_subscription) = ResourceReclaimSubscription::channel();
         let own_lease = port
@@ -5701,20 +5736,8 @@ mod tests {
             _lease: own_lease,
         };
 
-        let others = (0..competitors)
-            .map(|_| {
-                let scope = port.create_fairness_root_scope().expect("competing root");
-                let (target, subscription) = ResourceReclaimSubscription::channel();
-                let lease = port
-                    .acquire_reclaimable_now(&scope, one, target)
-                    .expect("competing reclaimable unit");
-                VictimRoot {
-                    scope,
-                    subscription,
-                    _lease: lease,
-                }
-            })
-            .collect();
+        // Competing roots created after the requester.
+        others.extend((0..after).map(|_| new_competitor(&port)));
 
         VictimFixture {
             provider,
@@ -6047,14 +6070,47 @@ mod tests {
 
     #[test]
     fn reclaim_cursor_wrap_selects_the_same_next_victim_for_existing_and_new_child_requests() {
-        // Three competitors, so a wrap is observable rather than degenerate.
-        // The first request fixes the cursor on one competitor's root; the
-        // second must advance to the next competitor, not re-notify the first
-        // and not reach into the requester's own root while competitors remain.
-        // Both request shapes must wrap to the same victim.
+        // One competitor before the requester's root and one after, so the
+        // requester sits mid-order. That arrangement is what makes the
+        // `victim_root == requester_root` component of the sort key
+        // load-bearing.
+        //
+        // With the requester at the lowest root order — as a plain
+        // `victim_fixture` produces — the test would be degenerate: once the
+        // first victim sets a cursor, `victim_root <= cursor` already sorts the
+        // requester last, so deleting the own-root component would leave the
+        // selection unchanged and the control would prove nothing.
+        //
+        // Here, after the first request sets the cursor on the *earlier*
+        // competitor, the requester is no longer covered by that cursor
+        // predicate. Only the own-root component keeps it last, so removing
+        // that component makes the second request select the requester's own
+        // root — which this control detects.
         fn wrap_victim(new_child: bool) -> (Vec<bool>, bool) {
-            let fixture = victim_fixture(3);
+            let fixture = victim_fixture_around_requester(1, 1);
             let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+            // Premise: creation order really did place the requester between
+            // the two competitors in root order. Root values are visible in the
+            // snapshot, so this is checked rather than assumed.
+            let snapshot = fixture.provider.transactional_snapshot_for_test();
+            let root_of_scope = |scope: &ResourceScope| {
+                snapshot
+                    .scopes
+                    .iter()
+                    .find(|(scope_id, _, _, _)| *scope_id == scope.id())
+                    .map(|(_, root, _, _)| *root)
+                    .expect("every live scope appears in the snapshot")
+            };
+            let earlier = root_of_scope(&fixture.others[0].scope);
+            let requester = root_of_scope(&fixture.own.scope);
+            let later = root_of_scope(&fixture.others[1].scope);
+            assert!(
+                earlier < requester && requester < later,
+                "fixture premise: the requester's root must sit between the two \
+                 competing roots, or the own-root sort component is unobservable \
+                 ({earlier} < {requester} < {later})"
+            );
 
             let first = pending(
                 fixture
@@ -6069,8 +6125,9 @@ mod tests {
             );
             assert_eq!(
                 notified_competitors(&fixture),
-                vec![true, false, false],
-                "the first request victimizes the first competing root"
+                vec![true, false],
+                "the first request victimizes the earlier competing root, \
+                 setting the cursor below the requester's own root"
             );
             drop(first);
 
@@ -6115,9 +6172,10 @@ mod tests {
         );
         assert_eq!(
             existing_notified,
-            vec![true, true, false],
-            "the cursor advances to the next competing root rather than \
-             re-notifying the first or skipping ahead"
+            vec![true, true],
+            "the second request skips the requester's own root and selects the \
+             later competitor. Without the own-root sort component the requester \
+             would be chosen here, since the cursor no longer covers it"
         );
         assert!(
             !existing_own && !new_child_own,
