@@ -130,8 +130,10 @@ pub(super) fn realtime_flow_capability_claim(
 /// Temporary adapter for the existing live channel object.
 ///
 /// The adapter requires a capability that the connector already produced. A
-/// legacy object cannot mint the capability. Arc 04 deletes this wrapper when
-/// endpoint authentication consumes `ConnectedChannelCapability` directly.
+/// legacy object cannot mint the capability. Arc 04 endpoint authentication now
+/// consumes the connected channel directly — `EndpointAuthTask::authenticate`
+/// takes the whole handoff — but this wrapper was not removed by that change;
+/// its deletion belongs to Arc 05.
 #[allow(
     dead_code,
     reason = "Arc 04 installs and deletes this migration adapter"

@@ -373,6 +373,12 @@ The endpoint-authentication profile must bind:
 
 A signaling account, ICE username, DTLS certificate not bound to the Device ID, TURN credential, IP address, or relay identity cannot substitute for this proof.
 
+**Implementation status (Arc 04).** This document claims no execution or audit result; citation requires exact-state local evidence and exact-head hosted/audit evidence recorded externally. The requirements above are unchanged; this records which permitted alternative was selected and how it is composed.
+
+- *Exact connected channel or channel exporter*: the **channel** alternative was selected, and it is satisfied by composition rather than by any single term. The peer-agreed cryptographic binding term is both endpoints' DTLS certificate fingerprints in role-canonical order. **The fingerprint pair alone does not establish exact-channel binding** — reused certificates make it non-session-unique. Exactness of the overall promotion comes from two further parts: the two fresh bilateral contributions, which bind the transcript to *this attempt*; and the non-transferable, connector-incarnation-owned handoff and capability, which bind the promotion to *this live connector*. The RFC 5705 exporter alternative is **deferred**: it is implemented in `webrtc-dtls` but unreachable, since `DTLSConn.state` and `RTCDtlsTransport::conn()` are both crate-private, so reaching it would require vendoring a third dependency while vendored-tree integrity remains an open gate.
+- *Negotiated cryptographic profile*: realised as a closed single-variant selection (`EndpointAuthProfile::V1Ed25519Dtls`), bound as a signed length-prefixed field. There is no negotiation source yet, so the requirement is met by construction — a caller cannot select a weaker profile because no other inhabitant exists — rather than by runtime agreement.
+- *Residual, and it is load-bearing*: because the binding term is not session-unique, replay across channels is prevented by the two per-attempt CSPRNG contributions, and transfer or survival of an already-issued capability is prevented by exact connector-incarnation ownership. Ownership does not make an otherwise-valid signature invalid, and the binding does not separate sessions — neither mechanism substitutes for the other.
+
 ### 7.2 Promotion transition
 
 Only the session runtime may promote a connected channel.

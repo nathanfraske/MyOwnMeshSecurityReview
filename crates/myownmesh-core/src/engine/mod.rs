@@ -2445,9 +2445,12 @@ async fn handle_inbound_frame_from(
     let Some(peer) = state.peers.get_if_current(owner) else {
         return;
     };
+    // Evaluated before the write guard: the predicate reads peer state, and
+    // re-entering the lock under a writer would deadlock.
+    let application_admitted = peer.is_application_admitted();
     {
         let mut data = peer.state.write();
-        if application && !data.is_admitted() {
+        if application && !application_admitted {
             data.admission_rejected = data.admission_rejected.saturating_add(1);
             let count = data.admission_rejected;
             drop(data);
@@ -2769,7 +2772,7 @@ pub(crate) async fn send_to_peer(
             return Err(Error::Network(format!("peer not found: {device_id}")));
         };
         if matches!(message_admission(msg), Admission::Application)
-            && !peer.state.read().is_admitted()
+            && !peer.is_application_admitted()
         {
             return Err(Error::Network(format!(
                 "peer is not admitted for application traffic: {device_id}"
@@ -2811,8 +2814,7 @@ pub(crate) async fn send_to_peer_owner(
         .peers
         .get_if_current(owner)
         .ok_or_else(|| Error::Network(format!("peer owner is stale: {}", owner.device_id())))?;
-    if matches!(message_admission(msg), Admission::Application) && !peer.state.read().is_admitted()
-    {
+    if matches!(message_admission(msg), Admission::Application) && !peer.is_application_admitted() {
         return Err(Error::Network(format!(
             "peer owner is not admitted for application traffic: {}",
             owner.device_id()
@@ -2847,7 +2849,7 @@ async fn send_channel_frame(
     let admitted = state
         .peers
         .get(peer)
-        .is_some_and(|connection| connection.state.read().is_admitted());
+        .is_some_and(|connection| connection.is_application_admitted());
     if !admitted {
         return Err(Error::Network(format!(
             "peer is not admitted for application traffic: {peer}"
@@ -3428,6 +3430,28 @@ pub(crate) fn insert_admitted_legacy_test_peer(
     worker: Arc<crate::transport::WebRtcConnectorWorker>,
     auth_task: Arc<crate::endpoint_auth::EndpointAuthTask>,
 ) {
+    let peer = insert_legacy_test_peer_pending_auth(state, device_id, worker, auth_task);
+    // Arc 04: policy state alone no longer admits application traffic — every
+    // application, reliable and real-time gate additionally requires a live
+    // authenticated channel. A fixture that claims to be *admitted* must carry
+    // one, or every relayed frame it sends or receives is correctly refused.
+    peer.install_authenticated_channel_for_test();
+}
+
+/// Test-only: an installed peer with a live connector and endpoint-auth task,
+/// approved by legacy policy but holding **no** authenticated channel.
+///
+/// This is the pre-promotion state, and it is deliberately separate from
+/// [`insert_admitted_legacy_test_peer`]. Controls that must observe a
+/// promotion succeed or fail have to start without a capability, or a
+/// pre-installed one would mask the very outcome under test.
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn insert_legacy_test_peer_pending_auth(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    auth_task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+) -> Arc<PeerConnection> {
     let peer = Arc::new(PeerConnection::new(device_id.to_string(), Some(worker)));
     assert!(peer.install_endpoint_auth(auth_task));
     {
@@ -3436,7 +3460,52 @@ pub(crate) fn insert_admitted_legacy_test_peer(
         data.status = PeerStatus::Active;
         data.data_channel_open = true;
     }
-    install_peer(&state.peers, peer);
+    install_peer(&state.peers, Arc::clone(&peer));
+    peer
+}
+
+/// Test-only: the exact current owner token for an installed peer.
+///
+/// These three helpers exist so the native endpoint-auth controls in
+/// `legacy_v1` can bind exact-current peer state without the registry field
+/// being widened out of `engine`. Each one resolves through the owner token,
+/// so a control cannot accidentally observe a superseded registry entry.
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn legacy_test_owner(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+) -> Option<state::PeerOwnerToken> {
+    state.peers.owner(device_id)
+}
+
+/// Test-only: seed a completed contribution exchange on the exact current
+/// peer, returning the encoded local contribution a transcript must use.
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn legacy_test_seed_contributions(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    local: crate::endpoint_auth::LocalContribution,
+    remote: crate::endpoint_auth::PeerContribution,
+) -> Option<String> {
+    let peer = state.peers.get_if_current(owner)?;
+    let encoded = local.as_str().to_owned();
+    let mut data = peer.state.write();
+    data.nonce_sent = Some(local);
+    data.nonce_received = Some(remote);
+    Some(encoded)
+}
+
+/// Test-only: whether the exact current peer holds a live authenticated
+/// channel. A retired or superseded entry answers `false`.
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn legacy_test_has_authenticated_channel(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+) -> bool {
+    state
+        .peers
+        .get_if_current(owner)
+        .is_some_and(|peer| peer.has_authenticated_channel())
 }
 
 #[cfg(all(test, feature = "legacy-v1"))]
@@ -3966,6 +4035,14 @@ mod tests {
         let state = build_test_state("admit-active-ok");
         insert_session_less_peer(&state, "member", None);
         set_admission(&state, "member", true, PeerStatus::Active);
+        // Arc 04: policy state alone no longer admits. Install a real
+        // authenticated-channel capability so this exercises the inbound
+        // wiring rather than re-testing the gate's refusal.
+        state
+            .peers
+            .get("member")
+            .expect("peer present")
+            .install_authenticated_channel_for_test();
 
         handle_inbound_frame(
             &state,
@@ -3982,6 +4059,45 @@ mod tests {
         assert_eq!(d.diag.frames_in, 1, "an admitted peer's frame is processed");
         assert_eq!(d.admission_rejected, 0);
         assert!(d.last_recv_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_admission_gate_refuses_application_traffic_without_a_capability() {
+        // The bool-only negative, at the real inbound call site. `set_admission`
+        // makes legacy policy consider this peer fully admitted; without an
+        // installed authenticated channel the frame must still be rejected.
+        // This is the case that regresses if any gate falls back to the bool.
+        let state = build_test_state("admit-no-capability");
+        insert_session_less_peer(&state, "member", None);
+        set_admission(&state, "member", true, PeerStatus::Active);
+        assert!(
+            state
+                .peers
+                .get("member")
+                .expect("peer present")
+                .state
+                .read()
+                .is_admitted(),
+            "non-vacuity: legacy policy really does consider this peer admitted"
+        );
+
+        handle_inbound_frame(
+            &state,
+            "member",
+            frame_bytes(&MeshMessage::Channel {
+                channel: "chat".into(),
+                payload: serde_json::json!("hi"),
+            }),
+        )
+        .await;
+
+        let p = state.peers.get("member").expect("peer present");
+        let d = p.state.read();
+        assert_eq!(
+            d.diag.frames_in, 0,
+            "no application frame is processed without a live capability"
+        );
+        assert_eq!(d.admission_rejected, 1);
     }
 
     #[tokio::test]

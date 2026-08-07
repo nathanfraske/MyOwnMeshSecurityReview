@@ -68,16 +68,35 @@
 //!
 //! # Trust model
 //!
-//! Each device owns a long-lived ed25519 keypair. The `hello`
-//! handshake commits both sides to a shared nonce; the
-//! `auth_response` is an ed25519 signature over
-//! `SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id ||
-//! channel_binding`. Domain separation prevents a signature obtained
-//! for one protocol step from being replayed in another, and the
-//! `channel_binding` — the DTLS certificate fingerprint of the channel
-//! the handshake runs over — ties the proven identity to *this*
-//! transport, so a man-in-the-middle on the (unauthenticated) signaling
-//! path can't relay the handshake across two DTLS legs it terminates.
+//! Each device owns a long-lived ed25519 keypair. Both sides send a
+//! `hello` carrying an independently drawn 32-byte contribution; the
+//! `auth_response` is an ed25519 signature over the endpoint-auth
+//! transcript, whose fields are length-prefixed under
+//! `ENDPOINT_AUTH_DOMAIN_TAG`: the mesh context, the fixed crypto
+//! profile, the signer's role, both device IDs, both contributions, and
+//! both endpoints' DTLS certificate fingerprints — every paired field
+//! in role-canonical order, so the two sides derive identical bytes.
+//! Each side verifies its own half as well as the peer's, so a proof is
+//! mutual rather than one-directional.
+//!
+//! Domain separation prevents a signature obtained for one protocol step
+//! from being replayed in another. Binding both fingerprints ties the
+//! proven identity to *this* transport, so a man-in-the-middle on the
+//! (unauthenticated) signaling path can't relay the handshake across two
+//! DTLS legs it terminates — it would have to present its own
+//! certificate to each leg.
+//!
+//! A certificate fingerprint is **not** a session-unique exporter,
+//! though: two channels between the same pair reusing the same
+//! certificates carry the same value. Replay across channels is
+//! prevented by the per-attempt contributions, and transfer of an
+//! already-issued capability is prevented by connector-incarnation
+//! ownership — not by the fingerprints.
+//!
+//! This is a hard cutover. The legacy `SIGN_DOMAIN_TAG` handshake
+//! payload is neither produced nor accepted on the live path, and there
+//! is no feature-negotiated fallback: an older peer fails authentication
+//! rather than negotiating down, so a downgrade is not attacker-selectable.
 //!
 //! A user-visible 6-char verification code lets a human
 //! eyeball-confirm the handshake over voice/video at first-meeting

@@ -38,4 +38,6 @@ This worker does not mint session authority, decide mesh authorization, authenti
 
 ## Compatibility adapter
 
-`LegacyConnectedChannel<T>` keeps the current native channel object beside an already-created capability. It cannot create authority from the legacy value. Arc 04 deletes it when endpoint authentication consumes `ConnectedChannelCapability` directly.
+`LegacyConnectedChannel<T>` keeps the current native channel object beside an already-created capability. It cannot create authority from the legacy value.
+
+Arc 04 endpoint authentication now consumes the connected channel directly: `EndpointAuthTask::authenticate` takes the whole `EndpointAuthHandoff` — capability, connector incarnation, and close owner together — so the close-owner retention travels with the promotion. `LegacyConnectedChannel<T>` was **not** deleted by that change and still exists; its removal remains Arc 05's.

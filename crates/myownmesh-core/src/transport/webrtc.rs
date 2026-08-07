@@ -1,5 +1,5 @@
-//! WebRTC peer connection wrapper. Bridges webrtc-rs's callback-
-//! driven API to one bounded mailbox per connector worker.
+//! WebRTC peer connection wrapper. Bridges webrtc-rs's callback-driven
+//! API to one bounded mailbox per connector worker.
 //!
 //! Lifecycle per peer:
 //!
@@ -3033,6 +3033,27 @@ impl EndpointAuthHandoff {
     pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
         Arc::ptr_eq(&self.incarnation, incarnation)
     }
+
+    /// The exact connector incarnation this channel belongs to.
+    pub(crate) fn incarnation(&self) -> &Arc<WebRtcConnectorIncarnation> {
+        &self.incarnation
+    }
+
+    /// Borrow the connected capability without consuming the handoff.
+    ///
+    /// Endpoint authentication validates against this borrow before it takes
+    /// anything, so a refused attempt leaves the handoff intact and `Drop`
+    /// still re-retains the claim.
+    pub(crate) fn capability(&self) -> Option<&crate::connector::ConnectedChannelCapability> {
+        self.capability.as_ref()
+    }
+
+    // Deliberately no `take`/`restore` of the bare capability. Promotion moves
+    // the *whole* handoff, because this type is what carries the connector
+    // incarnation and the close owner, and its `Drop` is what re-retains the
+    // connected claim until native close succeeds. Extracting the capability
+    // alone would strip that retention, so an authenticated capability dropped
+    // on retirement or on a refused install would release the claim early.
 }
 
 impl Drop for EndpointAuthHandoff {
@@ -6455,12 +6476,19 @@ impl PeerSession {
     /// peer's presented certificate against the `a=fingerprint:` in the SDP it
     /// received, so on an un-intercepted channel a peer's
     /// [`Self::remote_fingerprint`] equals its counterpart's
-    /// `local_fingerprint`. The auth handshake folds this value into the signed
-    /// ed25519 payload (see [`crate::signing::handshake_payload`]) so a
+    /// `local_fingerprint`. The auth handshake folds this value — together
+    /// with [`Self::remote_fingerprint`], so the transcript commits to the
+    /// pair rather than to the signer alone — into the signed Arc 04
+    /// endpoint-auth transcript (see [`crate::endpoint_auth`]), so a
     /// signaling-path man-in-the-middle — which must present its own
     /// certificate on each leg it terminates — is detected: the victim's
     /// observed remote fingerprint no longer matches the one the real peer
     /// signed. `None` before the local description is set.
+    ///
+    /// A fingerprint identifies the certificate, not the session, so this is
+    /// not a session-unique exporter and does not separate two channels that
+    /// reuse the same certificates; per-attempt contributions and
+    /// connector-incarnation ownership carry that.
     pub async fn local_fingerprint(&self) -> Option<String> {
         sdp_fingerprint(&self.pc.local_description().await?.sdp)
     }
@@ -9327,6 +9355,818 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    // ---- Arc 04 endpoint-authentication controls -------------------------
+    //
+    // These live here rather than in `endpoint_auth` because the ownership
+    // half of the property needs real connector incarnations and a real close
+    // owner, which is exactly what `close_owner_fixture` provides. The
+    // transcript half is covered by the controls in `endpoint_auth::tests`.
+
+    const AUTH_MESH: &str = "mesh-context-alpha";
+    const AUTH_PROFILE: crate::endpoint_auth::EndpointAuthProfile =
+        crate::endpoint_auth::EndpointAuthProfile::V1Ed25519Dtls;
+
+    fn auth_key(seed: u8) -> (ed25519_dalek::SigningKey, String) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let device_id = data_encoding::BASE32_NOPAD
+            .encode(signing_key.verifying_key().as_bytes())
+            .to_lowercase();
+        (signing_key, device_id)
+    }
+
+    /// One live endpoint-auth task over a fresh connector incarnation.
+    fn auth_task_fixture(
+        owner: &MeshConnectorResourceScope,
+    ) -> (
+        Arc<crate::endpoint_auth::EndpointAuthTask>,
+        Arc<ConnectorCloseOwner>,
+        AttemptLifetime,
+        Arc<AtomicUsize>,
+    ) {
+        let (close_owner, lifetime) = close_owner_fixture(owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+            EndpointAuthHandoff::new(
+                connected,
+                Arc::clone(&close_owner.ownership.incarnation),
+                Arc::clone(&close_owner),
+            ),
+        ));
+        (task, close_owner, lifetime, calls)
+    }
+
+    /// The exact bytes one role must sign for this transcript.
+    #[allow(clippy::too_many_arguments)]
+    fn auth_transcript(
+        local_id: &str,
+        remote_id: &str,
+        local_c: &crate::endpoint_auth::LocalContribution,
+        remote_c: &crate::endpoint_auth::PeerContribution,
+        local_fp: &str,
+        remote_fp: &str,
+        signer: crate::endpoint_auth::EndpointRole,
+    ) -> Vec<u8> {
+        crate::endpoint_auth::EndpointAuthAttempt::transcript_bytes(
+            AUTH_MESH,
+            AUTH_PROFILE,
+            signer,
+            local_id,
+            remote_id,
+            local_c.as_str(),
+            remote_c.as_str(),
+            local_fp,
+            remote_fp,
+        )
+    }
+
+    /// One fresh peer contribution, as the wire would carry it.
+    fn peer_draw() -> crate::endpoint_auth::PeerContribution {
+        crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("a generated draw is canonical")
+    }
+
+    const FP_LOCAL: &str = "sha-256 AA:BB:CC:DD";
+    const FP_REMOTE: &str = "sha-256 11:22:33:44";
+
+    #[tokio::test]
+    async fn v4_arc04_complete_transcript_promotes_the_exact_channel() {
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let (local_key, local_id) = auth_key(1);
+        let (remote_key, remote_id) = auth_key(2);
+        let local_c = crate::endpoint_auth::LocalContribution::generate();
+        let remote_c = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("a generated draw is canonical");
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+        let local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id, &remote_id, &local_c, &remote_c, FP_LOCAL, FP_REMOTE, local_role,
+            ),
+        );
+        let remote_sig = crate::signing::sign_with(
+            &remote_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                local_role.peer(),
+            ),
+        );
+
+        let authenticated = task
+            .authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                &local_sig,
+                &remote_sig,
+            )
+            .expect("a complete mutual proof over the exact channel promotes");
+        drop(authenticated);
+
+        // The handoff is consumed exactly once: a second attempt has no
+        // channel left to authenticate.
+        let spare = crate::endpoint_auth::LocalContribution::generate();
+        let spare_peer = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("canonical");
+        assert_eq!(
+            task.authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &spare,
+                &spare_peer,
+                FP_LOCAL,
+                FP_REMOTE,
+                &local_sig,
+                &remote_sig,
+            )
+            .err(),
+            Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent),
+            "one channel yields at most one authenticated capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_refused_remote_half_restores_the_channel_claim() {
+        // The failure path that positive-only tests miss: `authenticate` takes
+        // the capability out of the handoff before checking the peer half, and
+        // the handoff's `Drop` re-retains only what is still present. Without
+        // the restore, a refused attempt would silently strand the claim and
+        // native close would never run.
+        let owner = test_resource_owner(1, 1);
+        let (task, close_owner, _lifetime, calls) = auth_task_fixture(&owner);
+        let (local_key, local_id) = auth_key(1);
+        let (_impostor, remote_id) = auth_key(2);
+        let (impostor_key, _) = auth_key(9);
+        let local_c = crate::endpoint_auth::LocalContribution::generate();
+        let remote_c = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("canonical");
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+        let local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id, &remote_id, &local_c, &remote_c, FP_LOCAL, FP_REMOTE, local_role,
+            ),
+        );
+        // Signed by a key that is not the claimed remote Device.
+        let forged = crate::signing::sign_with(
+            &impostor_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                local_role.peer(),
+            ),
+        );
+
+        assert_eq!(
+            task.authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                &local_sig,
+                &forged,
+            )
+            .err(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid)
+        );
+        assert_eq!(
+            owner.report().active_candidates,
+            1,
+            "the refusal must leave the channel claim owned, not stranded"
+        );
+
+        // And the restored claim is genuinely retainable: releasing the task
+        // still drives exactly one native close.
+        drop(task);
+        close_owner
+            .wait()
+            .await
+            .expect("native close follows the restored handoff");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_production_retirement_invalidates_the_endpoint_auth_task() {
+        // Drives the *production* replacement path, `retire_connector`, rather
+        // than calling `task.retire()` directly. Before this was wired, the
+        // task survived replacement with `is_retired() == false` and its
+        // handoff intact, so a late proof could still mint a capability —
+        // install would reject it, but only after the fact. Retirement must
+        // fail closed at the source.
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let peer = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "retiring-peer".to_string(),
+            Arc::clone(&task),
+        );
+        *peer.state.write() = admitted_legacy_state();
+        peer.install_authenticated_channel_for_test();
+
+        // Non-vacuity: everything is live and admitted before replacement.
+        assert!(!task.is_retired());
+        assert!(task.belongs_to(task.incarnation()));
+        assert!(peer.is_application_admitted());
+
+        // The exact production replacement call.
+        peer.retire_connector();
+
+        assert!(
+            task.is_retired(),
+            "replacement must retire the task at the source"
+        );
+        assert!(
+            !task.belongs_to(task.incarnation()),
+            "a retired task belongs to no connector"
+        );
+        assert!(
+            !peer.is_application_admitted(),
+            "application admission must be false immediately after replacement"
+        );
+
+        // A proof that would otherwise verify is now refused with the exact
+        // typed cause, before any capability can be minted.
+        let (local_key, local_id) = auth_key(1);
+        let (remote_key, remote_id) = auth_key(2);
+        let local_c = crate::endpoint_auth::LocalContribution::generate();
+        let remote_c = peer_draw();
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+        let local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id, &remote_id, &local_c, &remote_c, FP_LOCAL, FP_REMOTE, local_role,
+            ),
+        );
+        let remote_sig = crate::signing::sign_with(
+            &remote_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                local_role.peer(),
+            ),
+        );
+        assert_eq!(
+            task.authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                &local_sig,
+                &remote_sig,
+            )
+            .err(),
+            Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent),
+            "a superseded connector must refuse promotion, not merely fail to install"
+        );
+        assert!(
+            !peer.has_authenticated_channel(),
+            "and no capability is installed by the attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_retired_task_cannot_authenticate() {
+        // Replacement invalidation is a security control here, not
+        // housekeeping: with a certificate-fingerprint binding that is not
+        // session-unique, exact incarnation ownership is what separates two
+        // channels between the same pair.
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let (local_key, local_id) = auth_key(1);
+        let (remote_key, remote_id) = auth_key(2);
+        let local_c = crate::endpoint_auth::LocalContribution::generate();
+        let remote_c = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("canonical");
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+        let local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id, &remote_id, &local_c, &remote_c, FP_LOCAL, FP_REMOTE, local_role,
+            ),
+        );
+        let remote_sig = crate::signing::sign_with(
+            &remote_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                local_role.peer(),
+            ),
+        );
+
+        // The channel is replaced/retired before the proof arrives.
+        task.retire();
+
+        assert_eq!(
+            task.authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                &local_sig,
+                &remote_sig,
+            )
+            .err(),
+            Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent),
+            "a proof that would otherwise verify must not promote a retired channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_same_certificate_two_channels_bind_capabilities_to_distinct_incarnations() {
+        // C5. Two channels between one device pair reusing the same
+        // certificates, so the channel binding is identical by construction.
+        let owner = test_resource_owner(2, 2);
+        let (channel_one, _co1, _l1, _c1) = auth_task_fixture(&owner);
+        let (channel_two, _co2, _l2, _c2) = auth_task_fixture(&owner);
+        let (local_key, local_id) = auth_key(1);
+        let (remote_key, remote_id) = auth_key(2);
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+
+        // (a) NON-VACUITY. Both channels must genuinely share the binding; if
+        // the fixture ever produced per-channel certificates this control
+        // would silently become a no-op that passes while proving nothing.
+        let (ch1_local_fp, ch1_remote_fp) = (FP_LOCAL, FP_REMOTE);
+        let (ch2_local_fp, ch2_remote_fp) = (FP_LOCAL, FP_REMOTE);
+        assert_eq!(ch1_local_fp, ch2_local_fp);
+        assert_eq!(ch1_remote_fp, ch2_remote_fp);
+
+        // Channel 1 authenticates normally.
+        let one_local = crate::endpoint_auth::LocalContribution::generate();
+        let one_remote = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("canonical");
+        let one_local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &one_local,
+                &one_remote,
+                ch1_local_fp,
+                ch1_remote_fp,
+                local_role,
+            ),
+        );
+        let one_remote_sig = crate::signing::sign_with(
+            &remote_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &one_local,
+                &one_remote,
+                ch1_local_fp,
+                ch1_remote_fp,
+                local_role.peer(),
+            ),
+        );
+        let promoted = channel_one
+            .authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &one_local,
+                &one_remote,
+                ch1_local_fp,
+                ch1_remote_fp,
+                &one_local_sig,
+                &one_remote_sig,
+            )
+            .expect("channel 1 authenticates");
+
+        // (b) ORDINARY REPLAY. Channel 2 draws its own fresh contributions, so
+        // channel 1's captured signature does not cover channel 2's
+        // transcript. This is freshness doing the work, not the binding.
+        let two_local = crate::endpoint_auth::LocalContribution::generate();
+        let two_remote = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("canonical");
+        let two_local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &two_local,
+                &two_remote,
+                ch2_local_fp,
+                ch2_remote_fp,
+                local_role,
+            ),
+        );
+        assert_eq!(
+            channel_two
+                .authenticate(
+                    AUTH_MESH,
+                    AUTH_PROFILE,
+                    &local_id,
+                    &remote_id,
+                    &two_local,
+                    &two_remote,
+                    ch2_local_fp,
+                    ch2_remote_fp,
+                    &two_local_sig,
+                    &one_remote_sig, // replayed from channel 1
+                )
+                .err(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "a replayed proof must not authenticate a channel with fresh contributions"
+        );
+
+        // (c) THE DISCRIMINATING CASE, stated honestly. Force channel 2 to
+        // reuse channel 1's exact contributions. Because the fingerprints are
+        // equal, the two transcripts are now byte-identical and channel 1's
+        // signature is cryptographically VALID over channel 2's transcript.
+        // Ownership cannot and does not change that — asserting otherwise
+        // would be an overclaim.
+        let forced = auth_transcript(
+            &local_id,
+            &remote_id,
+            &one_local,
+            &one_remote,
+            ch2_local_fp,
+            ch2_remote_fp,
+            local_role.peer(),
+        );
+        let original = auth_transcript(
+            &local_id,
+            &remote_id,
+            &one_local,
+            &one_remote,
+            ch1_local_fp,
+            ch1_remote_fp,
+            local_role.peer(),
+        );
+        assert_eq!(
+            forced, original,
+            "equal certificates plus reused contributions make the transcripts identical"
+        );
+        assert_eq!(
+            crate::signing::verify(&remote_id, &forced, &one_remote_sig).ok(),
+            Some(true),
+            "and the replayed signature is genuinely valid over it"
+        );
+
+        // Two distinct mechanisms carry this, and they must not be conflated:
+        //
+        //  * Cross-channel *proof* replay is prevented by per-attempt
+        //    contribution uniqueness, and by that alone. If channel 2 ever
+        //    presented the same certificate pair AND the same two contribution
+        //    values, its transcript would be identical and its own task would
+        //    verify the old signature — ownership cannot tell where a
+        //    cryptographically valid proof was signed. In production that case
+        //    does not arise because the engine draws a fresh contribution per
+        //    connector attempt and `LocalContribution` has no constructor that
+        //    rebuilds one from bytes. Non-`Clone` prevents casual duplication;
+        //    it is not by itself the guarantee.
+        //
+        //  * Ownership prevents *already-issued authority* from transferring
+        //    across channels or surviving replacement. That is what the
+        //    assertions below cover, and what
+        //    `v4_arc04_install_refuses_a_capability_from_another_incarnation`
+        //    exercises through the real install path.
+        assert!(
+            promoted.belongs_to(channel_one.incarnation()),
+            "non-vacuity: the predicate is not constantly false"
+        );
+        assert!(
+            !promoted.belongs_to(channel_two.incarnation()),
+            "a capability promoted on channel 1 must not be installable against \
+             channel 2, valid proof or not"
+        );
+        assert!(
+            !Arc::ptr_eq(channel_one.incarnation(), channel_two.incarnation()),
+            "the two fixtures really are distinct incarnations"
+        );
+        drop(promoted);
+    }
+
+    /// Promote one channel to an authenticated capability, for install tests.
+    fn promote_for_install(
+        task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> crate::endpoint_auth::AuthenticatedChannelCapability {
+        let (local_key, local_id) = auth_key(1);
+        let (remote_key, remote_id) = auth_key(2);
+        let local_c = crate::endpoint_auth::LocalContribution::generate();
+        let remote_c = peer_draw();
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+        let local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id, &remote_id, &local_c, &remote_c, FP_LOCAL, FP_REMOTE, local_role,
+            ),
+        );
+        let remote_sig = crate::signing::sign_with(
+            &remote_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                local_role.peer(),
+            ),
+        );
+        task.authenticate(
+            AUTH_MESH,
+            AUTH_PROFILE,
+            &local_id,
+            &remote_id,
+            &local_c,
+            &remote_c,
+            FP_LOCAL,
+            FP_REMOTE,
+            &local_sig,
+            &remote_sig,
+        )
+        .expect("the fixture proof promotes")
+    }
+
+    /// Peer state that legacy policy would call admitted.
+    fn admitted_legacy_state() -> crate::engine::connection::PeerStateData {
+        crate::engine::connection::PeerStateData {
+            authenticated: true,
+            status: crate::engine::connection::PeerStatus::Active,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_application_admission_requires_a_live_capability_not_just_the_legacy_bool() {
+        // The enforcement half. Storing the capability is not the same as
+        // gating on it: `authenticated` records policy history and survives
+        // channel replacement, so a gate reading only the bool would keep
+        // admitting application traffic after the authority artifact is gone.
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let peer = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "gate-peer".to_string(),
+            Arc::clone(&task),
+        );
+
+        // (1) Legacy bool set, no capability installed → refused.
+        *peer.state.write() = admitted_legacy_state();
+        assert!(
+            peer.state.read().is_admitted(),
+            "non-vacuity: legacy policy really does consider this admitted"
+        );
+        assert!(
+            !peer.is_application_admitted(),
+            "the legacy bool alone must not admit application traffic"
+        );
+
+        // (2) Capability installed but policy not active → refused.
+        *peer.state.write() = crate::engine::connection::PeerStateData::default();
+        let capability = promote_for_install(&task);
+        assert!(peer.install_authenticated_channel(&task, capability));
+        assert!(
+            !peer.is_application_admitted(),
+            "a live capability does not bypass approval policy"
+        );
+
+        // (3) Both present on the current connector → admitted.
+        *peer.state.write() = admitted_legacy_state();
+        assert!(
+            peer.is_application_admitted(),
+            "policy plus a live capability admits"
+        );
+
+        // (4) Replacement invalidates immediately, while the registry entry and
+        // the legacy bool are both untouched.
+        peer.retire_connector();
+        assert!(
+            peer.state.read().is_admitted(),
+            "the legacy bool is deliberately left set, which is why it cannot \
+             be the gate"
+        );
+        assert!(
+            !peer.is_application_admitted(),
+            "retiring the connector must refuse application traffic at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_install_refuses_a_capability_from_another_incarnation() {
+        // The install-path half of C5, and the one that actually fails if the
+        // capability/incarnation binding is removed from
+        // `install_authenticated_channel`. Both channels share device
+        // identities and certificate fingerprints, so nothing cryptographic
+        // separates them — only provenance does.
+        let owner = test_resource_owner(3, 3);
+        let (task_one, _co1, _l1, _c1) = auth_task_fixture(&owner);
+        let (task_two, _co2, _l2, _c2) = auth_task_fixture(&owner);
+        // A third live channel, so the negative case uses a capability this
+        // test still owns rather than one already moved into `peer_one`.
+        let (task_three, _co3, _l3, _c3) = auth_task_fixture(&owner);
+        assert!(
+            !Arc::ptr_eq(task_one.incarnation(), task_two.incarnation()),
+            "non-vacuity: the fixtures are genuinely distinct incarnations"
+        );
+
+        // POSITIVE: a capability installs on the peer whose current task
+        // promoted it. Without this the negative case below could pass simply
+        // because install always refuses.
+        let cap_one = promote_for_install(&task_one);
+        let peer_one = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "peer-one".to_string(),
+            Arc::clone(&task_one),
+        );
+        assert!(
+            peer_one.install_authenticated_channel(&task_one, cap_one),
+            "a capability must install against the task that promoted it"
+        );
+        assert!(peer_one.has_authenticated_channel());
+
+        // NEGATIVE: channel 2's task is current on its own peer, but the
+        // capability came from channel 1. Checking only that the *task* is
+        // current would accept this, which is the cross-channel relay.
+        let relayed = promote_for_install(&task_three);
+        let peer_two = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "peer-two".to_string(),
+            Arc::clone(&task_two),
+        );
+        assert!(
+            !peer_two.install_authenticated_channel(&task_two, relayed),
+            "a capability promoted on another connector incarnation must not \
+             install, even with the current task supplied alongside it"
+        );
+        assert!(
+            !peer_two.has_authenticated_channel(),
+            "and nothing is left installed after the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_promoted_capability_retains_the_connected_claim_until_native_close() {
+        // Promotion must carry the *whole* handoff. If it moved only the
+        // connected capability, dropping the authenticated capability — on
+        // retirement, or on a refused install — would release the claim
+        // directly and defeat Arc 03's "retained until native close succeeds".
+        let owner = test_resource_owner(1, 1);
+        // A *gated* native close, so the interval between "close entered" and
+        // "close succeeded" is observable. With an immediate close, an early
+        // release would produce the same before/after readings and the control
+        // would not discriminate.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Gate(Arc::clone(&gate)),
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+            EndpointAuthHandoff::new(
+                connected,
+                Arc::clone(&close_owner.ownership.incarnation),
+                Arc::clone(&close_owner),
+            ),
+        ));
+        let (local_key, local_id) = auth_key(1);
+        let (remote_key, remote_id) = auth_key(2);
+        let local_c = crate::endpoint_auth::LocalContribution::generate();
+        let remote_c = peer_draw();
+        let local_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_id, &remote_id);
+        let local_sig = crate::signing::sign_with(
+            &local_key,
+            &auth_transcript(
+                &local_id, &remote_id, &local_c, &remote_c, FP_LOCAL, FP_REMOTE, local_role,
+            ),
+        );
+        let remote_sig = crate::signing::sign_with(
+            &remote_key,
+            &auth_transcript(
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                local_role.peer(),
+            ),
+        );
+        let promoted = task
+            .authenticate(
+                AUTH_MESH,
+                AUTH_PROFILE,
+                &local_id,
+                &remote_id,
+                &local_c,
+                &remote_c,
+                FP_LOCAL,
+                FP_REMOTE,
+                &local_sig,
+                &remote_sig,
+            )
+            .expect("promotes");
+        assert_eq!(
+            owner.report().active_candidates,
+            1,
+            "promotion does not release the connected claim"
+        );
+
+        // Dropping the authenticated capability is what a retirement or a
+        // refused install does. The claim must survive into native close.
+        drop(promoted);
+        drop(task);
+
+        // Native close has now been entered but is blocked on the gate. This
+        // is the load-bearing interval: if promotion had stripped the handoff
+        // and the capability released the claim directly, the claim would
+        // already be gone here.
+        let closing = tokio::spawn({
+            let close_owner = Arc::clone(&close_owner);
+            async move { close_owner.wait().await }
+        });
+        while calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            owner.report().active_candidates,
+            1,
+            "the connected claim must still be retained while native close is in flight"
+        );
+
+        gate.notify_waiters();
+        closing
+            .await
+            .expect("close task joins")
+            .expect("native close succeeds once released");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "exactly one native close: no double retention, no missed release"
+        );
+        assert_eq!(
+            owner.report().active_candidates,
+            0,
+            "and the claim is released only after close succeeded"
+        );
     }
 
     #[tokio::test]

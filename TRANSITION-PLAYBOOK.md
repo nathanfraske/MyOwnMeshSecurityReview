@@ -349,6 +349,10 @@ DataChannelOpen
 
 **Delete:** cryptographic identity decisions from the legacy approval state machine.
 
+**Status (production-reachable, not complete).** This document claims no execution or audit result; citation requires exact-state local evidence and exact-head hosted/audit evidence recorded externally. Steps 1–5 are implemented and wired into the live `Hello`/`AuthResponse` handlers, with `EndpointAuthTask::authenticate` as the sole issuer and the resulting `AuthenticatedChannelCapability` owned by `PeerConnection` and enforced by every application, reliable, and real-time admission gate. Step 2's "binding/exporter" alternative was met with the **binding** option — both endpoints' DTLS certificate fingerprints, role-canonical — not an exporter; see the residual in `crates/myownmesh-core/src/endpoint_auth/BOUNDARY.md`. Step 5 is satisfied by `on_hello`/`on_auth_response` dropping the peer when either fingerprint is unavailable.
+
+**This document does not declare the arc complete.** It claims no execution or audit result for any gate above; citation requires exact-state local evidence and exact-head hosted/audit evidence recorded externally. Gate line 3 in particular carries the guarantee here, because the fingerprint binding is not session-unique — cross-channel replay is prevented by per-attempt contributions and by connector-incarnation ownership, so that control must be run and cited rather than assumed.
+
 ### Arc 05. First Session Broker vertical slice
 
 **Goal:** prove the new architecture end to end with one application operation.
@@ -927,7 +931,7 @@ The first PRs should be deliberately small:
 3. **`transport: wrap existing webrtc session as connector capability`**  
    Preserve transport behavior, no app dispatch.
 4. **`auth: extract channel-bound device authentication`**  
-   Produce `AuthenticatedChannelCapability`.
+   Produce `AuthenticatedChannelCapability`. *(Implemented and enforced at the admission gates; no execution or audit result is claimed here. Binding term is the certificate-fingerprint pair, not an exporter.)*
 5. **`session: promote one authenticated channel into one capability`**  
    Temporary policy adapter, one typed Channel positive control.
 6. **`session: gate directed channel and rpc operations`**  

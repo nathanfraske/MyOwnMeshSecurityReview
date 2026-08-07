@@ -60,8 +60,18 @@ pub struct PeerStateData {
     pub remote_shelved: bool,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
-    pub nonce_sent: Option<String>,
-    pub nonce_received: Option<String>,
+    /// This endpoint's own per-attempt contribution.
+    ///
+    /// Typed rather than a bare `String` so it can only have come from a fresh
+    /// CSPRNG draw. With a certificate-fingerprint channel binding that is not
+    /// session-unique, this freshness is the primary anti-replay mechanism, so
+    /// a value reconstructed from storage or from the wire must not be able to
+    /// stand in for one.
+    /// Crate-private, like the contribution types themselves: this is
+    /// in-flight handshake material, never part of the public peer snapshot.
+    pub(crate) nonce_sent: Option<crate::endpoint_auth::LocalContribution>,
+    /// The peer's contribution, accepted only in its canonical wire encoding.
+    pub(crate) nonce_received: Option<crate::endpoint_auth::PeerContribution>,
     pub verification_code_sent: Option<String>,
     pub verification_code_received: Option<String>,
     pub last_recv_at: Option<Instant>,
@@ -257,6 +267,14 @@ pub struct PeerConnection {
     pub state: RwLock<PeerStateData>,
     pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
     endpoint_auth: Mutex<Option<Arc<crate::endpoint_auth::EndpointAuthTask>>>,
+    /// The Arc 04 authority artifact for the exact current channel.
+    ///
+    /// `PeerStateData::authenticated` remains as legacy diagnostic and policy
+    /// state, but a bool cannot be invalidated by channel replacement and
+    /// carries no provenance. This slot does: it is installed only by the
+    /// endpoint-auth task that owns the current connector, and it is dropped
+    /// whenever that connector is retired or replaced.
+    authenticated_channel: Mutex<Option<crate::endpoint_auth::AuthenticatedChannelCapability>>,
     realtime_flow: Mutex<Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>>>,
     registry_retired: AtomicBool,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
@@ -274,6 +292,7 @@ impl PeerConnection {
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
             endpoint_auth: Mutex::new(None),
+            authenticated_channel: Mutex::new(None),
             realtime_flow: Mutex::new(None),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -287,8 +306,24 @@ impl PeerConnection {
 
     /// Retire the exact connector worker owned by this registry entry.
     /// External `Arc` holders cannot keep callbacks or queued candidates live.
-    pub(super) fn retire_connector(&self) {
+    pub(crate) fn retire_connector(&self) {
         self.registry_retired.store(true, Ordering::Release);
+        // Replacement invalidation is a security control, not housekeeping:
+        // because the certificate-fingerprint binding is not session-unique,
+        // exact connector ownership is what distinguishes this channel from
+        // another between the same pair. A capability authenticated under the
+        // retired connector must not survive into its replacement.
+        drop(self.authenticated_channel.lock().take());
+        // Retire the endpoint-auth task at the source, so a superseded
+        // connector refuses promotion rather than merely failing to install
+        // afterwards. Without this the task stays live with its handoff
+        // intact, `belongs_to` still answers true, and a late AuthResponse can
+        // still mint a capability — one that install would reject, but only
+        // after the fact. Retiring here makes `authenticate` fail closed with
+        // `ChannelNotCurrent`.
+        if let Some(task) = self.endpoint_auth.lock().as_ref() {
+            task.retire();
+        }
         drop(self.realtime_flow.lock().take());
         let worker = self.session.lock().clone();
         if let Some(worker) = worker {
@@ -305,6 +340,7 @@ impl PeerConnection {
             Some(worker) => worker.retire_and_close().await,
             None => Ok(()),
         };
+        drop(self.authenticated_channel.lock().take());
         drop(self.endpoint_auth.lock().take());
         result
     }
@@ -343,12 +379,127 @@ impl PeerConnection {
             .is_some_and(|current| Arc::ptr_eq(current, task))
     }
 
-    /// Temporary Arc 03 adapter. Endpoint Auth owns connected-channel
-    /// provenance, while the existing authenticated and mutually-approved
-    /// state machine remains the admission fact until Arc 04 implements the
-    /// channel-bound transcript capability.
+    /// The current endpoint-auth task, if this entry still owns one.
+    pub(super) fn endpoint_auth_task(&self) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
+        (!self.registry_retired()).then(|| self.endpoint_auth.lock().clone())?
+    }
+
+    /// Build an entry that already holds `task` as its current endpoint-auth
+    /// task, without a connector worker.
+    ///
+    /// The worker check in [`Self::install_endpoint_auth`] is deliberately
+    /// bypassed: it is not what this seam exists to exercise. Controls use it
+    /// to drive the real [`Self::install_authenticated_channel`] — including
+    /// its capability/incarnation binding — against tasks built from genuine
+    /// connector fixtures, which live in the transport module's test tree.
+    #[cfg(test)]
+    pub(crate) fn with_endpoint_auth_for_test(
+        device_id: String,
+        task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> Self {
+        let peer = Self::new(device_id, None);
+        *peer.endpoint_auth.lock() = Some(task);
+        peer
+    }
+
+    /// Install the authenticated-channel capability produced by `task`.
+    ///
+    /// Refused unless `task` is still this entry's current endpoint-auth task,
+    /// is not retired, and the entry has not been retired — so a capability
+    /// cannot be installed against a channel that has already been replaced.
+    /// Refused a second time, so one channel yields at most one installed
+    /// capability. Also refused unless the capability was promoted from that
+    /// same connector incarnation.
+    pub(crate) fn install_authenticated_channel(
+        &self,
+        task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
+        capability: crate::endpoint_auth::AuthenticatedChannelCapability,
+    ) -> bool {
+        let mut current = self.authenticated_channel.lock();
+        if current.is_some() {
+            return false;
+        }
+        // Rechecked *under* the slot lock, not before taking it. Checking
+        // first would leave a window in which `retire_connector` sets retired,
+        // takes an empty slot, and returns — after which this call would write
+        // a capability into an already-invalidated entry, surviving the very
+        // replacement invalidation it is supposed to obey. With the recheck
+        // here, retirement either lands before it (and is seen) or blocks on
+        // this same lock and takes the capability we just installed.
+        // `is_retired` is checked explicitly: a task can be retired between
+        // `authenticate` returning and this install, and it stays in the slot
+        // when that happens, so slot identity alone would not notice.
+        if self.registry_retired() || task.is_retired() || !self.endpoint_auth_is_current(task) {
+            return false;
+        }
+        // The capability must have been promoted from *this* task's connector
+        // incarnation. Checking only that `task` is current would accept a
+        // capability promoted from a superseded channel whenever the caller
+        // supplied the current task alongside it — a cross-channel relay the
+        // certificate-fingerprint binding cannot rule out by itself.
+        if !capability.belongs_to(task.incarnation()) {
+            return false;
+        }
+        *current = Some(capability);
+        true
+    }
+
+    /// Install a real authenticated capability, bypassing only provenance.
+    ///
+    /// For call-site tests that need to exercise the inbound / send / reliable
+    /// wiring rather than the promotion path. The capability installed here is
+    /// a genuine [`crate::endpoint_auth::AuthenticatedChannelCapability`], so
+    /// the gate is satisfied the same way production satisfies it — what is
+    /// skipped is only the connector-provenance check, which is proven
+    /// separately by the transport controls. This is deliberately not a way to
+    /// make [`Self::is_application_admitted`] answer `true` without a
+    /// capability present.
+    #[cfg(test)]
+    pub(crate) fn install_authenticated_channel_for_test(&self) {
+        *self.authenticated_channel.lock() = Some(crate::endpoint_auth::authenticated_for_test(
+            crate::runtime::runtime_for_test(),
+        ));
+    }
+
+    /// The single application-admission predicate for this entry.
+    ///
+    /// Every production application, reliable, and real-time admission gate
+    /// must route through this rather than reading `PeerStateData::authenticated`
+    /// directly. The legacy bool records policy history and cannot be
+    /// invalidated by channel replacement: `retire_connector` drops the
+    /// authenticated capability but leaves the bool set, so a retired entry
+    /// would still read as admitted. Requiring a live capability makes the
+    /// Arc 04 artifact *enforced* rather than merely stored, and makes
+    /// replacement invalidation immediate.
+    ///
+    /// Protocol admission traffic — Hello, AuthResponse, Approve, Deny — is
+    /// deliberately outside this gate, as the existing admission
+    /// classification already intends; it is what establishes the capability
+    /// in the first place.
+    pub(crate) fn is_application_admitted(&self) -> bool {
+        self.has_authenticated_channel() && self.state.read().is_admitted()
+    }
+
+    /// Whether this entry holds a live authenticated channel for its exact
+    /// current connector.
+    ///
+    /// This is the provenance-carrying counterpart to
+    /// `PeerStateData::authenticated`: a retired entry answers `false` even if
+    /// the legacy bool is still set.
+    pub(crate) fn has_authenticated_channel(&self) -> bool {
+        !self.registry_retired() && self.authenticated_channel.lock().is_some()
+    }
+
+    /// Retained compatibility adapter for the legacy real-time flow.
+    ///
+    /// Endpoint Auth owns connected-channel provenance, and the Arc 04
+    /// channel-bound capability is implemented and enforced — this path is
+    /// gated on it through [`Self::is_application_admitted`], alongside the
+    /// existing mutual-approval policy state. The adapter itself is retained
+    /// for compatibility, not because the capability is still pending; Arc 05
+    /// owns its deletion.
     pub(super) fn install_legacy_realtime_flow(&self) -> bool {
-        if self.registry_retired() || !self.state.read().is_admitted() {
+        if !self.is_application_admitted() {
             return false;
         }
         let worker = self.session.lock().clone();
@@ -373,7 +524,7 @@ impl PeerConnection {
         Arc<WebRtcConnectorWorker>,
         Arc<crate::connector::ConnectorRealtimeFlowCapability>,
     )> {
-        if self.registry_retired() || !self.state.read().is_admitted() {
+        if !self.is_application_admitted() {
             return None;
         }
         let worker = self.session.lock().clone()?;

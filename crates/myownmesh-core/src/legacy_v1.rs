@@ -215,6 +215,109 @@ mod tests {
         }
     }
 
+    /// Terminating-signaling-MITM / fingerprint substitution, through the live
+    /// `on_auth_response` handler.
+    ///
+    /// An interceptor that terminates DTLS on each leg must present its own
+    /// certificate, so the fingerprints the victim observes differ from the
+    /// ones the real peer signed. This drives that condition on a real link:
+    /// the AuthResponse is otherwise entirely correct — right signer, right
+    /// identities, right mesh context, right profile, right contributions —
+    /// and differs only in the fingerprint pair it commits to.
+    ///
+    /// Transcript-level inequality is not the gate; this asserts the exact
+    /// current peer is refused and removed by the production handler.
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run in the isolated WSL legacy-v1 control"]
+    async fn v4_arc04_substituted_fingerprint_is_refused_by_the_live_handler() {
+        let state_a = crate::engine::build_test_state("arc04-mitm-a");
+        let state_b = crate::engine::build_test_state("arc04-mitm-b");
+        let id_a = state_a.identity.public_id().to_string();
+        let id_b = state_b.identity.public_id().to_string();
+
+        let link = connect(&state_a, &state_b).await;
+        // Pre-promotion state on purpose: this control must observe the forged
+        // proof fail to promote, so it cannot start with a capability already
+        // installed. The shared *admitted* fixture preinstalls one, which would
+        // mask exactly the outcome under test.
+        crate::engine::insert_legacy_test_peer_pending_auth(
+            &state_a,
+            &id_b,
+            Arc::clone(&link.left),
+            Arc::clone(&link.left_auth),
+        );
+        let owner =
+            crate::engine::legacy_test_owner(&state_a, &id_b).expect("peer owner is installed");
+        assert!(
+            !crate::engine::legacy_test_has_authenticated_channel(&state_a, &owner),
+            "non-vacuity: the channel must be unauthenticated before the forged proof"
+        );
+
+        // The genuine channel material this side observes.
+        let observed_local = link
+            .left
+            .local_fingerprint()
+            .await
+            .expect("the live link exposes our fingerprint");
+        let observed_remote = link
+            .left
+            .remote_fingerprint()
+            .await
+            .expect("the live link exposes the peer's fingerprint");
+
+        // What an interceptor would have presented instead.
+        let substituted_remote = format!("{observed_remote}:ff");
+        assert_ne!(
+            substituted_remote, observed_remote,
+            "non-vacuity: the substituted fingerprint must differ from the observed one"
+        );
+
+        // Both contributions, recorded as a completed exchange would leave them.
+        let our_contribution = crate::endpoint_auth::LocalContribution::generate();
+        let peer_contribution = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("a generated draw is canonical");
+        let our_contribution_bytes = crate::engine::legacy_test_seed_contributions(
+            &state_a,
+            &owner,
+            our_contribution,
+            peer_contribution.clone(),
+        )
+        .expect("the exact current peer records both contributions");
+
+        // The peer's half, signed over the SUBSTITUTED pair. Everything else
+        // matches what this side will reconstruct.
+        let signer_role = crate::endpoint_auth::EndpointAuthAttempt::role_of(&id_a, &id_b).peer();
+        let forged = crate::signing::sign_with(
+            state_b.identity.signing_key(),
+            &crate::endpoint_auth::EndpointAuthAttempt::transcript_bytes(
+                &state_a.network_id,
+                crate::endpoint_auth::EndpointAuthProfile::V1Ed25519Dtls,
+                signer_role,
+                &id_a,
+                &id_b,
+                &our_contribution_bytes,
+                peer_contribution.as_str(),
+                &observed_local,
+                &substituted_remote,
+            ),
+        );
+
+        crate::engine::handshake::on_auth_response(
+            &state_a,
+            &owner,
+            crate::protocol::handshake::AuthResponseMessage { signature: forged },
+        )
+        .await;
+
+        assert!(
+            !crate::engine::legacy_test_has_authenticated_channel(&state_a, &owner),
+            "a proof committing to a substituted fingerprint must not authenticate \
+             this channel"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "opens two native WebRTC links; run in the isolated WSL legacy-v1 control"]
     async fn v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops() {

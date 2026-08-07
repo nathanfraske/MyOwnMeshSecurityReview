@@ -144,8 +144,12 @@ pub(crate) async fn enqueue(
 /// speaks the acked contract. `None` = not sendable yet.
 fn link_ready(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
     let entry = state.peers.get(peer)?;
+    // Evaluated before the read guard is taken: the predicate reads peer state
+    // itself, and re-entering the lock here would risk deadlocking against a
+    // waiting writer.
+    let admitted = entry.is_application_admitted();
     let data = entry.state.read();
-    let up = data.is_admitted() && data.data_channel_open;
+    let up = admitted && data.data_channel_open;
     if !up {
         return None;
     }
@@ -169,8 +173,9 @@ pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
 pub(crate) async fn flush_peer_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
     let peer = owner.device_id();
     let acked_peer = state.peers.get_if_current(owner).and_then(|entry| {
+        let admitted = entry.is_application_admitted();
         let data = entry.state.read();
-        (data.is_admitted() && data.data_channel_open)
+        (admitted && data.data_channel_open)
             .then(|| features::peer_supports(&data.features, features::Feature::RELIABLE_CHANNELS))
     });
     flush_peer_inner(state, peer, Some(owner), acked_peer).await;
@@ -437,6 +442,10 @@ mod tests {
         }
         assert_eq!(link_ready(&state, "peer"), None);
 
+        // The legacy bool alone is no longer sufficient: the Arc 04 gate
+        // requires a live authenticated-channel capability, so this stays
+        // refused. Keeping it as an explicit negative is the point — it is the
+        // case that would silently regress if the gate fell back to the bool.
         state
             .peers
             .get("peer")
@@ -444,6 +453,18 @@ mod tests {
             .state
             .write()
             .authenticated = true;
+        assert_eq!(
+            link_ready(&state, "peer"),
+            None,
+            "policy state without an installed capability must not open the link"
+        );
+
+        // With a real capability installed, the link opens.
+        state
+            .peers
+            .get("peer")
+            .expect("peer is installed")
+            .install_authenticated_channel_for_test();
         assert_eq!(link_ready(&state, "peer"), Some(false));
     }
 

@@ -46,10 +46,12 @@ First frame on a fresh data channel from each side.
 | `features` | string[] | Capability ids the sender claims. |
 | `app_version` | string? | Cosmetic. |
 
-The other side signs
-`SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id`
-with their ed25519 secret key and returns the signature in
-`auth_response`.
+The other side signs the Arc 04 endpoint-auth transcript (see
+[Handshake signature](#handshake-signature)) with their ed25519 secret
+key and returns the signature in `auth_response`. `nonce` is that
+endpoint's per-attempt contribution: a fresh 32-byte CSPRNG draw,
+base32-lowercase, accepted only in that exact canonical encoding. Both
+sides send one, and both are bound into the signed transcript.
 
 ### `auth_response`
 Proves possession of the secret key matching `hello.device_id`.
@@ -196,17 +198,48 @@ Side A                                              Side B
   │ ◀──── ping / pong / channel / rpc_* / shelve ──▶│
 ```
 
-The exact byte-shape of the domain-tagged payload that both sides
-sign:
+### Handshake signature
+
+The exact byte-shape of the domain-tagged transcript that both sides
+sign. Every field is length-prefixed `len:value`, and each of the two
+sides derives byte-identical input because every paired field is
+ordered by role, not by which endpoint is local:
 
 ```
-SIGN_DOMAIN_TAG + nonce + "|" + my_device_id + "|" + their_device_id
+ENDPOINT_AUTH_DOMAIN_TAG
+  + f(mesh_context)              # canonical network id
+  + f(crypto_profile)            # fixed selection, "ed25519-dtls-v1"
+  + f(signer_role)               # "initiator" | "responder"
+  + f(initiator_device_id) + f(responder_device_id)
+  + f(initiator_contribution) + f(responder_contribution)
+  + f(initiator_fingerprint) + f(responder_fingerprint)
 ```
 
-— see `crate::signing::handshake_payload`. The `|` separators ensure
-no `nonce` value can be reinterpreted as part of a device id when the
-concatenation is parsed back. Both `device_id` fields are the
-canonical base32-lowercase pubkey portion (display suffixes stripped).
+where `f(x) = len(x) + ":" + x`, `ENDPOINT_AUTH_DOMAIN_TAG =
+"myownmesh-endpoint-auth-v1:"`, roles are derived from the device pair
+rather than chosen, and the fingerprints are the DTLS certificate
+fingerprints of **both** endpoints. Length prefixes — rather than `|`
+separators — make the encoding injective, so no field value can shift a
+later field boundary and make two distinct tuples sign identical bytes.
+Device IDs are the canonical base32-lowercase pubkey portion (display
+suffixes stripped). Each side verifies its own half as well as the
+peer's, so a proof is mutual rather than one-directional.
+
+This is a hard cutover. The legacy
+`SIGN_DOMAIN_TAG + nonce + "|" + my_device_id + "|" + their_device_id`
+payload (`crate::signing::handshake_payload`) is retained as a helper
+for other callers but is neither produced nor accepted on the live
+`hello`/`auth_response` path, and there is no feature-negotiated
+fallback: domain separation means an older peer fails authentication
+rather than negotiating down, so a downgrade is not attacker-selectable.
+
+The fingerprint pair is **not** an RFC 5705 exporter and is not
+session-unique — two channels between one device pair reusing the same
+certificates carry the same value. It defeats a terminating
+signaling-path man-in-the-middle, which must present its own
+certificate on each leg; separation of one channel from another is
+carried by the per-attempt contributions and by connector-incarnation
+ownership.
 
 ---
 
