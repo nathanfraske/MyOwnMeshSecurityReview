@@ -107,7 +107,8 @@ jobs:
             v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks \
             v4_arc03g_close_fence_rejects_endpoint_send_realtime_write_and_lane_open \
             v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner \
-            v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops
+            v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops \
+            v4_arc04_substituted_fingerprint_is_refused_by_the_live_handler
           do
             cargo test -p myownmesh-core \
               --features "legacy-v1,legacy-media,transport-lab" \
