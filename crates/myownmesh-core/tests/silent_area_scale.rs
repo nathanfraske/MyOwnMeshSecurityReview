@@ -31,7 +31,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::state::NetworkState;
+use myownmesh_core::engine::connection::PeerStatus;
+use myownmesh_core::engine::NetworkState;
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
@@ -41,6 +42,9 @@ use tokio::time::Instant;
 
 const CHANNEL: &str = "area-probe";
 const NETWORK_ID: &str = "silent-area-scale";
+const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
+const REDIAL_INTERVAL: Duration = Duration::from_secs(4);
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn silent_cfg(id: &str) -> NetworkConfig {
     NetworkConfig {
@@ -79,11 +83,40 @@ async fn spawn_node(label: &str, transport: &Transport, broker: &LocalBroker) ->
     }
 }
 
-fn authenticated(state: &Arc<NetworkState>, peer: &str) -> bool {
-    state
-        .peer_info(peer)
-        .map(|p| p.authenticated)
-        .unwrap_or(false)
+fn admitted(state: &Arc<NetworkState>, peer: &str) -> bool {
+    state.peer_info(peer).is_some_and(|peer| {
+        peer.authenticated && matches!(peer.status, PeerStatus::Active | PeerStatus::Shelved)
+    })
+}
+
+async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node]) {
+    let deadline = Instant::now() + DIAL_TIMEOUT;
+    let mut next_dial = Instant::now();
+    loop {
+        let admitted_count = spokes
+            .iter()
+            .filter(|spoke| {
+                admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id)
+            })
+            .count();
+        if admitted_count == spokes.len() {
+            return;
+        }
+        if Instant::now() >= next_dial {
+            for spoke in spokes.iter().filter(|spoke| {
+                !admitted(&operator.state, &spoke.id) || !admitted(&spoke.state, &operator.id)
+            }) {
+                operator.state.connect_peer(&spoke.id);
+            }
+            next_dial = Instant::now() + REDIAL_INTERVAL;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline",
+            spokes.len()
+        );
+        tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
+    }
 }
 
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
@@ -108,7 +141,7 @@ fn report(label: &str, mut samples_ms: Vec<f64>) {
 async fn run_area(n_spokes: usize) {
     let started = Instant::now();
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let operator = spawn_node("operator", &transport, &broker).await;
     let mut spokes = Vec::with_capacity(n_spokes);
@@ -146,14 +179,14 @@ async fn run_area(n_spokes: usize) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (i, spoke) in spokes.iter().enumerate() {
         assert!(
-            !authenticated(&spoke.state, &operator.id),
-            "member-{i} authenticated to the operator without a deliberate dial"
+            !admitted(&spoke.state, &operator.id),
+            "member-{i} was admitted to the operator without a deliberate dial"
         );
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
-                    !authenticated(&spoke.state, &other.id),
-                    "member-{i} authenticated to member-{j} on a silent mesh"
+                    !admitted(&spoke.state, &other.id),
+                    "member-{i} was admitted to member-{j} on a silent mesh"
                 );
             }
         }
@@ -169,16 +202,14 @@ async fn run_area(n_spokes: usize) {
     let mut dial_ms = Vec::with_capacity(n_spokes);
     for spoke in &spokes {
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_secs(60);
+        let deadline = t0 + DIAL_TIMEOUT;
         let mut next_dial = Instant::now();
         loop {
             if Instant::now() >= next_dial {
                 operator.state.connect_peer(&spoke.id);
-                next_dial = Instant::now() + Duration::from_secs(4);
+                next_dial = Instant::now() + REDIAL_INTERVAL;
             }
-            if authenticated(&operator.state, &spoke.id)
-                && authenticated(&spoke.state, &operator.id)
-            {
+            if admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id) {
                 break;
             }
             assert!(
@@ -186,18 +217,28 @@ async fn run_area(n_spokes: usize) {
                 "operator dial to {} did not come up in 60s",
                 spoke.id
             );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
         }
         dial_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     report("dial connect→session", dial_ms);
 
+    // Sequential latency sampling can leave an early session stale while a
+    // slow runner brings up later sessions. Re-drive only missing pairs and
+    // require one simultaneous admitted snapshot before testing N-session
+    // shape or application delivery.
+    converge_all_operator_sessions(&operator, &spokes).await;
+
     // ---- the area shape holds under N sessions --------------------------
     for (i, spoke) in spokes.iter().enumerate() {
+        assert!(
+            admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id),
+            "member-{i} is not mutually admitted to the operator"
+        );
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
-                    !authenticated(&spoke.state, &other.id),
+                    !admitted(&spoke.state, &other.id),
                     "member-{i} ↔ member-{j} session appeared — spokes must only see the operator"
                 );
             }
@@ -301,3 +342,4 @@ async fn silent_area_soak() {
         .unwrap_or(24);
     run_area(n).await;
 }
+mod support;

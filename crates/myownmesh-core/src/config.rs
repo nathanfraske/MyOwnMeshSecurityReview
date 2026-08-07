@@ -392,8 +392,8 @@ pub const DEFAULT_STUN_TURN_PORT: u16 = 3478;
 /// external ICE / Nostr client), so the toggles live on the device
 /// config, not on an individual [`NetworkConfig`].
 ///
-/// Everything is off by default — turning a device into an always-on
-/// relay, signaling host, or TURN server is an explicit opt-in. When a
+/// Everything is off by default. Turning a device into an always-on
+/// signaling, STUN, or TURN host is an explicit opt-in. When a
 /// service is enabled the daemon advertises the matching
 /// [`crate::services::ServiceRole`] to peers so the rest of the mesh can
 /// discover and adopt it, which is what makes a fully self-hosted,
@@ -404,19 +404,20 @@ pub struct ServicesConfig {
     /// Whether this device participates as a regular mesh node. On by
     /// default; turn off for a pure-infrastructure box.
     pub node: NodeServiceConfig,
+    /// Frozen LegacyV1 ordinary-member application relay configuration.
+    /// Normal V4 startup rejects `enabled: true`.
     pub relay: RelayServiceConfig,
     pub signaling: SignalingServerConfig,
     pub stun: StunServiceConfig,
     pub turn: TurnServiceConfig,
 }
 
-/// Whether this device acts as a regular mesh node — i.e. joins its
+/// Whether this device acts as a regular mesh node and joins its
 /// configured networks and participates as a peer. Enabled by default;
 /// disable it to run a **pure-infrastructure box** that only hosts
 /// signaling / STUN / TURN (advertising itself purely as an edge /
-/// ingress-egress point) without joining any network itself. The
-/// roster-gated relay forwards traffic *within* networks, so it needs
-/// node participation and has no effect when node is off.
+/// ingress-egress point) without joining any network itself. Frozen LegacyV1
+/// ordinary-member forwarding requires node participation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NodeServiceConfig {
@@ -429,17 +430,15 @@ impl Default for NodeServiceConfig {
     }
 }
 
-/// Mesh-member routing. When enabled this device forwards typed-channel
-/// traffic between roster members on the reserved
-/// [`crate::services::RELAY_CHANNEL`] — turning it into an ingress /
-/// egress hub so spokes that can each reach the relay but not each
-/// other can still exchange messages. Forwarding is roster-gated: a
+/// Frozen LegacyV1 mesh-member application routing. When explicitly enabled
+/// by a LegacyV1 runtime, this device forwards typed-channel traffic between
+/// roster members on the reserved `__mesh_relay__/v1` channel. Forwarding is roster-gated: a
 /// frame is only relayed when both the sender and the destination are
 /// approved peers of this device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct RelayServiceConfig {
-    /// Off by default — hosting a relay is opt-in.
+    /// Off by default. Retaining this compatibility behavior is explicit.
     pub enabled: bool,
     /// Ceiling on how many distinct destinations a single inbound frame
     /// may fan out to in broadcast mode. 0 (the default) = unlimited. A

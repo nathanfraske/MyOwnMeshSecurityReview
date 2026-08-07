@@ -1,15 +1,15 @@
 # Hosted services
 
 A MyOwnMesh device can host infrastructure for the rest of the mesh:
-relay routing, a signaling server, a STUN server, and a TURN server.
-Turning these on lets a device advertise itself as a router, an
-ingress / egress point, or a STUN / TURN handler — which is what makes a
+a signaling server, a STUN server, and a TURN server. Turning these on lets
+a device advertise itself as a signaling, address-discovery, or ICE relay
+service, which is what makes a
 **fully internet-isolated network** practical. No Google STUN, no
 Cloudflare TURN, no public Nostr relay required: one always-on device
 (or a few) can supply every piece of plumbing a closed fleet needs.
 
 A device is **any combination** of a mesh node and these hosted
-services — so a dedicated box can be pure infrastructure (signaling +
+services. A dedicated box can be pure infrastructure (signaling +
 STUN + TURN, not itself a member). The hosted services are **off by
 default** and configured device-wide (not per network); a hosted service
 serves every network the device participates in, plus any external client
@@ -21,29 +21,34 @@ is a normal member).
 | Service | What it does | Default | Needs |
 |---|---|---|---|
 | **Node** | Participate as a regular mesh member (join configured networks). On by default; off = pure-infra box. | on | nothing |
-| **Relay** | Forwards traffic between roster members so peers that can each reach this device, but not each other, can still talk. | off | node on |
-| **Signaling** | An *intelligent* Nostr relay (NIP-01 / WebSocket) peers use in place of public Nostr — live presence, instant departure, flood limits. | off · :4848 | nothing |
+| **LegacyV1 member relay** | Frozen application-frame forwarding for pre-V4 deployments. This is not TURN or signaling. | unavailable in normal V4 builds | `legacy-v1`, explicit legacy daemon option, node on |
+| **Signaling** | An *intelligent* Nostr relay (NIP-01 / WebSocket) peers use in place of public Nostr, with live presence, instant departure, and flood limits. | off · :4848 | nothing |
 | **STUN** | Answers RFC 5389 binding requests so peers learn their reflexive address. | off · :3478 | nothing |
 | **TURN** | Relays media / data for peers behind symmetric NAT (RFC 5766), with an optional per-connection bandwidth cap. | off · :3478 | public IP + credentials |
 
 ### Node
 
-Whether this device participates as a regular mesh member — joining its
+Whether this device participates as a regular mesh member by joining its
 configured networks and acting as a peer. It's on by default. Turn it off
 to run a **pure-infrastructure box**: the daemon hosts signaling / STUN /
 TURN (advertising itself purely as an edge / ingress-egress point) and
-joins no networks itself. Because the relay forwards traffic *within* a
-network, it needs node participation and goes idle when node is off.
+joins no networks itself. The frozen LegacyV1 member relay is different: it
+requires node participation because it forwards application frames between
+members.
 
-Toggling `node` live joins or leaves every configured network in place —
+Toggling `node` live joins or leaves every configured network in place;
 no restart needed.
 
-### Relay
+### LegacyV1 member relay
+
+This section describes frozen pre-V4 compatibility. Normal V4 startup rejects
+the old `services.relay` configuration. A retained compatibility build must
+enable the `legacy-v1` feature and start the daemon with `--legacy-v1`.
 
 When enabled, the device forwards typed-channel frames between roster
 members on a reserved channel. A spoke sends a `RelayEnvelope`
 (`{ dst, payload }`) to the relay; the relay rewrites the authenticated
-origin into `src` and forwards it — to one destination (directed) or to
+origin into `src` and forwards it to one destination (directed) or to
 every other reachable member (broadcast, `dst` empty).
 
 Forwarding is **roster-gated on both ends**: a frame is only relayed when
@@ -51,11 +56,9 @@ its sender is an approved peer of the relay device, and a directed frame
 only reaches its destination when that destination is also approved. The
 relay never forwards for or to strangers.
 
-This is application-layer routing built on the existing channel API — it
-does not change the WebRTC data path. Transparent relay *fallback* (a
-peer automatically routing through a relay when a direct ICE path can't
-be found) is a planned follow-up; today a relay node is an explicit
-message hub for the roster.
+This is application-frame routing built on the old channel API. It is not a
+V4 connector feature, TURN, signaling, or a generic relay. New V4 code must
+not use it. It remains only while downstream applications migrate.
 
 ### Signaling
 
@@ -63,7 +66,7 @@ A self-hosted [Nostr](https://github.com/nostr-protocol/nips) relay
 speaking the slice of NIP-01 the mesh needs (`REQ` / `EVENT` / `EOSE` /
 `CLOSE`, with `kinds` / `since` / `#tag` filters). The win is that the
 built-in signaling driver **already speaks NIP-01 to public relays**, so
-a peer adopts your relay with zero client changes — just add
+a peer adopts your relay with zero client changes. Add
 `ws://your-host:4848` to that network's signaling servers (see
 *Pointing peers at your services* below).
 
@@ -71,21 +74,21 @@ Presence events (kind `1077`) are retained for ~15 minutes so a late
 joiner discovers everyone already in the room; negotiation events
 (ephemeral kind `21077`) are forwarded live and never stored, so a stale
 offer can't bind a fresh connection. The relay does not verify event
-signatures — it's a forwarder, and the mesh runs its own ed25519 mutual
+signatures. It is a forwarder, and the mesh runs its own ed25519 mutual
 auth over the resulting WebRTC channel, so a forged Nostr event buys an
 attacker nothing but a failed handshake.
 
 #### Intelligent coordination
 
 A self-hosted relay is *stateful*, the way a normal WebRTC signaling
-server is — it does more than blindly forward, which makes connections
+server is. It does more than blindly forward, which makes connections
 come up faster and recover quicker. All of it stays plain NIP-01 on the
 wire and **degrades gracefully**: against a public relay (or an older
 peer) you simply get the dumb-forwarder baseline.
 
 - **Live presence.** The relay learns `(connection → device, room)` from
   the announces a peer publishes, so it knows who's actually connected
-  *now*. A peer subscribing gets the live member set replayed instantly —
+  *now*. A peer subscribing gets the live member set replayed instantly,
   near-instant discovery, even if a member's last announce is old.
 - **Instant departure.** When a member's socket closes, the relay emits a
   `leave` to the room. The engine already understands "peer left" and
@@ -95,7 +98,7 @@ peer) you simply get the dumb-forwarder baseline.
   that doesn't get one just falls back to timeout detection.)
 
 These accelerate the engine's existing reconnection ladder rather than
-replacing it — the relay is an **optional accelerator, never a
+replacing it. The relay is an **optional accelerator, never a
 coordinator the mesh depends on**. If it goes away, peers fall back to
 the public-Nostr behaviour and the mesh keeps working.
 
@@ -120,7 +123,7 @@ violating limits accrues strikes and is disconnected with a `NOTICE`.
 ### STUN
 
 A standalone STUN server: it answers binding requests with the source's
-XOR-mapped address and does nothing else. Pure reflexion — no auth, no
+XOR-mapped address and does nothing else. It is pure reflexion, with no auth or
 allocations. Peers add `stun:your-host:3478` to a network's STUN servers.
 
 ### TURN
@@ -129,16 +132,16 @@ A full TURN server (via the webrtc-rs `turn` crate) for peers behind
 symmetric NAT, where a direct path can't be punched. TURN needs three
 things that STUN/signaling don't:
 
-- **A public IP** (`public_ip`) — the routable address the server hands
+- **A public IP** (`public_ip`), the routable address the server hands
   out in relay allocations. It can't guess this; if the bind address is a
   wildcard (`0.0.0.0`) you *must* set it, or TURN refuses to start.
-- **At least one credential** — a username / password pair. Mirror the
+- **At least one credential**, a username / password pair. Mirror the
   same pair into each peer's TURN config. Enabled without credentials,
   TURN shows as *enabled, not running*.
-- **Open UDP ports — the one that bites people.** `:3478` is only the
+- **Open UDP ports, the one that bites people.** `:3478` is only the
   *control* channel; every relayed allocation flows through a *separate*
   UDP port. By default the server draws those from the **OS ephemeral
-  range** (so the relay is never artificially capped) — on Linux that's
+  range** (so the relay is never artificially capped). On Linux, that is
   `sysctl net.ipv4.ip_local_port_range`, e.g. Ubuntu's `32768–60999`.
   Open `udp 3478` **and that whole range**:
 
@@ -146,7 +149,7 @@ things that STUN/signaling don't:
       sudo ufw allow 32768:60999/udp     # your sysctl range
 
   **All of it must be open at the host firewall AND your cloud/provider
-  security group** — a host firewall being inactive (`ufw status` →
+  security group**. A host firewall being inactive (`ufw status` →
   `inactive`) does **not** mean the provider lets them in. The classic
   failure is opening only 443 for the signaling proxy and then seeing
   `0 srflx · 0 relay` candidates on every client. To shrink the firewall
@@ -155,14 +158,14 @@ things that STUN/signaling don't:
   enable turn` prints the right checklist either way.
 
 A TURN server also answers STUN binding requests, so enabling TURN gives
-you STUN for free on the same port — you rarely need both the STUN and
+you STUN for free on the same port. You rarely need both the STUN and
 TURN services on one host. (So `stun:` and `turn:` URLs can point at the
 same host:3478.)
 
 **Bandwidth cap (QoS).** `max_bps_per_connection` shapes each
 allocation's relayed throughput to a byte/sec ceiling, applied
-independently in each direction (`0` = unlimited). It's a global knob —
-every allocation gets the same cap, there's no per-user override yet — so
+independently in each direction (`0` = unlimited). It is a global knob:
+every allocation gets the same cap, with no per-user override yet, so
 one client can't saturate the relay. It's enforced by a token bucket on
 each allocation's relay socket; because the data is UDP, exceeding the
 cap creates backpressure and drops rather than unbounded buffering, which
@@ -177,7 +180,7 @@ Services live under `services` in `~/.myownmesh/config.json`:
   "version": 1,
   "services": {
     "node":      { "enabled": true },
-    "relay":     { "enabled": true, "max_fanout": 0 },
+    "relay":     { "enabled": false, "max_fanout": 0 },
     "signaling": {
       "enabled": true,
       "bind": "0.0.0.0",
@@ -207,7 +210,7 @@ Services live under `services` in `~/.myownmesh/config.json`:
 ```
 
 > `node` is on by default and `services.signaling.limits` fills in safe
-> defaults, so neither needs to appear in a hand-written config — they're
+> defaults, so neither needs to appear in a hand-written config. They are
 > shown here for completeness.
 
 > Because TURN also serves STUN, the example above would try to bind both
@@ -221,7 +224,7 @@ Changes are picked up three ways, all equivalent:
 **Settings → Services.** Each service has a toggle and its fields; TURN
 adds credential management. A live status pill shows whether each
 listener is actually running (a service can be *enabled* but fail to
-start — e.g. a port already in use, or TURN with no credentials). Edits
+start, such as when a port is already in use or TURN has no credentials). Edits
 are staged; **Apply changes** persists them and reconciles the running
 services.
 
@@ -231,7 +234,7 @@ services.
 # Show what's hosted and where it's listening.
 myownmesh ctl services status
 
-# Toggle a service: node | relay | signaling | stun | turn.
+# Toggle a normal V4 service: node | signaling | stun | turn.
 myownmesh ctl services enable signaling
 myownmesh ctl services disable stun
 
@@ -241,7 +244,7 @@ myownmesh ctl services disable node
 
 `enable` / `disable` flip just the one flag and persist. TURN credentials
 + public IP and the signaling flood limits / TURN bandwidth cap can't be
-set from the CLI toggle — edit `config.json` (or use the GUI) for those;
+set from the CLI toggle. Edit `config.json` or use the GUI for those;
 an enabled-but-unconfigured TURN shows as *not running* in
 `services status`.
 
@@ -253,8 +256,8 @@ re-apply live via the GUI / CLI.
 ## Discovery: advertising and adopting services
 
 When a device hosts a service it advertises a **service role** to peers
-via the capability matrix — stable tags (`service:relay`,
-`service:signaling`, `service:stun`, `service:turn`) that ride in the
+via the capability matrix. Normal V4 roles use the stable tags
+`service:signaling`, `service:stun`, and `service:turn`, which ride in the
 `hello` handshake every peer already exchanges. A peer can therefore see
 "this device is a TURN handler" with no wire-format change.
 
@@ -268,9 +271,14 @@ endpoint URLs in a structured `services` blob inside its capability
     "signaling_url": "ws://203.0.113.7:4848",
     "stun_url": "stun:203.0.113.7:3478",
     "turn_url": "turn:203.0.113.7:3478",
-    "relay": true
+    "relay": false
 } }
 ```
+
+The wire field `relay` and tag `service:relay` are frozen LegacyV1 names for
+the ordinary-member application relay. Their source role is
+`LegacyV1MemberRelay`. They do not describe TURN, signaling, or a generic
+opaque relay.
 
 A peer reads this with `ServiceAdvert::from_extra(...)` and can drop the
 URLs straight into its own network config.
@@ -301,15 +309,15 @@ outside its own walls.
 The signaling relay is built to be safe to stand up publicly (that's what
 the flood limits are for). Three deployment realities to get right:
 
-### 1. It serves plain `ws://` — terminate TLS in front of it
+### 1. It serves plain `ws://`; terminate TLS in front of it
 
 The relay speaks plain WebSocket; it has **no built-in TLS**. The built-in
 default relay list uses `wss://`, and port 443 also sails through
-restrictive firewalls that block oddball ports — so a public endpoint
+restrictive firewalls that block oddball ports. A public endpoint
 wants a TLS-terminating reverse proxy on **443** that forwards the
 WebSocket upgrade to the relay on loopback.
 
-One command does the lot — installs Caddy if it's missing, writes the
+One command installs Caddy if needed, writes the
 site block, binds the relay to loopback, and (re)starts the Caddy
 service:
 
@@ -331,7 +339,7 @@ relay.example.com {
         reverse_proxy 127.0.0.1:4848
     }
     handle {
-        respond "MyOwnMesh signaling relay — connect over wss://" 200
+        respond "MyOwnMesh signaling relay; connect over wss://" 200
     }
 }
 ```
@@ -348,21 +356,21 @@ location / {
 }
 ```
 
-Peers then point at `wss://relay.example.com` (no port — 443). Open **80
+Peers then point at `wss://relay.example.com` (no port because it uses 443). Open **80
 and 443** at the firewall (Caddy needs 80 for the ACME challenge) and keep
-the relay's own port (4848) on loopback — `install caddy` sets
+the relay's own port (4848) on loopback. `install caddy` sets
 `services.signaling.bind` to `127.0.0.1` for you, so the only public door
 is the TLS one.
 
 ### 2. Give it its own hostname
 
 If a name is a static site (GitHub Pages, etc.) its DNS points at the
-static host, not your relay box — `wss://that-name` hits the site, not the
+static host, not your relay box. `wss://that-name` hits the site, not the
 relay. Run the relay on a server you control and point a **dedicated
 subdomain** (e.g. `relay.example.com`) at it.
 
 > Point peers at the **relay's** host, not a static site. The project's
-> own site `myownmesh.net` is GitHub Pages — it can't host a WebSocket
+> own site `myownmesh.net` is GitHub Pages and cannot host a WebSocket
 > server, so `wss://myownmesh.net` would hit the site, not a relay.
 > `myownmesh.com` is the relay (a server running the Caddy proxy above).
 > Give your own relay a host or subdomain that resolves to the box it
@@ -371,7 +379,7 @@ subdomain** (e.g. `relay.example.com`) at it.
 ### 3. Verify traffic is actually arriving
 
 The relay logs every connection and a periodic heartbeat at `info`, and
-`ctl services status` reports live counts — so you can tell "nobody's
+`ctl services status` reports live counts, so you can tell "nobody's
 reaching me" from "I'm broken":
 
 ```
@@ -388,7 +396,7 @@ INFO signaling: relay activity       connections=2 rooms=1 events_relayed=42
 ```
 
 If you see `listening` but **never** a `client connected` (and
-`connections` stays `0`) while peers are trying, the relay is fine — the
+`connections` stays `0`) while peers are trying, the relay is fine. The
 traffic isn't arriving. Check, in order: **DNS** (does the hostname
 resolve to this box?), **TLS / proxy** (is the proxy upgrading
 WebSockets?), then **firewall** (is the port open?).
@@ -398,7 +406,7 @@ WebSockets?), then **firewall** (is the port open?).
 | Piece | Location |
 |---|---|
 | Service config schema | `crates/myownmesh-core/src/config.rs` (`ServicesConfig`, `NodeServiceConfig`) |
-| Roles, advert, relay runtime | `crates/myownmesh-core/src/services/` |
+| Service roles and advert, including the frozen LegacyV1 member relay | `crates/myownmesh-core/src/services/` |
 | STUN / TURN servers (+ bandwidth throttle) | `crates/myownmesh-services/` |
 | Intelligent signaling relay (presence / leave / limits) | `crates/myownmesh-signaling/src/server.rs` |
 | `Leave` signal + driver `PeerLeft` | `crates/myownmesh-signaling/src/{lib.rs,nostr/driver.rs}` |

@@ -2,18 +2,18 @@
 
 ## Purpose
 
-Own fresh mutual Device authentication for one exact connected channel. Arc 02 installs the capability seam. Arc 04 adds the verified transcript and production transition.
+Own fresh mutual Device authentication for one exact connected channel. Arc 03 moves the connected-channel capability into this owner and binds its installation to the exact connector incarnation. Arc 04 adds the verified transcript and authenticated-channel transition.
 
 ## Owned state
 
-The target task owns the fresh transcript, ordered endpoint roles, exact mesh-context binding, exact channel binding, and authentication result. No mutable production state moves here in Arc 02.
+The Arc 03 task owns connected-channel provenance. Its handoff records the exact process-local connector incarnation and cleanup owner. Arc 04 adds admitted authentication work, the fresh transcript, ordered endpoint roles, exact mesh-context binding, exact channel binding, and the authenticated result.
 
 ## Inputs
 
 - one `ConnectedChannelCapability`;
-- one `EndpointAuthPermit` issued after pre-authentication resource admission;
-- fresh contributions from both endpoints;
-- exact local and remote Device IDs, mesh context, and channel exporter evidence.
+- one `EndpointAuthPermit` issued after pre-authentication resource admission in Arc 04;
+- fresh contributions from both endpoints in Arc 04;
+- exact local and remote Device IDs, mesh context, and channel exporter evidence in Arc 04.
 
 ## Outputs
 
@@ -26,7 +26,7 @@ This task depends on the connected-channel capability and the selected cryptogra
 
 ## Resources
 
-Endpoint-authentication work remains pre-authentication work. Arc 02 defines the permit type but does not create a production issuer or infer a limit.
+Endpoint-authentication work remains pre-authentication work. The connected transport claim stays owned until native close succeeds. Arc 02 defines the authentication permit type, but Arc 03 does not create a production issuer, admit authentication resources, verify the Arc 04 transcript, or infer a limit.
 
 ## Restart behavior
 

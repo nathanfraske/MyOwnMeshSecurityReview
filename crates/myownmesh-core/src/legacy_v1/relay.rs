@@ -1,8 +1,9 @@
-//! Roster-gated frame relay. A device running the relay service
-//! forwards [`RelayEnvelope`] frames it receives on [`RELAY_CHANNEL`]
+//! Frozen LegacyV1 roster-gated application frame relay.
+//!
+//! It forwards [`RelayEnvelope`] frames it receives on [`RELAY_CHANNEL`]
 //! to other roster members, so peers that can each reach the relay but
-//! not each other still exchange messages — the device becomes a
-//! router / ingress / egress hub for the network.
+//! not each other can still exchange messages. The device becomes a
+//! router, ingress, and egress hub for the network.
 //!
 //! The forwarder uses nothing beyond the core channel + roster + peer
 //! snapshot APIs, so it lives in core and any embedder can host a relay
@@ -16,6 +17,11 @@
 //! also approved. The relay never forwards for or to strangers, and it
 //! stamps the authenticated sender id into the forwarded envelope so the
 //! recipient can trust the `src` field rather than the wire claim.
+//!
+//! Corrected LegacyV1 rejects the historical topology-routing wrapper at this
+//! boundary. That wrapper used this same relay channel before routed and plain
+//! relay ownership became disjoint. Apart from recognizing and rejecting that
+//! exact wrapper shape, the relay treats application payload as opaque.
 
 use std::sync::Arc;
 
@@ -29,12 +35,20 @@ use crate::engine::state::NetworkState;
 /// Reserved channel name the relay listens on. Versioned so a future
 /// envelope-shape change can run a second channel in parallel without a
 /// flag day.
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub const RELAY_CHANNEL: &str = "__mesh_relay__/v1";
 
 /// One relayed frame. A member wraps its real payload in this and sends
 /// it to the relay on [`RELAY_CHANNEL`]; the relay rewrites `src`,
 /// clears `dst`, and forwards to the resolved destination(s).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub struct RelayEnvelope {
     /// Final recipient device id. Empty = broadcast to every other
     /// roster member the relay currently has reachable.
@@ -45,7 +59,9 @@ pub struct RelayEnvelope {
     /// recipient can trust it.
     #[serde(default)]
     pub src: String,
-    /// Opaque application payload. The relay never inspects it.
+    /// Application payload. The corrected relay recognizes and rejects only
+    /// the exact historical routed-wrapper shape. Every other payload remains
+    /// opaque to relay policy.
     pub payload: serde_json::Value,
 }
 
@@ -58,6 +74,10 @@ pub struct RelayEnvelope {
 ///    is currently reachable, and never reflect back to the sender.
 ///  - broadcast (`dst` empty): forward to every reachable roster member
 ///    except the sender, capped at `max_fanout` (0 = unlimited).
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub fn relay_targets(
     from: &str,
     dst: &str,
@@ -92,7 +112,7 @@ pub fn relay_targets(
 }
 
 /// A peer is "reachable" for relay purposes when its data channel is
-/// open — Active or Shelved. Shelved peers are demoted by the topology
+/// open, either Active or Shelved. Shelved peers are demoted by the topology
 /// selector but keep the channel open as a heartbeat path, so a relayed
 /// frame still gets through.
 fn is_reachable_status(status: PeerStatus) -> bool {
@@ -101,14 +121,27 @@ fn is_reachable_status(status: PeerStatus) -> bool {
 
 /// Running relay forwarder for one network. Holds the spawned task;
 /// drop or call [`RelayService::stop`] to tear it down.
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub struct RelayService {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[allow(
+    deprecated,
+    reason = "this implementation is confined to the frozen LegacyV1 subtree"
+)]
 impl RelayService {
     /// Start forwarding on `state`'s network. `max_fanout` caps
     /// broadcast fan-out (0 = unlimited).
-    pub fn start(state: Arc<NetworkState>, max_fanout: u32) -> RelayService {
+    pub fn start(
+        state: Arc<NetworkState>,
+        max_fanout: u32,
+        runtime: &super::LegacyV1Runtime,
+    ) -> RelayService {
+        let _authority = runtime;
         let task = tokio::spawn(run(state, max_fanout));
         RelayService { task }
     }
@@ -126,6 +159,10 @@ impl Drop for RelayService {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "this function is confined to the frozen LegacyV1 subtree"
+)]
 async fn run(state: Arc<NetworkState>, max_fanout: u32) {
     let channel: Channel<RelayEnvelope> = Channel::new(RELAY_CHANNEL.to_string(), state.clone());
     let mut sub = channel.subscribe();
@@ -138,46 +175,56 @@ async fn run(state: Arc<NetworkState>, max_fanout: u32) {
                 continue;
             }
         };
-        let from = msg.from;
-        let env = msg.body;
-
-        // Snapshot roster + reachable peers fresh per frame so a peer
-        // that just left or was removed isn't relayed to.
-        let rostered: Vec<String> = state
-            .roster
-            .read()
-            .authorized_devices
-            .iter()
-            .map(|d| d.device_id.clone())
-            .collect();
-        let reachable: Vec<String> = state
-            .peer_snapshot()
-            .into_iter()
-            .filter(|p| is_reachable_status(p.status))
-            .map(|p| p.device_id)
-            .collect();
-
-        let targets = relay_targets(&from, &env.dst, &rostered, &reachable, max_fanout);
-        if targets.is_empty() {
-            trace!(%from, dst = %env.dst, "relay: no eligible targets");
-            continue;
-        }
-
-        // Stamp the authenticated origin and clear dst so the recipient
-        // sees a flat "from src" frame regardless of how it was
-        // addressed.
-        let out = RelayEnvelope {
-            dst: String::new(),
-            src: from.clone(),
-            payload: env.payload,
-        };
-        for target in &targets {
-            if let Err(e) = channel.send_to(target, &out).await {
-                trace!(%target, "relay: forward failed: {e}");
-            }
-        }
-        debug!(%from, count = targets.len(), "relay: forwarded frame");
+        forward_envelope(&state, &channel, msg.from, msg.body, max_fanout).await;
     }
+}
+
+#[allow(
+    deprecated,
+    reason = "this function is confined to the frozen LegacyV1 subtree"
+)]
+pub(super) async fn forward_envelope(
+    state: &Arc<NetworkState>,
+    channel: &Channel<RelayEnvelope>,
+    from: String,
+    env: RelayEnvelope,
+    max_fanout: u32,
+) {
+    if super::routing::is_historical_routed_wrapper(&env.payload) {
+        trace!(%from, "relay: rejecting historical routed-wrapper wire shape");
+        return;
+    }
+    let rostered: Vec<String> = state
+        .roster
+        .read()
+        .authorized_devices
+        .iter()
+        .map(|device| device.device_id.clone())
+        .collect();
+    let reachable: Vec<String> = state
+        .peer_snapshot()
+        .into_iter()
+        .filter(|peer| is_reachable_status(peer.status))
+        .map(|peer| peer.device_id)
+        .collect();
+
+    let targets = relay_targets(&from, &env.dst, &rostered, &reachable, max_fanout);
+    if targets.is_empty() {
+        trace!(%from, dst = %env.dst, "relay: no eligible targets");
+        return;
+    }
+
+    let out = RelayEnvelope {
+        dst: String::new(),
+        src: from.clone(),
+        payload: env.payload,
+    };
+    for target in &targets {
+        if let Err(error) = channel.send_to(target, &out).await {
+            trace!(%target, "relay: forward failed: {error}");
+        }
+    }
+    debug!(%from, count = targets.len(), "relay: forwarded frame");
 }
 
 #[cfg(test)]
@@ -235,7 +282,7 @@ mod tests {
     #[test]
     fn broadcast_excludes_non_rostered_reachable_peers() {
         // A reachable peer that isn't in the roster is not a broadcast
-        // target — relay only serves approved members.
+        // target. The relay only serves approved members.
         let targets = relay_targets("a", "", &ids(&["a", "b"]), &ids(&["a", "b", "ghost"]), 0);
         assert_eq!(targets, ids(&["b"]));
     }
@@ -260,5 +307,18 @@ mod tests {
         assert_eq!(env.dst, "");
         assert_eq!(env.src, "");
         assert_eq!(env.payload, serde_json::json!({"hi": 1}));
+    }
+
+    #[test]
+    fn corrected_plain_relay_rejects_the_historical_routed_wrapper_shape() {
+        let historical = serde_json::json!({
+            "__channel": "legacy.application",
+            "__body": {"value": 7},
+            "__ttl": 3,
+            "__id": 42
+        });
+        assert!(super::super::routing::is_historical_routed_wrapper(
+            &historical
+        ));
     }
 }

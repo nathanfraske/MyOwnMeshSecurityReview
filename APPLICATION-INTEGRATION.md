@@ -186,7 +186,8 @@ request_session(mesh_context, exact_remote_device_id)
     | RemoteParticipationUnknown
     | RemoteNotParticipating
     | RemoteNotAuthorized
-    | ResourceLimited
+    | ResourcePressure(resource_class)
+    | ResourceUnavailable(resource_class)
 
 watch_session(session_operation_or_handle)
     -> bounded stream<SessionEvent>
@@ -214,7 +215,8 @@ A conceptual optional interface is:
 open_realtime_flow(session_handle, application_flow_spec)
     -> RealtimeFlowHandle
     | UnsupportedDataPlane
-    | ResourceLimited
+    | ResourcePressure(resource_class)
+    | ResourceUnavailable(resource_class)
     | StaleHandle
 
 write_realtime_unit(realtime_flow_handle, application_encoded_unit)
@@ -474,7 +476,8 @@ SessionFailure =
     | NoSignalingPath
     | NoViablePeerTransport
     | EndpointAuthenticationFailed
-    | ResourceLimited
+    | ResourcePressure(resource_class)
+    | ResourceUnavailable(resource_class)
     | StaleHandle
     | SessionClosed
 ```
@@ -483,7 +486,7 @@ SessionFailure =
 
 ## 14. Resource ownership
 
-MyOwnMesh owns measured limits for:
+MyOwnMesh owns leases and pressure behavior for:
 
 - durable fact validation and storage;
 - signaling connections, frames, queues, and provenance;
@@ -503,7 +506,30 @@ The application owns:
 - application queues, persistence, retries, and fanout;
 - user-visible history and workflow.
 
-The component that allocates a resource reserves it before allocation.
+The component that allocates or retains a protected resource acquires its finite lease before allocation or retention. Basal MyOwnMesh does not expose or require a fixed maximum number of Mesh runtimes, peers, attempts, sessions, or flows. A request is admitted while the process resource provider grants its exact claim. Otherwise the application receives typed pressure or unavailability.
+
+A granted claim is an admission decision, not a guarantee that the underlying resource can be obtained. Depending on the provider a deployment installs, admission may prove bookkeeping only. Allocation therefore remains fallible: an admitted operation can still fail on the real resource, and an application must handle that failure rather than treat a granted lease as a promise of success.
+
+The application does not choose low-level connector counters, resource weights, quotas, or shares. One finite process grant is shared by all Mesh scopes, and unused capacity is borrowable. Adding scopes cannot multiply that grant.
+
+The basal application-visible contract is a set of properties, not a scheduling algorithm:
+
+- **Conservation.** Live claims never exceed the process grant. No admission path mints capacity.
+- **Cleanup ownership.** Only the exact owner releases a claim, and only after its own cleanup. The provider may request retirement of a lease whose owner contract declares it reclaimable, but a request releases nothing.
+- **Honest retention.** An owner whose cleanup cannot be proven transfers the exact charge into failed-cleanup retention rather than dropping it silently.
+- **Fallible admission.** There is no guarantee of eventual admission. A nonreclaimable lease, an ignored retirement request, or a retained failed-cleanup charge may hold capacity indefinitely.
+- **Pressure is not authorization.** The application receives typed pressure or unavailability, never an Open or Closed authorization result, when resources are short.
+- **Time is not resource truth.** No timer expires a pending demand, completes a retirement, or releases a claim. Elapsed time alone never changes what is charged.
+- **Optional isolation.** A deployment may install a stricter local ceiling or isolation policy for a locked-down appliance, Closed deployment, carrier cost boundary, or product requirement. Such policy is explicitly optional, and it cannot create resources or mesh authority.
+- **Refusal is typed and named.** A refusal identifies the unavailable resource dimension. It is never an arbitrary or undeclared limit, and it is never an authorization outcome.
+
+How a provider orders and services demands under pressure is provider policy, not a basal mesh semantic. Applications depend on the properties above, never on a particular selection rule, and no application-visible type encodes one.
+
+No resource result is an authorization result. Pressure, unavailability, and refusal say something about capacity and nothing about whether a peer participates, is authorized, or may be trusted. An application must not convert a resource outcome into an admission, entitlement, or identity decision in either direction.
+
+The provider-side obligations that support these properties are deliberately not restated here. Their provider-facing constraints and status are collected in [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md), which points to the architectural definitions and formal model that govern them. An application neither observes nor depends on that machinery, and silence here is not a conformance claim about any provider.
+
+Reliable streams, interactive real-time flows, delayed satellite delivery, and storage-backed transport do not share one queue rule. Each uses the pressure contract appropriate to its provider. Every retained unit still owns storage and scheduled-work leases. Time passage alone does not expire a slow operation or release its resources.
 
 ## 15. Acceptance gates
 
@@ -524,7 +550,23 @@ The application integration passes only when:
 - stale or foreign-principal handles fail before payload use;
 - signaling never becomes a generic application-data bus;
 - explicit application intermediaries remain explicit endpoints;
-- every queue, candidate, transport, relay, and session resource remains within owner-selected measured limits.
+- every protected queue entry, candidate, transport, relay, and session object holds a live finite lease;
+- another object is admitted whenever the provider grants its exact claim, without a basal product-count ceiling;
+- resource refusal identifies pressure or unavailability, never Open or Closed authorization;
+- Mesh scopes share one process grant and cannot multiply capacity;
+- no basal weights, quotas, reserved shares, or partitions exist;
+- no basal pending-demand ordering, rotation rule, or per-scope demand cardinality is required, and no application-visible type encodes one;
+- the selected provider documents its own demand-selection policy and shows that the policy alone mints no capacity;
+- every refusal names the unavailable resource dimension and is never an arbitrary or undeclared limit;
+- no resource result is converted into an authorization, entitlement, or identity decision in either direction;
+- an admitted claim is never presented to the application as a guarantee that the underlying allocation will succeed;
+- provider-side resource obligations are asserted against [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md) and are not restated as application gates;
+- only owners of leases their contract declares reclaimable receive retirement requests;
+- a retirement request does not release its claim;
+- owner Drop or explicit failed-cleanup retention preserves exact release accounting;
+- admission is not guaranteed against nonreclaimable pressure, ignored retirement, or failed cleanup;
+- elapsed time alone expires no demand, retirement, or claim;
+- optional local ceilings and isolation policies remain explicit, optional deployment policy.
 
 ## 16. Owner decisions
 
@@ -539,5 +581,7 @@ The owner must select:
 7. session recovery and multi-channel behavior;
 8. diagnostic detail;
 9. headless consumer connector types;
-10. every pre-authentication and post-authentication resource value;
-11. the measurements that decide defaults.
+10. the resource provider for each deployment form, reported as a provider and host-isolation integration description — its declared demand-selection policy, its residual and isolation boundaries, and the evidence that it satisfies the properties in section 14 — rather than a table of fixed numeric limits, weights, or product counts;
+11. any optional local ceilings, cost policies, or isolation requirements, each recorded as explicitly optional deployment policy;
+12. acceptance or isolation of native WebRTC, allocator, runtime, kernel, driver, and external-provider residuals;
+13. measurements used for performance, cost, scheduling, regression, and opaque-resource characterization.

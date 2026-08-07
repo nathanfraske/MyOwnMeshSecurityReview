@@ -1,6 +1,12 @@
-# Network types: open, closed, and silent
+# Legacy network types: open, closed, and silent
 
-**Status: implemented and shipped.** Types live in
+**Status: historical pre-V4 implementation record.** This document describes
+legacy source behavior that remains during migration. It is not the V4 product
+contract and does not override [`ARCHITECTURE.md`](../ARCHITECTURE.md),
+[`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](../IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md),
+or the deletion gates in
+[`CURRENT-TO-TARGET-MIGRATION-MATRIX.md`](../CURRENT-TO-TARGET-MIGRATION-MATRIX.md).
+The current legacy types live in
 [`crates/myownmesh-core/src/network_state.rs`](../crates/myownmesh-core/src/network_state.rs);
 wire frames are in
 [`crates/myownmesh-core/src/protocol/`](../crates/myownmesh-core/src/protocol/);
@@ -9,9 +15,8 @@ frame and surfaces quorum-violating proposals as diag entries; the
 `JoinedNetwork` handle exposes propose / sign / deny / split. The
 ratify + deny lifecycle is exercised end-to-end in
 [`tests/closed_network_governance.rs`](../crates/myownmesh-core/tests/closed_network_governance.rs).
-This doc remains the contract; the four foundational decisions
-(sync algorithm, deadlock resolution, fork semantics, wire shape)
-are settled — see [Decisions](#decisions) at the bottom.
+The four decisions below record the legacy sync algorithm, deadlock resolution,
+fork semantics, and wire shape. They are migration evidence, not V4 authority.
 
 ## Why
 
@@ -104,7 +109,7 @@ round and the delete would never converge.
 
 ## Silent networks
 
-**Status: implemented.** A `silent` network is governance-identical to
+**Legacy implementation status: implemented.** A `silent` network is governance-identical to
 `open` — permissionless, auto-accept, no signed cert chain — but changes two
 *connection* behaviours so that **nothing connects until a deliberate dial**,
 true at the transport layer. It's the shape a remote-support ("AnyDesk-style")
@@ -485,8 +490,7 @@ The four foundational choices, settled:
 
 ## Implementation map
 
-This feature is implemented and shipped; the touch points across the
-code are:
+The legacy implementation uses these source touch points:
 
 - `crates/myownmesh-core/src/roster.rs` — add a `role` field to
   `AuthorizedPeer` (default `Member` for backward-compat), the
@@ -512,5 +516,5 @@ code are:
 - `crates/myownmesh-core/src/lib.rs` — export
   `SIGN_DOMAIN_TAG_STATE`, `NetworkKind`, `Role`.
 
-All of the above is implemented and shipped; this document remains the
-design contract those changes follow.
+All of the above describes the retained legacy implementation. New V4 work
+follows the adopted architecture and migration gates instead of this record.

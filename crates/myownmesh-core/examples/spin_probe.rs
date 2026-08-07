@@ -15,6 +15,22 @@
 //! the arithmetic the window depends on would show before any webrtc code.
 use std::time::Duration;
 
+fn callback_policy() -> myownmesh_core::ConnectorCallbackPolicy {
+    let raw = std::env::var("MYOWNMESH_LAB_CALLBACK_CAPACITY")
+        .expect("set MYOWNMESH_LAB_CALLBACK_CAPACITY for this transport-lab probe");
+    let capacity = std::num::NonZeroUsize::new(
+        raw.parse::<usize>()
+            .expect("MYOWNMESH_LAB_CALLBACK_CAPACITY must be an integer"),
+    )
+    .expect("MYOWNMESH_LAB_CALLBACK_CAPACITY must be nonzero");
+    myownmesh_core::ConnectorCallbackPolicy::new(
+        myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+        myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
+        myownmesh_core::RealtimeConnectorPolicy::Disabled,
+    )
+    .expect("the explicit transport-lab callback policy is valid")
+}
+
 fn jiffies() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     let f: Vec<&str> = stat.split_whitespace().collect();
@@ -77,7 +93,12 @@ async fn main() {
     // C+D. open_peer + create_offer with EMPTY ICE servers.
     if let Some(Ok((session, _rx))) = staged(
         "C open_peer(Offerer, no ICE servers)",
-        t.open_peer(myownmesh_core::transport::Role::Offerer, &[], &[]),
+        t.open_peer(
+            myownmesh_core::transport::Role::Offerer,
+            &[],
+            &[],
+            callback_policy(),
+        ),
     )
     .await
     {
@@ -93,7 +114,12 @@ async fn main() {
     let turn = myownmesh_core::config::default_turn_servers();
     if let Some(Ok((session, _rx))) = staged(
         "E open_peer(Offerer, public-venue STUN+TURN)",
-        t.open_peer(myownmesh_core::transport::Role::Offerer, &stun, &turn),
+        t.open_peer(
+            myownmesh_core::transport::Role::Offerer,
+            &stun,
+            &turn,
+            callback_policy(),
+        ),
     )
     .await
     {

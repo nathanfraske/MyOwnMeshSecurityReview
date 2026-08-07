@@ -29,10 +29,9 @@ pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
-pub mod routing;
 pub mod scheduler;
 pub mod signaling_bridge;
-pub mod state;
+pub(crate) mod state;
 pub mod tick;
 pub mod traffic;
 pub mod wake;
@@ -66,7 +65,6 @@ use tracing::{debug, trace, warn};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::config::NetworkConfig;
 use crate::error::{Error, Result};
@@ -81,14 +79,20 @@ use crate::protocol::{
     CapabilityAdvert, MeshMessage,
 };
 use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot};
-use crate::transport::{Role, Transport, TransportEvent};
+use crate::transport::{
+    DataChannelOpenOwnership, RemoteCandidateDisposition, Role, Transport, TransportEvent,
+    WebRtcConnectorEvent,
+};
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
-pub use state::{
-    InboundAudioSample, InboundVideoSample, NetworkCmd, NetworkState, SignalingInbound,
-    SignalingOutbound,
-};
+#[cfg(feature = "legacy-media")]
+#[deprecated(
+    since = "0.3.2",
+    note = "temporary legacy H.264 and Opus compatibility surface"
+)]
+pub use state::{InboundAudioSample, InboundVideoSample};
+pub use state::{NetworkCmd, NetworkState, SignalingInbound, SignalingOutbound};
 
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
@@ -307,29 +311,29 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             sticky,
             reply,
         } => connect_peer(state, &device_id, sticky, reply).await,
+        #[cfg(feature = "legacy-media")]
         NetworkCmd::MediaLaneOpen { peer, kind, reply } => {
-            let session = state
-                .peers
-                .get(&peer)
-                .and_then(|p| p.session.lock().clone());
-            let result = match session {
-                Some(s) => s.open_media_lane(kind).await,
-                None => Err(Error::Network(format!("peer not connected: {peer}"))),
+            let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
+            let result = match flow {
+                Some((worker, capability)) => worker.open_media_lane(&capability, kind).await,
+                None => Err(Error::Network(format!(
+                    "peer real-time flow not admitted: {peer}"
+                ))),
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "legacy-media")]
         NetworkCmd::MediaLaneClose {
             peer,
             kind,
             lane,
             reply,
         } => {
-            let session = state
-                .peers
-                .get(&peer)
-                .and_then(|p| p.session.lock().clone());
-            let result = match session {
-                Some(s) => s.close_media_lane(kind, lane).await,
+            let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
+            let result = match flow {
+                Some((worker, capability)) => {
+                    worker.close_media_lane(&capability, kind, lane).await
+                }
                 None => Ok(()), // no session, nothing open — close is idempotent
             };
             let _ = reply.send(result);
@@ -371,14 +375,6 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         NetworkCmd::BroadcastCapabilities { caps, reply } => {
             let _ = reply.send(broadcast_capabilities(state, caps).await);
         }
-        NetworkCmd::TransportEvent {
-            device_id,
-            epoch,
-            event,
-        } => {
-            handle_transport_event(state, device_id, epoch, event).await;
-        }
-
         // ---- governance ops ----
         NetworkCmd::ProposeTransition {
             variant,
@@ -649,8 +645,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     let topo = state.topology_impl.read();
                     if topo.prunes() {
                         let me = state.identity.public_id().to_string();
-                        let mut known: Vec<String> =
-                            state.peers.iter().map(|e| e.key().clone()).collect();
+                        let mut known = state.peers.device_ids_snapshot();
                         if !known.iter().any(|k| k == &device_id) {
                             known.push(device_id.clone());
                         }
@@ -790,86 +785,95 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             device_id,
             candidate,
         } => {
-            // Classify the inbound candidate so the no-TURN
-            // diagnostic has accurate remote-side counts. Record
-            // before adding to the session — recording is cheap and
-            // the add_ice_candidate await must happen without the
-            // peer lock held.
-            let kind = crate::transport::classify_candidate_sdp(&candidate.candidate);
-            // Decide under the lock whether to apply now or queue
-            // for after `set_remote_description`. Trickle ICE
-            // candidates routinely arrive a few hundred ms before
-            // the answer on a fast network; if we just hand them
-            // to webrtc-rs at that point, it rejects with "remote
-            // description is not set" and the candidate is gone —
-            // including the host candidate that would have closed
-            // a LAN pair, leaving the agent to fall back to a
-            // peer-reflexive pair and the GUI to mis-paint the
-            // link as STUN instead of LAN.
-            enum Action {
-                Apply {
-                    session: Arc<crate::transport::PeerSession>,
-                    candidate: connection::PendingRemoteCandidate,
-                },
-                Queued,
-                NoPeer,
-            }
-            let action = if let Some(peer) = state.peers.get(&device_id) {
-                let mut data = peer.state.write();
-                data.diag.remote_candidates.record(kind);
-                if !data.remote_description_set {
-                    peer.queue_remote_candidate(&mut data, candidate);
-                    Action::Queued
-                } else {
-                    let session = peer.session.lock().clone();
-                    drop(data);
-                    match session {
-                        Some(session) => Action::Apply {
-                            session,
-                            candidate: peer.observe_remote_candidate(candidate),
-                        },
-                        None => Action::NoPeer,
-                    }
-                }
-            } else {
-                Action::NoPeer
-            };
-            match action {
-                Action::Apply { session, candidate } => {
-                    let result = connection::apply_pending_remote_candidate(
-                        candidate,
-                        move |candidate| async move { session.add_ice_candidate(candidate).await },
-                    )
-                    .await;
-                    if let Err(e) = result {
+            // The worker decides whether the remote description is ready and
+            // owns either the retained queue value or the live application.
+            let owner = state.peers.owner(&device_id);
+            let worker = owner.as_ref().and_then(|owner| {
+                state
+                    .peers
+                    .get_if_current(owner)
+                    .and_then(|peer| peer.session.lock().clone())
+            });
+            if let (Some(owner), Some(worker)) = (owner, worker) {
+                let report = match worker.add_remote_candidate_observed(candidate).await {
+                    Ok(report) => report,
+                    Err(e) => {
                         state.log_diag_with(
                             crate::events::DiagLevel::Warn,
                             "ice",
                             format!(
-                                "remote {kind:?} candidate rejected by {}: {e}",
+                                "remote candidate rejected by {}: {e}",
                                 short_peer(&device_id)
                             ),
                             serde_json::json!({
                                 "peer": device_id,
-                                "kind": format!("{kind:?}"),
                                 "error": e.to_string(),
                             }),
                         );
                         warn!(peer = %device_id, "add_ice_candidate failed: {e}");
+                        return;
+                    }
+                };
+                if report.disposition == RemoteCandidateDisposition::AttemptRetired {
+                    return;
+                }
+                let Some(kind) = report.kind else {
+                    return;
+                };
+                if state
+                    .peers
+                    .with_current(&owner, |peer| {
+                        peer.state.write().diag.remote_candidates.record(kind);
+                    })
+                    .is_none()
+                {
+                    return;
+                }
+                match report.disposition {
+                    RemoteCandidateDisposition::Applied => {}
+                    RemoteCandidateDisposition::QueuedUntilRemoteDescription => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Debug,
+                            "ice",
+                            format!(
+                                "queued remote {kind:?} candidate from {} (awaiting remote SDP)",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
+                        );
+                    }
+                    RemoteCandidateDisposition::DuplicateIgnored => {
+                        trace!(peer = %device_id, "duplicate remote candidate ignored");
+                    }
+                    RemoteCandidateDisposition::AttemptRetired => {}
+                    RemoteCandidateDisposition::InvalidBinding(error) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote {kind:?} candidate from {} has an invalid ICE username-fragment binding: {}",
+                                short_peer(&device_id),
+                                error.description()
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "kind": format!("{kind:?}"),
+                                "reason": error.description(),
+                            }),
+                        );
+                    }
+                    RemoteCandidateDisposition::RefusedByOwner => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote {kind:?} candidate from {} reached an owner-selected candidate-attempt ceiling",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
+                        );
                     }
                 }
-                Action::Queued => {
-                    state.log_diag_with(
-                        crate::events::DiagLevel::Debug,
-                        "ice",
-                        format!(
-                            "queued remote {kind:?} candidate from {} (awaiting remote SDP)",
-                            short_peer(&device_id)
-                        ),
-                        serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
-                    );
-                }
-                Action::NoPeer => {}
             }
         }
         SignalingInbound::PeerLeft { device_id } => {
@@ -949,11 +953,11 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
 }
 
-/// Drive the media-lane renegotiations the transport flagged — OFF the
-/// driver task. The tick only *selects* peers (pending flag, or drained
-/// lanes due for reaping) and spawns one task per peer; the webrtc-rs
-/// excursion (reap's remove_track, create_offer's ICE re-gather) runs
-/// there, so the driver — and every input frame queued behind it —
+/// Drive the media-lane renegotiations the transport flagged off the
+/// driver task. The tick only selects peers with an explicit pending
+/// lane-set change and spawns one task per peer. The webrtc-rs excursion
+/// remove_track during finalization and ICE re-gather for the offer run
+/// there, so the driver and every input frame queued behind it
 /// never waits on SDP work. Glare-guarded: a peer whose signaling state
 /// isn't Stable is skipped and retried next tick rather than wedging
 /// webrtc-rs with a mid-negotiation offer. Single-flighted per peer via
@@ -962,31 +966,27 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
     if state.is_offline() {
         return;
     }
-    let candidates: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            let d = e.value().state.read();
-            !d.media_reneg_inflight
-                && d.data_channel_open
-                && matches!(d.status, PeerStatus::Active | PeerStatus::Shelved)
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let candidates: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        (!data.media_reneg_inflight
+            && data.data_channel_open
+            && matches!(data.status, PeerStatus::Active | PeerStatus::Shelved))
+        .then(|| peer.device_id.clone())
+    });
     for device_id in candidates {
         let Some(entry) = state.peers.get(&device_id) else {
             continue;
         };
-        let Some(session) = entry.session.lock().clone() else {
+        let Some((session, _realtime_flow)) = entry.realtime_flow_ports() else {
             continue;
         };
         let pending = {
             let d = entry.state.read();
             d.media_reneg_pending
         };
-        // Anything draining past the grace? (Cheap read; the actual
-        // removal happens in the spawned task.)
-        if !pending && !session.has_reapable_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE) {
+        // Explicit finalization is the only operation that creates a pending
+        // removal. Elapsed time never does so.
+        if !pending {
             continue;
         }
         {
@@ -994,6 +994,9 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
             d.media_reneg_inflight = true;
             d.media_reneg_pending = false;
         }
+        let Some(owner) = state.peers.owner(&device_id) else {
+            continue;
+        };
         drop(entry);
         let state = state.clone();
         tokio::spawn(async move {
@@ -1001,31 +1004,27 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                 != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
             {
                 // Mid-negotiation (glare, or our own earlier offer still
-                // settling) — don't stack an offer on it, and don't touch
-                // the session either: unreaped drains keep the peer a
-                // candidate, and the Err below re-arms the pending flag.
+                // settling): do not stack an offer on it or touch the
+                // session. The error below re-arms the explicit pending flag.
                 Err("signaling not stable".to_string())
             } else {
-                // Finalize due drains first so the offer below carries
-                // the removals too — one renegotiation for the whole
-                // delta.
-                let reaped = session
-                    .reap_drained_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE)
-                    .await;
+                // Explicit finalization already changed the lane set. One
+                // offer now carries the complete pending delta.
                 match session.create_offer().await {
                     Ok(desc) => {
+                        if state.peers.get_if_current(&owner).is_none() {
+                            return;
+                        }
                         state.log_diag_with(
                             crate::events::DiagLevel::Debug,
                             "media",
                             format!(
-                                "media renegotiation offer to {} (lane set changed{})",
-                                short_peer(&device_id),
-                                if reaped > 0 { ", drains reaped" } else { "" }
+                                "media renegotiation offer to {} (lane set changed)",
+                                short_peer(&device_id)
                             ),
                             serde_json::json!({
                                 "peer": device_id,
                                 "sdp_bytes": desc.sdp.len(),
-                                "reaped": reaped,
                             }),
                         );
                         let _ = state.signaling_tx.send(SignalingOutbound::Offer {
@@ -1037,7 +1036,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                     Err(e) => Err(e.to_string()),
                 }
             };
-            if let Some(peer) = state.peers.get(&device_id) {
+            if let Some(peer) = state.peers.get_if_current(&owner) {
                 let mut d = peer.state.write();
                 d.media_reneg_inflight = false;
                 match outcome {
@@ -1112,6 +1111,19 @@ pub(crate) async fn renegotiate_ice(
     force: bool,
     trigger: &'static str,
 ) {
+    let Some(owner) = state.peers.owner(device_id) else {
+        return;
+    };
+    renegotiate_ice_for_owner(state, &owner, force, trigger).await;
+}
+
+pub(crate) async fn renegotiate_ice_for_owner(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    force: bool,
+    trigger: &'static str,
+) {
+    let device_id = owner.device_id();
     // No primary interface → a `restart_ice()` here can't bind a socket
     // and only feeds the `Network is unreachable` gather spam. Hold off;
     // the network-change handler drives a fresh restart fan-out the
@@ -1120,7 +1132,7 @@ pub(crate) async fn renegotiate_ice(
         return;
     }
     let session = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let s = peer.session.lock().clone();
@@ -1142,7 +1154,7 @@ pub(crate) async fn renegotiate_ice(
         // (`force`), leave it alone — and opportunistically settle the
         // tier back to Steady if a prior restart has since recovered.
         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed if !force => {
-            if let Some(peer) = state.peers.get(device_id) {
+            state.peers.with_current(owner, |peer| {
                 let mut data = peer.state.write();
                 data.ice_disconnected_since = None;
                 if matches!(
@@ -1151,7 +1163,7 @@ pub(crate) async fn renegotiate_ice(
                 ) {
                     data.tier = ConnectionTier::Steady;
                 }
-            }
+            });
             return;
         }
         // A gather/connectivity check is already in flight — don't
@@ -1162,25 +1174,31 @@ pub(crate) async fn renegotiate_ice(
 
     // Single-flight: collapse overlapping triggers into one offer/window.
     let offerer = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(offerer) = state.peers.with_current(owner, |peer| {
+            let mut data = peer.state.write();
+            let due = data
+                .last_offer_sent_at
+                .map(|t| {
+                    Instant::now().duration_since(t)
+                        >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                })
+                .unwrap_or(true);
+            if !due {
+                return None;
+            }
+            data.last_offer_sent_at = Some(Instant::now());
+            data.tier = ConnectionTier::IceRestart {
+                started: Instant::now(),
+            };
+            data.diag.ice_restarts += 1;
+            Some(state.identity.public_id() < device_id)
+        }) else {
             return;
         };
-        let mut data = peer.state.write();
-        let due = data
-            .last_offer_sent_at
-            .map(|t| {
-                Instant::now().duration_since(t) >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
-            })
-            .unwrap_or(true);
-        if !due {
+        let Some(offerer) = offerer else {
             return;
-        }
-        data.last_offer_sent_at = Some(Instant::now());
-        data.tier = ConnectionTier::IceRestart {
-            started: Instant::now(),
         };
-        data.diag.ice_restarts += 1;
-        state.identity.public_id() < device_id
+        offerer
     };
 
     // One line per *committed* restart (past single-flight), carrying the
@@ -1190,11 +1208,12 @@ pub(crate) async fn renegotiate_ice(
     // names its cause. A burst of `trigger=network-change` from
     // `ice_before=Connected` on a healthy box is the signature of the
     // network watcher mis-firing on a multi-homed host.
-    let restarts = state
+    let Some(restarts) = state
         .peers
-        .get(device_id)
-        .map(|p| p.state.read().diag.ice_restarts)
-        .unwrap_or(0);
+        .with_current(owner, |peer| peer.state.read().diag.ice_restarts)
+    else {
+        return;
+    };
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "ice",
@@ -1227,6 +1246,9 @@ pub(crate) async fn renegotiate_ice(
             // the next watchdog poll picks it up once that settles.
             debug!(peer = %device_id, "restart_ice during renegotiate: {e}");
         }
+        if state.peers.get_if_current(owner).is_none() {
+            return;
+        }
         // create_offer runs INLINE on the single driver task, so an unbounded
         // await here starves every command, timer, and other peer on this
         // network until it returns — the same NanoKVM single-slow-core wedge
@@ -1245,6 +1267,9 @@ pub(crate) async fn renegotiate_ice(
         .await;
         match built {
             Ok(Ok(desc)) => {
+                if state.peers.get_if_current(owner).is_none() {
+                    return;
+                }
                 // The single INFO line for this restart is the `trigger=…`
                 // line above; the offer/nudge mechanics ride at DEBUG so a
                 // renegotiation is one line in the default stream.
@@ -1261,9 +1286,11 @@ pub(crate) async fn renegotiate_ice(
                         "sdp_bytes": desc.sdp.len(),
                     }),
                 );
-                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                    device_id: device_id.to_string(),
-                    sdp: desc.sdp,
+                state.peers.with_current(owner, |_| {
+                    let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                        device_id: device_id.to_string(),
+                        sdp: desc.sdp,
+                    });
                 });
             }
             Ok(Err(e)) => warn!(peer = %device_id, "renegotiate create_offer failed: {e}"),
@@ -1279,6 +1306,9 @@ pub(crate) async fn renegotiate_ice(
         // side with "can not be restarted when gathering". Just nudge the
         // offerer to send the restart offer; the reactive announce is globally
         // rate-limited so this can't add signaling load.
+        if state.peers.get_if_current(owner).is_none() {
+            return;
+        }
         state.log_diag_with(
             crate::events::DiagLevel::Debug,
             "ice",
@@ -1308,12 +1338,7 @@ fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str, why:
     }
     install_peer(
         &state.peers,
-        device_id.to_string(),
-        Arc::new(PeerConnection::new(
-            device_id.to_string(),
-            None,
-            state.peer_connection_resource_scope(),
-        )),
+        Arc::new(PeerConnection::new(device_id.to_string(), None)),
     );
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
         network_id: state.network_id.clone(),
@@ -1390,13 +1415,19 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
     debug!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
     let cfg = state.config.read().clone();
-    let (session, mut rx) = match state
-        .transport
-        .open_peer(role, &cfg.stun_servers, &cfg.turn_servers)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
+    let construction = tokio::time::timeout(
+        Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+        state.transport.open_connector_peer(
+            role,
+            &cfg.stun_servers,
+            &cfg.turn_servers,
+            state.peer_connection_resource_scope(),
+        ),
+    )
+    .await;
+    let (session, mut rx) = match construction {
+        Ok(Ok(peer)) => peer,
+        Ok(Err(e)) => {
             state.log_diag_with(
                 crate::events::DiagLevel::Error,
                 "transport",
@@ -1406,19 +1437,34 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
             warn!(peer = %device_id, "open_peer failed: {e}");
             return;
         }
+        Err(_) => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Error,
+                "transport",
+                format!(
+                    "open_peer for {} did not complete within the existing {} ms connection-attempt window",
+                    short_peer(&device_id),
+                    scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "timeout_ms": scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS,
+                }),
+            );
+            return;
+        }
     };
     let session = Arc::new(session);
     let peer = Arc::new(PeerConnection::new(
         device_id.clone(),
         Some(session.clone()),
-        state.peer_connection_resource_scope(),
     ));
     // Start the connect-timeout clock the moment the session exists: if the
     // data channel hasn't opened within DATA_CHANNEL_OPEN_TIMEOUT_MS of
     // now, the attempt is reclaimed and rebuilt (see
     // `ice_watchdog::poll_all`).
     peer.state.write().session_started_at = Some(Instant::now());
-    install_peer(&state.peers, device_id.clone(), peer.clone());
+    install_peer(&state.peers, peer.clone());
 
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
         network_id: state.network_id.clone(),
@@ -1486,25 +1532,18 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         }
     }
 
-    // Per-peer transport-event pump. Forwards every event into
-    // the main driver via the command queue so all per-peer state
-    // mutation happens serially. Each event is stamped with this
-    // session's epoch so the driver can drop events from a torn-down
-    // session that's still draining (see `handle_transport_event`).
-    let driver_tx = state.cmd_tx.clone();
+    // Per-peer transport-event pump. It handles one event at a time from the
+    // worker's bounded mailbox. Connector events never enter the unbounded
+    // general command queue. The receiver stamps each value with the exact
+    // connector worker identity that owns its callback source.
+    let connector_state = Arc::clone(state);
     let peer_id_for_pump = device_id.clone();
-    let session_epoch = peer.epoch;
+    let task_observation = session.observe_owned_task();
     tokio::spawn(async move {
+        let _task_observation = task_observation;
         while let Some(ev) = rx.recv().await {
-            if driver_tx
-                .send(NetworkCmd::TransportEvent {
-                    device_id: peer_id_for_pump.clone(),
-                    epoch: session_epoch,
-                    event: ev,
-                })
-                .is_err()
-            {
-                break;
+            if handle_transport_event(&connector_state, peer_id_for_pump.clone(), ev).await {
+                rx.commit_data_channel_open();
             }
         }
     });
@@ -1556,69 +1595,60 @@ async fn apply_remote_sdp(
         reoffer_after_failed_answer(state, device_id).await;
         return;
     }
-    let desc = match sdp_type {
-        RTCSdpType::Offer => RTCSessionDescription::offer(sdp).ok(),
-        RTCSdpType::Answer => RTCSessionDescription::answer(sdp).ok(),
-        _ => None,
-    };
-    if let Some(desc) = desc {
-        if let Err(e) = session.set_remote_description(desc).await {
-            state.log_diag_with(
-                crate::events::DiagLevel::Error,
-                "signaling",
-                format!(
-                    "set_remote_description({sdp_type:?}) failed for {}: {e}",
-                    short_peer(device_id)
-                ),
-                serde_json::json!({
-                    "peer": device_id,
-                    "sdp_type": format!("{sdp_type:?}"),
-                    "error": e.to_string(),
-                }),
-            );
-            warn!(peer = %device_id, "set_remote_description failed: {e}");
-            // The common failure here is an Answer arriving when our
-            // signaling state has already raced back to `stable` (no
-            // pending local offer) — "invalid proposed signaling state
-            // transition from stable". A fresh offer re-opens the
-            // negotiation cleanly rather than leaving the link wedged
-            // until the next announce.
-            if sdp_type == RTCSdpType::Answer {
-                reoffer_after_failed_answer(state, device_id).await;
-            }
-        } else {
-            // Drain any ICE candidates that arrived ahead of the
-            // SDP. The lock comes off before any await — we pull
-            // the pending vec out, then apply each candidate
-            // outside the guard so the per-peer state lock isn't
-            // held across the webrtc-rs add_ice_candidate await.
-            let pending = if let Some(peer) = state.peers.get(device_id) {
-                let mut data = peer.state.write();
-                data.remote_description_set = true;
-                data.take_pending_remote_candidates()
-            } else {
-                connection::PendingRemoteCandidateDrain::default()
-            };
-            if !pending.is_empty() {
+    if matches!(sdp_type, RTCSdpType::Offer | RTCSdpType::Answer) {
+        match session.apply_remote_sdp(sdp_type, sdp).await {
+            Err(e) => {
                 state.log_diag_with(
-                    crate::events::DiagLevel::Debug,
-                    "ice",
+                    crate::events::DiagLevel::Error,
+                    "signaling",
                     format!(
-                        "applying {} queued remote candidate(s) for {}",
-                        pending.len(),
+                        "set_remote_description({sdp_type:?}) failed for {}: {e}",
                         short_peer(device_id)
                     ),
-                    serde_json::json!({ "peer": device_id, "count": pending.len() }),
+                    serde_json::json!({
+                        "peer": device_id,
+                        "sdp_type": format!("{sdp_type:?}"),
+                        "error": e.to_string(),
+                    }),
                 );
-                for candidate in pending {
-                    let session = Arc::clone(&session);
-                    let result = connection::apply_pending_remote_candidate(
-                        candidate,
-                        move |candidate| async move { session.add_ice_candidate(candidate).await },
-                    )
-                    .await;
-                    if let Err(e) = result {
-                        warn!(peer = %device_id, "queued add_ice_candidate failed: {e}");
+                warn!(peer = %device_id, "set_remote_description failed: {e}");
+                // The common failure here is an Answer arriving when our
+                // signaling state has already raced back to `stable` (no
+                // pending local offer) — "invalid proposed signaling state
+                // transition from stable". A fresh offer re-opens the
+                // negotiation cleanly rather than leaving the link wedged
+                // until the next announce.
+                if sdp_type == RTCSdpType::Answer {
+                    reoffer_after_failed_answer(state, device_id).await;
+                }
+            }
+            Ok(report) => {
+                // Drain any ICE candidates that arrived ahead of the
+                // SDP. The lock comes off before any await — we pull
+                // the pending vec out, then apply each candidate
+                // outside the guard so the per-peer state lock isn't
+                // held across the webrtc-rs add_ice_candidate await.
+                if report.queued_candidate_count != 0 {
+                    state.log_diag_with(
+                        crate::events::DiagLevel::Debug,
+                        "ice",
+                        format!(
+                            "applying {} queued remote candidate(s) for {}",
+                            report.queued_candidate_count,
+                            short_peer(device_id)
+                        ),
+                        serde_json::json!({
+                            "peer": device_id,
+                            "count": report.queued_candidate_count,
+                            "failure_count": report.candidate_failure_count,
+                        }),
+                    );
+                    if report.candidate_failure_count != 0 {
+                        warn!(
+                            peer = %device_id,
+                            failure_count = report.candidate_failure_count,
+                            "queued remote-candidate application failures were retained only as a count"
+                        );
                     }
                 }
             }
@@ -1709,34 +1739,33 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
 async fn handle_transport_event(
     state: &Arc<NetworkState>,
     device_id: String,
-    epoch: u64,
-    event: TransportEvent,
-) {
-    // Drop events from a stale session. When a peer is rebuilt (drop +
-    // re-open for the same device id), the old session's event pump keeps
-    // draining for a moment; its trailing `DataChannelClosed` would
-    // otherwise call `drop_peer` on the *replacement* session and force an
-    // immediate, needless rebuild — the duplicate "data channel closed"
-    // lines and the spurious post-HeartbeatTimeout `IceFailed` seen in the
-    // field. If the peer is gone entirely, there's nothing to act on
-    // either. Either way, ignore the event (TRACE so the drop is still
-    // greppable when chasing a transport bug).
-    match state.peers.get(&device_id) {
-        Some(peer) if peer.epoch == epoch => {}
-        _ => {
-            trace!(peer = %device_id, epoch, "ignoring transport event from stale/absent session");
-            return;
-        }
-    }
+    event: WebRtcConnectorEvent,
+) -> bool {
+    // The callback stamp must match the exact active worker. A delayed event
+    // from a replaced worker cannot act on the replacement peer.
+    let owner = state.peers.owner(&device_id);
+    let worker = owner
+        .as_ref()
+        .and_then(|owner| state.peers.get_if_current(owner))
+        .and_then(|peer| peer.session.lock().clone());
+    let (Some(owner), Some(worker)) = (owner, worker) else {
+        trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
+        return false;
+    };
+    let Some(event) = worker.accept_event(event) else {
+        trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
+        return false;
+    };
+    let (event, _callback_resources) = event.into_parts();
     match event {
         TransportEvent::RenegotiationNeeded => {
             // A lane opened/closed. Don't offer inline — a burst of lane
             // changes (a screen share starting video + audio together)
             // must collapse into one offer, and glare with the remote's
             // own changes is least likely on the paced tick.
-            if let Some(peer) = state.peers.get(&device_id) {
+            state.peers.with_current(&owner, |peer| {
                 peer.state.write().media_reneg_pending = true;
-            }
+            });
         }
         TransportEvent::LocalIceCandidate(Some(cand)) => {
             // Classify before moving `cand` into the signaling
@@ -1744,8 +1773,18 @@ async fn handle_transport_event(
             // (`ice_watchdog::maybe_emit_no_turn_diag`) has accurate
             // host/srflx/relay counts to report.
             let kind = crate::transport::classify_candidate_sdp(&cand.candidate);
-            if let Some(peer) = state.peers.get(&device_id) {
-                peer.state.write().diag.local_candidates.record(kind);
+            let accepted = state
+                .peers
+                .with_current(&owner, |peer| {
+                    peer.state.write().diag.local_candidates.record(kind);
+                    state.signaling_tx.send(SignalingOutbound::Candidate {
+                        device_id: device_id.clone(),
+                        candidate: cand.clone(),
+                    })
+                })
+                .is_some();
+            if !accepted {
+                return false;
             }
             // Debug-level: candidates are noisy (one per
             // host/srflx/relay), so the per-candidate detail lands
@@ -1762,10 +1801,6 @@ async fn handle_transport_event(
                 ),
                 serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
             );
-            let _ = state.signaling_tx.send(SignalingOutbound::Candidate {
-                device_id: device_id.clone(),
-                candidate: cand,
-            });
         }
         TransportEvent::LocalIceCandidate(None) => {
             // Gathering complete sentinel. Surface as a single info
@@ -1773,15 +1808,15 @@ async fn handle_transport_event(
             // the peer never connects we want the user to see at a
             // glance "we sent 3 host, 1 srflx, 0 relay candidates"
             // so the TURN-needed diagnosis is one read away.
-            let (h, s, r) = if let Some(peer) = state.peers.get(&device_id) {
+            let Some((h, s, r)) = state.peers.with_current(&owner, |peer| {
                 let data = peer.state.read();
                 (
                     data.diag.local_candidates.host,
                     data.diag.local_candidates.server_reflexive,
                     data.diag.local_candidates.relay,
                 )
-            } else {
-                (0, 0, 0)
+            }) else {
+                return false;
             };
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
@@ -1811,7 +1846,7 @@ async fn handle_transport_event(
                 format!("ICE → {ice_state:?} for {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "state": format!("{ice_state:?}") }),
             );
-            handle_ice_state_change(state, &device_id, ice_state).await;
+            handle_ice_state_change(state, &owner, ice_state).await;
         }
         TransportEvent::PeerConnectionStateChanged(pc_state) => {
             // Peer connection state is the higher-level view of the
@@ -1824,18 +1859,46 @@ async fn handle_transport_event(
                 format!("PC → {pc_state:?} for {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "state": format!("{pc_state:?}") }),
             );
-            handle_pc_state_change(state, &device_id, pc_state).await;
+            handle_pc_state_change(state, &owner, pc_state).await;
         }
         TransportEvent::DataChannelOpen => {
+            if state.peers.get_if_current(&owner).is_none() {
+                return false;
+            }
+            let connected = match worker.confirm_data_channel_open() {
+                DataChannelOpenOwnership::Rejected => {
+                    trace!(peer = %device_id, "ignoring DataChannelOpen without a live connector owner");
+                    return false;
+                }
+                DataChannelOpenOwnership::AlreadyConnected => {
+                    trace!(peer = %device_id, "ignoring duplicate DataChannelOpen for the exact connector owner");
+                    return true;
+                }
+                DataChannelOpenOwnership::Connected(connected) => connected,
+            };
+            let auth_task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(connected));
             // The reliable "transport is up" milestone — record it so the
             // connect-timeout watchdog knows this session made it, and stops
             // counting it as a connecting peer that might need rebuilding.
-            if let Some(peer) = state.peers.get(&device_id) {
+            let accepted = state.peers.with_current(&owner, |peer| {
+                if !peer.install_endpoint_auth(Arc::clone(&auth_task)) {
+                    return false;
+                }
                 peer.state.write().data_channel_open = true;
+                state.clear_reconnect_intent(&device_id);
+                true
+            });
+            if accepted != Some(true) {
+                // The connector capability was already promoted, but the
+                // exact registry owner lost its install race. Fence this
+                // connector now so it cannot retain connected ownership or
+                // later release queued endpoint protocol without an installed
+                // Endpoint Auth Task.
+                worker.retire();
+                return false;
             }
             // The link is back — retire any reconnect intent we were driving
             // for this peer so the tick stops re-offering it.
-            state.clear_reconnect_intent(&device_id);
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "transport",
@@ -1845,7 +1908,8 @@ async fn handle_transport_event(
                 ),
                 serde_json::json!({ "peer": device_id }),
             );
-            handshake::initiate(state, &device_id).await;
+            handshake::initiate(state, &owner, auth_task).await;
+            return true;
         }
         TransportEvent::DataChannelClosed => {
             // A channel that closes right after we hand an evicted peer its
@@ -1867,10 +1931,10 @@ async fn handle_transport_event(
                 ),
                 serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
             );
-            drop_peer(state, &device_id, reason).await;
+            drop_peer_if_current(state, &owner, reason).await;
         }
         TransportEvent::Message(bytes) => {
-            handle_inbound_frame(state, &device_id, bytes).await;
+            handle_inbound_frame_from(state, &owner, bytes).await;
         }
         TransportEvent::VideoSample(sample) => {
             // No per-sample admission check on this hot path: an unadmitted peer
@@ -1879,19 +1943,25 @@ async fn handle_transport_event(
             // pre-admission — and the embedder matches an inbound sample to an
             // authorized route. Admission is enforced at the route layer (the
             // outer layer), not per frame here.
-            state.dispatch_video(&device_id, sample);
+            state.peers.with_current(&owner, |_| {
+                state.dispatch_video(&device_id, sample);
+            });
         }
         TransportEvent::AudioSample(sample) => {
-            state.dispatch_audio(&device_id, sample);
+            state.peers.with_current(&owner, |_| {
+                state.dispatch_audio(&device_id, sample);
+            });
         }
     }
+    false
 }
 
 async fn handle_ice_state_change(
     state: &Arc<NetworkState>,
-    device_id: &str,
+    owner: &state::PeerOwnerToken,
     ice: RTCIceConnectionState,
 ) {
+    let device_id = owner.device_id();
     // Instrumentation: a breadcrumb on every ICE transition so the log
     // carries the full state trail per peer, not just the headline
     // "connected"/"stuck" lines. `Disconnected` is the one that was
@@ -1915,10 +1985,7 @@ async fn handle_ice_state_change(
     // Resolve the state transition under the lock, return what the
     // caller should do, then drop the lock before any await.
     let mut confirm_ping = false;
-    let escalate_failed = {
-        let Some(peer) = state.peers.get(device_id) else {
-            return;
-        };
+    let Some(escalate_failed) = state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
         data.diag.ice_transitions += 1;
         // ICE state never tears a peer down — it only clears or schedules
@@ -1990,21 +2057,26 @@ async fn handle_ice_state_change(
             }
             _ => false,
         }
+    }) else {
+        return;
     };
     if escalate_failed {
         // Dump the full connectivity-check snapshot *before* the ladder
         // tears the session down — this is the "why did it fail"
         // record: every candidate pair, every STUN check counter, and a
         // plain-language diagnosis the user can act on.
-        log_ice_check_snapshot(state, device_id, "ICE failed", true).await;
-        ice_watchdog::on_failed(state, device_id).await;
+        log_ice_check_snapshot_for_owner(state, owner, "ICE failed", true).await;
+        if state.peers.get_if_current(owner).is_none() {
+            return;
+        }
+        ice_watchdog::on_failed(state, owner).await;
     }
     if confirm_ping {
         // Probe the restarted path with traffic right now instead of
         // waiting up to a heartbeat interval: a live path pongs within an
         // RTT and gets promoted to Steady; a dead one stays unconfirmed for
         // the restart-verify watchdog to rebuild.
-        heartbeat::send_ping(state, device_id).await;
+        heartbeat::send_ping_to_owner(state, owner).await;
     }
     // Once ICE settles, ask the agent which candidate pair it
     // actually chose so the GUI can paint the link type from real
@@ -2013,21 +2085,21 @@ async fn handle_ice_state_change(
     // selection doesn't claim "LAN" while the connection is dead.
     match ice {
         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
-            record_selected_pair(state, device_id).await;
+            record_selected_pair_for_owner(state, owner).await;
         }
         RTCIceConnectionState::Disconnected => {
             // A drop on a previously-checking/active pair: log a concise
             // breadcrumb of the check counters so a flap leaves a trail
             // (was the path ever two-way?) before we clear the pair.
-            log_ice_check_snapshot(state, device_id, "ICE disconnected", false).await;
-            if let Some(peer) = state.peers.get(device_id) {
+            log_ice_check_snapshot_for_owner(state, owner, "ICE disconnected", false).await;
+            state.peers.with_current(owner, |peer| {
                 peer.state.write().selected_pair = None;
-            }
+            });
         }
         RTCIceConnectionState::Failed | RTCIceConnectionState::Closed => {
-            if let Some(peer) = state.peers.get(device_id) {
+            state.peers.with_current(owner, |peer| {
                 peer.state.write().selected_pair = None;
-            }
+            });
         }
         _ => {}
     }
@@ -2039,6 +2111,14 @@ async fn handle_ice_state_change(
 /// down, etc.) and the next state change or the ICE poll will
 /// re-query.
 pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &str) {
+    let Some(owner) = state.peers.owner(device_id) else {
+        return;
+    };
+    record_selected_pair_for_owner(state, &owner).await;
+}
+
+async fn record_selected_pair_for_owner(state: &Arc<NetworkState>, owner: &state::PeerOwnerToken) {
+    let device_id = owner.device_id();
     // Same DashMap-Ref + MutexGuard scoping pattern as the watchdog:
     // pull the cloned `Arc<PeerSession>` into a named local before
     // the inner block returns so the guard drops before the `Ref`
@@ -2046,7 +2126,7 @@ pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &
     // expression scoping keeps the guard alive across the outer
     // borrow check.
     let session = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let session = peer.session.lock().clone();
@@ -2071,8 +2151,11 @@ pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &
         }
     };
     let Some(pair) = pair else { return };
-    if let Some(peer) = state.peers.get(device_id) {
+    let committed = state.peers.with_current(owner, |peer| {
         peer.state.write().selected_pair = Some(pair);
+    });
+    if committed.is_none() {
+        return;
     }
     // Summarize the chosen path as a transport word so a glance tells you
     // whether you're going direct or through STUN/TURN — the detail keeps
@@ -2124,10 +2207,23 @@ pub(crate) async fn log_ice_check_snapshot(
     context: &str,
     full: bool,
 ) {
+    let Some(owner) = state.peers.owner(device_id) else {
+        return;
+    };
+    log_ice_check_snapshot_for_owner(state, &owner, context, full).await;
+}
+
+async fn log_ice_check_snapshot_for_owner(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    context: &str,
+    full: bool,
+) {
+    let device_id = owner.device_id();
     // Same Ref + MutexGuard scoping dance as record_selected_pair:
     // clone the session out, drop every guard, then await.
     let session = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let session = peer.session.lock().clone();
@@ -2151,6 +2247,9 @@ pub(crate) async fn log_ice_check_snapshot(
             return;
         }
     };
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
     if snap.is_empty() {
         return;
     }
@@ -2239,7 +2338,7 @@ fn render_candidate_list(items: &[String]) -> String {
 
 async fn handle_pc_state_change(
     state: &Arc<NetworkState>,
-    device_id: &str,
+    owner: &state::PeerOwnerToken,
     pc: RTCPeerConnectionState,
 ) {
     // A closed connection is a real teardown — drop and let discovery
@@ -2250,7 +2349,7 @@ async fn handle_pc_state_change(
     // inbound silence. (`Failed` used to arm the old checking-timeout; that
     // machinery is gone — ICE/PC state no longer tears anyone down.)
     if pc == RTCPeerConnectionState::Closed {
-        drop_peer(state, device_id, DropReason::IceFailed).await;
+        drop_peer_if_current(state, owner, DropReason::IceFailed).await;
     }
 }
 
@@ -2262,12 +2361,12 @@ async fn handle_pc_state_change(
 /// above any real handshake / roster / governance / RPC / user-channel frame —
 /// so it only ever bites a pathological one. (Per-peer byte-rate budgets are a
 /// deeper follow-up; this is the hard per-frame ceiling.)
-const MAX_INBOUND_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ENDPOINT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether an inbound frame is small enough to decode. Split out so the
-/// [`MAX_INBOUND_FRAME_BYTES`] boundary is unit-tested.
+/// [`MAX_ENDPOINT_FRAME_BYTES`] boundary is unit-tested.
 fn frame_within_cap(len: usize) -> bool {
-    len <= MAX_INBOUND_FRAME_BYTES
+    len <= MAX_ENDPOINT_FRAME_BYTES
 }
 
 /// Which admission phase an inbound frame requires before it may move peer
@@ -2288,7 +2387,7 @@ enum Admission {
 /// Classify an inbound frame's admission phase. Only the four handshake/
 /// approval frames are `Protocol`; everything else — including any future
 /// variant — is `Application` and requires an admitted peer (fail closed).
-fn inbound_admission(msg: &MeshMessage) -> Admission {
+fn message_admission(msg: &MeshMessage) -> Admission {
     match msg {
         MeshMessage::Hello(_)
         | MeshMessage::AuthResponse(_)
@@ -2298,13 +2397,26 @@ fn inbound_admission(msg: &MeshMessage) -> Admission {
     }
 }
 
+#[cfg(test)]
 async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes: Bytes) {
+    let Some(owner) = state.peers.owner(device_id) else {
+        return;
+    };
+    handle_inbound_frame_from(state, &owner, bytes).await;
+}
+
+async fn handle_inbound_frame_from(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    bytes: Bytes,
+) {
+    let device_id = owner.device_id();
     // Reject an oversize frame before the deserializer allocates for it.
     if !frame_within_cap(bytes.len()) {
         warn!(
             peer = %device_id,
             len = bytes.len(),
-            "dropping oversize inbound frame (> {MAX_INBOUND_FRAME_BYTES} bytes)"
+            "dropping oversize inbound endpoint frame (> {MAX_ENDPOINT_FRAME_BYTES} bytes)"
         );
         return;
     }
@@ -2329,8 +2441,11 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
     // `handshake::on_approve`). This check is synchronous, not swept: a
     // never-admitted peer must get *zero* application processing, so there is
     // no grace window a periodic revalidation could open.
-    let application = matches!(inbound_admission(&msg), Admission::Application);
-    if let Some(peer) = state.peers.get(device_id) {
+    let application = matches!(message_admission(&msg), Admission::Application);
+    let Some(peer) = state.peers.get_if_current(owner) else {
+        return;
+    };
+    {
         let mut data = peer.state.write();
         if application && !data.is_admitted() {
             data.admission_rejected = data.admission_rejected.saturating_add(1);
@@ -2367,28 +2482,21 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
             data.tier = ConnectionTier::Steady;
             data.ice_disconnected_since = None;
         }
-    } else if application {
-        // No peer entry means nothing can admit an application frame — drop it.
-        // Protocol frames fall through; their handlers look the peer up and
-        // handle its absence themselves.
-        return;
     }
     state
         .traffic
         .record_rx(traffic::class_of(&msg), bytes.len());
     match msg {
-        MeshMessage::Hello(hello) => handshake::on_hello(state, device_id, hello).await,
-        MeshMessage::AuthResponse(resp) => {
-            handshake::on_auth_response(state, device_id, resp).await
-        }
-        MeshMessage::Approve(_) => handshake::on_approve(state, device_id).await,
-        MeshMessage::Deny(d) => handshake::on_deny(state, device_id, d).await,
+        MeshMessage::Hello(hello) => handshake::on_hello(state, owner, hello).await,
+        MeshMessage::AuthResponse(resp) => handshake::on_auth_response(state, owner, resp).await,
+        MeshMessage::Approve(_) => handshake::on_approve(state, owner).await,
+        MeshMessage::Deny(d) => handshake::on_deny(state, owner, d).await,
         MeshMessage::Ping(p) => heartbeat::on_ping(state, device_id, p).await,
         MeshMessage::Pong(p) => heartbeat::on_pong(state, device_id, p).await,
         MeshMessage::Shelve(s) => on_shelve(state, device_id, s).await,
         MeshMessage::Unshelve(_) => on_unshelve(state, device_id).await,
         MeshMessage::CapabilitiesUpdate(u) => on_capabilities_update(state, device_id, u).await,
-        MeshMessage::RpcRequest(req) => on_rpc_request(state, device_id, req).await,
+        MeshMessage::RpcRequest(req) => on_rpc_request(state, owner, req).await,
         MeshMessage::RpcResponse(resp) => on_rpc_response(state, device_id, resp).await,
         MeshMessage::RpcStreamChunk(c) => on_rpc_stream_chunk(state, device_id, c).await,
         MeshMessage::RpcStreamEnd(e) => on_rpc_stream_end(state, device_id, e).await,
@@ -2461,13 +2569,18 @@ async fn on_capabilities_update(
     }));
 }
 
-async fn on_rpc_request(state: &Arc<NetworkState>, device_id: &str, req: RpcRequestMessage) {
+async fn on_rpc_request(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    req: RpcRequestMessage,
+) {
+    let device_id = owner.device_id();
     let Some(rpc) = state.rpc.read().clone() else {
         // No RPC bound yet — send a transient error so the peer
         // doesn't hang on the oneshot.
-        let _ = send_to_peer(
+        let _ = send_to_peer_owner(
             state,
-            device_id,
+            owner,
             &MeshMessage::RpcResponse(RpcResponseMessage {
                 request_id: req.request_id,
                 ok: None,
@@ -2486,9 +2599,9 @@ async fn on_rpc_request(state: &Arc<NetworkState>, device_id: &str, req: RpcRequ
     };
     let handler = rpc.handlers.get(&req.method);
     let Some(handler) = handler else {
-        let _ = send_to_peer(
+        let _ = send_to_peer_owner(
             state,
-            device_id,
+            owner,
             &MeshMessage::RpcResponse(RpcResponseMessage {
                 request_id: req.request_id,
                 ok: None,
@@ -2502,7 +2615,7 @@ async fn on_rpc_request(state: &Arc<NetworkState>, device_id: &str, req: RpcRequ
         crate::rpc::HandlerEntry::Single(h) => {
             let fut = (h.clone())(call);
             let state = state.clone();
-            let device_id = device_id.to_string();
+            let owner = owner.clone();
             let request_id = req.request_id;
             drop(handler);
             tokio::spawn(async move {
@@ -2519,22 +2632,22 @@ async fn on_rpc_request(state: &Arc<NetworkState>, device_id: &str, req: RpcRequ
                         error: Some(e),
                     },
                 };
-                let _ = send_to_peer(&state, &device_id, &MeshMessage::RpcResponse(frame)).await;
+                let _ = send_to_peer_owner(&state, &owner, &MeshMessage::RpcResponse(frame)).await;
             });
         }
         crate::rpc::HandlerEntry::Stream(h) => {
             let fut = (h.clone())(call);
             let state = state.clone();
-            let device_id = device_id.to_string();
+            let owner = owner.clone();
             let request_id = req.request_id;
             drop(handler);
             tokio::spawn(async move {
                 let mut rx = match fut.await {
                     Ok(rx) => rx,
                     Err(e) => {
-                        let _ = send_to_peer(
+                        let _ = send_to_peer_owner(
                             &state,
-                            &device_id,
+                            &owner,
                             &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                                 request_id,
                                 error: Some(e),
@@ -2547,9 +2660,9 @@ async fn on_rpc_request(state: &Arc<NetworkState>, device_id: &str, req: RpcRequ
                 let mut seq = 0u64;
                 while let Some(payload) = rx.recv().await {
                     seq += 1;
-                    let _ = send_to_peer(
+                    let _ = send_to_peer_owner(
                         &state,
-                        &device_id,
+                        &owner,
                         &MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
                             request_id: request_id.clone(),
                             seq,
@@ -2558,9 +2671,9 @@ async fn on_rpc_request(state: &Arc<NetworkState>, device_id: &str, req: RpcRequ
                     )
                     .await;
                 }
-                let _ = send_to_peer(
+                let _ = send_to_peer_owner(
                     &state,
-                    &device_id,
+                    &owner,
                     &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                         request_id,
                         error: None,
@@ -2636,15 +2749,9 @@ async fn on_channel_frame(
     channel: String,
     payload: serde_json::Value,
 ) {
-    // Routed envelopes ride the reserved relay channel; the router
-    // consumes the wrapper-shaped ones (delivering / forwarding across
-    // the topology) and leaves legacy RelayService envelopes to the
-    // ordinary subscriber path below.
-    if channel == crate::services::relay::RELAY_CHANNEL
-        && Box::pin(routing::on_relay_frame(state, device_id, &payload)).await
-    {
-        return;
-    }
+    // Arc 03 never interprets an endpoint frame as an ordinary-member routing
+    // envelope. The legacy routing module remains tracked by RTM-001, but the
+    // V4 inbound path does not dispatch into it.
     state.dispatch_channel_frame(&channel, device_id, payload);
 }
 
@@ -2661,6 +2768,13 @@ pub(crate) async fn send_to_peer(
         let Some(peer) = state.peers.get(device_id) else {
             return Err(Error::Network(format!("peer not found: {device_id}")));
         };
+        if matches!(message_admission(msg), Admission::Application)
+            && !peer.state.read().is_admitted()
+        {
+            return Err(Error::Network(format!(
+                "peer is not admitted for application traffic: {device_id}"
+            )));
+        }
         let session = peer.session.lock().clone();
         session
     };
@@ -2675,7 +2789,7 @@ pub(crate) async fn send_to_peer(
     let class = traffic::class_of(msg);
     let n = tokio::time::timeout(
         Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
-        session.send(Bytes::from(serialized)),
+        session.send_owned(Bytes::from(serialized)),
     )
     .await
     .map_err(|_| Error::Transport("peer send timed out".into()))??;
@@ -2688,44 +2802,66 @@ pub(crate) async fn send_to_peer(
     Ok(())
 }
 
+pub(crate) async fn send_to_peer_owner(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    msg: &MeshMessage,
+) -> Result<()> {
+    let peer = state
+        .peers
+        .get_if_current(owner)
+        .ok_or_else(|| Error::Network(format!("peer owner is stale: {}", owner.device_id())))?;
+    if matches!(message_admission(msg), Admission::Application) && !peer.state.read().is_admitted()
+    {
+        return Err(Error::Network(format!(
+            "peer owner is not admitted for application traffic: {}",
+            owner.device_id()
+        )));
+    }
+    let session = peer
+        .session
+        .lock()
+        .clone()
+        .ok_or_else(|| Error::Transport("session not yet established".into()))?;
+    let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
+    let class = traffic::class_of(msg);
+    let n = tokio::time::timeout(
+        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        session.send_owned(Bytes::from(serialized)),
+    )
+    .await
+    .map_err(|_| Error::Transport("peer send timed out".into()))??;
+    state.traffic.record_tx(class, n);
+    let mut data = peer.state.write();
+    data.diag.bytes_out += n as u64;
+    data.diag.frames_out += 1;
+    Ok(())
+}
+
 async fn send_channel_frame(
     state: &Arc<NetworkState>,
     peer: &str,
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    // Only a shaped topology can ever route around a missing link, so
-    // only a shaped topology pays for keeping a copy. On full mesh the
-    // payload moves — this is the hot path for MJPEG / PCM / file
-    // chunks, and a per-frame clone of a 100 KB frame is real money.
-    let shaped = state.topology_impl.read().prunes();
-    if !shaped {
-        return send_to_peer(
-            state,
-            peer,
-            &MeshMessage::Channel {
-                channel: channel.to_string(),
-                payload,
-            },
-        )
-        .await;
+    let admitted = state
+        .peers
+        .get(peer)
+        .is_some_and(|connection| connection.state.read().is_admitted());
+    if !admitted {
+        return Err(Error::Network(format!(
+            "peer is not admitted for application traffic: {peer}"
+        )));
     }
-    let direct = send_to_peer(
+    send_to_peer(
         state,
         peer,
         &MeshMessage::Channel {
             channel: channel.to_string(),
-            payload: payload.clone(),
+            payload,
         },
     )
-    .await;
-    match direct {
-        Ok(()) => Ok(()),
-        // Under a shaped topology "no direct link" is the normal state
-        // for most pairs — hand the frame to the shape's forwarders
-        // instead of surfacing an error the caller can't act on.
-        Err(_) => routing::send_routed(state, peer, channel, &payload).await,
-    }
+    .await
 }
 
 async fn broadcast_channel_frame(
@@ -2733,22 +2869,13 @@ async fn broadcast_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> usize {
-    // A shaped topology reaches members we hold no connection to —
-    // flood one wrapped envelope per connected edge and let the
-    // forwarders re-fan it (per-node dedup keeps delivery exactly
-    // once). Full mesh keeps the plain per-peer send.
-    if state.topology_impl.read().prunes() {
-        return routing::broadcast_flood(state, channel, &payload).await;
-    }
-    let peers: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            let s = e.value().state.read();
-            matches!(s.status, PeerStatus::Active) && !s.local_shelved && !s.remote_shelved
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    // V4 broadcast is one direct send per connected endpoint. It never asks
+    // an ordinary member to forward application payload.
+    let peers: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        (matches!(data.status, PeerStatus::Active) && !data.local_shelved && !data.remote_shelved)
+            .then(|| peer.device_id.clone())
+    });
     let mut delivered = 0usize;
     for peer in peers {
         if send_to_peer(
@@ -2777,12 +2904,9 @@ async fn send_rpc_request(
 }
 
 async fn broadcast_capabilities(state: &Arc<NetworkState>, caps: CapabilityAdvert) -> usize {
-    let peers: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| matches!(e.value().state.read().status, PeerStatus::Active))
-        .map(|e| e.key().clone())
-        .collect();
+    let peers: Vec<String> = state.peers.collect_map(|peer| {
+        matches!(peer.state.read().status, PeerStatus::Active).then(|| peer.device_id.clone())
+    });
     let mut delivered = 0usize;
     for peer in peers {
         if send_to_peer(
@@ -2927,10 +3051,13 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
 /// ICE — the probe only decides *whether to ask*.
 async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id: &str) {
     // Decide under the peer lock, stamping the single-flight marker so a
-    // burst of announces produces at most one probe. Yields the session
-    // epoch to probe, or `None` to skip.
-    let probe_epoch = match state.peers.get(device_id) {
-        Some(peer) => {
+    // burst of announces produces at most one probe. Yields the exact worker
+    // being probed, or `None` to skip.
+    let probed = match state.peers.owner(device_id) {
+        Some(owner) => {
+            let Some(peer) = state.peers.get_if_current(&owner) else {
+                return;
+            };
             let mut data = peer.state.write();
             let established = matches!(data.status, PeerStatus::Active | PeerStatus::Shelved);
             let silent = data
@@ -2958,14 +3085,15 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
                 .unwrap_or(false);
             if established && silent && !restart_in_flight && !probed_recently {
                 data.last_liveness_probe_at = Some(Instant::now());
-                Some(peer.epoch)
+                drop(data);
+                peer.session.lock().clone().map(|worker| (owner, worker))
             } else {
                 None
             }
         }
         None => None,
     };
-    let Some(probe_epoch) = probe_epoch else {
+    let Some((owner, probed_worker)) = probed else {
         return;
     };
 
@@ -2982,27 +3110,26 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
             "stale_inbound_ms": scheduler::STALE_INBOUND_MS,
         }),
     );
-    heartbeat::send_ping(state, device_id).await;
+    heartbeat::send_ping_to_owner(state, &owner).await;
 
-    // Confirm by inbound traffic — not by ICE: wait the probe delay, then
-    // rebuild the peer if it still hasn't sent us a frame. The epoch guard
-    // makes sure we only reclaim the *same* session we probed — a rebuild
-    // that happened during the grace (a fresh offer landed, say) carries a
-    // new epoch and is left alone.
+    // Confirm by inbound traffic after the probe delay. Pointer identity
+    // ensures this task can reclaim only the exact worker it probed.
     let state = state.clone();
     let device_id = device_id.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS)).await;
-        let still_silent = match state.peers.get(&device_id) {
-            Some(peer) if peer.epoch == probe_epoch => peer
-                .state
-                .read()
-                .last_recv_at
-                .map(|t| t.elapsed().as_millis() as u64 > scheduler::WAKE_PROBE_DELAY_MS)
-                .unwrap_or(true),
-            // Gone, or already rebuilt to a newer session — nothing to do.
-            _ => false,
-        };
+        let still_silent = state.peers.get_if_current(&owner).is_some_and(|peer| {
+            let current_worker = peer.session.lock().clone();
+            current_worker
+                .as_ref()
+                .is_some_and(|worker| Arc::ptr_eq(worker, &probed_worker))
+                && peer
+                    .state
+                    .read()
+                    .last_recv_at
+                    .map(|t| t.elapsed().as_millis() as u64 > scheduler::WAKE_PROBE_DELAY_MS)
+                    .unwrap_or(true)
+        });
         if still_silent {
             state.log_diag_with(
                 crate::events::DiagLevel::Warn,
@@ -3013,12 +3140,7 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
                 ),
                 serde_json::json!({ "peer": device_id }),
             );
-            drop_peer(
-                &state,
-                &device_id,
-                crate::events::DropReason::HeartbeatTimeout,
-            )
-            .await;
+            drop_peer_if_current(&state, &owner, crate::events::DropReason::HeartbeatTimeout).await;
             // Re-seed discovery so the rebuilt peer reconnects on the next
             // round-trip rather than waiting for its own announce schedule.
             maybe_reactive_announce(&state);
@@ -3026,17 +3148,19 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
     });
 }
 
-pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
-    let removed = remove_peer(&state.peers, device_id);
+async fn finish_drop_peer(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    reason: DropReason,
+    removed: Option<Arc<PeerConnection>>,
+) {
     if let Some(peer) = removed {
-        let session = peer.session.lock().clone();
-        if let Some(session) = session {
-            // Spawn the close so the driver loop never blocks on
-            // the WebRTC teardown's potentially-slow path.
-            tokio::spawn(async move {
-                let _ = session.close().await;
-            });
-        }
+        let cleanup_peer = Arc::clone(&peer);
+        tokio::spawn(async move {
+            if let Err(error) = cleanup_peer.retire_and_close().await {
+                warn!(%error, "peer cleanup did not complete successfully");
+            }
+        });
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
@@ -3106,11 +3230,35 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
     ladder::reevaluate_topology(state).await;
 }
 
+pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
+    let removed = remove_peer(&state.peers, device_id);
+    finish_drop_peer(state, device_id, reason, removed).await;
+}
+
+pub(crate) async fn drop_peer_if_current(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    reason: DropReason,
+) {
+    let removed = state.peers.remove_if_current(owner);
+    if removed.is_none() {
+        return;
+    }
+    finish_drop_peer(state, owner.device_id(), reason, removed).await;
+}
+
 /// Install the current peer owner and retire any replaced compatibility queue.
 /// Explicit retirement is required because other tasks may still hold an
 /// `Arc` to the replaced peer object.
-fn install_peer(peers: &state::PeerRegistry, device_id: String, peer: Arc<PeerConnection>) {
-    peers.install(device_id, peer);
+fn install_peer(peers: &state::PeerRegistry, peer: Arc<PeerConnection>) {
+    let Some(replaced) = peers.install(peer) else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(error) = replaced.retire_and_close().await {
+            warn!(%error, "replaced peer cleanup did not complete successfully");
+        }
+    });
 }
 
 /// Remove the current peer owner and retire its compatibility queue before the
@@ -3125,6 +3273,14 @@ fn remove_peer(peers: &state::PeerRegistry, device_id: &str) -> Option<Arc<PeerC
 /// their on-disk roster / state files don't collide.
 #[cfg(test)]
 pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
+    let (state, _cmd_rx) = build_test_state_parts(network_id_suffix);
+    state
+}
+
+#[cfg(test)]
+fn build_test_state_parts(
+    network_id_suffix: &str,
+) -> (Arc<NetworkState>, mpsc::UnboundedReceiver<NetworkCmd>) {
     use std::sync::OnceLock;
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     let _ = HOME.get_or_init(|| {
@@ -3148,10 +3304,107 @@ pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
         auto_approve: true,
     };
     let identity = Arc::new(crate::identity::Identity::ephemeral());
-    let transport = crate::transport::Transport::new().expect("transport");
-    let (state, _signaling_in_rx, _cmd_rx) =
+    let max_connectors = std::num::NonZeroUsize::new(2)
+        .expect("engine fixture has two simultaneous connector slots");
+    let callback_capacity =
+        std::num::NonZeroUsize::new(16).expect("engine fixture callback capacity is nonzero");
+    let callbacks = crate::runtime::attempt::ConnectorCallbackPolicy::new(
+        crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
+            callback_capacity,
+            callback_capacity,
+        ),
+        crate::runtime::attempt::ConnectorCallbackServiceWeights::data_only(
+            callback_capacity,
+            callback_capacity,
+        ),
+        crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
+    )
+    .expect("engine fixture data-only callback policy is valid");
+    let webrtc_profile = crate::WebRtcConnectorProfile::new(
+        callbacks,
+        crate::PendingRemoteCandidatePolicy::elastic(),
+    );
+    let profiles = vec![webrtc_profile; max_connectors.get()];
+    let connectors = std::num::NonZeroU64::new(max_connectors.get() as u64)
+        .expect("engine fixture connector count is nonzero");
+    let frame_bytes = std::num::NonZeroU64::new(
+        u64::try_from(myownmesh_signaling::mdns::wire::MAX_FRAME_BYTES)
+            .expect("the signaling frame limit fits u64"),
+    )
+    .expect("the signaling frame limit is nonzero");
+    let candidate_content = std::num::NonZeroU64::new(
+        frame_bytes
+            .get()
+            .checked_mul(connectors.get())
+            .expect("engine fixture candidate content is representable"),
+    )
+    .expect("engine fixture candidate content is nonzero");
+    let candidate_strings = std::num::NonZeroU64::new(
+        candidate_content
+            .get()
+            .checked_mul(3)
+            .expect("engine fixture candidate strings are representable"),
+    )
+    .expect("engine fixture candidate strings are nonzero");
+    // Every candidate admitted by the fixture has at least one content byte.
+    // Therefore the cumulative content envelope is also a conservative upper
+    // bound on the number of distinct retained candidates.
+    let max_unique_candidates = candidate_content;
+    let candidate_grant = crate::transport::webrtc::transport_lab_remote_candidate_fixture_grant(
+        max_unique_candidates,
+        connectors,
+        candidate_strings,
+        candidate_content,
+        frame_bytes,
+    )
+    .expect("engine fixture remote-candidate grant is mechanically representable");
+    let remote_description_grant =
+        crate::transport::webrtc::transport_lab_remote_description_fixture_grant(
+            connectors,
+            frame_bytes,
+            std::num::NonZeroU64::new(1).expect("the data-only fixture has one media section"),
+            std::num::NonZeroU64::new(1).expect("the data-only fixture has one active binding"),
+            frame_bytes,
+        )
+        .expect("engine fixture remote-SDP grant is mechanically representable");
+    let grant = crate::transport::webrtc::one_mesh_connector_fixture_grant(&profiles)
+        .expect("engine fixture construction grant is mechanically representable");
+    let grant = grant
+        .checked_add(candidate_grant)
+        .and_then(|claim| claim.checked_add(remote_description_grant))
+        .expect("engine fixture connector and signaling grant is representable");
+    let provider = crate::resource::ResourceProviderPort::new(
+        crate::resource::FiniteResourceProvider::new(grant),
+    )
+    .expect("engine fixture provider admits its process scope");
+    let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider);
+    let scope = owner
+        .issue_mesh_scope()
+        .expect("engine fixture process owner issues one explicit Mesh scope");
+    let transport = crate::transport::Transport::new()
+        .expect("transport")
+        .with_connector_resource_scope(scope, webrtc_profile);
+    let (state, _signaling_in_rx, cmd_rx) =
         NetworkState::new(config, identity, transport).expect("network state");
-    state
+    (state, cmd_rx)
+}
+
+/// Build test state with the same serialized command consumer that owns
+/// delayed exact-peer mutations in the production driver.
+#[cfg(test)]
+pub(crate) fn build_test_state_with_command_driver(
+    network_id_suffix: &str,
+) -> (Arc<NetworkState>, tokio::task::JoinHandle<()>) {
+    let (state, mut cmd_rx) = build_test_state_parts(network_id_suffix);
+    let command_state = Arc::clone(&state);
+    let command_driver = tokio::spawn(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            if !handle_command(&command_state, command).await {
+                break;
+            }
+        }
+    });
+    (state, command_driver)
 }
 
 /// Insert a peer with no WebRTC session and a chosen `last_recv_at`,
@@ -3163,132 +3416,261 @@ pub(crate) fn insert_session_less_peer(
     device_id: &str,
     last_recv_at: Option<Instant>,
 ) {
-    let peer = Arc::new(PeerConnection::new(
-        device_id.to_string(),
-        None,
-        state.peer_connection_resource_scope(),
-    ));
+    let peer = Arc::new(PeerConnection::new(device_id.to_string(), None));
     peer.state.write().last_recv_at = last_recv_at;
-    install_peer(&state.peers, device_id.to_string(), peer);
+    install_peer(&state.peers, peer);
+}
+
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn insert_admitted_legacy_test_peer(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    auth_task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+) {
+    let peer = Arc::new(PeerConnection::new(device_id.to_string(), Some(worker)));
+    assert!(peer.install_endpoint_auth(auth_task));
+    {
+        let mut data = peer.state.write();
+        data.authenticated = true;
+        data.status = PeerStatus::Active;
+        data.data_channel_open = true;
+    }
+    install_peer(&state.peers, peer);
+}
+
+#[cfg(all(test, feature = "legacy-v1"))]
+pub(crate) fn spawn_admitted_legacy_test_pump(
+    state: Arc<NetworkState>,
+    device_id: String,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    mut events: crate::transport::webrtc::WebRtcConnectorEventReceiver,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Some(event) = worker.accept_event(event) {
+                let (event, _callback_resources) = event.into_parts();
+                if let TransportEvent::Message(bytes) = event {
+                    handle_inbound_frame(&state, &device_id, bytes).await;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{
-        NetworkInstanceResourceScope, PreAuthResourceFamily, ProcessResourceRoot, ResourceUse,
-    };
+    use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
     use std::time::{Duration, Instant};
 
-    fn arc02_candidate_fixture() -> crate::transport::LocalIceCandidate {
+    fn arc03_candidate_fixture() -> crate::transport::LocalIceCandidate {
         crate::transport::LocalIceCandidate {
-            candidate: "candidate:arc02 1 udp host".to_string(),
+            candidate: "candidate:arc03 1 udp host".to_string(),
             sdp_mid: Some("data".to_string()),
             sdp_mline_index: None,
-            username_fragment: Some("arc02-fragment".to_string()),
+            username_fragment: Some("arc03-fragment".to_string()),
         }
     }
 
-    fn arc02_peer_with_pending_candidate(
-        context: &NetworkInstanceResourceScope,
-        device_id: &str,
-    ) -> Arc<PeerConnection> {
-        let peer = Arc::new(PeerConnection::new(
-            device_id.to_string(),
-            None,
-            context.peer_connection_scope(),
-        ));
-        {
-            let mut state = peer.state.write();
-            peer.queue_remote_candidate(&mut state, arc02_candidate_fixture());
-        }
-        peer
-    }
-
-    fn arc02_candidate_use(context: &NetworkInstanceResourceScope) -> ResourceUse {
-        context
-            .report()
+    fn pre_auth_report(
+        state: &NetworkState,
+        family: PreAuthResourceFamily,
+    ) -> ResourceFamilyReport<PreAuthResourceFamily> {
+        state
+            .resource_report()
             .pre_authentication
             .iter()
-            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
-            .expect("candidate family is present")
-            .active
-    }
-
-    #[test]
-    fn v4_arc02_peer_replacement_releases_queue_while_retired_arc_survives() {
-        let process = ProcessResourceRoot::isolated();
-        let mesh = process.mesh_runtime_scope();
-        let context = mesh.network_instance_scope();
-        let peers = state::PeerRegistry::default();
-        let device_id = "arc02-replaced-peer";
-        let retired = arc02_peer_with_pending_candidate(&context, device_id);
-        install_peer(&peers, device_id.to_string(), Arc::clone(&retired));
-        assert_ne!(arc02_candidate_use(&context), ResourceUse::ZERO);
-
-        let replacement = Arc::new(PeerConnection::new(
-            device_id.to_string(),
-            None,
-            context.peer_connection_scope(),
-        ));
-        install_peer(&peers, device_id.to_string(), replacement);
-
-        assert_eq!(arc02_candidate_use(&context), ResourceUse::ZERO);
-        assert_eq!(retired.device_id, device_id);
-    }
-
-    #[test]
-    fn v4_arc02_peer_removal_releases_queue_while_removed_arc_survives() {
-        let process = ProcessResourceRoot::isolated();
-        let mesh = process.mesh_runtime_scope();
-        let context = mesh.network_instance_scope();
-        let peers = state::PeerRegistry::default();
-        let device_id = "arc02-removed-peer";
-        let retained = arc02_peer_with_pending_candidate(&context, device_id);
-        install_peer(&peers, device_id.to_string(), Arc::clone(&retained));
-        assert_ne!(arc02_candidate_use(&context), ResourceUse::ZERO);
-
-        let removed = remove_peer(&peers, device_id).expect("installed peer is removable");
-
-        assert!(Arc::ptr_eq(&retained, &removed));
-        assert_eq!(arc02_candidate_use(&context), ResourceUse::ZERO);
+            .find(|report| report.family == family)
+            .copied()
+            .expect("pre-authentication family is present")
     }
 
     #[tokio::test]
-    async fn v4_arc02_shutdown_retires_queue_while_external_peer_arc_survives() {
-        let state = build_test_state("arc02-shutdown-external-peer");
-        let device_id = "arc02-shutdown-peer";
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives() {
+        let state = build_test_state("arc03-shutdown-external-peer");
+        let device_id = "arc03-shutdown-peer";
+        let (worker, mut events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("test connector opens");
+        let worker = Arc::new(worker);
+        let transport = pre_auth_report(&state, PreAuthResourceFamily::TransportObject);
+        let callbacks = pre_auth_report(&state, PreAuthResourceFamily::Callback);
+        let tasks = pre_auth_report(&state, PreAuthResourceFamily::Task);
+        assert_eq!(transport.active.items(), 1, "one connector worker");
+        assert_eq!(
+            callbacks.active.items(),
+            5,
+            "five RTCPeerConnection callbacks"
+        );
+        println!(
+            "arc03_connector_observation transport_items={} callback_items={} task_items={} task_count={} transport_inexact={} callback_inexact={} task_inexact={}",
+            transport.active.items(),
+            callbacks.active.items(),
+            tasks.active.items(),
+            tasks.active.tasks(),
+            transport.measurement_inexact,
+            callbacks.measurement_inexact,
+            tasks.measurement_inexact,
+        );
+        assert_eq!(
+            worker
+                .add_remote_candidate(arc03_candidate_fixture())
+                .await
+                .expect("candidate enters the connector queue"),
+            RemoteCandidateDisposition::QueuedUntilRemoteDescription
+        );
         let retained = Arc::new(PeerConnection::new(
             device_id.to_string(),
-            None,
-            state.peer_connection_resource_scope(),
+            Some(Arc::clone(&worker)),
         ));
-        {
-            let mut peer_state = retained.state.write();
-            retained.queue_remote_candidate(&mut peer_state, arc02_candidate_fixture());
-        }
-        install_peer(&state.peers, device_id.to_string(), Arc::clone(&retained));
-        let before = state
-            .resource_report()
-            .pre_authentication
-            .iter()
-            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
-            .expect("candidate family is present")
-            .active;
-        assert_ne!(before, ResourceUse::ZERO);
+        install_peer(&state.peers, Arc::clone(&retained));
+        assert_ne!(
+            pre_auth_report(&state, PreAuthResourceFamily::CandidateObject).active,
+            ResourceUse::ZERO
+        );
 
         state.shutdown().await;
 
-        let after = state
-            .resource_report()
-            .pre_authentication
-            .iter()
-            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
-            .expect("candidate family is present")
-            .active;
-        assert_eq!(after, ResourceUse::ZERO);
-        assert_eq!(retained.device_id, device_id);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("retirement wakes the connector event receiver")
+                .is_none(),
+            "a retired connector cannot forward later callbacks"
+        );
+        assert_eq!(
+            pre_auth_report(&state, PreAuthResourceFamily::CandidateObject).active,
+            ResourceUse::ZERO
+        );
         assert!(state.peers.is_empty());
+        assert!(worker
+            .add_remote_candidate(arc03_candidate_fixture())
+            .await
+            .is_err());
+        assert_eq!(retained.device_id, device_id);
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_offerer_observes_data_channel_handlers() {
+        let state = build_test_state("arc03-offerer-observation");
+        let (worker, _events) = state
+            .transport
+            .open_connector_peer(
+                Role::Offerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("test connector opens");
+        let transport = pre_auth_report(&state, PreAuthResourceFamily::TransportObject);
+        let callbacks = pre_auth_report(&state, PreAuthResourceFamily::Callback);
+        let tasks = pre_auth_report(&state, PreAuthResourceFamily::Task);
+
+        assert_eq!(transport.active.items(), 1, "one connector worker");
+        assert_eq!(
+            callbacks.active.items(),
+            9,
+            "five peer callbacks plus four data-channel callbacks"
+        );
+        assert_eq!(
+            tasks.active.items(),
+            0,
+            "data-only construction creates no sender-drain tasks"
+        );
+        println!(
+            "arc03_offerer_observation transport_items={} callback_items={} task_items={} task_count={} transport_inexact={} callback_inexact={} task_inexact={}",
+            transport.active.items(),
+            callbacks.active.items(),
+            tasks.active.items(),
+            tasks.active.tasks(),
+            transport.measurement_inexact,
+            callbacks.measurement_inexact,
+            tasks.measurement_inexact,
+        );
+        worker.retire();
+    }
+
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_stale_transport_event_cannot_mutate_replacement_worker() {
+        let state = build_test_state("arc03-stale-transport-event");
+        let device_id = "arc03-stale-event-peer";
+        let (first, _first_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("first connector opens");
+        let first = Arc::new(first);
+        let stale_event = first.stamp_event_for_test(TransportEvent::DataChannelOpen);
+        install_peer(
+            &state.peers,
+            Arc::new(PeerConnection::new(
+                device_id.to_string(),
+                Some(Arc::clone(&first)),
+            )),
+        );
+
+        let (replacement, _replacement_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("replacement connector opens");
+        let replacement = Arc::new(replacement);
+        install_peer(
+            &state.peers,
+            Arc::new(PeerConnection::new(
+                device_id.to_string(),
+                Some(Arc::clone(&replacement)),
+            )),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if first.connection_state() == RTCPeerConnectionState::Closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement closes the displaced native peer");
+
+        handle_transport_event(&state, device_id.to_string(), stale_event).await;
+
+        let current = state.peers.get(device_id).expect("replacement remains");
+        {
+            let data = current.state.read();
+            assert!(!data.data_channel_open);
+            assert!(data.handshake_started_at.is_none());
+        }
+        let replacement_is_current = {
+            let session = current.session.lock();
+            Arc::ptr_eq(session.as_ref().expect("replacement session"), &replacement)
+        };
+        assert!(replacement_is_current);
+        drop(current);
+        state.shutdown().await;
     }
 
     fn stale_instant() -> Instant {
@@ -3390,11 +3772,11 @@ mod tests {
     #[test]
     fn frame_cap_rejects_oversize_inbound_frames() {
         assert!(frame_within_cap(0));
-        assert!(frame_within_cap(MAX_INBOUND_FRAME_BYTES));
-        assert!(!frame_within_cap(MAX_INBOUND_FRAME_BYTES + 1));
+        assert!(frame_within_cap(MAX_ENDPOINT_FRAME_BYTES));
+        assert!(!frame_within_cap(MAX_ENDPOINT_FRAME_BYTES + 1));
         // The ceiling is generous (far above any real control frame) but
         // bounded — a regression that zeroed or ballooned it would trip here.
-        assert!((1 << 20..=1 << 26).contains(&MAX_INBOUND_FRAME_BYTES));
+        assert!((1 << 20..=1 << 26).contains(&MAX_ENDPOINT_FRAME_BYTES));
     }
 
     #[tokio::test]
@@ -3403,7 +3785,7 @@ mod tests {
         // parse attempt, no panic, and the peer's frame counter doesn't move.
         let state = build_test_state("oversize-frame");
         insert_session_less_peer(&state, "flooder", None);
-        let huge = Bytes::from(vec![b' '; MAX_INBOUND_FRAME_BYTES + 1]);
+        let huge = Bytes::from(vec![b' '; MAX_ENDPOINT_FRAME_BYTES + 1]);
         handle_inbound_frame(&state, "flooder", huge).await;
         let peer = state.peers.get("flooder").expect("peer present");
         assert_eq!(
@@ -3442,26 +3824,78 @@ mod tests {
             Offline,
             Error,
         ] {
-            let mut d = connection::PeerStateData::default();
-            d.authenticated = true;
-            d.status = status;
+            let d = connection::PeerStateData {
+                authenticated: true,
+                status,
+                ..Default::default()
+            };
             assert!(!d.is_admitted(), "{status:?} is not an admitted status");
         }
         for status in [Active, Shelved] {
-            let mut ok = connection::PeerStateData::default();
-            ok.authenticated = true;
-            ok.status = status;
+            let ok = connection::PeerStateData {
+                authenticated: true,
+                status,
+                ..Default::default()
+            };
             assert!(
                 ok.is_admitted(),
                 "authenticated {status:?} must be admitted"
             );
-            let mut no_auth = connection::PeerStateData::default();
-            no_auth.status = status;
+            let no_auth = connection::PeerStateData {
+                status,
+                ..Default::default()
+            };
             assert!(
                 !no_auth.is_admitted(),
                 "{status:?} without authentication is never admitted"
             );
         }
+    }
+
+    #[test]
+    fn v4_arc03_relay_selection_is_not_authentication_or_session_admission() {
+        let relay_pair = crate::transport::SelectedCandidatePair {
+            local: crate::transport::IceCandidateKind::Relay,
+            remote: crate::transport::IceCandidateKind::Relay,
+        };
+        let unauthenticated = connection::PeerStateData {
+            authenticated: false,
+            status: PeerStatus::Active,
+            selected_pair: Some(relay_pair),
+            ..Default::default()
+        };
+        assert!(!unauthenticated.is_admitted());
+
+        let pending = connection::PeerStateData {
+            authenticated: true,
+            status: PeerStatus::PendingApproval,
+            selected_pair: Some(relay_pair),
+            ..Default::default()
+        };
+        assert!(!pending.is_admitted());
+
+        let peer = PeerConnection::new("relay-negative".to_string(), None);
+        *peer.state.write() = pending;
+        assert!(peer.realtime_flow_ports().is_none());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_outbound_application_send_requires_current_session_admission() {
+        let state = build_test_state("arc03-outbound-admission");
+        insert_session_less_peer(&state, "pending-peer", None);
+        set_admission(&state, "pending-peer", true, PeerStatus::PendingApproval);
+
+        let error = send_channel_frame(
+            &state,
+            "pending-peer",
+            "negative-control",
+            serde_json::json!("must-not-send"),
+        )
+        .await
+        .expect_err("pending peer cannot receive outbound application data");
+
+        assert!(error.to_string().contains("not admitted"));
+        assert_eq!(state.traffic.snapshot().app_tx.frames, 0);
     }
 
     #[tokio::test]
@@ -3554,7 +3988,6 @@ mod tests {
     async fn admission_gate_lets_protocol_frames_through_while_handshaking() {
         // Report case 4: handshake/approval frames pass even while the peer is
         // unauthenticated, so the handshake can actually complete.
-        use crate::protocol::ApproveMessage;
         let state = build_test_state("admit-protocol-pass");
         insert_session_less_peer(&state, "peer", None);
         set_admission(&state, "peer", false, PeerStatus::Handshaking);
@@ -3562,7 +3995,7 @@ mod tests {
         handle_inbound_frame(
             &state,
             "peer",
-            frame_bytes(&MeshMessage::Approve(ApproveMessage {})),
+            frame_bytes(&MeshMessage::Approve(crate::protocol::ApproveMessage {})),
         )
         .await;
 
@@ -3589,7 +4022,8 @@ mod tests {
             p.state.write().local_approve_sent = true;
         }
 
-        handshake::on_approve(&state, "peer").await;
+        let owner = state.peers.owner("peer").expect("peer owner");
+        handshake::on_approve(&state, &owner).await;
 
         let p = state.peers.get("peer").expect("peer present");
         let d = p.state.read();
@@ -3601,22 +4035,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_approve_send_unlatches_so_a_later_trigger_can_resend() {
-        // The one-way trust wedge: a roster-driven approve can fire before
-        // the peer's data channel opens, and the send fails. Leaving
-        // `local_approve_sent` latched true meant every later call
-        // short-circuited on "already sent" — the peer never received our
-        // approve and sat in PendingApproval refusing our app traffic,
-        // while we went Active the moment theirs landed. A failed send
-        // must reset the latch so the handshake that starts when the
-        // channel opens re-runs auto-approve and actually delivers it.
-        let state = build_test_state("approve-unlatch");
+    async fn v4_arc03_stale_message_owner_cannot_mutate_replacement_peer() {
+        let state = build_test_state("arc03-stale-message-owner");
+        insert_session_less_peer(&state, "peer", None);
+        let stale_owner = state.peers.owner("peer").expect("first peer owner");
+        insert_session_less_peer(&state, "peer", None);
+
+        handle_inbound_frame_from(
+            &state,
+            &stale_owner,
+            frame_bytes(&MeshMessage::Approve(crate::protocol::ApproveMessage {})),
+        )
+        .await;
+
+        let replacement = state.peers.get("peer").expect("replacement peer");
+        assert!(!replacement.state.read().remote_approve_seen);
+    }
+
+    #[tokio::test]
+    async fn failed_approve_send_does_not_record_local_acceptance() {
+        // A roster-driven approve can run before the peer's data channel
+        // opens. A failed local send must leave `local_approve_sent` false so
+        // a later handshake trigger can try again. The flag is written only
+        // after the current channel accepts the bytes for transmission.
+        let state = build_test_state("approve-failed-send");
         insert_session_less_peer(&state, "early-peer", None); // no session → the send fails
         handshake::send_local_approve(&state, "early-peer").await;
         let peer = state.peers.get("early-peer").expect("peer present");
         assert!(
             !peer.state.read().local_approve_sent,
-            "a failed approve send must not read as delivered"
+            "a failed approve send must not read as locally accepted"
         );
     }
 
@@ -3650,21 +4098,27 @@ mod tests {
 
         // Fresh session, channel not open yet → still legitimately
         // negotiating, NOT stuck (don't churn a new attempt).
-        let mut fresh = connection::PeerStateData::default();
-        fresh.session_started_at = Some(Instant::now());
+        let fresh = connection::PeerStateData {
+            session_started_at: Some(Instant::now()),
+            ..Default::default()
+        };
         assert!(!connecting_stuck_past_grace(&fresh, grace));
 
         // Old session, channel still never opened → stuck; a fresh offer
         // should rebuild rather than renegotiate onto the corpse.
-        let mut stuck = connection::PeerStateData::default();
-        stuck.session_started_at = Some(old);
+        let stuck = connection::PeerStateData {
+            session_started_at: Some(old),
+            ..Default::default()
+        };
         assert!(connecting_stuck_past_grace(&stuck, grace));
 
         // Channel opened → never "stuck" regardless of age; liveness is the
         // heartbeat's job from here, and an offer is a real renegotiation.
-        let mut open = connection::PeerStateData::default();
-        open.session_started_at = Some(old);
-        open.data_channel_open = true;
+        let open = connection::PeerStateData {
+            session_started_at: Some(old),
+            data_channel_open: true,
+            ..Default::default()
+        };
         assert!(!connecting_stuck_past_grace(&open, grace));
     }
 
@@ -3932,41 +4386,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_session_transport_event_is_ignored() {
-        let state = build_test_state("epoch-guard");
-        insert_session_less_peer(&state, "peer-epoch", Some(Instant::now()));
-        let epoch = state.peers.get("peer-epoch").expect("peer present").epoch;
-
-        // A DataChannelClosed pumped in from a torn-down session (epoch no
-        // longer current) must not drop the live replacement peer — this is
-        // the spurious post-rebuild `IceFailed` we saw amplifying the flap.
-        handle_transport_event(
-            &state,
-            "peer-epoch".to_string(),
-            epoch.wrapping_add(1),
-            TransportEvent::DataChannelClosed,
-        )
-        .await;
-        assert!(
-            state.peers.contains_key("peer-epoch"),
-            "a DataChannelClosed from a stale session epoch must be ignored, not drop the live peer"
-        );
-
-        // The current session's close is still honored.
-        handle_transport_event(
-            &state,
-            "peer-epoch".to_string(),
-            epoch,
-            TransportEvent::DataChannelClosed,
-        )
-        .await;
-        assert!(
-            !state.peers.contains_key("peer-epoch"),
-            "a DataChannelClosed from the current session epoch drops the peer as before"
-        );
-    }
-
-    #[tokio::test]
     async fn offline_flag_round_trips_and_reports_edges() {
         let state = build_test_state("offline-flag");
         assert!(!state.is_offline(), "a fresh state is online");
@@ -4030,16 +4449,30 @@ mod tests {
     /// confirmed by traffic on the peer's re-announce and rebuilt when no
     /// frame answers — recovery driven by presence, not by a `Leave`.
     #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn silent_active_session_rebuilt_on_reannounce() {
-        let state = build_test_state("announce-probe-drop");
-        insert_session_less_peer(&state, "peer-silent", Some(stale_instant()));
-        state
-            .peers
-            .get("peer-silent")
-            .expect("peer present")
-            .state
-            .write()
-            .status = PeerStatus::Active;
+        let (state, command_driver) = build_test_state_with_command_driver("announce-probe-drop");
+        let (worker, _events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("test connector opens");
+        let worker = Arc::new(worker);
+        let peer = Arc::new(PeerConnection::new(
+            "peer-silent".to_string(),
+            Some(Arc::clone(&worker)),
+        ));
+        {
+            let mut data = peer.state.write();
+            data.last_recv_at = Some(stale_instant());
+            data.status = PeerStatus::Active;
+        }
+        install_peer(&state.peers, peer);
 
         confirm_active_session_on_announce(&state, "peer-silent").await;
 
@@ -4053,23 +4486,39 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        state.shutdown().await;
+        command_driver.abort();
     }
 
     #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn probe_answered_by_traffic_keeps_the_session() {
         // The teardown is keyed off inbound traffic, never a timer or ICE
         // state: if a frame arrives during the confirm window — a pong
         // answering the probe — the session is genuinely alive and must
         // survive, even though `last_recv_at` looked stale when we pinged.
-        let state = build_test_state("announce-probe-answered");
-        insert_session_less_peer(&state, "peer-answers", Some(stale_instant()));
-        state
-            .peers
-            .get("peer-answers")
-            .expect("peer present")
-            .state
-            .write()
-            .status = PeerStatus::Active;
+        let (state, command_driver) =
+            build_test_state_with_command_driver("announce-probe-answered");
+        let (worker, _events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("test connector opens");
+        let peer = Arc::new(PeerConnection::new(
+            "peer-answers".to_string(),
+            Some(Arc::new(worker)),
+        ));
+        {
+            let mut data = peer.state.write();
+            data.last_recv_at = Some(stale_instant());
+            data.status = PeerStatus::Active;
+        }
+        install_peer(&state.peers, peer);
 
         confirm_active_session_on_announce(&state, "peer-answers").await;
         // Inbound traffic answers the probe partway through the confirm
@@ -4091,6 +4540,8 @@ mod tests {
             state.peers.contains_key("peer-answers"),
             "a probe answered by inbound traffic must not rebuild the session"
         );
+        state.shutdown().await;
+        command_driver.abort();
     }
 
     #[tokio::test]

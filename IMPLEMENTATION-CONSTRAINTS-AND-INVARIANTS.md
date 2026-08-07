@@ -133,7 +133,7 @@ A profile may authenticate an ephemeral signal. Authentication strengthens attri
 At minimum, the runtime must use non-serializable or otherwise unforgeable local capabilities equivalent to:
 
 ```text
-CandidateCapability
+ConnectorCandidateCapability
 ConnectedChannelCapability
 AuthenticatedChannelCapability
 SessionCapability
@@ -242,7 +242,7 @@ The signaling runtime must not:
 - synthesize Open withdrawal or Closed removal from disconnect;
 - turn service identity into Device identity;
 - create an authenticated session directly;
-- allocate beyond its own measured bounds.
+- allocate or retain protected resources without live provider leases.
 
 ## 6. Connector runtime
 
@@ -252,14 +252,14 @@ A connector profile must expose equivalent operations to:
 
 ```text
 start_attempt(local_intent, bounded_hints)
-    -> CandidateCapability*
+    -> ConnectorCandidateCapability*
 
-poll_or_receive_candidate(candidate_capability, typed_input)
-    -> CandidateUpdate
+poll_or_receive_connector_candidate(connector_candidate_capability, typed_input)
+    -> ConnectorCandidateUpdate
 
-try_candidate(candidate_capability)
+try_connector_candidate(connector_candidate_capability)
     -> ConnectedChannelCapability
-       | CandidateFailure
+       | ConnectorCandidateFailure
 
 observe_channel(channel_capability)
     -> TransportObservation
@@ -269,6 +269,8 @@ close_candidate_or_channel(capability)
 ```
 
 The exact API may be asynchronous or event driven.
+
+One connection attempt may own multiple connector candidates. One WebRTC connector candidate owns one `RTCPeerConnection` and one ICE agent. The ICE agent may own multiple internal ICE candidates and pairs. An internal ICE candidate is typed control input, not a `ConnectorCandidateCapability`.
 
 ### 6.2 Speculative work is allowed
 
@@ -463,7 +465,8 @@ A relay allocation must be ephemeral live state and must bind:
 - exact endpoints A and C;
 - exact relay B or service instance;
 - exact allocation capabilities for each endpoint;
-- bounded lifetime, buffering, bandwidth, retry, and queue resources.
+- explicit provider lifetime state where the relay protocol requires it;
+- lease-backed buffering, bandwidth, retry, and queued work.
 
 The allocation must not accept:
 
@@ -604,40 +607,435 @@ Carrier diagnostics are separate from peer identity and application authorizatio
 
 ## 14. Resource model
 
-### 14.1 Pre-authentication resource class
+### 14.1 Normative resource contract
 
-The owner must measure and select finite bounds for:
+Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit must hold a live finite lease issued by the applicable resource provider. Basal MyOwnMesh defines no fixed semantic cardinality for Mesh runtimes, peers, connector attempts, sessions, or real-time flows.
 
-- accepted connections and half-open handshakes;
-- frame and parser bytes;
-- durable-fact hash and signature work;
-- ephemeral signaling parse work;
-- candidate objects;
-- sockets and transport objects;
-- DNS, STUN, ICE, relay, and connector-specific work;
-- pre-authentication media or packet quarantine;
-- timers, tasks, callbacks, and diagnostic queues;
-- cleanup.
+The resource interface must provide equivalent responsibilities to:
 
-Bounds apply per ingress source where meaningful and globally regardless of identity.
+```text
+ResourceProvider
+    acquire(ResourceClaim, ResourceAuthorityClass)
+        -> ResourceLease
+         | move-only PendingDemand
+         | ResourcePressure(ResourceClass)
+         | ResourceUnavailable(ResourceClass)
+    request_retirement(exact owner of a reclaimable lease)
+        -> owner notification only
 
-### 14.2 Post-authentication resource class
+ResourceClaim
+    finite quantities by ResourceClass
 
-Separate bounds apply to:
+ResourceLease
+    exact provider, claim, owner, and live release authority
 
-- authenticated sessions;
-- application queues;
-- media decode and encode;
-- relay bandwidth and buffering;
-- session recovery;
-- application callbacks;
-- local handle and subscription state.
+ResourceClass
+    AccountedMemory
+    QueuedBytes
+    SocketOrHandle
+    NativeTransportObject
+    WorkerOrTask
+    CallbackOrScheduledWork
+    StorageBytes
+    StorageObject
+    RelayOrProviderAllocation
+    ParsingOrCpuWork
+    OpaqueDependencyResidual
+```
 
-A successful pre-authentication reservation cannot be reused as proof that post-authentication capacity exists.
+A claim may combine several resource classes. An admitted object's count emerges from the claims and current provider grant. There is no `unlimited` sentinel. Admission is always fallible.
 
-### 14.3 Effect execution
+The process resource root owns the process grant. Each Mesh runtime receives an AttributionChildScope for accounting, not a new grant. Attempt, candidate, session, and flow owners receive descendant leases. Creating another scope cannot multiply capacity.
 
-State and effect intents commit before external execution. Every effect carries exact live capabilities and reservations and rechecks them before use. Cleanup effects remain available even when the authority for new work disappears.
+The basal requirements on the finite provider are properties, not a scheduling algorithm. A conforming provider must preserve all of:
+
+```text
+P1 Domain conservation
+    the sum of live and failed-cleanup-retained claims in each resource
+    dimension never exceeds the grant actually assigned to the process;
+    a claim never exceeds the provider domain it is drawn from
+
+P2 Cleanup ownership
+    only the exact owner releases a claim, and only after cleanup; no
+    provider, peer, message, or timer can forge a release, and resources
+    a cleanup path requires stay retained until that cleanup completes
+
+P3 No minting
+    no scope, child scope, or identity creates capacity
+
+P4 Work conservation
+    capacity that is neither live nor reserved for an in-flight
+    admission is borrowable by any scope that can use it. A provider
+    may return immediate typed pressure instead of retaining a demand
+    only when the claim does not currently fit. A claim that does fit
+    is admitted, unless the refusal is justified by a proven structural
+    limit of the provider, by an explicit isolation policy or optional
+    local ceiling under P5, or by accounting that is unavailable,
+    poisoned, or otherwise unable to prove the admission safe. Every
+    such reason is declared. Arbitrary refusal is prohibited and can
+    never stand as a hidden limit
+
+P5 Explicit isolation
+    every partition, reserved share, or isolation ceiling is explicit
+    local policy, never a basal guarantee
+
+P6 Partition non-amplification
+    subdividing a fairness root's attribution into more child scopes
+    must not increase that root's cumulative selections, or its
+    cumulative admitted quantity in any dimension, at any point of the
+    provider's decision sequence, and must not move any competing
+    root's selection later. One-way only: no equality of outcome is
+    implied
+
+P7 Pressure is not authorization
+    refusal, pressure, and unavailability are typed resource results,
+    never an Open or Closed authorization outcome in either direction
+
+P8 Time is not resource truth
+    elapsed duration alone creates, releases, expires, and validates
+    nothing
+```
+
+`FairnessRoot` and `AttributionChildScope` are closed architectural definitions owned by [`ARCHITECTURE.md`](ARCHITECTURE.md). This document does not restate or narrow them; it uses them exactly as defined there. Where a term below carries additional detail, that detail implements the canonical definition and never competes with it. If the two ever diverge, ARCHITECTURE governs and this document is wrong.
+
+What this document owns is the trusted local mapping and its provenance, the typed provider states, and the provider-specific mechanics that make the canonical properties checkable.
+
+A scope is an accounting subdivision. It is never itself a claimant or a FairnessRoot, and no wording in this document may be read as making it one.
+
+The exact obligation — the causally closed model, the derived-release rule, and the prefix-wise comparison — is stated once in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md), Note 14.5e. This document does not restate that mathematics and must not carry a second copy of it. What follows are the obligations a conforming implementation and its controls must meet in order to be checkable against it. If this section and Note 14.5e ever disagree, Note 14.5e governs.
+
+Two consequences of that model bind every control written here. Releases are derived from the deterministic owner response rule and are never supplied as fixed inputs, so a control may not script releases in order to manufacture or suppress a difference between the runs. And the comparison is prefix-wise, so a control that compares only final states, only one competitor, only one dimension, or only the terminal decision does not discharge the obligation — amplification can appear and be reabsorbed within a run.
+
+The obligation is one-directional. A control must not require that the subdivided root fare no worse, or that a competing root fare no better; a subdivision that disadvantages the subdivided root or advantages a competitor is conforming. Equality of outcome must never be asserted. A test showing only that some scope is eventually served does not discharge P6.
+
+**Construction A is how the two runs are set up.** A control that compares a baseline run against a subdivided run must build both runs this way, so that attribution mapping is the only difference between them:
+
+```text
+Construction A
+    identical FairnessRoot set in both runs
+
+    identical AttributionChildScope topology, pre-created in both runs
+        before the measured prefix begins
+
+    identical bookkeeping claims, already charged in both runs before
+        the measured prefix begins
+
+    stable DemandIds: one demand carries the same identifier in both
+        runs
+
+    identical initial provider state at the start of the measured
+        prefix
+
+    baseline    maps every demand of A to one already-created
+                AttributionChildScope beneath A
+
+    subdivided  maps the same demands across the same already-created
+                AttributionChildScopes beneath A
+
+    only the DemandId-to-child-scope mapping differs
+```
+
+Because the scope topology and its bookkeeping already exist in both runs before measurement starts, subdivision creates no scope and charges no additional bookkeeping inside the measured prefix. Scope creation is deliberately moved outside the comparison rather than compensated for inside it.
+
+**That normalization is a property of the comparison, not a claim about the world.** Bookkeeping is real, finite, and fallible. Creating an AttributionChildScope consumes resources, is charged like any other work, and can fail. Construction A does not promise unlimited scopes, does not make scope creation free, and must never be read as establishing that bookkeeping can never become a binding constraint. It establishes only that, within the measured prefix, the two runs carry the same bookkeeping and therefore differ solely in attribution.
+
+**The fixed workload includes the environment.** The workload fixes a deterministic, clock-free environment and reducer that interleaves exogenous arrivals with owner-derived actions in a fixed order. No wall-clock time, timer, or scheduler nondeterminism participates. Because releases are owner-derived rather than supplied, this interleaving is what makes the two runs comparable at all.
+
+**Terminal stuttering.** After the last exogenous arrival, the environment continues to step the provider with no new input until both runs reach a terminal state in which no further decision changes anything. The comparison is therefore well defined at every decision index, including indices past the final arrival, and neither run can appear to win merely by ending sooner.
+
+**First control: a bounded decision prefix.** The first required control fixes a finite decision prefix — a bounded number of selection decisions — chosen so that none of the newly admitted demands under comparison releases within that prefix, and it starts from the identical topology and bookkeeping that Construction A requires. The comparison is then well defined without depending on release timing. Within that prefix it is a conformance control: it establishes the three conditions for the decisions it covers, and that is a genuine positive result for the case it covers. It is honestly scoped rather than demoted — it claims nothing about decisions beyond its prefix, is not defined as the longest such prefix, and is not merely a device for exhibiting a failure. It is not globally sufficient, is not a proof of the whole model, and must never be reported as either.
+
+**What P6 does not claim.** Partition non-amplification concerns attribution beneath one FairnessRoot. It is not a real-world identity or claimant-count claim. It does not assert that a real adversary is confined to one FairnessRoot, that distinct roots correspond to distinct people, organizations, devices, or tenants, or that an adversary able to obtain several genuine roots is limited by this property. Sybil resistance, principal admission, and ingress identity are separate problems. P6 does not address them, no P6 control may be cited as evidence about them, and no Sybil or admission control may be cited as evidence for P6.
+
+**Trusted local mapping is allowed and required.** Which local values a deployment maps onto a FairnessRoot is provider and deployment policy. An OS user, a local service account, an authenticated IPC peer, a local principal, or a named local ingress are all admissible choices. This document fixes no universal scheduler model, root taxonomy, or principal enumeration, and P6 requires none.
+
+The mapping is performed by a trusted local verifier, and it may take verified facts as inputs. An authenticated local principal, a verified ingress classification, or another locally established and verified fact may legitimately determine which root a demand is attributed to. P6 does not require the mapping to be independent of the existence of such facts, and a provider that attributes demand per authenticated principal is conforming.
+
+What P6 forbids is claimant control over the root structure itself. No claimant-supplied, peer-supplied, or wire-visible value may directly name, select, split, or multiply a FairnessRoot, and no party may increase the number of roots it is attributed to by asserting something that trusted local verification has not established. The distinguishing test is not "did any claimant-related fact influence the mapping" but "can a claimant, by its own action or assertion, obtain more roots or more turns than the trusted local mapping assigns it". Verified input is permitted; unverified assertion is not.
+
+**Hostile-ingress progress is a separate contract.** P6 says nothing about whether a hostile or misbehaving ingress can delay or starve other work. Progress under hostile ingress is governed by the separate ingress progress and backpressure contract: bounded pre-authentication work, typed backpressure to the producer, and refusal naming an unavailable resource dimension. Neither contract is evidence for the other, and a control for one must not be reported against the other.
+
+Pending-demand cardinality, selection order, and rotation are concrete provider policy. The provider implementation selects them, and any policy preserving P1 through P8 is conforming. No other component may depend on a particular selection order or rotation rule, and conformance tests must assert the properties rather than the schedule.
+
+The provider shipped with basal MyOwnMesh implements one policy of this kind: shared and work-conserving, with no weights, quotas, reserved shares, or partitions; unused process capacity borrowable across child scopes; at most one exact move-only pending demand per FairnessRoot; pending demands selected in `Cleanup > Admitted > Speculative` authority order; and equal-class selection rotating across FairnessRoots after a demand resolves. Replacing that policy is a provider decision, not a semantic change.
+
+**P6 status of the shipped provider.**
+
+*Mechanism.* The previously disclosed nonconformance is resolved. The shipped provider's equal-class rotation cursor and its reclaim cursor are keyed to the FairnessRoot, not to `ResourceScopeId`. A root is minted only where a scope is created with no parent; every ordinary child arrives with a parent and inherits that root verbatim. Creating AttributionChildScopes beneath a root therefore introduces no additional rotation key, and the several scopes beneath one root resolve back to that root.
+
+*Consequence.* Take one FairnessRoot `A` and a competing root `B`. Subdividing `A`'s attribution across N AttributionChildScopes no longer yields `A` N rotation turns, so the counterexample that raised `A`'s cumulative selections and deferred `B` is removed.
+
+*Evidence status: controls landed in the working tree; this document claims no execution result.* `construction_a_against_live_provider_does_not_amplify` compares baseline and subdivided runs against the live provider via `evaluate_live_non_amplification`, over `State.decision_log: Vec<ProviderDecision>` read through `decision_log_for_test()`; `live_oracle_rejects_scope_keyed_selection` drives the *same* provider through the *same* oracle with `set_scope_keyed_selection_for_test` restoring the superseded scope-keyed rule and requires rejection — the only reason a positive result carries weight.
+
+`decision_log` is an ordered trace of **cooperative-admission dispositions on the non-failing path** — `PendingAccepted`, `PendingRefused`, `ImmediateGrant`, `ArbitrationGrant`, `TerminalPressure`, and **owner** `Cancelled` via `cancel_demand` — complete within that scope **and no wider**. Fail-closed invariant cancellation inside `arbitrate`, which poisons the provider, and teardown cancellation in `release_scope` are specifically excluded and are not recorded. It also does not cover `acquire`, `acquire_reclaimable_now`, scope creation or release, reclaim requests, or pre-admission validation failures. It must not be described as a complete ordered decision trace.
+
+An earlier revision called the superseded selection-only test the formal Construction A control; **that was an overclaim and was withdrawn**, and the history is retained here so it cannot quietly reappear. **This document claims no execution result for the landed controls**; citing them requires exact-state local verification and exact-head hosted evidence recorded externally. No pass is claimed here, and the earlier pass of the superseded test establishes nothing about them. Two defects and their dispositions are recorded below. Four limits apply and must be carried wherever this status is cited. It is a **bounded control, not a whole-model proof** over every P6 workload. It is **working-tree evidence**, not exact-head and not hosted CI. Its `DemandId`s are **test-side logical identifiers reconstructed positionally after the fact** rather than bound at issue, not caller-supplied provider identifiers, and the provider exposes no such identifier. And **no deployed multi-root mapping is claimed**: additional trusted-root minting and the cross-root controls are `#[cfg(test)]` only, production mints exactly one process root, and roots remain provider-private and unnameable by public callers. The existing rotation and yield tests still show only eventual service and remain insufficient for P6 on their own; connector-local scheduling metadata remains a separate claim that does not discharge it.
+
+**Defect 1 — requester-root propagation. Disposition landed in the working tree.** A pending `NewChild` demand is owned and stored under the existing parent scope, but `PendingDemand::lease_scope_id` returns the prospective child id. `arbitrate` passed that id into `select_reclaim_victims`, and because the child was not yet installed, `root_of(state, prospective_child_id)` returned `None`, so `NewChild` requests lost requester-root-last victim sequencing and could route around same-root treatment. *Disposition, verified present:* `requester_root` is derived from the exact existing pending-owner scope and carried separately through arbitration; `select_reclaim_victims` receives the resolved `requester_root`; `lease_scope_id` remains the prospective child solely for exact lease ownership and diagnostics; victim scope, reservation, and target remain exact. Working-tree evidence, not exact-head and not hosted CI.
+
+**Defect 2 — proof-control fidelity. Disposition landed in the working tree; no execution result claimed here.** The superseded trace observed only arbitration grants, with admitted quantity assumed rather than observed and no ordering for refusals or terminal outcomes: the selection record was appended only in the arbitration grant path, so immediate grants never entered it; the admitted quantity was the test's own unit constant rather than a provider-reported value; refusals were aggregate counts and terminal pressure and cancellation were unrecorded; and logical ids were reconstructed positionally rather than bound at issue — a strand that was **unsound**, not merely weak, since the baseline refuses two demands from the same child and a scope-keyed map overwrote both onto the last id. The horizon was therefore the **selection sequence**, not the ordered disposition sequence.
+
+*Disposition, verified present:* ids bind at issue time rather than by later reconstruction, **variant-specifically** — `PendingAccepted`, `ArbitrationGrant`, `TerminalPressure`, and `Cancelled` carry the provider-minted `demand_key` where applicable, while `PendingRefused` and `ImmediateGrant` do not and are bound by exact per-call decision-log index. The ordered cooperative-admission disposition trace above replaces the selection record, and the oracle compares over the full disposition prefix with stuttering, all dimensions, and all competitors, with the scope-keyed negative fixture retained.
+
+Recorded quantities are also variant-specific, and it is **not** the case that each decision carries `requested` alongside `charged`: `PendingAccepted` and `PendingRefused` carry `requested` only; `ImmediateGrant` and `ArbitrationGrant` carry both; `TerminalPressure` and `Cancelled` carry neither claim quantity. The oracle accumulates provider-recorded `requested` claims **from grant events only**; `charged` is diagnostic and must never be accumulated in its place — Note 14.5e defines `cum_admitted` over the exact claim, whereas the charge is inflated by bookkeeping the model does not define. `requested` is observed from provider state rather than assumed, which is what fixes the original overclaim.
+
+P6 is unchanged and remains basal. An AttributionChildScope is not redefined as a FairnessRoot, and P6 is not relaxed to a per-scope guarantee. The shipped provider's standing under P1 through P5, P7, and P8 is asserted only where separately supported and is not implied by this paragraph.
+
+When the selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Reclaimability is a property of the owner contract, not a provider decision; the shipped policy treats `Speculative` leases as the reclaimable class. The provider does not release, revoke, replace, or reuse those claims. The notified owner performs cleanup and releases through lease Drop. If cleanup cannot be proven, the owner explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth.
+
+No scheduling or cooperative retirement model guarantees later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. A policy that gives cleanup authority the first pending-demand opportunity does not thereby manufacture capacity, and it is not a promise that cleanup can start without its exact claim.
+
+**Immediate pressure only for a non-fitting claim.** Fit is `EffectiveFit`, defined below; it is never evaluated against an external observation `O` or a target `T`. An immediate, nonwaiting acquisition may return typed pressure without creating a pending demand, but only when the exact claim exceeds `EffectiveFit` in some dimension the claim requires. `EffectiveFit` already excludes capacity that is live or reserved for an in-flight admission, so no further subtraction is applied on top of it. A claim that fits must be admitted unless one of exactly three stated conditions holds: a proven structural limit forbids it; an explicit isolation policy or optional local ceiling refuses it; or the accounting needed to prove the admission safe is unavailable, poisoned, or cannot be proven safe. Each of those must be reported as itself, not as ordinary pressure.
+
+Work conservation constrains refusal in the other direction. An immediate path may not refuse a fitting claim in order to hold capacity for an anticipated demand, to smooth one demand source's request rate, or to enforce an undeclared share. Any such withholding is a partition and is conforming only as explicit local isolation policy under P5.
+
+**Narrow provider determinism.** The provider is deterministic only in this exact sense: given identical already-issued `ResourceScopeId` values, identical provider state, and the same operations applied in the same order, it produces the same decisions. Nothing stronger is claimed. Because a `ResourceScopeId` is derived from the allocation address of a fresh process-local scope identity at construction, the identifiers issued by a fresh run generally differ from those of a previous run, and any behavior keyed to their values or ordering may differ with them. Cross-run, cross-process, cross-allocator, and cross-schedule reproducibility is therefore not claimed, and no test may assume it. A determinism control must fix the already-issued identities rather than re-deriving them.
+
+**Committed grant, envelope, backing, and external observation.** Six quantities are distinct and must never be conflated:
+
+```text
+S    the sum of live claims and failed-cleanup-retained charges in one
+     resource dimension
+Gc   the provider-owned committed grant in that dimension
+E    an enforceable envelope: an isolation ceiling the provider or host
+     can actually enforce against this domain
+B    actual reserved or owned backing in that dimension, claimable only
+     under an exact guarantee that the resource is held for this domain
+T    an explicit owner-selected target in that dimension
+O    an external observation of host capacity
+```
+
+*`E` is containment, not availability.* An enforceable envelope bounds what this domain can consume. It proves that the domain is contained, so it cannot exceed `E`. It proves nothing whatever about whether capacity up to `E` is available, reserved, or obtainable. An envelope is a ceiling, never a promise, and `E` must never be read as, reported as, or substituted for `B`.
+
+*`B` requires an exact guarantee.* `B` may be claimed only where the resource is actually reserved or owned for this domain under an exact guarantee. An owner-supplied configuration vector, a measurement, a quota, or an envelope is not backing. Absent that exact guarantee, `B` is not claimed at all, and the shortfall is a named Slice C residual.
+
+**Isolation and backing are orthogonal capabilities.** They are not exclusive, and they are not a hierarchy. A provider may claim isolation, or backing, or both, or neither, and it may do so independently per resource dimension. Each claim is licensed only by its own exact proof:
+
+```text
+accounting-only
+    proves S <= Gc, and claims neither E nor B
+    the grant is a bookkeeping commitment this process respects by its
+    own arithmetic
+
+isolated
+    proves S <= Gc, and additionally claims E: an enforceable envelope
+    contains the process. Containment is not availability, so an E
+    claim says nothing about whether capacity within it can be obtained
+
+backed
+    proves S <= Gc, and additionally claims B: an exact substrate
+    contract genuinely reserves the capacity. Reservation is not
+    containment, so a B claim says nothing about whether consumption
+    beyond it is prevented
+```
+
+A provider may hold both claims, and may hold them per dimension: `E` proved in one resource dimension and `B` proved in another is an ordinary configuration, not a contradiction. Any combination is permitted exactly where each premise it names is separately proved. Claiming `E` never licenses a `B` claim, and claiming `B` never licenses an `E` claim. Allocation remains fallible under every label: admission does not imply that the underlying resource can actually be obtained.
+
+Neither claim implies the other in either direction, and neither is a prerequisite for the other. A provider may be backed in one dimension and merely contained in another, or contained in a dimension it does not back. Where a provider makes no claim for a dimension, that dimension is accounting-only regardless of what it claims elsewhere, and the unproved case is a named Slice C residual rather than an assumption. Absent a backing claim, an admission proves bookkeeping and not physical success; absent an isolation claim, it proves neither containment nor success.
+
+**Capacities, charges, and fit.** The exact arithmetic is stated in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) and is not restated here. This document carries only the obligations an implementation must meet. If the two disagree, FORMAL governs.
+
+Two charge quantities are distinct and are never conflated, per dimension `d`:
+
+```text
+S(d)         live claims plus failed-cleanup-retained charges
+R_flight(d)  the aggregate exact capacity reserved for all admissions
+             currently in flight; zero when there are none
+```
+
+`R_flight` is a distinct symbol, deliberately not `R`. [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) already uses `R` for the multiset of live lease claims and failed-cleanup-retained claims, including in the P6 material, and that notation is not disturbed here.
+
+`AccountingCapacity(d)` and `EffectiveCapacity(d)` are **absolute** capacities, not remainders. `AccountingCapacity` is the absolute committed grant `Gc` in `d`, narrowed only by an explicit P5 restriction drawn from the closed vocabulary below. `EffectiveCapacity` is `AccountingCapacity` intersected with `E(d)` where `E` is proved for `d`, and with `B(d)` where `B` is proved for `d`, and is still absolute. `EffectiveFit(d)` is the residual actually available to a new claim, clamped at zero.
+
+A claim `q` fits in a dimension exactly when `q <= EffectiveFit(d)`. A composite claim fits only when it fits in every dimension it names; headroom in one dimension never compensates for its absence in another.
+
+Three ordering and shape obligations follow, and an implementation must honour all of them:
+
+- **Subtract charges last.** `S(d)` and `R_flight(d)` are deducted only after `E` and `B` have been intersected in. `E` and `B` are absolute substrate bounds, so intersecting them against a figure from which charges were already deducted would compare a residual against an absolute and silently understate the bound.
+- **Deduct `R_flight` as well as `S`.** Without it, concurrent admissions each read the same headroom as free and both proceed.
+- **Clamp the residual at zero.** `EffectiveCapacity(d) - S(d) - R_flight(d)` can be negative when a proved premise falls below existing committed use. The clamp keeps `EffectiveFit(d)` well formed and makes the fit test refuse, rather than yielding a negative bound that arithmetic elsewhere might treat as slack.
+
+Each intersection is licensed only by its own independent proof for that exact dimension. An `E` proved for one dimension narrows no other, and a `B` proved for one dimension narrows no other.
+
+*`R_flight` is counted exactly once.* A claim is reserved only after `q(d) <= EffectiveFit(d)` holds in every dimension it names; a failure in any dimension reserves nothing in every dimension. A successful reservation adds the exact `q(d)` to aggregate `R_flight(d)` once per named dimension. Promotion transfers exactly that quantity from `R_flight` into `S`, leaving `S + R_flight` unchanged. Failure or abandonment removes exactly that reservation under the existing ownership and cleanup rules and touches no live charge or other reservation. Owner release after proven cleanup and failed-cleanup retention both leave `R_flight(d)` untouched: release reduces `S(d)` by exactly the released claim, and retention replaces a live claim with the identical retained claim, so neither disturbs a reservation in flight. A reservation is never counted in both `R_flight` and `S`, never counted twice by concurrent admission paths, and never silently dropped from both. A forgotten reservation is a capacity leak, and a double-counted reservation is a spurious refusal; both are defects.
+
+*The closed P5 vocabulary.* An explicit P5 restriction narrowing `AccountingCapacity` is exactly one of:
+
+```text
+named local isolation domain
+    an explicitly named domain confining a scope to part of the
+    dimension
+
+named partition or reserved share
+    an explicitly named division of the dimension, or a quantity
+    withheld from general admission and held for a named scope
+
+named optional local ceiling or cost boundary
+    an explicitly named upper bound below Gc, whether selected for
+    policy, appliance, deployment, or cost reasons
+```
+
+Each is explicit, named, and recorded, and each names the scope it applies to. There is no generic exclusion category: a restriction that does not fall in one of the three above is not a P5 restriction. Nothing outside this list narrows `AccountingCapacity` — no observation, target, measurement, generic owner preference, workload calibration, anticipated future demand, rate smoothing, inferred restriction, or undeclared product policy. A provider may not introduce any further narrowing of its own: no undeclared reserve, headroom, safety margin, or rounding-down that a deployment did not ask for. An undeclared narrowing is an arbitrary refusal, which P4 forbids.
+
+*Accounting-only equality is valid.* Where a provider proves neither isolation nor backing for a dimension, `EffectiveCapacity(d) = AccountingCapacity(d)` holds, and stating that equality is correct rather than a defect or an omission. It is an honest description of what an accounting-only dimension admits against. It is not a claim that the two are equivalent in strength, and it never converts accounting into containment or backing.
+
+*`O` and `T` are excluded throughout.* Neither an external observation nor a target participates in `AccountingCapacity`, `EffectiveCapacity`, or `EffectiveFit`, in any dimension, under any provider.
+
+*Passing the test is not substrate success.* Satisfying `EffectiveFit` is an admission result. A successful admission against an accounting-only dimension does not guarantee allocator success, kernel success, runtime success, transport success, external-relay success, or hardware success. Where `B` is independently proved for a dimension, the assurance is exactly the `B` premise for that dimension and nothing broader. Everywhere else, and always for the substrate beneath a proved premise, allocation remains fallible: an admitted operation may still fail on the real resource.
+
+*Premise loss narrows capacity and stays work-conserving.* When a proved `E` or `B` premise falls, `EffectiveCapacity` narrows accordingly. Within the headroom that remains above `S + R_flight`, the provider stays work-conserving: it continues to admit claims that fit the narrowed `EffectiveCapacity`, and it does not refuse work merely because a premise moved. A narrowed premise reduces what may be admitted; it does not license withholding capacity that is still genuinely free.
+
+*Typed loss is reported only below `S + R_flight`.* A typed containment-loss, backing-loss, or external-overcommitment state is reported only when the premise falls below `S + R_flight` in that dimension — that is, below what is already committed. A premise that falls but remains at or above `S + R_flight` is reduced headroom, not a loss: it narrows future admission and is reported as capacity, not as a loss condition. Reporting loss on any fall would make ordinary contraction indistinguishable from a real shortfall.
+
+*Unproved is never presented as established.* A provider never presents unproved containment or backing as established, in a result, a report, a log, or a document. An accounting-only committed grant is explicitly an accounting commitment. It is not proof that substrate capacity exists, and it is not proof that an allocation will succeed. Describing it as though it were either is a defect in the description, not a stronger provider.
+
+*The shipped `FiniteResourceProvider` is accounting-only in every dimension.* Its grant is an owner-supplied vector, and an owner-supplied vector is not host backing. It claims no `B`, proves no `E`, and for every dimension `EffectiveCapacity = AccountingCapacity`. Its admissions carry no assurance that the underlying allocation will succeed, and any report that treats an admission as evidence of available or reserved capacity is incorrect.
+
+Being accounting-only is a coherent classification and is not itself a defect. A provider that accounts honestly and claims nothing further is correctly described, not broken, and this section must not be read as faulting it for the absence of `E` or `B` claims it never made.
+
+The shipped provider's P6 standing is stated in full in the P6 status note above and is not overstated here: its rotation and reclaim cursors are keyed to the FairnessRoot, the disclosed subdivision counterexample is removed, and its controls are landed in the working tree with **no execution result claimed here**, scoped to cooperative-admission dispositions and bounded rather than a whole-model proof. That does not affect the accounting-only classification, and the two findings remain independent: proving every `E` and `B` mapping in this document would not have discharged P6, and discharging P6 does not prove any `E` or `B`. The provider still proves neither premise in any dimension.
+
+Separately, it is **not sufficient on its own for final production resource closure**. Production closure additionally requires the independently proved `E` or `B` mappings described below for the dimensions a deployment intends to rely on. Shipping this provider alone must never be reported as having achieved resource closure.
+
+*`O` is inert.* `O` is optional, is a policy input only, and carries no authority. It may be stale, wrong, adversarially influenced, in foreign units, or absent, and a deployment may have no `O` at all. No admission decision reads `O`, no refusal is justified by `O`, and no value derives from `O` automatically.
+
+*`T` is owner-selected.* `T` is an explicit, named owner-policy target. An owner may set `T` directly, with no observation involved. An owner may instead derive `T` through a named policy that consults `O`. There is no mandatory path from `O` to `T` and no control that requires one. A change in `O` never changes `T` by itself: absent an owner decision or an explicitly named policy acting on the owner's behalf, `T` is unchanged.
+
+*`T` requests gradual contraction.* `T` is a request, not an act. It asks `Gc` to descend toward it over time. `T` never lowers `Gc` by itself, never releases a charge, and never refuses an admission on its own authority.
+
+*`Gc` follows only after owner release lowers committed use.* `Gc` is never installed or reduced below `S(d) + R_flight(d)`. `Gc` descends toward `T` only as owner-driven release reduces committed use enough to make each step safe, one safe step at a time. `S(d) + R_flight(d) <= Gc(d)` holds at every instant and implies `S <= Gc`, without exception or window.
+
+*Loss of `B` or `E` is a typed state, and the shortfall is real.* A provider that claimed backing and finds it fallen below `S + R_flight` reports typed backing loss for that dimension; a provider whose envelope no longer contains what is already committed reports typed containment loss. External overcommitment is the corresponding typed classification where applicable. In every case each charge and reservation is retained, no release is forged or inferred, conflicting admission is refused with a typed result naming the dimension, and `Gc` is still not lowered below `S(d) + R_flight(d)`. A premise that falls but remains at or above `S + R_flight` is reduced capacity rather than loss, and is reported as capacity.
+
+A backing proof taken at admission is historical. It does not make physical backing exist later. When backing is lost, substrate availability may genuinely have failed, and this document must not pretend otherwise: charges remain charged and commitments remain owed, but the underlying resource may simply not be there. The typed state names that condition honestly. It must never be read, or reported, as an assurance that every charge is still physically backed.
+
+*Typed reporting requires a live, observing provider.* Every typed state above can be reported only while the process is alive and able to observe its own condition. A fail-stop outcome reports nothing. If the host kills the process — an out-of-memory kill is the ordinary case — there is no typed containment-loss, backing-loss, or external-overcommitment result, because there is no longer anything to emit it. No obligation here may be written or read as a guarantee that resource exhaustion will be observed and reported rather than simply ending the process.
+
+Process death destroys the live in-process capabilities, leases, and accounting state held in that process, and recovery follows ordinary restart semantics rather than any contract in this subsection. That boundary is exactly as wide as the process and no wider. It is not a claim that resources outside the process are released. An external relay or TURN allocation, a peer's view of a session, a file or directory on disk, a kernel object the OS does not reclaim, or any reservation held by another party may outlive the process that charged it. Whether such a resource is reclaimed is a property of that external owner, not of this contract, and no cleanup of external or substrate-owned resources may be claimed on the strength of process death alone.
+
+*Unproved backing is a residual, not an assumption.* Where an adapter cannot prove what actually backs a dimension — allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, external provider allocations — that shortfall is a named Slice C residual. It must not be silently treated as backed, and it must not be counted into `B`.
+
+*P4 fit is `EffectiveFit`.* A claim `q` fits when `q <= EffectiveFit(d)` in every dimension `d` it requires, as defined above. For a dimension where neither containment nor backing is proved, `EffectiveCapacity` equals `AccountingCapacity`, and admission on that accounting basis alone implies nothing about physical success. The test never uses `O` and never uses `T`.
+
+**Slice C handoff: what an `E` or `B` claim requires.** This document does not implement Slice C and states no mapping here. It records only what Slice C must deliver before any `Gc <= E` or `Gc <= B` claim may be made.
+
+Every such claim requires, for each dimension it covers, a mapping between the MyOwnMesh `ResourceClaim` quantity and the substrate quantity actually contained or reserved. The canonical list of what that mapping must satisfy is stated once in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) under "What proving `E` or `B` requires", and FORMAL governs it. The conditions are dimension-specific, unit-correct, monotone, coverage, composition, subject alignment, lifetime and loss, and `B` exclusivity. This document does not restate that list as a competing normative block.
+
+Dimensions the owner directive calls out are:
+
+```text
+AccountedMemory
+SocketOrHandle
+WorkerOrTask
+StorageBytes
+RelayOrProviderAllocation
+```
+
+The list is illustrative, not exhaustive. Every other `ResourceClass` dimension is governed by the same rule: it needs its own mapping satisfying every condition before it carries an `E` or `B` claim, and otherwise remains accounting-only and an explicit residual.
+
+The five conditions below are the ones an implementation most often gets wrong, so each is read here in implementation terms. This adds no condition and narrows none; where this reading and FORMAL differ, FORMAL is correct.
+
+- **Coverage.** The mapping accounts for every consumer of that substrate quantity, not only the charged ones. A consumer this model does not charge is included **conservatively**: its use is subtracted from the premise rather than assumed absent. In practice that means a retry, a callback, a buffer grown under load, a dependency's own allocation, and any co-tenant of the same substrate quantity must each be either charged or subtracted. A partially mapped dimension is not a mapped dimension.
+- **Composition.** No two `ResourceClass` dimensions, and no two providers, may claim the same substrate quantity. A quantity counted twice is not thereby contained twice or reserved twice. Two dimensions that both map onto the same bytes, handles, or allocations are double-claiming, and so are two providers each treating the same substrate reservation as its own; in both cases the premise is inflated by exactly the overlap.
+- **Subject alignment.** The contained or reserved subject is exactly the subject `Gc` is committed for: the same process, the same worker, and the same provider, neither broader nor narrower. A premise measured for a broader subject includes consumption that is not ours, and one measured for a narrower subject omits consumption that is.
+- **Lifetime and loss.** The mapping names when it begins, when it ends, and who observes it. Where its loss cannot be observed before a fail-stop, the charge is **retained** and the premise is **not claimed** for that unobservable interval. A substrate may withdraw backing without notice and the process may be killed before detecting it, so a mapping that assumes every loss is seen, or seen early enough to react, is unsound. The charge stays; the premise lapses for exactly the interval that could not be observed.
+- **`B` exclusivity.** Reserved capacity is exclusive to that subject. Competing unaccounted use is **conservatively deducted from `B`**, and a shared pool another party may consume from is not `B`. `B` is what remains exclusively ours after every unaccounted competing consumer is subtracted, not the nominal size of the pool we draw from. Where competing use cannot be bounded, no conservative deduction exists, `B` is not established, and the dimension remains accounting-only.
+
+A mapping that fails any condition is not a weaker mapping; it is not a mapping, and the dimension remains accounting-only.
+
+Where no such mapping exists for a dimension, that dimension stays accounting-only and is carried as an explicit residual.
+
+`OpaqueDependencyResidual` is the case to watch, because it is the dimension most likely to be mistaken for a satisfied one. Assigning it a number is not sufficient: being counted, measured, or reported does not make it contained or reserved, since a quantity is neither a containment proof nor a reservation. Absent a mapping meeting the three conditions above — one that names what a single unit of it means and proves dimension-specific, unit-correct monotonicity against the substrate quantity — it remains accounting-only and an explicit residual, carries no `E` or `B` claim, and is never absorbed silently into an aggregate claim. If such a mapping is later supplied, or the dimension is replaced by one that admits it, it becomes eligible on exactly the same terms as any other dimension; nothing here forecloses that.
+
+Until Slice C supplies a mapping satisfying every condition in FORMAL's canonical list for a dimension, that dimension carries no `E` or `B` claim, `EffectiveCapacity` there equals `AccountingCapacity`, and any report must say so.
+
+Contraction releases, revokes, invalidates, and reuses nothing. It never forges a release and never admits a conflicting claim to make room. It may request retirement only from the exact owners whose lease contract declares those leases reclaimable, and such a request releases nothing. It applies only to admission decisions taken after it.
+
+`S(d) + R_flight(d) > Gc(d)` is not a reachable state and must never be described as one, and `S > Gc` follows as the weaker consequence. P1 is not suspended, relaxed, deferred, or evaluated against a historical grant during contraction; conservation holds continuously throughout. Any wording suggesting a window in which committed use exceeds the committed grant is incorrect and must be corrected rather than explained. Contraction is never a reclamation mechanism, and it never strands an in-flight reservation.
+
+A contraction is not an instantaneous probe of current use, and the two must never be substituted for each other. A probe reports committed use `S + R_flight` at an instant and changes nothing; a contraction lowers `Gc`, subject to the floor `S(d) + R_flight(d) <= Gc(d)`, and changes the admission ceiling going forward. A typed containment-loss, backing-loss, or external-overcommitment report is caused by a premise falling below committed use, not by the contraction itself, and it never indicates that `Gc` fell below `S(d) + R_flight(d)`. Reporting a probe as a contraction would let a transient measurement appear to authorize a permanent ceiling change; reporting a contraction as a probe would let a ceiling change appear to be a mere observation.
+
+*Status of these obligations in the shipped provider.* The shipped provider is accounting-only. It takes its grant at construction as an owner-supplied vector, exposes no contraction entry point, models no external observation `O`, selects no target `T`, enforces no envelope `E`, and proves no backing `B`. It therefore exercises none of the obligations in this subsection: there is no target selection to record, no gradual descent of `Gc` to control, no envelope containment to enforce, and no backing claim at admission. Every clause above constrains work that has not been built. None may be reported as a satisfied property, the absence of a contraction path is not evidence that contraction is safe, and an admission by this provider is evidence of bookkeeping only — never that the underlying allocation will succeed.
+
+The current resource classes describe an accounting vocabulary, not proof that every dependency exposes that dimension. Exactness is limited to the quantity actually charged. Allocator slack, native WebRTC state, runtime internals, kernel handles, driver state, and external provider allocations must remain named residuals until the responsible adapter can conservatively claim or isolate them.
+
+### 14.2 Limit classification
+
+Every limit must be classified as exactly one of:
+
+```text
+Protocol-shape bound
+    required for canonical or valid wire shape
+
+Provider structural limit
+    imposed by a transport, codec, kernel, hardware device, or dependency
+
+Runtime resource availability
+    a current provider grant consumed through leases
+
+Optional local policy ceiling
+    an explicit administrator, cost, isolation, Closed deployment, appliance,
+    test, or temporary compatibility restriction
+```
+
+An implementation must not turn a measured workload size into a protocol bound, turn an optional policy ceiling into basal semantics, or describe an opaque dependency allocation as exact.
+
+### 14.3 Pre-authentication resource class
+
+Pre-authentication claims include accepted connections and handshakes, parser bytes and work, fact verification work, signaling work, candidate storage, sockets and transport objects, DNS, STUN, ICE and relay work, speculative packet quarantine, callbacks, scheduled work, diagnostics, and cleanup ownership.
+
+The process component is checked regardless of identity. Per-ingress accounting may guide fairness or optional policy, but identity rotation cannot create a new process grant.
+
+### 14.4 Post-authentication resource class
+
+Post-authentication claims include authenticated sessions, application-facing queues, codec work, relay buffering, recovery, callbacks, handles, and subscriptions. A successful pre-authentication lease cannot be reused as proof that post-authentication resources exist. Promotion performs an explicit resource transition.
+
+### 14.5 Queue and delayed-work contracts
+
+No queue may grow without leases for its retained storage and scheduled work. Basal MyOwnMesh does not define one universal queue-item count.
+
+```text
+connector lifecycle
+    fixed non-lossy state transition owner
+
+reliable endpoint stream
+    resource-backed bytes plus producer backpressure or typed failure
+
+interactive real-time flow
+    provider or application-selected complete-unit pressure semantics
+
+satellite or store-and-forward
+    delayed-delivery spool backed by storage leases
+
+raw storage or removable media
+    storage-object and storage-byte leases
+```
+
+Elapsed time does not create or release a lease. A slow operation may retain its finite claim until an explicit owner transition releases or replaces it. A provider retirement request changes no claim. The exact owner releases through Drop after cleanup, or transfers the charge into failed-cleanup retention when release cannot be proven.
+
+### 14.6 Opaque native and operating-system resources
+
+Every opaque family must be reported as one of:
+
+```text
+exactly observable and leasable
+conservatively claimable
+isolatable in a worker, process, job, cgroup, rlimit, or equivalent domain
+observable but not enforceable yet
+unobservable residual
+```
+
+The implementation must prefer host-enforced resource domains and narrow provider guards where available. It must not substitute a guessed peer or flow count for an unobservable native allocation.
+
+### 14.7 Optional local ceilings
+
+An optional `LocalCeilingPolicy` or equivalent wrapper may impose stricter counts or resource partitions for a locked-down appliance, Closed deployment, carrier cost boundary, compatibility provider, or test.
+
+This wrapper is explicitly optional. It is not required for ordinary V4 construction, it cannot mint authority or capacity, and basal conformance must never assume it is present. Every isolation domain or reserved share it introduces is local policy, not a basal guarantee, and must be reported as such.
+
+### 14.8 Effect execution
+
+State and effect intents commit before external execution. Every effect carries exact live capabilities and leases and rechecks them before use. Cleanup effects remain available even when authority for new work disappears.
 
 ## 15. Fundamental invariants
 
@@ -679,7 +1077,19 @@ Pre-authentication work cannot create durable authority, application delivery, o
 
 ### I10. Work is reserved before allocation
 
-Every protected parser, candidate, socket, relay, handshake, queue, and session allocation is dominated by its resource guard.
+Every protected parser, candidate, socket, relay, handshake, queue entry, task, native object, and session allocation is dominated by a live finite resource lease.
+
+### I10a. Basal semantic cardinality is open
+
+Basal MyOwnMesh defines no fixed maximum for Mesh runtimes, peers, connector attempts, sessions, or real-time flows. Each new object is admitted by its actual composite claim and may fail with typed resource pressure or unavailability.
+
+### I10b. Child scopes share one cooperative process grant
+
+Mesh and descendant scopes share one finite process grant. No basal weights, quotas, shares, or partitions exist. Claims never exceed the actual provider domain, no scope mints capacity, unused capacity is work-conservingly borrowable, any isolation or reserved share is explicit local policy, and P6 as formally defined in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) Note 14.5e remains the standing obligation. The shipped provider rotates over FairnessRoots rather than over mintable scope identities — both its demand cursor and its reclaim cursor are root-keyed — which removes the disclosed counterexample in which subdividing a root's attribution manufactured extra turns for it. Its controls are **landed in the working tree, with no execution result claimed here**, covering that comparison with a non-vacuous negative fixture over an ordered trace of cooperative-admission dispositions. That is bounded evidence, not categorical whole-P6 conformance; section 14.1 records the two defects, their dispositions, and the four limits, including the trace's scope and that nothing here is exact-head or hosted. Only the exact owner releases a claim, after cleanup; no forged release exists, and cleanup retains the resources it requires. The pending-demand cardinality, selection order, and rotation rule that satisfy these properties are concrete provider policy, not mesh semantics. The provider may ask an owner whose contract declares its lease reclaimable to retire, but it never releases that owner's claim. Admission remains fallible under nonreclaimable admitted pressure, ignored retirement, or failed-cleanup retention.
+
+### I10c. Time is not resource authority
+
+Elapsed duration alone cannot create, release, expire, or validate a resource lease.
 
 ### I11. A working socket is not a session
 
@@ -783,16 +1193,76 @@ A release must pass at least the following groups.
 - durable and ephemeral parser separation;
 - carrier identity non-authority;
 - no carrier-synthesized roster changes;
-- bounded frame, queue, retry, and provenance state;
+- lease-backed frame, queue, retry, and provenance state;
 - no application payload construction.
 
 ### 16.3 Speculative transport
 
 - raw hints can create bounded candidate work;
-- global resource limits hold under identity rotation;
+- process resource grants hold under identity rotation;
+- admission continues for another object whenever its exact claim is granted;
+- refusal names the unavailable resource class rather than a basal object-count ceiling;
+- multiple Mesh scopes cannot multiply the process grant;
+- claims never exceed the actual provider domain in any resource dimension;
+- unused capacity is work-conservingly borrowable;
+- the basal provider has no weights, quotas, reserved shares, or partitions;
+- partition non-amplification as defined in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) Note 14.5e: the baseline and subdivided runs of one causally closed model, with releases derived rather than scripted, compared prefix-wise on cumulative selections, on cumulative admitted quantity per dimension, and on each competing root's selection index. The control must exhibit both runs and must not require equality of outcome in either direction — **implemented against the shipped provider with a non-vacuous negative fixture; see the P6 status note at the end of this subsection for the four limits on that result**;
+- both runs are built by Construction A: identical FairnessRoot set, identical pre-created AttributionChildScope topology, identical already-charged bookkeeping, stable DemandIds, and identical initial state at the start of the measured prefix, with baseline mapping all of A's demands to one already-created child scope, subdivided mapping the same demands across those same already-created scopes, and only the DemandId-to-child mapping differing;
+- the workload fixes a deterministic clock-free environment and reducer interleaving exogenous arrivals with owner-derived actions, and both runs stutter to a terminal state so the comparison is defined past the final arrival;
+- Construction A's normalization is never reported as a claim that scopes are unlimited, that scope creation is free, or that bookkeeping can never bind; scope creation remains real, finite, charged, and fallible;
+- the first partition non-amplification control fixes a bounded decision prefix in which none of the compared newly admitted demands releases and starts from Construction A's identical topology and bookkeeping; it is a conformance result for the case it covers and is never reported as globally sufficient or as a whole-model proof;
+- the FairnessRoot mapping is performed by trusted local verification, which may take verified local facts such as an authenticated principal as inputs, while no claimant-supplied, peer-supplied, or wire-visible value can directly name, select, split, or multiply a root, and no unverified assertion increases the roots a party is attributed to;
+- no partition non-amplification control is reported as a Sybil, claimant-count, or real-world identity result, and no Sybil or principal-admission control is reported against P6;
+- hostile-ingress progress and backpressure are exercised as their own contract and are never reported as fairness evidence, in either direction;
+- an immediate nonwaiting acquisition returns typed pressure only for a claim that does not fit in some required dimension, and a fitting claim is refused only under a stated structural limit, an explicit isolation or optional ceiling policy, or accounting that is unavailable, poisoned, or unprovable-safe;
+- no immediate path withholds a fitting claim to reserve capacity for anticipated demand, to smooth a rate, or to enforce an undeclared share;
+- determinism is exercised only across identical already-issued `ResourceScopeId` values, identical state, and the same ordered operations, and no control assumes cross-run identifier stability;
+- `Gc` is never installed or reduced below `S(d) + R_flight(d)`, so the stronger invariant holds continuously, implies `S <= Gc`, and no control may exhibit or describe `S > Gc` or strand an in-flight reservation;
+- an external observation `O` is inert and optional: a policy input only, never read by an admission decision, never used as a limit, never justifying a refusal, and never producing any value automatically;
+- `T` is an explicit named owner-policy target that an owner may set directly with no observation involved, or derive through a named policy consulting `O`; no path from `O` to `T` is mandatory, no control requires one, and a change in `O` never changes `T` by itself;
+- `T` never lowers `Gc`, releases a charge, or refuses an admission by itself;
+- `Gc` descends toward `T` only as owner-driven release lowers committed use `S + R_flight`, one safe step at a time;
+- a provider that claims backing for a dimension proves `Gc <= B` in that dimension at admission; a provider making no backing claim is not required to, and the unproved case is reported as a Slice C residual rather than assumed;
+- typed containment loss, backing loss, or external overcommitment is reported only where the premise falls below `S + R_flight`; in every case all charges and reservations are retained, no release is forged or inferred, conflicting admission is refused with a typed dimension-naming result, and `Gc` is still not lowered below `S + R_flight`;
+- no control or document treats an admission-time backing proof as evidence that physical backing still exists later, and none asserts that every charge remains backed once `B` has fallen;
+- capacity an adapter cannot prove is backed is a named Slice C residual and is never counted into `B`;
+- `AccountingCapacity` and `EffectiveCapacity` are absolute capacities, not remainders: `AccountingCapacity` is `Gc` narrowed only by an explicit restriction from the closed P5 vocabulary, and `EffectiveCapacity` narrows it by `E` only where `E` is proved and by `B` only where `B` is proved, per dimension and independently; where neither is proved the two are equal, and that equality is valid;
+- `EffectiveFit` is what `EffectiveCapacity` leaves once `S` and `R_flight` are accounted, and admission requires `q <= EffectiveFit` in every dimension the claim touches;
+- `S` and aggregate `R_flight` are distinct; reservation occurs only after the claim fits every named dimension and is all-or-nothing, promotion transfers the exact quantity from `R_flight` to `S`, and failure or abandonment removes only its own reservation, so the reservation is counted exactly once, never held in both, never double-counted, and never silently dropped;
+- the only narrowings of `AccountingCapacity` are explicit P5 restrictions drawn from the closed three-category vocabulary — named local isolation domain, named partition or reserved share, named optional local ceiling or cost boundary — each naming its scope, with no generic exclusion category and no undeclared reserve, headroom, safety margin, or rounding-down;
+- `S` and `R_flight` are subtracted only after `E` and `B` are intersected in, and the residual is clamped at zero so a fallen premise refuses rather than presenting a negative bound as slack;
+- a composite claim fits only when it fits in every dimension it names; headroom in one dimension never compensates for its absence in another;
+- on loss of a proved `E` or `B` premise the provider narrows `EffectiveCapacity` and remains work-conserving in the headroom above `S + R_flight`, continuing to admit claims that fit;
+- typed containment-loss, backing-loss, or external-overcommitment is reported only where the premise falls below `S + R_flight`; a premise that falls but stays at or above `S + R_flight` is reported as reduced capacity, not as loss;
+- `O` and `T` never participate in `AccountingCapacity`, `EffectiveCapacity`, or `EffectiveFit`, in any dimension, under any provider;
+- isolation and backing are orthogonal per-dimension capabilities, not exclusive and not a hierarchy: each is licensed only by its own exact proof, neither implies or requires the other, and a dimension with no claim is accounting-only and reported as a Slice C residual;
+- `E` is never reported as, or substituted for, `B`, and containment is never presented as availability;
+- the shipped `FiniteResourceProvider` is reported as accounting-only in every dimension, because its owner-supplied grant vector is not host backing, and is never reported as sufficient on its own for final production resource closure;
+- no provider presents unproved containment or backing as established; an accounting-only committed grant is described as an accounting commitment, never as proof that substrate capacity exists or that an allocation will succeed;
+- a successful admission against an accounting-only dimension is never reported as guaranteeing allocator, kernel, runtime, transport, external-relay, or hardware success;
+- accounting-only classification is reported as coherent and not itself a defect, and remains true of the shipped provider independently of its P6 standing: discharging P6 proves no `E` and no `B`, and proving either would not have discharged P6;
+- every `E` or `B` mapping additionally discharges coverage, composition, subject alignment, lifetime and loss, and `B` exclusivity; a mapping failing any of these is treated as no mapping at all;
+- no mapping assumes premise loss is observable in time; undetectable withdrawal followed by fail-stop is treated as the expected worst case;
+- every unaccounted competing consumer of the same underlying resource is deducted from `B`, and where competing use cannot be bounded `B` is not established and the dimension remains accounting-only;
+- every `Gc <= E` or `Gc <= B` claim rests on a dimension-specific, unit-correct, monotone mapping between the `ResourceClaim` quantity and the substrate quantity contained or reserved; absent that mapping the dimension stays accounting-only and is carried as an explicit residual;
+- `OpaqueDependencyResidual` carries no `E` or `B` claim and is never absorbed into an aggregate one absent a mapping satisfying every condition in FORMAL's canonical list, including naming what a single unit of it means; assigning it a number is not sufficient, since being counted or measured does not make it contained or reserved;
+- no typed containment-loss, backing-loss, or external-overcommitment result is claimed for a fail-stop outcome; process death destroys live in-process capabilities, leases, and accounting state and is handled by ordinary restart semantics, not by this contract;
+- no cleanup of external or substrate-owned resources is claimed on the strength of process death; relay and TURN allocations, peer-held session state, on-disk artifacts, and kernel objects the OS does not reclaim may outlive the process that charged them;
+- grant contraction is never exercised as, or substituted for, an instantaneous use probe;
+- pressure and refusal never become an authorization result in either direction;
+- elapsed time alone creates, releases, expires, and validates nothing;
+- a retirement request never releases the claim it targets;
+- only the exact owner releases, through Drop after cleanup, or the exact charge enters failed-cleanup retention;
+- cleanup retains the resources it requires and cannot depend on a forged release;
+- no admission guarantee is claimed against nonreclaimable admitted pressure, ignored retirement, or failed cleanup;
+- optional local ceilings, isolation domains, and reserved shares remain explicit wrappers;
+- selection order, rotation rule, and pending-demand cardinality are provider policy, so conformance asserts the properties above rather than a particular schedule;
+- when the shipped provider policy is in use, one move-only pending demand exists per FairnessRoot, pending demand is selected in `Cleanup > Admitted > Speculative` order with equal-class per-root rotation, and retirement is requested only from exact owners whose contract declares the lease reclaimable;
 - malformed and unauthorized inputs cannot cross promotion;
 - media and packets remain quarantined before promotion;
 - cleanup completes at every failure point.
+
+P6 status at this disposition: the shipped provider's equal-class rotation cursor and reclaim cursor are keyed to the FairnessRoot, so subdividing one root's attribution across additional AttributionChildScopes creates no additional turn key — every scope beneath a root maps to that root's turn and the cursor advances a whole root at a time. The disclosed cursor counterexample is thereby removed. That is a statement about the rotation key, not a general guarantee over every workload's decision prefixes. The controls are **landed in the working tree, with no execution result claimed here**: they evaluate baseline and subdivided runs against the live provider over an ordered cooperative-admission disposition trace, paired with a negative fixture that reverts production selection to scope keying and requires the oracle to reject it. Four limits hold: the result is bounded and never a whole-model proof; the trace is scoped to cooperative admission on the non-failing path and no wider; it is working-tree scope, not exact-head and not hosted CI, and citation requires exact-state local verification and exact-head hosted evidence recorded externally; its DemandIds are test-side logical ids bound at issue to the provider-minted demand key rather than caller-supplied identifiers; and no deployed multi-root mapping is claimed, since additional trusted-root minting and cross-root exercises are `#[cfg(test)]` only and production has exactly one scheduling root, beneath which child subdivision cannot multiply turns, with cross-root production fairness unclaimed and future trusted-root assignment belonging to its owning provider or ingress arc. The gate must not be reworded into a per-scope guarantee, rotation-only controls still may not be cited as evidence for it, and the connector-local scheduling-metadata obligation remains a separate claim about capacity authority that does not discharge P6.
 
 ### 16.4 Promotion
 
@@ -822,7 +1292,7 @@ A release must pass at least the following groups.
 - visible member-relay identity;
 - anonymous relay credential rejection;
 - relay endpoint-substitution negatives;
-- measured allocation, buffer, retry, and bandwidth limits.
+- exact allocation ownership, lease-backed buffering and retry, provider bandwidth constraints, and optional local cost policy.
 
 ### 16.7 Reachability and application boundary
 
@@ -848,7 +1318,7 @@ A conforming implementation supplies:
 3. durable canonical test vectors;
 4. endpoint-authentication and channel-binding test vectors;
 5. connector profile specifications;
-6. resource measurement report for every supported target;
+6. resource-provider and integration report for every supported target, giving exactness and residual classification per resource dimension, the host isolation domains used, the concrete scheduling policy the provider implements, and evidence that the policy preserves the basal properties in section 14.1;
 7. model or property tests for durable projection and conflict;
 8. speculative-work and promotion state model;
 9. crash and effect-idempotency model;
@@ -864,10 +1334,13 @@ The owner must select:
 - Closed governance proof and relay authorization profile;
 - signaling and connector profiles;
 - required egress and restrictive-network environments;
-- pre-authentication and post-authentication resource values;
+- resource-provider integration and host isolation for each deployment form;
+- any optional local ceiling or cost policy;
 - session recovery and multi-channel policy;
 - reachability display and freshness policy;
 - application data-operation set;
 - optional durable application contract domains.
 
-Every numeric value requires measurement and review.
+These selections are delivered as a provider and integration report, not as a dossier of chosen numbers. The report names each provider and deployment form, states which resource dimensions are exactly observable, conservatively claimable, isolatable in a host-enforced domain, or unobservable residuals, and records the concrete scheduling policy in use with evidence that it preserves the basal properties in section 14.1.
+
+Every numeric protocol or provider limit requires proof from that protocol or provider. Every optional local policy value requires owner review and is never assumed present by basal conformance. Measurements characterize performance, cost, scheduling, regression, and opaque residuals. They do not define universal semantic cardinality.

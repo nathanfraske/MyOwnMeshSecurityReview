@@ -1,7 +1,19 @@
-//! Observation-only resource accounting for the V4 transition.
+//! Resource ownership and observation for the V4 transition.
 //!
-//! This module measures current resource use. It does not reserve capacity,
-//! enforce limits, authorize work, or create a permit. See `BOUNDARY.md`.
+//! The provider submodule grants finite resource leases. The existing
+//! accountant below remains observation-only and cannot authorize work.
+//! Keeping those roles distinct prevents measurements from becoming permits.
+
+pub mod provider;
+
+pub use provider::{
+    FiniteResourceProvider, ReclaimResult, ResourceAcquireDemand, ResourceAdmission,
+    ResourceAuthorityClass, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceLease, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
+    ResourceProviderConflict, ResourceProviderPort, ResourceReclaimSubscription,
+    ResourceReclaimTarget, ResourceReservationState, ResourceScope, ResourceScopeId,
+    ResourceUnavailable, RESOURCE_CLASS_COUNT,
+};
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -70,7 +82,7 @@ impl PreAuthResourceFamily {
         Self::Cleanup,
     ];
 
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self as usize
     }
 }
@@ -202,13 +214,6 @@ impl ResourceUse {
             tasks: self.tasks.max(other.tasks),
         }
     }
-
-    pub(crate) const fn fits_within(self, capacity: Self) -> bool {
-        self.items <= capacity.items
-            && self.logical_bytes <= capacity.logical_bytes
-            && self.retained_bytes <= capacity.retained_bytes
-            && self.tasks <= capacity.tasks
-    }
 }
 
 /// One caller-supplied measurement and whether all of its components were
@@ -275,16 +280,17 @@ pub struct ResourceReport {
         [ResourceFamilyReport<PostAuthResourceFamily>; POST_AUTH_RESOURCE_FAMILY_COUNT],
 }
 
-/// The one observation root shared by all MyOwnMesh runtime objects in this
-/// process. It aggregates measurements only and grants no authority.
-static PROCESS_RESOURCE_ROOT: OnceLock<ResourceAccountant> = OnceLock::new();
+/// The one resource root shared by all MyOwnMesh runtime objects in this
+/// process. Its accountant remains observation-only. Its separate connector
+/// owner slot binds one owner-selected resource-provider identity.
+static PROCESS_RESOURCE_ROOT: OnceLock<ProcessResourceRoot> = OnceLock::new();
 
 /// Return a process-wide observation snapshot.
 pub fn process_resource_report() -> ResourceReport {
     ProcessResourceRoot::global().report()
 }
 
-/// The root of the production observation hierarchy.
+/// The root of the production resource hierarchy.
 ///
 /// Child scopes are created in one fixed ownership order: process, Mesh
 /// runtime, joined network instance, then attempt or peer connection. These
@@ -292,19 +298,81 @@ pub fn process_resource_report() -> ResourceReport {
 /// Carrier, ingress source, attempt, and known-origin attribution remain
 /// independent dimensions. An observation made at a leaf is recorded at that
 /// leaf and every ancestor.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProcessResourceRoot {
     accountant: ResourceAccountant,
+    connector_owner: Arc<OnceLock<crate::runtime::attempt::ConnectorResourceOwnerPort>>,
+}
+
+impl std::fmt::Debug for ProcessResourceRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessResourceRoot")
+            .field("accountant", &self.accountant)
+            .field(
+                "resource_provider_installed",
+                &self.connector_owner.get().is_some(),
+            )
+            .finish()
+    }
 }
 
 impl ProcessResourceRoot {
     /// Get the observation root for this process.
     pub fn global() -> Self {
-        Self {
-            accountant: PROCESS_RESOURCE_ROOT
-                .get_or_init(ResourceAccountant::observation_only)
-                .clone(),
+        PROCESS_RESOURCE_ROOT
+            .get_or_init(|| Self {
+                accountant: ResourceAccountant::observation_only(),
+                connector_owner: Arc::new(OnceLock::new()),
+            })
+            .clone()
+    }
+
+    /// Install or reuse the one resource provider for this process root.
+    ///
+    /// The first owner-selected provider identity wins. A later Mesh runtime
+    /// can share it only by cloning the exact same port. Replacing it while
+    /// leases may exist would split the process grant.
+    pub fn install_resource_provider(
+        &self,
+        provider: ResourceProviderPort,
+    ) -> std::result::Result<
+        crate::runtime::attempt::ConnectorResourceOwnerPort,
+        ResourceProviderConflict,
+    > {
+        let installed = self.connector_owner.get_or_init(|| {
+            crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider.clone())
+        });
+        if installed.same_provider(&provider) {
+            Ok(installed.clone())
+        } else {
+            Err(ResourceProviderConflict)
         }
+    }
+
+    /// Return the installed process connector owner, if the process owner has
+    /// selected a policy.
+    pub fn connector_resource_owner(
+        &self,
+    ) -> Option<crate::runtime::attempt::ConnectorResourceOwnerPort> {
+        self.connector_owner.get().cloned()
+    }
+
+    /// Issue one unforgeable connector admission scope for an exact live
+    /// [`crate::Mesh`] runtime.
+    ///
+    /// The process provider must already be installed. Scope creation grants
+    /// no capacity and all Mesh scopes draw from the same process grant.
+    pub fn issue_mesh_connector_scope(
+        &self,
+    ) -> Result<
+        crate::runtime::attempt::MeshConnectorResourceScope,
+        crate::runtime::attempt::MeshConnectorResourceScopeIssueError,
+    > {
+        let owner = self.connector_owner.get().ok_or(
+            crate::runtime::attempt::MeshConnectorResourceScopeIssueError::ResourceProviderMissing,
+        )?;
+        owner.issue_mesh_scope()
     }
 
     /// Read the process aggregate without changing it.
@@ -322,6 +390,7 @@ impl ProcessResourceRoot {
     pub(crate) fn isolated() -> Self {
         Self {
             accountant: ResourceAccountant::observation_only(),
+            connector_owner: Arc::new(OnceLock::new()),
         }
     }
 }

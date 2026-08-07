@@ -14,6 +14,11 @@ categories = ["command-line-utilities", "network-programming"]
 # Releases matrix (`myownmesh-<platform>.{tar.gz,zip}`); see RELEASE.md.
 publish = false
 
+[features]
+default = []
+legacy-v1 = ["myownmesh-core/legacy-v1"]
+legacy-media = ["myownmesh-core/legacy-media"]
+
 [[bin]]
 name = "myownmesh"
 path = "src/main.rs"
@@ -33,6 +38,7 @@ myownmesh-updater = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

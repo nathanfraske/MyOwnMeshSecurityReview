@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "claude/**"]
+    branches: [main, "claude/**", "arc/**"]
   pull_request:
     branches: [main]
 
@@ -46,8 +46,91 @@ jobs:
       - name: Tests
         run: cargo test --workspace --no-fail-fast
 
+      - name: Arc 03 final desktop compatibility artifact
+        run: |
+          cargo check -p myownmesh-core --all-targets --features "legacy-v1"
+          cargo check -p myownmesh-core --all-targets --features "legacy-media"
+          cargo check -p myownmesh-core --all-targets --features "legacy-v1,legacy-media"
+          cargo check -p myownmesh --all-targets --features "legacy-v1"
+          cargo check -p myownmesh --all-targets --features "legacy-media"
+          cargo check -p myownmesh --all-targets --features "legacy-v1,legacy-media"
+          cargo test -p myownmesh --features "legacy-v1" v4_arc03h_legacy_v1_daemon_option_is_explicit -- --nocapture
+          cargo test -p myownmesh --features "legacy-media" v4_arc03j_legacy_media_daemon_option_is_independent -- --nocapture
+          cargo test -p myownmesh --features "legacy-media" v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form -- --nocapture
+          cargo test -p myownmesh-core --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
+          cargo test -p myownmesh --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
+
+  arc03-compatibility:
+    name: Arc 03 retained compatibility paths
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: arc03-compatibility
+
+      - name: Reject deprecated use from normal V4 source
+        run: |
+          RUSTFLAGS="-D warnings -D deprecated" cargo check -p myownmesh-core --all-targets
+          RUSTFLAGS="-D warnings -D deprecated" cargo check -p myownmesh --all-targets
+
+      - name: Compile and test retained feature paths
+        run: |
+          cargo test -p myownmesh-core --features "legacy-v1,legacy-media,transport-lab" --no-fail-fast
+          cargo test -p myownmesh --features "legacy-v1,legacy-media" --no-fail-fast
+
+      - name: Arc 03 compiler boundary controls
+        run: python3 scripts/check-v4-arc03-compiler-boundaries.py
+
+      - name: Arc 03 final native lifecycle, cleanup, restart, and provider controls
+        run: |
+          set -euo pipefail
+          for control in \
+            v4_arc03_cancelled_construction_closes_partial_native_peer \
+            v4_arc03_cancelled_construction_with_native_close_error_retains_exact_claim \
+            v4_arc03_cancelled_delivered_result_closes_native_peer_before_release \
+            v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed \
+            v4_arc03_background_construction_failure_closes_partial_native_peer \
+            v4_arc03j_native_local_ice_restart_commits_exact_replacement \
+            v4_arc03j_native_local_ice_restart_failure_retires_connector \
+            v4_arc03h_close_wins_before_open_promotion \
+            v4_arc03h_close_wins_before_legacy_realtime_admission \
+            v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks \
+            v4_arc03g_close_fence_rejects_endpoint_send_realtime_write_and_lane_open \
+            v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner \
+            v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops
+          do
+            cargo test -p myownmesh-core \
+              --features "legacy-v1,legacy-media,transport-lab" \
+              "$control" -- --ignored --nocapture --test-threads=1
+          done
+          cargo test -p myownmesh-core \
+            --features "legacy-v1,legacy-media,transport-lab" \
+            v4_arc03h_failed_remove_track_retains_exact_lane_owner_and_blocks_reuse \
+            -- --nocapture --test-threads=1
+
+      - name: Direct and TURN endpoint controls
+        run: |
+          cargo test -p myownmesh-core --lib \
+            --features "legacy-v1,legacy-media,transport-lab" \
+            loopback_handshake_opens_data_channel \
+            -- --nocapture --test-threads=1
+          cargo test -p myownmesh-services \
+            --test turn_webrtc_endpoint_auth \
+            turn_selected_session_authenticates_endpoints_before_bidirectional_data \
+            -- --nocapture --test-threads=1
+
   # Validate the static-musl appliance daemons actually cross-compile on every
-  # PR — not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
+  # PR, not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
   # (NanoKVM-Pro) are the exact `cargo zigbuild` invocations release.yml ships,
   # so a broken .cargo/config.toml, a dependency that won't cross-compile, or the
   # static-musl getrandom link regression is caught here instead of at release.
@@ -68,7 +151,7 @@ jobs:
       # Pin to the same toolchain as rust-toolchain.toml (channel 1.88.0) and the
       # release jobs. `@stable` would add the cross target to the stable
       # toolchain, but cargo honors rust-toolchain.toml's pin and builds with
-      # 1.88.0 — which would then lack the target ("can't find crate for core").
+      # 1.88.0, which would then lack the target ("can't find crate for core").
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.target }}

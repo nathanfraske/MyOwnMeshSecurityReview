@@ -1,6 +1,6 @@
 # MyOwnMesh fundamental hybrid networking architecture
 
-Status: owner-adopted V4 architecture, source revision `2a04e29e0a4c09b95a4914972018850ddb2cbacb`.
+Status: owner-adopted V4 architecture, as amended by owner review.
 
 This document defines the smallest common architecture for MyOwnMesh discovery, durable mesh semantics, signaling, transport path construction, endpoint authentication, session recovery, and application data delivery.
 
@@ -186,13 +186,13 @@ The connector owns pathfinding and packet transport. It may start useful work be
 
 ![Usability-first pathfinding with a strict channel-promotion boundary](diagrams/02-channel-promotion-boundary.svg)
 
-An untrusted hint or partially authenticated signal may create only bounded speculative state, such as:
+An untrusted hint or partially authenticated signal may create only lease-backed speculative state, such as:
 
 ```text
-CandidateHandle
+ConnectorCandidateCapability
 TransportHandle
 RelayAllocationToken
-ConnectedChannelHandle
+ConnectedChannelCapability
 TransportObservation
 ```
 
@@ -216,11 +216,151 @@ Before promotion, speculative work may not:
 - deliver application payload to a consumer;
 - send application payload as an authenticated peer;
 - select arbitrary relay destinations;
-- exceed the measured pre-authentication resource envelope.
+- retain protected state or schedule protected work without a live resource lease.
 
 MyOwnMesh does not maintain a parallel global route table. A connector may keep local ephemeral candidate and channel indexes for operation and diagnostics. Those local identifiers are not ledger facts, peer identity, application authority, or cross-runtime route identifiers.
 
-### 5.1 Connector profiles
+### 5.1 Attempt, connector, and resource cardinality
+
+One connection attempt is a cancellation, race, and aggregate-resource owner. It may own several connector candidates. One WebRTC connector candidate owns exactly one `RTCPeerConnection` and its one ICE agent. That ICE agent may gather, receive, and check many internal ICE candidates and candidate pairs.
+
+These relationships describe ownership, not product-wide maximum counts. Basal MyOwnMesh defines no fixed semantic ceiling for Mesh runtimes, peers, attempts, sessions, or real-time flows. A finite host still has finite resources, so creating any of these objects is fallible. Admission succeeds only when the applicable resource provider grants the object's finite composite claim. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result.
+
+```text
+host or process resource provider
+    -> grants finite ResourceLease for an exact ResourceClaim
+    -> process resource root
+        -> Mesh resource scope
+            -> attempt, candidate, callback, cleanup, and flow owners
+
+sum of live and failed-cleanup-retained claims in each resource dimension
+    <= resource grant currently assigned to the process
+```
+
+Mesh scopes attribute use to one finite process grant. Creating another Mesh scope does not create capacity.
+
+Basal MyOwnMesh constrains the finite provider by property, not by algorithm. Any conforming provider must preserve:
+
+```text
+P1 Domain conservation
+    the sum of live and failed-cleanup-retained claims in each resource
+    dimension never exceeds the grant actually assigned to the process;
+    a claim never exceeds the provider domain it is drawn from
+
+P2 Cleanup ownership
+    only the exact owner releases a claim, and only after cleanup; no
+    provider, peer, message, or timer can forge a release, and resources
+    a cleanup path requires stay retained until that cleanup completes
+
+P3 No minting
+    no scope, child scope, or identity creates capacity
+
+P4 Work conservation
+    capacity that is neither live nor reserved for an in-flight
+    admission is borrowable by any scope that can use it. A provider
+    may return immediate typed pressure instead of retaining a demand
+    only when the claim does not currently fit. A claim that does fit
+    is admitted, unless the refusal is justified by a proven structural
+    limit of the provider, by an explicit isolation policy or optional
+    local ceiling under P5, or by accounting that is unavailable,
+    poisoned, or otherwise unable to prove the admission safe. Every
+    such reason is declared. Arbitrary refusal is prohibited and can
+    never stand as a hidden limit
+
+P5 Explicit isolation
+    every partition, reserved share, or isolation ceiling is explicit
+    local policy, never a basal guarantee
+
+P6 Partition non-amplification
+    subdividing a fairness root's attribution into more child scopes
+    must not increase that root's cumulative selections, or its
+    cumulative admitted quantity in any dimension, at any point of the
+    provider's decision sequence, and must not move any competing
+    root's selection later. One-way only: no equality of outcome is
+    implied
+
+P7 Pressure is not authorization
+    refusal, pressure, and unavailability are typed resource results,
+    never an Open or Closed authorization outcome in either direction
+
+P8 Time is not resource truth
+    elapsed duration alone creates, releases, expires, and validates
+    nothing
+```
+
+P6 is stated over fairness roots and attribution child scopes. Both are closed architectural definitions:
+
+```text
+FairnessRoot
+    the unit of scheduling attribution that a provider serves
+    selected locally by the trusted provider or ingress owner that
+        installs the grant
+    process-local and opaque: never transmitted, never compared across
+        processes
+    not mintable by the claimant it attributes: no unverified claimant,
+        peer, or wire assertion may name, select, split, rotate, or
+        multiply one
+    not a semantic or durable identity, and not an authentication or
+        authorization root or capability; holding one grants nothing
+
+AttributionChildScope
+    an accounting and attribution refinement beneath exactly one
+        FairnessRoot
+    may divide, label, and measure use within that root
+    carries no independent scheduling entitlement, and adds no share,
+        turn, or service weight to the root beneath which it sits
+```
+
+**P6, partition non-amplification.** Subdividing a fairness root's attribution into more child scopes must not increase that root's cumulative selections, or its cumulative admitted quantity in any resource dimension, at any point of the provider's decision sequence, and must not move any competing root's selection to a later decision. The requirement is one-way: a ceiling on what subdivision can gain, not a guarantee that subdivision is free. It implies no equality of outcome, permits the subdivided root to fare worse and a competitor to fare better, and constrains nothing else. The exact model, comparisons, and conformance controls are in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md).
+
+P6 is silent about who a claimant is. It binds no apparent ingress source to a real-world actor, is not Sybil resistance, and does not decide how many roots an actor receives. It is equally not a progress property: it says nothing about progress, throughput, latency, backpressure, or behavior under hostile ingress, which are separate obligations of the ingress path.
+
+Selection order, rotation rule, and pending-demand cardinality are concrete provider policy, not basal architecture. This architecture selects no scheduler, no fairness-root taxonomy, no weights or quotas, and no mapping from roots to service turns. A resource-provider implementation chooses them and may replace them with any policy preserving P1 through P8. No other subsystem may depend on a particular choice.
+
+A conforming provider satisfies P1 through P8. Whether any particular provider does so is recorded in the implementation and transition documents, not here.
+
+**The committed grant is an accounting commitment.** It is not proof that substrate capacity exists, and not a promise that an allocation will succeed. Containment and reservation are separate premises, each proved per resource dimension, and a provider never presents unproved containment or backing as established. An accounting-only commitment is a coherent basis for admission, and it is not by itself sufficient for final production closure.
+
+**Grant change never forges a release.** The committed grant is not required to be constant. A provider may raise it, and may lower it, but never below committed use, which includes both the charges already held and any reservation held for an admission in flight. No grant change ever releases, revokes, reduces, or reattributes a live claim or a reservation. Only the exact owner releases, after its own cleanup, exactly as P2 requires. A provider may request retirement from an owner whose contract declares that lease reclaimable; the request is sticky, carries no timer, and alters no claim. A measurement never becomes a grant by being taken. The exact treatment of observation, target, containment, backing, committed grant, charged sum, in-flight reservation, capacity, and admission fit is in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md).
+
+No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. An explicit named P5 local isolation domain, partition or reserved share, or optional local ceiling or cost boundary may impose stricter restrictions for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
+
+Resource limits have four distinct sources:
+
+```text
+Protocol-shape bound
+    canonical parser or wire validity
+
+Provider structural limit
+    actual transport, codec, kernel, or hardware constraint
+
+Runtime resource availability
+    currently granted memory, handles, sockets, tasks, storage, and work
+
+Optional local policy ceiling
+    explicit administrator, cost, isolation, or compatibility restriction
+```
+
+One category cannot be presented as another. Measurements characterize cost and may inform selection of an explicit named P5 restriction; they do not themselves narrow accounting capacity. They do not establish a universal peer, Mesh, attempt, session, or flow count.
+
+An exact lease is exact only for the resource units named by its claim. Native WebRTC, allocator, runtime, kernel, driver, and external relay state that the adapter cannot count remains an explicit residual. A conforming implementation must conservatively claim, isolate, or report that residual. It must not describe a visible Rust allocation or a connector-count proxy as complete native or OS accounting.
+
+```text
+one connection attempt
+    -> multiple connector candidates
+
+one WebRTC connector candidate
+    -> one RTCPeerConnection and ICE agent
+    -> multiple internal ICE candidates and candidate pairs
+
+DataChannelOpen for that exact live WebRTC connector candidate
+    -> ConnectedChannelCapability
+    -> not endpoint authentication or session authority
+```
+
+An internal `LocalIceCandidate` is typed transport-control input to a WebRTC connector candidate. It is not a connector candidate, an attempt, or an authority capability.
+
+### 5.2 Connector profiles
 
 A connector profile defines the transport-specific work it performs, including:
 
@@ -438,9 +578,12 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 11. **No relay-authorized handoff.** Relays cannot add, select, or retire an application-usable channel.
 12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
-14. **Work is bounded before use.** Pre-authentication and post-authentication resource classes are separately measured and enforced.
-15. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
-16. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
+14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
+15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result in either direction.
+16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and subdividing attribution beneath a fixed fairness root cannot increase that root's cumulative selections or cumulative admitted quantity in any dimension, and cannot move a competing root's selection later, because attribution child scopes refine accounting beneath one fairness root without creating another share or turn. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
+17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
+18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
+19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
 
 ## 14. Owner decisions that remain explicit
 
@@ -454,9 +597,11 @@ Owner review must select and test:
 6. Connector profiles and required egress environments.
 7. Endpoint-authentication and channel-binding protocols.
 8. Direct, TURN, generic relay, and Closed member-relay requirements.
-9. Pre-authentication and post-authentication resource budgets.
+9. Resource-provider integration: the provider actually used in each deployment form, its structural limits, its host isolation domains, and any optional local resource ceiling.
 10. Reachability observation and local path-selection policies.
 11. Session-handle sharing, recovery, and application lifecycle behavior.
-12. The measurements that select every numeric maximum, timeout, retry, queue, and cache value.
+12. Measurements used for performance characterization, provider-cost estimation, regression detection, opaque-allocation discovery, and optional deployment policy.
 
-No numeric value is inferred from a plausible default.
+Item 9 is delivered as a provider and integration report, not as a dossier of chosen numbers. For each provider and deployment form, that report names which resource dimensions the provider exposes exactly, which are conservatively claimable, which are isolatable in a host-enforced domain, and which remain unobservable residuals. It records the concrete scheduling policy that provider implements, together with the evidence that the policy preserves the basal properties in section 5.1.
+
+No numeric product cardinality is inferred from a plausible default. Any numeric protocol or provider limit must be proven by that protocol or provider. Any optional local ceiling requires explicit owner selection and is never assumed present by basal conformance.

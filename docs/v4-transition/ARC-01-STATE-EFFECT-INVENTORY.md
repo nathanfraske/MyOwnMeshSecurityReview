@@ -1,8 +1,10 @@
 # V4 Arc 01 state and effect inventory
 
-Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with additive coverage for the linked Arc 02 production modules.
+Status: historical Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`. It is not a current Arc 03 source inventory.
 
-This arc changes no product behavior and deletes no code. It establishes the ownership record that later implementation arcs must reduce. No listener, peer connection, firewall rule, or live MyOwnMesh instance was started while producing this record.
+The current source check intentionally fails against this record. The record contains 106 production Rust units and 1,792 declaration members from its fixed baseline. Later Arc 03 source has different units, declarations, module paths, and markers. Do not use this file or its JSON as current source coverage. The machine-readable Arc 03 ownership delta records the bounded current owner changes without rewriting this historical inventory.
+
+This inventory refresh changes no product behavior and deletes no code. It records the ownership seams that later implementation arcs must reduce. The checker opens no listener, peer connection, firewall rule, or live MyOwnMesh instance.
 
 ## Evidence and completeness rule
 
@@ -15,15 +17,15 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The baseline commit remains fixed. The current fingerprints cover that baseline plus the linked Arc 02 capability and resource-observation modules:
+The baseline commit remains fixed. These recorded fingerprints describe an earlier transition snapshot and do not cover the current Arc 03 implementation:
 
-| Input class | Recorded count | Snapshot SHA-256 |
+| Historical input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 106 | `2678fb41e9f2e796d44ef02cf858b80796be6a7e7e0a5c8ede4afc140fb6732e` |
-| Production Rust declaration members | 1,599 | `c45d588bc71c6d4294617953790c7b1e3c5535ceffdf10443fd8b96ea8fcd2fa` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,708 | `f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af` |
-| Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |
-| Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
+| Production Rust source units | 106 | `b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba` |
+| Production Rust declaration members | 1,792 | `f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,952 | `4780aaf7147bdff122a5a644c120c12a2abeceb925eb52fd23ac2f256d555eeb` |
+| Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |
+| Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
 The scanner removes `cfg(test)` items and inventories the remaining Rust in workspace crates, crate build scripts, and the Tauri Rust client. It records declaration bodies and members, named callable bodies, trait callables, registered transport callbacks, mutable statics, constructors, parser entries, queues, tasks, filesystem writes, socket operations, buffered stream reads, external carrier and HTTP calls, child processes, and public action APIs. The full-source fingerprint covers outer attributes, visibility, and source constructs that are not represented as separate declaration members. Each discovered declaration or surface must match exactly one ownership rule.
 
@@ -35,23 +37,23 @@ The assignment counts are records, not architectural sizing targets.
 
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
-| Application Gateway | 348 | 156 |
-| Attempt Node | 55 | 22 |
-| Connector Worker | 48 | 76 |
-| Endpoint Auth Task | 30 | 13 |
-| Peer Session Node | 73 | 50 |
-| Reachability Node | 173 | 52 |
+| Application Gateway | 351 | 165 |
+| Attempt Node | 92 | 72 |
+| Connector Worker | 189 | 229 |
+| Endpoint Auth Task | 33 | 15 |
+| Peer Session Node | 73 | 53 |
+| Reachability Node | 173 | 54 |
 | Relay Node | 38 | 40 |
-| Runtime Supervisor | 57 | 22 |
-| Semantic Node | 117 | 106 |
-| Session Broker | 21 | 12 |
+| Runtime Supervisor | 61 | 25 |
+| Semantic Node | 117 | 111 |
+| Session Broker | 21 | 15 |
 | Signaling Node | 190 | 271 |
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
-| Resource instrumentation domain | 104 | 48 |
+| Resource instrumentation domain | 107 | 58 |
 | Delete | 23 | 25 |
-| Split | 87 | 380 |
+| Split | 86 | 384 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
 | Decision: OD-DEVICE-KEY-CUSTODY | 13 | 33 |
 | Decision: OD-LEGACY-SILENT-MIGRATION | 1 | 0 |
@@ -86,17 +88,17 @@ The same rule applies to `PeerStateData`. Endpoint authentication, policy promot
 
 These findings are confirmed from the current input source. Items that depend on operating-system reachability or a hostile network service still require dynamic reproduction before final severity is assigned.
 
-### 1. Pre-authentication media reaches application subscribers
+### 1. Arc 03 now stops pre-authentication media before application delivery
 
-WebRTC sessions provision media before endpoint authentication, and their track pumps emit `VideoSample` and `AudioSample` events. The engine dispatches those events to application subscribers without an admission or session-capability check at [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L1840). Endpoint authentication begins only after the data channel opens at [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L1794).
+WebRTC sessions still provision the existing native media primitives before endpoint authentication. Arc 03 now discards remote audio before event creation and remote video before H.264 access-unit assembly until the exact connector is activated. The engine's existing admission check remains a second boundary before application delivery.
 
-This is a direct Arc 05 and Arc 06 blocker. Transport may perform bounded work before authentication, but application delivery may not occur before Session Broker promotion.
+This closes the original application-delivery finding for the admitted connector path. It does not establish a complete hostile-input budget for dependency-owned RTP work before that gate.
 
-### 2. Ordinary members forward application payload and may assert an origin
+### 2. Legacy ordinary-member payload routing remains an open removal item
 
-The current fallback routing path wraps application data, forwards it through ordinary members, and accepts an asserted source when the topology identifies the carrier as a forwarder. The acceptance and re-forwarding path is in [`engine/routing.rs`](../../crates/myownmesh-core/src/engine/routing.rs#L142). A failed direct send enters this path from [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L2656).
+The legacy routing module still contains code that wraps application data, forwards it through ordinary members, and accepts an asserted source when the topology identifies the carrier as a forwarder. The acceptance and re-forwarding implementation remains in [`engine/routing.rs`](../../crates/myownmesh-core/src/engine/routing.rs). Arc 03D removes every V4 engine call to `send_routed`, `broadcast_flood`, and `on_relay_frame`. Directed and broadcast channel paths now use exact endpoint-session sends only.
 
-This is not the target Relay Node. It has no exact A-to-C allocation and no authenticated A-to-C channel behind the forwarding member. The migration matrix already assigns this code no target. Its reproductions may be retained, but the production behavior is scheduled for deletion.
+This is not the target Relay Node. It has no exact A-to-C allocation and no authenticated A-to-C channel behind the forwarding member. RTM-001 remains open until the legacy module and compatibility surface are removed or separately dispositioned. Arc 03 does not claim repository-wide removal merely because the V4 path no longer invokes it.
 
 ### 3. Public interfaces expose internal state and Device signing authority
 
@@ -106,9 +108,9 @@ These surfaces bypass the intended Application Gateway and capability transition
 
 ### 4. Speculative resources are not globally confined
 
-An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 02C keeps remote candidates and their private pre-SDP queue observable, moves peer mutation behind a retiring registry, and adds an aggregate attempt-reservation primitive. No production capacity has been selected and the current connector does not consume that primitive. The transport event queue and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
+An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 03 places the existing WebRTC session, remote-description state, and private pre-SDP candidate queue behind `WebRtcConnectorWorker`. It adds exact local callback and registry-installation identities and carries that identity through handshake, approval, roster persistence, waiter completion, reconnect cleanup, and reliable-send effects. Only an inbound `Approve` records remote approval. A successful local send records that the exact current transport accepted the bytes for transmission, not that the remote endpoint received them. Production constructs the connector through a candidate admitted by the one owner installed in `ProcessResourceRoot`, promotes the exact data channel, and moves the resulting capability into an exact-incarnation `EndpointAuthTask`. Connector callbacks use bounded control and endpoint-data mailboxes plus independent bounded real-time flow queues. Real-time queues use structural limits and deterministic overflow, not elapsed-time expiry. The global command queue remains unbounded for its existing non-connector commands. The observed pre-SDP candidate queue and several signaling queues also remain unbounded at process scope. RPC streaming uses an unbounded queue and detached request tasks.
 
-This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 02C defines reservation ordering and observes the current candidate path without inventing production enforcement values.
+This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 03 now enforces process-global connector count, connector ownership, cancellation, exact promotion, and per-worker backpressure without inventing values. Complete anonymous-ingress admission for every dependency-owned resource remains unresolved.
 
 ### 5. Nostr inbound events are trusted beyond their proven carrier facts
 
@@ -166,7 +168,7 @@ The consistency check belongs with the selected identity foundation. It is indep
 
 ## Resource inventory
 
-The source scanner records 19 unbounded channel constructions, and every one has exactly one structured resource record. The audited collections and work sources also include:
+The source scanner records 18 unbounded channel constructions, and every one has exactly one structured resource record. The audited collections and work sources also include:
 
 - peer, connection, subscription, pending-request, candidate, and presence maps or vectors;
 - one task per control or signaling connection in several paths;
@@ -177,7 +179,7 @@ The source scanner records 19 unbounded channel constructions, and every one has
 - configurable signaling limits where zero disables the limit;
 - TURN credential, listener, relay-port, allocation-socket, and lifetime boundaries without an established wrapper-level global resource budget.
 
-The existing fixed capacities are evidence of current behavior, not automatically approved V4 values. `OD-RESOURCE-LIMITS` requires measured owner selection. Arc 02 may count items, bytes, tasks, and lifetimes, but it may not enforce fabricated defaults.
+The existing fixed capacities are evidence of current behavior, not automatically approved V4 values. `OD-RESOURCE-LIMITS` requires measured owner selection. Arc 02 and Arc 03 instrumentation may count items, bytes, tasks, and lifetimes, but it may not enforce fabricated defaults.
 
 ## Owner decisions retained without guessing
 
@@ -195,11 +197,11 @@ The full questions are in the JSON. The unresolved decisions are:
 10. Early signaling authentication and its allowed speculative-work vector.
 11. Ownership of network-change recovery policy after observation is separated from restart effects.
 
-These are explicit decision records, so the Arc 01 rule against guessed assignments is satisfied. None requires inventing a value to install the Arc 02 capability types and resource instrumentation. Key custody becomes blocking before Arc 04 can claim a complete Endpoint Auth boundary. Codec ownership becomes blocking before the media compatibility adapter is removed. Numeric resource values become blocking before enforcement is enabled.
+These are explicit decision records, so the Arc 01 rule against guessed assignments is satisfied. None requires inventing a value to install the Arc 02 capability types, resource instrumentation, or the Arc 03 ownership implementation. Key custody becomes blocking before Arc 04 can claim a complete Endpoint Auth boundary. Codec ownership becomes blocking before the media compatibility adapter is removed. Numeric resource values become blocking before enforcement is enabled.
 
 ## Boundary documents
 
-Arc 01 created no target implementation module. Arc 02 now links seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
+Arc 01 created no target implementation module. Arc 02 and Arc 03 use seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
 
 - `application_gateway`;
 - `connector`;
@@ -216,7 +218,7 @@ The `runtime/mod.rs` namespace owns the memory-only runtime-incarnation witness 
 - Every mechanically discovered declaration member and effect has exactly one target, deletion/split disposition, or named owner decision.
 - No item has two final owners.
 - Payload bypasses, ordinary forwarding, authority mutations, and unbounded queues are recorded.
-- No product code was deleted or changed.
+- This inventory refresh changed no product code.
 - The exact baseline and input fingerprints are recorded.
 
-The linked Arc 02 modules are now covered by this gate. Arc 02 remains limited to private-constructor capabilities, forbidden-conversion tests, compatibility wrappers, a retiring peer registry, bounded observation, and the aggregate attempt-reservation foundation. It must not change transport behavior or choose unmeasured resource limits.
+The linked Arc 02 foundation and Arc 03 WebRTC ownership, approval convergence, and owner-bound reliable-outbound implementation are covered by this gate. Arc 03 wraps the existing WebRTC work, moves remote-candidate and callback ownership into `WebRtcConnectorWorker`, adds exact local retirement and installation identities, carries exact peer ownership through handshake and activation, and uses admitted production construction. It does not choose process resource limits, bound the remaining observed and dependency-owned resources, or substitute this inventory for the supported-platform behavior matrix.

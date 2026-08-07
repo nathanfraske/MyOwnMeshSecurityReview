@@ -8,11 +8,14 @@
 //! # Quick tour
 //!
 //! ```no_run
-//! # async fn _ex() -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn _ex(connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy) -> Result<(), Box<dyn std::error::Error>> {
 //! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
 //!
-//! // Load (or create) the local identity + open the WebRTC stack.
-//! let mesh = Mesh::open(MeshConfig::default()).await?;
+//! // The process owner supplies the reviewed connector policy explicitly.
+//! let mesh = Mesh::open_connector_capable(
+//!     MeshConfig::default(),
+//!     connector_policy,
+//! ).await?;
 //! println!("device id: {}", mesh.identity().display_id());
 //!
 //! // Join a named network. Returns a per-network handle.
@@ -104,6 +107,8 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
+#[cfg(feature = "legacy-v1")]
+pub mod legacy_v1;
 pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
@@ -134,12 +139,40 @@ pub use network_state::{
     SIGN_DOMAIN_TAG_STATE,
 };
 pub use protocol::CapabilityAdvert;
+pub use resource::{
+    FiniteResourceProvider, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
+    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourcePressure,
+    ResourceProvider, ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
+    ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
+    RESOURCE_CLASS_COUNT,
+};
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
-pub use services::{
-    relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,
+pub use runtime::attempt::{
+    connector_resource_structural_claims, ConnectorCallbackMailboxCapacities,
+    ConnectorCallbackPolicy, ConnectorCallbackPolicyError, ConnectorCallbackServiceWeights,
+    ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
+    ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
+    ConnectorResourceStructuralClaims, EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport,
+    MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
+    WebRtcConnectorCapablePolicy,
 };
+pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
+#[cfg(feature = "transport-lab")]
+pub use transport::{
+    transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
+    transport_lab_remote_description_fixture_grant,
+};
+#[cfg(feature = "legacy-media")]
+#[allow(
+    deprecated,
+    reason = "these are the explicit deprecated legacy-media compatibility exports"
+)]
+pub use transport::{LegacyWebRtcMediaProfile, LegacyWebRtcMediaProfileError};
+pub use transport::{
+    PendingRemoteCandidatePolicy, WebRtcConnectorProfile, WebRtcConnectorProfileError,
+};
 
 /// Domain-separation tag prefixed to every signed handshake payload.
 /// A signature obtained for one protocol step cannot be replayed in

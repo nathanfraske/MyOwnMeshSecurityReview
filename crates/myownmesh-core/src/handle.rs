@@ -26,6 +26,9 @@ use crate::protocol::CapabilityAdvert;
 use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
+use crate::runtime::attempt::{
+    ConnectorResourceOwnerReport, MeshConnectorResourceReport, WebRtcConnectorCapablePolicy,
+};
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// How long [`JoinedNetwork::announce_leave`] waits after queuing the
@@ -60,26 +63,60 @@ struct NetworkEntry {
 }
 
 impl Mesh {
-    /// Build a fresh `Mesh`. Loads (or generates) the on-disk identity
-    /// anchor (`~/.myownmesh/.secrets/identity.json`) and constructs the
-    /// shared WebRTC API.
-    pub async fn open(config: MeshConfig) -> Result<MeshHandle> {
+    /// Build an identity and infrastructure-only `Mesh` without connector
+    /// authority.
+    ///
+    /// This form can host non-participating infrastructure services, but its
+    /// handle cannot join a network or allocate a native peer connector. A
+    /// network-capable owner must use [`Self::open_connector_capable`]
+    /// and provide the reviewed process policy explicitly.
+    pub async fn open_infrastructure_only(config: MeshConfig) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
-        Self::open_with_identity(config, identity).await
+        Self::open_infrastructure_only_with_identity(config, identity).await
     }
 
-    /// Build a fresh `Mesh` with a **caller-supplied identity**, for embedders
+    /// Build a `Mesh` whose native connector allocations are admitted by the
+    /// caller's process resource owner. Arc 03 supplies no fallback policy or
+    /// inferred capacity.
+    pub async fn open_connector_capable(
+        config: MeshConfig,
+        policy: WebRtcConnectorCapablePolicy,
+    ) -> Result<MeshHandle> {
+        let identity = Arc::new(crate::identity::load_or_create()?);
+        Self::open_connector_capable_with_identity(config, identity, policy).await
+    }
+
+    /// Build an infrastructure-only `Mesh` with a **caller-supplied identity**,
+    /// for embedders
     /// that manage their own key storage rather than the on-disk anchor — e.g.
     /// a mobile app holding its ed25519 seed in the iOS Keychain / Android
     /// Keystore, or any host that has already loaded a key. Pair with
     /// [`Identity::from_signing_key`](crate::identity::Identity::from_signing_key).
-    /// Otherwise identical to [`Mesh::open`]: same shared WebRTC stack, same
-    /// network join/leave surface.
-    pub async fn open_with_identity(
+    /// Otherwise identical to [`Mesh::open_infrastructure_only`]. It has no connector authority;
+    /// use [`Self::open_connector_capable_with_identity`] for
+    /// network participation.
+    pub async fn open_infrastructure_only_with_identity(
         _config: MeshConfig,
         identity: Arc<Identity>,
     ) -> Result<MeshHandle> {
         let transport = Transport::new()?;
+        Self::open_with_identity_and_transport(identity, transport)
+    }
+
+    /// Identity-injected form of [`Self::open_connector_capable`].
+    pub async fn open_connector_capable_with_identity(
+        _config: MeshConfig,
+        identity: Arc<Identity>,
+        policy: WebRtcConnectorCapablePolicy,
+    ) -> Result<MeshHandle> {
+        let transport = Transport::new()?.with_connector_resource_policy(policy)?;
+        Self::open_with_identity_and_transport(identity, transport)
+    }
+
+    fn open_with_identity_and_transport(
+        identity: Arc<Identity>,
+        transport: Transport,
+    ) -> Result<MeshHandle> {
         let resource_scope = ProcessResourceRoot::global().mesh_runtime_scope();
         let (events_tx, _) = broadcast::channel(256);
         let inner = Arc::new(MeshInner {
@@ -99,7 +136,8 @@ impl Mesh {
     }
 }
 
-/// Clonable handle to the mesh. Created by [`Mesh::open`].
+/// Clonable handle to the mesh. Created by one of the explicitly named
+/// [`Mesh`] constructors.
 #[derive(Clone)]
 pub struct MeshHandle {
     mesh: Mesh,
@@ -124,6 +162,17 @@ impl MeshHandle {
         self.mesh.inner.identity.public_id().to_string()
     }
 
+    /// Current connector resource-owner state. `None` means connector
+    /// allocation is disabled for this process instance.
+    pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
+        self.mesh.inner.transport.connector_resource_report()
+    }
+
+    /// Current connector accounting for this exact live Mesh runtime.
+    pub fn mesh_connector_resource_report(&self) -> Option<MeshConnectorResourceReport> {
+        self.mesh.inner.transport.mesh_connector_resource_report()
+    }
+
     /// Subscribe to mesh-wide events (every joined network's
     /// PeerEvent / PhaseEvent / Diag stream is fanned into this
     /// single broadcaster).
@@ -141,6 +190,15 @@ impl MeshHandle {
     /// until [`JoinedNetwork::leave`] is called (or the
     /// `JoinedNetwork` is dropped).
     pub async fn join(&self, mut config: NetworkConfig) -> Result<JoinedNetwork> {
+        if self
+            .mesh
+            .inner
+            .transport
+            .connector_resource_report()
+            .is_none()
+        {
+            return Err(Error::ConnectorPolicyRequired);
+        }
         // Normalize the network id so signaling derivation is
         // case-insensitive on the user input.
         config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
@@ -534,26 +592,50 @@ impl JoinedNetwork {
     /// auto-open (writing to a closed lane opens it transparently).
     /// The new m-line goes live on the next coalesced renegotiation;
     /// writes before that are no-ops, exactly like stream start.
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
+    )]
+    #[cfg(feature = "legacy-media")]
     pub async fn open_media_lane(
         &self,
         peer: &str,
-        kind: crate::transport::webrtc::LaneKind,
+        kind: crate::transport::LaneKind,
     ) -> Result<u8> {
         self.state.media_lane_open(peer, kind).await
     }
 
-    /// Close a media lane toward `peer`. The close is a *drain*: the
-    /// track stays negotiated for a short grace so an immediate reopen
-    /// (a settings change's stop→start) is free, and the engine reaps
-    /// the m-line only once the grace lapses. Idempotent — a lane that
-    /// isn't open is a no-op, so teardown can't double-fault.
+    /// Suspend a media lane toward `peer`. The track remains negotiated until
+    /// an explicit resume or finalize event. No elapsed time changes its
+    /// ownership. Suspending a lane that is not open is a no-op.
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
+    )]
+    #[cfg(feature = "legacy-media")]
     pub async fn close_media_lane(
         &self,
         peer: &str,
-        kind: crate::transport::webrtc::LaneKind,
+        kind: crate::transport::LaneKind,
         lane: u8,
     ) -> Result<()> {
         self.state.media_lane_close(peer, kind, lane).await
+    }
+
+    /// Finalize all explicitly suspended transient lanes for one peer and
+    /// schedule the resulting lane-set renegotiation. No elapsed time can
+    /// trigger this transition.
+    #[cfg(feature = "legacy-media")]
+    #[allow(
+        deprecated,
+        reason = "this exact method is the temporary legacy media finalization boundary"
+    )]
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
+    )]
+    pub async fn finalize_suspended_media_lanes(&self, peer: &str) -> Result<usize> {
+        self.state.media_lanes_finalize(peer).await
     }
 
     /// Point-in-time traffic accounting for this network: frames and
@@ -664,9 +746,10 @@ pub struct PeerInfo {
     /// back: this device's suffix + code, the peer's suffix + code.
     /// `None` until our handshake has fired.
     pub verification_code_sent: Option<String>,
-    /// True once we've sent an `Approve` to this peer — either via
-    /// the user clicking Approve in the GUI, or via auto-approve
-    /// because the peer is already in the roster. Surfaced so the
+    /// True once this peer's exact current data channel has accepted our
+    /// `Approve` bytes for transmission, either via the user clicking Approve
+    /// in the GUI or via roster auto-approval. This does not prove remote
+    /// receipt. Surfaced so the
     /// approval UI can flip the row from "review and approve" to
     /// "waiting for peer to approve their side" — the connection
     /// doesn't transition to Active until both ends have approved.
@@ -717,11 +800,29 @@ mod tests {
         let identity = Arc::new(Identity::ephemeral());
         let want = identity.public_id().to_string();
 
-        let mesh = Mesh::open_with_identity(MeshConfig::default(), identity)
+        let mesh = Mesh::open_infrastructure_only_with_identity(MeshConfig::default(), identity)
             .await
             .expect("open_with_identity");
 
         // The mesh's wire id derives from the injected key, not a disk anchor.
         assert_eq!(mesh.device_id(), want);
+    }
+
+    #[tokio::test]
+    async fn ownerless_mesh_rejects_network_join_with_typed_policy_error() {
+        let identity = Arc::new(Identity::ephemeral());
+        let mesh = Mesh::open_infrastructure_only_with_identity(MeshConfig::default(), identity)
+            .await
+            .expect("open infrastructure-only mesh");
+
+        let error = match mesh
+            .join(NetworkConfig::from_network_id("ownerless", "ownerless"))
+            .await
+        {
+            Ok(_) => panic!("ownerless mesh must not join a network"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::ConnectorPolicyRequired));
+        assert!(mesh.joined_network_ids().is_empty());
     }
 }
