@@ -155,6 +155,15 @@ jobs:
         with:
           key: arc04-endpoint-auth
 
+      - name: Prefetch locked dependencies for the offline boundary harness
+        # The boundary harness builds its probes with `--offline`, so every
+        # crate it needs must already be in the local registry. `--locked`
+        # keeps that population faithful to Cargo.lock: it fails rather than
+        # resolving a different graph, so the harness cannot silently probe
+        # against dependencies the lockfile does not pin. This step only
+        # populates the cache; it does not relax the harness's offline mode.
+        run: cargo fetch --locked
+
       - name: Arc 04 compiler boundary controls
         run: python3 scripts/check-v4-arc04-compiler-boundaries.py
 

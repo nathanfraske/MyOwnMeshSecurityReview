@@ -235,6 +235,22 @@ impl AuthenticatedChannelCapability {
     }
 }
 
+/// Length-prefixed digest input, so two different field tuples cannot produce
+/// the same digest.
+fn digest_of(fields: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update(field.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(field);
+    }
+    data_encoding::BASE32_NOPAD
+        .encode(&hasher.finalize())
+        .to_lowercase()
+}
+
 /// One genuine capability over a fixture channel.
 ///
 /// Test-only. It builds a real record from a real context and a real handoff,
@@ -396,20 +412,4 @@ mod tests {
             "non-vacuity: the two endpoints of one attempt hold different roles, so the role comparison in `issued` can fail"
         );
     }
-}
-
-/// Length-prefixed digest input, so two different field tuples cannot produce
-/// the same digest.
-fn digest_of(fields: &[&[u8]]) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    for field in fields {
-        hasher.update(field.len().to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(field);
-    }
-    data_encoding::BASE32_NOPAD
-        .encode(&hasher.finalize())
-        .to_lowercase()
 }
