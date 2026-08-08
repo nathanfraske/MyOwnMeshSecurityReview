@@ -313,9 +313,9 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         } => connect_peer(state, &device_id, sticky, reply).await,
         #[cfg(feature = "legacy-media")]
         NetworkCmd::MediaLaneOpen { peer, kind, reply } => {
-            let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
+            let flow = admitted_realtime_operation(state, &peer);
             let result = match flow {
-                Some((worker, capability)) => worker.open_media_lane(&capability, kind).await,
+                Some(flow) => flow.open_media_lane(kind).await,
                 None => Err(Error::Network(format!(
                     "peer real-time flow not admitted: {peer}"
                 ))),
@@ -329,11 +329,9 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             lane,
             reply,
         } => {
-            let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
+            let flow = admitted_realtime_operation(state, &peer);
             let result = match flow {
-                Some((worker, capability)) => {
-                    worker.close_media_lane(&capability, kind, lane).await
-                }
+                Some(flow) => flow.close_media_lane(kind, lane).await,
                 None => Ok(()), // no session, nothing open — close is idempotent
             };
             let _ = reply.send(result);
@@ -974,33 +972,35 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         .then(|| peer.device_id.clone())
     });
     for device_id in candidates {
-        let Some(entry) = state.peers.get(&device_id) else {
+        // Through the fence: renegotiation is legacy real-time work, so it needs
+        // the same admitted witness as every other real-time operation. There is
+        // deliberately no separate `peers.get(&device_id)` here. Reading the
+        // pending flag through one lookup and claiming it through another let
+        // the read, the claim, and the connector belong to different
+        // installations if a replacement landed between them; all three now come
+        // from the peer this witness captured.
+        let Some(realtime) = admitted_realtime_operation(state, &device_id) else {
             continue;
-        };
-        let Some((session, _realtime_flow)) = entry.realtime_flow_ports() else {
-            continue;
-        };
-        let pending = {
-            let d = entry.state.read();
-            d.media_reneg_pending
         };
         // Explicit finalization is the only operation that creates a pending
         // removal. Elapsed time never does so.
-        if !pending {
+        if !realtime.media_reneg_pending() {
             continue;
         }
-        {
-            let mut d = entry.state.write();
-            d.media_reneg_inflight = true;
-            d.media_reneg_pending = false;
-        }
-        let Some(owner) = state.peers.owner(&device_id) else {
+        // Consuming the witness is what claims the renegotiation: it revalidates
+        // the captured connector/capability pair first, so a superseded
+        // connector yields no session and nothing is claimed. Fail closed.
+        // The claim yields one move-only operation carrying the connector *and*
+        // the owner captured under the same fence. There is deliberately no
+        // `peers.owner(&device_id)` here, and the completion call below takes
+        // no owner argument, so a fresh one cannot be substituted without
+        // abandoning the API entirely.
+        let Some(renegotiation) = realtime.into_renegotiation() else {
             continue;
         };
-        drop(entry);
         let state = state.clone();
         tokio::spawn(async move {
-            let outcome = if session.signaling_state()
+            let outcome = if renegotiation.session().signaling_state()
                 != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
             {
                 // Mid-negotiation (glare, or our own earlier offer still
@@ -1010,17 +1010,23 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
             } else {
                 // Explicit finalization already changed the lane set. One
                 // offer now carries the complete pending delta.
-                match session.create_offer().await {
+                match renegotiation.session().create_offer().await {
                     Ok(desc) => {
-                        if state.peers.get_if_current(&owner).is_none() {
+                        if !renegotiation.is_current(&state.peers) {
+                            // Dropping the operation here is safe precisely
+                            // because this installation is already gone:
+                            // `complete` would find nothing current and write
+                            // nothing, and the replacement carries its own
+                            // in-flight guard.
                             return;
                         }
+                        let device_id = renegotiation.device_id();
                         state.log_diag_with(
                             crate::events::DiagLevel::Debug,
                             "media",
                             format!(
                                 "media renegotiation offer to {} (lane set changed)",
-                                short_peer(&device_id)
+                                short_peer(device_id)
                             ),
                             serde_json::json!({
                                 "peer": device_id,
@@ -1028,7 +1034,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                             }),
                         );
                         let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                            device_id: device_id.clone(),
+                            device_id: device_id.to_string(),
                             sdp: desc.sdp,
                         });
                         Ok(())
@@ -1036,22 +1042,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                     Err(e) => Err(e.to_string()),
                 }
             };
-            if let Some(peer) = state.peers.get_if_current(&owner) {
-                let mut d = peer.state.write();
-                d.media_reneg_inflight = false;
-                match outcome {
-                    Ok(()) => {
-                        d.last_offer_sent_at = Some(Instant::now());
-                    }
-                    Err(e) => {
-                        // Leave the work owed: the flag re-arms the next
-                        // tick's attempt instead of losing the lane change.
-                        d.media_reneg_pending = true;
-                        drop(d);
-                        debug!(peer = %device_id, "media renegotiation deferred: {e}");
-                    }
-                }
-            }
+            renegotiation.complete(&state.peers, outcome);
         });
     }
 }
@@ -1865,6 +1856,22 @@ async fn handle_transport_event(
             if state.peers.get_if_current(&owner).is_none() {
                 return false;
             }
+            // The connector states what it can prove about this channel while
+            // its retirement-aware operation is still live, and before the
+            // handoff moves. Fail closed: without both components there is no
+            // binding, and an unbound endpoint-authentication attempt would
+            // prove nothing about the channel it ran over.
+            let Some(binding) = worker.endpoint_auth_binding().await else {
+                warn!(peer = %device_id, "no connector channel binding at DataChannelOpen — retiring rather than authenticating unbound");
+                worker.retire();
+                return false;
+            };
+            // The await above can lose the registry race, so the current owner
+            // is rechecked before anything is confirmed or installed.
+            if state.peers.get_if_current(&owner).is_none() {
+                worker.retire();
+                return false;
+            }
             let connected = match worker.confirm_data_channel_open() {
                 DataChannelOpenOwnership::Rejected => {
                     trace!(peer = %device_id, "ignoring DataChannelOpen without a live connector owner");
@@ -1876,7 +1883,38 @@ async fn handle_transport_event(
                 }
                 DataChannelOpenOwnership::Connected(connected) => connected,
             };
-            let auth_task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(connected));
+            // The whole handoff moves into its transport-independent form, so
+            // the close owner and the retained connected claim travel with it.
+            let Some(handoff) = connected.into_generic() else {
+                warn!(peer = %device_id, "connected handoff carried no capability — retiring");
+                worker.retire();
+                return false;
+            };
+            // Every fact this task will ever authenticate under is fixed here,
+            // once: the mesh, this endpoint's Device ID, the exact remote
+            // Device ID already in scope, and the connector's binding. The
+            // profile is derived from that binding inside endpoint
+            // authentication; the engine selects no profile semantics.
+            let remote_device_id = crate::signing::pubkey_part(&device_id).to_string();
+            let Ok(context) = crate::endpoint_auth::EndpointAuthContext::new(
+                &state.network_id,
+                state.identity.public_id(),
+                &remote_device_id,
+                binding,
+            ) else {
+                warn!(peer = %device_id, "endpoint-auth context refused its own identifiers — retiring");
+                worker.retire();
+                return false;
+            };
+            // The signing key moves into the task. From here the engine
+            // translates wire values and never signs.
+            let auth_task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+                context,
+                handoff,
+                crate::endpoint_auth::LocalIdentitySigner::from_signing_key(
+                    state.identity.signing_key().clone(),
+                ),
+            ));
             // The reliable "transport is up" milestone — record it so the
             // connect-timeout watchdog knows this session made it, and stops
             // counting it as a connecting peer that might need rebuilding.
@@ -1936,24 +1974,73 @@ async fn handle_transport_event(
         TransportEvent::Message(bytes) => {
             handle_inbound_frame_from(state, &owner, bytes).await;
         }
-        TransportEvent::VideoSample(sample) => {
-            // No per-sample admission check on this hot path: an unadmitted peer
-            // can't establish a media route to begin with — its `RouteControl`
-            // rides the data channel, which `handle_inbound_frame` drops
-            // pre-admission — and the embedder matches an inbound sample to an
-            // authorized route. Admission is enforced at the route layer (the
-            // outer layer), not per frame here.
-            state.peers.with_current(&owner, |_| {
-                state.dispatch_video(&device_id, sample);
-            });
-        }
-        TransportEvent::AudioSample(sample) => {
-            state.peers.with_current(&owner, |_| {
-                state.dispatch_audio(&device_id, sample);
-            });
-        }
+        // Both real-time arms delegate, and do nothing else. See
+        // `dispatch_admitted_video` for why the gate lives in a function of its
+        // own rather than inline here.
+        TransportEvent::VideoSample(sample) => dispatch_admitted_video(state, &owner, sample),
+        TransportEvent::AudioSample(sample) => dispatch_admitted_audio(state, &owner, sample),
     }
     false
+}
+
+/// Deliver one inbound video access unit, or refuse it, at the promotion fence.
+///
+/// Inbound real-time units are application delivery and are gated here, at the
+/// engine boundary, on the same witness as every other legacy application
+/// operation. The previous reasoning — that an unadmitted peer cannot establish
+/// a media route, so the embedder's route matching suffices — is not an
+/// authority boundary: a native track can produce units independently of
+/// whether route metadata was ever accepted, so the basal core must not hand
+/// units to subscribers before promotion.
+///
+/// A pre-authentication unit is dropped. It is already bounded by the
+/// connector's own quarantine, and retaining it here would create a second
+/// owner for data that may never become deliverable.
+///
+/// This is a function rather than an inline arm so the shipped gate is directly
+/// callable. `handle_transport_event` additionally requires a live connector
+/// worker on the exact current peer before it reaches any arm, which this gate
+/// does not — so a control forced in through the event path would be exercising
+/// connector wiring, and could pass while the admission conjunction itself was
+/// wrong. Taking the owner token rather than a device id keeps the exact-current
+/// check where the event path has it.
+fn dispatch_admitted_video(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    sample: crate::transport::webrtc::VideoSample,
+) {
+    state.peers.with_admitted_current_or_refused(
+        owner,
+        |admitted| state.dispatch_video(admitted.device_id(), sample),
+        record_refused_media_unit,
+    );
+}
+
+/// The audio twin of [`dispatch_admitted_video`], with the same fence, the same
+/// exact-owner dispatch, and the same refusal record.
+fn dispatch_admitted_audio(
+    state: &Arc<NetworkState>,
+    owner: &state::PeerOwnerToken,
+    sample: crate::transport::webrtc::AudioSample,
+) {
+    state.peers.with_admitted_current_or_refused(
+        owner,
+        |admitted| state.dispatch_audio(admitted.device_id(), sample),
+        record_refused_media_unit,
+    );
+}
+
+/// Count one inbound real-time unit refused at the media gate.
+///
+/// Deliberately the same `admission_rejected` evidence the inbound frame gate
+/// uses, not a second counter: a unit dropped here is dropped for exactly the
+/// reason a frame is, and no new semantics are introduced. It exists because a
+/// silent drop is indistinguishable from a unit that never arrived, so a
+/// negative media control could pass without the stimulus ever reaching this
+/// boundary.
+fn record_refused_media_unit(peer: &Arc<PeerConnection>) {
+    let mut data = peer.state.write();
+    data.admission_rejected = data.admission_rejected.saturating_add(1);
 }
 
 async fn handle_ice_state_change(
@@ -2442,31 +2529,14 @@ async fn handle_inbound_frame_from(
     // never-admitted peer must get *zero* application processing, so there is
     // no grace window a periodic revalidation could open.
     let application = matches!(message_admission(&msg), Admission::Application);
-    let Some(peer) = state.peers.get_if_current(owner) else {
-        return;
-    };
-    // Evaluated before the write guard: the predicate reads peer state, and
-    // re-entering the lock under a writer would deadlock.
-    let application_admitted = peer.is_application_admitted();
-    {
+    // The liveness commit for an inbound frame. Protocol frames take the plain
+    // owner fence, because they are what *establishes* admission and must not
+    // require it. An application frame takes the admission fence instead, so the
+    // decision to accept it and the state it moves happen at one linearization
+    // point under the registry mutation lock, rather than reading a boolean and
+    // acting on it afterwards.
+    let commit = |peer: &Arc<PeerConnection>| {
         let mut data = peer.state.write();
-        if application && !application_admitted {
-            data.admission_rejected = data.admission_rejected.saturating_add(1);
-            let count = data.admission_rejected;
-            drop(data);
-            // Power-of-two throttle so a pre-admission flood can't be turned
-            // into a log-amplification primitive; the running total stays
-            // visible for diagnostics.
-            if count.is_power_of_two() {
-                warn!(
-                    peer = %device_id,
-                    class = ?traffic::class_of(&msg),
-                    count,
-                    "dropping pre-admission frame from a peer that has not finished authenticating and approving"
-                );
-            }
-            return;
-        }
         data.last_recv_at = Some(Instant::now());
         data.diag.bytes_in += bytes.len() as u64;
         data.diag.frames_in += 1;
@@ -2485,6 +2555,43 @@ async fn handle_inbound_frame_from(
             data.tier = ConnectionTier::Steady;
             data.ice_disconnected_since = None;
         }
+    };
+    let accepted = if application {
+        state.peers.with_admitted_current_or_refused(
+            owner,
+            |admitted| {
+                admitted.record_inbound(commit);
+                true
+            },
+            |peer| {
+                // Counted under the same acquisition that refused it, so the
+                // count cannot be attributed to a replacement that landed
+                // between the refusal and the bookkeeping.
+                let mut data = peer.state.write();
+                data.admission_rejected = data.admission_rejected.saturating_add(1);
+                let count = data.admission_rejected;
+                drop(data);
+                // Power-of-two throttle so a pre-admission flood can't be turned
+                // into a log-amplification primitive; the running total stays
+                // visible for diagnostics.
+                if count.is_power_of_two() {
+                    warn!(
+                        peer = %device_id,
+                        count,
+                        "dropping pre-admission frame from a peer that has not finished authenticating and approving"
+                    );
+                }
+                false
+            },
+        )
+    } else {
+        state.peers.with_current(owner, |peer| {
+            commit(peer);
+            true
+        })
+    };
+    if accepted != Some(true) {
+        return;
     }
     state
         .traffic
@@ -2762,81 +2869,91 @@ async fn on_channel_frame(
 /// error if the peer is unknown or the data channel isn't open
 /// yet. Engine paths use this directly; user-facing channels call
 /// the [`NetworkState::send_channel_frame`] wrapper.
+/// Resolve one admitted real-time operation for `device_id`.
+///
+/// One owner resolution, then the admission fence. The wrapper it returns keeps
+/// the connector worker and the flow capability paired for the await that
+/// follows, so neither can be re-paired with another peer's half.
+fn admitted_realtime_operation(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+) -> Option<state::AdmittedRealtimeOperation> {
+    let owner = state.peers.owner(device_id)?;
+    state
+        .peers
+        .with_admitted_current(&owner, |admitted| admitted.realtime_operation())
+        .flatten()
+}
+
+/// Resolve the exact current owner once, then send through it.
+///
+/// The device id is used for exactly one lookup and never again: everything
+/// after this point is keyed to the installation that lookup found. The old
+/// shape looked the peer up a second time *after* the await to record the
+/// send, which attributed those bytes to whatever entry was current by then —
+/// a replacement included.
 pub(crate) async fn send_to_peer(
     state: &Arc<NetworkState>,
     device_id: &str,
     msg: &MeshMessage,
 ) -> Result<()> {
-    let session = {
-        let Some(peer) = state.peers.get(device_id) else {
-            return Err(Error::Network(format!("peer not found: {device_id}")));
-        };
-        if matches!(message_admission(msg), Admission::Application)
-            && !peer.is_application_admitted()
-        {
-            return Err(Error::Network(format!(
-                "peer is not admitted for application traffic: {device_id}"
-            )));
-        }
-        let session = peer.session.lock().clone();
-        session
+    let Some(owner) = state.peers.owner(device_id) else {
+        return Err(Error::Network(format!("peer not found: {device_id}")));
     };
-    let session = session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
-    let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
-    // Bounded: this send runs inline on the driver task (reachable via the
-    // heartbeat ping and the state-watch tick's shelve-unshelve), so a
-    // data-channel write that parks on a slow core mid-gather would wedge the
-    // whole driver. Best-effort by contract, so a timed-out control frame is
-    // just dropped and re-sent next cycle (see `scheduler::PEER_SEND_TIMEOUT_MS`;
-    // the reliable channels take `send_channel_frame`, not this path).
-    let class = traffic::class_of(msg);
-    let n = tokio::time::timeout(
-        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
-        session.send_owned(Bytes::from(serialized)),
-    )
-    .await
-    .map_err(|_| Error::Transport("peer send timed out".into()))??;
-    state.traffic.record_tx(class, n);
-    if let Some(peer) = state.peers.get(device_id) {
-        let mut data = peer.state.write();
-        data.diag.bytes_out += n as u64;
-        data.diag.frames_out += 1;
-    }
-    Ok(())
+    send_to_peer_owner(state, &owner, msg).await
 }
 
+/// The one outbound send.
+///
+/// An application frame is authorized by an owned witness minted under the
+/// registry fence, and both the write and its accounting go through the exact
+/// worker and peer that witness captured. Bounded: this runs inline on the
+/// driver task (reachable via the heartbeat ping and the state-watch tick's
+/// shelve-unshelve), so a data-channel write that parks on a slow core mid-gather
+/// would wedge the whole driver. Best-effort by contract, so a timed-out control
+/// frame is just dropped and re-sent next cycle.
 pub(crate) async fn send_to_peer_owner(
     state: &Arc<NetworkState>,
     owner: &state::PeerOwnerToken,
     msg: &MeshMessage,
 ) -> Result<()> {
-    let peer = state
-        .peers
-        .get_if_current(owner)
-        .ok_or_else(|| Error::Network(format!("peer owner is stale: {}", owner.device_id())))?;
-    if matches!(message_admission(msg), Admission::Application) && !peer.is_application_admitted() {
-        return Err(Error::Network(format!(
-            "peer owner is not admitted for application traffic: {}",
-            owner.device_id()
-        )));
-    }
-    let session = peer
-        .session
-        .lock()
-        .clone()
-        .ok_or_else(|| Error::Transport("session not yet established".into()))?;
     let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
     let class = traffic::class_of(msg);
-    let n = tokio::time::timeout(
-        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
-        session.send_owned(Bytes::from(serialized)),
-    )
-    .await
-    .map_err(|_| Error::Transport("peer send timed out".into()))??;
-    state.traffic.record_tx(class, n);
-    let mut data = peer.state.write();
-    data.diag.bytes_out += n as u64;
-    data.diag.frames_out += 1;
+    let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+    let sent = if matches!(message_admission(msg), Admission::Application) {
+        state
+            .peers
+            .admit_application_operation(owner)
+            .ok_or_else(|| {
+                Error::Network(format!(
+                    "peer owner is not admitted for application traffic: {}",
+                    owner.device_id()
+                ))
+            })?
+            .send_frame(Bytes::from(serialized), timeout)
+            .await?
+    } else {
+        // Protocol admission traffic — Hello, AuthResponse, Approve, Deny — is
+        // deliberately ungated: it is what establishes the capability the gate
+        // above requires. It still sends only through the exact current owner.
+        let peer = state
+            .peers
+            .get_if_current(owner)
+            .ok_or_else(|| Error::Network(format!("peer owner is stale: {}", owner.device_id())))?;
+        let session = peer
+            .session
+            .lock()
+            .clone()
+            .ok_or_else(|| Error::Transport("session not yet established".into()))?;
+        let sent = tokio::time::timeout(timeout, session.send_owned(Bytes::from(serialized)))
+            .await
+            .map_err(|_| Error::Transport("peer send timed out".into()))??;
+        let mut data = peer.state.write();
+        data.diag.bytes_out += sent as u64;
+        data.diag.frames_out += 1;
+        sent
+    };
+    state.traffic.record_tx(class, sent);
     Ok(())
 }
 
@@ -2846,15 +2963,10 @@ async fn send_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let admitted = state
-        .peers
-        .get(peer)
-        .is_some_and(|connection| connection.is_application_admitted());
-    if !admitted {
-        return Err(Error::Network(format!(
-            "peer is not admitted for application traffic: {peer}"
-        )));
-    }
+    // No pre-check. A channel frame is application class, so `send_to_peer`
+    // already refuses it unless the fence mints a witness — and a pre-check
+    // here would be a second, earlier read whose answer could have changed by
+    // the time the send ran.
     send_to_peer(
         state,
         peer,
@@ -3283,6 +3395,18 @@ pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
 fn build_test_state_parts(
     network_id_suffix: &str,
 ) -> (Arc<NetworkState>, mpsc::UnboundedReceiver<NetworkCmd>) {
+    build_test_state_parts_with(network_id_suffix, None)
+}
+
+/// The one fixture body. `profile_override` is `None` for every existing
+/// caller, which keeps the exact data-only behaviour they were built against;
+/// only the 04B-3 renegotiation control supplies a legacy-media profile, and it
+/// does so through the same grant chain rather than a duplicate of it.
+#[cfg(test)]
+fn build_test_state_parts_with(
+    network_id_suffix: &str,
+    profile_override: Option<crate::WebRtcConnectorProfile>,
+) -> (Arc<NetworkState>, mpsc::UnboundedReceiver<NetworkCmd>) {
     use std::sync::OnceLock;
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     let _ = HOME.get_or_init(|| {
@@ -3310,22 +3434,24 @@ fn build_test_state_parts(
         .expect("engine fixture has two simultaneous connector slots");
     let callback_capacity =
         std::num::NonZeroUsize::new(16).expect("engine fixture callback capacity is nonzero");
-    let callbacks = crate::runtime::attempt::ConnectorCallbackPolicy::new(
-        crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-            callback_capacity,
-            callback_capacity,
-        ),
-        crate::runtime::attempt::ConnectorCallbackServiceWeights::data_only(
-            callback_capacity,
-            callback_capacity,
-        ),
-        crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
-    )
-    .expect("engine fixture data-only callback policy is valid");
-    let webrtc_profile = crate::WebRtcConnectorProfile::new(
-        callbacks,
-        crate::PendingRemoteCandidatePolicy::elastic(),
-    );
+    let webrtc_profile = profile_override.unwrap_or_else(|| {
+        let callbacks = crate::runtime::attempt::ConnectorCallbackPolicy::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
+                callback_capacity,
+                callback_capacity,
+            ),
+            crate::runtime::attempt::ConnectorCallbackServiceWeights::data_only(
+                callback_capacity,
+                callback_capacity,
+            ),
+            crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
+        )
+        .expect("engine fixture data-only callback policy is valid");
+        crate::WebRtcConnectorProfile::new(
+            callbacks,
+            crate::PendingRemoteCandidatePolicy::elastic(),
+        )
+    });
     let profiles = vec![webrtc_profile; max_connectors.get()];
     let connectors = std::num::NonZeroU64::new(max_connectors.get() as u64)
         .expect("engine fixture connector count is nonzero");
@@ -3391,6 +3517,81 @@ fn build_test_state_parts(
     (state, cmd_rx)
 }
 
+/// Test state whose connectors carry a legacy-media profile.
+///
+/// Needed only where a control must reach `realtime_enabled()`, which is
+/// `legacy_media_profile.is_some() && realtime_flows.is_enabled()` — both, so a
+/// data-only profile can never mint a real-time witness however the peer is
+/// admitted.
+///
+/// Pre-provisioned lanes are deliberately 0/0: the control needs flow authority
+/// and `realtime_enabled`, not audio or video m-lines. Media tracks are created
+/// only in `for lane in 0..preprovisioned`, so nothing is added to the SDP and
+/// the existing one-media-section / one-active-binding remote-description grant
+/// stays correct. The connector grant itself auto-derives from the profile.
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) fn build_test_state_with_legacy_media(network_id_suffix: &str) -> Arc<NetworkState> {
+    use crate::runtime::attempt::{
+        ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
+        ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets,
+        ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
+        ConnectorRealtimeInboundLimits, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
+    };
+    let nonzero = |value: usize, name: &str| {
+        std::num::NonZeroUsize::new(value)
+            .unwrap_or_else(|| panic!("engine legacy-media fixture {name} is nonzero"))
+    };
+    let capacity = nonzero(16, "callback capacity");
+    let flows = ConnectorRealtimeFlowPolicy::new(
+        // Two flow domains, video and audio.
+        ConnectorRealtimeFlowCapacities::new(
+            nonzero(2, "inbound flows"),
+            nonzero(2, "outbound flows"),
+            capacity,
+        ),
+        ConnectorRealtimeInboundLimits::new(
+            nonzero(8, "fragment limit"),
+            nonzero(16, "per-unit fragment count"),
+            nonzero(1, "per-flow in-progress units"),
+            nonzero(1, "pre-auth packet limit"),
+            nonzero(16, "pre-auth content bytes"),
+        ),
+        ConnectorRealtimeByteBudgets::new(
+            nonzero(16, "inbound bytes"),
+            nonzero(16, "outbound bytes"),
+        ),
+        RealtimeQueueOverflowRule::DropNewest,
+    );
+    let realtime =
+        RealtimeConnectorPolicy::enabled_with_local_ceiling(nonzero(8, "unit limit"), flows)
+            .expect("engine legacy-media fixture real-time policy is structurally valid");
+    let callbacks = ConnectorCallbackPolicy::new(
+        ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+        ConnectorCallbackServiceWeights::new(
+            nonzero(1, "control weight"),
+            nonzero(1, "endpoint-data weight"),
+            nonzero(1, "real-time weight"),
+        ),
+        realtime,
+    )
+    .expect("engine legacy-media fixture callback policy is valid");
+    let profile = crate::WebRtcConnectorProfile::new(
+        callbacks,
+        crate::PendingRemoteCandidatePolicy::elastic(),
+    )
+    .with_legacy_webrtc_media(
+        crate::transport::webrtc::LegacyWebRtcMediaProfile::h264_opus(
+            nonzero(1, "lane ceiling"),
+            0,
+            0,
+        )
+        .expect("engine legacy-media fixture provider is structurally valid"),
+    )
+    .expect("engine legacy-media fixture real-time policy admits the legacy provider");
+    let (state, _cmd_rx) = build_test_state_parts_with(network_id_suffix, Some(profile));
+    state
+}
+
 /// Build test state with the same serialized command consumer that owns
 /// delayed exact-peer mutations in the production driver.
 #[cfg(test)]
@@ -3423,7 +3624,11 @@ pub(crate) fn insert_session_less_peer(
     install_peer(&state.peers, peer);
 }
 
-#[cfg(all(test, feature = "legacy-v1"))]
+// Both admitted-peer helpers serve the LegacyV1 routing control, which now
+// takes its native link fixture from `endpoint_auth::native_link`. They
+// therefore need both features, so a `legacy-v1`-only build does not carry an
+// unreachable helper.
+#[cfg(all(test, feature = "legacy-v1", feature = "transport-lab"))]
 pub(crate) fn insert_admitted_legacy_test_peer(
     state: &Arc<NetworkState>,
     device_id: &str,
@@ -3442,10 +3647,12 @@ pub(crate) fn insert_admitted_legacy_test_peer(
 /// approved by legacy policy but holding **no** authenticated channel.
 ///
 /// This is the pre-promotion state, and it is deliberately separate from
-/// [`insert_admitted_legacy_test_peer`]. Controls that must observe a
-/// promotion succeed or fail have to start without a capability, or a
-/// pre-installed one would mask the very outcome under test.
-#[cfg(all(test, feature = "legacy-v1"))]
+/// `insert_admitted_legacy_test_peer` — named in plain code rather than as an
+/// intra-doc link, because that helper additionally needs `legacy-v1` while
+/// this one is reachable from a `transport-lab`-only build. Controls that must
+/// observe a promotion succeed or fail have to start without a capability, or
+/// a pre-installed one would mask the very outcome under test.
+#[cfg(all(test, feature = "transport-lab"))]
 pub(crate) fn insert_legacy_test_peer_pending_auth(
     state: &Arc<NetworkState>,
     device_id: &str,
@@ -3466,11 +3673,17 @@ pub(crate) fn insert_legacy_test_peer_pending_auth(
 
 /// Test-only: the exact current owner token for an installed peer.
 ///
-/// These three helpers exist so the native endpoint-auth controls in
-/// `legacy_v1` can bind exact-current peer state without the registry field
-/// being widened out of `engine`. Each one resolves through the owner token,
-/// so a control cannot accidentally observe a superseded registry entry.
-#[cfg(all(test, feature = "legacy-v1"))]
+/// These helpers exist so the basal native endpoint-auth controls in
+/// `endpoint_auth::native_link` can bind exact-current peer state without the
+/// registry field being widened out of `engine`. Each one resolves through the
+/// owner token, so a control cannot accidentally observe a superseded registry
+/// entry.
+///
+/// There is deliberately no contribution seeder beside them. Both endpoint
+/// contributions belong to the Endpoint Auth Task, which draws its own and
+/// binds exactly one peer value, so a control drives `accept_peer_hello` rather
+/// than writing a pair into peer state that the task would not agree with.
+#[cfg(all(test, feature = "transport-lab"))]
 pub(crate) fn legacy_test_owner(
     state: &Arc<NetworkState>,
     device_id: &str,
@@ -3478,26 +3691,9 @@ pub(crate) fn legacy_test_owner(
     state.peers.owner(device_id)
 }
 
-/// Test-only: seed a completed contribution exchange on the exact current
-/// peer, returning the encoded local contribution a transcript must use.
-#[cfg(all(test, feature = "legacy-v1"))]
-pub(crate) fn legacy_test_seed_contributions(
-    state: &Arc<NetworkState>,
-    owner: &state::PeerOwnerToken,
-    local: crate::endpoint_auth::LocalContribution,
-    remote: crate::endpoint_auth::PeerContribution,
-) -> Option<String> {
-    let peer = state.peers.get_if_current(owner)?;
-    let encoded = local.as_str().to_owned();
-    let mut data = peer.state.write();
-    data.nonce_sent = Some(local);
-    data.nonce_received = Some(remote);
-    Some(encoded)
-}
-
 /// Test-only: whether the exact current peer holds a live authenticated
 /// channel. A retired or superseded entry answers `false`.
-#[cfg(all(test, feature = "legacy-v1"))]
+#[cfg(all(test, feature = "transport-lab"))]
 pub(crate) fn legacy_test_has_authenticated_channel(
     state: &Arc<NetworkState>,
     owner: &state::PeerOwnerToken,
@@ -3508,7 +3704,7 @@ pub(crate) fn legacy_test_has_authenticated_channel(
         .is_some_and(|peer| peer.has_authenticated_channel())
 }
 
-#[cfg(all(test, feature = "legacy-v1"))]
+#[cfg(all(test, feature = "legacy-v1", feature = "transport-lab"))]
 pub(crate) fn spawn_admitted_legacy_test_pump(
     state: Arc<NetworkState>,
     device_id: String,
@@ -3943,9 +4139,25 @@ mod tests {
         };
         assert!(!pending.is_admitted());
 
+        // Asserted through the fence, which is where the real-time gate now
+        // lives. Reading `realtime_flow_ports` directly would answer `None`
+        // merely because this fixture has no connector, and would stop saying
+        // anything about admission.
         let peer = PeerConnection::new("relay-negative".to_string(), None);
         *peer.state.write() = pending;
-        assert!(peer.realtime_flow_ports().is_none());
+        let state = build_test_state("arc03-relay-negative");
+        install_peer(&state.peers, Arc::new(peer));
+        let owner = state
+            .peers
+            .owner("relay-negative")
+            .expect("relay-negative peer is installed");
+        assert!(
+            state
+                .peers
+                .with_admitted_current(&owner, |admitted| admitted.realtime_operation())
+                .is_none(),
+            "a relay-selected but unadmitted peer yields no real-time operation"
+        );
     }
 
     #[tokio::test]
@@ -3953,6 +4165,21 @@ mod tests {
         let state = build_test_state("arc03-outbound-admission");
         insert_session_less_peer(&state, "pending-peer", None);
         set_admission(&state, "pending-peer", true, PeerStatus::PendingApproval);
+        {
+            // Transport readiness is made explicit, so the refusal below cannot
+            // be explained by a link that was never up: the data channel is
+            // open and the peer advertises the acked contract, which is
+            // everything `reliable::link_ready` asks for.
+            let peer = state.peers.get("pending-peer").expect("peer present");
+            let mut data = peer.state.write();
+            data.data_channel_open = true;
+            data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
+        }
+        assert_eq!(
+            reliable::link_ready_for_test(&state, "pending-peer"),
+            Some(true),
+            "non-vacuity: the transport link is ready and speaks the acked contract"
+        );
 
         let error = send_channel_frame(
             &state,
@@ -3963,8 +4190,768 @@ mod tests {
         .await
         .expect_err("pending peer cannot receive outbound application data");
 
-        assert!(error.to_string().contains("not admitted"));
+        // The exact refusal, not merely some error: a ready link that fell
+        // through the fence would fail later and differently (no session, or a
+        // transport write error), and asserting only `is_err` would accept that.
+        assert!(
+            error
+                .to_string()
+                .contains("not admitted for application traffic"),
+            "the send must be refused by the admission fence, got: {error}"
+        );
         assert_eq!(state.traffic.snapshot().app_tx.frames, 0);
+    }
+
+    // ---- Arc 04B-3b: the inbound real-time promotion fence ----
+    //
+    // Every control below drives the exact production functions the transport
+    // event arms delegate to (`dispatch_admitted_video` /
+    // `dispatch_admitted_audio`), so what is under test is the shipped gate
+    // rather than a restatement of it, and a subscriber count is read from the
+    // real broadcast the embedder subscribes to.
+
+    /// Which real gate one parameterized control drives.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MediaUnitKind {
+        Video,
+        Audio,
+    }
+
+    impl MediaUnitKind {
+        /// Both real gates. Controls iterate this rather than testing video and
+        /// trusting audio to match: they are separate call sites, and a gate
+        /// dropped from one of them is exactly the regression at issue.
+        const BOTH: [MediaUnitKind; 2] = [MediaUnitKind::Video, MediaUnitKind::Audio];
+
+        fn lane(self) -> &'static str {
+            match self {
+                Self::Video => "video",
+                Self::Audio => "audio",
+            }
+        }
+    }
+
+    /// One installed peer, the exact owner token resolved for it, and a live
+    /// subscriber on both real-time lanes.
+    ///
+    /// Both lanes are always subscribed, so "zero units delivered" means zero
+    /// on either lane rather than zero on the one the control happened to look
+    /// at, and a unit that leaked onto the wrong lane would still be counted.
+    struct MediaGate {
+        state: Arc<NetworkState>,
+        device_id: String,
+        owner: state::PeerOwnerToken,
+        video: tokio::sync::broadcast::Receiver<state::InboundVideoSample>,
+        audio: tokio::sync::broadcast::Receiver<state::InboundAudioSample>,
+    }
+
+    impl MediaGate {
+        /// A session-less peer in its genuine pre-authentication state: no
+        /// authenticated channel, and no retained policy either.
+        fn pre_auth(suffix: &str) -> Self {
+            let state = build_test_state(suffix);
+            let device_id = "arc04c-media-peer".to_string();
+            insert_session_less_peer(&state, &device_id, None);
+            Self::over(state, device_id)
+        }
+
+        /// The same fixture over an already-installed peer, for the controls
+        /// that need a real connector on it.
+        fn over(state: Arc<NetworkState>, device_id: String) -> Self {
+            let owner = state
+                .peers
+                .owner(&device_id)
+                .expect("the media peer is installed");
+            let video = state.video_subscribers.subscribe();
+            let audio = state.audio_subscribers.subscribe();
+            Self {
+                state,
+                device_id,
+                owner,
+                video,
+                audio,
+            }
+        }
+
+        /// The exact current peer under this device id.
+        fn peer(&self) -> Arc<PeerConnection> {
+            self.state
+                .peers
+                .get(&self.device_id)
+                .expect("the media peer is installed")
+        }
+
+        /// The exact current owner token, which is *not* `self.owner` once a
+        /// replacement has been installed.
+        fn current_owner(&self) -> state::PeerOwnerToken {
+            self.state
+                .peers
+                .owner(&self.device_id)
+                .expect("the media peer is installed")
+        }
+
+        /// Grant the retained legacy policy conjunct only.
+        fn grant_legacy_policy(&self) {
+            set_admission(&self.state, &self.device_id, true, PeerStatus::Active);
+        }
+
+        /// Install a real authenticated-channel capability on the exact current
+        /// peer. The capability is genuine; only connector provenance is
+        /// bypassed, which the transport controls prove separately.
+        fn grant_capability(&self) {
+            self.peer().install_authenticated_channel_for_test();
+        }
+
+        /// Present one unit to the production gate for `kind`, as the exact
+        /// `owner` given — which a replacement control deliberately makes stale.
+        fn drive(&self, kind: MediaUnitKind, owner: &state::PeerOwnerToken, marker: u32) {
+            let data = Bytes::from_static(b"arc04c-unit");
+            match kind {
+                MediaUnitKind::Video => dispatch_admitted_video(
+                    &self.state,
+                    owner,
+                    crate::transport::webrtc::VideoSample::for_test(marker, true, 0, data),
+                ),
+                MediaUnitKind::Audio => dispatch_admitted_audio(
+                    &self.state,
+                    owner,
+                    crate::transport::webrtc::AudioSample::for_test(marker, 0, data),
+                ),
+            }
+        }
+
+        /// Everything the subscribers have been handed since the last drain, as
+        /// `(lane, sending peer, marker)`. The marker rides `rtp_timestamp`, so
+        /// a delivered unit is attributable to the exact call that produced it.
+        fn drained(&mut self) -> Vec<(&'static str, String, u32)> {
+            let mut delivered = Vec::new();
+            while let Ok(unit) = self.video.try_recv() {
+                delivered.push(("video", unit.from, unit.sample.rtp_timestamp));
+            }
+            while let Ok(unit) = self.audio.try_recv() {
+                delivered.push(("audio", unit.from, unit.sample.rtp_timestamp));
+            }
+            delivered
+        }
+
+        /// The exact current peer's refused-unit count.
+        fn refused(&self) -> u64 {
+            self.peer().state.read().admission_rejected
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_inbound_media_without_capability_delivers_zero_units() {
+        for kind in MediaUnitKind::BOTH {
+            let lane = kind.lane();
+            let mut gate = MediaGate::pre_auth(&format!("arc04c-media-pre-auth-{lane}"));
+            // Premise: genuinely pre-authentication. Neither conjunct holds, so
+            // this is the state a native track can produce units in before any
+            // endpoint proof has run — the case the old comment left to the
+            // embedder's route matching.
+            assert!(
+                !gate.peer().has_authenticated_channel(),
+                "{lane}: no authenticated channel"
+            );
+            assert!(
+                !gate.peer().state.read().is_admitted(),
+                "{lane}: no retained policy either"
+            );
+
+            gate.drive(kind, &gate.owner, 11);
+
+            assert!(
+                gate.drained().is_empty(),
+                "{lane}: a pre-authentication unit must reach no subscriber"
+            );
+            // The refusal is counted at the boundary, so a passing negative
+            // proves the stimulus arrived rather than never being produced.
+            assert_eq!(gate.refused(), 1, "{lane}: the refusal is recorded once");
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_legacy_policy_alone_delivers_zero_media_units() {
+        for kind in MediaUnitKind::BOTH {
+            let lane = kind.lane();
+            let mut gate = MediaGate::pre_auth(&format!("arc04c-media-policy-only-{lane}"));
+            gate.grant_legacy_policy();
+            // Differs from the control above in exactly one conjunct: legacy
+            // policy now considers this peer fully admitted. A delivery here
+            // would be attributable to the bool, which is the regression this
+            // exists to catch.
+            assert!(
+                gate.peer().state.read().is_admitted(),
+                "{lane}: non-vacuity — legacy policy really does admit this peer"
+            );
+            assert!(
+                !gate.peer().has_authenticated_channel(),
+                "{lane}: and still no authenticated channel"
+            );
+
+            gate.drive(kind, &gate.owner, 21);
+
+            assert!(
+                gate.drained().is_empty(),
+                "{lane}: the retained policy bool alone must deliver nothing"
+            );
+            assert_eq!(gate.refused(), 1, "{lane}: the refusal is recorded once");
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_capability_plus_policy_delivers_exactly_one_media_unit() {
+        for kind in MediaUnitKind::BOTH {
+            let lane = kind.lane();
+            let mut gate = MediaGate::pre_auth(&format!("arc04c-media-admitted-{lane}"));
+            gate.grant_legacy_policy();
+            // The one addition over the refusing fixture: the exact current
+            // peer's authenticated channel. Nothing else about the fixture
+            // moves, so delivery here is attributable to the capability.
+            gate.grant_capability();
+            assert!(
+                gate.peer().has_authenticated_channel(),
+                "{lane}: capability"
+            );
+            assert!(gate.peer().state.read().is_admitted(), "{lane}: policy");
+
+            gate.drive(kind, &gate.owner, 31);
+
+            let delivered = gate.drained();
+            assert_eq!(
+                delivered,
+                vec![(lane, gate.device_id.clone(), 31)],
+                "{lane}: the conjunction permits exactly one unit, attributed to the exact peer"
+            );
+            assert_eq!(
+                gate.refused(),
+                0,
+                "{lane}: an admitted unit is not also counted as refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_capability_without_legacy_policy_delivers_zero_media_units() {
+        for kind in MediaUnitKind::BOTH {
+            let lane = kind.lane();
+            let mut gate = MediaGate::pre_auth(&format!("arc04c-media-capability-only-{lane}"));
+            // The fourth cell of the truth table, and the mirror of the
+            // policy-only control: the Arc 04 conjunction is a conjunction in
+            // both directions, so an authenticated channel whose peer has not
+            // reached mutual approval delivers nothing either.
+            gate.grant_capability();
+            assert!(
+                gate.peer().has_authenticated_channel(),
+                "{lane}: non-vacuity — the authenticated channel really is installed"
+            );
+            assert!(
+                !gate.peer().state.read().is_admitted(),
+                "{lane}: and retained policy does not admit this peer"
+            );
+
+            gate.drive(kind, &gate.owner, 71);
+
+            assert!(
+                gate.drained().is_empty(),
+                "{lane}: a capability without retained policy must deliver nothing"
+            );
+            assert_eq!(gate.refused(), 1, "{lane}: the refusal is recorded once");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_arc04c_connector_replacement_blocks_later_media_from_the_old_incarnation() {
+        let state = build_test_state("arc04c-media-connector-replacement");
+        let device_id = "arc04c-replacement-peer".to_string();
+        let (first, _first_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("first connector opens");
+        let first = Arc::new(first);
+        let retired_peer = Arc::new(PeerConnection::new(
+            device_id.clone(),
+            Some(Arc::clone(&first)),
+        ));
+        install_peer(&state.peers, Arc::clone(&retired_peer));
+        let mut gate = MediaGate::over(Arc::clone(&state), device_id.clone());
+        gate.grant_legacy_policy();
+        gate.grant_capability();
+        let retired_owner = gate.owner.clone();
+
+        // Baseline on this exact incarnation, before anything is replaced: the
+        // fixture genuinely does deliver, so the refusals below are not an
+        // artefact of a path that never worked.
+        gate.drive(MediaUnitKind::Video, &retired_owner, 41);
+        assert_eq!(
+            gate.drained(),
+            vec![("video", device_id.clone(), 41u32)],
+            "the live incarnation delivers while it is current"
+        );
+
+        // The engine fixture grants exactly two simultaneous connectors per
+        // Mesh scope, and this control deliberately saturates 2/2: replacement
+        // is only meaningful with both incarnations alive at once, so the first
+        // is still open here. A third open on this state would be refused by
+        // the grant, which is the fixture's envelope and not a bug to route
+        // around — no production grant is changed for this control.
+        let (replacement_worker, _replacement_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("replacement connector opens");
+        let replacement_worker = Arc::new(replacement_worker);
+        assert!(
+            !Arc::ptr_eq(&first, &replacement_worker),
+            "the replacement must be a genuinely distinct connector incarnation"
+        );
+        install_peer(
+            &state.peers,
+            Arc::new(PeerConnection::new(
+                device_id.clone(),
+                Some(Arc::clone(&replacement_worker)),
+            )),
+        );
+        // The replacement is admitted in its own right, so a unit that escaped
+        // through it would be a real escape rather than a refusal for some
+        // unrelated reason.
+        gate.grant_legacy_policy();
+        gate.grant_capability();
+        let replacement_owner = gate.current_owner();
+        assert!(
+            state.peers.get_if_current(&retired_owner).is_none(),
+            "the retired incarnation is no longer the installed owner"
+        );
+        assert!(
+            state.peers.get_if_current(&replacement_owner).is_some(),
+            "the replacement is"
+        );
+        assert!(
+            !Arc::ptr_eq(&retired_peer, &gate.peer()),
+            "the two installations are distinct peer objects"
+        );
+        assert!(
+            !retired_peer.has_authenticated_channel(),
+            "replacement invalidated the retired incarnation's capability"
+        );
+
+        // Later units from the retired incarnation, on both lanes.
+        gate.drive(MediaUnitKind::Video, &retired_owner, 42);
+        gate.drive(MediaUnitKind::Audio, &retired_owner, 43);
+
+        assert!(
+            gate.drained().is_empty(),
+            "no unit from the retired incarnation may dispatch"
+        );
+        assert_eq!(
+            gate.refused(),
+            0,
+            "and the replacement's own counters are not mutated by it"
+        );
+        assert_eq!(
+            retired_peer.state.read().admission_rejected,
+            0,
+            "the stale owner never reached either arm"
+        );
+
+        // Same-fixture positive baseline on the far side of the replacement.
+        gate.drive(MediaUnitKind::Audio, &replacement_owner, 44);
+        assert_eq!(
+            gate.drained(),
+            vec![("audio", device_id.clone(), 44u32)],
+            "the replacement itself still delivers, so the refusal above is the fence"
+        );
+
+        drop(gate);
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_pre_auth_unit_is_not_released_by_later_authentication() {
+        for kind in MediaUnitKind::BOTH {
+            let lane = kind.lane();
+            let mut gate = MediaGate::pre_auth(&format!("arc04c-media-late-auth-{lane}"));
+
+            // One genuinely pre-authentication unit, refused.
+            gate.drive(kind, &gate.owner, 51);
+            assert!(
+                gate.drained().is_empty(),
+                "{lane}: the pre-authentication unit is refused"
+            );
+            assert_eq!(gate.refused(), 1, "{lane}: and the refusal is recorded");
+
+            // The same peer authenticates afterwards.
+            gate.grant_legacy_policy();
+            gate.grant_capability();
+
+            gate.drive(kind, &gate.owner, 52);
+            let delivered = gate.drained();
+            assert_eq!(
+                delivered,
+                vec![(lane, gate.device_id.clone(), 52)],
+                "{lane}: exactly the new unit is delivered, exactly once"
+            );
+            // The refused unit was dropped, not parked: promotion releases
+            // nothing, now or on any later drain.
+            assert!(
+                gate.drained().is_empty(),
+                "{lane}: the pre-authentication unit never replays"
+            );
+            assert_eq!(
+                gate.refused(),
+                1,
+                "{lane}: promotion does not retroactively re-run the refused unit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_replacement_before_admission_commit_delivers_nothing_through_the_replacement(
+    ) {
+        for kind in MediaUnitKind::BOTH {
+            let lane = kind.lane();
+            let mut gate = MediaGate::pre_auth(&format!("arc04c-media-commit-race-{lane}"));
+            gate.grant_legacy_policy();
+            gate.grant_capability();
+
+            // The owner resolves successfully first — this is exactly the value
+            // an event path holds on its way into the fence. No hook is needed
+            // to open the window: resolving here and committing after the
+            // replacement *is* the race, deterministically ordered.
+            let stale = gate.owner.clone();
+            assert!(
+                gate.state.peers.get_if_current(&stale).is_some(),
+                "{lane}: the owner resolves before the replacement"
+            );
+            let stale_peer = gate.peer();
+
+            // A different installation under the same device id, admitted in
+            // its own right.
+            install_peer(
+                &gate.state.peers,
+                Arc::new(PeerConnection::new(gate.device_id.clone(), None)),
+            );
+            gate.grant_legacy_policy();
+            gate.grant_capability();
+            let replacement_owner = gate.current_owner();
+            assert!(
+                gate.state.peers.get_if_current(&stale).is_none(),
+                "{lane}: the resolved owner is no longer installed"
+            );
+            assert!(
+                !Arc::ptr_eq(&stale_peer, &gate.peer()),
+                "{lane}: the replacement is a distinct installation"
+            );
+
+            gate.drive(kind, &stale, 61);
+
+            assert!(
+                gate.drained().is_empty(),
+                "{lane}: the pre-replacement owner delivers nothing through the replacement"
+            );
+            assert_eq!(
+                gate.refused(),
+                0,
+                "{lane}: and the refusal arm does not mutate the replacement either"
+            );
+            assert_eq!(
+                stale_peer.state.read().admission_rejected,
+                0,
+                "{lane}: neither arm ran at all"
+            );
+
+            // Same-fixture positive: the replacement does deliver, so the
+            // silence above is the owner fence and not a dead fixture.
+            gate.drive(kind, &replacement_owner, 62);
+            let delivered = gate.drained();
+            assert_eq!(
+                delivered,
+                vec![(lane, gate.device_id.clone(), 62)],
+                "{lane}: the replacement itself is admitted and delivers"
+            );
+        }
+    }
+
+    /// The outbound twin of the replacement controls, over a real link.
+    ///
+    /// A witness is minted under the fence, the peer is then replaced by a
+    /// different installation on a different connector incarnation, and only
+    /// then is the witness consumed. The send must write through the connector
+    /// it captured and record against the peer it captured — never through or
+    /// onto the replacement — which is what makes `AdmittedApplicationOperation`
+    /// an authority rather than a boolean read that has since gone stale.
+    ///
+    /// This needs a genuinely connected connector: a positive baseline that
+    /// could not have sent anything anyway would make the negative unfalsifiable,
+    /// so the fixture is the live two-connector link, and the control is gated
+    /// on `transport-lab` with it.
+    /// 04B-3. Renegotiation completion must land on the installation the claim
+    /// was made for, never on whatever installation holds the device id by the
+    /// time the offer settles.
+    ///
+    /// This drives the real claim path — registry fence, `realtime_operation`,
+    /// `into_renegotiation` — and completes through the operation's own
+    /// `complete`, which takes no owner argument. A regression to
+    /// `peers.owner(device_id)` after the claim would have to abandon that API,
+    /// and the replacement assertions here are what it would break. Needs a
+    /// live connector because `realtime_flow_ports` requires a real worker, so
+    /// it is gated and ignored like its `transport-lab` neighbours.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
+    async fn v4_arc04b_renegotiation_completion_follows_the_captured_owner() {
+        // Legacy-media states on both sides: realtime_enabled() gates the whole
+        // real-time witness path, and a data-only profile can never satisfy it.
+        let state = build_test_state_with_legacy_media("arc04b-reneg-a");
+        let peer_state = build_test_state_with_legacy_media("arc04b-reneg-b");
+        let device_id = peer_state.identity.public_id().to_string();
+        // Two distinct live links, held for the whole test. The replacement has
+        // to own a *different* connector and endpoint-auth task: reusing the
+        // first pair would mean claiming against a worker the replacement
+        // itself retired, which is not what a real replacement looks like. Two
+        // connectors per side is exactly the Mesh grant.
+        let first_link = crate::endpoint_auth::native_link::connect(&state, &peer_state).await;
+        let second_link = crate::endpoint_auth::native_link::connect(&state, &peer_state).await;
+
+        // The exact worker/auth-task pair must travel together:
+        // `install_legacy_realtime_flow` needs `session.zip(endpoint_auth)` and
+        // asks the connector `owns_endpoint_auth(task)`, so a peer carrying a
+        // session but no task can never mint a real-time witness.
+        let install_live_peer =
+            |worker: Arc<crate::transport::WebRtcConnectorWorker>,
+             auth: Arc<crate::endpoint_auth::EndpointAuthTask>| {
+                let peer = insert_legacy_test_peer_pending_auth(&state, &device_id, worker, auth);
+                peer.install_authenticated_channel_for_test();
+                peer
+            };
+
+        // Claim through the exact production sequence the tick uses.
+        let claim = |owner: &state::PeerOwnerToken| {
+            state
+                .peers
+                .with_admitted_current(owner, |admitted| {
+                    admitted.install_legacy_realtime_flow();
+                    admitted.realtime_operation()
+                })
+                .flatten()
+                .and_then(|realtime| realtime.into_renegotiation())
+        };
+
+        let first_peer = install_live_peer(
+            Arc::clone(&first_link.left),
+            Arc::clone(&first_link.left_auth),
+        );
+        let first_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the first installation is current");
+
+        // POSITIVE BASELINE. Without it the negative could pass merely because
+        // completion never writes anything at all.
+        let baseline = claim(&first_owner).expect("the live connector claims a renegotiation");
+        assert!(
+            first_peer.state.read().media_reneg_inflight,
+            "claiming latches the single-flight guard"
+        );
+        baseline.complete(&state.peers, Ok(()));
+        {
+            let data = first_peer.state.read();
+            assert!(!data.media_reneg_inflight, "the claimed peer is cleared");
+            assert!(
+                data.last_offer_sent_at.is_some(),
+                "the claimed peer records the offer"
+            );
+        }
+
+        // Claim again, then replace the installation before completing — the
+        // exact window the defect lived in.
+        let superseded = claim(&first_owner).expect("the first installation claims again");
+        let replacement = install_live_peer(
+            Arc::clone(&second_link.left),
+            Arc::clone(&second_link.left_auth),
+        );
+        assert!(
+            state.peers.get_if_current(&first_owner).is_none(),
+            "non-vacuity: the installations must be distinct, or this proves nothing"
+        );
+        {
+            let mut data = replacement.state.write();
+            data.media_reneg_inflight = true;
+            data.media_reneg_pending = true;
+            data.last_offer_sent_at = None;
+        }
+
+        // The superseded operation completes. It must not touch the replacement.
+        superseded.complete(&state.peers, Ok(()));
+        {
+            let data = replacement.state.read();
+            assert!(
+                data.media_reneg_inflight,
+                "a superseded renegotiation must not clear the replacement's in-flight guard"
+            );
+            assert!(
+                data.media_reneg_pending,
+                "nor consume the replacement's pending lane change"
+            );
+            assert!(
+                data.last_offer_sent_at.is_none(),
+                "nor stamp an offer the replacement never sent"
+            );
+        }
+
+        // The replacement's own claim still completes, so the no-op above is
+        // attribution and not a dead path.
+        let replacement_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the replacement is current");
+        let own = claim(&replacement_owner).expect("the replacement claims its own renegotiation");
+        own.complete(&state.peers, Ok(()));
+        {
+            let data = replacement.state.read();
+            assert!(!data.media_reneg_inflight);
+            assert!(data.last_offer_sent_at.is_some());
+        }
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
+    async fn v4_arc04c_send_uses_the_captured_session_and_records_only_the_captured_peer() {
+        let state = build_test_state("arc04c-captured-send-a");
+        let peer_state = build_test_state("arc04c-captured-send-b");
+        let device_id = peer_state.identity.public_id().to_string();
+        let link = crate::endpoint_auth::native_link::connect(&state, &peer_state).await;
+
+        let captured_peer = Arc::new(PeerConnection::new(
+            device_id.clone(),
+            Some(Arc::clone(&link.left)),
+        ));
+        install_peer(&state.peers, Arc::clone(&captured_peer));
+        {
+            let mut data = captured_peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        captured_peer.install_authenticated_channel_for_test();
+        let captured_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the captured peer is installed");
+        let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+
+        // Same-fixture positive baseline: a witness minted under the fence
+        // sends through the captured session and records on the captured peer.
+        state
+            .peers
+            .admit_application_operation(&captured_owner)
+            .expect("an admitted owner mints a witness")
+            .send_frame(Bytes::from_static(b"arc04c-baseline"), timeout)
+            .await
+            .expect("the captured live session carries the send");
+        assert_eq!(
+            captured_peer.state.read().diag.frames_out,
+            1,
+            "the baseline send is recorded against the captured peer"
+        );
+
+        // Minted while the captured owner is still current; consumed after it
+        // is not.
+        let witness = state
+            .peers
+            .admit_application_operation(&captured_owner)
+            .expect("the owner is still current at mint time");
+
+        // Second connector on this state, alongside the live link's left half,
+        // so this control also saturates the fixture's 2/2 simultaneous
+        // connector grant (the right half belongs to the peer's own scope).
+        // Both must be alive at once for the replacement to be real, and no
+        // production grant is changed to allow it.
+        let (replacement_worker, _replacement_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Offerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("replacement connector opens");
+        let replacement_worker = Arc::new(replacement_worker);
+        assert!(
+            !Arc::ptr_eq(&link.left, &replacement_worker),
+            "the replacement is a genuinely distinct connector incarnation"
+        );
+        let replacement = Arc::new(PeerConnection::new(
+            device_id.clone(),
+            Some(Arc::clone(&replacement_worker)),
+        ));
+        install_peer(&state.peers, Arc::clone(&replacement));
+        {
+            let mut data = replacement.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        replacement.install_authenticated_channel_for_test();
+        let replacement_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the replacement is installed");
+        assert!(
+            state.peers.get_if_current(&captured_owner).is_none(),
+            "the captured installation is superseded"
+        );
+        assert!(
+            state.peers.get_if_current(&replacement_owner).is_some(),
+            "the replacement is the installed owner"
+        );
+        assert!(
+            !Arc::ptr_eq(&captured_peer, &replacement),
+            "the two installations are distinct peer objects"
+        );
+
+        assert!(
+            witness
+                .send_frame(Bytes::from_static(b"arc04c-post-mint"), timeout)
+                .await
+                .is_err(),
+            "the captured connector was retired by the replacement, so the post-mint send fails there rather than being redirected"
+        );
+        assert_eq!(
+            replacement.state.read().diag.frames_out,
+            0,
+            "no frame is attributed to the replacement"
+        );
+        assert_eq!(
+            replacement.state.read().diag.bytes_out,
+            0,
+            "and no bytes are either"
+        );
+        assert_eq!(
+            captured_peer.state.read().diag.frames_out,
+            1,
+            "the failed send records nothing new on the captured peer either"
+        );
+
+        state.shutdown().await;
+        peer_state.shutdown().await;
+        for worker in [&link.left, &link.right, &replacement_worker] {
+            let _ = worker.retire_and_close().await;
+        }
     }
 
     #[tokio::test]

@@ -43,8 +43,26 @@ First frame on a fresh data channel from each side.
 | `verification_code` | string | 6-char `[a-z0-9]`. Read aloud over voice. |
 | `capabilities` | object? | `CapabilityAdvert` — see below. Optional. |
 | `max_connections` | u32? | Hint to the topology selector. |
-| `features` | string[] | Capability ids the sender claims. |
+| `features` | string[] | Capability ids the sender claims. Must include `endpoint_auth_v1` — see below. |
 | `app_version` | string? | Cosmetic. |
+
+**The endpoint-authentication profile is advertised, and it is a hard
+precondition rather than an optional-frame gate.** A `hello` whose
+`features` list does not contain the exact id `endpoint_auth_v1` is
+refused with a typed incompatible-auth-profile failure, and that refusal
+happens *before* any proof work: before the peer's contribution is
+parsed, before it is bound to the attempt, before any transcript is
+assembled, and before any signature is produced or verified. Nothing is
+signed for a peer that cannot be authenticated.
+
+There is exactly one closed profile and no way to select another, so
+this is advertisement, not negotiation: a peer states that it speaks the
+one profile, it does not choose among several. There is no fallback, no
+downgrade path, no free-form profile string, and no third outcome — the
+selection either resolves to the single closed profile or fails closed.
+A peer that omits the id is dropped with an explicit diagnostic naming
+the required id, rather than being allowed to proceed to a signature
+check and surface as a generic bad-identity failure.
 
 The other side signs the Arc 04 endpoint-auth transcript (see
 [Handshake signature](#handshake-signature)) with their ed25519 secret
@@ -233,6 +251,15 @@ for other callers but is neither produced nor accepted on the live
 fallback: domain separation means an older peer fails authentication
 rather than negotiating down, so a downgrade is not attacker-selectable.
 
+The cutover is also *diagnosable* rather than silent. Because the
+profile is advertised on `hello` (see [`hello`](#hello)), a peer running
+the old format is refused explicitly, by name, before any proof work —
+instead of being told only that a signature did not verify, which reads
+identically to a wrong key or a tampered transcript. The signed
+transcript still binds the selected closed profile, so the
+advertisement decides only whether an attempt begins; it can never
+widen or replace what the transcript commits to.
+
 The fingerprint pair is **not** an RFC 5705 exporter and is not
 session-unique — two channels between one device pair reusing the same
 certificates carry the same value. It defeats a terminating
@@ -259,6 +286,15 @@ ownership.
 4. **`features` gate optional message kinds**: senders consult the
    peer's advertised `features` list before sending an optional frame.
    Older peers that don't advertise a feature don't receive it.
+
+   **`endpoint_auth_v1` is the one exception and is not
+   forward-compatible by design.** It is a required precondition, not an
+   optional-frame gate: a peer that does not advertise it is refused,
+   not merely sent less. Absence fails closed with a typed refusal
+   before any proof work rather than degrading to anything weaker, which
+   is exactly what makes the Arc 04 cutover hard. Treat it as a
+   compatibility break against pre-Arc-04 peers, and never as a feature
+   a sender can route around.
 
 5. **Bump `PROTOCOL_VERSION` only when an existing message's shape
    changes incompatibly.** Additive changes don't bump.

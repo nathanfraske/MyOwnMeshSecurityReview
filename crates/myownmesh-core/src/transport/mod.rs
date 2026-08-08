@@ -43,9 +43,13 @@ pub use webrtc::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
     transport_lab_remote_description_fixture_grant, TransportEvent,
 };
+// `EndpointAuthHandoff` is deliberately no longer re-exported: it is now an
+// internal WebRTC detail that converts to the generic
+// `connector::ConnectedChannelHandoff` at the boundary, and endpoint
+// authentication names only the generic form.
 pub(crate) use webrtc::{
-    DataChannelOpenOwnership, EndpointAuthHandoff, RemoteCandidateDisposition,
-    WebRtcConnectorEvent, WebRtcConnectorIncarnation, WebRtcConnectorWorker,
+    DataChannelOpenOwnership, RemoteCandidateDisposition, WebRtcConnectorEvent,
+    WebRtcConnectorIncarnation, WebRtcConnectorWorker,
 };
 pub use webrtc::{
     LocalIceCandidate, PeerSession, PendingRemoteCandidatePolicy, Role, Transport,

@@ -378,6 +378,97 @@ impl PeerRegistry {
         Some(effect(&current.value().peer))
     }
 
+    /// Run one synchronous legacy application operation, only while `owner` is
+    /// the installed peer **and** that peer is admitted for application work.
+    ///
+    /// This is the one admission linearization point. All three conjuncts — the
+    /// exact current owner, a live authenticated capability for that peer's
+    /// exact current connector, and retained policy — are evaluated together
+    /// under the registry mutation lock, and the witness that proves them is
+    /// minted inside it. Replacement takes the same lock, so it orders strictly
+    /// before or after the whole effect.
+    ///
+    /// `None` means the operation was not authorized. The caller deliberately
+    /// cannot tell whether the owner was stale or admission failed: an
+    /// admission answer that escaped as a value would be exactly the transient
+    /// boolean this replaces.
+    pub(super) fn with_admitted_current<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        effect: impl FnOnce(&AdmittedLegacyOperation<'_>) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !peer.admitted_for_legacy_application() {
+            return None;
+        }
+        Some(effect(&AdmittedLegacyOperation {
+            peer,
+            owner,
+            _not_send: std::marker::PhantomData,
+        }))
+    }
+
+    /// The same fence, with an explicit refusal arm.
+    ///
+    /// `refused` receives the exact current peer and may only *record* — it
+    /// authorizes nothing, because no witness exists on that arm. It exists so
+    /// the inbound path can count a refused application frame under the same
+    /// acquisition that refused it, instead of re-entering the registry and
+    /// racing its own refusal. `None` still means the owner is stale.
+    pub(super) fn with_admitted_current_or_refused<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        admitted: impl FnOnce(&AdmittedLegacyOperation<'_>) -> R,
+        refused: impl FnOnce(&Arc<PeerConnection>) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !peer.admitted_for_legacy_application() {
+            return Some(refused(peer));
+        }
+        Some(admitted(&AdmittedLegacyOperation {
+            peer,
+            owner,
+            _not_send: std::marker::PhantomData,
+        }))
+    }
+
+    /// Mint one owned authority for a legacy application operation that will
+    /// cross an await.
+    ///
+    /// Built under the same fence and the same three conjuncts as
+    /// [`Self::with_admitted_current`], and additionally requires a live
+    /// connector worker, since an operation that cannot name its exact
+    /// connector has nothing to write through.
+    pub(super) fn admit_application_operation(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Option<AdmittedApplicationOperation> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !peer.admitted_for_legacy_application() {
+            return None;
+        }
+        let session = peer.session.lock().clone()?;
+        Some(AdmittedApplicationOperation {
+            peer: Arc::clone(peer),
+            session,
+        })
+    }
+
     pub(super) fn contains_key(&self, device_id: &str) -> bool {
         self.peers.contains_key(device_id)
     }
@@ -503,6 +594,288 @@ impl Drop for PeerRegistry {
     fn drop(&mut self) {
         let retired = self.retire_all();
         drop(retired);
+    }
+}
+
+/// Proof that one exact peer installation was admitted for legacy application
+/// work, valid only for the body of one synchronous effect.
+///
+/// Minted only inside the registry fence, so possessing one *is* the proof that
+/// the owner was current and admission held at a single linearization point.
+/// The peer is bound internally and reached through the operations below rather
+/// than handed out, so a witness for peer A cannot be presented alongside peer
+/// B's connection. [`Self::record_inbound`] is the one exception: it lends the
+/// exact admitted peer to a closure. That `Arc` conveys no admission authority —
+/// it is the same handle any registry read yields — and the borrow ends with the
+/// closure, inside the fence.
+///
+/// `PhantomData<*const ()>` makes it `!Send`: it cannot be moved into a task,
+/// and the lifetime keeps it inside the closure, so it can never be held across
+/// an await or outlive the fence that minted it.
+pub(super) struct AdmittedLegacyOperation<'a> {
+    peer: &'a Arc<PeerConnection>,
+    /// The exact owner token this fence admitted, borrowed rather than cloned
+    /// so entering the fence costs nothing. Any witness that crosses an await
+    /// clones it, so later bookkeeping names *this* installation instead of
+    /// re-resolving a device id that a replacement may since have taken over.
+    owner: &'a PeerOwnerToken,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl AdmittedLegacyOperation<'_> {
+    /// The exact admitted peer's device id, for dispatch attribution.
+    pub(super) fn device_id(&self) -> &str {
+        &self.peer.device_id
+    }
+
+    /// Record inbound liveness and traffic on the exact admitted peer.
+    pub(super) fn record_inbound(&self, effect: impl FnOnce(&Arc<PeerConnection>)) {
+        effect(self.peer);
+    }
+
+    /// Install the retained legacy real-time flow for this admitted peer.
+    pub(super) fn install_legacy_realtime_flow(&self) -> bool {
+        self.peer.install_legacy_realtime_flow()
+    }
+
+    /// Take the paired real-time ports as one owned value that can cross an
+    /// await without ever being re-paired with another peer or connector.
+    pub(super) fn realtime_operation(&self) -> Option<AdmittedRealtimeOperation> {
+        let (session, flow) = self.peer.realtime_flow_ports()?;
+        Some(AdmittedRealtimeOperation {
+            peer: Arc::clone(self.peer),
+            owner: self.owner.clone(),
+            session,
+            flow,
+        })
+    }
+}
+
+/// Move-only authority to perform exactly one legacy application send on one
+/// exact peer installation.
+///
+/// Carries the peer and the connector worker captured **at admission**, under
+/// the registry fence. The send writes through that captured worker and records
+/// against that captured peer; nothing here re-resolves a device id, so a
+/// replacement installed during the await cannot receive this operation or its
+/// accounting.
+///
+/// No separate incarnation is stored. `send_owned` enters the worker's own
+/// operation and close fence and races the write against retirement, so the
+/// captured worker *is* the incarnation check; a duplicate field would be state
+/// that never decides anything.
+///
+/// Deliberately not `Clone`, `Copy`, `Debug`, `Default`, or serializable, and
+/// consumed by value, so one admission authorizes one operation.
+#[must_use = "an admitted operation authorizes exactly one send and must be consumed"]
+pub(super) struct AdmittedApplicationOperation {
+    peer: Arc<PeerConnection>,
+    session: Arc<crate::transport::WebRtcConnectorWorker>,
+}
+
+impl AdmittedApplicationOperation {
+    /// Send one serialized frame through the exact captured connector, then
+    /// record it against the exact captured peer.
+    ///
+    /// Both halves use the captured values, so a send and its accounting can
+    /// never land on different installations.
+    pub(super) async fn send_frame(
+        self,
+        bytes: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<usize> {
+        let sent = tokio::time::timeout(timeout, self.session.send_owned(bytes))
+            .await
+            .map_err(|_| Error::Transport("peer send timed out".into()))??;
+        let mut data = self.peer.state.write();
+        data.diag.bytes_out += sent as u64;
+        data.diag.frames_out += 1;
+        Ok(sent)
+    }
+}
+
+/// Move-only authority for one legacy real-time operation, keeping the exact
+/// peer, connector worker, and flow capability bound together.
+///
+/// The binding is the point, so there is deliberately no accessor that yields
+/// the worker and the capability separately: every operation below applies the
+/// pair this witness captured, which makes a cross-paired call unconstructible
+/// rather than merely refused by the connector. Renegotiation is the one path
+/// that legitimately needs the worker alone, and it says so by name.
+#[must_use = "an admitted real-time operation must be consumed"]
+pub(super) struct AdmittedRealtimeOperation {
+    peer: Arc<PeerConnection>,
+    /// The exact owner captured under the same fence that admitted this
+    /// witness. Completion bookkeeping must name this token, never a fresh
+    /// `owner(device_id)` lookup: a replacement installed after the mint would
+    /// answer that lookup and receive another installation's result.
+    owner: PeerOwnerToken,
+    session: Arc<crate::transport::WebRtcConnectorWorker>,
+    flow: Arc<crate::connector::ConnectorRealtimeFlowCapability>,
+}
+
+impl AdmittedRealtimeOperation {
+    /// Whether the captured peer has a pending lane-set change.
+    pub(super) fn media_reneg_pending(&self) -> bool {
+        self.peer.state.read().media_reneg_pending
+    }
+
+    /// Consume this witness into the renegotiation session, claiming the
+    /// renegotiation only once the captured pair has revalidated.
+    ///
+    /// Renegotiation drives SDP on the connector and opens no lane, so it is the
+    /// one legitimate session-only use — but it is still minted from a live
+    /// real-time capability, and yielding the worker while silently discarding
+    /// that capability would make the witness's own authority decorative. The
+    /// pair is therefore rechecked here, under every feature configuration:
+    /// `owns_realtime_flow` asks the connector whether this exact capability
+    /// belongs to this exact incarnation, so a capability from a superseded
+    /// connector yields no session and the caller fails closed.
+    ///
+    /// The claim is taken **inside** this method, after validation, and
+    /// deliberately not by a separate call before it. `media_reneg_inflight` is
+    /// cleared only by the spawned renegotiation task, so claiming and then
+    /// failing validation would leave the single-flight guard latched and that
+    /// peer would never renegotiate again.
+    ///
+    /// This yields the worker **and** the exact owner captured at admission.
+    /// Every later SDP call still passes the connector's own liveness and close
+    /// fence, which stays authoritative.
+    ///
+    /// The owner travels with the session deliberately. Re-resolving it by
+    /// device id after this point would reopen the window this witness exists
+    /// to close: a replacement installed between the mint and that lookup would
+    /// answer it, and the spawned task's completion bookkeeping —
+    /// `media_reneg_inflight`, `media_reneg_pending`, `last_offer_sent_at` —
+    /// would land on the replacement instead of the peer whose renegotiation
+    /// actually ran. Carrying the token makes that bookkeeping a no-op after a
+    /// replacement rather than a misattribution.
+    pub(super) fn into_renegotiation(self) -> Option<AdmittedRenegotiation> {
+        if !self.session.owns_realtime_flow(&self.flow) {
+            return None;
+        }
+        {
+            let mut data = self.peer.state.write();
+            data.media_reneg_inflight = true;
+            data.media_reneg_pending = false;
+        }
+        Some(AdmittedRenegotiation {
+            session: self.session,
+            owner: self.owner,
+        })
+    }
+
+    #[cfg(feature = "legacy-media")]
+    pub(super) async fn open_media_lane(
+        self,
+        kind: crate::transport::webrtc::LaneKind,
+    ) -> Result<u8> {
+        self.session.open_media_lane(&self.flow, kind).await
+    }
+
+    #[cfg(feature = "legacy-media")]
+    pub(super) async fn close_media_lane(
+        self,
+        kind: crate::transport::webrtc::LaneKind,
+        lane: u8,
+    ) -> Result<()> {
+        self.session.close_media_lane(&self.flow, kind, lane).await
+    }
+
+    #[cfg(feature = "legacy-media")]
+    pub(super) async fn send_video(
+        self,
+        lane: u8,
+        data: bytes::Bytes,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        self.session
+            .send_video(&self.flow, lane, data, duration)
+            .await
+    }
+
+    #[cfg(feature = "legacy-media")]
+    pub(super) async fn send_audio(
+        self,
+        lane: u8,
+        data: bytes::Bytes,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        self.session
+            .send_audio(&self.flow, lane, data, duration)
+            .await
+    }
+
+    /// Finalize suspended lanes and, if any were removed, mark renegotiation
+    /// pending on the captured peer rather than on a post-await lookup.
+    #[cfg(feature = "legacy-media")]
+    pub(super) async fn finalize_suspended_lanes(self) -> usize {
+        let finalized = self.session.finalize_suspended_lanes(&self.flow).await;
+        if finalized != 0 {
+            self.peer.state.write().media_reneg_pending = true;
+        }
+        finalized
+    }
+}
+
+/// One claimed renegotiation: the connector to drive, plus the exact owner it
+/// was claimed for, as a single move-only value.
+///
+/// The pairing is the point. `complete` takes **no owner argument**, so the
+/// caller cannot substitute a freshly resolved one — a regression to
+/// `peers.owner(device_id)` after the claim would have to abandon this API and
+/// hand-roll the bookkeeping, which is a visible deletion rather than a silent
+/// misattribution. `media_reneg_inflight` is already latched by the time this
+/// exists, so a still-current installation must be completed: dropping it while
+/// its peer is current would leave the single-flight guard set and that peer
+/// would never renegotiate again. Dropping it once the installation has been
+/// replaced is safe — `complete` would find nothing current and write nothing.
+#[must_use = "a claimed renegotiation must be completed, or its in-flight guard stays latched"]
+pub(super) struct AdmittedRenegotiation {
+    session: Arc<crate::transport::WebRtcConnectorWorker>,
+    owner: PeerOwnerToken,
+}
+
+impl AdmittedRenegotiation {
+    /// The connector this renegotiation drives. Its own liveness and close
+    /// fence stays authoritative for every SDP call.
+    pub(super) fn session(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
+        &self.session
+    }
+
+    /// The captured owner's device id, for logging and signaling attribution.
+    pub(super) fn device_id(&self) -> &str {
+        self.owner.device_id()
+    }
+
+    /// Whether the exact installation this was claimed for is still current.
+    pub(super) fn is_current(&self, peers: &PeerRegistry) -> bool {
+        peers.get_if_current(&self.owner).is_some()
+    }
+
+    /// Record the outcome against the exact captured installation.
+    ///
+    /// A peer replaced while the offer was in flight fails `get_if_current`, so
+    /// every write here becomes a no-op: the result is dropped rather than
+    /// attributed to the replacement.
+    pub(super) fn complete(self, peers: &PeerRegistry, outcome: std::result::Result<(), String>) {
+        let Some(peer) = peers.get_if_current(&self.owner) else {
+            return;
+        };
+        let mut data = peer.state.write();
+        data.media_reneg_inflight = false;
+        match outcome {
+            Ok(()) => {
+                data.last_offer_sent_at = Some(std::time::Instant::now());
+            }
+            Err(error) => {
+                // Leave the work owed: the flag re-arms the next tick's attempt
+                // instead of losing the lane change.
+                data.media_reneg_pending = true;
+                drop(data);
+                tracing::debug!(peer = %self.owner.device_id(), "media renegotiation deferred: {error}");
+            }
+        }
     }
 }
 
@@ -1177,15 +1550,9 @@ impl NetworkState {
         data: bytes::Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let flow = {
-            let Some(p) = self.peers.get(peer) else {
-                return Err(Error::Network(format!("peer not found: {peer}")));
-            };
-            p.realtime_flow_ports()
-        };
-        let (session, capability) = flow
-            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
-        session.send_video(&capability, lane, data, duration).await
+        self.admitted_realtime_operation(peer)?
+            .send_video(lane, data, duration)
+            .await
     }
 
     /// Subscribe to audio frames from every peer on this network
@@ -1218,15 +1585,25 @@ impl NetworkState {
         data: bytes::Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let flow = {
-            let Some(p) = self.peers.get(peer) else {
-                return Err(Error::Network(format!("peer not found: {peer}")));
-            };
-            p.realtime_flow_ports()
-        };
-        let (session, capability) = flow
-            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
-        session.send_audio(&capability, lane, data, duration).await
+        self.admitted_realtime_operation(peer)?
+            .send_audio(lane, data, duration)
+            .await
+    }
+
+    /// Resolve one admitted real-time operation for `peer` through the fence.
+    ///
+    /// One owner resolution, then the admission fence, then an owned wrapper
+    /// that keeps the worker and the flow capability paired across the await.
+    #[cfg(feature = "legacy-media")]
+    fn admitted_realtime_operation(&self, peer: &str) -> Result<AdmittedRealtimeOperation> {
+        let owner = self
+            .peers
+            .owner(peer)
+            .ok_or_else(|| Error::Network(format!("peer not found: {peer}")))?;
+        self.peers
+            .with_admitted_current(&owner, |admitted| admitted.realtime_operation())
+            .flatten()
+            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))
     }
 
     /// Send a channel frame to one peer via the command queue.
@@ -1591,22 +1968,13 @@ impl NetworkState {
         reason = "this exact method is the temporary legacy media finalization boundary"
     )]
     pub(crate) async fn media_lanes_finalize(&self, peer: &str) -> Result<usize> {
-        let owner = self
-            .peers
-            .owner(peer)
-            .ok_or_else(|| Error::Network(format!("peer not found: {peer}")))?;
-        let flow = self
-            .peers
-            .get_if_current(&owner)
-            .and_then(|entry| entry.realtime_flow_ports())
-            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
-        let finalized = flow.0.finalize_suspended_lanes(&flow.1).await;
-        if finalized != 0 {
-            if let Some(entry) = self.peers.get_if_current(&owner) {
-                entry.state.write().media_reneg_pending = true;
-            }
-        }
-        Ok(finalized)
+        // The pending flag is written through the captured peer inside the
+        // operation, so a replacement installed during the finalize await
+        // cannot inherit it.
+        Ok(self
+            .admitted_realtime_operation(peer)?
+            .finalize_suspended_lanes()
+            .await)
     }
 
     /// Whether `device_id` has a standing dial (config pin or runtime

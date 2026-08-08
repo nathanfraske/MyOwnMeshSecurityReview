@@ -46,6 +46,21 @@ impl Feature {
     /// but unacknowledged) against peers that don't advertise this.
     /// See the engine's `reliable` module.
     pub const RELIABLE_CHANNELS: &'static str = "reliable_channels_v1";
+
+    /// Peer speaks the Arc 04 endpoint-authentication profile: the
+    /// length-prefixed transcript under `ENDPOINT_AUTH_DOMAIN_TAG`, binding
+    /// the mesh context, the closed profile identifier, ordered roles, both
+    /// per-attempt contributions, and both endpoints' DTLS certificate
+    /// fingerprints.
+    ///
+    /// Unlike every other id here, this one is **not** an optional-frame
+    /// gate. It is a hard precondition: a peer that does not advertise it
+    /// cannot be authenticated at all, and the handshake fails closed with
+    /// `EndpointAuthError::IncompatibleProfile` rather than falling back to
+    /// anything. There is deliberately no negotiation and no second profile
+    /// to select — advertising is how a peer states it speaks the one closed
+    /// profile, not how it chooses among several.
+    pub const ENDPOINT_AUTH_V1: &'static str = "endpoint_auth_v1";
 }
 
 /// The set of features this build advertises to peers. Embedders
@@ -58,6 +73,7 @@ pub const ADVERTISED_FEATURES: &[&str] = &[
     Feature::CAPABILITIES_UPDATE,
     Feature::NETWORK_STATE_V1,
     Feature::RELIABLE_CHANNELS,
+    Feature::ENDPOINT_AUTH_V1,
 ];
 
 /// Test whether a peer's advertised feature list contains `feature`.

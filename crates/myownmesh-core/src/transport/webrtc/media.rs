@@ -33,6 +33,45 @@ pub struct AudioSample {
     pub(super) _reservation: Option<RealtimePayloadLease>,
 }
 
+/// Crate-test constructors for the two compatibility media units.
+///
+/// These exist so a control outside this module can present a unit to the
+/// engine's inbound promotion fence. Only the payload fields are accepted; the
+/// resource lease stays private and is always `None`, so a control can state
+/// what arrived on a track but can never mint the output reservation a real
+/// pump holds. Nothing built here carries admission, ownership, peer identity,
+/// or connector provenance — a unit is inert until the engine gate decides to
+/// deliver it — so this seam cannot be used to construct a witness.
+///
+/// No re-export is added for them: both types are already nameable crate-wide,
+/// so an inherent `pub(crate)` constructor is the narrowest exposure that
+/// works.
+#[cfg(test)]
+impl VideoSample {
+    pub(crate) fn for_test(rtp_timestamp: u32, key: bool, lane: u8, data: Bytes) -> Self {
+        Self {
+            rtp_timestamp,
+            key,
+            lane,
+            data,
+            _reservation: None,
+        }
+    }
+}
+
+/// The audio twin of the video constructor above, under the same terms.
+#[cfg(test)]
+impl AudioSample {
+    pub(crate) fn for_test(rtp_timestamp: u32, lane: u8, data: Bytes) -> Self {
+        Self {
+            rtp_timestamp,
+            lane,
+            data,
+            _reservation: None,
+        }
+    }
+}
+
 /// Historical per-kind lane ceiling for the temporary H.264 and Opus adapter.
 /// The generic connector does not read this value or create media tracks.
 pub const MEDIA_LANES: usize = LEGACY_MEDIA_MAX_LANES_PER_KIND;

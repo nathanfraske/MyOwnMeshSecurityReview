@@ -2,6 +2,28 @@
 //!
 //! This Arc 02 module adds the ownership transition only. Existing WebRTC,
 //! Arc 03 wraps the existing ICE, TURN, and connection behavior in this owner.
+//!
+//! Arc 04B-1 adds the transport-independent boundary that endpoint
+//! authentication consumes, split by owner rather than by size:
+//!
+//! - [`incarnation`] owns the opaque process-local connector identity;
+//! - [`handoff`] owns the move-only channel handoff and its retention contract;
+//! - [`binding`] owns the closed connector-supplied channel binding.
+//!
+//! A transport keeps its own incarnation type and owns a generic one. Endpoint
+//! authentication names only the generic types, so it imports no transport.
+
+mod binding;
+mod handoff;
+mod incarnation;
+
+pub(crate) use binding::{
+    EndpointAuthBinding, EndpointAuthBindingProfile, EndpointAuthBindingProvenance,
+};
+#[cfg(test)]
+pub(crate) use handoff::{counted_handoff_for_test, handoff_for_test};
+pub(crate) use handoff::{ConnectedChannelHandoff, ConnectedChannelRetention};
+pub(crate) use incarnation::ConnectorIncarnation;
 
 use crate::runtime::attempt::ConnectorCandidateCapability;
 use crate::runtime::RuntimeIncarnation;

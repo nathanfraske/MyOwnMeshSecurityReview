@@ -110,6 +110,38 @@ evidence only. This second correction is unverified on an exact pushed head.
 Runs `31051812846`, `31054735382`, and `31054732818` remain superseded and
 non-evidential for every boundary in this record.
 
+### Status note at Arc 04B-4
+
+Everything above this note is a historical record of Arc 03 runs and remains
+stated as of the heads named in it. Two claims in it have since gone stale, and
+are corrected here rather than edited in place, so the run records keep saying
+what those runs actually reported:
+
+- **Probe counts.** The run records above report "17 cause-matched rejection
+  controls". That was the tally at those heads. The Arc 03 script's probe tuple
+  has grown since — counted by reading the current working tree, it is 20
+  rejection probes plus 2 authority-set rejections, and the script prints its
+  own total rather than a hardcoded number. No Arc 03 count in this record has
+  been re-verified by execution at Arc 04B-4, and none should be quoted as
+  current.
+- **Ownership of the basal native fingerprint control.** Arc 03 left the live
+  substituted-fingerprint control inside `legacy_v1`, where it needed the
+  deprecated compatibility feature to compile at all. Under Arc 04 it is basal
+  V4 behaviour and no longer lives there: the reusable two-connector fixture and
+  its controls are owned by `endpoint_auth::native_link`, gated on
+  `transport-lab` alone, and CI runs them in a `transport-lab`-only job so
+  deleting the LegacyV1 subtree cannot delete the evidence. The LegacyV1
+  *routing* controls stay in `legacy_v1`, which is unchanged.
+
+Arc 04 has its own compiler-boundary harness,
+`scripts/check-v4-arc04-compiler-boundaries.py`. It reuses this record's
+hard-won harness invariants — root-derived vendor patches, generated-manifest
+self-check, rustflag-normalized probe environment, copied lockfile, shared
+isolated target, `--offline`, and exact code/fragment/primary-line cause
+matching — and adds its own probes over the endpoint-authentication boundary.
+It carries no evidence from the Arc 03 runs recorded above and has not itself
+been executed at the time of this note.
+
 ## 2. RT-03-01: manufacture connector resource authority
 
 Attack: construct a worker, provider, Mesh child, lease, or candidate capability without the process provider and exact claim.

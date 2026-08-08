@@ -16,6 +16,20 @@ enum ConnectedClaimRetention {
     Multiple(Vec<crate::connector::ConnectedChannelCapability>),
 }
 
+/// The WebRTC close owner is the retention behind a generic channel handoff.
+///
+/// The generic handoff cannot know how to hold a claim through native close;
+/// this impl is the one narrow bridge that lets it delegate to the exact owner
+/// that does. It adds no behaviour of its own.
+impl crate::connector::ConnectedChannelRetention for ConnectorCloseOwner {
+    fn retain_connected_claim(
+        self: Arc<Self>,
+        capability: crate::connector::ConnectedChannelCapability,
+    ) {
+        ConnectorCloseOwner::retain_connected_claim(&self, capability);
+    }
+}
+
 impl ConnectedClaimRetention {
     fn release_after_cleanup_success(&mut self) {
         match self {
@@ -259,6 +273,16 @@ impl ConnectorCloseOwner {
         };
         drop(retained);
         self.start();
+    }
+
+    /// This close owner as the transport-independent retention obligation.
+    ///
+    /// The generic handoff calls back through this on drop, so the connected
+    /// claim returns to exactly the same retention path it uses today.
+    pub(super) fn generic_retention(
+        self: &Arc<Self>,
+    ) -> Arc<dyn crate::connector::ConnectedChannelRetention> {
+        Arc::clone(self) as Arc<dyn crate::connector::ConnectedChannelRetention>
     }
 
     pub(super) fn start(self: &Arc<Self>) {

@@ -60,18 +60,11 @@ pub struct PeerStateData {
     pub remote_shelved: bool,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
-    /// This endpoint's own per-attempt contribution.
-    ///
-    /// Typed rather than a bare `String` so it can only have come from a fresh
-    /// CSPRNG draw. With a certificate-fingerprint channel binding that is not
-    /// session-unique, this freshness is the primary anti-replay mechanism, so
-    /// a value reconstructed from storage or from the wire must not be able to
-    /// stand in for one.
-    /// Crate-private, like the contribution types themselves: this is
-    /// in-flight handshake material, never part of the public peer snapshot.
-    pub(crate) nonce_sent: Option<crate::endpoint_auth::LocalContribution>,
-    /// The peer's contribution, accepted only in its canonical wire encoding.
-    pub(crate) nonce_received: Option<crate::endpoint_auth::PeerContribution>,
+    // Both endpoint-authentication contributions used to live here. They now
+    // belong to the Endpoint Auth Task, which owns one draw and one bound peer
+    // value for its whole life. Keeping copies in mutable peer state is what
+    // allowed a later Hello to rewrite the transcript underneath a completed
+    // proof, so the fields are gone rather than merely unused.
     pub verification_code_sent: Option<String>,
     pub verification_code_received: Option<String>,
     pub last_recv_at: Option<Instant>,
@@ -234,8 +227,6 @@ impl Default for PeerStateData {
             remote_shelved: false,
             label: String::new(),
             capabilities: None,
-            nonce_sent: None,
-            nonce_received: None,
             verification_code_sent: None,
             verification_code_received: None,
             last_recv_at: None,
@@ -440,6 +431,14 @@ impl PeerConnection {
         if !capability.belongs_to(task.incarnation()) {
             return false;
         }
+        // And it must carry *this* task's authenticated context. The answer
+        // comes from the capability's own private record — mesh, local and
+        // remote Device, profile, and connector — not from anything the caller
+        // supplied, so a capability authenticated for another mesh or another
+        // peer is refused here even when the current task is handed in with it.
+        if !task.issued(&capability) {
+            return false;
+        }
         *current = Some(capability);
         true
     }
@@ -452,7 +451,7 @@ impl PeerConnection {
     /// the gate is satisfied the same way production satisfies it — what is
     /// skipped is only the connector-provenance check, which is proven
     /// separately by the transport controls. This is deliberately not a way to
-    /// make [`Self::is_application_admitted`] answer `true` without a
+    /// make [`Self::admitted_for_legacy_application`] answer `true` without a
     /// capability present.
     #[cfg(test)]
     pub(crate) fn install_authenticated_channel_for_test(&self) {
@@ -476,8 +475,27 @@ impl PeerConnection {
     /// deliberately outside this gate, as the existing admission
     /// classification already intends; it is what establishes the capability
     /// in the first place.
-    pub(crate) fn is_application_admitted(&self) -> bool {
+    /// **Not a gate.** This is the admission half only, and it is private to
+    /// the registry: production reaches it exclusively through
+    /// `PeerRegistry::with_admitted_current` / `admit_application_operation`,
+    /// which additionally prove the owner is the installed peer and mint a
+    /// witness under the mutation lock. Read on its own it is a transient
+    /// boolean about a peer that may already have been replaced, which is
+    /// precisely the shape Arc 04B-3 removes.
+    pub(super) fn admitted_for_legacy_application(&self) -> bool {
         self.has_authenticated_channel() && self.state.read().is_admitted()
+    }
+
+    /// The admission half as the fence evaluates it. **Controls only.**
+    ///
+    /// The connector-provenance controls build a peer directly from a real
+    /// connector fixture and never install it in a registry, so they cannot
+    /// take the fence. They assert this half; the owner half is proven by the
+    /// engine's own replacement controls. Compiled out of production, so no
+    /// externally readable admission boolean survives there.
+    #[cfg(test)]
+    pub(crate) fn admitted_for_legacy_application_for_test(&self) -> bool {
+        self.admitted_for_legacy_application()
     }
 
     /// Whether this entry holds a live authenticated channel for its exact
@@ -494,14 +512,17 @@ impl PeerConnection {
     ///
     /// Endpoint Auth owns connected-channel provenance, and the Arc 04
     /// channel-bound capability is implemented and enforced — this path is
-    /// gated on it through [`Self::is_application_admitted`], alongside the
-    /// existing mutual-approval policy state. The adapter itself is retained
-    /// for compatibility, not because the capability is still pending; Arc 05
-    /// owns its deletion.
+    /// gated on it by the registry admission fence, alongside the existing
+    /// mutual-approval policy state. The adapter itself is retained for
+    /// compatibility, not because the capability is still pending; Arc 05 owns
+    /// its deletion.
+    ///
+    /// Admission is **not** rechecked here. This is reachable only through an
+    /// `AdmittedLegacyOperation`, which is minted under the registry fence and
+    /// already proves the exact current owner, a live capability, and retained
+    /// policy. Rechecking would read peer state a second time, outside the
+    /// linearization point that authorized the call.
     pub(super) fn install_legacy_realtime_flow(&self) -> bool {
-        if !self.is_application_admitted() {
-            return false;
-        }
         let worker = self.session.lock().clone();
         let task = self.endpoint_auth.lock().clone();
         let Some((worker, task)) = worker.zip(task) else {
@@ -518,15 +539,19 @@ impl PeerConnection {
         true
     }
 
+    /// The paired ports for the retained legacy real-time flow.
+    ///
+    /// Admission is not rechecked, for the same reason as
+    /// [`Self::install_legacy_realtime_flow`]: the only caller is the registry
+    /// witness, which already established it. The pair is returned together so
+    /// the witness can bind it into one owned operation rather than letting a
+    /// caller carry a loose worker and capability across an await.
     pub(super) fn realtime_flow_ports(
         &self,
     ) -> Option<(
         Arc<WebRtcConnectorWorker>,
         Arc<crate::connector::ConnectorRealtimeFlowCapability>,
     )> {
-        if !self.is_application_admitted() {
-            return None;
-        }
         let worker = self.session.lock().clone()?;
         let capability = self.realtime_flow.lock().clone()?;
         worker

@@ -1,28 +1,35 @@
 //! Hello → auth_response state machine.
 //!
+//! This file owns wire translation and peer lifecycle. It owns no
+//! cryptographic state: the context, both contributions, the transcript
+//! framing, the signing key, the one cached local proof, and the terminal
+//! state all belong to the exact current `EndpointAuthTask`. Nothing here
+//! draws a contribution, assembles a transcript, selects profile semantics,
+//! or signs.
+//!
 //! On data channel open:
-//!   - Local generates nonce + verification code.
+//!   - Reads the task's own single contribution and a verification code.
 //!   - Sends `hello { device_id, label, nonce, verification_code,
 //!     capabilities, app_version, features }`.
 //!   - Watchdog scheduled at `HANDSHAKE_TIMEOUT_MS`; up to three
 //!     hello retries on the [`HANDSHAKE_HELLO_RETRY_SCHEDULE_MS`].
 //!
 //! On inbound hello:
-//!   - Record peer's contribution + verification code.
-//!   - Build the Arc 04 endpoint-auth transcript — length-prefixed
-//!     fields under `ENDPOINT_AUTH_DOMAIN_TAG`: mesh context, fixed
-//!     crypto profile, signer role, both device IDs, both contributions,
-//!     and both endpoints' DTLS fingerprints, every paired field in
-//!     role-canonical order — and ed25519-sign it.
-//!   - Reply with `auth_response { signature }`.
-//!   - A hello arriving after this channel is already authenticated is a
-//!     retransmission: the stored contribution is reused and peer state
-//!     is left untouched, but the reply is still sent.
+//!   - Hand the typed peer contribution to the exact current task first,
+//!     before recording anything from the frame, and send back the proof
+//!     it returns.
+//!   - The task classifies the Hello: a first binding, an exact
+//!     retransmission answered from the cached proof with no draw and no
+//!     second signature, or a conflicting value that is a typed terminal
+//!     failure for that exact task.
+//!   - Only a first binding records the peer's label, verification code,
+//!     features, and capabilities, under the exact-current owner fence. A
+//!     retransmission is answered without adopting any of them.
 //!
 //! On inbound auth_response:
-//!   - Reconstruct the same transcript, recompute *our* half, and verify
-//!     both halves through the exact current `EndpointAuthTask`. A
-//!     one-directional proof is not accepted as mutual.
+//!   - Hand the wire signature to the exact current task, which verifies
+//!     it against the transcript it already built. A one-directional
+//!     proof is not accepted as mutual.
 //!   - On success: install the `AuthenticatedChannelCapability` on the
 //!     peer *before* any legacy admission state, emit `PeerAuthenticated`,
 //!     decide approval (roster auto-approve or wait for user), send
@@ -60,15 +67,6 @@ use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::{NetworkState, PeerOwnerToken};
 use super::{phase, send_to_peer_owner};
 
-/// Generate a fresh contribution: 32 CSPRNG bytes, base32-lowercase.
-///
-/// This is the endpoint-auth contribution as well as the legacy handshake
-/// nonce; the type keeps the two from drifting apart, and keeps the value
-/// unconstructible except from a draw.
-fn fresh_nonce() -> crate::endpoint_auth::LocalContribution {
-    crate::endpoint_auth::LocalContribution::generate()
-}
-
 /// Kick off the handshake — called once the data channel opens.
 /// Sends the first hello and schedules the timeout watchdog.
 pub(super) async fn initiate(
@@ -84,7 +82,11 @@ pub(super) async fn initiate(
         return;
     }
     let device_id = owner.device_id();
-    let nonce = fresh_nonce();
+    // The contribution on the wire is the task's own single draw, read out
+    // rather than generated here. The task signs and verifies against the value
+    // it drew, so a second draw made at this boundary would put a contribution
+    // on the wire that this endpoint's own transcript does not contain.
+    let contribution = auth_task.local_contribution();
     let code = verification::generate_code();
     let caps = state
         .rpc
@@ -96,22 +98,27 @@ pub(super) async fn initiate(
         protocol: PROTOCOL_VERSION,
         device_id: state.identity.public_id().to_string(),
         label: state.identity.label().to_string(),
-        nonce: nonce.as_str().to_owned(),
+        nonce: contribution,
         verification_code: code.clone(),
         capabilities: Some(caps),
         max_connections: None,
         features: ADVERTISED_FEATURES.iter().map(|s| s.to_string()).collect(),
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
-    if let Some(peer) = state.peers.get_if_current(owner) {
+    // `with_current` rather than `get_if_current`, for the same reason as the
+    // first-Hello metadata write below: this is a synchronous multi-field write
+    // that must linearize against registry replacement, not merely observe that
+    // the owner was current a moment ago. There is no await inside, so
+    // replacement orders strictly before or after the whole block and a peer
+    // replaced after the lookup cannot be started into Handshaking.
+    state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
         data.status = PeerStatus::Handshaking;
-        data.nonce_sent = Some(nonce);
         data.verification_code_sent = Some(code.clone());
         data.handshake_started_at = Some(Instant::now());
         data.hello_attempt = 1;
         data.diag.hellos_sent += 1;
-    }
+    });
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "handshake",
@@ -137,10 +144,12 @@ pub(super) async fn initiate(
 
 /// Re-send the same hello at each tick of
 /// [`HANDSHAKE_HELLO_RETRY_SCHEDULE_MS`] until the peer authenticates
-/// or the watchdog tears down. Replaying the hello is safe: the
-/// receiver overwrites its `nonce_received` slot unconditionally and
-/// the signature in `auth_response` is deterministic, so a duplicate
-/// just yields a duplicate (idempotent) reply.
+/// or the watchdog tears down. Replaying the hello is safe because the
+/// contribution it carries is the task's one immutable draw: the
+/// receiver's task recognises the exact duplicate and answers from its
+/// cached proof, without a new draw, a rebuilt transcript, or a second
+/// signature. Idempotence is a property of the task, not of a slot
+/// this path overwrites.
 fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello: MeshMessage) {
     tokio::spawn(async move {
         let device_id = owner.device_id().to_string();
@@ -226,6 +235,32 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
         return;
     }
 
+    // Profile first, before any proof work. A peer that does not advertise the
+    // closed endpoint-auth profile has no agreed transcript, so nothing it
+    // sends can be verified and nothing we send it can be verified either.
+    // Refusing here means no contribution is bound, no transcript is built and
+    // no signature is computed for an unauthenticatable peer. There is no
+    // fallback: an older peer fails closed rather than being offered anything
+    // weaker, which is the whole point of advertising the profile at all.
+    if let Err(error) = crate::endpoint_auth::negotiate_profile(&hello.features) {
+        state.log_diag_with(
+            crate::events::DiagLevel::Error,
+            "handshake",
+            format!(
+                "hello from {} does not advertise the endpoint-auth profile — dropping",
+                super::short_peer(device_id)
+            ),
+            serde_json::json!({
+                "peer": device_id,
+                "error": format!("{error:?}"),
+                "required": crate::protocol::features::Feature::ENDPOINT_AUTH_V1,
+            }),
+        );
+        warn!(peer = %device_id, "endpoint-auth profile not advertised: {error:?} — dropping");
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
+        return;
+    }
+
     // The peer's contribution must arrive in its exact canonical encoding. A
     // short or non-canonical value cannot carry a full-width draw, and since
     // freshness — not the channel binding — is what separates two channels
@@ -238,148 +273,86 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
         return;
     };
 
-    // A Hello that arrives after this channel is already authenticated is a
-    // retransmission, not a new attempt. Adopting its contribution would
-    // rewrite the transcript underneath a completed proof, so the stored one
-    // is reused and peer state is left alone. We still fall through and re-send
-    // an AuthResponse, because the retransmission usually means ours was lost.
-    let already_authenticated = state
-        .peers
-        .get_if_current(owner)
-        .is_some_and(|p| p.has_authenticated_channel());
-    let peer_contribution = if already_authenticated {
-        let stored = state
-            .peers
-            .get_if_current(owner)
-            .and_then(|p| p.state.read().nonce_received.clone());
-        let Some(stored) = stored else {
-            warn!(peer = %device_id, "authenticated peer has no recorded contribution — dropping");
-            super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-            return;
-        };
-        stored
-    } else {
-        peer_contribution
-    };
-
-    // Record the peer's nonce / verification code and capabilities.
-    if let Some(peer) = state
-        .peers
-        .get_if_current(owner)
-        .filter(|_| !already_authenticated)
-    {
-        let mut data = peer.state.write();
-        data.nonce_received = Some(peer_contribution.clone());
-        data.verification_code_received = Some(hello.verification_code.clone());
-        data.label = hello.label.clone();
-        // The advertised feature set is the sender-side gate for every
-        // optional frame kind (acked channel delivery, governance wire,
-        // …) — record it, or `peer_supports` has nothing to consult.
-        data.features = hello.features.clone();
-        if let Some(caps) = &hello.capabilities {
-            data.capabilities = Some(caps.clone());
-        }
-    }
-
-    state.log_diag_with(
-        crate::events::DiagLevel::Debug,
-        "handshake",
-        format!(
-            "hello received from {} (label: {:?}, code: {})",
-            super::short_peer(device_id),
-            hello.label,
-            hello.verification_code,
-        ),
-        serde_json::json!({
-            "peer": device_id,
-            "label": hello.label,
-            "code": hello.verification_code,
-        }),
-    );
-
-    // Bind the signed handshake to this DTLS channel: fold in the fingerprint
-    // of the certificate we present here. The initiator verifies it against
-    // the fingerprint it observes on its end of the channel, so a
-    // signaling-path MITM that terminates DTLS on each leg (presenting its own
-    // cert) makes the two disagree and the signature fails. Fail closed if the
-    // transport can't surface it — dropping is safer than sending an unbound
-    // signature an interceptor could relay unmodified.
-    let Some(session) = state
-        .peers
-        .get_if_current(owner)
-        .and_then(|p| p.session.lock().clone())
-    else {
-        // On an already-authenticated channel this hello is a retransmission,
-        // and failing to build the *reply* is not grounds to tear down a peer
-        // whose proof already succeeded. Only a first attempt fails closed.
-        if already_authenticated {
-            debug!(peer = %device_id, "no session for a hello retransmission — leaving the authenticated peer alone");
-            return;
-        }
-        warn!(peer = %device_id, "no transport session at hello — cannot channel-bind, dropping");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    let Some(local_fingerprint) = session.local_fingerprint().await else {
-        if already_authenticated {
-            debug!(peer = %device_id, "no local fingerprint for a hello retransmission — leaving the authenticated peer alone");
-            return;
-        }
-        warn!(peer = %device_id, "no local DTLS fingerprint — refusing to send an unbound auth response");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    // Both endpoints' certificates are bound, in role-canonical order, so the
-    // transcript commits to the pair rather than only to the signer's own
-    // certificate. A signer-only binding leaves the verifier's endpoint
-    // uncommitted.
-    let Some(remote_fingerprint) = session.remote_fingerprint().await else {
-        if already_authenticated {
-            debug!(peer = %device_id, "no remote fingerprint for a hello retransmission — leaving the authenticated peer alone");
-            return;
-        }
-        warn!(peer = %device_id, "no remote DTLS fingerprint — refusing to send a half-bound auth response");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    // Our own contribution must already exist: the transcript is mutual, and
-    // signing it without our half would prove only one direction.
-    // Borrowed only long enough to copy the encoded form: the typed value
-    // stays in place so this attempt's completion still consumes it. Hello
-    // retries within one attempt therefore reuse the same stored draw.
-    let Some(local_contribution) = state.peers.get_if_current(owner).and_then(|p| {
-        p.state
-            .read()
-            .nonce_sent
-            .as_ref()
-            .map(|c| c.as_str().to_owned())
-    }) else {
-        warn!(peer = %device_id, "no local contribution at hello — refusing to sign a one-sided transcript");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    if state.peers.get_if_current(owner).is_none() {
-        return;
-    }
-
-    // Build the Arc 04 endpoint-auth transcript and reply. The legacy
-    // `SIGN_DOMAIN_TAG` payload is deliberately not sent: domain separation
+    // Hand the typed contribution to the exact current task *before* recording
+    // anything from this frame. The channel binding, the transcript, the role
+    // ordering, the profile, and the signature all belong to the task — this
+    // path translates wire values and nothing else. The legacy
+    // `SIGN_DOMAIN_TAG` payload is deliberately never sent: domain separation
     // means a peer that still speaks the old format simply fails to verify,
     // rather than being offered a weaker format it could select.
-    let local_device_id = state.identity.public_id().to_string();
-    let remote_device_id = signing::pubkey_part(device_id).to_string();
-    let payload = crate::endpoint_auth::EndpointAuthAttempt::transcript_bytes(
-        &state.network_id,
-        crate::endpoint_auth::EndpointAuthProfile::V1Ed25519Dtls,
-        crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_device_id, &remote_device_id),
-        &local_device_id,
-        &remote_device_id,
-        &local_contribution,
-        peer_contribution.as_str(),
-        &local_fingerprint,
-        &remote_fingerprint,
-    );
-    let signature = signing::sign_with(state.identity.signing_key(), &payload);
+    let Some(task) = state
+        .peers
+        .get_if_current(owner)
+        .and_then(|p| p.endpoint_auth_task())
+    else {
+        warn!(peer = %device_id, "no endpoint-auth task at hello — dropping");
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
+        return;
+    };
+    // Whether this Hello is the first one or a retransmission is the task's
+    // answer, decided against the contribution it actually bound — never
+    // re-derived here from engine state. A conflicting value has already retired
+    // this exact task inside `accept_peer_hello` and is terminal.
+    let accepted = match task.accept_peer_hello(peer_contribution) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            warn!(peer = %device_id, "endpoint-auth task refused the peer contribution: {error:?}");
+            super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
+            return;
+        }
+    };
+    let signature = accepted.proof().as_str().to_owned();
+
+    // Peer-supplied metadata belongs to the Hello that established this
+    // attempt. A retransmission carries the same contribution but is otherwise
+    // attacker-controlled input, so adopting its label, code, features, or
+    // capabilities would let a late frame rewrite the identity of an attempt
+    // that is already bound — or already promoted — while the proof it gets
+    // back is the cached one. Only the first binding records; the classification
+    // is matched, never inferred from peer state.
+    match accepted {
+        crate::endpoint_auth::AcceptedPeerHello::FirstBinding(_) => {
+            // `with_current` rather than `get_if_current`, because this write
+            // must linearize against registry replacement rather than merely
+            // observe that the owner was current a moment ago. There is no
+            // await inside, so replacement orders strictly before or after the
+            // whole block, and a peer replaced after the task call cannot
+            // receive the old frame's metadata.
+            state.peers.with_current(owner, |peer| {
+                let mut data = peer.state.write();
+                data.verification_code_received = Some(hello.verification_code.clone());
+                data.label = hello.label.clone();
+                // The advertised feature set is the sender-side gate for every
+                // optional frame kind (acked channel delivery, governance wire,
+                // …) — record it, or `peer_supports` has nothing to consult.
+                data.features = hello.features.clone();
+                if let Some(caps) = &hello.capabilities {
+                    data.capabilities = Some(caps.clone());
+                }
+            });
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "handshake",
+                format!(
+                    "hello received from {} (label: {:?}, code: {})",
+                    super::short_peer(device_id),
+                    hello.label,
+                    hello.verification_code,
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "label": hello.label,
+                    "code": hello.verification_code,
+                }),
+            );
+        }
+        crate::endpoint_auth::AcceptedPeerHello::ExactDuplicate(_) => {
+            debug!(
+                peer = %device_id,
+                "retransmitted hello: replying from the cached proof without adopting its metadata"
+            );
+        }
+    }
     if let Err(e) = send_to_peer_owner(
         state,
         owner,
@@ -415,11 +388,11 @@ pub async fn on_auth_response(
     // rather than by which side is local — so both endpoints derive identical
     // bytes. Domain separation from the legacy `SIGN_DOMAIN_TAG` payload means
     // an Arc 03 signature simply fails here; it is not an accepted fallback.
-    // `nonce_sent` stays owned by per-peer state for the whole connector
-    // attempt; only its encoded form is copied out. Consuming it here would
-    // open a retry race — a retransmitted or delayed Hello would then find no
-    // local contribution and tear down a peer whose proof is valid. Single
-    // promotion is enforced by the move-only handoff instead.
+    // Neither contribution is held in per-peer state. Both belong to the task,
+    // which keeps its own draw and its bound peer value for its whole life,
+    // including after promotion — so a retransmitted or delayed Hello still
+    // finds the attempt it belongs to instead of tearing down a peer whose
+    // proof is valid. Single promotion is enforced by the move-only handoff.
     // Idempotence for sequential retransmission, checked before any transport
     // or signing work. Each connector has one event-pump task that awaits an
     // event before taking the next, so a duplicate AuthResponse on this channel
@@ -436,54 +409,15 @@ pub async fn on_auth_response(
         debug!(peer = %device_id, "ignoring duplicate auth_response for an already authenticated channel");
         return;
     }
-    let (my_nonce, peer_nonce, peer_label, verification_code) = {
+    let (peer_label, verification_code) = {
         let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let data = peer.state.read();
         (
-            data.nonce_sent.as_ref().map(|c| c.as_str().to_owned()),
-            data.nonce_received.clone(),
             data.label.clone(),
             data.verification_code_received.clone().unwrap_or_default(),
         )
-    };
-    let Some(my_nonce) = my_nonce else {
-        warn!(peer = %device_id, "auth_response without an unconsumed local contribution — no hello sent, or this attempt already completed");
-        return;
-    };
-    // Both contributions are required. Verifying with only ours would leave
-    // the peer's freshness out of the transcript, and freshness is what
-    // separates two channels that share a certificate.
-    let Some(peer_nonce) = peer_nonce else {
-        warn!(peer = %device_id, "auth_response before the peer's hello — no peer contribution to bind");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    // Reconstruct the peer's channel binding: the DTLS fingerprint we observe
-    // on our end of the channel. The peer signed the fingerprint of the cert
-    // it presented; WebRTC guarantees that equals what we observe here unless
-    // DTLS was re-terminated in the middle — in which case the fingerprints
-    // differ and the signature won't verify below. Fail closed if the
-    // transport can't surface it.
-    let Some(session) = state
-        .peers
-        .get_if_current(owner)
-        .and_then(|p| p.session.lock().clone())
-    else {
-        warn!(peer = %device_id, "no transport session at auth_response — cannot verify channel binding, dropping");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    let Some(remote_fingerprint) = session.remote_fingerprint().await else {
-        warn!(peer = %device_id, "no remote DTLS fingerprint — cannot verify channel binding, dropping");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
-    };
-    let Some(local_fingerprint) = session.local_fingerprint().await else {
-        warn!(peer = %device_id, "no local DTLS fingerprint — cannot verify the bound pair, dropping");
-        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-        return;
     };
     // The endpoint-auth task for the *exact current* connector. A task from a
     // replaced channel cannot promote: because the certificate-fingerprint
@@ -499,50 +433,27 @@ pub async fn on_auth_response(
         return;
     };
 
-    let local_device_id = state.identity.public_id().to_string();
-    let remote_device_id = signing::pubkey_part(device_id).to_string();
-    let profile = crate::endpoint_auth::EndpointAuthProfile::V1Ed25519Dtls;
-    // Recompute our own half. Proving only the peer's half would let a
-    // one-directional proof masquerade as mutual authentication.
-    let local_signature = signing::sign_with(
-        state.identity.signing_key(),
-        &crate::endpoint_auth::EndpointAuthAttempt::transcript_bytes(
-            &state.network_id,
-            profile,
-            crate::endpoint_auth::EndpointAuthAttempt::role_of(&local_device_id, &remote_device_id),
-            &local_device_id,
-            &remote_device_id,
-            &my_nonce,
-            peer_nonce.as_str(),
-            &local_fingerprint,
-            &remote_fingerprint,
-        ),
-    );
-    let Some(peer) = state.peers.get_if_current(owner) else {
+    // The task must be the one built for *this* mesh and *this* peer. Ownership
+    // of the current connector is not the same fact: a task is created with an
+    // immutable context, and this is where the engine states that the entry it
+    // is about to promote is the entry that context names. The remote id is
+    // derived exactly as task creation derives it, so the comparison is against
+    // the same canonical form the context stored rather than a display spelling.
+    // Fail closed with no fallback: a task whose context does not match cannot
+    // be corrected here, only refused.
+    if !auth_task.context_matches(&state.network_id, crate::signing::pubkey_part(device_id)) {
+        warn!(peer = %device_id, "endpoint-auth task authenticates a different mesh or peer — dropping");
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
-    };
-    // The typed local contribution is *borrowed* from per-peer state, never
-    // moved out, so a Hello retransmission can still re-sign this attempt.
-    // The read guard is held only across synchronous work.
-    let outcome = {
-        let data = peer.state.read();
-        data.nonce_sent.as_ref().map(|my_contribution| {
-            auth_task.authenticate(
-                &state.network_id,
-                profile,
-                &local_device_id,
-                &remote_device_id,
-                my_contribution,
-                &peer_nonce,
-                &local_fingerprint,
-                &remote_fingerprint,
-                &local_signature,
-                &resp.signature,
-            )
-        })
-    };
-    let capability = match outcome {
-        Some(Ok(capability)) => capability,
+    }
+
+    // The task owns both halves. It already produced and cached our own proof
+    // when it bound the peer's contribution, and it holds the context, the
+    // binding, and the transcript, so this path hands it the wire signature and
+    // nothing else. There is no fingerprint fetch, no transcript assembly, and
+    // no signing here.
+    let capability = match auth_task.accept_peer_proof(&resp.signature) {
+        Ok(capability) => capability,
         // A retransmission that arrived after promotion completed. Each
         // connector has a single event-pump task that awaits one event before
         // taking the next, so frames on one channel are handled sequentially —
@@ -550,30 +461,29 @@ pub async fn on_auth_response(
         // the time it runs the install has already happened.
         //
         // This check deliberately does not claim to close a concurrent window.
-        // If two callers could ever run `authenticate` against one task in
-        // parallel, the loser could observe `ChannelNotCurrent` while the
-        // winner had taken the handoff but not yet installed, and would fail
-        // closed rather than being recognised as a duplicate. Making that safe
-        // needs promotion and install to be one atomic step, not a wider
-        // read-back here.
-        Some(Err(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent))
-            if peer.has_authenticated_channel() && peer.endpoint_auth_is_current(&auth_task) =>
+        // If two callers could ever run promotion against one task in parallel,
+        // the loser could observe `ChannelNotCurrent` while the winner had taken
+        // the handoff but not yet installed, and would fail closed rather than
+        // being recognised as a duplicate. Making that safe needs promotion and
+        // install to be one atomic step, not a wider read-back here.
+        Err(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent)
+            if state.peers.get_if_current(owner).is_some_and(|peer| {
+                peer.has_authenticated_channel() && peer.endpoint_auth_is_current(&auth_task)
+            }) =>
         {
             debug!(peer = %device_id, "duplicate auth_response after promotion completed");
             return;
         }
-        Some(Err(error)) => {
+        Err(error) => {
             warn!(peer = %device_id, "endpoint authentication refused: {error:?}");
-            super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
-            return;
-        }
-        None => {
-            warn!(peer = %device_id, "local contribution vanished mid-attempt — dropping");
             super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
             return;
         }
     };
 
+    let Some(peer) = state.peers.get_if_current(owner) else {
+        return;
+    };
     // Install the capability before any legacy admission state is set, so no
     // window exists in which `authenticated == true` without a live
     // authenticated channel behind it.
@@ -603,21 +513,24 @@ pub async fn on_auth_response(
     if super::governance::deny_if_evicted(state, owner).await {
         return;
     }
-    let (auto_approve, rostered, caps) = {
-        let Some(peer) = state.peers.get_if_current(owner) else {
-            return;
-        };
+    // Both network-global reads are hoisted above the peer write. Taking the
+    // roster and the config while holding a peer's state guard nests a
+    // `NetworkState` lock under a per-peer lock, which is the opposite of the
+    // order everything else uses, and it makes the policy decision and the
+    // policy write two separate atoms for no benefit — neither read depends on
+    // this peer's state.
+    let rostered = state.is_rostered(device_id);
+    let auto_approve = state.config.read().auto_approve || rostered;
+    // The write itself linearizes against registry replacement rather than
+    // merely observing that the owner was current a moment ago. It is
+    // synchronous, has no await inside, and carries only owned values out.
+    let Some(caps) = state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
         data.authenticated = true;
         data.status = PeerStatus::PendingApproval;
-        let rostered = state.is_rostered(device_id);
-        let cfg = state.config.read();
-        let auto = cfg.auto_approve || rostered;
-        (
-            auto,
-            rostered,
-            data.capabilities.clone().unwrap_or_default(),
-        )
+        data.capabilities.clone().unwrap_or_default()
+    }) else {
+        return;
     };
 
     state.log_diag_with(
@@ -727,17 +640,6 @@ async fn maybe_activate_after_check(
         // replacement is excluded. Replacement therefore linearizes before
         // this complete commit or after it.
         let roster_result = state.approve_roster_now(device_id, &label);
-        if !peer.install_legacy_realtime_flow() {
-            state.log_diag_with(
-                crate::events::DiagLevel::Debug,
-                "connector",
-                format!(
-                    "{} ACTIVE without an admitted connector-native real-time flow",
-                    super::short_peer(device_id)
-                ),
-                serde_json::json!({ "peer": device_id }),
-            );
-        }
         state.log_diag_with(
             crate::events::DiagLevel::Info,
             "peer",
@@ -755,6 +657,28 @@ async fn maybe_activate_after_check(
     }) else {
         return;
     };
+
+    // Best-effort, and deliberately *after* the Active commit released the
+    // registry fence. The real-time install now needs an admitted witness, and
+    // minting one re-enters the same mutation lock — doing it inside the commit
+    // closure would deadlock on a non-reentrant lock. Splitting it costs
+    // nothing: the peer is Active by the time this runs, so admission is
+    // established, and a replacement in between simply yields no witness and no
+    // flow, which is the same outcome as a refused install.
+    let installed = state
+        .peers
+        .with_admitted_current(owner, |admitted| admitted.install_legacy_realtime_flow());
+    if installed != Some(true) {
+        state.log_diag_with(
+            crate::events::DiagLevel::Debug,
+            "connector",
+            format!(
+                "{} ACTIVE without an admitted connector-native real-time flow",
+                super::short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id }),
+        );
+    }
 
     if let Err(e) = roster_result {
         state.log_diag(
@@ -889,51 +813,192 @@ mod tests {
         );
     }
 
+    // The one-sided-transcript control that stood here worked by writing a
+    // contribution pair into peer state, which no longer exists: the pair
+    // belongs to the Endpoint Auth Task. Its substance moved with it, to
+    // `endpoint_auth::task::v4_arc04b_proof_before_any_peer_contribution_is_refused`.
+    // The delayed-hello control did not move — it is restored below, against the
+    // real handler, because the property it holds is an engine one: what a
+    // retransmission is allowed to write.
+
+    /// A Hello carrying an exact contribution plus every field a late frame
+    /// could try to rewrite.
+    fn hello_carrying(
+        device_id: &str,
+        contribution: &str,
+        label: &str,
+        code: &str,
+        feature: &str,
+        advertise_capabilities: bool,
+    ) -> HelloMessage {
+        HelloMessage {
+            protocol: PROTOCOL_VERSION,
+            device_id: device_id.to_string(),
+            label: label.to_string(),
+            nonce: contribution.to_string(),
+            verification_code: code.to_string(),
+            capabilities: if advertise_capabilities {
+                Some(Default::default())
+            } else {
+                None
+            },
+            max_connections: None,
+            // Every well-formed peer advertises the closed endpoint-auth
+            // profile alongside whatever else it supports; without it the
+            // handshake now fails closed before any proof work. `feature` is
+            // the id each control varies, so both are carried here.
+            features: vec![
+                crate::protocol::features::Feature::ENDPOINT_AUTH_V1.to_string(),
+                feature.to_string(),
+            ],
+            app_version: None,
+        }
+    }
+
+    /// The same fixture with the endpoint-auth profile deliberately absent.
+    fn hello_without_endpoint_auth_profile(device_id: &str, contribution: &str) -> HelloMessage {
+        HelloMessage {
+            protocol: PROTOCOL_VERSION,
+            device_id: device_id.to_string(),
+            label: "unadvertised".to_string(),
+            nonce: contribution.to_string(),
+            verification_code: "zzz999".to_string(),
+            capabilities: None,
+            max_connections: None,
+            // An older peer: it speaks other features, just not this profile.
+            features: vec![crate::protocol::features::Feature::TYPED_CHANNELS.to_string()],
+            app_version: None,
+        }
+    }
+
+    #[test]
+    fn v4_arc04c_profile_negotiation_refuses_an_unadvertised_peer() {
+        use crate::protocol::features::Feature;
+
+        // Non-vacuity: the advertised set really does resolve, so the refusal
+        // below is the absence of the id and not a predicate that never says
+        // yes. Both directions are asserted.
+        assert_eq!(
+            crate::endpoint_auth::negotiate_profile(&[
+                Feature::ENDPOINT_AUTH_V1.to_string(),
+                Feature::TYPED_CHANNELS.to_string(),
+            ]),
+            Ok(crate::endpoint_auth::EndpointAuthProfile::V1Ed25519Dtls),
+            "a peer advertising the profile resolves to the one closed profile"
+        );
+        assert_eq!(
+            crate::endpoint_auth::negotiate_profile(&[Feature::TYPED_CHANNELS.to_string()]),
+            Err(crate::endpoint_auth::EndpointAuthError::IncompatibleProfile),
+            "a peer that speaks other features but not this profile is refused"
+        );
+        assert_eq!(
+            crate::endpoint_auth::negotiate_profile(&[]),
+            Err(crate::endpoint_auth::EndpointAuthError::IncompatibleProfile),
+            "an empty advertisement is refused, not defaulted"
+        );
+        // Exact-string matching: a near-miss must not resolve, or the id would
+        // be an invitation to improvise rather than a closed selector.
+        assert_eq!(
+            crate::endpoint_auth::negotiate_profile(&["endpoint_auth_v2".to_string()]),
+            Err(crate::endpoint_auth::EndpointAuthError::IncompatibleProfile),
+            "no forward-compatible guessing: an unknown id is not this profile"
+        );
+        assert!(
+            crate::protocol::features::ADVERTISED_FEATURES.contains(&Feature::ENDPOINT_AUTH_V1),
+            "this build must advertise what it requires, or two MyOwnMesh peers \
+             could never authenticate each other"
+        );
+    }
+
     #[tokio::test]
-    async fn v4_arc04_delayed_hello_after_promotion_does_not_rewrite_the_attempt() {
-        // A hello that arrives after this channel is authenticated is a
-        // retransmission. Adopting its contribution would rewrite the
-        // transcript underneath a completed proof, and failing to build the
-        // reply must not tear down a peer whose proof already succeeded.
-        let state = crate::engine::build_test_state("arc04-delayed-hello");
+    async fn v4_arc04c_hello_without_the_profile_is_refused_before_any_proof_work() {
+        // The live-handler half. An unadvertised peer must be dropped before a
+        // contribution is bound, so no transcript exists and no proof is
+        // computed for a peer that could never verify one.
+        let state = crate::engine::build_test_state("arc04c-profile-refusal");
         crate::engine::insert_session_less_peer(&state, "peer", None);
         let owner = state.peers.owner("peer").expect("installed peer owner");
-        let settled = crate::endpoint_auth::LocalContribution::generate();
-        let settled_peer = crate::endpoint_auth::PeerContribution::from_wire(
-            crate::endpoint_auth::LocalContribution::generate().as_str(),
-        )
-        .expect("a generated draw is canonical");
-        {
-            let peer = state.peers.get("peer").expect("peer is installed");
-            let mut data = peer.state.write();
-            data.nonce_sent = Some(settled);
-            data.nonce_received = Some(settled_peer.clone());
-            data.label = "settled-label".to_string();
-            data.verification_code_received = Some("aaa111".to_string());
-        }
-        let peer = state.peers.get("peer").expect("peer is installed");
-        peer.install_authenticated_channel_for_test();
-        assert!(
-            peer.has_authenticated_channel(),
-            "non-vacuity: the attempt really is complete before the delayed hello"
-        );
+        let contribution = crate::endpoint_auth::LocalContribution::generate();
 
-        // A late hello carrying a *different* contribution and label.
-        let intruding = crate::endpoint_auth::LocalContribution::generate();
         on_hello(
             &state,
             &owner,
-            HelloMessage {
-                protocol: PROTOCOL_VERSION,
-                device_id: owner.device_id().to_string(),
-                label: "rewritten-label".to_string(),
-                nonce: intruding.as_str().to_string(),
-                verification_code: "zzz999".to_string(),
-                capabilities: None,
-                max_connections: None,
-                features: Vec::new(),
-                app_version: None,
-            },
+            hello_without_endpoint_auth_profile(owner.device_id(), contribution.as_str()),
+        )
+        .await;
+
+        assert!(
+            state.peers.get_if_current(&owner).is_none(),
+            "an unadvertised peer is dropped rather than authenticated"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04b_duplicate_hello_replies_without_adopting_its_metadata() {
+        // Migrated delayed-Hello control, restated for task-owned contributions.
+        // A retransmission carries the bound contribution, so it is answered
+        // from the cached proof — but everything else in that frame is still
+        // attacker-controlled input. Adopting it would let a late Hello rewrite
+        // the identity of an attempt that is already bound while the proof it
+        // receives is the one the first Hello earned.
+        let state = crate::engine::build_test_state("arc04-duplicate-hello-metadata");
+        let task = Arc::new(crate::endpoint_auth::task_for_test(
+            crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
+        ));
+        crate::engine::install_peer(
+            &state.peers,
+            Arc::new(crate::engine::PeerConnection::with_endpoint_auth_for_test(
+                "peer".to_string(),
+                Arc::clone(&task),
+            )),
+        );
+        let owner = state.peers.owner("peer").expect("installed peer owner");
+
+        let contribution = crate::endpoint_auth::LocalContribution::generate();
+        on_hello(
+            &state,
+            &owner,
+            hello_carrying(
+                "peer",
+                contribution.as_str(),
+                "settled-label",
+                "aaa111",
+                "settled-feature",
+                false,
+            ),
+        )
+        .await;
+
+        {
+            let peer = state
+                .peers
+                .get_if_current(&owner)
+                .expect("the first hello keeps the peer");
+            let data = peer.state.read();
+            assert_eq!(
+                data.label, "settled-label",
+                "non-vacuity: the first hello really did establish this metadata"
+            );
+            assert_eq!(data.verification_code_received.as_deref(), Some("aaa111"));
+            assert_eq!(data.features, vec!["settled-feature".to_string()]);
+            assert!(data.capabilities.is_none());
+        }
+        let draws = task.draw_count();
+        let signatures = task.signature_count();
+
+        // The same contribution — so the task classifies this a retransmission —
+        // with every other field changed.
+        on_hello(
+            &state,
+            &owner,
+            hello_carrying(
+                "peer",
+                contribution.as_str(),
+                "rewritten-label",
+                "zzz999",
+                "injected-feature",
+                true,
+            ),
         )
         .await;
 
@@ -941,74 +1006,161 @@ mod tests {
             .peers
             .get_if_current(&owner)
             .expect("a retransmitted hello must not tear the peer down");
-        assert!(
-            peer.has_authenticated_channel(),
-            "the exact current capability is preserved"
-        );
         let data = peer.state.read();
         assert_eq!(
-            data.nonce_received.as_ref().map(|c| c.as_str().to_owned()),
-            Some(settled_peer.as_str().to_owned()),
-            "the completed attempt's contribution must not be rewritten"
+            data.label, "settled-label",
+            "the first hello's label stands"
         );
-        assert_eq!(data.label, "settled-label", "nor its recorded label");
         assert_eq!(
             data.verification_code_received.as_deref(),
             Some("aaa111"),
-            "nor its verification code"
+            "and its verification code"
         );
-    }
-
-    #[tokio::test]
-    async fn v4_arc04_auth_response_before_our_hello_is_refused() {
-        // No local contribution has been drawn, so there is no attempt to
-        // complete and nothing can be promoted.
-        let state = crate::engine::build_test_state("arc04-auth-response-before-hello");
-        crate::engine::insert_session_less_peer(&state, "peer", None);
-        let owner = state.peers.owner("peer").expect("installed peer owner");
-        assert!(state
-            .peers
-            .get("peer")
-            .expect("peer is installed")
-            .state
-            .read()
-            .nonce_sent
-            .is_none());
-
-        on_auth_response(&state, &owner, auth_response("unsolicited")).await;
-
+        assert_eq!(
+            data.features,
+            vec!["settled-feature".to_string()],
+            "and its advertised feature set, which gates every optional frame kind"
+        );
         assert!(
-            !state
-                .peers
-                .get("peer")
-                .expect("peer is installed")
-                .has_authenticated_channel(),
-            "an unsolicited auth_response must never promote"
+            data.capabilities.is_none(),
+            "and a late frame cannot introduce capabilities the first never advertised"
+        );
+        drop(data);
+        // Ed25519 is deterministic, so equal proof bytes would prove nothing
+        // about re-signing. The counters do.
+        assert_eq!(task.draw_count(), draws, "no second draw");
+        assert_eq!(
+            task.signature_count(),
+            signatures,
+            "and no second signature"
         );
     }
 
     #[tokio::test]
-    async fn v4_arc04_auth_response_before_the_peers_hello_is_refused() {
-        // We drew our contribution, but the peer's has not arrived, so the
-        // transcript is missing a required field. Promotion must not occur.
-        let state = crate::engine::build_test_state("arc04-auth-response-before-peer-hello");
-        crate::engine::insert_session_less_peer(&state, "peer", None);
+    async fn v4_arc04b_conflicting_hello_is_terminal_and_writes_no_metadata() {
+        // The other classification: a different contribution is not a repeat,
+        // so it is terminal for that exact task and must leave the established
+        // metadata alone on its way out.
+        let state = crate::engine::build_test_state("arc04-conflicting-hello-metadata");
+        let task = Arc::new(crate::endpoint_auth::task_for_test(
+            crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
+        ));
+        crate::engine::install_peer(
+            &state.peers,
+            Arc::new(crate::engine::PeerConnection::with_endpoint_auth_for_test(
+                "peer".to_string(),
+                Arc::clone(&task),
+            )),
+        );
         let owner = state.peers.owner("peer").expect("installed peer owner");
-        {
-            let peer = state.peers.get("peer").expect("peer is installed");
-            let mut data = peer.state.write();
-            data.nonce_sent = Some(crate::endpoint_auth::LocalContribution::generate());
-            assert!(data.nonce_received.is_none());
-        }
 
-        on_auth_response(&state, &owner, auth_response("premature")).await;
+        on_hello(
+            &state,
+            &owner,
+            hello_carrying(
+                "peer",
+                crate::endpoint_auth::LocalContribution::generate().as_str(),
+                "settled-label",
+                "aaa111",
+                "settled-feature",
+                false,
+            ),
+        )
+        .await;
+        assert!(
+            state.peers.get_if_current(&owner).is_some(),
+            "non-vacuity: the first hello bound the attempt"
+        );
+
+        on_hello(
+            &state,
+            &owner,
+            hello_carrying(
+                "peer",
+                crate::endpoint_auth::LocalContribution::generate().as_str(),
+                "rewritten-label",
+                "zzz999",
+                "injected-feature",
+                true,
+            ),
+        )
+        .await;
+
+        assert!(task.is_retired(), "a conflicting contribution is terminal");
+        if let Some(peer) = state.peers.get("peer") {
+            let data = peer.state.read();
+            assert_eq!(data.label, "settled-label");
+            assert_eq!(data.verification_code_received.as_deref(), Some("aaa111"));
+            assert!(data.capabilities.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04c_auth_response_for_another_context_is_refused_before_promotion() {
+        // The task-context fence at the real handler. Everything else about this
+        // attempt is correct: the task binds the peer's contribution and the
+        // AuthResponse carries the genuine proof over that task's own transcript,
+        // signed by the exact remote key its context expects — so without the
+        // context check this promotes and installs. It must be refused because
+        // the task authenticates a different mesh and a different remote Device
+        // than the entry it is installed on.
+        let state = crate::engine::build_test_state("arc04c-auth-response-context-mismatch");
+        let task = Arc::new(crate::endpoint_auth::task_for_test(
+            crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
+        ));
+        crate::engine::install_peer(
+            &state.peers,
+            Arc::new(crate::engine::PeerConnection::with_endpoint_auth_for_test(
+                "peer".to_string(),
+                Arc::clone(&task),
+            )),
+        );
+        let owner = state.peers.owner("peer").expect("installed peer owner");
+        assert!(
+            !task.context_matches(&state.network_id, crate::signing::pubkey_part("peer")),
+            "non-vacuity: the fixture task really does authenticate another mesh and peer"
+        );
+
+        // The peer's half, over the task's own bound attempt.
+        let peer_contribution = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("a generated draw is canonical");
+        task.accept_peer_hello(peer_contribution.clone())
+            .expect("the first canonical contribution binds this attempt");
+        let proof = crate::endpoint_auth::peer_proof_for_test(
+            &task,
+            &peer_contribution,
+            &ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]),
+        );
+
+        on_auth_response(&state, &owner, auth_response(&proof)).await;
 
         assert!(
             state
                 .peers
                 .get("peer")
                 .is_none_or(|peer| !peer.has_authenticated_channel()),
-            "a one-sided transcript must never promote"
+            "a task built for another context must not promote this entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_auth_response_before_our_hello_is_refused() {
+        // No endpoint-auth task exists for this peer, so there is no attempt to
+        // complete and nothing can be promoted.
+        let state = crate::engine::build_test_state("arc04-auth-response-before-hello");
+        crate::engine::insert_session_less_peer(&state, "peer", None);
+        let owner = state.peers.owner("peer").expect("installed peer owner");
+
+        on_auth_response(&state, &owner, auth_response("unsolicited")).await;
+
+        assert!(
+            state
+                .peers
+                .get("peer")
+                .is_none_or(|peer| !peer.has_authenticated_channel()),
+            "an unsolicited auth_response must never promote"
         );
     }
 

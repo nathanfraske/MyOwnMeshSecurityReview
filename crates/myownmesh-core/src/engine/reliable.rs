@@ -144,19 +144,32 @@ pub(crate) async fn enqueue(
 /// speaks the acked contract. `None` = not sendable yet.
 fn link_ready(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
     let entry = state.peers.get(peer)?;
-    // Evaluated before the read guard is taken: the predicate reads peer state
-    // itself, and re-entering the lock here would risk deadlocking against a
-    // waiting writer.
-    let admitted = entry.is_application_admitted();
+    // Readiness is transport liveness only. Admission is deliberately *not*
+    // snapshotted here: this answer is read before the batch is collected and
+    // acted on after several awaits, so an admission decision taken at this
+    // point would be stale by the time anything is written. Each frame is
+    // authorized where it is actually sent, by the witness `send_to_peer`
+    // requires — so a peer that loses admission mid-flush stops sending there,
+    // not because a boolean read earlier happened to be false.
     let data = entry.state.read();
-    let up = admitted && data.data_channel_open;
-    if !up {
+    if !data.data_channel_open {
         return None;
     }
     Some(features::peer_supports(
         &data.features,
         features::Feature::RELIABLE_CHANNELS,
     ))
+}
+
+/// The transport-liveness answer, for controls that must state it explicitly.
+///
+/// Read-only and non-authoritative: it reports whether the link can carry
+/// frames, which is exactly the fact an outbound-admission control has to pin
+/// down before it can claim the refusal came from admission rather than from a
+/// link that was never up.
+#[cfg(test)]
+pub(super) fn link_ready_for_test(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
+    link_ready(state, peer)
 }
 
 /// Drain `peer`'s unsent entries onto the wire, in order. Safe to call
@@ -172,10 +185,11 @@ pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
 /// A replacement under the same public device id cannot receive this batch.
 pub(crate) async fn flush_peer_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
     let peer = owner.device_id();
+    // Transport liveness only, for the same reason as `link_ready`: the actual
+    // send consumes the admission witness.
     let acked_peer = state.peers.get_if_current(owner).and_then(|entry| {
-        let admitted = entry.is_application_admitted();
         let data = entry.state.read();
-        (admitted && data.data_channel_open)
+        data.data_channel_open
             .then(|| features::peer_supports(&data.features, features::Feature::RELIABLE_CHANNELS))
     });
     flush_peer_inner(state, peer, Some(owner), acked_peer).await;
@@ -429,8 +443,39 @@ mod tests {
         rx.try_recv().ok()
     }
 
-    #[test]
-    fn v4_arc03_reliable_flush_requires_authenticated_admission() {
+    /// One application-class send through the exact function `flush_peer_inner`
+    /// calls, asserted to be refused by the admission fence itself.
+    ///
+    /// Both halves matter: the error must be the fence's, and the fence must
+    /// mint no witness. A control that only checked the string would still pass
+    /// if some later layer happened to produce a similar message.
+    async fn assert_admission_refuses_the_flush_send(
+        state: &Arc<NetworkState>,
+        owner: &PeerOwnerToken,
+        frame: &MeshMessage,
+    ) {
+        let error = crate::engine::send_to_peer_owner(state, owner, frame)
+            .await
+            .expect_err("an unadmitted owner cannot carry application traffic");
+        assert!(
+            error
+                .to_string()
+                .contains("not admitted for application traffic"),
+            "the refusal must come from the admission fence, got: {error}"
+        );
+        assert!(
+            state.peers.with_admitted_current(owner, |_| ()).is_none(),
+            "and the fence must mint no witness for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_reliable_flush_requires_authenticated_admission() {
+        // Readiness and admission are now separate contracts: `link_ready`
+        // answers transport liveness only, and every frame is authorized where
+        // it is actually sent. So this fixture holds readiness *true* at every
+        // step and varies only admission — which makes each refusal below
+        // attributable to the gate rather than to a link that was never up.
         let state = build_test_state("arc03-reliable-admission");
         insert_session_less_peer(&state, "peer", None);
         {
@@ -438,9 +483,47 @@ mod tests {
             let mut data = peer.state.write();
             data.status = PeerStatus::Active;
             data.data_channel_open = true;
+            data.features = vec![features::Feature::RELIABLE_CHANNELS.to_string()];
             data.authenticated = false;
         }
-        assert_eq!(link_ready(&state, "peer"), None);
+        let owner = state.peers.owner("peer").expect("peer is installed");
+        let frame = MeshMessage::Channel {
+            channel: "reliable-negative".to_string(),
+            payload: serde_json::json!("must-not-send"),
+        };
+
+        // Unauthenticated: the link is ready and speaks the acked contract, and
+        // the send is still refused.
+        assert_eq!(
+            link_ready(&state, "peer"),
+            Some(true),
+            "non-vacuity: the link is ready and acked-capable before authentication"
+        );
+        assert_admission_refuses_the_flush_send(&state, &owner, &frame).await;
+
+        // The reliable path itself, not just the primitive underneath it:
+        // `enqueue`'s immediate flush runs `flush_peer` — the device-id branch,
+        // with `owner: None` — and readiness lets it reach the send, so the
+        // entry can only stay queued because admission refused it.
+        let (reply, mut waiter) = oneshot::channel();
+        enqueue(
+            &state,
+            "peer",
+            "reliable-negative",
+            serde_json::json!("must-not-send"),
+            None,
+            reply,
+        )
+        .await;
+        assert_eq!(
+            pending_total(&state),
+            1,
+            "the entry stays queued: a ready link could not carry it without admission"
+        );
+        assert!(
+            recv_now(&mut waiter).is_none(),
+            "and the caller is neither resolved nor failed — the entry is retriable"
+        );
 
         // The legacy bool alone is no longer sufficient: the Arc 04 gate
         // requires a live authenticated-channel capability, so this stays
@@ -453,19 +536,87 @@ mod tests {
             .state
             .write()
             .authenticated = true;
+        assert!(
+            state
+                .peers
+                .get("peer")
+                .expect("peer is installed")
+                .state
+                .read()
+                .is_admitted(),
+            "non-vacuity: legacy policy really does consider this peer admitted"
+        );
         assert_eq!(
             link_ready(&state, "peer"),
-            None,
-            "policy state without an installed capability must not open the link"
+            Some(true),
+            "readiness is unchanged, so it explains nothing about the refusal"
+        );
+        assert_admission_refuses_the_flush_send(&state, &owner, &frame).await;
+
+        // The exact-owner flush branch, driven explicitly this time, on the
+        // same still-queued entry.
+        flush_peer_owner(&state, &owner).await;
+        assert_eq!(
+            pending_total(&state),
+            1,
+            "policy alone does not drain the outbox either"
+        );
+        assert!(
+            recv_now(&mut waiter).is_none(),
+            "and the caller is still waiting"
         );
 
-        // With a real capability installed, the link opens.
+        // With a real capability installed, the same fence that refused twice
+        // now mints a witness for the exact peer. That is the layer advancing:
+        // admission opened, so neither negative above was a transport failure.
         state
             .peers
             .get("peer")
             .expect("peer is installed")
             .install_authenticated_channel_for_test();
-        assert_eq!(link_ready(&state, "peer"), Some(false));
+        assert_eq!(
+            link_ready(&state, "peer"),
+            Some(true),
+            "readiness still unchanged across the whole control"
+        );
+        assert_eq!(
+            state
+                .peers
+                .with_admitted_current(&owner, |admitted| admitted.device_id().to_string()),
+            Some("peer".to_string()),
+            "the admission fence now admits the exact peer"
+        );
+        // The send itself still cannot complete on this fixture, because
+        // `admit_application_operation` additionally requires a live connector
+        // worker and this peer has none by construction. That refusal is folded
+        // into the same `Option`, so it reports the same message — which is why
+        // the advance is asserted at the fence above rather than by comparing
+        // error strings.
+        assert!(
+            state.peers.admit_application_operation(&owner).is_none(),
+            "an admitted peer with no connector still has nothing to write through"
+        );
+        // Stated plainly rather than dressed up: this last flush also leaves the
+        // entry queued. Admission opened — the fence above says so — but a
+        // session-less fixture has no connector to write through, so what is
+        // proven here is that the entry stayed *retriable* across all three
+        // states, not that a send ever succeeded. The successful-send half of
+        // this contract belongs to a control with a live connector.
+        flush_peer_owner(&state, &owner).await;
+        assert_eq!(
+            pending_total(&state),
+            1,
+            "the entry is still queued and still retriable, not failed and not sent"
+        );
+        assert!(
+            recv_now(&mut waiter).is_none(),
+            "the caller has been neither resolved nor failed at any point"
+        );
+        assert_eq!(
+            state.traffic.snapshot().app_tx.frames,
+            0,
+            "no application frame left this node in any of the three states"
+        );
     }
 
     #[tokio::test]

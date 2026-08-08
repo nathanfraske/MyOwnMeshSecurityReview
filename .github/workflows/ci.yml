@@ -130,6 +130,122 @@ jobs:
             turn_selected_session_authenticates_endpoints_before_bidirectional_data \
             -- --nocapture --test-threads=1
 
+  # Arc 04 endpoint authentication is basal V4 behaviour, so its evidence must
+  # not be reachable only through the deprecated compatibility features. This
+  # job builds and runs it with `transport-lab` alone: no legacy-v1, no
+  # legacy-media. Deleting the LegacyV1 subtree must not delete the proof that
+  # the endpoint-auth profile gate, the channel binding, and the promotion fence
+  # hold. It also gives the transport-lab-only configuration its own
+  # `-D warnings` gate, which no other job provides.
+  arc04-endpoint-auth:
+    name: Arc 04 basal endpoint authentication
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: arc04-endpoint-auth
+
+      - name: Arc 04 compiler boundary controls
+        run: python3 scripts/check-v4-arc04-compiler-boundaries.py
+
+      - name: Arc 04 basal endpoint-auth controls (transport-lab only)
+        run: |
+          set -euo pipefail
+          # `cargo test` exits 0 when a filter matches nothing, so a renamed or
+          # deleted control would pass here silently and this whole step would
+          # be decorative. Every run is therefore parsed for three facts:
+          # exactly one test was selected, that exact name reported ok, and the
+          # summary is one passed with nothing failed and nothing ignored.
+          #
+          # `--nocapture` is deliberately not used: it interleaves test stdout
+          # into the `test <name> ... ok` line, which would make that parse
+          # unreliable. The Arc 03 native step keeps --nocapture for its
+          # human-readable evidence; this step is the machine-checked one.
+          run_exact_control() {
+            name="$1"
+            shift
+            log="$(mktemp)"
+            cargo test -p myownmesh-core --lib --features "transport-lab" \
+              "$name" -- --test-threads=1 "$@" | tee "$log"
+            grep -qx 'running 1 test' "$log" || {
+              echo "non-vacuity failure: '$name' selected no test, or more than one" >&2
+              exit 1
+            }
+            grep -qE "^test .*${name} \.\.\. ok\$" "$log" || {
+              echo "non-vacuity failure: '$name' did not report ok under that exact name" >&2
+              exit 1
+            }
+            grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored' "$log" || {
+              echo "non-vacuity failure: '$name' summary was not 1 passed / 0 failed / 0 ignored" >&2
+              exit 1
+            }
+          }
+
+          for control in \
+            v4_arc04c_profile_negotiation_refuses_an_unadvertised_peer \
+            v4_arc04c_hello_without_the_profile_is_refused_before_any_proof_work \
+            v4_arc04c_auth_response_for_another_context_is_refused_before_promotion \
+            v4_arc04b_record_carries_the_connector_stated_binding_context \
+            v4_arc04b_binding_requires_both_components_and_names_its_profile \
+            v4_arc04b_connector_incarnation_is_exact_identity_only \
+            v4_arc04c_inbound_media_without_capability_delivers_zero_units \
+            v4_arc04c_legacy_policy_alone_delivers_zero_media_units \
+            v4_arc04c_capability_without_legacy_policy_delivers_zero_media_units \
+            v4_arc04c_capability_plus_policy_delivers_exactly_one_media_unit \
+            v4_arc04c_pre_auth_unit_is_not_released_by_later_authentication \
+            v4_arc04c_replacement_before_admission_commit_delivers_nothing_through_the_replacement
+          do
+            run_exact_control "$control"
+          done
+
+      - name: Arc 04 native endpoint-auth controls (transport-lab only)
+        run: |
+          set -euo pipefail
+          run_exact_control() {
+            name="$1"
+            shift
+            log="$(mktemp)"
+            cargo test -p myownmesh-core --lib --features "transport-lab" \
+              "$name" -- --test-threads=1 "$@" | tee "$log"
+            grep -qx 'running 1 test' "$log" || {
+              echo "non-vacuity failure: '$name' selected no test, or more than one" >&2
+              exit 1
+            }
+            grep -qE "^test .*${name} \.\.\. ok\$" "$log" || {
+              echo "non-vacuity failure: '$name' did not report ok under that exact name" >&2
+              exit 1
+            }
+            grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored' "$log" || {
+              echo "non-vacuity failure: '$name' summary was not 1 passed / 0 failed / 0 ignored" >&2
+              exit 1
+            }
+          }
+
+          # Live two-connector controls. The positive twin runs first: if the
+          # fixture cannot bring a real link up at all, every negative below
+          # would pass for the wrong reason.
+          for control in \
+            v4_arc04_observed_fingerprint_promotes_through_the_live_handler \
+            v4_arc04_substituted_fingerprint_is_refused_by_the_live_handler \
+            v4_arc04d_missing_local_fingerprint_is_fail_closed_on_a_live_link \
+            v4_arc04d_missing_remote_fingerprint_is_fail_closed_on_a_live_link \
+            v4_arc04d_unadvertised_profile_is_refused_by_the_live_handler \
+            v4_arc04c_send_uses_the_captured_session_and_records_only_the_captured_peer \
+            v4_arc04c_connector_replacement_blocks_later_media_from_the_old_incarnation
+          do
+            run_exact_control "$control" --ignored
+          done
+
   # Validate the static-musl appliance daemons actually cross-compile on every
   # PR, not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
   # (NanoKVM-Pro) are the exact `cargo zigbuild` invocations release.yml ships,
