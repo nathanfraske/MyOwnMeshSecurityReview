@@ -1077,8 +1077,16 @@ def main() -> int:
         )
 
     remote_sdp_ingress_start = webrtc_source.find("pub(crate) async fn apply_remote_sdp")
+    # Delimited by the owned applier's definition, which is where
+    # `apply_remote_sdp` ends. The previous delimiter named the LegacyV1/test
+    # entry point `pub(crate) async fn apply_remote_description`, and that entry
+    # point was deliberately deleted in c02d966 — it bypassed this very ingress
+    # — so the delimiter has been dangling since. Naming the owned applier
+    # instead also survives a visibility change, which is the churn that broke
+    # it, and matches the marker the residual-ownership guard below already
+    # uses.
     remote_sdp_ingress_end = webrtc_source.find(
-        "pub(crate) async fn apply_remote_description", remote_sdp_ingress_start
+        "async fn apply_remote_description_owned", remote_sdp_ingress_start
     )
     remote_sdp_ingress = webrtc_source[
         remote_sdp_ingress_start:remote_sdp_ingress_end

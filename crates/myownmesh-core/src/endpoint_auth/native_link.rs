@@ -18,6 +18,13 @@
 //! proof commits to — so the fingerprint field is load-bearing rather than
 //! incidental: the negative fails *because* of the substitution, and the
 //! positive proves the same construction promotes when nothing is substituted.
+//!
+//! [`connect_before_engine_open`] is the second fixture, and it exists because
+//! [`connect`] performs the promotion itself. The open-path controls need the
+//! production engine arm to be the thing that promotes, so that fixture stops at
+//! the left connector's own native open callback and hands it over unconsumed.
+//! It is the fixture, not a re-implementation of the arm: it opens the link and
+//! nothing else.
 
 use super::contribution::{LocalContribution, PeerContribution};
 use super::transcript;
@@ -26,7 +33,9 @@ use crate::connector::EndpointAuthBinding;
 use crate::engine::state::NetworkState;
 use crate::protocol::handshake::AuthResponseMessage;
 use crate::transport::webrtc::WebRtcConnectorEventReceiver;
-use crate::transport::{DataChannelOpenOwnership, Role, TransportEvent, WebRtcConnectorWorker};
+use crate::transport::{
+    DataChannelOpenOwnership, Role, TransportEvent, WebRtcConnectorEvent, WebRtcConnectorWorker,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,7 +95,7 @@ async fn task_for_open_channel(
     EndpointAuthTask::begin(
         context,
         handoff,
-        LocalIdentitySigner::from_signing_key(state.identity.signing_key().clone()),
+        LocalIdentitySigner::for_identity(Arc::clone(&state.identity)),
     )
 }
 
@@ -213,6 +222,143 @@ pub(crate) async fn connect(
         right_auth,
         #[cfg(not(feature = "legacy-v1"))]
         _right_auth: right_auth,
+    }
+}
+
+/// A live link whose left data channel is open but **not yet promoted**.
+///
+/// [`connect`] cannot serve the open-path controls, because it performs the
+/// promotion itself: it confirms the left channel and builds the left task, so a
+/// control reusing it would find the connector already connected and the
+/// production arm would take its duplicate branch without ever installing a
+/// task. The positive twin would then prove nothing about installation, and the
+/// negative's "no task" assertion would have nothing to be discriminating
+/// against.
+///
+/// So this stops one step earlier. The left connector is live, its data channel
+/// is genuinely open, and its own native open callback is held here unconsumed —
+/// the real event, not one stamped by a fixture — so the engine's own
+/// `DataChannelOpen` arm can be driven with exactly what the native stack
+/// produced.
+pub(crate) struct LinkBeforeEngineOpen {
+    pub(crate) left: Arc<WebRtcConnectorWorker>,
+    /// Lifetime anchor. Dropping it stops the connector's event pump, which
+    /// would retire the very link the controls are asserting is live.
+    pub(crate) _left_events: WebRtcConnectorEventReceiver,
+    pub(crate) right: Arc<WebRtcConnectorWorker>,
+    pub(crate) _right_events: WebRtcConnectorEventReceiver,
+    /// The left connector's genuine `DataChannelOpen` callback, unconsumed.
+    ///
+    /// An `Option` so a caller can take the event out while the fixture — and
+    /// with it both event receivers — stays alive. Destructuring the fixture to
+    /// get at the event would drop those receivers, stopping the connectors'
+    /// event pumps at the exact moment the control is asserting the link is up.
+    left_open_event: Option<WebRtcConnectorEvent>,
+}
+
+impl LinkBeforeEngineOpen {
+    /// Take the genuine native open callback. Exactly once per fixture.
+    pub(crate) fn take_open_event(&mut self) -> WebRtcConnectorEvent {
+        self.left_open_event
+            .take()
+            .expect("the open callback is taken exactly once")
+    }
+
+    pub(crate) async fn close(self) {
+        for worker in [&self.left, &self.right] {
+            worker
+                .retire_and_close()
+                .await
+                .expect("native control connector closes");
+        }
+    }
+}
+
+/// Open a real offerer/answerer pair and stop at the left's open callback.
+///
+/// Neither side is promoted and no task is built: promotion is what the
+/// production engine arm is supposed to perform, so a fixture that performed it
+/// first would be standing in for the code under test.
+pub(crate) async fn connect_before_engine_open(
+    left_state: &Arc<NetworkState>,
+    right_state: &Arc<NetworkState>,
+) -> LinkBeforeEngineOpen {
+    let (left, mut left_events) = left_state
+        .transport
+        .open_connector_peer(
+            Role::Offerer,
+            &[],
+            &[],
+            left_state.peer_connection_resource_scope(),
+        )
+        .await
+        .expect("left connector opens");
+    let (right, mut right_events) = right_state
+        .transport
+        .open_connector_peer(
+            Role::Answerer,
+            &[],
+            &[],
+            right_state.peer_connection_resource_scope(),
+        )
+        .await
+        .expect("right connector opens");
+    let left = Arc::new(left);
+    let right = Arc::new(right);
+
+    // The production V4 ingress entry point, exactly as `connect` uses it.
+    let offer = left.create_offer().await.expect("create offer");
+    right
+        .apply_remote_sdp(offer.sdp_type, offer.sdp)
+        .await
+        .expect("apply offer");
+    let answer = right.create_answer().await.expect("create answer");
+    left.apply_remote_sdp(answer.sdp_type, answer.sdp)
+        .await
+        .expect("apply answer");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut left_open_event = None;
+    while left_open_event.is_none() && tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            event = left_events.recv() => {
+                let event = event.expect("left connector remains live");
+                // Classified before acceptance, never through it: `accept_event`
+                // consumes the value, and this is the one event the control has
+                // to deliver intact to the production handler.
+                if event.is_data_channel_open() {
+                    left_open_event = Some(event);
+                    continue;
+                }
+                if let Some(event) = left.accept_event(event) {
+                    let (event, _callback_resources) = event.into_parts();
+                    if let TransportEvent::LocalIceCandidate(Some(candidate)) = event {
+                        right.add_remote_candidate(candidate).await.expect("right accepts candidate");
+                    }
+                }
+            }
+            event = right_events.recv() => {
+                let event = event.expect("right connector remains live");
+                if let Some(event) = right.accept_event(event) {
+                    let (event, _callback_resources) = event.into_parts();
+                    // The right half is a live DTLS peer and nothing more. Its
+                    // own open callback is deliberately ignored: promoting it
+                    // would take a connected claim no control here asks for.
+                    if let TransportEvent::LocalIceCandidate(Some(candidate)) = event {
+                        left.add_remote_candidate(candidate).await.expect("left accepts candidate");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+
+    LinkBeforeEngineOpen {
+        left,
+        _left_events: left_events,
+        right,
+        _right_events: right_events,
+        left_open_event: Some(left_open_event.expect("left data channel opens")),
     }
 }
 

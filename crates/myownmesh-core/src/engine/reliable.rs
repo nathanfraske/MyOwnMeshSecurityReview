@@ -30,8 +30,17 @@
 //! on successful *send* rather than acknowledged *delivery*.
 //!
 //! Everything here runs on the engine driver task (via the command
-//! queue and the state-watch tick), so outbox mutation is serial; the
-//! mutexes only guard against snapshot readers.
+//! queue and the state-watch tick), so outbox mutation is serial; that
+//! mutex only guards against snapshot readers. The inbound mark's mutex
+//! carries one real invariant on top of that: `advance_inbound_mark_and_deliver`
+//! advances a mark and hands the payload on under a single acquisition,
+//! so the two can never be observed apart.
+//!
+//! Both tables are keyed by *device id*, so successive peer installations
+//! under one id share them. That is deliberate — a reconnect must not
+//! lose a queued outbox or re-deliver everything the previous
+//! installation already acked — and it is why every inbound mutation
+//! here is called from inside a registry fence rather than after one.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -95,6 +104,14 @@ impl Outbox {
     pub(crate) fn depth(&self) -> usize {
         self.entries.len()
     }
+
+    /// This outbox's stream id. Controls need it to build an ack frame that
+    /// this outbox would actually accept, so a refusal under test is provably
+    /// the admission fence and not a stale-stream mismatch.
+    #[cfg(test)]
+    pub(super) fn stream_for_test(&self) -> u64 {
+        self.stream
+    }
 }
 
 /// Receiver-side high-water mark for one peer's inbound stream.
@@ -102,6 +119,17 @@ impl Outbox {
 pub(crate) struct InboundMark {
     stream: u64,
     last_seq: u64,
+}
+
+impl InboundMark {
+    /// The seq this mark records as received. Controls in the engine's own
+    /// module assert it in the same breath as delivery, because the contract
+    /// [`advance_inbound_mark_and_deliver`] holds is that the two move together
+    /// — a mark read alone would prove only half of it.
+    #[cfg(test)]
+    pub(super) fn last_seq_for_test(&self) -> u64 {
+        self.last_seq
+    }
 }
 
 /// Queue a frame for acknowledged delivery to `peer`, then try to flush
@@ -275,79 +303,213 @@ async fn flush_peer_inner(
     }
 }
 
-/// Inbound `channel_seq`: deliver exactly once, ack cumulatively.
-pub(crate) async fn on_channel_seq(
-    state: &Arc<NetworkState>,
+/// What the admission fence already settled for one inbound reliable frame.
+///
+/// Both reliable-stream tables are keyed by *device id*, so successive
+/// installations under one id share them. A frame admitted for installation A,
+/// applied after A was replaced, would drain an outbox that installation B then
+/// reads as its own — so the outbox removal happens inside the registry
+/// admission fence, under the same acquisition that admitted the frame, and
+/// only its *result* travels out.
+///
+/// Nothing decided here is re-decided outside: this carries removed entries, not
+/// a verdict. In particular it carries **no boolean**. The receive side's own
+/// state — the inbound high-water mark — is deliberately absent from this type
+/// for that reason: advancing the mark and delivering the payload have to be one
+/// step, and the payload is only available on the dispatch side, so both happen
+/// together there under [`super::state::AdmittedInboundDispatch::with_captured_peer`].
+/// See [`advance_inbound_mark_and_deliver`].
+pub(crate) enum InboundReliableAdmission {
+    /// Nothing was settled under the fence — either not a reliable-stream frame
+    /// at all, or a `ChannelSeq`, whose mark and delivery move together on the
+    /// dispatch side instead.
+    Nothing,
+    /// A `ChannelAck`. The outbox entries it settles were already removed under
+    /// the fence; these are the caller waits still to resolve.
+    Ack(Vec<oneshot::Sender<Result<()>>>),
+}
+
+impl InboundReliableAdmission {
+    /// Resolve the caller waits a fenced ack settled.
+    ///
+    /// Deferred out of the fence deliberately, and safely: these receivers are
+    /// local caller futures, not peer state and not anything a replacement can
+    /// observe. Firing a oneshot under the registry mutation lock would let a
+    /// waiter's continuation run inside it.
+    pub(crate) fn settle(self) {
+        if let Self::Ack(replies) = self {
+            for reply in replies {
+                let _ = reply.send(Ok(()));
+            }
+        }
+    }
+}
+
+/// Move the device-id-keyed *send*-side reliable state for one inbound frame.
+///
+/// **Call only from inside the registry admission fence.** See
+/// [`InboundReliableAdmission`] for why this cannot be deferred to the async
+/// dispatch. Takes `&NetworkState` rather than the peer, because what it moves
+/// is per-device-id stream state, not per-installation peer state.
+///
+/// A `ChannelSeq` is deliberately not handled here. Its receive-side effect is
+/// two things that must be indivisible — advancing the high-water mark and
+/// handing the payload to the subscribers — and the payload leaves this fence
+/// with the frame, so it is the dispatch side that runs both, together, under
+/// its own fence. Answering a `deliver` verdict here and delivering there is
+/// precisely the gap this shape removes.
+pub(crate) fn admit_inbound_reliable(
+    state: &NetworkState,
     peer: &str,
+    msg: &MeshMessage,
+) -> InboundReliableAdmission {
+    match msg {
+        MeshMessage::ChannelAck { stream, up_to } => {
+            InboundReliableAdmission::Ack(take_acked_replies(state, peer, *stream, *up_to))
+        }
+        _ => InboundReliableAdmission::Nothing,
+    }
+}
+
+/// Advance `peer`'s inbound high-water mark and hand a fresh payload to
+/// `deliver` as one indivisible step, answering the cumulative mark to ack.
+///
+/// The mark advances **iff** `deliver` is invoked: both happen under one
+/// acquisition of the mark table, so no reader — and no later frame on this
+/// stream — can observe a seq recorded as received that was never handed on.
+/// That biconditional is the whole point. A mark advanced without delivery
+/// makes the sender's retransmit look like a duplicate, so it is acked, and the
+/// caller's `enqueue` resolves `Ok` for a payload delivered nowhere.
+///
+/// **Call only from inside the registry fence**, so that the installation the
+/// payload was admitted for is still the installed one for the whole step. That
+/// makes `deliver` a synchronous, non-reentrant closure by construction: it may
+/// hand a value off (a broadcast send), but it must not await, run embedder
+/// code, or call back into [`super::state::PeerRegistry`].
+///
+/// A duplicate — a seq at or below the mark — is not delivered and moves
+/// nothing, but still answers the mark, because a duplicate usually means our
+/// previous ack was lost and re-acking is what stops the retransmits.
+pub(super) fn advance_inbound_mark_and_deliver(
+    state: &NetworkState,
+    peer: &str,
+    stream: u64,
+    seq: u64,
+    payload: serde_json::Value,
+    deliver: impl FnOnce(serde_json::Value),
+) -> u64 {
+    let mut marks = state.reliable_in.lock();
+    let mark = marks.entry(peer.to_string()).or_default();
+    if mark.stream != stream {
+        // New outbox lifetime on the sender (restart) — adopt it.
+        *mark = InboundMark {
+            stream,
+            last_seq: 0,
+        };
+    }
+    if seq > mark.last_seq {
+        mark.last_seq = seq;
+        deliver(payload);
+    }
+    mark.last_seq
+}
+
+/// Remove every outbox entry of `stream` at or below `up_to` and hand back the
+/// caller waits they owe. Split from the send so the removal can happen inside
+/// the admission fence while the resolution happens outside it.
+fn take_acked_replies(
+    state: &NetworkState,
+    peer: &str,
+    stream: u64,
+    up_to: u64,
+) -> Vec<oneshot::Sender<Result<()>>> {
+    let mut out = state.reliable_out.lock();
+    let Some(outbox) = out.get_mut(peer) else {
+        return Vec::new();
+    };
+    if outbox.stream != stream {
+        // Ack for a previous outbox lifetime — nothing it can settle.
+        return Vec::new();
+    }
+    let mut done = Vec::new();
+    while let Some(front) = outbox.entries.front() {
+        if front.seq > up_to {
+            break;
+        }
+        if let Some(reply) = outbox.entries.pop_front().and_then(|p| p.reply) {
+            done.push(reply);
+        }
+    }
+    if outbox.entries.is_empty() {
+        out.remove(peer);
+    }
+    done
+}
+
+/// Receive one inbound `channel_seq`: move the high-water mark, deliver, ack.
+///
+/// The first two are one fenced step. `with_captured_peer` holds the registry
+/// mutation lock across the whole closure, and replacement takes that same lock,
+/// so it orders strictly before or after — never between the mark and the
+/// delivery. Combined with [`advance_inbound_mark_and_deliver`]'s own
+/// biconditional, this peer's mark records a seq exactly when its payload was
+/// handed to the subscribers.
+///
+/// The two sides of that ordering are both truthful:
+///
+/// * A replacement landing **before** the fence refuses the closure outright.
+///   Nothing is marked, nothing is delivered, and nothing is acked — so the
+///   sender retransmits and the frame is still fresh when it arrives.
+/// * A replacement landing **after** it may make the owner-bound ack fail, since
+///   `send_to_peer_owner` refuses to ack through a replacement under the same
+///   device id. The sender then retransmits, and that retransmit really is a
+///   duplicate: the payload was already delivered under the installation it was
+///   admitted for.
+///
+/// A duplicate is re-acked and not re-delivered, which is what stops a sender
+/// whose earlier ack was lost.
+pub(super) async fn on_channel_seq_admitted(
+    state: &Arc<NetworkState>,
+    dispatch: &super::state::AdmittedInboundDispatch,
     stream: u64,
     seq: u64,
     channel: String,
     payload: serde_json::Value,
 ) {
-    let deliver = {
-        let mut marks = state.reliable_in.lock();
-        let mark = marks.entry(peer.to_string()).or_default();
-        if mark.stream != stream {
-            // New outbox lifetime on the sender (restart) — adopt it.
-            *mark = InboundMark {
-                stream,
-                last_seq: 0,
-            };
-        }
-        if seq <= mark.last_seq {
-            false // duplicate of something we already delivered
-        } else {
-            mark.last_seq = seq;
-            true
-        }
+    let owner = dispatch.owner();
+    // Delivery is an application effect whose escape is visible outside the
+    // engine: a subscriber reads `from` as a device identity, so a payload
+    // admitted for one installation and delivered after that installation was
+    // replaced is attributed to whoever holds the id now. Both the attribution
+    // and the mark are therefore settled inside the fence.
+    //
+    // `dispatch_channel_frame` is a broadcast hand-off: it never blocks on a
+    // subscriber and never re-enters the registry, so it is safe under the
+    // mutation lock and under the mark table's.
+    let Some(ack_up_to) = dispatch.with_captured_peer(&state.peers, |_peer| {
+        advance_inbound_mark_and_deliver(
+            state,
+            owner.device_id(),
+            stream,
+            seq,
+            payload,
+            |payload| state.dispatch_channel_frame(&channel, owner.device_id(), payload),
+        )
+    }) else {
+        // Superseded installation: the frame moved nothing and reached nobody,
+        // so there is nothing to acknowledge either. Acking here would tell the
+        // sender a payload had been received that no subscriber ever saw.
+        return;
     };
-    if deliver {
-        super::on_channel_frame(state, peer, channel, payload).await;
-    }
-    // Ack our high-water mark either way — a duplicate usually means
-    // our previous ack was lost, and re-acking is what stops the
-    // retransmits.
-    let up_to = state
-        .reliable_in
-        .lock()
-        .get(peer)
-        .map(|m| m.last_seq)
-        .unwrap_or(seq);
-    if let Err(e) =
-        super::send_to_peer(state, peer, &MeshMessage::ChannelAck { stream, up_to }).await
-    {
-        trace!(peer = %super::short_peer(peer), "channel_ack send failed: {e}");
-    }
-}
-
-/// Inbound cumulative ack: resolve and drop every entry of `stream`
-/// with `seq <= up_to`.
-pub(crate) fn on_channel_ack(state: &NetworkState, peer: &str, stream: u64, up_to: u64) {
-    let resolved: Vec<oneshot::Sender<Result<()>>> = {
-        let mut out = state.reliable_out.lock();
-        let Some(outbox) = out.get_mut(peer) else {
-            return;
-        };
-        if outbox.stream != stream {
-            // Ack for a previous outbox lifetime — nothing it can settle.
-            return;
-        }
-        let mut done = Vec::new();
-        while let Some(front) = outbox.entries.front() {
-            if front.seq > up_to {
-                break;
-            }
-            if let Some(reply) = outbox.entries.pop_front().and_then(|p| p.reply) {
-                done.push(reply);
-            }
-        }
-        if outbox.entries.is_empty() {
-            out.remove(peer);
-        }
-        done
+    let msg = MeshMessage::ChannelAck {
+        stream,
+        up_to: ack_up_to,
     };
-    for reply in resolved {
-        let _ = reply.send(Ok(()));
+    if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
+        trace!(
+            peer = %super::short_peer(owner.device_id()),
+            "channel_ack send failed: {e}"
+        );
     }
 }
 
@@ -660,22 +822,84 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_dedup_delivers_once_and_reacks() {
+        // The dedup decision now lives where the payload does: in
+        // `advance_inbound_mark_and_deliver`, which the inbound path calls from
+        // inside its dispatch fence. Driving it directly keeps the property
+        // under test (deliver once, re-ack a duplicate, adopt a restarted
+        // stream) separate from the fence and the ack send, which are proven by
+        // the engine's own replacement controls.
+        //
+        // Every case asserts delivery and mark together, because the contract
+        // is a biconditional: a mark that moved without a delivery is the defect
+        // this shape exists to prevent.
         let state = build_test_state("rel-dedup");
         insert_session_less_peer(&state, "peer-b", None);
-        // First delivery: routes to the channel layer and records seq 1.
-        on_channel_seq(&state, "peer-b", 7, 1, "c".into(), serde_json::json!(1)).await;
-        {
-            let marks = state.reliable_in.lock();
-            let m = marks.get("peer-b").copied().unwrap();
-            assert_eq!(m.last_seq, 1);
-        }
-        // Duplicate: high-water mark unchanged (no double delivery).
-        on_channel_seq(&state, "peer-b", 7, 1, "c".into(), serde_json::json!(1)).await;
+        let mut delivered: Vec<serde_json::Value> = Vec::new();
+
+        // First delivery: fresh, handed on once, and records seq 1.
+        let ack_up_to = advance_inbound_mark_and_deliver(
+            &state,
+            "peer-b",
+            7,
+            1,
+            serde_json::json!(1),
+            |payload| delivered.push(payload),
+        );
+        assert_eq!(ack_up_to, 1);
+        assert_eq!(
+            delivered,
+            vec![serde_json::json!(1)],
+            "delivered exactly once"
+        );
         assert_eq!(state.reliable_in.lock().get("peer-b").unwrap().last_seq, 1);
+
+        // Duplicate: not delivered, high-water mark unchanged, still re-acked.
+        let ack_up_to = advance_inbound_mark_and_deliver(
+            &state,
+            "peer-b",
+            7,
+            1,
+            serde_json::json!(1),
+            |payload| delivered.push(payload),
+        );
+        assert_eq!(ack_up_to, 1);
+        assert_eq!(
+            delivered,
+            vec![serde_json::json!(1)],
+            "a duplicate is re-acked, never re-delivered"
+        );
+        assert_eq!(state.reliable_in.lock().get("peer-b").unwrap().last_seq, 1);
+
         // New stream (sender restarted): mark resets and seq 1 delivers.
-        on_channel_seq(&state, "peer-b", 9, 1, "c".into(), serde_json::json!(2)).await;
+        let ack_up_to = advance_inbound_mark_and_deliver(
+            &state,
+            "peer-b",
+            9,
+            1,
+            serde_json::json!(2),
+            |payload| delivered.push(payload),
+        );
+        assert_eq!(ack_up_to, 1);
+        assert_eq!(
+            delivered,
+            vec![serde_json::json!(1), serde_json::json!(2)],
+            "a restarted stream is adopted and its first frame delivers"
+        );
         let m = *state.reliable_in.lock().get("peer-b").unwrap();
         assert_eq!((m.stream, m.last_seq), (9, 1));
+    }
+
+    /// Settle an inbound ack exactly the way production does: mint the
+    /// admission under the fence, then resolve the caller waits it owes.
+    ///
+    /// There is deliberately no non-test entry point doing this. The old
+    /// `on_channel_ack` wrapper became unreachable from production once the
+    /// outbox began settling inside the admission fence, and keeping a
+    /// second, unfenced way to drain an outbox alive purely so tests could
+    /// call it would have meant these tests no longer exercised the path that
+    /// actually runs.
+    fn settle_inbound_ack(state: &NetworkState, peer: &str, stream: u64, up_to: u64) {
+        admit_inbound_reliable(state, peer, &MeshMessage::ChannelAck { stream, up_to }).settle();
     }
 
     #[tokio::test]
@@ -687,11 +911,11 @@ mod tests {
         enqueue(&state, "peer-a", "c", serde_json::json!(2), None, tx2).await;
         let stream = state.reliable_out.lock().get("peer-a").unwrap().stream;
 
-        on_channel_ack(&state, "peer-a", stream, 1);
+        settle_inbound_ack(&state, "peer-a", stream, 1);
         assert!(matches!(recv_now(&mut rx1), Some(Ok(()))), "seq 1 acked");
         assert!(recv_now(&mut rx2).is_none(), "seq 2 still pending");
 
-        on_channel_ack(&state, "peer-a", stream, 2);
+        settle_inbound_ack(&state, "peer-a", stream, 2);
         assert!(matches!(recv_now(&mut rx2), Some(Ok(()))), "seq 2 acked");
         assert_eq!(pending_total(&state), 0, "outbox drained and removed");
     }
@@ -702,7 +926,7 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         enqueue(&state, "peer-a", "c", serde_json::json!(1), None, tx).await;
         let stream = state.reliable_out.lock().get("peer-a").unwrap().stream;
-        on_channel_ack(&state, "peer-a", stream.wrapping_add(1), 1);
+        settle_inbound_ack(&state, "peer-a", stream.wrapping_add(1), 1);
         assert!(recv_now(&mut rx).is_none(), "wrong-stream ack ignored");
         assert_eq!(pending_total(&state), 1);
     }

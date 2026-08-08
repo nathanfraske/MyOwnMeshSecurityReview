@@ -20,8 +20,9 @@
 //!     it returns.
 //!   - The task classifies the Hello: a first binding, an exact
 //!     retransmission answered from the cached proof with no draw and no
-//!     second signature, or a conflicting value that is a typed terminal
-//!     failure for that exact task.
+//!     second signature, or a conflicting value, which is the typed
+//!     terminal `ConflictingPeerContribution` for that exact task — its
+//!     own cause, never the currentness one.
 //!   - Only a first binding records the peer's label, verification code,
 //!     features, and capabilities, under the exact-current owner fence. A
 //!     retransmission is answered without adopting any of them.
@@ -292,10 +293,30 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
     // Whether this Hello is the first one or a retransmission is the task's
     // answer, decided against the contribution it actually bound — never
     // re-derived here from engine state. A conflicting value has already retired
-    // this exact task inside `accept_peer_hello` and is terminal.
+    // this exact task inside `accept_peer_hello` and is terminal, carrying
+    // `ConflictingPeerContribution` rather than a currentness cause, so the
+    // diagnostic below distinguishes a peer sending a second, different
+    // contribution from this endpoint tearing the channel down.
     let accepted = match task.accept_peer_hello(peer_contribution) {
         Ok(accepted) => accepted,
         Err(error) => {
+            // Structured, like its sibling profile refusal above: the typed
+            // cause is the whole diagnostic value here. Without it the drop
+            // reads identically for a conflict, a stale contribution and an
+            // ordinary teardown, and the one that indicates a live peer doing
+            // something it cannot be doing is the one that gets lost.
+            state.log_diag_with(
+                crate::events::DiagLevel::Error,
+                "handshake",
+                format!(
+                    "endpoint-auth task refused the contribution from {} — dropping",
+                    super::short_peer(device_id)
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "error": format!("{error:?}"),
+                }),
+            );
             warn!(peer = %device_id, "endpoint-auth task refused the peer contribution: {error:?}");
             super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
             return;
@@ -466,6 +487,14 @@ pub async fn on_auth_response(
         // the handoff but not yet installed, and would fail closed rather than
         // being recognised as a duplicate. Making that safe needs promotion and
         // install to be one atomic step, not a wider read-back here.
+        //
+        // The variant matched here is why the conflict cause is separate. This
+        // arm turns one cause into "benign duplicate, do nothing". A task that a
+        // conflicting contribution retired answers with
+        // `ConflictingPeerContribution`, so it cannot reach this arm at all and
+        // falls to the refusal below — a peer that sent a second, different
+        // contribution can never present the result to this guard as a
+        // retransmission of its first.
         Err(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent)
             if state.peers.get_if_current(owner).is_some_and(|peer| {
                 peer.has_authenticated_channel() && peer.endpoint_auth_is_current(&auth_task)
@@ -941,6 +970,8 @@ mod tests {
         // attacker-controlled input. Adopting it would let a late Hello rewrite
         // the identity of an attempt that is already bound while the proof it
         // receives is the one the first Hello earned.
+        use crate::protocol::features::Feature;
+
         let state = crate::engine::build_test_state("arc04-duplicate-hello-metadata");
         let task = Arc::new(crate::endpoint_auth::task_for_test(
             crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
@@ -980,7 +1011,13 @@ mod tests {
                 "non-vacuity: the first hello really did establish this metadata"
             );
             assert_eq!(data.verification_code_received.as_deref(), Some("aaa111"));
-            assert_eq!(data.features, vec!["settled-feature".to_string()]);
+            assert_eq!(
+                data.features,
+                vec![
+                    Feature::ENDPOINT_AUTH_V1.to_string(),
+                    "settled-feature".to_string()
+                ]
+            );
             assert!(data.capabilities.is_none());
         }
         let draws = task.draw_count();
@@ -1018,7 +1055,10 @@ mod tests {
         );
         assert_eq!(
             data.features,
-            vec!["settled-feature".to_string()],
+            vec![
+                Feature::ENDPOINT_AUTH_V1.to_string(),
+                "settled-feature".to_string()
+            ],
             "and its advertised feature set, which gates every optional frame kind"
         );
         assert!(
@@ -1041,6 +1081,13 @@ mod tests {
         // The other classification: a different contribution is not a repeat,
         // so it is terminal for that exact task and must leave the established
         // metadata alone on its way out.
+        //
+        // The cause is asserted, not merely the retirement. Retirement alone
+        // would also hold if this Hello had been refused for some unrelated
+        // reason, or if the conflict site went back to reporting a currentness
+        // failure — and the diagnostic this path emits carries that cause, so a
+        // conflict would become indistinguishable from an ordinary teardown in
+        // the one record an operator actually reads.
         let state = crate::engine::build_test_state("arc04-conflicting-hello-metadata");
         let task = Arc::new(crate::endpoint_auth::task_for_test(
             crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
@@ -1087,6 +1134,11 @@ mod tests {
         .await;
 
         assert!(task.is_retired(), "a conflicting contribution is terminal");
+        assert_eq!(
+            task.terminal_error(),
+            Some(crate::endpoint_auth::EndpointAuthError::ConflictingPeerContribution),
+            "and it is terminal for the conflict, not for a currentness failure it never had"
+        );
         if let Some(peer) = state.peers.get("peer") {
             let data = peer.state.read();
             assert_eq!(data.label, "settled-label");

@@ -649,6 +649,121 @@ impl AdmittedLegacyOperation<'_> {
             flow,
         })
     }
+
+    /// Take one admitted inbound frame as an owned, move-only operation.
+    ///
+    /// The message is moved *in* to the fence by the caller and comes back out
+    /// only here, on the admitted arm, bound to the exact peer and owner this
+    /// fence proved. Mirrors [`Self::realtime_operation`]: the binding is what
+    /// lets the dispatch that follows name *this* installation instead of
+    /// re-resolving a device id a replacement may since have taken over.
+    pub(super) fn inbound_application_operation(
+        &self,
+        msg: crate::protocol::MeshMessage,
+    ) -> AdmittedInboundApplicationOperation {
+        AdmittedInboundApplicationOperation {
+            msg,
+            dispatch: AdmittedInboundDispatch {
+                peer: Arc::clone(self.peer),
+                owner: self.owner.clone(),
+            },
+        }
+    }
+}
+
+/// Move-only authority to dispatch exactly one already-parsed inbound
+/// application frame against one exact peer installation.
+///
+/// This is what the inbound path used to answer with an `Option<bool>`. The
+/// boolean was the defect: it outlived the fence that produced it, and every
+/// dispatch arm below then re-resolved the peer *by device id*, so a
+/// replacement installed during the await answered the lookup and received the
+/// effect, the liveness touch, the counters, and the delivery. An authority
+/// cannot be re-resolved — it names one installation, and after replacement it
+/// names nothing.
+///
+/// Carries all three things one admission decided, as a single value: the
+/// exact owner, the exact captured peer, and the one parsed frame. Deliberately
+/// not `Clone`, `Copy`, `Debug`, `Default`, or serializable, and consumed by
+/// value, so one admission dispatches exactly one frame.
+#[must_use = "an admitted inbound frame authorizes exactly one dispatch and must be consumed"]
+pub(super) struct AdmittedInboundApplicationOperation {
+    msg: crate::protocol::MeshMessage,
+    dispatch: AdmittedInboundDispatch,
+}
+
+impl AdmittedInboundApplicationOperation {
+    /// Split into the one frame this admission authorized and the installation
+    /// binding that outlives it for the dispatch.
+    ///
+    /// Consuming by value is the single-dispatch rule: the frame cannot be
+    /// dispatched twice, and it cannot be paired with a different admission.
+    pub(super) fn into_dispatch(self) -> (crate::protocol::MeshMessage, AdmittedInboundDispatch) {
+        (self.msg, self.dispatch)
+    }
+}
+
+/// The installation binding an admitted inbound frame dispatches against.
+///
+/// There is deliberately **no device-id accessor here**. The device id is the
+/// re-resolution key this witness exists to remove, so a handler that needs
+/// mesh identity for attribution takes it from [`Self::owner`], which names one
+/// *installation* and not merely one device — and which every peer-reaching
+/// helper (`get_if_current`, `send_to_peer_owner`) already accepts directly.
+///
+/// Dropping one is harmless: unlike [`AdmittedRenegotiation`] it latches
+/// nothing, so an arm that decides the frame needs no effect simply drops it.
+///
+/// Strictly `pub(super)`. Every inbound handler that takes one is reachable
+/// only from the engine's own dispatch, so they are narrowed to `pub(super)`
+/// too rather than this witness being widened to fit them — an admission
+/// authority that had to become a public item to be usable would be the wrong
+/// trade, and `#[doc(hidden)]` is a documentation flag, not a visibility one.
+pub(super) struct AdmittedInboundDispatch {
+    peer: Arc<PeerConnection>,
+    owner: PeerOwnerToken,
+}
+
+impl AdmittedInboundDispatch {
+    /// The exact owner this frame was admitted for. Never a fresh
+    /// `owner(device_id)` lookup — that is the escape being closed.
+    pub(super) fn owner(&self) -> &PeerOwnerToken {
+        &self.owner
+    }
+
+    /// Run one synchronous application effect on the exact captured peer,
+    /// **inside** the registry fence, and answer with whatever it produced.
+    ///
+    /// This delegates to [`PeerRegistry::with_current`], which holds the
+    /// mutation lock across the whole effect. That is the point, and it is the
+    /// difference between this and a currency *check*: replacement takes the
+    /// same lock, so it orders strictly before or after the entire effect and
+    /// there is no instant at which "still current" has been established but
+    /// the effect has not yet run. A `get_if_current` guard followed by the
+    /// effect would be exactly the check-then-act shape this witness exists to
+    /// remove — the boolean would simply have moved inside the type.
+    ///
+    /// Everything the effect needs must therefore be synchronous and
+    /// non-reentrant: it runs under the registry mutation lock. It must not
+    /// await, and it must not call back into [`PeerRegistry`] (the lock is not
+    /// reentrant). Broadcast sends are fine — they hand off a value and wake
+    /// tasks without running them inline — which is what lets a state change
+    /// and the event announcing it happen as one atomic step.
+    ///
+    /// The effect receives the *captured* handle rather than the registry's.
+    /// They are the same object whenever the fence admits, and naming the
+    /// captured one states the invariant: this operation writes to the
+    /// installation that was admitted, or to nothing at all.
+    ///
+    /// `None` means the captured installation is no longer the installed one,
+    /// so nothing ran.
+    pub(super) fn with_captured_peer<R>(
+        &self,
+        peers: &PeerRegistry,
+        effect: impl FnOnce(&Arc<PeerConnection>) -> R,
+    ) -> Option<R> {
+        peers.with_current(&self.owner, |_current| effect(&self.peer))
+    }
 }
 
 /// Move-only authority to perform exactly one legacy application send on one

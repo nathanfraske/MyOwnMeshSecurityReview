@@ -504,6 +504,73 @@ def matches(probe: RejectedProbe, diagnostics: list[dict]) -> bool:
     return False
 
 
+def impl_body(source: str, type_name: str) -> str | None:
+    """Return the whole body of `impl <type_name>`, or None if it is absent.
+
+    Anchored on column-zero boundaries — the `impl` header and the next
+    top-level `}` — rather than on a non-greedy brace match. A non-greedy match
+    is only correct as long as no inner line ever begins a brace at column zero,
+    which is a formatting accident rather than a guarantee; a guard that
+    silently inspected the first method alone would report every later method as
+    absent, or miss a widened one entirely. Slicing to the next top-level item
+    makes the extraction independent of what the method bodies contain.
+    """
+
+    header = re.search(
+        rf"^impl {re.escape(type_name)}\b[^\n]*\{{\n", source, re.MULTILINE
+    )
+    if header is None:
+        return None
+    rest = source[header.end() :]
+    end = re.search(r"^\}", rest, re.MULTILINE)
+    return rest[: end.start()] if end is not None else rest
+
+
+def function_body(source: str, name: str) -> str | None:
+    """Return one free function's source, or None if it is absent.
+
+    Anchored the same way as `impl_body`: from the signature's column-zero
+    `fn`/visibility keyword to the next top-level `}`. Any visibility qualifier
+    and an optional `async` are accepted, so a guard written against this does
+    not silently start passing because the function was narrowed or widened.
+    """
+
+    header = re.search(
+        rf"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn {re.escape(name)}\b",
+        source,
+        re.MULTILINE,
+    )
+    if header is None:
+        return None
+    rest = source[header.start() :]
+    end = re.search(r"^\}", rest, re.MULTILINE)
+    return rest[: end.start()] if end is not None else rest
+
+
+def call_arguments(source: str, name: str) -> str | None:
+    """Return the argument text of the first `name(...)` call in `source`.
+
+    Paren-balanced rather than line- or regex-shaped, so a multi-line closure
+    argument is returned whole and rustfmt may re-wrap the call freely. This is
+    what lets a guard ask what happens *inside* a fenced closure rather than
+    guessing at its extent from indentation.
+    """
+
+    call = re.search(rf"\b{re.escape(name)}\s*\(", source)
+    if call is None:
+        return None
+    depth = 0
+    for index in range(call.end() - 1, len(source)):
+        character = source[index]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return source[call.end() : index]
+    return None
+
+
 def source_shape_failures() -> list[str]:
     """Positive guards for the surfaces the probes above claim to fence.
 
@@ -697,6 +764,14 @@ def source_shape_failures() -> list[str]:
             "AdmittedRenegotiation",
             r"pub\(super\)\s+struct\s+AdmittedRenegotiation\b",
         ),
+        (
+            "AdmittedInboundApplicationOperation",
+            r"pub\(super\)\s+struct\s+AdmittedInboundApplicationOperation\b",
+        ),
+        (
+            "AdmittedInboundDispatch",
+            r"pub\(super\)\s+struct\s+AdmittedInboundDispatch\b",
+        ),
     ):
         if not re.search(declaration, state_source):
             failures.append(
@@ -704,6 +779,285 @@ def source_shape_failures() -> list[str]:
                 "declared `pub(super)` in engine/state.rs; the module-privacy probe "
                 "cannot carry that claim on its own"
             )
+
+    # The inbound witness replaced an `Option<bool>` that outlived its fence, so
+    # the two properties that make it a witness rather than a flag are guarded
+    # here: it cannot be quietly ignored, and it authorizes exactly one dispatch
+    # because the only way to open it consumes it.
+    if not re.search(
+        r"#\[must_use[^\n]*\]\s*(?:#\[[^\n]*\]\s*)*"
+        r"pub\(super\) struct AdmittedInboundApplicationOperation\b",
+        state_source,
+    ):
+        failures.append(
+            "AdmittedInboundApplicationOperation is not #[must_use]; an admitted "
+            "inbound frame that can be dropped silently is the Option<bool> again"
+        )
+    if not re.search(
+        r"pub\(super\)\s+fn\s+into_dispatch\s*\(\s*self\s*,?\s*\)",
+        state_source,
+    ):
+        failures.append(
+            "AdmittedInboundApplicationOperation::into_dispatch must take `self` by "
+            "value; a `&self` form would let one admission dispatch a frame twice"
+        )
+
+    # The dispatch witness had a check-then-act defect: it answered currency as
+    # a boolean and the caller acted on that answer afterwards, outside the
+    # registry mutation fence, so a replacement could land in the gap between
+    # "still current" and the effect. The repair was to run the effect *inside*
+    # `PeerRegistry::with_current`, which holds the mutation lock across the
+    # whole closure. These three guards pin that shape, because the defect is
+    # reintroduced by ordinary-looking code and no probe above can see it.
+    dispatch_body = impl_body(state_source, "AdmittedInboundDispatch")
+    if dispatch_body is None:
+        failures.append(
+            "the AdmittedInboundDispatch impl block is missing or reshaped in "
+            "engine/state.rs, so its fenced-dispatch shape cannot be checked"
+        )
+    else:
+        # Anything wider than `pub(super)`, in any of the forms rustfmt emits:
+        # bare `pub`, a restricted-but-wider `pub(crate)` or `pub(in ...)`, and
+        # the `async` variants of each. `pub(super)` is the one accepted form,
+        # so the check is a negative lookahead rather than a list of the ways to
+        # get it wrong.
+        if re.search(
+            r"^\s*pub(?!\(super\))(?:\([^)]*\))?\s+(?:async\s+)?fn\s+",
+            dispatch_body,
+            re.MULTILINE,
+        ):
+            failures.append(
+                "AdmittedInboundDispatch exposes a method wider than `pub(super)`; "
+                "every method on an admission witness must stay `pub(super)`"
+            )
+        if not re.search(r"peers\.with_current\s*\(", dispatch_body):
+            failures.append(
+                "AdmittedInboundDispatch no longer dispatches through "
+                "`PeerRegistry::with_current`; the effect must run inside the "
+                "registry mutation fence, not after a currency answer"
+            )
+        if re.search(r"\bget_if_current\s*\(", dispatch_body):
+            failures.append(
+                "AdmittedInboundDispatch uses `get_if_current`; that is the "
+                "check-then-act shape this witness exists to remove, because a "
+                "replacement can land between the check and the effect"
+            )
+        # A currency *predicate* on the witness is the boolean again with a new
+        # name: whatever it returns is already stale by the time a caller reads
+        # it, and every caller must then act outside the fence.
+        if re.search(r"\bfn\s+is_current\b", dispatch_body):
+            failures.append(
+                "AdmittedInboundDispatch exposes an `is_current` boolean accessor; "
+                "currency must be established and consumed inside one fenced "
+                "operation, never handed to a caller to act on"
+            )
+        # The whole point of the witness is that it names an installation rather
+        # than a device id. An accessor that handed the device id back would
+        # restore the re-resolution escape it was built to close.
+        if re.search(r"\bfn\s+(device_id|peer_id|peer_device_id)\b", dispatch_body):
+            failures.append(
+                "AdmittedInboundDispatch exposes a device-id accessor; the device id "
+                "is the re-resolution key this witness exists to remove, and handlers "
+                "must take identity from its owner token instead"
+            )
+
+    # The other half of the same defect, at the call sites: taking the fenced
+    # helper's `Option` and collapsing it to a bool re-creates the stale answer
+    # the repair removed, even though the helper itself is now correct.
+    #
+    # Narrow on purpose, and anchored rather than windowed. For each call it
+    # looks at exactly one place — whatever immediately follows that call's own
+    # closing `)`, on the same line — so an unrelated `.is_some()` elsewhere in
+    # the function cannot be misattributed to it. It does not follow a result
+    # through an intermediate binding. It is a recurrence guard, not a proof.
+    for module in ("mod.rs", "heartbeat.rs", "reliable.rs", "handshake.rs"):
+        source = (CORE / "src" / "engine" / module).read_text(encoding="utf-8")
+        for call in re.finditer(r"\bwith_captured_peer\s*\(", source):
+            tail = source[call.start() :]
+            # A call closed on its own line, or a multi-line call closed by the
+            # closure's `})`. Whichever applies, `after` is the text that would
+            # carry a conversion.
+            single_line = re.match(r"with_captured_peer\s*\([^\n]*\)(?P<after>[^\n]*)", tail)
+            if single_line is not None:
+                after = single_line.group("after")
+            else:
+                closing = re.search(r"^[ \t]*\}\s*\)(?P<after>[^\n]*)", tail, re.MULTILINE)
+                after = closing.group("after") if closing is not None else ""
+            if re.match(r"\s*\.(is_some|is_none|unwrap_or)\s*\(", after):
+                failures.append(
+                    f"engine/{module} turns a with_captured_peer result into a bool "
+                    "at the call site; the fenced effect's own return value must be "
+                    "used, not a currency verdict acted on outside the fence"
+                )
+
+    # The inbound handlers that take a dispatch witness are crate-internal. They
+    # were narrowed from `pub` once every caller was known to live in
+    # `engine::mod`, so re-widening one would put a witness-taking signature back
+    # on the module's public surface for no caller that needs it.
+    for module, handlers in (
+        ("heartbeat.rs", ("on_ping", "on_pong")),
+        ("reliable.rs", ("on_channel_seq_admitted",)),
+    ):
+        source = (CORE / "src" / "engine" / module).read_text(encoding="utf-8")
+        for handler in handlers:
+            if not re.search(
+                rf"^pub\(super\) async fn {handler}\b", source, re.MULTILINE
+            ):
+                failures.append(
+                    f"engine/{module}::{handler} is no longer declared "
+                    "`pub(super) async fn`; the inbound handlers that take an "
+                    "admission witness must stay crate-internal"
+                )
+
+    # The inbound reliable path had the same defect one layer down, and in its
+    # most damaging form. The receiver's high-water mark was advanced inside the
+    # admission fence while the payload was delivered under a *second* fence, so
+    # a replacement landing in the gap fenced out the delivery and left the mark
+    # advanced. The sender's retransmit was then classified a duplicate,
+    # acknowledged, and the caller's `enqueue` resolved `Ok` for a payload that
+    # reached no subscriber — a silent loss reported as a success.
+    #
+    # The repair makes the mark and the delivery one fenced step. These guards
+    # pin that shape, because it is undone by ordinary-looking refactors — a
+    # `deliver` flag returned "for clarity", a delivery hoisted out of the
+    # closure — and no compiler probe can see either.
+    reliable_source = (CORE / "src" / "engine" / "reliable.rs").read_text(encoding="utf-8")
+    admission_result = re.search(
+        r"pub\(crate\) enum InboundReliableAdmission \{(?P<body>.*?)\n\}",
+        reliable_source,
+        flags=re.DOTALL,
+    )
+    if admission_result is None:
+        failures.append(
+            "the InboundReliableAdmission result is missing or reshaped in "
+            "engine/reliable.rs, so the fenced inbound-reliable shape cannot be checked"
+        )
+    else:
+        # Comment lines are stripped first: the guard is about what the type
+        # carries, and the doc comments here legitimately discuss the boolean
+        # that used to be carried.
+        carried = "\n".join(
+            line
+            for line in admission_result.group("body").splitlines()
+            if not line.strip().startswith("//")
+        )
+        if re.search(r"\bbool\b", carried):
+            failures.append(
+                "InboundReliableAdmission carries a boolean out of the admission "
+                "fence; a delivery verdict decided under one fence and acted on "
+                "under another is exactly the gap a replacement lands in"
+            )
+
+    seq_handler = function_body(reliable_source, "on_channel_seq_admitted")
+    if seq_handler is None:
+        failures.append(
+            "engine/reliable.rs::on_channel_seq_admitted is missing or reshaped, so "
+            "the fenced mark-and-deliver step cannot be checked"
+        )
+    else:
+        fenced = call_arguments(seq_handler, "with_captured_peer")
+        if fenced is None:
+            failures.append(
+                "on_channel_seq_admitted no longer runs through "
+                "`with_captured_peer`; the high-water mark and the delivery must "
+                "move inside the registry mutation fence, not around it"
+            )
+        else:
+            for required, consequence in (
+                (
+                    "advance_inbound_mark_and_deliver",
+                    "the high-water mark is no longer advanced inside the fenced "
+                    "closure",
+                ),
+                (
+                    "dispatch_channel_frame",
+                    "the payload is no longer handed to the subscribers inside the "
+                    "same fenced closure",
+                ),
+            ):
+                if required not in fenced:
+                    failures.append(
+                        f"on_channel_seq_admitted: {consequence}; a mark that can "
+                        "advance without the delivery makes the sender's retransmit "
+                        "read as a duplicate and be acked"
+                    )
+            if ".await" in fenced:
+                failures.append(
+                    "the fenced closure in on_channel_seq_admitted awaits; it runs "
+                    "under the non-reentrant PeerRegistry mutation lock, and an await "
+                    "there is also the gap the mark and the delivery must not have "
+                    "between them"
+                )
+
+    mark_helper = function_body(reliable_source, "advance_inbound_mark_and_deliver")
+    if mark_helper is None:
+        failures.append(
+            "engine/reliable.rs::advance_inbound_mark_and_deliver is missing or "
+            "renamed; the mark advance and the delivery must stay one call"
+        )
+    else:
+        advance = mark_helper.find("mark.last_seq = seq")
+        hand_off = mark_helper.find("deliver(payload)")
+        if advance < 0 or hand_off < 0 or hand_off < advance:
+            failures.append(
+                "advance_inbound_mark_and_deliver does not advance the mark and then "
+                "hand the payload on in the same branch; the biconditional it exists "
+                "to hold is that the mark moves if and only if the payload was "
+                "delivered"
+            )
+        if ".await" in mark_helper:
+            failures.append(
+                "advance_inbound_mark_and_deliver awaits; it is called from inside "
+                "the registry fence and must be one synchronous step"
+            )
+
+    engine_source = (CORE / "src" / "engine" / "mod.rs").read_text(encoding="utf-8")
+
+    # `AdmittedRpcCall` is the heaviest fenced authority: it authorizes one run
+    # of arbitrary embedder code. Three structural facts are guarded, and only
+    # three, because only three are true.
+    #
+    # It claims **authorization atomicity, not cancellation.** A replacement
+    # landing before the mint refuses the authority and the handler never runs;
+    # a replacement landing after the mint does not cancel anything, and the
+    # handler runs to completion. Nothing below asserts otherwise, and no guard
+    # here should ever be read as evidence that an authorized run can be
+    # revoked. What the capture buys is that the run is owner-bound, so its
+    # replies fail closed against a superseded installation.
+    if not re.search(
+        r"#\[must_use[^\n]*\]\s*struct AdmittedRpcCall\b", engine_source
+    ):
+        failures.append(
+            "AdmittedRpcCall must stay a module-private `#[must_use] struct` in "
+            "engine/mod.rs; a visibility qualifier would hand the authority to run "
+            "embedder code to another module, and dropping #[must_use] would let "
+            "one be minted and silently discarded"
+        )
+    rpc_mint = re.search(
+        r"with_captured_peer\s*\(.{0,400}?AdmittedRpcCall\s*\{.{0,300}?\}\s*\)\s*else",
+        engine_source,
+        re.DOTALL,
+    )
+    if rpc_mint is None:
+        failures.append(
+            "AdmittedRpcCall is no longer minted inside `with_captured_peer`; the "
+            "authority to run a handler must be taken at the same fenced "
+            "linearization point that proves the installation is current"
+        )
+    elif ".await" in rpc_mint.group(0):
+        failures.append(
+            "the fenced closure that mints an AdmittedRpcCall awaits; it must build "
+            "a value and call nothing, or embedder code runs under the "
+            "non-reentrant PeerRegistry mutation lock and a handler that calls back "
+            "into the mesh deadlocks"
+        )
+
+    if not re.search(r"^pub\(crate\) mod state;", engine_source, re.MULTILINE):
+        failures.append(
+            "engine::state is no longer declared `pub(crate) mod state;`; that "
+            "declaration is what keeps every admission witness in it out of the "
+            "downstream API, and the module-privacy probe depends on it"
+        )
     return failures
 
 

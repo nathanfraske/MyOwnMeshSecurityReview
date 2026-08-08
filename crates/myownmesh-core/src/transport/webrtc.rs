@@ -266,6 +266,27 @@ pub struct WebRtcConnectorEvent {
     _callback_work: Option<CallbackWorkLease>,
 }
 
+impl WebRtcConnectorEvent {
+    /// Whether this is the data-channel-open callback. **Controls only.**
+    ///
+    /// A control that must hand the *genuine* native open event to the
+    /// production engine arm has to recognise it without consuming it first —
+    /// `accept_event` takes the event by value, so classifying through that
+    /// would spend the very event the control needs to deliver. Read-only, and
+    /// it exposes no payload: the answer is a bool, and the event's resources
+    /// and its incarnation stay unreachable.
+    ///
+    /// Gated to match its only caller. The live pre-open fixture needs
+    /// `transport-lab`, so gating on `test` alone would leave this with no
+    /// caller in a default-feature test build — an orphan the compiler is right
+    /// to refuse, and one that would have to be silenced with a mask rather
+    /// than fixed.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn is_data_channel_open(&self) -> bool {
+        matches!(self.event, TransportEvent::DataChannelOpen)
+    }
+}
+
 /// Resource ownership retained while the engine handles one accepted native
 /// callback. The fields are intentionally opaque outside this module.
 pub(crate) struct AcceptedWebRtcConnectorEventResources {
@@ -3133,6 +3154,38 @@ impl Drop for EndpointAuthHandoff {
     }
 }
 
+/// One component of the endpoint-authentication channel binding this connector
+/// can be made to withhold. **Controls only.**
+///
+/// A live native link whose data channel is open always presents both DTLS
+/// fingerprints, so the condition the production supplier fails closed on —
+/// half a pair — cannot be reached by driving the stack. Naming the component
+/// here is what lets the two missing-side controls be exact twins that differ in
+/// one value, rather than one control that proves "something was missing".
+///
+/// The whole withheld-binding surface is gated on `transport-lab` as well as
+/// `test`, because the only thing that can arm it is the live two-connector
+/// fixture, and that needs a real WebRTC link. Gating it on `test` alone leaves
+/// every item here uncalled in a default-feature test build.
+#[cfg(all(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WithheldBindingComponent {
+    Local,
+    Remote,
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+impl WithheldBindingComponent {
+    /// The armed marker for this component. Never zero: zero is "withholding
+    /// nothing", which is the state every connector is constructed in.
+    fn marker(self) -> u8 {
+        match self {
+            Self::Local => 1,
+            Self::Remote => 2,
+        }
+    }
+}
+
 /// Narrow owner of one RTCPeerConnection, its ICE agent, callback identity,
 /// and pending remote-candidate queue.
 ///
@@ -3145,6 +3198,17 @@ pub(crate) struct WebRtcConnectorWorker {
     close_owner: Arc<ConnectorCloseOwner>,
     resource_scope: PeerConnectionResourceScope,
     _transport_observation: ObservationLease,
+    /// Which single binding component this connector withholds from its own
+    /// supplier. **Controls only**, compiled out of production entirely.
+    ///
+    /// Withhold-only and monotonic: there is no operation that supplies a
+    /// component, restores one, or names both, so a fixture can remove material
+    /// the live link genuinely stated and can never inject material it did not.
+    /// That direction is the safety property — a seam that could supply a
+    /// fingerprint would be the substitution this whole boundary exists to
+    /// refuse, dressed as a test helper.
+    #[cfg(all(test, feature = "transport-lab"))]
+    withheld_binding_component: std::sync::atomic::AtomicU8,
 }
 
 struct AdmittedConnectorOwnership {
@@ -3215,6 +3279,8 @@ impl WebRtcConnectorWorker {
                 close_owner,
                 resource_scope,
                 _transport_observation: transport_observation,
+                #[cfg(all(test, feature = "transport-lab"))]
+                withheld_binding_component: std::sync::atomic::AtomicU8::new(0),
             },
             receiver,
         ))
@@ -3673,7 +3739,40 @@ impl WebRtcConnectorWorker {
     ) -> Option<crate::connector::EndpointAuthBinding> {
         let local = self.local_fingerprint().await?;
         let remote = self.remote_fingerprint().await?;
+        // Controls only, compiled out of production. Both genuine components
+        // have been read by this point and are discarded unread when one is
+        // withheld — the refusal is the absence of a component, never a blank
+        // or defaulted one, so the constructor below is never reached with an
+        // empty string and no fallback value exists anywhere on this path.
+        //
+        // The gate is exactly the one on the field and the helper below. It has
+        // to be: a build where those are absent and this line is present would
+        // not compile at all.
+        #[cfg(all(test, feature = "transport-lab"))]
+        self.refuse_withheld_binding_component_for_test()?;
         crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(&local, &remote)
+    }
+
+    /// Arm this connector to withhold one binding component. **Controls only.**
+    ///
+    /// Set-only and monotonic: there is no clearing operation, so an armed
+    /// connector stays armed for its whole life and the positive twin has to be
+    /// a fixture that was never armed rather than the same one disarmed. That
+    /// keeps the twins genuinely independent — a control cannot arrange the
+    /// failure, observe it, and then arrange the success on the same connector.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn withhold_binding_component_for_test(&self, component: WithheldBindingComponent) {
+        self.withheld_binding_component
+            .store(component.marker(), Ordering::Release);
+    }
+
+    /// `None` when a component is withheld, so the caller's `?` refuses.
+    ///
+    /// Returns `Some(())` and nothing else: this cannot hand back material, only
+    /// stop material that was genuinely read from being assembled into a pair.
+    #[cfg(all(test, feature = "transport-lab"))]
+    fn refuse_withheld_binding_component_for_test(&self) -> Option<()> {
+        (self.withheld_binding_component.load(Ordering::Acquire) == 0).then_some(())
     }
 
     pub(crate) fn awaiting_answer(&self) -> bool {
@@ -9440,7 +9539,22 @@ mod tests {
 
     /// One live endpoint-auth task over a fresh connector incarnation.
     fn auth_task_fixture(owner: &MeshConnectorResourceScope) -> AuthTaskFixture {
-        auth_task_fixture_with(owner, None)
+        auth_task_fixture_with(owner, None, TestNativeCloseResult::Success)
+    }
+
+    /// The same fixture with the native close held open by a caller's gate.
+    ///
+    /// Only the refused-proof control uses it, and only because the property it
+    /// asserts is a *during*: the connected claim stays owned while the one
+    /// native close is in flight. With the ungated port that window is not
+    /// observable — the dedicated cleanup thread may finish the close before
+    /// any assertion runs, so the same assertion would be a race rather than a
+    /// control. The gate makes the window exact instead of timed.
+    fn auth_task_fixture_gated(
+        owner: &MeshConnectorResourceScope,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> AuthTaskFixture {
+        auth_task_fixture_with(owner, None, TestNativeCloseResult::Gate(gate))
     }
 
     /// The same fixture, forcing this endpoint's contribution to a prior value.
@@ -9451,18 +9565,23 @@ mod tests {
         owner: &MeshConnectorResourceScope,
         local_contribution: &str,
     ) -> AuthTaskFixture {
-        auth_task_fixture_with(owner, Some(local_contribution))
+        auth_task_fixture_with(
+            owner,
+            Some(local_contribution),
+            TestNativeCloseResult::Success,
+        )
     }
 
     fn auth_task_fixture_with(
         owner: &MeshConnectorResourceScope,
         reuse: Option<&str>,
+        native_close: TestNativeCloseResult,
     ) -> AuthTaskFixture {
         let (close_owner, lifetime) = close_owner_fixture(owner);
         let calls = Arc::new(AtomicUsize::new(0));
         assert!(
             close_owner.attach_native_port(Arc::new(TestNativeClosePort {
-                result: TestNativeCloseResult::Success,
+                result: native_close,
                 calls: Arc::clone(&calls),
             }))
         );
@@ -9560,36 +9679,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc04_refused_remote_half_restores_the_channel_claim() {
-        // The failure path that positive-only tests miss. A refusal is terminal,
-        // and terminal release drops the handoff — which is what runs connector
-        // retention. If a refused attempt released the claim directly instead,
-        // or stranded it, native close would never run.
+    async fn v4_arc04_refused_remote_half_is_terminal_and_drives_exactly_one_native_close() {
+        // The failure path that positive-only tests miss. A refusal is terminal
+        // and drops the handoff there and then — which is what runs connector
+        // retention — so the refused attempt neither strands the claim nor
+        // releases it behind the close it is supposed to drive. The native
+        // close is held on a gate so each of those is asserted at a point where
+        // it is actually decided, rather than wherever the dedicated cleanup
+        // thread happened to be.
         let owner = test_resource_owner(1, 1);
-        let (task, close_owner, _lifetime, calls) = auth_task_fixture(&owner);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (task, close_owner, _lifetime, calls) =
+            auth_task_fixture_gated(&owner, Arc::clone(&gate));
         // Signed by a key that is not the expected remote Device.
         let (impostor_key, _) = auth_key(9);
+        let (remote_key, _remote_id) = auth_key(2);
         let remote_c = peer_draw();
+
+        // Non-vacuity: the channel is claimed and nothing has closed yet, so
+        // every transition below is one this refusal caused.
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
 
         assert_eq!(
             drive_exchange(&task, &remote_c, &impostor_key).err(),
-            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid)
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "an impostor's half is refused with the exact typed cause"
         );
+        assert_eq!(
+            task.terminal_error(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "and the refusal is terminal for this exact task"
+        );
+
+        // No retry, and no promotion by a later genuine half. The task keeps the
+        // cause that actually refused it rather than reporting whichever
+        // lifecycle event reached it next, so a refused channel cannot be
+        // reopened by supplying the key it was expecting all along.
+        assert_eq!(
+            drive_exchange(&task, &peer_draw(), &remote_key).err(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "the first cause stands and the genuine remote cannot promote it"
+        );
+
+        // Exactly one native close begins, driven by the terminal release
+        // itself: the task is still alive here, so nothing but the refusal put
+        // this connector into close.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal release drives the connector's native close");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // While that close is in flight the connected claim is still owned. An
+        // unheld close could complete before this line, which is why the gate
+        // exists: the claim releases on the confirmed close, never ahead of it.
         assert_eq!(
             owner.report().active_candidates,
             1,
-            "the refusal must leave the channel claim owned, not stranded"
+            "the refusal must leave the channel claim owned while close is in flight"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), close_owner.wait())
+                .await
+                .is_err(),
+            "and the close cannot be terminal while the native dependency is held"
         );
 
-        // And the restored claim is genuinely retainable: releasing the task
-        // still drives exactly one native close.
-        drop(task);
-        close_owner
-            .wait()
+        // Release the gate: the one native close succeeds and the claim goes
+        // back with it.
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), close_owner.wait())
             .await
-            .expect("native close follows the restored handoff");
+            .expect("released native dependency completes")
+            .expect("native close follows the terminal release");
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(owner.report().active_candidates, 0);
+        drop(task);
     }
 
     #[tokio::test]

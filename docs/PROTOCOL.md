@@ -266,7 +266,33 @@ certificates carry the same value. It defeats a terminating
 signaling-path man-in-the-middle, which must present its own
 certificate on each leg; separation of one channel from another is
 carried by the per-attempt contributions and by connector-incarnation
-ownership.
+ownership. This is a named, accepted residual rather than a closed
+question, and nothing below narrows it.
+
+Both fingerprints are required. If either the local or the remote
+component is absent, the channel is **not** authenticated with a
+partial transcript and is **not** allowed through unauthenticated: the
+open path fails closed before an attempt begins. A transcript is only
+ever signed over a fingerprint pair both endpoints actually stated, so
+an absent component can never be silently encoded as an empty field
+that two peers might agree on.
+
+A peer's contribution binds an attempt exactly once. A retransmitted
+`hello` carrying the *same* contribution is answered from the cached
+proof — no second draw, no second signature — and none of its other
+fields are adopted, so a late frame cannot rewrite the label,
+verification code, advertised features, or capabilities of an attempt
+that is already bound. A `hello` carrying a *different* contribution is
+not a retransmission; it is a typed terminal conflict that retires the
+attempt.
+
+Terminal causes are **first-cause**: an attempt that has already failed
+keeps the error that actually refused it. This matters because ordinary
+teardown reaches the same terminal path a refusal does — a refused
+proof removes the peer, and peer removal retires the task — so without
+the rule, the recorded cause of a refusal would depend on scheduling and
+a signature failure could be reported as an ordinary channel
+replacement.
 
 ---
 

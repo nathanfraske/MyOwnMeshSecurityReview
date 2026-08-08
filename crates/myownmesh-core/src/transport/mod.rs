@@ -47,6 +47,16 @@ pub use webrtc::{
 // internal WebRTC detail that converts to the generic
 // `connector::ConnectedChannelHandoff` at the boundary, and endpoint
 // authentication names only the generic form.
+/// Controls only. Named here so the live open-path controls can arm a connector
+/// to withhold one binding component.
+///
+/// There is no production re-export, because the type does not exist outside
+/// the controls. The gate carries `transport-lab` as well as `test` to match
+/// both the type itself and its only consumers, the live open-path controls: a
+/// default-feature test build has no live link to arm, so re-exporting there
+/// would name something that neither exists nor could be used.
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) use webrtc::WithheldBindingComponent;
 pub(crate) use webrtc::{
     DataChannelOpenOwnership, RemoteCandidateDisposition, WebRtcConnectorEvent,
     WebRtcConnectorIncarnation, WebRtcConnectorWorker,

@@ -142,6 +142,87 @@ matching — and adds its own probes over the endpoint-authentication boundary.
 It carries no evidence from the Arc 03 runs recorded above and has not itself
 been executed at the time of this note.
 
+### Status note at Arc 04E
+
+Added rather than edited in place, for the same reason as the note above: the
+run records must keep saying what those runs actually reported. Nothing in this
+subsection has been executed. No run identifier is cited for any claim here,
+because none exists — these are working-tree source facts, read from the tree,
+and they are not evidence that anything passes.
+
+- **The inbound application path is now fenced by a witness, not a boolean.**
+  The path previously answered admission with an `Option<bool>` that outlived
+  the fence which produced it, after which the affected peer-directed dispatch
+  arms re-resolved the peer *by device id*. A replacement installed during the
+  await could therefore answer that lookup and receive those peer-scoped
+  effects, the liveness touch, the counters, and the delivery. Durable
+  identity-keyed governance is deliberately outside the witness and is not
+  covered by this change or by the controls below.
+
+  Admission now yields a move-only witness that names one exact installation and
+  carries the parsed frame with it, so there is nothing left to re-resolve;
+  after replacement the witness names nothing. The synchronous effect runs
+  *inside* the registry mutation fence rather than after a currency answer — the
+  helper delegates to `PeerRegistry::with_current`, which holds the lock across
+  the whole closure, so replacement orders strictly before or after the entire
+  effect and there is no instant at which "still current" has been established
+  but the effect has not yet run. Reliable stream state moves under the same
+  fence. The witness types are crate-internal and remain externally unreachable
+  — `engine::state` is `pub(crate)` and both are `pub(super)` — and the Arc 04
+  harness now carries source-shape guards for them, including guards against the
+  boolean and check-then-act shapes specifically, so the module-privacy probe
+  cannot go green on a renamed, deleted, or re-widened witness.
+
+  The RPC arm is the one place where the fenced authority is weaker than it may
+  read: it claims authorization atomicity, not cancellation. A replacement
+  landing before the mint refuses the authority and the handler never runs; a
+  replacement landing after the mint does **not** cancel it, and the handler
+  runs to completion. What the capture buys there is that the run is owner-bound,
+  so its replies fail closed against a superseded installation rather than being
+  delivered to whoever holds the device id by then.
+- **The missing-binding path is now the real one.** The absent-component
+  controls previously could only be stated against a hand-built context. They
+  are now driven through the production engine open arm on a live link, using a
+  fixture that opens a genuine offerer/answerer pair and stops at the left
+  connector's own native open callback without consuming it, so the arm under
+  test is the thing that promotes. The positive twin runs first: if stated
+  components cannot open and start a handshake at all, "absent component fails
+  closed" would pass for the wrong reason.
+- **A conflicting contribution is a typed terminal cause, and the first cause
+  wins.** Ordinary teardown reaches the same terminal path a refusal does — a
+  refused proof removes the peer, and peer removal retires the task — so without
+  an explicit first-cause rule the recorded cause of a refusal would depend on
+  scheduling. The controls pin both halves: a conflict keeps its own cause
+  through later retirement, and later frames on a conflicted task report the
+  conflict rather than whichever lifecycle event arrived next.
+- **The signer shares the process identity instead of copying a private key.**
+  The endpoint-auth task is now built with `LocalIdentitySigner::for_identity`
+  over an `Arc<Identity>`, replacing a construction that cloned the signing key
+  out of the identity. This narrows how many copies of the private key exist; it
+  is not a claim about key storage, zeroization, or memory hygiene, none of
+  which this change addresses and none of which has a control here.
+- **Current control totals, counted by reading the working tree.** The Arc 04
+  compiler harness carries 19 cause-matched rejection probes and one positive
+  public-surface control, and the script prints its own total rather than a
+  hardcoded number, so quote the script's output and not this sentence. The
+  `arc04-endpoint-auth` CI job names 33 exact controls: 23 run without
+  `--ignored`, and 10 are live two-connector controls run with `--ignored` in the
+  `transport-lab`-only step. Every one is wrapped in the same triple non-vacuity
+  parse — exactly one test selected, that exact name reported ok, and a summary
+  of one passed with nothing failed and nothing ignored — because `cargo test`
+  exits 0 when a filter matches nothing. None of these totals has been verified
+  by execution at any head, and none should be quoted as a passing result.
+- **The non-exporter residual is unchanged and still accepted.** The DTLS
+  certificate fingerprint pair is not an RFC 5705 exporter and is not
+  session-unique: two channels between one device pair reusing the same
+  certificates carry the same value. Nothing in Arc 04E narrows this. It remains
+  accepted on the stated grounds — the pair defeats a terminating signaling-path
+  man-in-the-middle, and separation of one channel from another is carried by
+  the per-attempt contributions and by connector-incarnation ownership — and is
+  documented as a protocol property in
+  [`docs/PROTOCOL.md`](../docs/PROTOCOL.md#handshake-signature). It is a named
+  residual, not a closed question.
+
 ## 2. RT-03-01: manufacture connector resource authority
 
 Attack: construct a worker, provider, Mesh child, lease, or candidate capability without the process provider and exact claim.

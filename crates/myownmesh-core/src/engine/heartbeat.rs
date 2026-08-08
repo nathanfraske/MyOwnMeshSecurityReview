@@ -106,16 +106,29 @@ pub(super) async fn send_ping_to_owner(
     }
 }
 
-pub async fn on_ping(state: &Arc<NetworkState>, device_id: &str, ping: PingMessage) {
+// `pub(super)`, not `pub`: these take the inbound admission witness, which is
+// private to the engine, and the engine's own frame dispatch is their only
+// caller. Narrowing them is what keeps the witness private.
+pub(super) async fn on_ping(
+    state: &Arc<NetworkState>,
+    dispatch: &super::state::AdmittedInboundDispatch,
+    ping: PingMessage,
+) {
     // A free clock-skew sample: `ping.t` is the sender's wall clock at
     // send (see `PingMessage::t`), so after correcting for transit time
     // (half our measured RTT to this peer) the difference to our own wall
     // clock is how far the two clocks disagree. Median over a small window
     // rides out one-off delivery stalls. Entirely passive — the ping was
     // coming anyway.
+    //
+    // The sample belongs to the installation that sent it. Folding it into a
+    // replacement's window would put one peer's clock into another's estimate,
+    // and that estimate feeds a fleet-wide diagnostic.
     if ping.t > 0 {
         let now = monotonic_ms();
-        if let Some(peer) = state.peers.get(device_id) {
+        // A superseded installation simply contributes no sample; the estimate
+        // is a median over whoever is live, so there is nothing to handle.
+        let _ = dispatch.with_captured_peer(&state.peers, |peer| {
             let mut data = peer.state.write();
             let half_rtt = i64::from(data.rtt_ms.unwrap_or(0)) / 2;
             let sample = ping.t + half_rtt - now;
@@ -124,30 +137,32 @@ pub async fn on_ping(state: &Arc<NetworkState>, device_id: &str, ping: PingMessa
                 data.clock_skew_samples.remove(0);
             }
             data.clock_skew_ms = median(&data.clock_skew_samples);
-        }
+        });
     }
-    // Echo back unchanged so the sender can compute RTT against
-    // its own clock.
-    if let Err(e) = super::send_to_peer(
-        state,
-        device_id,
-        &MeshMessage::Pong(PongMessage { t: ping.t }),
-    )
-    .await
+    // Echo back unchanged so the sender can compute RTT against its own clock —
+    // through the captured owner, so the echo cannot be delivered to (or
+    // charged against) a replacement that took the device id in the meantime.
+    let owner = dispatch.owner();
+    if let Err(e) =
+        super::send_to_peer_owner(state, owner, &MeshMessage::Pong(PongMessage { t: ping.t })).await
     {
-        trace!(peer = %device_id, "pong send failed: {e}");
+        trace!(peer = %owner.device_id(), "pong send failed: {e}");
     }
 }
 
-pub async fn on_pong(state: &Arc<NetworkState>, device_id: &str, pong: PongMessage) {
+pub(super) async fn on_pong(
+    state: &Arc<NetworkState>,
+    dispatch: &super::state::AdmittedInboundDispatch,
+    pong: PongMessage,
+) {
     let now = monotonic_ms();
-    if let Some(peer) = state.peers.get(device_id) {
+    let _ = dispatch.with_captured_peer(&state.peers, |peer| {
         let mut data = peer.state.write();
         if data.last_ping_t == Some(pong.t) {
             let rtt = (now - pong.t).max(0) as u32;
             data.rtt_ms = Some(rtt);
         }
-    }
+    });
 }
 
 fn monotonic_ms() -> i64 {

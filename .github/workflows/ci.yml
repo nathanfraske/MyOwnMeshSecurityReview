@@ -217,6 +217,52 @@ jobs:
             run_exact_control "$control"
           done
 
+          # Arc 04 E1: the inbound application path under the admission fence.
+          # The defect these pin was an `Option<bool>` that outlived the fence
+          # that produced it, after which the affected peer-directed dispatch
+          # arms re-resolved the peer by device id — so a replacement installed
+          # during the await could receive those peer-scoped effects, counters,
+          # and deliveries. Durable identity-keyed governance is intentionally
+          # outside the witness and is not what these controls cover. Each
+          # control names one consequence, because a single "replacement gets
+          # nothing" assertion passes when the frame reaches nobody at all.
+          for control in \
+            v4_arc04e1_admitted_inbound_effect_lands_on_the_captured_installation \
+            v4_arc04e1_captured_peer_effect_is_refused_after_replacement \
+            v4_arc04e1_inbound_application_effect_never_reaches_a_replacement \
+            v4_arc04e1_inbound_delivery_is_never_attributed_to_a_replacement \
+            v4_arc04e1_stale_owner_application_frame_credits_the_replacement_nothing \
+            v4_arc04e1_reliable_stream_state_moves_only_under_the_fence
+          do
+            run_exact_control "$control"
+          done
+
+          # Arc 04 E2: regressions that were previously non-deterministic or
+          # asserted a stale expectation. Each replaced a case that could pass
+          # for the wrong reason — a truncation whose typed cause varied by
+          # draw, a feature vector written before the profile became mandatory,
+          # and a post-refusal claim assertion that raced the dedicated cleanup
+          # thread. They are named here so a silent regression to the flaky
+          # form fails the gate rather than the nightly.
+          for control in \
+            v4_arc04_peer_contribution_rejects_short_and_noncanonical_wire_values \
+            v4_arc04b_duplicate_hello_replies_without_adopting_its_metadata \
+            v4_arc04_refused_remote_half_is_terminal_and_drives_exactly_one_native_close
+          do
+            run_exact_control "$control"
+          done
+
+          # Arc 04 E4: first-cause terminal semantics. A refused attempt must
+          # keep the error that actually refused it; ordinary teardown reaches
+          # the same terminal path, so without these the recorded cause of a
+          # conflict would depend on scheduling.
+          for control in \
+            v4_arc04e_a_conflict_keeps_its_cause_through_later_retirement \
+            v4_arc04e_later_frames_on_a_conflicted_task_report_the_conflict
+          do
+            run_exact_control "$control"
+          done
+
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |
           set -euo pipefail
@@ -251,6 +297,20 @@ jobs:
             v4_arc04d_unadvertised_profile_is_refused_by_the_live_handler \
             v4_arc04c_send_uses_the_captured_session_and_records_only_the_captured_peer \
             v4_arc04c_connector_replacement_blocks_later_media_from_the_old_incarnation
+          do
+            run_exact_control "$control" --ignored
+          done
+
+          # Arc 04 E3: the real missing-binding path, driven through the
+          # production open path on a live link rather than through a
+          # hand-built context. The positive twin runs first for the same
+          # reason as the block above: if stated components cannot open and
+          # start a handshake at all, "absent component fails closed" passes
+          # for the wrong reason.
+          for control in \
+            v4_arc04e_stated_binding_components_open_and_start_the_handshake \
+            v4_arc04e_absent_local_binding_component_fails_the_open_path_closed \
+            v4_arc04e_absent_remote_binding_component_fails_the_open_path_closed
           do
             run_exact_control "$control" --ignored
           done

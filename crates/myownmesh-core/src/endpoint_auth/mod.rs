@@ -118,15 +118,34 @@ pub(crate) enum EndpointAuthError {
     /// fallback and no second profile to select, so this is terminal for the
     /// attempt rather than a step in a negotiation.
     IncompatibleProfile,
-    /// The task's channel is gone: it was replaced or retired, a previous
-    /// attempt already consumed it, or a conflicting peer contribution retired
-    /// this exact task.
+    /// The task's channel is gone: it was replaced or retired, or a previous
+    /// attempt already consumed it.
     ///
     /// This is a security condition, not housekeeping. Because the channel
     /// binding is not session-unique, exact connector-incarnation ownership is
     /// what distinguishes two channels between the same pair — so refusing here
     /// is what defeats cross-channel relay.
+    ///
+    /// Reserved for retirement and currentness. A conflicting peer contribution
+    /// is *not* one of these: the channel was current and the attempt intact,
+    /// so it has its own cause in [`Self::ConflictingPeerContribution`].
     ChannelNotCurrent,
+    /// A second, different peer contribution arrived after this attempt was
+    /// already bound to one. Terminal for this exact task.
+    ///
+    /// Deliberately distinct from [`Self::ChannelNotCurrent`]. Nothing about
+    /// the channel had gone stale: the attempt held its bound pair and its
+    /// cached proof, and a value that is neither that pair's peer half nor an
+    /// exact retransmission of it is an attempt to rebind an attempt that is
+    /// already bound. Recording it as a currentness failure would file a
+    /// peer-supplied conflict under the same cause as ordinary lifecycle
+    /// teardown, and the two need to be told apart: one is a live peer sending
+    /// something it cannot be sending, the other is this endpoint closing up.
+    ///
+    /// Retirement still follows — the conflict retires this exact task — but
+    /// retirement is the consequence, not the cause, and the cause is what is
+    /// kept.
+    ConflictingPeerContribution,
 }
 
 /// The closed set of endpoint-authentication crypto profiles.

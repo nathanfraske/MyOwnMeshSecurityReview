@@ -113,9 +113,37 @@ mod tests {
         );
         // A short value cannot carry a full-width draw, and accepting one would
         // silently shrink the freshness the transcript rests on.
+        //
+        // Built by encoding a deterministic all-zero buffer one byte short,
+        // rather than by truncating the random draw above. Truncation was
+        // flaky: lopping characters off an arbitrary encoding usually leaves
+        // nonzero trailing bits, which `decode` rejects first, so the value
+        // came back `ContributionMalformed` on some draws and
+        // `ContributionTooShort` on others. Zero bytes encode to zero trailing
+        // bits, so this decodes cleanly and fails on length alone — every run.
+        let short = data_encoding::BASE32_NOPAD
+            .encode(&[0u8; CONTRIBUTION_BYTES - 1])
+            .to_lowercase();
         assert_eq!(
-            PeerContribution::from_wire(&canonical[..canonical.len() - 2]),
+            PeerContribution::from_wire(&short),
             Err(EndpointAuthError::ContributionTooShort)
+        );
+        // The companion case at full width: 32 zero bytes encode to 52
+        // characters, so length is not what rejects this one. Altering the
+        // final character sets a trailing bit that the canonical encoding of
+        // any 32-byte value leaves clear, so the value is rejected as
+        // malformed rather than accepted as a full-width draw — the guard is a
+        // decode, not a character count.
+        let mut full_width = data_encoding::BASE32_NOPAD
+            .encode(&[0u8; CONTRIBUTION_BYTES])
+            .to_lowercase();
+        assert_eq!(full_width.len(), 52, "non-vacuity: full encoded width");
+        assert!(full_width.ends_with('a'));
+        full_width.pop();
+        full_width.push('b');
+        assert_eq!(
+            PeerContribution::from_wire(&full_width),
+            Err(EndpointAuthError::ContributionMalformed)
         );
         // Uppercase decodes to the same bytes but is not the canonical
         // spelling: one draw has exactly one accepted wire form.

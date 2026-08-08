@@ -9,10 +9,16 @@
 //! One attempt has one immutable bilateral contribution pair. The first
 //! canonical peer contribution binds the attempt and produces exactly one
 //! proof; an exact duplicate returns that cached proof with no draw and no
-//! signature; a conflicting value is a typed terminal failure that retires this
-//! exact task through the handoff's own owner path. There is no engine-level
+//! signature; a conflicting value is
+//! [`EndpointAuthError::ConflictingPeerContribution`], which retires this exact
+//! task through the handoff's own owner path. There is no engine-level
 //! "already authenticated" exception: duplicate versus conflict is decided
 //! here, by comparing against the bound value.
+//!
+//! The conflict has its own cause rather than borrowing the currentness one.
+//! Retirement follows a conflict, but it is the consequence; what the task
+//! keeps is what actually refused it, so a peer sending a value it cannot be
+//! sending is never filed under the same cause as this endpoint closing up.
 
 use super::capability::{AuthenticatedBindingRecord, AuthenticatedChannelCapability};
 use super::context::EndpointAuthContext;
@@ -40,22 +46,35 @@ struct IssuedIdentity {
 /// Held by the task so the engine never signs and never supplies a signature.
 /// Scoped to exactly one operation: producing this endpoint's half of an
 /// endpoint-authentication transcript.
+///
+/// A **handle, not a copy.** The mesh identity already owns the Device signing
+/// key and is already shared as an `Arc`, so this borrows that one key rather
+/// than cloning secret material into every concurrent attempt. There is no new
+/// owner here and no custody machinery: the number of copies of the key in
+/// memory is unchanged by how many channels are authenticating at once.
+///
+/// The identity is held solely to borrow its key. The field is private, `sign`
+/// is private, and this type deliberately exposes no identity accessor, so
+/// holding the whole identity does not widen what any caller can reach — the
+/// key is immutable on `Identity` (only its label is interior-mutable), so a
+/// task's signer cannot be swapped under it either.
 pub(crate) struct LocalIdentitySigner {
-    key: ed25519_dalek::SigningKey,
+    identity: Arc<crate::identity::Identity>,
 }
 
 impl LocalIdentitySigner {
-    /// Take the caller's existing Device signing key.
+    /// Borrow the mesh identity's existing Device signing key.
     ///
-    /// The engine already holds this key and used to sign with it directly.
-    /// Handing it here is the whole cutover: the key moves into the task's
-    /// ownership at construction, and the engine never signs again.
-    pub(crate) fn from_signing_key(key: ed25519_dalek::SigningKey) -> Self {
-        Self { key }
+    /// The engine already holds this identity and used to sign with its key
+    /// directly. Handing the identity here is the whole cutover: signing moves
+    /// into the task's ownership at construction, and the engine never signs
+    /// again.
+    pub(crate) fn for_identity(identity: Arc<crate::identity::Identity>) -> Self {
+        Self { identity }
     }
 
     fn sign(&self, message: &[u8]) -> String {
-        crate::signing::sign_with(&self.key, message)
+        crate::signing::sign_with(self.identity.signing_key(), message)
     }
 }
 
@@ -80,8 +99,8 @@ impl EndpointAuthProof {
 /// invite the same inference back.
 ///
 /// A conflicting contribution is not represented here. It is terminal and
-/// returns a typed error instead, so no caller can treat it as an accepted
-/// Hello carrying a proof.
+/// returns [`EndpointAuthError::ConflictingPeerContribution`] instead, so no
+/// caller can treat it as an accepted Hello carrying a proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AcceptedPeerHello {
     /// The first canonical peer contribution: it bound this attempt and
@@ -155,6 +174,12 @@ impl EndpointAuthExchange {
     /// refusal would depend on scheduling. The claim is likewise returned
     /// exactly once: the handoff was already taken by the first transition, so
     /// re-entering here must not run retention again.
+    ///
+    /// The same guard is what lets a conflicting contribution keep its own
+    /// cause. A conflict retires the task it refused, and retirement reaches
+    /// this path with `ChannelNotCurrent`; without the guard the conflict would
+    /// be overwritten by the retirement it caused, and every terminal attempt
+    /// would report the lifecycle event rather than the reason.
     fn retire_terminally(&mut self, error: EndpointAuthError) -> EndpointAuthError {
         if let ExchangeState::Terminal(existing) = &self.state {
             return *existing;
@@ -306,7 +331,9 @@ impl EndpointAuthTask {
     ///
     /// Retirement is a lifecycle fact, not a cause. A task that already failed
     /// becomes retired while keeping the error that refused it, and its claim
-    /// stays returned exactly once.
+    /// stays returned exactly once. `ChannelNotCurrent` is what an attempt with
+    /// no earlier failure records here, and it stays reserved for that and for
+    /// the currentness refusals in [`Self::accept_peer_proof`].
     pub(crate) fn retire(&self) {
         self.retired.store(true, Ordering::Release);
         self.lock()
@@ -317,8 +344,9 @@ impl EndpointAuthTask {
     ///
     /// First canonical value binds and signs exactly once. An exact duplicate —
     /// including after promotion — returns the cached proof: no draw, no
-    /// transcript rebuild, no second signature. A conflicting value is terminal
-    /// for this exact task.
+    /// transcript rebuild, no second signature. A conflicting value is
+    /// [`EndpointAuthError::ConflictingPeerContribution`], terminal for this
+    /// exact task and distinct from any currentness failure.
     ///
     /// The returned [`AcceptedPeerHello`] states which of the two it was. The
     /// caller needs that to know whether the Hello it just handled is the one
@@ -332,9 +360,9 @@ impl EndpointAuthTask {
         // Bound and promoted answer identically: promotion moves the channel
         // out, it does not change what this attempt bound. An exact duplicate
         // is answered from the cache in both states; a conflicting value is
-        // terminal in both. After promotion the handoff is already gone, so a
-        // conflict retires this task without touching the capability that was
-        // issued from it.
+        // terminal in both, with the same conflict cause in both. After
+        // promotion the handoff is already gone, so a conflict retires this
+        // task without touching the capability that was issued from it.
         match &exchange.state {
             ExchangeState::Terminal(error) => return Err(*error),
             ExchangeState::Bound {
@@ -349,7 +377,15 @@ impl EndpointAuthTask {
                 if bound == &peer_contribution {
                     return Ok(AcceptedPeerHello::ExactDuplicate(local_proof.clone()));
                 }
-                let error = exchange.retire_terminally(EndpointAuthError::ChannelNotCurrent);
+                // The conflict's own cause, not the currentness one. This
+                // channel was current and this attempt was intact; what
+                // happened is that a peer offered a second, different
+                // contribution for a pair that is already bound. Retirement
+                // follows on the next line, and `retire_terminally` keeps the
+                // first cause, so the recorded reason stays the conflict rather
+                // than becoming the retirement it triggered.
+                let error =
+                    exchange.retire_terminally(EndpointAuthError::ConflictingPeerContribution);
                 self.retired.store(true, Ordering::Release);
                 return Err(error);
             }
@@ -387,6 +423,13 @@ impl EndpointAuthTask {
     /// The whole handoff moves into the capability, so connector retention
     /// travels with the promotion. Refusal is terminal and releases the channel
     /// through the same owner path.
+    ///
+    /// Every `ChannelNotCurrent` below is a genuine currentness refusal: the
+    /// channel claim is not there to promote, because promotion already
+    /// happened or the handoff is already gone. A terminal task answers with
+    /// the cause it recorded instead — so an attempt that a conflicting
+    /// contribution retired reports that conflict here, not a currentness
+    /// failure it never had.
     pub(crate) fn accept_peer_proof(
         &self,
         peer_signature: &str,
@@ -517,6 +560,22 @@ pub(crate) fn task_reusing_contribution_for_test(
     task
 }
 
+/// A signer over a seeded fixture key, through the same owner production uses.
+///
+/// Production hands the mesh's shared `Arc<Identity>`; a fixture holds only a
+/// seeded key, so it wraps that key in the identity type rather than being
+/// given a second constructor that takes a bare key. Keeping exactly one
+/// constructor is the point — a bare-key entry point would reintroduce the copy
+/// this type exists to stop making, and would do it on the path least likely to
+/// be reviewed.
+#[cfg(test)]
+fn signer_for_test(key: ed25519_dalek::SigningKey) -> LocalIdentitySigner {
+    LocalIdentitySigner::for_identity(Arc::new(crate::identity::Identity::from_signing_key(
+        key,
+        "endpoint-auth-fixture",
+    )))
+}
+
 #[cfg(test)]
 pub(crate) fn task_for_test(handoff: ConnectedChannelHandoff) -> EndpointAuthTask {
     fn device_id(key: &ed25519_dalek::SigningKey) -> String {
@@ -538,11 +597,7 @@ pub(crate) fn task_for_test(handoff: ConnectedChannelHandoff) -> EndpointAuthTas
         .expect("both fixture components present"),
     )
     .expect("non-empty fixture identifiers");
-    EndpointAuthTask::begin(
-        context,
-        handoff,
-        LocalIdentitySigner::from_signing_key(local_key),
-    )
+    EndpointAuthTask::begin(context, handoff, signer_for_test(local_key))
 }
 
 /// The peer's half of the proof for a task, over that task's own context.
@@ -616,7 +671,7 @@ mod tests {
         let task = EndpointAuthTask::begin(
             context_for(MESH, &local_device, &remote_device),
             handoff_for_test(crate::runtime::runtime_for_test()),
-            LocalIdentitySigner::from_signing_key(local_key),
+            signer_for_test(local_key),
         );
         Fixture {
             task,
@@ -699,7 +754,7 @@ mod tests {
         let task = EndpointAuthTask::begin(
             context_for(MESH, &local_device, &remote_device),
             handoff,
-            LocalIdentitySigner::from_signing_key(local_key),
+            signer_for_test(local_key),
         );
         task.accept_peer_hello(peer_draw()).expect("binds");
 
@@ -737,13 +792,19 @@ mod tests {
         // The other direction, so the guard above cannot be satisfied by a task
         // that simply never records retirement: an attempt with no earlier
         // failure does take ChannelNotCurrent, and returns its claim once.
+        //
+        // This is also the reservation twin for the conflict cause. Retirement
+        // keeps `ChannelNotCurrent` here; only an attempt with no earlier cause
+        // records it. If the conflict site ever borrowed this cause again, this
+        // control would still pass — which is exactly why the conflict controls
+        // assert the cause and not merely that the attempt died.
         let (local_key, local_device) = fixture_key(1);
         let (_, remote_device) = fixture_key(2);
         let (handoff, retention) = counted_handoff_for_test(crate::runtime::runtime_for_test());
         let task = EndpointAuthTask::begin(
             context_for(MESH, &local_device, &remote_device),
             handoff,
-            LocalIdentitySigner::from_signing_key(local_key),
+            signer_for_test(local_key),
         );
 
         task.retire();
@@ -818,7 +879,7 @@ mod tests {
         let task = EndpointAuthTask::begin(
             context_for(MESH, &device, &device),
             handoff_for_test(crate::runtime::runtime_for_test()),
-            LocalIdentitySigner::from_signing_key(key),
+            signer_for_test(key),
         );
 
         assert_eq!(
@@ -945,15 +1006,86 @@ mod tests {
     #[test]
     fn v4_arc04_conflicting_hello_terminally_retires_the_task() {
         // Migrated retry control, corrected: a different contribution is not a
-        // retransmission. It is terminal for this exact task.
+        // retransmission. It is terminal for this exact task, with its own
+        // cause — the channel was current and the attempt intact, so this is
+        // not a currentness failure and must not be recorded as one.
         let fixture = fixture();
         fixture.task.accept_peer_hello(peer_draw()).expect("binds");
 
         assert_eq!(
             fixture.task.accept_peer_hello(peer_draw()),
-            Err(EndpointAuthError::ChannelNotCurrent)
+            Err(EndpointAuthError::ConflictingPeerContribution)
         );
         assert!(fixture.task.is_retired());
+        // Retirement is the consequence; the recorded cause is the conflict.
+        assert_eq!(
+            fixture.task.terminal_error(),
+            Some(EndpointAuthError::ConflictingPeerContribution)
+        );
+        assert_eq!(fixture.task.signature_count(), 1);
+    }
+
+    #[test]
+    fn v4_arc04e_a_conflict_keeps_its_cause_through_later_retirement() {
+        // The conflict retires the task it refused, and retirement itself takes
+        // `ChannelNotCurrent`. Without the first-cause guard the conflict would
+        // be overwritten by the retirement it caused, and every conflicting
+        // Hello would report a currentness failure it never had.
+        let fixture = fixture();
+        fixture.task.accept_peer_hello(peer_draw()).expect("binds");
+        assert_eq!(
+            fixture.task.accept_peer_hello(peer_draw()),
+            Err(EndpointAuthError::ConflictingPeerContribution)
+        );
+
+        fixture.task.retire();
+
+        assert_eq!(
+            fixture.task.terminal_error(),
+            Some(EndpointAuthError::ConflictingPeerContribution),
+            "an explicit retirement must not overwrite the conflict that refused this attempt"
+        );
+    }
+
+    #[test]
+    fn v4_arc04e_later_frames_on_a_conflicted_task_report_the_conflict() {
+        // Both entry points, after the conflict. A later Hello — even an exact
+        // retransmission of the value that *was* bound — and a later proof both
+        // answer with the cause that actually refused the attempt.
+        //
+        // The proof half is load-bearing beyond bookkeeping: `on_auth_response`
+        // treats a `ChannelNotCurrent` from a promoted task as a benign
+        // duplicate. If a conflicted task answered with that same cause, a
+        // conflict could present itself to that guard as a retransmission, so
+        // the two must be distinguishable at this boundary.
+        let fixture = fixture();
+        let bound = peer_draw();
+        fixture
+            .task
+            .accept_peer_hello(bound.clone())
+            .expect("binds");
+        assert_eq!(
+            fixture.task.accept_peer_hello(peer_draw()),
+            Err(EndpointAuthError::ConflictingPeerContribution)
+        );
+
+        assert_eq!(
+            fixture.task.accept_peer_hello(bound.clone()),
+            Err(EndpointAuthError::ConflictingPeerContribution),
+            "the bound value is no longer answerable from the cache: the attempt is terminal"
+        );
+        // `err()` rather than a comparison: the capability is deliberately
+        // neither `Debug` nor `PartialEq`, because its private provenance must
+        // not be printable or comparable outside its owner.
+        assert_eq!(
+            fixture
+                .task
+                .accept_peer_proof(&fixture.peer_proof(&bound))
+                .err(),
+            Some(EndpointAuthError::ConflictingPeerContribution),
+            "and a genuine peer proof cannot promote a conflicted attempt, nor report it as \
+             a currentness failure"
+        );
         assert_eq!(fixture.task.signature_count(), 1);
     }
 
@@ -992,9 +1124,13 @@ mod tests {
             .accept_peer_proof(&fixture.peer_proof(&peer))
             .expect("promotes");
 
+        // Promotion does not change what a conflict is. The bound pair survives
+        // promotion, so a second, different contribution is still a conflict
+        // here and still carries the conflict's own cause — not the currentness
+        // cause that a *second promotion* of this same task would take.
         assert_eq!(
             fixture.task.accept_peer_hello(peer_draw()),
-            Err(EndpointAuthError::ChannelNotCurrent)
+            Err(EndpointAuthError::ConflictingPeerContribution)
         );
         assert!(fixture.task.is_retired());
         // The capability that was already issued is untouched: it still names
@@ -1005,7 +1141,10 @@ mod tests {
 
     #[test]
     fn v4_arc04_duplicate_auth_response_after_promotion_is_refused() {
-        // Migrated retry control: one attempt promotes exactly once.
+        // Migrated retry control: one attempt promotes exactly once. This is a
+        // genuine currentness refusal — the channel claim has already moved —
+        // and is the reserved meaning of `ChannelNotCurrent`, kept distinct
+        // from the conflict cause asserted by its neighbours above.
         let fixture = fixture();
         let peer = peer_draw();
         fixture.task.accept_peer_hello(peer.clone()).expect("binds");
