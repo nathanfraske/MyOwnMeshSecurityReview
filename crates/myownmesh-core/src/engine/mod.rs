@@ -1862,8 +1862,34 @@ async fn handle_transport_event(
             // binding, and an unbound endpoint-authentication attempt would
             // prove nothing about the channel it ran over.
             let Some(binding) = worker.endpoint_auth_binding().await else {
-                warn!(peer = %device_id, "no connector channel binding at DataChannelOpen — retiring rather than authenticating unbound");
-                worker.retire();
+                warn!(peer = %device_id, "no connector channel binding at DataChannelOpen — fencing the channel and dropping the exact peer rather than authenticating unbound");
+                // Retiring alone left a live native channel and a peer entry
+                // behind: nothing could be proved about that channel, yet the
+                // entry stayed addressable and the connector stayed allocated.
+                // Fail closed on both.
+                //
+                // The connector is fenced first, so the close is already in
+                // flight and the connected claim is already in conservative
+                // retention before the registry is touched. `refuse_data_channel_open`
+                // starts exactly one close owner and does so synchronously,
+                // even if this connector has already gone stale — there is no
+                // watchdog and no timer behind this, so if it did not start
+                // here it would never start at all.
+                //
+                // Then only the exact current peer goes. `drop_peer_if_current`
+                // is keyed on the owner token captured before the await above,
+                // so a replacement installed while `endpoint_auth_binding` was
+                // suspended is left entirely untouched: this refusal is about
+                // one channel, not about this device. Nothing is re-resolved
+                // from the device id after the await, for the same reason.
+                //
+                // No task is built, no Hello is sent, no proof is computed, no
+                // capability is promoted, no application traffic is admitted,
+                // and no profile is negotiated. The refusal is ownership and
+                // cleanup only; it states nothing about certificates or
+                // exporters.
+                worker.refuse_data_channel_open();
+                drop_peer_if_current(state, &owner, DropReason::AuthFailed).await;
                 return false;
             };
             // The await above can lose the registry race, so the current owner
@@ -2970,70 +2996,97 @@ async fn on_rpc_request(
     }
 }
 
+/// The three inbound arms that settle a *locally originated* call.
+///
+/// Each one previously took the dispatch witness as `_dispatch` and
+/// threw it away, reaching the pending map with nothing but the
+/// request id the inbound frame itself carried. That made a request
+/// id an authority: any authenticated peer able to learn or guess
+/// another peer's in-flight id could resolve that caller's oneshot
+/// with a body of its own choosing, push chunks into that caller's
+/// stream, or end the stream early — all under the victim peer's
+/// identity, because the caller never learns who actually answered.
+///
+/// The source is now taken from `dispatch.owner()`, the owner token
+/// minted when the frame was admitted, which names the peer the
+/// transport actually authenticated. It is never the request id,
+/// never a fresh registry lookup, and never anything the frame
+/// carries: a sender cannot nominate its own authority.
+///
+/// The comparison is against the pending operation's bound
+/// canonical device rather than its installation, which is the
+/// selected rule stated on `PendingOp`: the same device returning
+/// over a freshly authenticated replacement connector completes the
+/// call, a different device never does. That is why these arms do
+/// not run under `with_captured_peer` the way `on_rpc_request`
+/// does — a replacement there must refuse, because it authorizes a
+/// handler run; a replacement here must be allowed, because the
+/// local caller is still waiting for exactly this answer.
+///
+/// Each arm holds no DashMap guard across its send: the bound
+/// operation decides and extracts under the shard lock, hands the
+/// sender back, and the send happens here with no guard live.
 async fn on_rpc_response(
     state: &Arc<NetworkState>,
-    _dispatch: &state::AdmittedInboundDispatch,
+    dispatch: &state::AdmittedInboundDispatch,
     resp: RpcResponseMessage,
 ) {
-    let rpc = match state.rpc.read().clone() {
-        Some(r) => r,
-        None => return,
-    };
-    let Some((_, entry)) = rpc.pending.remove(&resp.request_id) else {
+    let Some(rpc) = state.rpc.read().clone() else {
         return;
     };
-    if let crate::rpc::PendingEntry::Single(tx) = entry {
-        let result = if let Some(err) = resp.error {
-            Err(err)
-        } else {
-            Ok(crate::rpc::RpcResponse {
-                body: resp.ok.unwrap_or(serde_json::Value::Null),
-            })
-        };
-        let _ = tx.send(result);
-    }
+    // Removes only for the bound device and only a single-response
+    // operation; a wrong source or a streaming operation leaves the
+    // entry untouched and settles nothing.
+    let Some(tx) = rpc.take_single_response(&resp.request_id, dispatch.owner().device_id()) else {
+        return;
+    };
+    let result = if let Some(err) = resp.error {
+        Err(err)
+    } else {
+        Ok(crate::rpc::RpcResponse {
+            body: resp.ok.unwrap_or(serde_json::Value::Null),
+        })
+    };
+    let _ = tx.send(result);
 }
 
 async fn on_rpc_stream_chunk(
     state: &Arc<NetworkState>,
-    _dispatch: &state::AdmittedInboundDispatch,
+    dispatch: &state::AdmittedInboundDispatch,
     chunk: RpcStreamChunkMessage,
 ) {
-    let rpc = match state.rpc.read().clone() {
-        Some(r) => r,
-        None => return,
+    let Some(rpc) = state.rpc.read().clone() else {
+        return;
     };
-    // Pull the sender out under the DashMap shard lock, drop the
-    // ref, then send — sender clone is cheap and avoids holding
-    // the ref across the send.
-    let sender = rpc
-        .pending
-        .get(&chunk.request_id)
-        .and_then(|entry| match &*entry {
-            crate::rpc::PendingEntry::Stream(tx) => Some(tx.clone()),
-            crate::rpc::PendingEntry::Single(_) => None,
-        });
-    if let Some(tx) = sender {
-        let _ = tx.send(Ok(chunk.payload));
-    }
+    // Clones the sender for the bound device's open stream and
+    // removes nothing — the stream stays pending until its end
+    // frame. A chunk from any other device is dropped, so a foreign
+    // peer cannot inject an item into someone else's stream.
+    let Some(tx) = rpc.stream_chunk_sender(&chunk.request_id, dispatch.owner().device_id()) else {
+        return;
+    };
+    let _ = tx.send(Ok(chunk.payload));
 }
 
 async fn on_rpc_stream_end(
     state: &Arc<NetworkState>,
-    _dispatch: &state::AdmittedInboundDispatch,
+    dispatch: &state::AdmittedInboundDispatch,
     end: RpcStreamEndMessage,
 ) {
-    let rpc = match state.rpc.read().clone() {
-        Some(r) => r,
-        None => return,
+    let Some(rpc) = state.rpc.read().clone() else {
+        return;
     };
-    if let Some((_, crate::rpc::PendingEntry::Stream(tx))) = rpc.pending.remove(&end.request_id) {
-        if let Some(err) = end.error {
-            let _ = tx.send(Err(err));
-        }
-        // Drop the sender so the receiver's loop exits.
-        drop(tx);
+    // Removes only for the bound device and only a streaming
+    // operation, so a foreign peer cannot cut another peer's stream
+    // short and a single-response frame cannot close one.
+    let Some(tx) = rpc.take_stream_end(&end.request_id, dispatch.owner().device_id()) else {
+        return;
+    };
+    if let Some(err) = end.error {
+        let _ = tx.send(Err(err));
     }
+    // Drop the sender so the receiver's loop exits.
+    drop(tx);
 }
 
 async fn on_channel_frame(
@@ -5155,19 +5208,32 @@ mod tests {
 
     /// What the open path must do when the connector cannot state its binding.
     ///
-    /// Shared verbatim by all three open-path controls below, so the twins
-    /// differ in exactly one value: which component the live connector is armed
-    /// to withhold, or — for the positive — that it is never armed at all.
-    /// Everything else is the same live link, the same registry installation,
-    /// and the same genuine native callback.
+    /// Shared verbatim by all four open-path controls below, so the twins differ
+    /// in exactly one arrangement value: which component the live connector is
+    /// armed to withhold, whether its one native close is made to fail, or — for
+    /// the positive — that it is never armed at all. Everything else is the same
+    /// live link, the same registry installation, and the same genuine native
+    /// callback.
     ///
     /// The observations are collected *after* the production arm has run,
     /// through the same reads the engine itself would use, so a control cannot
     /// pass by inspecting something the engine does not maintain.
+    ///
+    /// The peer-object observations are read off the `Arc` the control installed
+    /// rather than through the registry. That matters now that the refusal
+    /// removes the entry: a read through the owner token would answer "no task,
+    /// no Hello, nothing promoted" for the trivial reason that there is nothing
+    /// to read, which is exactly the vacuity these controls exist to avoid. Read
+    /// off the object, those assertions stay statements about what the arm did
+    /// to a peer that demonstrably exists.
     #[cfg(feature = "transport-lab")]
     struct OpenPathOutcome {
         handled: bool,
+        /// The registry side of the refusal: the exact owner is gone, and so is
+        /// any entry for the device — nothing is left addressable.
         owner_still_current: bool,
+        device_still_installed: bool,
+        reconnect_intent: bool,
         has_auth_task: bool,
         data_channel_open: bool,
         handshake_started: bool,
@@ -5175,12 +5241,76 @@ mod tests {
         hellos_sent: u32,
         handshaking: bool,
         has_authenticated_channel: bool,
+        /// Native closes that had reached the gate by the time the arm returned
+        /// and the gate was inspected. The refusal must start exactly one; the
+        /// positive must start none.
+        close_entries: usize,
+        /// Connected claims in conservative retention while that close was held
+        /// at the native boundary — before it could possibly have succeeded.
+        retained_claims_while_held: usize,
+        /// What the one close finally reported, and what the owner did with the
+        /// claim afterwards.
+        close_settled: crate::Result<()>,
+        retained_claims_after_close: usize,
+        /// Whether an unrelated connector could still be opened on this same
+        /// mesh afterwards. `None` unless the arrangement asked for the probe.
+        fresh_connector_admitted: Option<bool>,
         connector: DataChannelOpenOwnership,
+    }
+
+    /// The one thing the four open-path controls vary.
+    #[cfg(feature = "transport-lab")]
+    #[derive(Clone, Copy)]
+    struct OpenPathArrangement {
+        /// Which binding component the live connector is armed to withhold.
+        /// `None` is the positive twin: the same fixture, never armed.
+        withhold: Option<crate::transport::WithheldBindingComponent>,
+        /// Report a failure for the native close that physically runs.
+        fail_native_close: bool,
+        /// Afterwards, try to open an unrelated connector on the same mesh.
+        probe_fresh_connector: bool,
+    }
+
+    #[cfg(feature = "transport-lab")]
+    impl OpenPathArrangement {
+        fn withholding(component: crate::transport::WithheldBindingComponent) -> Self {
+            Self {
+                withhold: Some(component),
+                fail_native_close: false,
+                probe_fresh_connector: false,
+            }
+        }
+
+        fn stated() -> Self {
+            Self {
+                withhold: None,
+                fail_native_close: false,
+                probe_fresh_connector: false,
+            }
+        }
+
+        fn failing_close(component: crate::transport::WithheldBindingComponent) -> Self {
+            Self {
+                withhold: Some(component),
+                fail_native_close: true,
+                probe_fresh_connector: true,
+            }
+        }
+
+        /// Whether this arrangement expects the arm to accept the open.
+        ///
+        /// The one place the driver branches. A withheld component is the whole
+        /// cause of the refusal, so it is also the whole predicate for "a close
+        /// will be started": waiting for a gate entry on the positive twin would
+        /// hang on a close that must never happen.
+        fn handled_open_expected(self) -> bool {
+            self.withhold.is_none()
+        }
     }
 
     /// Drive one real link through the production `DataChannelOpen` arm.
     ///
-    /// `withhold` is the only thing the callers vary. The link is genuinely
+    /// `arrangement` is the only thing the callers vary. The link is genuinely
     /// live — real ICE, real DTLS, real SCTP — and the event handed to the arm
     /// is the connector's own native open callback, not one a fixture stamped,
     /// so the arm is entered exactly as it is in production.
@@ -5190,11 +5320,19 @@ mod tests {
     /// this boundary: the same connector stated both components a moment
     /// earlier, so the refusal is the withheld component and not an unusable
     /// fixture.
+    ///
+    /// The native-close gate is installed on every arrangement, before the arm,
+    /// and is the one instrument that reads the close side. Installing it on the
+    /// positive too is deliberate: "no close was started" then means the same
+    /// measurement returning zero, rather than a different measurement not
+    /// taken. Nothing about it can start a close — it can only hold one that
+    /// production already started — and its handle opens the gate on drop, so a
+    /// failing assertion cannot leave a cleanup task parked.
     #[cfg(feature = "transport-lab")]
     async fn drive_open_path(
         suffix_a: &str,
         suffix_b: &str,
-        withhold: Option<crate::transport::WithheldBindingComponent>,
+        arrangement: OpenPathArrangement,
     ) -> OpenPathOutcome {
         let state = build_test_state(suffix_a);
         let peer_state = build_test_state(suffix_b);
@@ -5206,6 +5344,11 @@ mod tests {
         let mut link =
             crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
                 .await;
+        // A second handle on the same connector, so its close owner can still be
+        // read after the fixture — and with it the fixture's `Arc` — is consumed
+        // by the close below. Holding it changes nothing: the worker's own
+        // `Drop` starts a close that has already been started and settled.
+        let left = Arc::clone(&link.left);
 
         // The data channel really is working, not merely reported open: a byte
         // crosses it before anything is arranged. Without this the negatives
@@ -5218,6 +5361,15 @@ mod tests {
         assert!(
             link.left.endpoint_auth_binding().await.is_some(),
             "non-vacuity: this connector states both binding components on this live link"
+        );
+        // The connector's claim is *active*: nothing has been handed to the
+        // close owner's conservative retention, because nothing has been
+        // promoted and no close has started. Every retention count asserted
+        // after the arm is a change from this zero, not an ambient value.
+        assert_eq!(
+            left.retained_connected_claims_for_test(),
+            0,
+            "non-vacuity: the connector's claim is active before the arm, not already retained"
         );
 
         // The pre-open registry state the production arm expects: a current
@@ -5237,8 +5389,22 @@ mod tests {
             peer.endpoint_auth_task().is_none(),
             "non-vacuity: the arm is what installs a task, so it must start with none"
         );
+        assert!(
+            !state.has_reconnect_intent(&device_id),
+            "non-vacuity: no reconnect intent exists before the arm runs"
+        );
 
-        if let Some(component) = withhold {
+        // Installed on every arrangement, including the positive, so "no close
+        // was started" and "exactly one close was started" are the *same*
+        // observation on the same instrument rather than two different ones.
+        // Installed before the arm, because the close it must catch is started
+        // synchronously inside the arm.
+        let gate = link.left.install_native_close_gate_for_test();
+        if arrangement.fail_native_close {
+            gate.inject_close_failure();
+        }
+
+        if let Some(component) = arrangement.withhold {
             link.left.withhold_binding_component_for_test(component);
             assert!(
                 link.left.endpoint_auth_binding().await.is_none(),
@@ -5249,12 +5415,17 @@ mod tests {
         let open_event = link.take_open_event();
         let handled = handle_transport_event(&state, device_id.clone(), open_event).await;
 
+        // Registry side of the refusal, read two ways: the exact owner token the
+        // arm carried, and the device it names. Both must be gone, or the entry
+        // would still be reachable by device id.
         let owner_still_current = state.peers.get_if_current(&owner).is_some();
-        let has_auth_task = state
-            .peers
-            .get_if_current(&owner)
-            .and_then(|peer| peer.endpoint_auth_task())
-            .is_some();
+        let device_still_installed = state.peers.owner(&device_id).is_some();
+        let reconnect_intent = state.has_reconnect_intent(&device_id);
+        // Read off the installed object, not through the registry: see the note
+        // on `OpenPathOutcome`. A refused peer is removed, so a registry read
+        // would answer "nothing happened" for free.
+        let has_auth_task = peer.endpoint_auth_task().is_some();
+        let has_authenticated_channel = peer.has_authenticated_channel();
         let (
             data_channel_open,
             handshake_started,
@@ -5271,56 +5442,117 @@ mod tests {
                 matches!(data.status, PeerStatus::Handshaking),
             )
         };
-        let outcome = OpenPathOutcome {
+        // Asked here, because it is the fencing observation: a connector the arm
+        // fenced can no longer promote a connected claim at all, while one the
+        // arm promoted answers that it already has. Taken before the gate is
+        // opened, so on the refusal paths it describes a connector whose one
+        // close is still in flight.
+        let connector = link.left.confirm_data_channel_open();
+
+        // The held window. On a refusal the arm has already started the one
+        // close and it is parked at the native boundary, so this is the moment
+        // in which "the claim is retained and the close has not succeeded" is a
+        // statement about a real close rather than about a finished one. The
+        // wait is a `watch` notification with a deadline — no sleep, and no
+        // re-run until it happens to pass.
+        if !arrangement.handled_open_expected() {
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+                .await
+                .expect("the refusal starts a native close that reaches the gate");
+        }
+        let close_entries = gate.entries();
+        let retained_claims_while_held = left.retained_connected_claims_for_test();
+        gate.open();
+
+        // Closed through the fixture's own path, and only then are the states
+        // shut down. Consuming the fixture here is what finally releases both
+        // receivers, so they stay owned for every observation above; and closing
+        // before shutdown means this is the one close, rather than a second one
+        // racing whatever `shutdown` already retired.
+        //
+        // The outcomes are inspected rather than unwrapped, because the failure
+        // twin's left connector is *supposed* to report a retained-claim error
+        // here — unwrapping would turn the behaviour under test into a panic.
+        let mut outcomes = link.close_outcomes().await.into_iter();
+        let close_settled = outcomes
+            .next()
+            .expect("the fixture closes the left connector first");
+        outcomes
+            .next()
+            .expect("the fixture closes the right connector")
+            .expect("the unarmed right control connector closes cleanly");
+        let retained_claims_after_close = left.retained_connected_claims_for_test();
+
+        // Non-poisoning: one connector's failed close retains that connector's
+        // exact claim and nothing more, so an unrelated connector slot on this
+        // same mesh must still be admissible afterwards.
+        let fresh_connector_admitted = if arrangement.probe_fresh_connector {
+            let opened = state
+                .transport
+                .open_connector_peer(
+                    Role::Offerer,
+                    &[],
+                    &[],
+                    state.peer_connection_resource_scope(),
+                )
+                .await;
+            let admitted = opened.is_ok();
+            if let Ok((fresh, _fresh_events)) = opened {
+                let _ = fresh.retire_and_close().await;
+            }
+            Some(admitted)
+        } else {
+            None
+        };
+
+        state.shutdown().await;
+        peer_state.shutdown().await;
+        OpenPathOutcome {
             handled,
             owner_still_current,
+            device_still_installed,
+            reconnect_intent,
             has_auth_task,
             data_channel_open,
             handshake_started,
             verification_code_sent,
             hellos_sent,
             handshaking,
-            has_authenticated_channel: legacy_test_has_authenticated_channel(&state, &owner),
-            // Asked last, because it is the fencing observation: a connector the
-            // arm retired can no longer promote a connected claim at all, while
-            // one the arm promoted answers that it already has.
-            connector: link.left.confirm_data_channel_open(),
-        };
-
-        // Closed through the fixture's own path first, and only then are the
-        // states shut down. Consuming the fixture here is what finally releases
-        // both receivers, so they stay owned for every observation above; and
-        // closing before shutdown means this is the one close, rather than a
-        // second one racing whatever `shutdown` already retired.
-        link.close().await;
-        state.shutdown().await;
-        peer_state.shutdown().await;
-        outcome
+            has_authenticated_channel,
+            close_entries,
+            retained_claims_while_held,
+            close_settled,
+            retained_claims_after_close,
+            fresh_connector_admitted,
+            connector,
+        }
     }
 
-    /// A missing **local** binding component fails the whole open path closed.
+    /// Everything a refusal must do, asserted once for every negative twin.
     ///
-    /// The existing missing-component controls assert that the binding
-    /// constructor refuses half a pair. That is one boundary below this one, and
-    /// it would still pass with the engine's fail-closed branch deleted. This
-    /// drives the production `DataChannelOpen` arm over a genuinely working
-    /// channel and asserts what that branch is actually for: no task, no
-    /// handshake work, a fenced connector, no capability.
+    /// The three negatives differ only in which component is withheld and
+    /// whether the one native close is made to fail. Everything that must be
+    /// true of *any* refusal lives here, so a twin that stopped checking one of
+    /// these could not do so quietly, and the twins' own bodies say only what is
+    /// specific to them.
     #[cfg(feature = "transport-lab")]
-    #[tokio::test]
-    #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
-    async fn v4_arc04e_absent_local_binding_component_fails_the_open_path_closed() {
-        let outcome = drive_open_path(
-            "arc04e-absent-local-a",
-            "arc04e-absent-local-b",
-            Some(crate::transport::WithheldBindingComponent::Local),
-        )
-        .await;
-
+    fn assert_refused_open_path(outcome: &OpenPathOutcome) {
         assert!(!outcome.handled, "the arm refuses this open");
-        // The entry survives, so every "nothing happened" assertion below is
-        // about a peer that is still there rather than one that vanished.
-        assert!(outcome.owner_still_current);
+        // Removed, not left addressable. This is the part a fenced-but-retained
+        // entry would have failed: an unbound channel's peer must not survive as
+        // something another path can find by owner token or by device id.
+        assert!(
+            !outcome.owner_still_current,
+            "the exact peer the arm captured is removed"
+        );
+        assert!(
+            !outcome.device_still_installed,
+            "and no entry for that device is left behind under any owner"
+        );
+        assert!(
+            !outcome.reconnect_intent,
+            "an authentication refusal is not recoverable, so nothing is queued to redial"
+        );
         assert!(
             !outcome.has_auth_task,
             "an unbound attempt must never be installed: it would authenticate nothing"
@@ -5344,6 +5576,58 @@ mod tests {
             matches!(outcome.connector, DataChannelOpenOwnership::Rejected),
             "the exact connector is fenced by the refusal"
         );
+        // Exactly one close, started by the arm itself. Not zero — a refusal
+        // that only unpromoted would leave the native connector allocated and
+        // the channel physically open. Not two — the brief promotion inside
+        // `refuse_data_channel_open` and the explicit start are the same close
+        // owner, and starting it twice must be idempotent.
+        assert_eq!(
+            outcome.close_entries, 1,
+            "the refusal starts exactly one native close"
+        );
+        // And while that close was still held at the native boundary, the
+        // connected claim was retained rather than released. This is the whole
+        // conservative-retention rule: the claim is not given back on the
+        // strength of having *asked* for a close.
+        assert_eq!(
+            outcome.retained_claims_while_held, 1,
+            "the connected claim is retained for the whole time the close is in flight"
+        );
+    }
+
+    /// A missing **local** binding component fails the whole open path closed.
+    ///
+    /// The existing missing-component controls assert that the binding
+    /// constructor refuses half a pair. That is one boundary below this one, and
+    /// it would still pass with the engine's fail-closed branch deleted. This
+    /// drives the production `DataChannelOpen` arm over a genuinely working
+    /// channel and asserts what that branch is actually for: no task, no
+    /// handshake work, a fenced connector, no capability, no surviving peer
+    /// entry, and exactly one native close that holds the claim until it is
+    /// observed to have succeeded.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
+    async fn v4_arc04e_absent_local_binding_component_fails_the_open_path_closed() {
+        let outcome = drive_open_path(
+            "arc04e-absent-local-a",
+            "arc04e-absent-local-b",
+            OpenPathArrangement::withholding(crate::transport::WithheldBindingComponent::Local),
+        )
+        .await;
+
+        assert_refused_open_path(&outcome);
+        // Released only after the close reported success, and released once:
+        // the owner empties its retention in the same critical section that
+        // releases it, so a second release has nothing left to act on.
+        assert!(
+            outcome.close_settled.is_ok(),
+            "the one native close succeeds on an unarmed close owner"
+        );
+        assert_eq!(
+            outcome.retained_claims_after_close, 0,
+            "the retained claim is released exactly once, on observed close success"
+        );
     }
 
     /// The exact twin, with the other side of the pair withheld, so neither
@@ -5355,33 +5639,69 @@ mod tests {
         let outcome = drive_open_path(
             "arc04e-absent-remote-a",
             "arc04e-absent-remote-b",
-            Some(crate::transport::WithheldBindingComponent::Remote),
+            OpenPathArrangement::withholding(crate::transport::WithheldBindingComponent::Remote),
         )
         .await;
 
-        assert!(!outcome.handled);
-        assert!(outcome.owner_still_current);
-        assert!(!outcome.has_auth_task);
-        assert!(!outcome.data_channel_open);
-        assert!(!outcome.handshake_started);
-        assert!(!outcome.verification_code_sent);
-        assert_eq!(outcome.hellos_sent, 0);
-        assert!(!outcome.handshaking);
-        assert!(!outcome.has_authenticated_channel);
-        assert!(matches!(
-            outcome.connector,
-            DataChannelOpenOwnership::Rejected
-        ));
+        assert_refused_open_path(&outcome);
+        assert!(outcome.close_settled.is_ok());
+        assert_eq!(outcome.retained_claims_after_close, 0);
+    }
+
+    /// The same refusal whose one native close then fails.
+    ///
+    /// The two twins above prove the claim comes back on success. That alone
+    /// would still pass for an owner that released unconditionally once the
+    /// close *finished*, which is the dangerous shape: a connector whose native
+    /// allocation could not be proved gone would have its finite claim handed
+    /// back anyway.
+    ///
+    /// So this is the same refusal with one value changed — the close is made to
+    /// report a failure *after* it has physically run, so this is a genuine
+    /// close whose result is bad, not a close that was skipped. The claim must
+    /// stay retained, and the retention must be this connector's alone: an
+    /// unrelated connector on the same mesh still has to be admissible, or one
+    /// bad close would have poisoned the process aggregate.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
+    async fn v4_arc04f3_refused_open_retains_its_claim_when_the_native_close_fails() {
+        let outcome = drive_open_path(
+            "arc04f3-failed-close-a",
+            "arc04f3-failed-close-b",
+            OpenPathArrangement::failing_close(crate::transport::WithheldBindingComponent::Local),
+        )
+        .await;
+
+        // Identical to the successful twins up to the close, so the divergence
+        // below is attributable to the close outcome and to nothing else.
+        assert_refused_open_path(&outcome);
+
+        assert!(
+            outcome.close_settled.is_err(),
+            "non-vacuity: this close owner really did report a failure"
+        );
+        assert_eq!(
+            outcome.retained_claims_after_close, 1,
+            "a close that could not be proved successful keeps its exact claim retained"
+        );
+        assert_eq!(
+            outcome.fresh_connector_admitted,
+            Some(true),
+            "the retention is exact: an unrelated connector slot is still admissible"
+        );
     }
 
     /// The positive twin: the same fixture, never armed.
     ///
-    /// This is what makes the two refusals attributable to the withheld
+    /// This is what makes the three refusals attributable to the withheld
     /// component rather than to a fixture that could never have opened at all.
-    /// Every assertion is the opposite of its counterpart above, and the last
-    /// one is the sharpest: an unarmed connector answers `AlreadyConnected`,
-    /// because the arm took its connected claim, where an armed one answers
-    /// `Rejected`, because the arm fenced it without ever taking one.
+    /// Every assertion is the opposite of its counterpart above, and two are the
+    /// sharpest: an unarmed connector answers `AlreadyConnected`, because the
+    /// arm took its connected claim and gave it to a task, where an armed one
+    /// answers `Rejected`, because the arm fenced it; and the same gate that
+    /// catches one close on every refusal catches none here, because a bound
+    /// channel must not be closed at all.
     ///
     /// No authenticated channel here either. A Hello has been sent and nothing
     /// has been verified yet, so promotion is correctly still absent — which is
@@ -5390,10 +5710,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
     async fn v4_arc04e_stated_binding_components_open_and_start_the_handshake() {
-        let outcome = drive_open_path("arc04e-stated-a", "arc04e-stated-b", None).await;
+        let outcome = drive_open_path(
+            "arc04e-stated-a",
+            "arc04e-stated-b",
+            OpenPathArrangement::stated(),
+        )
+        .await;
 
         assert!(outcome.handled, "the arm accepts this open");
         assert!(outcome.owner_still_current);
+        assert!(outcome.device_still_installed);
+        assert!(!outcome.reconnect_intent);
         assert!(
             outcome.has_auth_task,
             "the same construction installs a task when the binding is complete"
@@ -5410,6 +5737,18 @@ mod tests {
                 DataChannelOpenOwnership::AlreadyConnected
             ),
             "the connector was promoted, not fenced"
+        );
+        // Nothing was closed. Read on the same instrument the negatives use, so
+        // "one close" and "no close" are the same measurement.
+        assert_eq!(
+            outcome.close_entries, 0,
+            "a bound channel is not closed by the arm that accepted it"
+        );
+        // And the claim is *active* rather than retained: it moved into the
+        // endpoint-auth task, so the close owner is holding nothing back.
+        assert_eq!(
+            outcome.retained_claims_while_held, 0,
+            "the connected claim is live in the task, not in cleanup retention"
         );
     }
 
@@ -6613,6 +6952,299 @@ mod tests {
         assert!(
             peer.state.read().last_liveness_probe_at.is_none(),
             "a session mid in-place restart owns its recovery window"
+        );
+    }
+
+    // ---- Arc 04 F2: a request id is not an authority ---------------------
+    //
+    // The three inbound arms that settle a locally originated call took the
+    // admitted dispatch and ignored it, reaching the pending map with nothing
+    // but the request id the inbound frame carried. Any authenticated peer that
+    // learned or guessed another peer's in-flight id could therefore resolve
+    // that caller's oneshot with a body of its own choosing, inject chunks into
+    // that caller's stream, or end it early — and the caller could not tell,
+    // because it never learns which peer actually answered.
+    //
+    // Every control below uses two *separately authenticated* peers and drives
+    // the real handlers through the real admission seam. There is no sleep, no
+    // yield ordering and no timing assumption anywhere: `admit_inbound_for_test`
+    // mints exactly the authority the fence mints, so "C answers B's request"
+    // is expressed as an API fact rather than raced for.
+    //
+    // Each refusal control also asserts the rightful outcome afterwards. A
+    // refusal that merely dropped the entry would satisfy "the attacker got
+    // nothing" while still destroying the call, so every negative is paired
+    // with the positive that proves the operation survived intact.
+
+    /// Mint the dispatch witness for one exact installed peer, carrying one
+    /// RPC frame — the same pairing `handle_inbound_frame_from` produces.
+    fn rpc_dispatch_for(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+        msg: MeshMessage,
+    ) -> (MeshMessage, state::AdmittedInboundDispatch) {
+        let owner = state
+            .peers
+            .owner(device_id)
+            .expect("the peer is installed for this control");
+        admit_inbound_for_test(state, &owner, msg)
+            .expect("an admitted peer mints an inbound authority")
+            .into_dispatch()
+    }
+
+    /// Deliver one `rpc_response` frame as `device_id`.
+    async fn deliver_rpc_response(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+        request_id: &str,
+        body: serde_json::Value,
+    ) {
+        let frame = MeshMessage::RpcResponse(RpcResponseMessage {
+            request_id: request_id.to_string(),
+            ok: Some(body),
+            error: None,
+        });
+        let (msg, dispatch) = rpc_dispatch_for(state, device_id, frame);
+        let MeshMessage::RpcResponse(resp) = msg else {
+            panic!("the authority carries the frame it admitted");
+        };
+        on_rpc_response(state, &dispatch, resp).await;
+    }
+
+    /// Deliver one `rpc_stream_chunk` frame as `device_id`.
+    async fn deliver_rpc_stream_chunk(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+        request_id: &str,
+        payload: serde_json::Value,
+    ) {
+        let frame = MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
+            request_id: request_id.to_string(),
+            seq: 1,
+            payload,
+        });
+        let (msg, dispatch) = rpc_dispatch_for(state, device_id, frame);
+        let MeshMessage::RpcStreamChunk(chunk) = msg else {
+            panic!("the authority carries the frame it admitted");
+        };
+        on_rpc_stream_chunk(state, &dispatch, chunk).await;
+    }
+
+    /// Deliver one `rpc_stream_end` frame as `device_id`.
+    async fn deliver_rpc_stream_end(state: &Arc<NetworkState>, device_id: &str, request_id: &str) {
+        let frame = MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+            request_id: request_id.to_string(),
+            error: None,
+        });
+        let (msg, dispatch) = rpc_dispatch_for(state, device_id, frame);
+        let MeshMessage::RpcStreamEnd(end) = msg else {
+            panic!("the authority carries the frame it admitted");
+        };
+        on_rpc_stream_end(state, &dispatch, end).await;
+    }
+
+    /// Two separately authenticated peers and an attached RPC dispatcher.
+    fn two_authenticated_peers(suffix: &str) -> (Arc<NetworkState>, crate::rpc::Rpc) {
+        let state = build_test_state(suffix);
+        insert_admitted_session_less_peer(&state, "device-b");
+        insert_admitted_session_less_peer(&state, "device-c");
+        let rpc = crate::rpc::Rpc::attach(&state);
+        (state, rpc)
+    }
+
+    #[tokio::test]
+    async fn v4_arc04f2_a_foreign_peer_cannot_settle_another_peers_pending_call() {
+        // The central escape: C answers a request B owns. C is fully
+        // authenticated — this is not an admission failure, it is C being
+        // admitted for its own traffic and then reaching for B's.
+        let (state, rpc) = two_authenticated_peers("arc04f2-foreign-settle");
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let request_id = rpc
+            .inner
+            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("the pending call is filed");
+
+        deliver_rpc_response(&state, "device-c", &request_id, serde_json::json!("stolen")).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "C settles nothing, and the oneshot is still open rather than dropped — \
+             a dropped sender would resolve the caller with NetworkDown, which is \
+             destruction wearing a refusal's clothes"
+        );
+
+        // The operation survived whole: its rightful owner still completes it.
+        deliver_rpc_response(&state, "device-b", &request_id, serde_json::json!("mine")).await;
+        assert!(
+            matches!(rx.await, Ok(Ok(response)) if response.body == serde_json::json!("mine")),
+            "and B's own response is the one the caller receives"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04f2_a_single_response_cannot_settle_a_pending_stream() {
+        // Wrong class, right device. A streaming operation is not answered by
+        // a single response, and mistaking one for the other would resolve a
+        // stream caller with a body it has no way to interpret.
+        let (state, rpc) = two_authenticated_peers("arc04f2-single-onto-stream");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_id = rpc
+            .inner
+            .insert_local_request("device-b", crate::rpc::PendingEntry::Stream(tx))
+            .expect("the pending stream is filed");
+
+        deliver_rpc_response(&state, "device-b", &request_id, serde_json::json!("wrong")).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no item is routed to the stream, and it is not disconnected"
+        );
+
+        // Non-destructive: the stream is still open and still B's.
+        deliver_rpc_stream_chunk(&state, "device-b", &request_id, serde_json::json!("chunk")).await;
+        assert_eq!(
+            rx.try_recv()
+                .expect("the stream survived the wrong-class frame"),
+            Ok(serde_json::json!("chunk")),
+            "and it still delivers B's chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04f2_a_stream_end_cannot_settle_a_pending_single_call() {
+        // The same mismatch the other way. A stream end must not close a
+        // single-shot call: doing so drops the oneshot and resolves the caller
+        // with NetworkDown for a request that is still legitimately in flight.
+        let (state, rpc) = two_authenticated_peers("arc04f2-end-onto-single");
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let request_id = rpc
+            .inner
+            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("the pending call is filed");
+
+        deliver_rpc_stream_end(&state, "device-b", &request_id).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the call is neither resolved nor closed by a frame of the wrong class"
+        );
+
+        deliver_rpc_response(&state, "device-b", &request_id, serde_json::json!("mine")).await;
+        assert!(
+            matches!(rx.await, Ok(Ok(response)) if response.body == serde_json::json!("mine")),
+            "and the real response still completes it"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04f2_a_stream_chunk_from_a_foreign_device_is_ignored() {
+        // Chunk injection. This is the quietest of the three escapes: the
+        // stream stays open, the caller keeps reading, and a foreign peer's
+        // item is indistinguishable from the real peer's once delivered.
+        let (state, rpc) = two_authenticated_peers("arc04f2-foreign-chunk");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_id = rpc
+            .inner
+            .insert_local_request("device-b", crate::rpc::PendingEntry::Stream(tx))
+            .expect("the pending stream is filed");
+
+        deliver_rpc_stream_chunk(
+            &state,
+            "device-c",
+            &request_id,
+            serde_json::json!("injected"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "C's chunk never reaches B's stream"
+        );
+
+        deliver_rpc_stream_chunk(&state, "device-b", &request_id, serde_json::json!("real")).await;
+        assert_eq!(
+            rx.try_recv().expect("B's own chunk is delivered"),
+            Ok(serde_json::json!("real")),
+            "and the first item the caller sees is B's, not C's"
+        );
+
+        // A chunk removes nothing, so the stream is still B's to end.
+        deliver_rpc_stream_end(&state, "device-c", &request_id).await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "and C cannot cut B's stream short either — the receiver is still open"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call() {
+        // The selected rule, stated positively. Binding to the *installation*
+        // here would be wrong: a peer that drops and re-authenticates mid-call
+        // returns on a fresh connector under the same canonical device id, and
+        // the local caller is still waiting for exactly that answer. This is
+        // the one place the response path deliberately diverges from
+        // `on_rpc_request`, which binds to the installation because it
+        // authorizes a handler run rather than completing a pending call.
+        let (state, rpc) = two_authenticated_peers("arc04f2-replacement-connector");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = rpc
+            .inner
+            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("the pending call is filed");
+
+        let original = state.peers.owner("device-b").expect("B is installed");
+        // A genuinely distinct installation under the same device id.
+        insert_admitted_session_less_peer(&state, "device-b");
+        assert!(
+            state.peers.get_if_current(&original).is_none(),
+            "the original installation really is superseded"
+        );
+
+        deliver_rpc_response(&state, "device-b", &request_id, serde_json::json!("after")).await;
+
+        assert!(
+            matches!(rx.await, Ok(Ok(response)) if response.body == serde_json::json!("after")),
+            "the same canonical device completes its own pending call across a \
+             freshly authenticated replacement connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04f2_a_replacement_connector_for_a_different_device_still_never_settles() {
+        // The other half of the selected rule, so the control above cannot be
+        // read as "any replacement completes anything". Device identity is the
+        // binding; a fresh connector does not launder it.
+        let (state, rpc) = two_authenticated_peers("arc04f2-replacement-foreign");
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let request_id = rpc
+            .inner
+            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("the pending call is filed");
+
+        insert_admitted_session_less_peer(&state, "device-c");
+        deliver_rpc_response(&state, "device-c", &request_id, serde_json::json!("stolen")).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a different device settles nothing, however freshly it authenticated"
         );
     }
 }

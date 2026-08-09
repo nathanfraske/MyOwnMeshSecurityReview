@@ -3985,9 +3985,65 @@ impl WebRtcConnectorWorker {
         }
     }
 
+    /// Fence this connector for an open that must never be authenticated over.
+    ///
+    /// The caller has already decided that nothing can be proved about this
+    /// channel — the connector could not state its endpoint-auth binding — so
+    /// the channel must not merely go unpromoted, it must be closed, and the
+    /// connector's finite claim must be held until that close is observed to
+    /// have succeeded.
+    ///
+    /// The order is load-bearing and is the whole reason this is a method
+    /// rather than two calls at the call site:
+    ///
+    /// 1. `confirm_data_channel_open()` first. On a live connector this takes
+    ///    the connected claim and hands back a handoff; dropping that handoff
+    ///    immediately is the *normal* Connected path's `Drop`, which returns the
+    ///    claim to the close owner's conservative retention and starts the
+    ///    close. The brief promotion exists for exactly that reason — to return
+    ///    the claim to connected retention rather than to use the channel. No
+    ///    task is built, no capability escapes, and nothing is ever sent: the
+    ///    handoff is dropped in the same expression that produced it.
+    /// 2. `close_owner.start()` second, unconditionally. `retain_connected_claim`
+    ///    already started the close on the path above, so this is an idempotent
+    ///    second call there. It is not redundant: when `confirm` answers
+    ///    `Rejected` — a connector already stale or retired, so there is no
+    ///    handoff to drop — this is the only thing that starts a close owner, and
+    ///    the refusal must still start exactly one.
+    ///
+    /// Never retire before confirming. `retire()` would fence the operation
+    /// before `confirm` could take the claim, so the claim would sit outside
+    /// the close owner's retention and the connector would be torn down with a
+    /// claim nobody was holding conservatively.
+    ///
+    /// This makes no statement about certificates, exporters, or any keying
+    /// material: it is ownership and cleanup only.
+    pub(crate) fn refuse_data_channel_open(&self) {
+        drop(self.confirm_data_channel_open());
+        self.close_owner.start();
+    }
+
     /// Revoke callback acceptance and release every connector-owned candidate.
     pub(crate) fn retire(&self) {
         self.close_owner.retire_local();
+    }
+
+    /// Install this connector's native-close hold point. **Controls only.**
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn install_native_close_gate_for_test(&self) -> NativeCloseGateHandle {
+        self.close_owner.install_native_close_gate_for_test()
+    }
+
+    /// How many connected claims this connector's close owner is holding in
+    /// conservative retention right now. **Controls only.**
+    ///
+    /// Non-zero means the claim has been taken but not released: the close has
+    /// not yet reported success, or reported failure and is retaining it. Zero
+    /// after a successful close is the release; zero before any promotion is
+    /// simply that no claim has moved into retention yet.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn retained_connected_claims_for_test(&self) -> usize {
+        self.close_owner.retained_connected_claims_for_test()
     }
 
     pub(crate) fn admit_legacy_realtime_flow(

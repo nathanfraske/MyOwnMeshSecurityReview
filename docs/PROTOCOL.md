@@ -260,11 +260,33 @@ transcript still binds the selected closed profile, so the
 advertisement decides only whether an attempt begins; it can never
 widen or replace what the transcript commits to.
 
-The fingerprint pair is **not** an RFC 5705 exporter and is not
-session-unique — two channels between one device pair reusing the same
-certificates carry the same value. It defeats a terminating
-signaling-path man-in-the-middle, which must present its own
-certificate on each leg; separation of one channel from another is
+**Where the two fingerprints come from.** Both are read from the
+connector's own live native session, after that session exists, and
+never from a peer-supplied protocol field:
+
+- the **local** component is the `a=fingerprint:` line of this
+  endpoint's *applied local description* — the certificate this side
+  presents on the DTLS channel;
+- the **remote** component is the `a=fingerprint:` line of the
+  *applied remote description* — the certificate the peer said it
+  would present.
+
+What ties the remote component to the peer that is actually on the
+wire is the **native DTLS stack, not MyOwnMesh**: WebRTC verifies the
+certificate presented during the DTLS handshake against the
+`a=fingerprint:` in the SDP it received, and the connection does not
+come up if they disagree. MyOwnMesh neither reads nor validates the
+certificate itself. It reads an already-applied, already-enforced SDP
+attribute and commits to it.
+
+Stated plainly, because both of these are easy to over-read: this is
+**not** an RFC 5705 exporter, and it is **not** a raw certificate or a
+public-key read. It is a fingerprint string taken from applied SDP.
+
+The pair is also not session-unique — two channels between one device
+pair reusing the same certificates carry the same value. It defeats a
+terminating signaling-path man-in-the-middle, which must present its
+own certificate on each leg; separation of one channel from another is
 carried by the per-attempt contributions and by connector-incarnation
 ownership. This is a named, accepted residual rather than a closed
 question, and nothing below narrows it.
@@ -277,6 +299,16 @@ ever signed over a fingerprint pair both endpoints actually stated, so
 an absent component can never be silently encoded as an empty field
 that two peers might agree on.
 
+Failing closed there is a *cleanup* obligation as well as a refusal.
+The channel that cannot be bound is fenced — exactly one native close
+is started, synchronously, because nothing else will start it later —
+and only then is the peer entry removed, and only if it is still the
+exact entry this open was admitted for. A replacement installed for
+the same device while the binding was being read is left untouched:
+the refusal is about one channel, not about the device. No task is
+built, no `hello` is sent, no proof is computed, and no profile is
+negotiated. The refusal states nothing about certificates.
+
 A peer's contribution binds an attempt exactly once. A retransmitted
 `hello` carrying the *same* contribution is answered from the cached
 proof — no second draw, no second signature — and none of its other
@@ -286,6 +318,13 @@ that is already bound. A `hello` carrying a *different* contribution is
 not a retransmission; it is a typed terminal conflict that retires the
 attempt.
 
+An `auth_response` that arrives before anything is bound is terminal,
+not merely refused. There is no transcript for it to be a proof *of* —
+this endpoint has drawn its half and no peer half exists — so the
+frame cannot become valid later, and leaving the attempt live would
+hold a channel claim open for a peer that has already violated the one
+ordering the exchange has.
+
 Terminal causes are **first-cause**: an attempt that has already failed
 keeps the error that actually refused it. This matters because ordinary
 teardown reaches the same terminal path a refusal does — a refused
@@ -293,6 +332,54 @@ proof removes the peer, and peer removal retires the task — so without
 the rule, the recorded cause of a refusal would depend on scheduling and
 a signature failure could be reported as an ordinary channel
 replacement.
+
+An attempt has exactly one way to end, and it ends under the same lock
+every operation takes. Retirement acquires that lock first and marks
+nothing before it, so there is no interval in which the attempt reports
+itself dead while an operation already inside the critical section is
+still free to sign a transcript or hand the channel over. A retirement
+racing a `hello` or an `auth_response` therefore either reaches the
+state first — and that operation refuses before signing or promoting
+anything — or it waits, and the operation it lost to has completed
+before the retirement is observable at all. Successful promotion is
+deliberately *not* one of these terminal endings: a promoted attempt
+still belongs to its connector and still answers a retransmitted
+`hello` from its cache, which is what lets a duplicate `auth_response`
+be recognised as a benign retransmission rather than a failure.
+
+### RPC response binding
+
+A `request_id` is a routing key. It is **not** an authority, and on its
+own it settles nothing.
+
+Every in-flight local call additionally records the one canonical
+device that may answer it and the one response class it will accept.
+An inbound `rpc_response`, `rpc_stream_chunk`, or `rpc_stream_end` is
+matched against both, and the source is taken from the identity the
+transport authenticated for that frame — never from the frame's own
+contents, so a sender cannot nominate its own authority. A frame
+failing either test performs no action at all: nothing is removed,
+nothing is mutated, and the rightful caller's operation is left exactly
+as it was. Concretely, one peer cannot resolve another peer's pending
+call, inject chunks into another peer's stream, or end one early; a
+single response cannot settle a stream, and a stream end cannot settle
+a single-response call.
+
+The binding is to the **device**, not to the connector installation. A
+peer that drops and re-authenticates mid-call returns on a fresh
+connector under the same canonical device id, and that is a legitimate
+completion of a still-pending operation, so it is allowed. A different
+device is never allowed. This deliberately differs from an inbound
+`rpc_request`, which binds to the exact installation because it
+authorizes running a local handler rather than resolving a call the
+local caller is already waiting on.
+
+Request ids are drawn locally and are never reused to displace an
+in-flight operation. If a freshly drawn id is already owned, the call
+draws again rather than overwrite; if it cannot find an unused id it
+fails locally and is never sent. Displacing the owner would strand that
+caller on a reply that can never arrive and hand its answer to the
+wrong receiver.
 
 ---
 

@@ -223,6 +223,87 @@ and they are not evidence that anything passes.
   [`docs/PROTOCOL.md`](../docs/PROTOCOL.md#handshake-signature). It is a named
   residual, not a closed question.
 
+### Status note at Arc 04F
+
+**Nothing in this subsection has been executed.** No harness run, no `cargo`
+build, check, test or clippy run, and no CI run stands behind any statement
+below. Every claim here is a source read or a count taken from the working
+tree. No run identifier is cited for any of it, and none should be inferred.
+Operator review `4890068348` is cited as directive provenance only — it is the
+instruction this integration followed, and it is not execution evidence for
+anything.
+
+- **Binding provenance, stated exactly.** Both components of the channel
+  binding are read from the connector's own live native session after that
+  session exists: the local one from the `a=fingerprint:` of the *applied local
+  description*, the remote one from the `a=fingerprint:` of the *applied remote
+  description*. What ties the remote component to the peer actually on the wire
+  is the native DTLS stack, which verifies the certificate presented during the
+  handshake against the fingerprint in the SDP it received. MyOwnMesh does not
+  read or validate the certificate. It reads an already-applied, already-
+  enforced SDP attribute. This is **not** an RFC 5705 exporter and **not** a raw
+  certificate or public-key read, and the earlier language in this record should
+  be read subject to that correction.
+- **One terminal lifecycle transition.** The endpoint-auth task now has exactly
+  one way to end, and it runs with the exchange guard in hand — it is the sole
+  writer of both the terminal state and the lock-free `retired` observation
+  cache. Retirement takes the lock first and marks nothing before it, closing
+  the window in which a task could report itself retired while an operation
+  already inside the critical section was still free to sign a transcript or
+  move the handoff out. A proof arriving before anything is bound is now
+  terminal rather than merely refused. Successful promotion is deliberately not
+  a terminal ending, because the duplicate-`auth_response` guard depends on
+  telling `Promoted` from `Terminal`.
+- **RPC responses are bound to a device and a class.** A request id is a routing
+  key and never an authority. Before this, the three inbound settle arms took
+  the admitted dispatch witness and discarded it, reaching the pending map with
+  nothing but the id the frame itself carried, so any authenticated peer that
+  learned or guessed another peer's in-flight id could resolve that caller's
+  reply, inject chunks into its stream, or end the stream early. Each pending
+  operation now additionally names the one canonical device that may settle it
+  and the one response class it accepts, and the source is taken from the
+  admitted owner token. The binding is to the device rather than the
+  installation, deliberately: the same device returning over a freshly
+  authenticated replacement connector completes a still-pending call, a
+  different device never does. Request ids are never reused to displace an
+  in-flight operation — a colliding draw retries, and an exhausted draw fails
+  locally before anything is sent.
+- **Reconciliation, recorded explicitly.** `rpc::PendingEntry` is left `pub`,
+  exactly as it already was. An intermediate revision narrowed it to
+  `pub(crate)`; that was reverted here as unnecessary public API removal. The
+  authority boundary is the `pending` map being private together with the three
+  bound operations that are the only way to reach it, and naming `PendingEntry`
+  gets a caller no closer to an entry. No external rejection probe was added for
+  it, and the source-shape guards deliberately do not constrain its visibility.
+- **Public API compatibility, disclosed rather than buried.** `RpcError` gains a
+  new variant, `RequestIdUnavailable`, reporting the explicit local failure when
+  no unused request id could be drawn. `RpcError` is publicly re-exported and is
+  not `#[non_exhaustive]`, so this is a breaking change for any downstream
+  exhaustive `match` on it. That is a known and accepted consequence of naming
+  the failure rather than displacing a pending owner; adding `#[non_exhaustive]`
+  was considered and deliberately deferred out of this slice.
+- **A refused open now cleans up as well as refusing.** When no binding can be
+  formed, the connector is fenced first — exactly one native close is started,
+  synchronously, since there is no watchdog behind it and a close not started
+  there would never start — and only then is the peer removed, and only if it is
+  still the exact entry the open was admitted for. A replacement installed for
+  the same device while the binding was being read is left untouched. Retiring
+  alone, as before, left a live native channel and an addressable peer entry
+  that nothing could prove anything about.
+- **Current control totals, counted by reading the working tree.** The Arc 04
+  compiler harness carries 19 cause-matched rejection probes and one positive
+  public-surface control; the script prints its own total, so quote that and not
+  this sentence. The `arc04-endpoint-auth` CI job names 48 exact controls: 37
+  without `--ignored`, and 11 live two-connector controls with `--ignored` in the
+  `transport-lab`-only step. Every one is wrapped in the same triple non-vacuity
+  parse. None of these totals has been verified by execution at any head.
+- **Two control-only seams now exist inside security-critical code**, and both
+  are gated: the lifecycle rendezvous that can park a thread inside the exchange
+  critical section, and the native-close hold point that can park a real
+  cleanup. Neither can exist in a production build, and the source-shape guards
+  check that gating directly, because no compiler probe can see it from outside
+  the crate.
+
 ## 2. RT-03-01: manufacture connector resource authority
 
 Attack: construct a worker, provider, Mesh child, lease, or candidate capability without the process provider and exact claim.

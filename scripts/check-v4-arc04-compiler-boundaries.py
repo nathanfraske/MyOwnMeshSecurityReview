@@ -1058,7 +1058,440 @@ def source_shape_failures() -> list[str]:
             "declaration is what keeps every admission witness in it out of the "
             "downstream API, and the module-privacy probe depends on it"
         )
+
+    failures.extend(terminal_lifecycle_failures(task_source))
+    failures.extend(rpc_binding_failures(engine_source))
+    failures.extend(refused_open_failures(engine_source))
     return failures
+
+
+def terminal_lifecycle_failures(task_source: str) -> list[str]:
+    """Arc 04F1: the task has exactly one way to end, and it holds the lock.
+
+    The property is an interleaving, so no external probe can reach it: a
+    caller outside the crate cannot name the task at all, and the defect it
+    replaces was visible only to two threads. What makes the invariant hold is
+    that `terminalize` is the *sole* writer of both the terminal state and the
+    `retired` cache and can only be called with the exchange guard in hand.
+    Sole-writer claims are exactly what a source-shape guard can carry and a
+    control cannot: a control proves the paths it drives, while a second writer
+    added tomorrow is proved absent only by counting.
+    """
+
+    failures: list[str] = []
+
+    if "retire_terminally" in task_source:
+        failures.append(
+            "endpoint_auth/task.rs still mentions `retire_terminally`; that was the "
+            "transition that could run without the exchange guard, and its removal "
+            "is what makes `terminalize` the only way for a task to end"
+        )
+    if not re.search(
+        r"fn terminalize\s*\(\s*&self,\s*exchange:\s*&mut EndpointAuthExchange,",
+        task_source,
+    ):
+        failures.append(
+            "EndpointAuthTask::terminalize must take `exchange: &mut "
+            "EndpointAuthExchange`; taking the guard as an argument is what makes it "
+            "uncallable without the lock, and a `&self`-only form would restore a "
+            "transition that can run beside a live critical section"
+        )
+
+    # Two sole-writer counts. `state = ExchangeState::Terminal(` is the
+    # authoritative write; `retired.store(` is the lock-free observation cache.
+    # If either gains a second writer the two can disagree, and a task could
+    # report itself retired while its state would still admit a signature.
+    terminal_writes = len(
+        re.findall(r"\bstate\s*=\s*ExchangeState::Terminal\s*\(", task_source)
+    )
+    if terminal_writes != 1:
+        failures.append(
+            "endpoint_auth/task.rs assigns ExchangeState::Terminal "
+            f"{terminal_writes} times; exactly one writer is the invariant, and a "
+            "second one can commit a terminal state the retired cache does not know "
+            "about"
+        )
+    cache_writes = len(re.findall(r"\bretired\.store\s*\(", task_source))
+    if cache_writes != 1:
+        failures.append(
+            f"endpoint_auth/task.rs writes the `retired` cache {cache_writes} times; "
+            "exactly one writer, inside the locked transition, is what stops the "
+            "cache leading the state it is supposed to reflect"
+        )
+
+    # `retire` must take the lock before it marks anything. Marking first is
+    # the exact defect: an operation already inside the critical section would
+    # then be free to sign or move the handoff out after every observer could
+    # already see a retired task.
+    retire_body = fn_body(task_source, "pub(crate) fn retire(&self)")
+    if retire_body is None:
+        failures.append(
+            "EndpointAuthTask::retire is missing or reshaped in endpoint_auth/task.rs, "
+            "so its lock ordering cannot be checked"
+        )
+    else:
+        if "self.lock()" not in retire_body:
+            failures.append(
+                "EndpointAuthTask::retire no longer takes the exchange lock itself; "
+                "retirement must linearize through the same lock every operation uses"
+            )
+        if re.search(r"retired\.store\s*\(", retire_body):
+            failures.append(
+                "EndpointAuthTask::retire marks the retired cache directly; nothing "
+                "may be marked before the lock, or a task reports itself retired "
+                "while a locked operation can still sign"
+            )
+
+    # The test-only rendezvous seam. It parks a thread *inside* the exchange
+    # critical section, which is precisely what production must never be able to
+    # do, so every part of it is required to carry a `cfg(test)` gate. No probe
+    # can see this: the seam is invisible from outside the crate either way.
+    for item, pattern in (
+        ("the LifecycleTrap enum", r"enum LifecycleTrap\b"),
+        ("the LifecycleBarrier struct", r"struct LifecycleBarrier\b"),
+        ("the EndpointAuthTask barrier field", r"^\s*barrier:\s*std::sync::OnceLock"),
+        ("EndpointAuthTask::trap", r"fn trap\s*\(&self,\s*point:\s*LifecycleTrap"),
+        ("EndpointAuthTask::arm_barrier", r"fn arm_barrier\b"),
+    ):
+        if not cfg_test_gated(task_source, pattern, "#[cfg(test)]"):
+            failures.append(
+                f"{item} is not immediately preceded by `#[cfg(test)]` in "
+                "endpoint_auth/task.rs; the lifecycle rendezvous can hold a thread "
+                "inside the exchange critical section and must not exist in a "
+                "production build"
+            )
+
+    return failures
+
+
+def rpc_binding_failures(engine_source: str) -> list[str]:
+    """Arc 04F2: a request id is a routing key, not an authority.
+
+    Reconciliation, recorded here on purpose: `PendingEntry` is deliberately
+    left `pub`, exactly as downstream already had it, and this guard does NOT
+    require it to be narrowed. Naming that type gets a caller no closer to an
+    entry. The authority boundary is the `pending` map being private together
+    with the three bound operations that are the only way to reach it, so that
+    is what is guarded and nothing more. Narrowing `PendingEntry` would have
+    been public API removal that bought no boundary.
+    """
+
+    failures: list[str] = []
+    rpc_source = (CORE / "src" / "rpc.rs").read_text(encoding="utf-8")
+
+    # The boundary itself. A `pub(crate)` field would let the engine's inbound
+    # arms look an entry up by request id alone, which is the whole escape.
+    if not re.search(r"^\s{4}pending: DashMap<String, PendingOp>,", rpc_source, re.MULTILINE):
+        failures.append(
+            "RpcInner::pending must stay a private `DashMap<String, PendingOp>`; any "
+            "visibility qualifier on it re-opens settling an operation by request id "
+            "alone, which is the authority the device binding exists to remove"
+        )
+    if not re.search(r"^struct PendingOp \{", rpc_source, re.MULTILINE):
+        failures.append(
+            "PendingOp must stay a private struct in rpc.rs; it is the record that "
+            "carries the binding, and a nameable one invites construction elsewhere"
+        )
+    for field in ("expect_from", "effect"):
+        if not re.search(rf"^\s{{4}}{field}:", rpc_source, re.MULTILINE):
+            failures.append(
+                f"PendingOp no longer carries `{field}`; the binding needs both the "
+                "canonical device and the effect whose class it is checked against"
+            )
+
+    # Both conjuncts. A wrong source with the right class and a right source
+    # with the wrong class are equally not this operation's response, and
+    # dropping either half silently re-opens exactly one of the two attacks.
+    if not re.search(
+        r"self\.expect_from\s*==\s*from\s*&&\s*self\.effect\.class\(\)\s*==\s*class",
+        rpc_source,
+    ):
+        failures.append(
+            "PendingOp::accepts no longer requires both the bound device and the "
+            "response class; dropping the source half lets a foreign peer settle "
+            "another peer's call, and dropping the class half lets a single "
+            "response end a stream"
+        )
+    # Class derived from the variant, never stored beside it: a second field
+    # could disagree with the effect it describes and strand the call.
+    if not re.search(
+        r"fn class\(&self\) -> PendingClass \{\s*match self \{", rpc_source
+    ):
+        failures.append(
+            "PendingEntry::class must derive the class by matching its own variant; "
+            "a stored class is a second source of truth that can disagree with the "
+            "effect it describes"
+        )
+
+    # Collision-safe insertion. Overwriting an occupied id strands the previous
+    # caller on a oneshot that can never resolve and hands its reply elsewhere.
+    claim_body = fn_body(rpc_source, "fn claim_request_id")
+    if claim_body is None:
+        failures.append("RpcInner::claim_request_id is missing from rpc.rs")
+    else:
+        if "self.pending.entry(" not in claim_body:
+            failures.append(
+                "claim_request_id no longer uses the entry API; the occupancy test "
+                "and the insert must be one step or a concurrent call can take the "
+                "id between them"
+            )
+        if not re.search(r"Entry::Occupied\(_\)\s*=>\s*Err\(effect\)", claim_body):
+            failures.append(
+                "claim_request_id no longer hands the effect back on an occupied id; "
+                "anything other than refusing displaces the pending owner"
+            )
+
+    # The three bound operations each require the authenticated source.
+    for operation in ("take_single_response", "stream_chunk_sender", "take_stream_end"):
+        body = fn_body(rpc_source, f"pub(crate) fn {operation}")
+        if body is None:
+            failures.append(f"RpcInner::{operation} is missing from rpc.rs")
+            continue
+        if "from: &str" not in body:
+            failures.append(
+                f"RpcInner::{operation} no longer takes the authenticated source; a "
+                "request id on its own must never reach a pending operation"
+            )
+        if ".accepts(" not in body:
+            failures.append(
+                f"RpcInner::{operation} no longer checks the binding with `accepts`; "
+                "the predicate and the removal have to be the same shard-locked step "
+                "or a refused frame can still mutate the rightful owner's operation"
+            )
+
+    # The engine side: the source is taken from the admitted owner token, never
+    # from the frame. `_dispatch` is the pre-F2 defect in literal form — the
+    # witness bound and then thrown away.
+    for handler in ("on_rpc_response", "on_rpc_stream_chunk", "on_rpc_stream_end"):
+        body = fn_body(engine_source, f"async fn {handler}(")
+        if body is None:
+            failures.append(f"engine/mod.rs::{handler} is missing")
+            continue
+        if "_dispatch" in body:
+            failures.append(
+                f"engine/mod.rs::{handler} binds the dispatch witness as `_dispatch`; "
+                "discarding it is exactly the defect that made a request id an "
+                "authority any authenticated peer could use"
+            )
+        if "dispatch.owner().device_id()" not in body:
+            failures.append(
+                f"engine/mod.rs::{handler} no longer settles against "
+                "`dispatch.owner().device_id()`; the source must come from the "
+                "admitted owner token and never from the frame"
+            )
+    # Scoped to `rpc.pending` on purpose. A bare `.pending` check would fire on
+    # engine/governance.rs, which has an unrelated proposal list of that name.
+    if re.search(r"\brpc\.pending\b", engine_source):
+        failures.append(
+            "engine/mod.rs reaches RpcInner::pending directly; every settle must go "
+            "through one of the three bound operations"
+        )
+
+    return failures
+
+
+def refused_open_failures(engine_source: str) -> list[str]:
+    """Arc 04F3: a refused open closes the channel and drops the exact peer.
+
+    Retiring alone left a live native channel and an addressable peer entry
+    behind: nothing could be proved about that channel, yet it stayed allocated
+    and reachable. The repair fences the connector first and only then removes
+    the peer, and both halves are ordering claims a control can demonstrate on
+    one path but only a count can pin against a future edit.
+    """
+
+    failures: list[str] = []
+    webrtc_source = (CORE / "src" / "transport" / "webrtc.rs").read_text(
+        encoding="utf-8"
+    )
+
+    arm = re.search(
+        r"let Some\(binding\) = worker\.endpoint_auth_binding\(\)\.await else \{"
+        r"(?P<body>.*?)\n            \};",
+        engine_source,
+        re.DOTALL,
+    )
+    if arm is None:
+        failures.append(
+            "the missing-binding branch of the DataChannelOpen arm is missing or "
+            "reshaped in engine/mod.rs, so its fail-closed shape cannot be checked"
+        )
+    else:
+        body = arm.group("body")
+        if "worker.refuse_data_channel_open()" not in body:
+            failures.append(
+                "the missing-binding branch no longer calls "
+                "`refuse_data_channel_open`; retiring alone leaves a live native "
+                "channel that nothing can prove anything about, and there is no "
+                "watchdog behind this — a close not started here never starts"
+            )
+        if not re.search(r"drop_peer_if_current\(state, &owner,", body):
+            failures.append(
+                "the missing-binding branch no longer drops the peer through "
+                "`drop_peer_if_current(state, &owner, ..)`; keying on the owner "
+                "token captured before the await is what leaves a replacement "
+                "installed during it untouched"
+            )
+        # Ordering: fence the connector before touching the registry, so the
+        # close is in flight and the claim is already in conservative retention.
+        #
+        # Compared over code lines only. The branch's own comment explains the
+        # ordering and names `drop_peer_if_current` in prose several lines above
+        # the call, so comparing raw offsets reads that mention as the call and
+        # reports a correct branch as inverted.
+        code = "\n".join(
+            line for line in body.splitlines() if not line.strip().startswith("//")
+        )
+        if "worker.refuse_data_channel_open()" in code and "drop_peer_if_current" in code:
+            if code.index("worker.refuse_data_channel_open()") > code.index(
+                "drop_peer_if_current"
+            ):
+                failures.append(
+                    "the missing-binding branch drops the peer before fencing the "
+                    "connector; the close must already be in flight and the claim "
+                    "already retained before the registry is touched"
+                )
+        if re.search(r"\bconfirm_data_channel_open\b", body):
+            failures.append(
+                "the missing-binding branch confirms the data channel itself; the "
+                "refusal must not promote, and the one confirm belongs inside "
+                "`refuse_data_channel_open`"
+            )
+
+    # `refuse_data_channel_open` is confirm-then-start: it takes the connected
+    # claim so the close owner has something exact to retain, drops it, and
+    # starts exactly one close synchronously.
+    refuse_body = fn_body(webrtc_source, "pub(crate) fn refuse_data_channel_open")
+    if refuse_body is None:
+        failures.append(
+            "WebRtcConnectorWorker::refuse_data_channel_open is missing from "
+            "transport/webrtc.rs"
+        )
+    else:
+        if "self.confirm_data_channel_open()" not in refuse_body:
+            failures.append(
+                "refuse_data_channel_open no longer confirms before starting; without "
+                "taking the connected claim the close owner has no exact claim to "
+                "retain conservatively"
+            )
+        if "self.close_owner.start()" not in refuse_body:
+            failures.append(
+                "refuse_data_channel_open no longer starts the close owner; the "
+                "refusal must start exactly one close, synchronously, because "
+                "nothing else will"
+            )
+
+    # `drop_peer_if_current` is exact-owner, never a device-id re-resolve.
+    drop_body = fn_body(engine_source, "pub(crate) async fn drop_peer_if_current")
+    if drop_body is None:
+        failures.append("engine/mod.rs::drop_peer_if_current is missing")
+    elif "remove_if_current(owner)" not in drop_body:
+        failures.append(
+            "drop_peer_if_current no longer removes through `remove_if_current(owner)`; "
+            "resolving the peer any other way would let a refusal on one channel "
+            "remove a replacement installed for the same device"
+        )
+
+    # The control-only native-close hold point. Like the F1 rendezvous it can
+    # park real cleanup, so it must be unable to exist in a production build.
+    cleanup_source = (CORE / "src" / "transport" / "webrtc" / "cleanup.rs").read_text(
+        encoding="utf-8"
+    )
+    lab_gate = '#[cfg(all(test, feature = "transport-lab"))]'
+    for item, source, pattern in (
+        ("the NativeCloseGate struct", cleanup_source, r"struct NativeCloseGate\b"),
+        (
+            "WebRtcConnectorWorker::install_native_close_gate_for_test",
+            webrtc_source,
+            r"fn install_native_close_gate_for_test\b",
+        ),
+    ):
+        if not cfg_test_gated(source, pattern, lab_gate):
+            failures.append(
+                f"{item} is not gated on `{lab_gate}`; the native-close hold point "
+                "can park a real cleanup and must not exist in a production build"
+            )
+
+    return failures
+
+
+def fn_body(source: str, signature: str) -> str | None:
+    """Return the body of the item introduced by `signature`.
+
+    Sliced from the signature to the next line whose closing brace sits at the
+    signature's own indentation, so the whole item is covered however its
+    arguments and inner blocks are wrapped.
+    """
+
+    start = source.find(signature)
+    if start < 0:
+        return None
+    line_start = source.rfind("\n", 0, start) + 1
+    indent = source[line_start:start]
+    end = re.search(rf"^{indent}}}", source[start:], re.MULTILINE)
+    return source[start : start + end.start()] if end is not None else source[start:]
+
+
+def cfg_test_gated(source: str, pattern: str, gate: str) -> bool:
+    """Whether every match of `pattern` carries `gate` in its own attribute run.
+
+    Walks the lines immediately above each match backwards, stepping over doc
+    comments, ordinary comments and other attributes, and stops at the first
+    line that is none of those. The gate has to appear inside that run. Reading
+    only the item's own attribute block is the point: an unrelated `#[cfg(test)]`
+    elsewhere in the file must not be able to vouch for an ungated item.
+
+    A pattern that matches nothing answers False. The item is required to exist,
+    so a deletion or a rename is a failure rather than a silent pass.
+    """
+
+    matches = list(re.finditer(pattern, source, re.MULTILINE))
+    if not matches:
+        return False
+    for match in matches:
+        # Slice to the start of the match's OWN line. Slicing to the match
+        # itself would leave a partial line (`    ` or `pub(crate) `) as the
+        # last entry, which is neither a comment nor an attribute, so the walk
+        # would stop on it and report every indented item as ungated.
+        line_start = source.rfind("\n", 0, match.start()) + 1
+        # Gated by its own attribute run, or — for a method — by the `impl`
+        # block that encloses it. Both are real gates: an item inside a
+        # `#[cfg(test)] impl` block is compiled out exactly as surely as one
+        # carrying the attribute itself.
+        if attribute_run_carries(source, line_start, gate):
+            continue
+        if enclosing_impl_carries(source, line_start, gate):
+            continue
+        return False
+    return True
+
+
+def attribute_run_carries(source: str, line_start: int, gate: str) -> bool:
+    """Whether the attribute run directly above `line_start` contains `gate`.
+
+    Steps over doc comments, ordinary comments, blank lines and other
+    attributes, and stops at the first line that is none of those.
+    """
+
+    for line in reversed(source[:line_start].splitlines()):
+        stripped = line.strip()
+        if stripped == gate:
+            return True
+        if not stripped or stripped.startswith("//") or stripped.startswith("#["):
+            continue
+        return False
+    return False
+
+
+def enclosing_impl_carries(source: str, inner: int, gate: str) -> bool:
+    """Whether the innermost `impl` block containing `inner` carries `gate`."""
+
+    header = None
+    for match in re.finditer(r"^impl [^\n]*\{$", source[:inner], re.MULTILINE):
+        header = match
+    if header is None:
+        return False
+    return attribute_run_carries(source, header.start(), gate)
 
 
 def main() -> int:

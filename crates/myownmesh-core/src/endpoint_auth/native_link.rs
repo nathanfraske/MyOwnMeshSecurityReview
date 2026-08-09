@@ -264,13 +264,23 @@ impl LinkBeforeEngineOpen {
             .expect("the open callback is taken exactly once")
     }
 
-    pub(crate) async fn close(self) {
+    /// Close both control connectors and hand back what each close reported.
+    ///
+    /// Outcomes are returned rather than unwrapped because at least one control
+    /// deliberately makes a native close fail: there, the left connector's close
+    /// owner is *supposed* to answer with a retained-claim error, and a fixture
+    /// that unwrapped it would turn the behaviour under test into a fixture
+    /// panic. A control that expects clean closes asserts that on the returned
+    /// outcomes.
+    ///
+    /// Both connectors are always closed, in the same order, before anything is
+    /// returned — a control cannot use this to skip closing one of them.
+    pub(crate) async fn close_outcomes(self) -> Vec<crate::Result<()>> {
+        let mut outcomes = Vec::with_capacity(2);
         for worker in [&self.left, &self.right] {
-            worker
-                .retire_and_close()
-                .await
-                .expect("native control connector closes");
+            outcomes.push(worker.retire_and_close().await);
         }
+        outcomes
     }
 }
 

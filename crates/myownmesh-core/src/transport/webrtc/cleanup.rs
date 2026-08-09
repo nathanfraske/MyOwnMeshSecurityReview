@@ -100,6 +100,139 @@ impl NativeConnectorClosePort for WebRtcNativeCloseErrorPort {
     }
 }
 
+/// A deterministic hold point at the one native close. **Controls only.**
+///
+/// The refusal path this exists for is asynchronous by construction: the engine
+/// arm returns as soon as it has started the close, and the actual native close
+/// runs on the cleanup executor. A control that wants to state "the claim is
+/// still retained while the close is in flight" therefore has no moment it can
+/// name — by the time it looks, the close has usually finished and released.
+///
+/// So the gate names that moment. It is installed before the arm runs, it
+/// counts every entry into the native close, it publishes that entry so a
+/// control can await it without sleeping, and it parks the close until the
+/// control opens it. Nothing here can *cause* a close: it can only hold one that
+/// production already started, which is why an armed connector still proves the
+/// production ordering rather than a fixture's.
+///
+/// The failure injection is deliberately applied *after* the physical close has
+/// run, so the failure twin exercises the real native close and then reports the
+/// failure the owner is supposed to be conservative about. A gate that skipped
+/// the close would prove retention over a connector that was never closed.
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) struct NativeCloseGate {
+    /// How many times the native close has reached this gate. A `watch` rather
+    /// than a counter so a control can await the first entry deterministically.
+    entries: watch::Sender<usize>,
+    /// The permit. Closes park until this is `true`.
+    open: watch::Sender<bool>,
+    /// Whether to report a failure for a close that physically ran.
+    inject_failure: AtomicBool,
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+impl NativeCloseGate {
+    fn new() -> Arc<Self> {
+        let (entries, _entries_receiver) = watch::channel(0usize);
+        let (open, _open_receiver) = watch::channel(false);
+        Arc::new(Self {
+            entries,
+            open,
+            inject_failure: AtomicBool::new(false),
+        })
+    }
+
+    /// Record this entry, then park until the control opens the gate.
+    ///
+    /// The count is published before parking, so a control that observes the
+    /// entry is observing a close that has genuinely reached the native
+    /// boundary rather than one that merely submitted.
+    async fn hold(&self) {
+        self.entries.send_modify(|count| *count += 1);
+        let mut open = self.open.subscribe();
+        loop {
+            // The borrow is released before the await: holding a `watch` guard
+            // across a suspension point would block every other sender.
+            if *open.borrow() {
+                return;
+            }
+            if open.changed().await.is_err() {
+                // The handle was dropped with no receiver left to notify. The
+                // handle's own `Drop` opens the gate for exactly this reason,
+                // so proceeding is the safe reading: never wedge the executor.
+                return;
+            }
+        }
+    }
+
+    /// What this gate reports about a close that has already run successfully.
+    ///
+    /// Consulted only on the dependency's own success, so an armed gate can add
+    /// a failure but can never mask one.
+    fn observe_native_close(&self) -> Result<()> {
+        if self.inject_failure.load(Ordering::Acquire) {
+            return Err(Error::Transport(
+                "injected native close failure observed after the physical close".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A control's handle on one connector's native close gate. **Controls only.**
+///
+/// Held by the control for as long as it wants the hold point to exist. Its
+/// `Drop` opens the gate unconditionally: a control that panics an assertion
+/// mid-hold must not leave a cleanup task parked forever on the shared
+/// executor, because that would turn one failing control into a wedged suite.
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) struct NativeCloseGateHandle {
+    gate: Arc<NativeCloseGate>,
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+impl NativeCloseGateHandle {
+    /// How many native closes have reached the gate. The load-bearing
+    /// observation: the refusal must start exactly one.
+    pub(crate) fn entries(&self) -> usize {
+        *self.gate.entries.borrow()
+    }
+
+    /// Park until at least one native close has reached the gate.
+    ///
+    /// No sleep and no retry loop: this is a `watch` change notification, so it
+    /// resolves on the entry itself. Callers bound it with a deadline so a
+    /// close that never arrives fails the control rather than hanging it.
+    pub(crate) async fn wait_for_entry(&self) {
+        let mut entries = self.gate.entries.subscribe();
+        loop {
+            if *entries.borrow() > 0 {
+                return;
+            }
+            if entries.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Report a failure for the close that runs, *after* it has run.
+    pub(crate) fn inject_close_failure(&self) {
+        self.gate.inject_failure.store(true, Ordering::Release);
+    }
+
+    /// Let the held close proceed. Idempotent; `Drop` does the same.
+    pub(crate) fn open(&self) {
+        self.gate.open.send_replace(true);
+    }
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+impl Drop for NativeCloseGateHandle {
+    fn drop(&mut self) {
+        self.gate.open.send_replace(true);
+    }
+}
+
 /// Single cleanup owner for one native peer connection.
 pub(super) struct ConnectorCloseOwner {
     pub(super) ownership: ConnectorOwnership,
@@ -121,6 +254,12 @@ pub(super) struct ConnectorCloseOwner {
     fail_background_start: AtomicBool,
     #[cfg(test)]
     panic_cleanup_future: AtomicBool,
+    /// The hold point at this connector's one native close. **Controls only.**
+    ///
+    /// Installed at most once and never removed, so a control cannot arrange a
+    /// hold, observe it, and then quietly disarm the same connector.
+    #[cfg(all(test, feature = "transport-lab"))]
+    native_close_gate: SyncMutex<Option<Arc<NativeCloseGate>>>,
 }
 
 impl ConnectorCloseOwner {
@@ -149,6 +288,8 @@ impl ConnectorCloseOwner {
             fail_background_start: AtomicBool::new(false),
             #[cfg(test)]
             panic_cleanup_future: AtomicBool::new(false),
+            #[cfg(all(test, feature = "transport-lab"))]
+            native_close_gate: SyncMutex::new(None),
         })
     }
 
@@ -370,10 +511,54 @@ impl ConnectorCloseOwner {
         };
         self.ownership.incarnation.retire();
         self.ownership.operation_fence.wait_for_operations().await;
-        match native.close().await {
+        // Controls only, compiled out of production. The hold is taken *after*
+        // the operation fence has drained and *before* the native close, which
+        // is the one window in which "this connector is closing and its claim is
+        // still retained" is a true statement about a real close in flight.
+        #[cfg(all(test, feature = "transport-lab"))]
+        let gate = self.native_close_gate.lock().clone();
+        #[cfg(all(test, feature = "transport-lab"))]
+        if let Some(gate) = gate.as_ref() {
+            gate.hold().await;
+        }
+        // The one native close is matched directly on the dependency's own
+        // future, and that shape is pinned by the Arc 03 connector-worker
+        // boundary check. It is pinned because it is the honest shape: nothing
+        // between this owner and the dependency gets to decide the outcome of
+        // the close in production.
+        let outcome = match native.close().await {
+            // The physical close has already run and reported success. The only
+            // thing that can still turn this into a failure is an installed
+            // control gate, and only after the fact — so a failure twin
+            // exercises a genuine close and then reports the failure this owner
+            // is supposed to be conservative about, rather than skipping the
+            // close. In production there is no gate and this is `Ok(())`.
+            Ok(()) => self.observe_gated_native_close(),
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(()) => self.finish_closed(),
             Err(error) => self.fail_cleanup(error.to_string()),
         }
+    }
+
+    /// What an installed control gate reports about a close that has run.
+    ///
+    /// The gate is installed at most once and is never removed, so re-reading it
+    /// here yields the same gate the hold above used.
+    #[cfg(all(test, feature = "transport-lab"))]
+    fn observe_gated_native_close(&self) -> Result<()> {
+        let gate = self.native_close_gate.lock().clone();
+        match gate {
+            Some(gate) => gate.observe_native_close(),
+            None => Ok(()),
+        }
+    }
+
+    /// Production has no gate: the dependency's close is the whole outcome.
+    #[cfg(not(all(test, feature = "transport-lab")))]
+    fn observe_gated_native_close(&self) -> Result<()> {
+        Ok(())
     }
 
     fn finish_closed(&self) {
@@ -463,6 +648,23 @@ impl ConnectorCloseOwner {
     #[cfg(test)]
     pub(super) fn panic_cleanup_future_for_test(&self) {
         self.panic_cleanup_future.store(true, Ordering::Release);
+    }
+
+    /// Install this connector's one native-close hold point. **Controls only.**
+    ///
+    /// Exactly once per connector: a second installation would let a control
+    /// replace a gate whose entries it had already counted, so the invariant a
+    /// twin states about "one close" would be about two different gates.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn install_native_close_gate_for_test(&self) -> NativeCloseGateHandle {
+        let gate = NativeCloseGate::new();
+        let mut installed = self.native_close_gate.lock();
+        assert!(
+            installed.is_none(),
+            "the native close gate is installed exactly once per connector"
+        );
+        *installed = Some(Arc::clone(&gate));
+        NativeCloseGateHandle { gate }
     }
 
     #[cfg(test)]

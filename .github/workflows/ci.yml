@@ -263,6 +263,46 @@ jobs:
             run_exact_control "$control"
           done
 
+          # Arc 04 F1: one locked lifecycle transition. `terminalize` is the
+          # sole writer of both the terminal state and the retired cache, and
+          # it runs with the exchange guard in hand, so a task can never report
+          # itself retired while an operation already inside the critical
+          # section is still free to sign or to move the handoff out. The
+          # racing pairs are ordered positive-first: the two controls where the
+          # operation wins the race and commits run before the two where
+          # retirement wins and refuses, so "refused" is measured against a
+          # path that demonstrably commits.
+          for control in \
+            v4_arc04f_every_task_owned_terminal_cause_agrees_on_the_lifecycle \
+            v4_arc04f_a_hello_holding_the_lock_commits_before_retirement_lands \
+            v4_arc04f_promotion_holding_the_lock_issues_a_capability_retirement_cannot_install \
+            v4_arc04f_retirement_holding_the_lock_refuses_the_signature \
+            v4_arc04f_retirement_holding_the_lock_refuses_the_handoff_move \
+            v4_arc04f_a_premature_proof_is_terminal_not_merely_refused
+          do
+            run_exact_control "$control"
+          done
+
+          # Arc 04 F2: a request id is a routing key, never an authority. Each
+          # pending operation additionally names the one canonical device that
+          # may settle it and the one response class it accepts. The positive
+          # runs first and is load-bearing: it is the legitimate settle — the
+          # same device returning over a freshly authenticated replacement
+          # connector — so without it every refusal below would pass just as
+          # well if nothing could ever settle at all.
+          for control in \
+            v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call \
+            v4_arc04f2_a_foreign_peer_cannot_settle_another_peers_pending_call \
+            v4_arc04f2_a_replacement_connector_for_a_different_device_still_never_settles \
+            v4_arc04f2_a_stream_chunk_from_a_foreign_device_is_ignored \
+            v4_arc04f2_a_single_response_cannot_settle_a_pending_stream \
+            v4_arc04f2_a_stream_end_cannot_settle_a_pending_single_call \
+            v4_arc04f2_request_id_collision_never_displaces_the_existing_pending_owner \
+            v4_arc04f2_a_colliding_draw_does_not_rebind_the_incumbents_device
+          do
+            run_exact_control "$control"
+          done
+
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |
           set -euo pipefail
@@ -310,7 +350,8 @@ jobs:
           for control in \
             v4_arc04e_stated_binding_components_open_and_start_the_handshake \
             v4_arc04e_absent_local_binding_component_fails_the_open_path_closed \
-            v4_arc04e_absent_remote_binding_component_fails_the_open_path_closed
+            v4_arc04e_absent_remote_binding_component_fails_the_open_path_closed \
+            v4_arc04f3_refused_open_retains_its_claim_when_the_native_close_fails
           do
             run_exact_control "$control" --ignored
           done

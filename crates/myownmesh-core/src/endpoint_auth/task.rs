@@ -19,6 +19,34 @@
 //! Retirement follows a conflict, but it is the consequence; what the task
 //! keeps is what actually refused it, so a peer sending a value it cannot be
 //! sending is never filed under the same cause as this endpoint closing up.
+//!
+//! # One lifecycle transition
+//!
+//! The task has exactly one way to end: [`EndpointAuthTask::terminalize`],
+//! which runs with the exchange mutex already held and is the only writer of
+//! both the terminal state and the `retired` observation cache. Everything
+//! follows from that single writer:
+//!
+//! - **Retirement linearizes through the exchange lock.** `retire` takes the
+//!   lock *first* and marks nothing before it. There is no window in which the
+//!   task reports itself retired while another thread, holding the lock, is
+//!   still free to sign a transcript or move the handoff out.
+//! - **Every task-owned terminal path is a retirement.** A refused proof, a
+//!   conflicting contribution, an unfresh or non-mutual pair, a proof that
+//!   arrived before anything was bound, and a genuine currentness failure all
+//!   go through the same transition, so each of them immediately answers
+//!   `is_retired() == true` and `belongs_to(..) == false`. A caller cannot find
+//!   a dead attempt that still claims its connector.
+//! - **The cache never leads the state.** `retired` is written inside the same
+//!   critical section that writes `ExchangeState::Terminal`, so an observer
+//!   that reads the atomic without the lock still cannot see a retirement that
+//!   a locked transition has not committed.
+//!
+//! Promotion is deliberately *not* one of those paths. A promoted task still
+//! belongs to its connector and still answers a retransmitted Hello from its
+//! cache; a second promotion is refused as a currentness failure without
+//! collapsing `Promoted` into `Terminal`, because the engine's duplicate
+//! `AuthResponse` guard depends on telling those two apart.
 
 use super::capability::{AuthenticatedBindingRecord, AuthenticatedChannelCapability};
 use super::context::EndpointAuthContext;
@@ -160,33 +188,77 @@ struct EndpointAuthExchange {
     signatures: usize,
 }
 
-impl EndpointAuthExchange {
-    /// Enter the terminal state, releasing the channel through its exact owner.
-    ///
-    /// Dropping the handoff is what runs connector retention, so a terminal
-    /// attempt returns the claim rather than stranding it.
-    ///
-    /// **The first cause wins.** An attempt that already failed keeps the error
-    /// that actually refused it. Later teardown reaches this same path — a
-    /// refused proof removes the peer, and peer removal retires the task — so
-    /// without this guard an ordinary lifecycle event would overwrite
-    /// `SignatureInvalid` with `ChannelNotCurrent`, and the recorded cause of a
-    /// refusal would depend on scheduling. The claim is likewise returned
-    /// exactly once: the handoff was already taken by the first transition, so
-    /// re-entering here must not run retention again.
-    ///
-    /// The same guard is what lets a conflicting contribution keep its own
-    /// cause. A conflict retires the task it refused, and retirement reaches
-    /// this path with `ChannelNotCurrent`; without the guard the conflict would
-    /// be overwritten by the retirement it caused, and every terminal attempt
-    /// would report the lifecycle event rather than the reason.
-    fn retire_terminally(&mut self, error: EndpointAuthError) -> EndpointAuthError {
-        if let ExchangeState::Terminal(existing) = &self.state {
-            return *existing;
+/// The exact points inside a locked lifecycle transition a control can trap.
+///
+/// Compiled out of production. Every point named here is *inside* the exchange
+/// critical section, which is the whole reason the seam exists: the properties
+/// under test are interleavings, and one side has to be parked at an exact
+/// instruction while still holding the mutex for the other side to be forced to
+/// lose. No production behaviour reads this, and no variant changes what a
+/// transition does — a trapped transition commits exactly what an untrapped one
+/// would, just later.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleTrap {
+    /// Inside [`EndpointAuthTask::retire`], holding the exchange lock, one step
+    /// before the terminal transition runs.
+    Retirement,
+    /// Inside [`EndpointAuthTask::accept_peer_hello`], holding the exchange
+    /// lock, after the state read and before the one signature commits.
+    SignatureCommit,
+    /// Inside [`EndpointAuthTask::accept_peer_proof`], holding the exchange
+    /// lock, after the peer's half verified and before the handoff moves.
+    HandoffMove,
+}
+
+/// A one-shot rendezvous between a control and one locked transition.
+///
+/// Two barriers rather than a flag and a sleep: the control waits for
+/// [`Self::await_entry`] to return, which happens only once the trapped
+/// transition is genuinely inside the critical section, and the transition
+/// resumes only when the control calls [`Self::release`]. Nothing here depends
+/// on scheduler timing, and the *other* thread in each control blocks on the
+/// real exchange mutex rather than on this type, so the ordering a control
+/// establishes is the ordering production would produce.
+///
+/// One-shot by design. Only the first arrival at the named point is trapped, so
+/// a control can drive the same entry point again afterwards — which is exactly
+/// what the later-Hello refusal needs — without a second rendezvous hanging it.
+#[cfg(test)]
+struct LifecycleBarrier {
+    at: LifecycleTrap,
+    tripped: AtomicBool,
+    entered: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl LifecycleBarrier {
+    fn at(point: LifecycleTrap) -> Arc<Self> {
+        Arc::new(Self {
+            at: point,
+            tripped: AtomicBool::new(false),
+            entered: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        })
+    }
+
+    /// Block until the trapped transition holds the exchange lock.
+    fn await_entry(&self) {
+        self.entered.wait();
+    }
+
+    /// Let the trapped transition commit and release the exchange lock.
+    fn release(&self) {
+        self.resume.wait();
+    }
+
+    fn trap(&self, point: LifecycleTrap) {
+        if self.at != point || self.tripped.swap(true, Ordering::AcqRel) {
+            return;
         }
-        drop(self.handoff.take());
-        self.state = ExchangeState::Terminal(error);
-        error
+        self.entered.wait();
+        self.resume.wait();
     }
 }
 
@@ -196,10 +268,23 @@ pub(crate) struct EndpointAuthTask {
     /// Retained separately from the exchange, so the task still names its exact
     /// connector incarnation after promotion has moved the handoff out.
     incarnation: Arc<ConnectorIncarnation>,
-    /// Explicit lifecycle, kept separate from handoff presence: a promoted task
-    /// still belongs to its connector, while a retired one belongs to none.
+    /// Lock-free **observation cache** for the lifecycle, not an authority.
+    ///
+    /// Kept separate from handoff presence: a promoted task still belongs to
+    /// its connector, while a retired one belongs to none. It exists so
+    /// `is_retired` and `belongs_to` can be asked without taking the exchange
+    /// lock — install asks it while already holding the peer entry's capability
+    /// slot, which is exactly where that recheck has to happen — but it is
+    /// never the thing that decides anything.
+    /// [`EndpointAuthTask::terminalize`] is its only writer and writes it while
+    /// holding the exchange mutex, so it cannot report a retirement the
+    /// authoritative state has not committed, and every refusal is still
+    /// decided from the state under the lock.
     retired: AtomicBool,
     exchange: Mutex<EndpointAuthExchange>,
+    /// Test-only rendezvous, armed before a control starts a second thread.
+    #[cfg(test)]
+    barrier: std::sync::OnceLock<Arc<LifecycleBarrier>>,
 }
 
 impl EndpointAuthTask {
@@ -227,6 +312,8 @@ impl EndpointAuthTask {
                 #[cfg(test)]
                 signatures: 0,
             }),
+            #[cfg(test)]
+            barrier: std::sync::OnceLock::new(),
         }
     }
 
@@ -234,6 +321,78 @@ impl EndpointAuthTask {
         self.exchange
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The one authoritative lifecycle transition.
+    ///
+    /// This is the **only** writer of [`ExchangeState::Terminal`] and the only
+    /// writer of the `retired` cache, and it can only be called with the
+    /// exchange guard in hand, because the guard is its argument. Both writes
+    /// happen before the caller releases that guard, so the two can never
+    /// disagree: there is no ordering in which a task reports itself retired
+    /// while its state would still admit a signature or a handoff move, and
+    /// none in which a terminal task still claims its connector.
+    ///
+    /// Dropping the handoff is what runs connector retention, so a terminal
+    /// attempt returns the claim rather than stranding it.
+    ///
+    /// **The first cause wins.** An attempt that already failed keeps the error
+    /// that actually refused it. Later teardown reaches this same path — a
+    /// refused proof removes the peer, and peer removal retires the task — so
+    /// without this guard an ordinary lifecycle event would overwrite
+    /// `SignatureInvalid` with `ChannelNotCurrent`, and the recorded cause of a
+    /// refusal would depend on scheduling. The claim is likewise returned
+    /// exactly once: the handoff was already taken by the first transition, so
+    /// re-entering here must not run retention again.
+    ///
+    /// The same guard is what lets a conflicting contribution keep its own
+    /// cause. A conflict retires the task it refused, and retirement reaches
+    /// this path with `ChannelNotCurrent`; without the guard the conflict would
+    /// be overwritten by the retirement it caused, and every terminal attempt
+    /// would report the lifecycle event rather than the reason.
+    ///
+    /// The cache is written on **both** branches, not only on the first. It is
+    /// a statement about the lifecycle rather than about this call, so a second
+    /// transition arriving at an already-terminal attempt must still leave the
+    /// task observably retired; making the write conditional would put the
+    /// invariant at the mercy of which cause happened to land first.
+    fn terminalize(
+        &self,
+        exchange: &mut EndpointAuthExchange,
+        cause: EndpointAuthError,
+    ) -> EndpointAuthError {
+        let recorded = if let ExchangeState::Terminal(existing) = &exchange.state {
+            *existing
+        } else {
+            drop(exchange.handoff.take());
+            exchange.state = ExchangeState::Terminal(cause);
+            cause
+        };
+        self.retired.store(true, Ordering::Release);
+        recorded
+    }
+
+    /// Rendezvous with a control at a named point inside a locked transition.
+    ///
+    /// A no-op unless a control armed a barrier for exactly this point, and
+    /// absent entirely from production builds. It never touches the guard: the
+    /// trapped transition keeps holding the exchange mutex across the
+    /// rendezvous, which is the point — that is what makes the other thread
+    /// lose on the real lock rather than on scheduler timing.
+    #[cfg(test)]
+    fn trap(&self, point: LifecycleTrap) {
+        if let Some(barrier) = self.barrier.get() {
+            barrier.trap(point);
+        }
+    }
+
+    /// Arm the one rendezvous this task will honour, before any race starts.
+    #[cfg(test)]
+    fn arm_barrier(&self, barrier: Arc<LifecycleBarrier>) {
+        assert!(
+            self.barrier.set(barrier).is_ok(),
+            "a control arms exactly one barrier per task"
+        );
     }
 
     pub(crate) fn is_retired(&self) -> bool {
@@ -324,10 +483,21 @@ impl EndpointAuthTask {
 
     /// Retire this task.
     ///
-    /// Marked before the channel is released, so no observer sees a task that
-    /// has lost its channel but still reports itself live. Dropping the handoff
-    /// runs its retention, so a retired task returns the channel claim rather
-    /// than stranding it, and can never authenticate again.
+    /// **Linearized through the exchange lock, and nothing is marked before
+    /// it.** The lock comes first, then the one transition, which releases the
+    /// channel and marks the task retired together. Marking ahead of the lock
+    /// is precisely what this must not do: a Hello or a proof already inside
+    /// the critical section would then be free to commit its signature or move
+    /// the handoff out *after* every observer could already see a retired task,
+    /// so a superseded channel could still mint authority behind a lifecycle
+    /// that had already said it could not. Now retirement either reaches the
+    /// state first — and the operation refuses before signing or moving
+    /// anything — or it waits, and the operation it lost to is complete before
+    /// the retirement is visible at all.
+    ///
+    /// Dropping the handoff runs its retention, so a retired task returns the
+    /// channel claim rather than stranding it, and can never authenticate
+    /// again.
     ///
     /// Retirement is a lifecycle fact, not a cause. A task that already failed
     /// becomes retired while keeping the error that refused it, and its claim
@@ -335,9 +505,10 @@ impl EndpointAuthTask {
     /// no earlier failure records here, and it stays reserved for that and for
     /// the currentness refusals in [`Self::accept_peer_proof`].
     pub(crate) fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
-        self.lock()
-            .retire_terminally(EndpointAuthError::ChannelNotCurrent);
+        let mut exchange = self.lock();
+        #[cfg(test)]
+        self.trap(LifecycleTrap::Retirement);
+        self.terminalize(&mut exchange, EndpointAuthError::ChannelNotCurrent);
     }
 
     /// Bind the peer contribution and return this endpoint's proof.
@@ -357,6 +528,13 @@ impl EndpointAuthTask {
         peer_contribution: PeerContribution,
     ) -> Result<AcceptedPeerHello, EndpointAuthError> {
         let mut exchange = self.lock();
+        // The state is read under the lock and *before* anything is answered
+        // from the cache, before the freshness and mutuality rules run, and
+        // before any transcript is built or signed. A terminal attempt — for
+        // any cause, retirement included — leaves here with the cause it
+        // recorded, so no retired task can be made to hand back its cached
+        // proof or to produce a new one.
+        //
         // Bound and promoted answer identically: promotion moves the channel
         // out, it does not change what this attempt bound. An exact duplicate
         // is answered from the cache in both states; a conflicting value is
@@ -380,23 +558,23 @@ impl EndpointAuthTask {
                 // The conflict's own cause, not the currentness one. This
                 // channel was current and this attempt was intact; what
                 // happened is that a peer offered a second, different
-                // contribution for a pair that is already bound. Retirement
-                // follows on the next line, and `retire_terminally` keeps the
-                // first cause, so the recorded reason stays the conflict rather
-                // than becoming the retirement it triggered.
-                let error =
-                    exchange.retire_terminally(EndpointAuthError::ConflictingPeerContribution);
-                self.retired.store(true, Ordering::Release);
-                return Err(error);
+                // contribution for a pair that is already bound. Retirement is
+                // the same transition rather than a second step beside it, and
+                // it keeps the first cause, so the recorded reason stays the
+                // conflict rather than becoming the retirement it triggered.
+                return Err(self.terminalize(
+                    &mut exchange,
+                    EndpointAuthError::ConflictingPeerContribution,
+                ));
             }
             ExchangeState::AwaitingPeerContribution => {}
         }
 
         if peer_contribution.as_str() == exchange.local_contribution.as_str() {
-            return Err(exchange.retire_terminally(EndpointAuthError::ContributionNotFresh));
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::ContributionNotFresh));
         }
         if exchange.context.local_device_id() == exchange.context.expected_remote_device_id() {
-            return Err(exchange.retire_terminally(EndpointAuthError::NotMutual));
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::NotMutual));
         }
 
         let transcript = transcript::transcript_for_context(
@@ -405,6 +583,12 @@ impl EndpointAuthTask {
             exchange.local_contribution.as_str(),
             peer_contribution.as_str(),
         );
+        // Past the state read, still holding the lock, with the one signature
+        // about to commit. A retirement racing this call is blocked on the
+        // exchange mutex here, and stays blocked until the binding below is
+        // complete.
+        #[cfg(test)]
+        self.trap(LifecycleTrap::SignatureCommit);
         let signature = exchange.signer.sign(&transcript);
         #[cfg(test)]
         {
@@ -435,17 +619,33 @@ impl EndpointAuthTask {
         peer_signature: &str,
     ) -> Result<AuthenticatedChannelCapability, EndpointAuthError> {
         let mut exchange = self.lock();
-        let (peer_contribution, local_proof) = match &exchange.state {
+        // The same state read, under the same lock, before any verification and
+        // long before the handoff moves. A terminal attempt — retirement
+        // included — cannot reach the promotion below at all.
+        let bound = match &exchange.state {
             ExchangeState::Bound {
                 peer_contribution,
                 local_proof,
-            } => (peer_contribution.clone(), local_proof.clone()),
+            } => Some((peer_contribution.clone(), local_proof.clone())),
             ExchangeState::Terminal(error) => return Err(*error),
-            // One promotion per attempt: the channel has already moved.
+            // One promotion per attempt: the channel has already moved. This is
+            // deliberately *not* a terminal transition. `Promoted` has to stay
+            // distinct from `Terminal`, because the engine's duplicate
+            // `AuthResponse` guard treats this exact cause from a promoted task
+            // as a benign retransmission — and because a promoted task must go
+            // on answering a retransmitted Hello from its cache and go on
+            // vouching for what it issued.
             ExchangeState::Promoted { .. } => return Err(EndpointAuthError::ChannelNotCurrent),
-            ExchangeState::AwaitingPeerContribution => {
-                return Err(EndpointAuthError::MissingTranscriptField)
-            }
+            ExchangeState::AwaitingPeerContribution => None,
+        };
+        // A proof for an attempt that has bound nothing is terminal, not merely
+        // refused. There is no transcript for it to be a proof *of*: this
+        // endpoint has drawn its half and no peer half exists, so the frame
+        // cannot become valid later and the attempt has nothing left to do.
+        // Leaving it live would keep a channel claim held open by a peer that
+        // has already violated the one ordering the exchange has.
+        let Some((peer_contribution, local_proof)) = bound else {
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::MissingTranscriptField));
         };
 
         let peer_transcript = transcript::transcript_for_context(
@@ -460,19 +660,30 @@ impl EndpointAuthTask {
             peer_signature,
         );
         if !matches!(verified, Ok(true)) {
-            return Err(exchange.retire_terminally(EndpointAuthError::SignatureInvalid));
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::SignatureInvalid));
         }
 
         // Every borrow-checkable condition is satisfied; only now does the
-        // handoff move.
+        // handoff move. A retirement racing this call is blocked on the
+        // exchange mutex at this point: it either reached the state before the
+        // read above — in which case this call already left with the terminal
+        // cause — or it waits here and lands after the promotion is complete.
+        #[cfg(test)]
+        self.trap(LifecycleTrap::HandoffMove);
+        // Both currentness refusals below are genuine: the channel claim is not
+        // there to promote. Neither is reachable from a `Bound` attempt, which
+        // always still holds its handoff — only a terminal or promoted one has
+        // given it up, and both were answered above — so they are stated as the
+        // fail-closed floor rather than as live paths, and they terminalize
+        // through the same one transition as everything else.
         let Some(handoff) = exchange.handoff.take() else {
-            return Err(exchange.retire_terminally(EndpointAuthError::ChannelNotCurrent));
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::ChannelNotCurrent));
         };
         let Some(runtime) = handoff.capability().map(|c| c.runtime().clone()) else {
             // Nothing to promote: dropping the handoff hands the claim back to
             // its owner path.
             drop(handoff);
-            return Err(exchange.retire_terminally(EndpointAuthError::ChannelNotCurrent));
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::ChannelNotCurrent));
         };
         let record = AuthenticatedBindingRecord::from_verified_exchange(
             &exchange.context,
@@ -683,6 +894,70 @@ mod tests {
     fn peer_draw() -> PeerContribution {
         PeerContribution::from_wire(LocalContribution::generate().as_str())
             .expect("a local draw is canonical on the wire")
+    }
+
+    /// How many times a fixture channel's claim came back to its owner.
+    ///
+    /// A closure rather than the retention owner itself: that type is private
+    /// to the connector module, and a control helper here must not be the
+    /// reason it gets re-exported more widely.
+    type ClaimCounter = Box<dyn Fn() -> usize>;
+
+    /// One shared task on a counted channel, its peer key, and a claim counter.
+    ///
+    /// The `Arc` is what a second thread can own, so the lifecycle controls
+    /// below can put two genuine concurrent callers on one real task rather
+    /// than simulating the race sequentially.
+    fn counted_task() -> (
+        Arc<EndpointAuthTask>,
+        ed25519_dalek::SigningKey,
+        ClaimCounter,
+    ) {
+        let (local_key, local_device) = fixture_key(1);
+        let (peer_key, remote_device) = fixture_key(2);
+        let (handoff, retention) = counted_handoff_for_test(crate::runtime::runtime_for_test());
+        let task = Arc::new(EndpointAuthTask::begin(
+            context_for(MESH, &local_device, &remote_device),
+            handoff,
+            signer_for_test(local_key),
+        ));
+        (task, peer_key, Box::new(move || retention.count()))
+    }
+
+    /// Everything a task-owned terminal path must agree on, in one place.
+    ///
+    /// Stated as one predicate because the failure this guards against is
+    /// *disagreement*: a path that records a cause but leaves the task looking
+    /// live, or retires it while another path still reports a different reason,
+    /// or hands the channel claim back twice. Each of the four is asked of the
+    /// same attempt at the same moment.
+    ///
+    /// `belongs_to` is asked with the task's own incarnation, so the connector
+    /// half of that predicate is true by construction and the answer can only
+    /// be false because the task is retired — it cannot pass vacuously on a
+    /// mismatched incarnation.
+    fn assert_terminal_agreement(
+        task: &EndpointAuthTask,
+        cause: EndpointAuthError,
+        retained: usize,
+    ) {
+        assert_eq!(
+            task.terminal_error(),
+            Some(cause),
+            "the attempt keeps the exact cause that refused it"
+        );
+        assert!(
+            task.is_retired(),
+            "every task-owned terminal path retires the task immediately"
+        );
+        assert!(
+            !task.belongs_to(task.incarnation()),
+            "and a retired task belongs to no connector"
+        );
+        assert_eq!(
+            retained, 1,
+            "and the channel claim goes back to its owner exactly once"
+        );
     }
 
     impl Fixture {
@@ -1192,5 +1467,383 @@ mod tests {
         assert!(!fixture.task.issued(&foreign));
         fixture.task.accept_peer_hello(peer_draw()).expect("binds");
         assert!(!fixture.task.issued(&foreign));
+    }
+
+    #[test]
+    fn v4_arc04f_every_task_owned_terminal_cause_agrees_on_the_lifecycle() {
+        // The unification, stated over the whole closed set at once. Before it,
+        // the causes disagreed: a refused proof, an unfresh pair and a
+        // non-mutual context all recorded a terminal state while leaving the
+        // task reporting itself live and still belonging to its connector, and
+        // only explicit retirement wrote the observation cache. A caller could
+        // therefore hold a dead attempt that answered `belongs_to` with `true`.
+        //
+        // Enumerated rather than sampled, because the property is that no cause
+        // is special. Every one of these is a *task-owned* refusal: the
+        // encoding and profile causes are refused before a task exists and
+        // cannot be driven here at all.
+
+        // A peer that echoed our own contribution back.
+        {
+            let (task, _peer_key, retained) = counted_task();
+            let shared = PeerContribution::from_wire(&task.local_contribution())
+                .expect("the local draw is canonical");
+            assert_eq!(
+                task.accept_peer_hello(shared),
+                Err(EndpointAuthError::ContributionNotFresh)
+            );
+            assert_terminal_agreement(&task, EndpointAuthError::ContributionNotFresh, retained());
+        }
+
+        // A context with no second party. Built directly, because the whole
+        // point is a Device pair `counted_task` cannot produce.
+        {
+            let (key, device) = fixture_key(1);
+            let (handoff, retention) = counted_handoff_for_test(crate::runtime::runtime_for_test());
+            let task = EndpointAuthTask::begin(
+                context_for(MESH, &device, &device),
+                handoff,
+                signer_for_test(key),
+            );
+            assert_eq!(
+                task.accept_peer_hello(peer_draw()),
+                Err(EndpointAuthError::NotMutual)
+            );
+            assert_terminal_agreement(&task, EndpointAuthError::NotMutual, retention.count());
+        }
+
+        // A peer half that does not verify.
+        {
+            let (task, _peer_key, retained) = counted_task();
+            task.accept_peer_hello(peer_draw()).expect("binds");
+            assert_eq!(
+                task.accept_peer_proof("not-a-signature").err(),
+                Some(EndpointAuthError::SignatureInvalid)
+            );
+            assert_terminal_agreement(&task, EndpointAuthError::SignatureInvalid, retained());
+        }
+
+        // A second, different contribution for an attempt already bound.
+        {
+            let (task, _peer_key, retained) = counted_task();
+            task.accept_peer_hello(peer_draw()).expect("binds");
+            assert_eq!(
+                task.accept_peer_hello(peer_draw()),
+                Err(EndpointAuthError::ConflictingPeerContribution)
+            );
+            assert_terminal_agreement(
+                &task,
+                EndpointAuthError::ConflictingPeerContribution,
+                retained(),
+            );
+        }
+
+        // A proof for an attempt that has bound nothing.
+        {
+            let (task, _peer_key, retained) = counted_task();
+            assert_eq!(
+                task.accept_peer_proof("premature").err(),
+                Some(EndpointAuthError::MissingTranscriptField)
+            );
+            assert_terminal_agreement(&task, EndpointAuthError::MissingTranscriptField, retained());
+        }
+
+        // And the lifecycle event itself, so the predicate is not one that only
+        // the failure causes satisfy.
+        {
+            let (task, _peer_key, retained) = counted_task();
+            task.retire();
+            assert_terminal_agreement(&task, EndpointAuthError::ChannelNotCurrent, retained());
+        }
+    }
+
+    #[test]
+    fn v4_arc04f_a_premature_proof_is_terminal_not_merely_refused() {
+        // A proof cannot arrive before the Hello that binds the attempt: both
+        // travel from one peer on one ordered channel, and the peer sends its
+        // Hello first. So this frame is a peer violating the only ordering the
+        // exchange has, and refusing it without ending the attempt left the
+        // channel claim held open for a party that had already done something
+        // it cannot do.
+        let (task, peer_key, retained) = counted_task();
+
+        assert_eq!(
+            task.accept_peer_proof("premature").err(),
+            Some(EndpointAuthError::MissingTranscriptField)
+        );
+
+        assert_terminal_agreement(&task, EndpointAuthError::MissingTranscriptField, retained());
+        assert_eq!(
+            task.signature_count(),
+            0,
+            "and nothing was signed for an attempt that had bound nothing"
+        );
+
+        // The attempt cannot be restarted. A Hello that would have bound it,
+        // and then a genuine peer half over the value that Hello carried, both
+        // answer with the cause that ended it.
+        let peer = peer_draw();
+        assert_eq!(
+            task.accept_peer_hello(peer.clone()),
+            Err(EndpointAuthError::MissingTranscriptField),
+            "a later Hello cannot revive an attempt a premature proof ended"
+        );
+        assert_eq!(
+            task.accept_peer_proof(&peer_proof_for_test(&task, &peer, &peer_key))
+                .err(),
+            Some(EndpointAuthError::MissingTranscriptField),
+            "and neither can a proof that would otherwise have verified"
+        );
+        assert_eq!(task.signature_count(), 0);
+        assert_eq!(retained(), 1, "the claim still goes back exactly once");
+    }
+
+    #[test]
+    fn v4_arc04f_retirement_holding_the_lock_refuses_the_signature() {
+        // Retirement wins. The barrier parks it *inside* the exchange critical
+        // section, one step before its transition, and the Hello then blocks on
+        // the real mutex — not on scheduler timing, and not on a sleep.
+        let (task, _peer_key, retained) = counted_task();
+        let barrier = LifecycleBarrier::at(LifecycleTrap::Retirement);
+        task.arm_barrier(Arc::clone(&barrier));
+
+        let retiring = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.retire())
+        };
+        barrier.await_entry();
+
+        // The load-bearing observation, and the exact regression this closes.
+        // Retirement holds the lock but has not committed, so nothing may see
+        // it yet. When the cache was written *before* the lock, this already
+        // read true — while a Hello holding the lock was still free to sign.
+        // (Read through the atomic only: taking the exchange lock here would
+        // deadlock against the thread the barrier is holding, which is the
+        // point.)
+        assert!(
+            !task.is_retired(),
+            "a retirement is not observable before its own transition commits"
+        );
+        assert!(
+            task.belongs_to(task.incarnation()),
+            "and the task still belongs to its connector until then"
+        );
+
+        let hello = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.accept_peer_hello(peer_draw()))
+        };
+        barrier.release();
+        retiring.join().expect("the retiring thread completes");
+        let refused = hello.join().expect("the hello thread completes");
+
+        assert_eq!(
+            refused,
+            Err(EndpointAuthError::ChannelNotCurrent),
+            "the Hello reaches the state after the retirement and is refused by it"
+        );
+        assert_eq!(
+            task.signature_count(),
+            0,
+            "and it is refused before anything is signed, not after"
+        );
+        assert_eq!(task.draw_count(), 1, "the one draw is still the only draw");
+        assert_terminal_agreement(&task, EndpointAuthError::ChannelNotCurrent, retained());
+    }
+
+    #[test]
+    fn v4_arc04f_a_hello_holding_the_lock_commits_before_retirement_lands() {
+        // The other order over the same pair of callers. The Hello is parked
+        // inside the critical section with its signature about to commit, and
+        // the retirement blocks on the mutex behind it — so the binding is not
+        // lost, and the retirement is not lost either. One order, both facts.
+        let (task, _peer_key, retained) = counted_task();
+        let barrier = LifecycleBarrier::at(LifecycleTrap::SignatureCommit);
+        task.arm_barrier(Arc::clone(&barrier));
+        let peer = peer_draw();
+
+        let binding = {
+            let task = Arc::clone(&task);
+            let peer = peer.clone();
+            std::thread::spawn(move || task.accept_peer_hello(peer))
+        };
+        barrier.await_entry();
+        let retiring = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.retire())
+        };
+        barrier.release();
+        let accepted = binding
+            .join()
+            .expect("the hello thread completes")
+            .expect("the Hello that holds the lock binds this attempt");
+        retiring.join().expect("the retiring thread completes");
+
+        assert!(
+            matches!(accepted, AcceptedPeerHello::FirstBinding(_)),
+            "the winning Hello is the one that established the attempt"
+        );
+        assert_eq!(
+            task.signature_count(),
+            1,
+            "and its one signature committed rather than being torn out from under it"
+        );
+        assert_terminal_agreement(&task, EndpointAuthError::ChannelNotCurrent, retained());
+
+        // The later Hello, carrying the exact value this attempt bound. The
+        // state read precedes the cache, so a retired task answers no Hello
+        // from it — a channel that is gone cannot keep replying with the proof
+        // it produced while it was still there.
+        assert_eq!(
+            task.accept_peer_hello(peer),
+            Err(EndpointAuthError::ChannelNotCurrent),
+            "a retired task answers no Hello from its cache, not even the one it bound"
+        );
+        assert_eq!(
+            task.signature_count(),
+            1,
+            "and the refused retransmission signs nothing"
+        );
+        assert_eq!(retained(), 1);
+    }
+
+    #[test]
+    fn v4_arc04f_retirement_holding_the_lock_refuses_the_handoff_move() {
+        // Retirement wins against a proof that would otherwise promote. The
+        // handoff is what carries the channel claim, so this is the case where
+        // losing the race would mint real authority over a channel the
+        // lifecycle had already given up.
+        let (task, peer_key, retained) = counted_task();
+        let peer = peer_draw();
+        task.accept_peer_hello(peer.clone()).expect("binds");
+        let proof = peer_proof_for_test(&task, &peer, &peer_key);
+        let barrier = LifecycleBarrier::at(LifecycleTrap::Retirement);
+        task.arm_barrier(Arc::clone(&barrier));
+
+        let retiring = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.retire())
+        };
+        barrier.await_entry();
+        assert!(!task.is_retired());
+
+        let promoting = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.accept_peer_proof(&proof))
+        };
+        barrier.release();
+        retiring.join().expect("the retiring thread completes");
+        let outcome = promoting.join().expect("the promoting thread completes");
+
+        // `err()` rather than a comparison: the capability is deliberately
+        // neither `Debug` nor `PartialEq`. If this had wrongly promoted, the
+        // assertion fails here — before the retention count below could be
+        // satisfied by the capability's own drop instead of by the retirement.
+        assert_eq!(
+            outcome.err(),
+            Some(EndpointAuthError::ChannelNotCurrent),
+            "a proof that verifies cannot move a handoff the retirement already released"
+        );
+        assert_eq!(
+            task.signature_count(),
+            1,
+            "the refusal produces no second signature"
+        );
+        assert_terminal_agreement(&task, EndpointAuthError::ChannelNotCurrent, retained());
+    }
+
+    #[test]
+    fn v4_arc04f_promotion_holding_the_lock_issues_a_capability_retirement_cannot_install() {
+        // The last order: promotion wins, retirement lands behind it. The
+        // capability is genuinely issued — the handoff moved — so the question
+        // is what install does with it, and the answer must not depend on which
+        // thread got there first.
+        //
+        // The positive twin runs first, over the identical construction with no
+        // retirement, so the refusal below is attributable to the retirement
+        // and not to anything about this fixture.
+        {
+            let (task, peer_key, _retained) = counted_task();
+            let peer = peer_draw();
+            task.accept_peer_hello(peer.clone()).expect("binds");
+            let capability = task
+                .accept_peer_proof(&peer_proof_for_test(&task, &peer, &peer_key))
+                .expect("the fixture proof promotes");
+            let entry = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+                "arc04f-install-positive".to_string(),
+                Arc::clone(&task),
+            );
+
+            assert!(
+                entry.install_authenticated_channel(&task, capability),
+                "non-vacuity: this exact construction installs while the task is live"
+            );
+            assert!(entry.has_authenticated_channel());
+        }
+
+        let (task, peer_key, retained) = counted_task();
+        let peer = peer_draw();
+        task.accept_peer_hello(peer.clone()).expect("binds");
+        let proof = peer_proof_for_test(&task, &peer, &peer_key);
+        let barrier = LifecycleBarrier::at(LifecycleTrap::HandoffMove);
+        task.arm_barrier(Arc::clone(&barrier));
+
+        let promoting = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.accept_peer_proof(&proof))
+        };
+        barrier.await_entry();
+        assert!(
+            !task.is_retired(),
+            "the promotion holds the lock with the handoff still in place"
+        );
+        let retiring = {
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || task.retire())
+        };
+        barrier.release();
+        let capability = promoting
+            .join()
+            .expect("the promoting thread completes")
+            .expect("the promotion that holds the lock completes");
+        retiring.join().expect("the retiring thread completes");
+
+        // The capability is real and names this exact channel: promotion did
+        // win, and this control is not quietly asserting that it failed.
+        assert!(
+            capability.belongs_to(task.incarnation()),
+            "the promotion that won the lock issued authority over its own channel"
+        );
+        // But the task behind it is retired, and a retired task vouches for
+        // nothing — including what it issued a moment earlier.
+        assert!(task.is_retired());
+        assert!(!task.belongs_to(task.incarnation()));
+        assert_eq!(
+            task.terminal_error(),
+            Some(EndpointAuthError::ChannelNotCurrent)
+        );
+        assert!(
+            !task.issued(&capability),
+            "a retired task cannot prove it issued anything"
+        );
+
+        let entry = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "arc04f-install-after-retirement".to_string(),
+            Arc::clone(&task),
+        );
+
+        assert!(
+            !entry.install_authenticated_channel(&task, capability),
+            "the real install refuses a capability whose task retirement already invalidated"
+        );
+        assert!(
+            !entry.has_authenticated_channel(),
+            "and no authority is installed by the refusal"
+        );
+        assert_eq!(
+            retained(),
+            1,
+            "the refused capability hands the channel claim back exactly once"
+        );
     }
 }
