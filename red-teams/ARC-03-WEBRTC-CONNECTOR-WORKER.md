@@ -304,6 +304,145 @@ anything.
   check that gating directly, because no compiler probe can see it from outside
   the crate.
 
+### Status note at Arc 04G
+
+**Nothing in this subsection has been executed.** No harness run, no `cargo`
+build, check, test or clippy run, and no CI run stands behind any statement
+below. Every claim here is a source read or a count taken from the working
+tree. No run identifier is cited for any of it, and none should be inferred.
+Operator review `4890447056` on PR #6 is cited as directive provenance only —
+it is the instruction this integration followed, and it is not execution
+evidence for anything. The Arc 04F note above is left exactly as it stands;
+where this note corrects it, it says so.
+
+**Neither of the two findings this slice acts on was an exploitable
+vulnerability**, and neither is written up here as one. One was a documented
+exactness property the code did not actually have, reachable only behind a
+negligibly unlikely local event no peer can induce; the other was a type
+telling an untruth about a live attempt's state, behind behaviour that was
+already fail-closed. Both are worth closing, and neither should be read as a
+defeated attack.
+
+- **G1: local withdrawal is exact, and the earlier claim of exactness was an
+  overclaim.** Arc 04F bound the *inbound* settle to a canonical device and a
+  response class, and that binding is unchanged and still correct: a frame
+  cannot know a process-local identity and must not have to. What Arc 04F then
+  reused for the *local* withdrawal after a failed send was that same
+  device-and-class predicate, described in the source as abandoning "its own
+  operation and never a newer occupant of the same key". That description was
+  not true of the code. The predicate names a *class* of operations, so if the
+  withdrawing call's own entry had already left the map — settled by a response
+  that raced the failing send — and the id had since been redrawn by a fresh
+  call to the same device in the same class, every coordinate matched the
+  newcomer and the stale withdrawal removed a live operation, stranding its
+  caller on a reply nothing could deliver. Reaching it requires the same 96-bit
+  random id to be drawn twice — negligibly unlikely, not impossible — which is
+  why this is a latent exactness gap and a documentation overclaim rather than a
+  vulnerability: no peer behaviour induces the collision, and the race that
+  would exercise it needs the collision first. It is nonetheless handled
+  exactly rather than argued away, on the same grounds the collision refusal
+  itself is. The withdrawal is now conditional on a private, process-local identity
+  — a zero-sized private marker behind an `Arc`, compared with `Arc::ptr_eq`,
+  deliberately not `PartialEq` because a derived comparison on a zero-sized
+  pointee makes every identity equal to every other. It is never serialized,
+  never sent, never derived from anything a peer supplies, and no inbound path
+  reads it. It is not an authority, a credential, or a generation counter.
+- **G1, correcting the Arc 04F note above.** That note ends its RPC paragraph
+  with "a colliding draw retries, and an exhausted draw fails locally before
+  anything is sent". That is no longer the shape and the sentence should be read
+  subject to this correction: there is now exactly one draw and one claim, with
+  no redraw, no retry and no attempt counter. `REQUEST_ID_ATTEMPTS` is gone.
+  "Never displace" was total either way; the bounded loop only read as a policy
+  that would eventually take the id, when the honest answer is that it will not
+  try. `RpcError::RequestIdUnavailable` keeps its name and its place in the
+  public enum — the Arc 04F disclosure about that breaking change stands
+  unaltered — but its documented meaning narrows from "no unused id in N draws"
+  to "the one id this call drew was already owned".
+- **G2: a second promotion is a typed outcome, not a borrowed terminal cause.**
+  A retransmitted `auth_response` reaching an already-promoted attempt used to
+  be reported as `EndpointAuthError::ChannelNotCurrent`. The attempt behind it
+  is alive — bound, promoted, still its connector's, still answering a
+  retransmitted `hello` from its cache and still vouching for what it issued —
+  so that made an intact task claim a terminal cause it never took, and it left
+  `EndpointAuthError` carrying two senses at once: "the attempt is over" and
+  "this call had nothing to do". Promotion now answers a closed
+  `PeerProofAcceptance` with exactly two variants, `Promoted(capability)` and a
+  payload-free `AlreadyPromoted`, and every `Err` from that path is a cause the
+  attempt recorded through the single locked terminal transition. **This is a
+  correctness-of-type repair, not a closed hole.** The engine's duplicate guard
+  corroborated an installed, current authenticated channel before treating a
+  duplicate as benign, and dropped the peer otherwise; it still does, against
+  the same two conditions. No peer was authenticated without that corroboration
+  before this change, and none is now.
+- **G2: what the duplicate outcome does not say, stated where callers read
+  it.** `AlreadyPromoted` is a lifecycle fact and nothing more. It does not say
+  the replayed signature verified — the attempt's state is read under the lock
+  before any verification, and a promoted attempt has no handoff left to
+  promote in any case, so those bytes are never examined and any bytes at all
+  produce it. It does not say the capability was installed: promotion issues the
+  one capability to whoever won it, and a winner can move the channel out and
+  then fail to install it. The handler therefore keeps corroborating
+  installation and current-attempt ownership and fails closed without both, and
+  the duplicate variant carries no payload, so a second caller cannot be handed
+  — or lent — the capability the promoting caller already holds.
+- **What the two new guard families count, and what they cannot.** Both
+  properties are counts, not paths, so no control can stand in for them. On the
+  G1 side: the identity type stays private and opaque, gains no derived or
+  hand-written equality and no `Serialize`, is decided only by `Arc::ptr_eq`;
+  both records carry it under their own names; there is exactly one call site
+  that draws a request id and no loop, attempt counter or generation in either
+  registration; the withdrawal reads the identity and none of the binding
+  coordinates; and the three inbound bound operations read none of the identity.
+  On the G2 side: the outcome enum is closed at exactly those two variants and
+  stays `pub(crate)`; the controls-only `into_promoted` stays `#[cfg(test)]`;
+  the promoted arm returns the non-error; every `return Err` in the promotion
+  path is either a cause already recorded or one recorded through `terminalize`,
+  and no variant is constructed bare; and the engine matches both outcomes by
+  name, requires both corroborations together, fails closed without them, and
+  special-cases no error variant as benign. What none of this proves is that any
+  of it compiles or runs: these are text shapes read out of the working tree.
+- **Current control totals, counted by reading the working tree.** The Arc 04
+  compiler harness still carries 19 cause-matched rejection probes and one
+  positive public-surface control; no probe was added or removed by this slice,
+  and the script prints its own total, so quote that and not this sentence. The
+  `arc04-endpoint-auth` CI job now names 54 exact controls, up from 48: 43
+  without `--ignored`, and the same 11 live two-connector controls with
+  `--ignored`. The six added are two for G1 and four for G2, each wrapped in the
+  same triple non-vacuity parse, and each block ordered positives first. Five
+  are new; the sixth,
+  `v4_arc04_duplicate_auth_response_after_promotion_is_idempotent`, is a
+  pre-existing control named in CI for the first time because the new
+  fail-closed control needs it — without a case in which this handler does *not*
+  drop, "already promoted with nothing installed drops" would pass just as well
+  for a handler that dropped every duplicate it ever saw.
+- **One existing control was renamed, and the rename is disclosed rather than
+  absorbed into the count.**
+  `v4_arc04_duplicate_auth_response_after_promotion_is_refused` at head `8b325f6`
+  is now `v4_arc04g_second_promotion_is_benign_and_leaves_the_attempt_promoted`.
+  The old name asserted the behaviour this slice changed: a second promotion is
+  no longer refused, so keeping it would have left the control register
+  describing a refusal that no longer happens. The old name was not named in CI
+  at `8b325f6` — the workflow there matches it nowhere — so no CI entry was
+  displaced, repointed, or left dangling by the rename, and nothing that was
+  being checked stopped being checked. The new name is named in CI, added by
+  this slice as the first control of the G2 block. It is counted once, as one of
+  the six additions above, and not twice. No other control was renamed.
+- **`insert_local_request` is gated to controls, and the guard says so rather
+  than assuming it.** Every caller it has is a control — two in `rpc::tests`,
+  six in `engine::tests` — and no production path files through it, because a
+  production caller needs the identity back to withdraw its own failed send and
+  this wrapper drops it. Under the workspace `-D warnings` gate an ungated
+  crate-internal fn with no non-test caller is `dead_code`, so a normal lib
+  build refuses it. The source-shape guard therefore requires the `#[cfg(test)]`
+  containment fail-closed, through the same attribute-run helper the Arc 04F
+  seams use, which reads only the item's own attribute run so an unrelated
+  `#[cfg(test)]` elsewhere in the file cannot vouch for it. The exact signature
+  and the wrapper body are still required alongside: gating an item that had
+  drifted into a second insertion path would not be a repair. This is a
+  hygiene and surface-narrowing property, not a defeated attack.
+
+  None of these totals has been verified by execution at any head.
+
 ## 2. RT-03-01: manufacture connector resource authority
 
 Attack: construct a worker, provider, Mesh child, lease, or candidate capability without the process provider and exact claim.

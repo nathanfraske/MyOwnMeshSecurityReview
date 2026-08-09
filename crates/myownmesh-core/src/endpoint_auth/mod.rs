@@ -50,7 +50,9 @@ pub(crate) use contribution::LocalContribution;
 pub(crate) use contribution::PeerContribution;
 #[cfg(test)]
 pub(crate) use task::{peer_proof_for_test, task_for_test, task_reusing_contribution_for_test};
-pub(crate) use task::{AcceptedPeerHello, EndpointAuthTask, LocalIdentitySigner};
+pub(crate) use task::{
+    AcceptedPeerHello, EndpointAuthTask, LocalIdentitySigner, PeerProofAcceptance,
+};
 // The signed framing is deliberately *not* re-exported. It used to be, so that
 // controls outside this module could rebuild the exact bytes it signs — but
 // rebuilding them meant restating the mesh, profile, Device pair and channel
@@ -94,6 +96,15 @@ impl EndpointRole {
 
 /// Typed endpoint-authentication failure. Every variant is terminal for the
 /// attempt: no variant leaves a partially promoted capability behind.
+///
+/// "Terminal" is meant literally, and it is what makes this type readable on its
+/// own. An attempt that returns any of these has been terminalized — by the call
+/// that returned it or by an earlier one — so it is retired, belongs to no
+/// connector, and vouches for nothing. No variant is ever used to say "this call
+/// had nothing to do": a benign duplicate is a non-error outcome
+/// ([`AcceptedPeerHello::ExactDuplicate`], [`PeerProofAcceptance::AlreadyPromoted`])
+/// and never borrows a cause from here, so no caller has to consult its own
+/// state to find out which of the two sense was meant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EndpointAuthError {
     /// A required transcript field was empty.
@@ -118,17 +129,25 @@ pub(crate) enum EndpointAuthError {
     /// fallback and no second profile to select, so this is terminal for the
     /// attempt rather than a step in a negotiation.
     IncompatibleProfile,
-    /// The task's channel is gone: it was replaced or retired, or a previous
-    /// attempt already consumed it.
+    /// The task's channel is gone: it was replaced or retired, so there is no
+    /// connected claim left for this attempt to promote.
     ///
     /// This is a security condition, not housekeeping. Because the channel
     /// binding is not session-unique, exact connector-incarnation ownership is
     /// what distinguishes two channels between the same pair — so refusing here
     /// is what defeats cross-channel relay.
     ///
-    /// Reserved for retirement and currentness. A conflicting peer contribution
-    /// is *not* one of these: the channel was current and the attempt intact,
-    /// so it has its own cause in [`Self::ConflictingPeerContribution`].
+    /// Reserved for retirement and currentness, and terminal like every other
+    /// variant. Two things are deliberately *not* filed under it:
+    ///
+    /// - A conflicting peer contribution. The channel was current and the
+    ///   attempt intact, so it has its own cause in
+    ///   [`Self::ConflictingPeerContribution`].
+    /// - A second promotion of the same attempt. That attempt is alive and still
+    ///   holds the authority it issued, so it is the non-error
+    ///   [`PeerProofAcceptance::AlreadyPromoted`]. Reporting it here made a
+    ///   promoted task claim a terminal cause it never took, and left every
+    ///   caller to separate the two from its own state.
     ChannelNotCurrent,
     /// A second, different peer contribution arrived after this attempt was
     /// already bound to one. Terminal for this exact task.

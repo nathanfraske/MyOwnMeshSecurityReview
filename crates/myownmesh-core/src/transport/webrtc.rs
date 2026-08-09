@@ -9674,8 +9674,13 @@ mod tests {
     /// These drivers must surface the exact `EndpointAuthError` the typed
     /// assertions below match on, so the error type is named explicitly rather
     /// than left to whichever `Result` happens to be in scope.
+    ///
+    /// The success side is the task's own closed outcome, not a bare capability.
+    /// An attempt that has already promoted is not a failure of this exchange,
+    /// so it does not appear on the error side at all: `Err` here means the task
+    /// terminalized, which is exactly what the refusal controls below assert.
     type ExchangeResult = std::result::Result<
-        crate::endpoint_auth::AuthenticatedChannelCapability,
+        crate::endpoint_auth::PeerProofAcceptance,
         crate::endpoint_auth::EndpointAuthError,
     >;
 
@@ -9720,16 +9725,22 @@ mod tests {
         let remote_c = peer_draw();
 
         let authenticated = drive_exchange(&task, &remote_c, &remote_key)
-            .expect("a complete mutual proof over the exact channel promotes");
+            .expect("a complete mutual proof over the exact channel promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
         drop(authenticated);
 
         // The handoff is consumed exactly once: replaying the whole exchange
-        // against this task finds no channel left to authenticate. The Hello is
-        // an exact duplicate and is still answered from the cached proof, so the
-        // refusal comes from promotion — which is where the channel moved.
-        assert_eq!(
-            drive_exchange(&task, &remote_c, &remote_key).err(),
-            Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent),
+        // against this task finds no channel left to move. The Hello is an exact
+        // duplicate and is still answered from the cached proof, and promotion
+        // states that it already happened — so the replay yields no second
+        // capability, without the intact task being reported as terminal.
+        assert!(
+            matches!(
+                drive_exchange(&task, &remote_c, &remote_key)
+                    .expect("a replay against a promoted attempt is not a refusal"),
+                crate::endpoint_auth::PeerProofAcceptance::AlreadyPromoted
+            ),
             "one channel yields at most one authenticated capability"
         );
     }
@@ -9909,7 +9920,9 @@ mod tests {
         // Channel 1 authenticates normally.
         let one_remote = peer_draw();
         let promoted = drive_exchange(&channel_one, &one_remote, &remote_key)
-            .expect("channel 1 authenticates");
+            .expect("channel 1 authenticates")
+            .into_promoted()
+            .expect("channel 1's promotion issues the capability");
         // The exact proof channel 1 accepted, captured for replay below.
         let one_remote_sig =
             crate::endpoint_auth::peer_proof_for_test(&channel_one, &one_remote, &remote_key);
@@ -9935,10 +9948,13 @@ mod tests {
         let (forced, _co3, _l3, _c3) =
             auth_task_fixture_reusing(&owner, &channel_one.local_contribution());
         let forced_capability =
-            drive_exchange_with_signature(&forced, &one_remote, &one_remote_sig).expect(
-                "with identical certificates and identical contributions the replayed proof is \
-                 genuinely valid, and the task cannot tell where it was signed",
-            );
+            drive_exchange_with_signature(&forced, &one_remote, &one_remote_sig)
+                .expect(
+                    "with identical certificates and identical contributions the replayed proof \
+                     is genuinely valid, and the task cannot tell where it was signed",
+                )
+                .into_promoted()
+                .expect("the replayed proof genuinely promotes this third channel");
 
         // Two distinct mechanisms carry this, and they must not be conflated:
         //
@@ -9989,7 +10005,10 @@ mod tests {
         task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
     ) -> crate::endpoint_auth::AuthenticatedChannelCapability {
         let (remote_key, _remote_id) = auth_key(2);
-        drive_exchange(task, &peer_draw(), &remote_key).expect("the fixture proof promotes")
+        drive_exchange(task, &peer_draw(), &remote_key)
+            .expect("the fixture proof promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability")
     }
 
     /// Peer state that legacy policy would call admitted.
@@ -10136,7 +10155,10 @@ mod tests {
             Arc::clone(&close_owner),
         )));
         let (remote_key, _remote_id) = auth_key(2);
-        let promoted = drive_exchange(&task, &peer_draw(), &remote_key).expect("promotes");
+        let promoted = drive_exchange(&task, &peer_draw(), &remote_key)
+            .expect("promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
         assert_eq!(
             owner.report().active_candidates,
             1,

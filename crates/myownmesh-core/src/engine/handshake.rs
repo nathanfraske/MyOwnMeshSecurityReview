@@ -474,35 +474,56 @@ pub async fn on_auth_response(
     // nothing else. There is no fingerprint fetch, no transcript assembly, and
     // no signing here.
     let capability = match auth_task.accept_peer_proof(&resp.signature) {
-        Ok(capability) => capability,
-        // A retransmission that arrived after promotion completed. Each
-        // connector has a single event-pump task that awaits one event before
-        // taking the next, so frames on one channel are handled sequentially —
-        // this is a *sequential* retransmission, not a concurrent one, and by
-        // the time it runs the install has already happened.
+        // Unboxed here and nowhere else. The box is a size decision on the
+        // outcome enum, not a change of custody: what install receives below is
+        // the exact capability the promotion built.
+        Ok(crate::endpoint_auth::PeerProofAcceptance::Promoted(capability)) => *capability,
+        // A retransmission arriving at a task that has already promoted, stated
+        // by the task rather than inferred from a terminal cause it never took.
         //
-        // This check deliberately does not claim to close a concurrent window.
-        // If two callers could ever run promotion against one task in parallel,
-        // the loser could observe `ChannelNotCurrent` while the winner had taken
-        // the handoff but not yet installed, and would fail closed rather than
-        // being recognised as a duplicate. Making that safe needs promotion and
-        // install to be one atomic step, not a wider read-back here.
+        // What it states is exactly one thing: this *task* moved its channel out
+        // already. It is a lifecycle fact and nothing more. It does **not** say
+        // the replayed signature verified — once the handoff is gone there is
+        // nothing left to verify it against, and the frame's bytes are never
+        // examined — and it does **not** say the capability that promotion
+        // issued was ever installed.
         //
-        // The variant matched here is why the conflict cause is separate. This
-        // arm turns one cause into "benign duplicate, do nothing". A task that a
-        // conflicting contribution retired answers with
-        // `ConflictingPeerContribution`, so it cannot reach this arm at all and
-        // falls to the refusal below — a peer that sent a second, different
-        // contribution can never present the result to this guard as a
-        // retransmission of its first.
-        Err(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent)
+        // So installation is still corroborated here, and this arm fails closed
+        // without it. The caller that wins promotion can move the capability and
+        // then fail to install it; treating every `AlreadyPromoted` as benign
+        // would leave that peer alive and unauthenticated, which is precisely
+        // what the old `Err(ChannelNotCurrent)` shape avoided by falling through
+        // to the drop below. Only the corroborated case is benign.
+        //
+        // The ordinary sequential retransmission never reaches this arm: it is
+        // absorbed by the `has_authenticated_channel` guard above, before any
+        // task work at all. What the typed outcome buys is the concurrent case —
+        // a caller that loses a race to promote is *told* it lost, instead of
+        // reading a terminal currentness cause it must then disambiguate.
+        //
+        // This arm is also why the conflict cause is separate. A task that a
+        // conflicting contribution retired is terminal and answers
+        // `Err(ConflictingPeerContribution)`, so it cannot reach this arm at all
+        // and falls to the refusal below — a peer that sent a second, different
+        // contribution can never present the result here as a retransmission of
+        // its first.
+        Ok(crate::endpoint_auth::PeerProofAcceptance::AlreadyPromoted) => {
             if state.peers.get_if_current(owner).is_some_and(|peer| {
                 peer.has_authenticated_channel() && peer.endpoint_auth_is_current(&auth_task)
-            }) =>
-        {
-            debug!(peer = %device_id, "duplicate auth_response after promotion completed");
+            }) {
+                debug!(peer = %device_id, "duplicate auth_response after promotion completed");
+                return;
+            }
+            warn!(
+                peer = %device_id,
+                "endpoint-auth task already promoted with no authenticated channel installed for it — dropping"
+            );
+            super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
             return;
         }
+        // Every remaining outcome is terminal for the attempt: the task recorded
+        // this cause and retired itself, so there is nothing left to fall back
+        // to and the peer goes with it.
         Err(error) => {
             warn!(peer = %device_id, "endpoint authentication refused: {error:?}");
             super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
@@ -811,11 +832,127 @@ mod tests {
         }
     }
 
+    /// A registry peer whose endpoint-auth task has promoted and whose
+    /// capability was **not** installed.
+    ///
+    /// Built against `state.network_id` and the peer's own Device ID, so the
+    /// handler's context check passes and the control reaches the outcome under
+    /// test rather than stopping at an earlier refusal. The capability the
+    /// promotion issues is deliberately dropped: that is the whole scenario —
+    /// a caller that won promotion, moved the channel out, and then failed to
+    /// install what it was handed.
+    fn promoted_peer_without_an_installed_channel(
+        state: &Arc<NetworkState>,
+    ) -> (
+        PeerOwnerToken,
+        Arc<crate::endpoint_auth::EndpointAuthTask>,
+        String,
+    ) {
+        fn device_id(key: &ed25519_dalek::SigningKey) -> String {
+            data_encoding::BASE32_NOPAD
+                .encode(key.verifying_key().as_bytes())
+                .to_lowercase()
+        }
+
+        let local_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let peer_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let remote_id = device_id(&peer_key);
+        let context = crate::endpoint_auth::EndpointAuthContext::new(
+            &state.network_id,
+            &device_id(&local_key),
+            &remote_id,
+            crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
+                "arc04g-local-fp",
+                "arc04g-remote-fp",
+            )
+            .expect("both fixture components present"),
+        )
+        .expect("non-empty fixture identifiers");
+        let task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+            context,
+            crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
+            crate::endpoint_auth::LocalIdentitySigner::for_identity(Arc::new(
+                crate::identity::Identity::from_signing_key(local_key, "arc04g-fixture"),
+            )),
+        ));
+
+        // Drive the exchange to `Promoted`, then drop the capability on the
+        // floor. Nothing installs it.
+        let peer_contribution = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("a generated draw is canonical");
+        task.accept_peer_hello(peer_contribution.clone())
+            .expect("the first contribution binds");
+        let promoted = task
+            .accept_peer_proof(&crate::endpoint_auth::peer_proof_for_test(
+                &task,
+                &peer_contribution,
+                &peer_key,
+            ))
+            .expect("the fixture proof promotes");
+        assert!(
+            matches!(
+                promoted,
+                crate::endpoint_auth::PeerProofAcceptance::Promoted(_)
+            ),
+            "non-vacuity: the task really did promote"
+        );
+        drop(promoted);
+
+        super::super::install_peer(
+            &state.peers,
+            Arc::new(
+                crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+                    remote_id.clone(),
+                    Arc::clone(&task),
+                ),
+            ),
+        );
+        let owner = state.peers.owner(&remote_id).expect("installed peer owner");
+        (owner, task, remote_id)
+    }
+
+    #[tokio::test]
+    async fn v4_arc04g_already_promoted_without_an_installed_channel_drops() {
+        // The paired half of the entry guard below, and the reason the typed
+        // duplicate outcome is corroborated rather than trusted on its own.
+        //
+        // `PeerProofAcceptance::AlreadyPromoted` states one thing: the task moved
+        // its channel out. It does not state that the capability was installed,
+        // and it does not state that this frame's signature verified — the state
+        // is read before any verification, so the bytes below are never
+        // examined. A handler that read it as "benign duplicate, do nothing"
+        // would leave this peer alive and unauthenticated forever.
+        let state = crate::engine::build_test_state("arc04g-promoted-not-installed");
+        let (owner, task, device_id) = promoted_peer_without_an_installed_channel(&state);
+
+        // Non-vacuity: the entry guard cannot absorb this frame, because there
+        // is nothing installed for it to absorb it with, and the task is the
+        // entry's current one so the handler reaches the promotion outcome.
+        let peer = state.peers.get(&device_id).expect("peer is installed");
+        assert!(!peer.has_authenticated_channel());
+        assert!(peer.endpoint_auth_is_current(&task));
+
+        on_auth_response(&state, &owner, auth_response("bytes-nobody-verified")).await;
+
+        assert!(
+            state.peers.get_if_current(&owner).is_none(),
+            "a promoted task with no installed channel behind it must fail closed"
+        );
+    }
+
     #[tokio::test]
     async fn v4_arc04_duplicate_auth_response_after_promotion_is_idempotent() {
         // A retransmitted AuthResponse must not re-enter promotion. Before the
-        // idempotence guard it would find the handoff already consumed, return
-        // ChannelNotCurrent, and drop a peer whose proof was valid.
+        // idempotence guard it would find the handoff already consumed, be
+        // refused, and drop a peer whose proof was valid.
+        //
+        // This is the *entry* guard: an installed authenticated channel absorbs
+        // the duplicate before any task work happens, which is where every
+        // ordinary sequential retransmission is caught. Its paired half —
+        // a task that promoted with nothing installed behind it — is
+        // `v4_arc04g_already_promoted_without_an_installed_channel_drops`.
         let state = crate::engine::build_test_state("arc04-duplicate-auth-response");
         crate::engine::insert_session_less_peer(&state, "peer", None);
         let owner = state.peers.owner("peer").expect("installed peer owner");

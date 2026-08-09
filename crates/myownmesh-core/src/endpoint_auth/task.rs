@@ -43,10 +43,18 @@
 //!   a locked transition has not committed.
 //!
 //! Promotion is deliberately *not* one of those paths. A promoted task still
-//! belongs to its connector and still answers a retransmitted Hello from its
-//! cache; a second promotion is refused as a currentness failure without
-//! collapsing `Promoted` into `Terminal`, because the engine's duplicate
-//! `AuthResponse` guard depends on telling those two apart.
+//! belongs to its connector, still answers a retransmitted Hello from its
+//! cache, and still vouches for what it issued. A second promotion is not a
+//! refusal either: it is the closed non-error
+//! [`PeerProofAcceptance::AlreadyPromoted`], so `Promoted` never collapses into
+//! `Terminal` and nothing has to infer "benign duplicate" from a terminal cause.
+//!
+//! That is what makes the error type readable on its own. An
+//! [`EndpointAuthError`] out of this module — `ChannelNotCurrent` included —
+//! means the attempt was *terminalized*, by this call or by an earlier one. It
+//! never means "this call had nothing to do". A caller can therefore treat every
+//! `Err` as the end of the attempt without asking a second question of its own
+//! state to find out which sense was meant.
 
 use super::capability::{AuthenticatedBindingRecord, AuthenticatedChannelCapability};
 use super::context::EndpointAuthContext;
@@ -144,6 +152,91 @@ impl AcceptedPeerHello {
     pub(crate) fn proof(&self) -> &EndpointAuthProof {
         match self {
             Self::FirstBinding(proof) | Self::ExactDuplicate(proof) => proof,
+        }
+    }
+}
+
+/// What became of an attempt handed a peer proof.
+///
+/// The counterpart to [`AcceptedPeerHello`] on the second frame, and closed for
+/// the same reason: the classification is the task's answer, not something the
+/// engine infers. Both variants describe an attempt that is **alive** —
+/// `Err(EndpointAuthError)` is reserved for an attempt this call terminalized or
+/// found already terminal — so a caller can read the two apart without consulting
+/// its own state.
+///
+/// Named for the *attempt's* outcome rather than the proof's. Only
+/// [`Self::Promoted`] means a proof was verified;
+/// [`Self::AlreadyPromoted`] is reached before any verification and says nothing
+/// about the bytes that produced it. A name like "accepted proof" would assert
+/// across both variants what only one of them holds.
+///
+/// A second promotion used to be reported as
+/// [`EndpointAuthError::ChannelNotCurrent`]. That made a live, intact, still
+/// promoted task claim a terminal cause it never took, and it forced the engine
+/// to read a terminal cause and then work out from its own state which of the
+/// two senses was meant — the exact inference the task exists to remove.
+///
+/// It replaces that inference; it does not remove every question. The lifecycle
+/// fact is decided here, so a caller that loses a race to promote is *told* it
+/// lost. What became of the one capability is still the promoting caller's
+/// business, so a consumer that needs it installed must corroborate that
+/// separately — see [`Self::AlreadyPromoted`].
+///
+/// [`Self::AlreadyPromoted`] deliberately carries nothing. There is exactly one
+/// capability per attempt and it went to whoever promoted; handing it out again
+/// here — or lending a reference to it — would give a second caller authority
+/// over a channel it did not promote.
+pub(crate) enum PeerProofAcceptance {
+    /// This call verified the peer's half and moved the channel out. The one
+    /// capability this attempt will ever issue.
+    ///
+    /// Boxed purely for size. The capability carries the whole binding record
+    /// and is the larger part of this enum by two orders of magnitude, so
+    /// inlining it would make every `AlreadyPromoted` — the common outcome on a
+    /// retransmission — cost the same as a promotion. Nothing about the
+    /// indirection is semantic: the box is opened at the single production
+    /// consumer, which receives exactly the capability
+    /// [`AuthenticatedChannelCapability::from_verified_exchange`] built, and no
+    /// caller can observe the difference.
+    Promoted(Box<AuthenticatedChannelCapability>),
+    /// This attempt had already promoted: there was no channel left to move.
+    ///
+    /// **Non-terminal.** The task stays `Promoted`, keeps belonging to its
+    /// connector, keeps answering a retransmitted Hello from its cache, and
+    /// keeps vouching for what it issued.
+    ///
+    /// A lifecycle statement and nothing more, and a caller must not read more
+    /// into it. In particular it does **not** say:
+    ///
+    /// - **That the supplied proof is valid.** The state is read before any
+    ///   verification, and a promoted attempt has no handoff left to promote
+    ///   even if it were, so `peer_signature` is never examined on this path.
+    ///   Any bytes at all produce this outcome.
+    /// - **That the capability was installed.** Promotion issues the capability
+    ///   to whoever promoted; what that caller then did with it is outside this
+    ///   task. A consumer that needs installation to have happened has to
+    ///   corroborate it against its own state, and fail closed when it cannot —
+    ///   otherwise a promotion that moved the channel and then failed to install
+    ///   would be indistinguishable here from one that completed.
+    AlreadyPromoted,
+}
+
+#[cfg(test)]
+impl PeerProofAcceptance {
+    /// The capability, if this outcome was the promotion that issued it.
+    ///
+    /// **Controls only.** Production matches the closed set exhaustively, which
+    /// is the whole point of the type: the duplicate arm has to be handled, not
+    /// unwrapped away.
+    ///
+    /// Hands back the capability itself, not the box it travelled in. The
+    /// indirection is a size decision on the enum and has no bearing on what a
+    /// control is asserting about, so it stops here.
+    pub(crate) fn into_promoted(self) -> Option<AuthenticatedChannelCapability> {
+        match self {
+            Self::Promoted(capability) => Some(*capability),
+            Self::AlreadyPromoted => None,
         }
     }
 }
@@ -608,16 +701,24 @@ impl EndpointAuthTask {
     /// travels with the promotion. Refusal is terminal and releases the channel
     /// through the same owner path.
     ///
-    /// Every `ChannelNotCurrent` below is a genuine currentness refusal: the
-    /// channel claim is not there to promote, because promotion already
-    /// happened or the handoff is already gone. A terminal task answers with
-    /// the cause it recorded instead — so an attempt that a conflicting
-    /// contribution retired reports that conflict here, not a currentness
-    /// failure it never had.
+    /// **`Err` means terminalized.** Every error returned here is either the
+    /// cause a terminal attempt already recorded or one this call just recorded
+    /// through [`Self::terminalize`], so a caller can read any `Err` as "this
+    /// attempt is over" without asking a second question. A second promotion is
+    /// not one of them: it is the non-error
+    /// [`PeerProofAcceptance::AlreadyPromoted`], because the attempt behind it is
+    /// intact.
+    ///
+    /// Every `ChannelNotCurrent` below is therefore a genuine currentness
+    /// refusal *and* a terminal transition: the channel claim is not there to
+    /// promote and the attempt is ended here. A terminal task answers with the
+    /// cause it recorded instead — so an attempt that a conflicting contribution
+    /// retired reports that conflict here, not a currentness failure it never
+    /// had.
     pub(crate) fn accept_peer_proof(
         &self,
         peer_signature: &str,
-    ) -> Result<AuthenticatedChannelCapability, EndpointAuthError> {
+    ) -> Result<PeerProofAcceptance, EndpointAuthError> {
         let mut exchange = self.lock();
         // The same state read, under the same lock, before any verification and
         // long before the handoff moves. A terminal attempt — retirement
@@ -629,13 +730,15 @@ impl EndpointAuthTask {
             } => Some((peer_contribution.clone(), local_proof.clone())),
             ExchangeState::Terminal(error) => return Err(*error),
             // One promotion per attempt: the channel has already moved. This is
-            // deliberately *not* a terminal transition. `Promoted` has to stay
-            // distinct from `Terminal`, because the engine's duplicate
-            // `AuthResponse` guard treats this exact cause from a promoted task
-            // as a benign retransmission — and because a promoted task must go
-            // on answering a retransmitted Hello from its cache and go on
-            // vouching for what it issued.
-            ExchangeState::Promoted { .. } => return Err(EndpointAuthError::ChannelNotCurrent),
+            // deliberately *not* a terminal transition, and deliberately not an
+            // error. `Promoted` stays distinct from `Terminal` — the attempt
+            // goes on belonging to its connector, answering a retransmitted
+            // Hello from its cache, and vouching for what it issued — so the
+            // outcome is stated as the closed non-error rather than borrowed
+            // from `EndpointAuthError`. Reporting it as `ChannelNotCurrent` made
+            // an intact task claim a terminal cause it never took, and left the
+            // caller to re-derive "benign duplicate" from its own state.
+            ExchangeState::Promoted { .. } => return Ok(PeerProofAcceptance::AlreadyPromoted),
             ExchangeState::AwaitingPeerContribution => None,
         };
         // A proof for an attempt that has bound nothing is terminal, not merely
@@ -703,9 +806,9 @@ impl EndpointAuthTask {
                 runtime: record.runtime().clone(),
             },
         };
-        Ok(AuthenticatedChannelCapability::from_verified_exchange(
-            record, handoff,
-        ))
+        Ok(PeerProofAcceptance::Promoted(Box::new(
+            AuthenticatedChannelCapability::from_verified_exchange(record, handoff),
+        )))
     }
 
     /// The typed terminal error this task holds, if it has one.
@@ -992,7 +1095,9 @@ mod tests {
         let capability = fixture
             .task
             .accept_peer_proof(&fixture.peer_proof(&peer))
-            .expect("a complete mutual proof promotes");
+            .expect("a complete mutual proof promotes")
+            .into_promoted()
+            .expect("the first proof is the promotion that issues the capability");
 
         assert!(capability.belongs_to(fixture.task.incarnation()));
         assert!(fixture.task.issued(&capability));
@@ -1328,11 +1433,12 @@ mod tests {
         // retransmission of the value that *was* bound — and a later proof both
         // answer with the cause that actually refused the attempt.
         //
-        // The proof half is load-bearing beyond bookkeeping: `on_auth_response`
-        // treats a `ChannelNotCurrent` from a promoted task as a benign
-        // duplicate. If a conflicted task answered with that same cause, a
-        // conflict could present itself to that guard as a retransmission, so
-        // the two must be distinguishable at this boundary.
+        // The proof half is load-bearing beyond bookkeeping. `on_auth_response`
+        // has one arm that does not tear the peer down, and it is reached by an
+        // *outcome*, not by a cause: a conflicted attempt is terminal, so it can
+        // only ever answer `Err` here. Answering with a cause a live attempt
+        // could also take would put the two one refactor apart; keeping the
+        // conflict's own cause keeps them separable at this boundary.
         let fixture = fixture();
         let bound = peer_draw();
         fixture
@@ -1397,12 +1503,15 @@ mod tests {
         let capability = fixture
             .task
             .accept_peer_proof(&fixture.peer_proof(&peer))
-            .expect("promotes");
+            .expect("promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
 
         // Promotion does not change what a conflict is. The bound pair survives
         // promotion, so a second, different contribution is still a conflict
-        // here and still carries the conflict's own cause — not the currentness
-        // cause that a *second promotion* of this same task would take.
+        // here and still carries the conflict's own cause — and still ends the
+        // attempt, which is what separates it from a *second promotion* of this
+        // same task, an outcome that is no error at all.
         assert_eq!(
             fixture.task.accept_peer_hello(peer_draw()),
             Err(EndpointAuthError::ConflictingPeerContribution)
@@ -1415,21 +1524,134 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc04_duplicate_auth_response_after_promotion_is_refused() {
-        // Migrated retry control: one attempt promotes exactly once. This is a
-        // genuine currentness refusal — the channel claim has already moved —
-        // and is the reserved meaning of `ChannelNotCurrent`, kept distinct
-        // from the conflict cause asserted by its neighbours above.
+    fn v4_arc04g_second_promotion_is_benign_and_leaves_the_attempt_promoted() {
+        // Migrated retry control, corrected: one attempt promotes exactly once,
+        // but a second promotion is not a *refusal*. Nothing about this attempt
+        // went stale — it is bound, promoted, still its connector's, and still
+        // vouching for what it issued — so it answers with the closed non-error
+        // outcome instead of borrowing a terminal cause it never took.
+        //
+        // The paired half is
+        // `v4_arc04g_a_currentness_refusal_is_terminal_where_a_duplicate_is_not`,
+        // which drives the same frame against an attempt that genuinely is not
+        // current and asserts every fact this one denies.
         let fixture = fixture();
         let peer = peer_draw();
         fixture.task.accept_peer_hello(peer.clone()).expect("binds");
         let proof = fixture.peer_proof(&peer);
-        fixture.task.accept_peer_proof(&proof).expect("promotes");
+        let capability = fixture
+            .task
+            .accept_peer_proof(&proof)
+            .expect("promotes")
+            .into_promoted()
+            .expect("the first proof is the promotion that issues the capability");
 
+        let again = fixture
+            .task
+            .accept_peer_proof(&proof)
+            .expect("a second promotion is not an error");
+
+        assert!(
+            matches!(again, PeerProofAcceptance::AlreadyPromoted),
+            "the second proof issues no capability of its own"
+        );
+        // Non-terminal, stated rather than implied: the whole point of the
+        // separate outcome is that none of these four flips.
+        assert_eq!(
+            fixture.task.terminal_error(),
+            None,
+            "a second promotion terminalizes nothing"
+        );
+        assert!(!fixture.task.is_retired());
+        assert!(fixture.task.belongs_to(fixture.task.incarnation()));
+        assert!(
+            fixture.task.issued(&capability),
+            "and the attempt goes on vouching for the one capability it issued"
+        );
+        // The benign duplicate semantics on the other frame survive alongside
+        // it, and neither counter moves for either duplicate.
         assert!(matches!(
-            fixture.task.accept_peer_proof(&proof),
-            Err(EndpointAuthError::ChannelNotCurrent)
+            fixture.task.accept_peer_hello(peer).expect("still cached"),
+            AcceptedPeerHello::ExactDuplicate(_)
         ));
+        assert_eq!(fixture.task.draw_count(), 1);
+        assert_eq!(fixture.task.signature_count(), 1);
+    }
+
+    #[test]
+    fn v4_arc04g_a_currentness_refusal_is_terminal_where_a_duplicate_is_not() {
+        // The other half of the split. `ChannelNotCurrent` keeps its reserved
+        // meaning — the channel really is gone — and it is terminal in every
+        // sense the duplicate above is not. Both halves drive the *same* proof
+        // bytes against the *same* promoted attempt, so the only thing that
+        // differs is whether the attempt is still current: the outcome cannot be
+        // an artefact of the frame.
+        let (task, peer_key, retained) = counted_task();
+        let peer = peer_draw();
+        task.accept_peer_hello(peer.clone()).expect("binds");
+        let proof = peer_proof_for_test(&task, &peer, &peer_key);
+        let capability = task
+            .accept_peer_proof(&proof)
+            .expect("the fixture proof promotes")
+            .into_promoted()
+            .expect("the promotion issues the one capability");
+
+        // Non-vacuity: while the attempt is merely promoted, this exact frame is
+        // the benign duplicate and nothing about the attempt has changed.
+        assert!(matches!(
+            task.accept_peer_proof(&proof)
+                .expect("a second promotion is not an error"),
+            PeerProofAcceptance::AlreadyPromoted
+        ));
+        assert_eq!(task.terminal_error(), None);
+        assert!(task.belongs_to(task.incarnation()));
+        assert!(task.issued(&capability));
+        assert_eq!(
+            retained(),
+            0,
+            "and the channel claim is still out with the capability"
+        );
+
+        task.retire();
+
+        assert_eq!(
+            task.accept_peer_proof(&proof).err(),
+            Some(EndpointAuthError::ChannelNotCurrent),
+            "the same frame on a retired attempt is a refusal, not a duplicate"
+        );
+        assert_eq!(
+            task.terminal_error(),
+            Some(EndpointAuthError::ChannelNotCurrent),
+            "and the attempt records it as the cause that ended it"
+        );
+        assert!(task.is_retired());
+        assert!(
+            !task.belongs_to(task.incarnation()),
+            "a retired attempt belongs to no connector"
+        );
+        assert!(
+            !task.issued(&capability),
+            "and vouches for nothing, not even the capability it issued"
+        );
+
+        let entry = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "arc04g-currentness-refusal".to_string(),
+            Arc::clone(&task),
+        );
+
+        assert!(
+            !entry.install_authenticated_channel(&task, capability),
+            "so the real install refuses even the capability this task issued"
+        );
+        assert!(
+            !entry.has_authenticated_channel(),
+            "and no authority is installed by the refusal"
+        );
+        assert_eq!(
+            retained(),
+            1,
+            "the refused capability hands the channel claim back exactly once"
+        );
     }
 
     #[test]
@@ -1452,7 +1674,9 @@ mod tests {
         let mine = fixture
             .task
             .accept_peer_proof(&fixture.peer_proof(&peer))
-            .expect("promotes");
+            .expect("promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
         let foreign = super::super::authenticated_for_test(crate::runtime::runtime_for_test());
 
         assert!(fixture.task.issued(&mine));
@@ -1768,7 +1992,9 @@ mod tests {
             task.accept_peer_hello(peer.clone()).expect("binds");
             let capability = task
                 .accept_peer_proof(&peer_proof_for_test(&task, &peer, &peer_key))
-                .expect("the fixture proof promotes");
+                .expect("the fixture proof promotes")
+                .into_promoted()
+                .expect("the promotion issues the capability");
             let entry = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
                 "arc04f-install-positive".to_string(),
                 Arc::clone(&task),
@@ -1805,7 +2031,9 @@ mod tests {
         let capability = promoting
             .join()
             .expect("the promoting thread completes")
-            .expect("the promotion that holds the lock completes");
+            .expect("the promotion that holds the lock completes")
+            .into_promoted()
+            .expect("the winning promotion issues the capability");
         retiring.join().expect("the retiring thread completes");
 
         // The capability is real and names this exact channel: promotion did

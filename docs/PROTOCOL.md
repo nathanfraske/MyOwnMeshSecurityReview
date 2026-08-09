@@ -343,9 +343,30 @@ state first — and that operation refuses before signing or promoting
 anything — or it waits, and the operation it lost to has completed
 before the retirement is observable at all. Successful promotion is
 deliberately *not* one of these terminal endings: a promoted attempt
-still belongs to its connector and still answers a retransmitted
-`hello` from its cache, which is what lets a duplicate `auth_response`
-be recognised as a benign retransmission rather than a failure.
+still belongs to its connector, still answers a retransmitted `hello`
+from its cache, and still vouches for what it issued.
+
+A second `auth_response` reaching an already-promoted attempt is
+therefore not a failure at all. It is a distinct non-error outcome, and
+it is deliberately not expressed as one of the failure causes, so that
+a refusal always means *this attempt is over* and never means "this
+frame had nothing to do". A receiver never has to consult its own state
+to work out which of the two senses a refusal carried.
+
+That outcome states exactly one thing: this attempt had already moved
+its channel out. It does **not** say the replayed signature verified —
+the attempt's state is read before any verification, and a promoted
+attempt has no channel left to promote in any case, so those bytes are
+never examined and any bytes at all produce the same outcome. It also
+does **not** say the authenticated channel was ever installed:
+promotion hands the authenticated capability to whichever caller won
+the promotion, and what that caller then did with it is outside the
+attempt. The receiver therefore corroborates, against its own state,
+that an authenticated channel really is installed for this exact
+attempt, and drops the peer when it cannot. A promotion that moved the
+channel out and then failed to install what it was handed must not be
+indistinguishable from one that completed, or it would leave a peer
+alive and unauthenticated.
 
 ### RPC response binding
 
@@ -375,11 +396,31 @@ authorizes running a local handler rather than resolving a call the
 local caller is already waiting on.
 
 Request ids are drawn locally and are never reused to displace an
-in-flight operation. If a freshly drawn id is already owned, the call
-draws again rather than overwrite; if it cannot find an unused id it
-fails locally and is never sent. Displacing the owner would strand that
-caller on a reply that can never arrive and hand its answer to the
-wrong receiver.
+in-flight operation. A call draws exactly one id and claims it in a
+single step. If that id is already owned the call fails locally and is
+never sent, rather than overwriting: displacing the owner would strand
+that caller on a reply that can never arrive and hand its answer to the
+wrong receiver. There is no redraw, no retry and no attempt counter.
+The collision is handled explicitly rather than assumed away: at 96
+bits of entropy per draw it is negligibly unlikely, not impossible, so
+it gets a named local failure and the call is not sent. What a bounded
+redraw bought was nothing — "never displace" is total either way — and
+what it cost was clarity, because a loop reads as a policy that will
+eventually take the id when the honest answer is that it will not try.
+
+Withdrawal is by identity, not by binding. When an outbound send fails,
+the call withdraws its own pending entry, and the entry it removes is
+the *exact* one it filed — named by a process-local identity that is
+never serialized, never sent, never derived from anything a peer
+supplies, and never consulted by any inbound path. The device-and-class
+binding above is the right test for an inbound frame, which cannot know
+an identity and must not have to, and the wrong test here: it describes
+a *class* of operations rather than one. A withdrawal that ran late —
+after its own entry had already been settled by a response that raced
+the failing send, and after the id had been redrawn by a fresh call to
+the same device in the same class — would match that newcomer on every
+coordinate and remove a live operation, leaving its caller waiting on a
+reply no inbound frame could reach.
 
 ---
 

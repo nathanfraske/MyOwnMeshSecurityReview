@@ -303,6 +303,59 @@ jobs:
             run_exact_control "$control"
           done
 
+          # Arc 04 G1: a local withdrawal names one entry, not a class of
+          # them. F2 above bound the *inbound* settle to a device and a
+          # response class; those two coordinates describe a class of
+          # operations, and a caller abandoning its own failed send needs to
+          # reach exactly one. Matching on the binding meant a stale
+          # abandonment — one whose own entry had already been settled by a
+          # response that raced the failing send — removed whatever now held
+          # the recycled id, if that newcomer was to the same device in the
+          # same class. The withdrawal is now conditional on a private
+          # process-local identity instead.
+          #
+          # The positive runs first and is load-bearing in the strongest
+          # sense available here: an identity predicate that matched nothing
+          # at all would satisfy the negative below perfectly, and would also
+          # leave every failed call pending forever. Only the positive rules
+          # that out.
+          for control in \
+            v4_arc04g1_abandonment_withdraws_the_operation_that_filed_it \
+            v4_arc04g1_a_stale_abandonment_never_removes_the_reinstalled_owner_of_a_recycled_id
+          do
+            run_exact_control "$control"
+          done
+
+          # Arc 04 G2: a second promotion is a typed non-error outcome, not a
+          # borrowed terminal cause. It used to be reported as
+          # `ChannelNotCurrent`, which made a live, intact, still-promoted
+          # task claim a terminal cause it never took and forced the engine to
+          # re-derive "benign duplicate" from its own state.
+          #
+          # Ordered so that each later control is measured against a path that
+          # demonstrably works. The first two are the positives: the task
+          # answers a second promotion without terminalizing anything, and the
+          # engine really does absorb a corroborated duplicate rather than
+          # dropping. `v4_arc04_duplicate_auth_response_after_promotion_is_idempotent`
+          # is a pre-existing control, named here for the first time because
+          # the fail-closed control below needs it: without a case where this
+          # handler does *not* drop, "already promoted with nothing installed
+          # drops" passes just as well for a handler that drops every
+          # duplicate it ever sees. The third holds `ChannelNotCurrent` to its
+          # reserved meaning — driving the same proof bytes at the same task,
+          # so the split cannot be an artefact of the frame — and the fourth
+          # is the fail-closed half: `AlreadyPromoted` states a lifecycle fact
+          # and neither that the replayed signature verified nor that the
+          # capability was installed, so an uncorroborated one drops the peer.
+          for control in \
+            v4_arc04g_second_promotion_is_benign_and_leaves_the_attempt_promoted \
+            v4_arc04_duplicate_auth_response_after_promotion_is_idempotent \
+            v4_arc04g_a_currentness_refusal_is_terminal_where_a_duplicate_is_not \
+            v4_arc04g_already_promoted_without_an_installed_channel_drops
+          do
+            run_exact_control "$control"
+          done
+
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |
           set -euo pipefail

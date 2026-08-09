@@ -1161,6 +1161,254 @@ def terminal_lifecycle_failures(task_source: str) -> list[str]:
                 "production build"
             )
 
+    failures.extend(proof_acceptance_failures(task_source))
+    return failures
+
+
+def proof_acceptance_failures(task_source: str) -> list[str]:
+    """Arc 04G2: `Err` means terminalized, and a duplicate is not an `Err`.
+
+    A second promotion used to be reported as
+    `EndpointAuthError::ChannelNotCurrent`. The attempt behind it is alive —
+    bound, promoted, still its connector's, still answering a retransmitted
+    Hello from its cache and still vouching for what it issued — so that made an
+    intact task claim a terminal cause it never took, and it left every caller
+    to work out from its own state which of the two senses the cause carried.
+    The repair states the outcome in the task's own closed type, so
+    `EndpointAuthError` regains a single meaning: the attempt is over.
+
+    Three properties carry that, and all three are counts rather than paths, so
+    no control can stand in for them. The outcome type is closed at exactly two
+    variants; every error the promotion path returns is a terminal one; and the
+    engine treats the duplicate outcome as a lifecycle fact only, corroborating
+    installation itself and failing closed when it cannot.
+    """
+
+    failures: list[str] = []
+    endpoint_auth_source = (CORE / "src" / "endpoint_auth" / "mod.rs").read_text(
+        encoding="utf-8"
+    )
+    handshake_source = (CORE / "src" / "engine" / "handshake.rs").read_text(
+        encoding="utf-8"
+    )
+
+    # Closed at exactly two variants, and the duplicate one carries nothing.
+    # There is one capability per attempt and it went to whoever promoted;
+    # handing it out again here — or lending a reference to it — would give a
+    # second caller authority over a channel it did not promote.
+    #
+    # The `Box` on the promoted payload is pinned as part of that exact closure
+    # and for no other reason. It is size-only and carries no meaning: the
+    # capability is by far the larger part of the enum, so inlining it would
+    # make every `AlreadyPromoted` — the common outcome on a retransmission —
+    # cost a promotion, and the box is opened at the single production consumer,
+    # which receives exactly what `from_verified_exchange` built. Nothing here
+    # should be read as a claim that the indirection is a boundary. What this
+    # comparison guards is the closure and the payload-free duplicate; matching
+    # the payload text exactly is how that is expressed, and it means a later
+    # unboxing has to come back through this guard rather than slip past it.
+    acceptance_enum = re.search(
+        r"pub\(crate\) enum PeerProofAcceptance \{(?P<body>.*?)\n\}",
+        task_source,
+        flags=re.DOTALL,
+    )
+    if acceptance_enum is None:
+        failures.append(
+            "the closed PeerProofAcceptance outcome is missing from "
+            "endpoint_auth/task.rs; without it a second promotion has to borrow a "
+            "cause from EndpointAuthError, and every `Err` stops meaning `terminal`"
+        )
+    else:
+        variants = [
+            line.strip().rstrip(",")
+            for line in acceptance_enum.group("body").splitlines()
+            if line.strip() and not line.strip().startswith("//")
+        ]
+        if variants != [
+            "Promoted(Box<AuthenticatedChannelCapability>)",
+            "AlreadyPromoted",
+        ]:
+            failures.append(
+                "PeerProofAcceptance must expose exactly "
+                "`Promoted(Box<AuthenticatedChannelCapability>)` and a payload-free "
+                f"`AlreadyPromoted`, found {variants!r}; a payload on the duplicate "
+                "arm would hand a second caller the one capability the promoting "
+                "caller already holds, a third variant would put a state back that "
+                "callers have to disambiguate, and the box is size-only — dropping "
+                "it is not a security change, but it is a change to the exact shape "
+                "this guard pins and has to be made deliberately"
+            )
+
+    # Crate-internal, exactly as the error it replaces part of. A public outcome
+    # type would put the task's lifecycle answer on the downstream surface.
+    if not re.search(
+        r"pub\(crate\) use task::\{[^}]*\bPeerProofAcceptance\b", endpoint_auth_source, re.DOTALL
+    ):
+        failures.append(
+            "PeerProofAcceptance is not re-exported `pub(crate)` from "
+            "endpoint_auth/mod.rs; the promotion outcome is the engine's to read and "
+            "no embedder's"
+        )
+
+    # The controls-only unwrap. Production matches the closed set exhaustively,
+    # which is the whole point of the type: the duplicate arm has to be handled,
+    # not unwrapped away.
+    if not cfg_test_gated(task_source, r"fn into_promoted\b", "#[cfg(test)]"):
+        failures.append(
+            "PeerProofAcceptance::into_promoted is not gated on `#[cfg(test)]` in "
+            "endpoint_auth/task.rs; in a production build it would let a caller drop "
+            "the duplicate arm on the floor instead of handling it"
+        )
+
+    accept_body = fn_body(task_source, "pub(crate) fn accept_peer_proof")
+    if accept_body is None:
+        failures.append(
+            "EndpointAuthTask::accept_peer_proof is missing or reshaped in "
+            "endpoint_auth/task.rs, so its outcome shape cannot be checked"
+        )
+    else:
+        if not re.search(
+            r"\)\s*->\s*Result<PeerProofAcceptance, EndpointAuthError>", accept_body
+        ):
+            failures.append(
+                "accept_peer_proof must answer "
+                "`Result<PeerProofAcceptance, EndpointAuthError>`; returning the "
+                "capability directly is what forced a live duplicate to be reported "
+                "as a terminal error"
+            )
+        # The promoted arm: a non-error outcome, read under the same lock and
+        # before any verification. It must not terminalize and must not borrow a
+        # cause.
+        promoted_arm = re.search(
+            r"ExchangeState::Promoted \{ \.\. \} =>\s*(?P<answer>[^\n]*)", accept_body
+        )
+        if promoted_arm is None:
+            failures.append(
+                "the `ExchangeState::Promoted` arm of accept_peer_proof is missing or "
+                "reshaped; a second promotion has to be answered explicitly, or it "
+                "falls through to a path that takes a handoff that is already gone"
+            )
+        elif "return Ok(PeerProofAcceptance::AlreadyPromoted)" not in promoted_arm.group(
+            "answer"
+        ):
+            failures.append(
+                "the `ExchangeState::Promoted` arm of accept_peer_proof does not "
+                "return `Ok(PeerProofAcceptance::AlreadyPromoted)`; a promoted "
+                "attempt is intact — it belongs to its connector, answers a "
+                "retransmitted Hello from its cache and vouches for what it issued — "
+                "so answering with an error makes it claim a terminal cause it never "
+                "took"
+            )
+        # Every error out of this path is terminal. Two forms are accepted and
+        # only two: the cause a terminal attempt already recorded, and one this
+        # call records through the single locked transition. A bare variant
+        # would be an error that terminalized nothing, which is precisely the
+        # "this call had nothing to do" sense the type no longer carries.
+        for returned in re.finditer(r"return Err\((?P<what>[^\n]*)", accept_body):
+            what = returned.group("what")
+            if not (
+                what.startswith("*error)") or what.startswith("self.terminalize(")
+            ):
+                failures.append(
+                    "accept_peer_proof returns `Err("
+                    f"{what.strip()}`, which is neither the cause a terminal attempt "
+                    "already recorded nor one recorded through `terminalize`; every "
+                    "`Err` from this path has to mean the attempt is over, or callers "
+                    "are back to consulting their own state to find out which sense "
+                    "was meant"
+                )
+        if re.search(r"Err\(EndpointAuthError::", accept_body):
+            failures.append(
+                "accept_peer_proof constructs an `EndpointAuthError` variant "
+                "directly; a cause that does not go through `terminalize` leaves the "
+                "attempt alive behind an error that says it is not"
+            )
+
+    # The engine half. `AlreadyPromoted` is a lifecycle fact and states neither
+    # that the replayed signature verified — the state is read before any
+    # verification, so the bytes are never examined — nor that the capability
+    # promotion issued was ever installed. A caller that won promotion can move
+    # the capability and then fail to install it, so this arm corroborates
+    # installation against the engine's own registry and fails closed without
+    # it. Treating every duplicate as benign would leave that peer alive and
+    # unauthenticated, which is the one thing the old `Err` shape got right.
+    on_auth_response = fn_body(handshake_source, "pub async fn on_auth_response(")
+    if on_auth_response is None:
+        failures.append(
+            "engine/handshake.rs::on_auth_response is missing or reshaped, so the "
+            "duplicate-promotion arm cannot be checked"
+        )
+    else:
+        if (
+            "Ok(crate::endpoint_auth::PeerProofAcceptance::Promoted(capability)) => *capability,"
+            not in on_auth_response
+        ):
+            failures.append(
+                "on_auth_response no longer takes the capability from "
+                "`PeerProofAcceptance::Promoted`; the promotion outcome must be "
+                "matched by name, so the duplicate arm cannot be reached by a "
+                "catch-all that assumes success"
+            )
+        duplicate_start = on_auth_response.find(
+            "Ok(crate::endpoint_auth::PeerProofAcceptance::AlreadyPromoted) => {"
+        )
+        terminal_start = on_auth_response.find("Err(error) => {", max(duplicate_start, 0))
+        if duplicate_start < 0 or terminal_start < 0:
+            failures.append(
+                "on_auth_response does not handle `PeerProofAcceptance::AlreadyPromoted` "
+                "ahead of a catch-all `Err(error)` arm; the duplicate has to be a "
+                "handled outcome and every error has to be terminal"
+            )
+        else:
+            duplicate_arm = on_auth_response[duplicate_start:terminal_start]
+            for corroboration, consequence in (
+                (
+                    "peer.has_authenticated_channel()",
+                    "a promotion that moved the channel out and then failed to "
+                    "install it would be indistinguishable from one that completed, "
+                    "and the peer would stay alive and unauthenticated",
+                ),
+                (
+                    "peer.endpoint_auth_is_current(&auth_task)",
+                    "an authenticated channel installed for some *other* attempt "
+                    "would vouch for this one",
+                ),
+                (
+                    "state.peers.get_if_current(owner)",
+                    "the corroboration would be read from an installation this "
+                    "handler was not admitted for",
+                ),
+            ):
+                if corroboration not in duplicate_arm:
+                    failures.append(
+                        f"the AlreadyPromoted arm of on_auth_response no longer checks "
+                        f"`{corroboration}`; without it {consequence}"
+                    )
+            if "&&" not in duplicate_arm:
+                failures.append(
+                    "the AlreadyPromoted arm of on_auth_response no longer requires "
+                    "both halves of the corroboration together; either one alone "
+                    "admits a duplicate the other would have refused"
+                )
+            if "drop_peer_if_current(state, owner, DropReason::AuthFailed)" not in duplicate_arm:
+                failures.append(
+                    "the AlreadyPromoted arm of on_auth_response does not fail closed; "
+                    "an uncorroborated duplicate must drop the peer, because the "
+                    "outcome states a lifecycle fact and says nothing about whether "
+                    "the replayed signature verified or the capability was installed"
+                )
+        # The whole point of the split: no error variant is special-cased as a
+        # benign duplicate any more. One that was would be reading a terminal
+        # cause and then re-deriving the non-terminal sense from local state.
+        if re.search(
+            r"Err\(crate::endpoint_auth::EndpointAuthError::", on_auth_response
+        ):
+            failures.append(
+                "on_auth_response matches a specific EndpointAuthError variant; every "
+                "error from the promotion path is terminal for the attempt, and "
+                "singling one out is the inference the typed outcome removed"
+            )
+
     return failures
 
 
@@ -1286,6 +1534,274 @@ def rpc_binding_failures(engine_source: str) -> list[str]:
             "engine/mod.rs reaches RpcInner::pending directly; every settle must go "
             "through one of the three bound operations"
         )
+
+    failures.extend(local_identity_failures(rpc_source))
+    return failures
+
+
+def local_identity_failures(rpc_source: str) -> list[str]:
+    """Arc 04G1: a local withdrawal names one entry, never a class of them.
+
+    F2 above bound the *inbound* settle to a device and a response class. Those
+    two coordinates describe a class of operations, which is exactly right for a
+    frame — a frame cannot know an identity and must not have to — and exactly
+    wrong for a local caller withdrawing its own failed send, which has to reach
+    one entry. Reusing the binding there left a gap: if this caller's own entry
+    had already left the map, settled by a response that raced the failing send,
+    and the id had since been redrawn by a fresh call to the same device in the
+    same class, every coordinate the predicate looked at matched the newcomer.
+    The stale abandonment removed a live operation and stranded its caller on a
+    oneshot no inbound frame could reach.
+
+    These guards are the counting half of the two controls. The controls drive
+    the recycled-id path and the ordinary withdrawal; only a count can say that
+    identity has not quietly acquired a second, weaker way to be compared, that
+    the inbound side has not started reading it, or that the single claim has
+    not grown a retry loop back.
+    """
+
+    failures: list[str] = []
+
+    # The identity type. A private newtype over an `Arc` of a private, unit
+    # (therefore zero-sized) marker: the allocation *is* the identity, so there
+    # is nothing in it to read, compare, or serialize.
+    if not re.search(
+        r"^struct PendingOpId\(Arc<PendingOpMarker>\);", rpc_source, re.MULTILINE
+    ):
+        failures.append(
+            "PendingOpId must stay a private newtype over `Arc<PendingOpMarker>` in "
+            "rpc.rs; a visibility qualifier would let another module mint or hold an "
+            "identity, and any other representation would make identity a value that "
+            "can be reproduced rather than an allocation that cannot"
+        )
+    if not re.search(r"^struct PendingOpMarker;", rpc_source, re.MULTILINE):
+        failures.append(
+            "PendingOpMarker must stay a private unit struct in rpc.rs; a marker that "
+            "carries a field is a value that can be compared, copied, or put on a "
+            "wire, and the identity is supposed to be the allocation and nothing else"
+        )
+
+    # Derived equality is the trap this type is built around: the pointee is
+    # zero-sized, so a derived `PartialEq` makes every identity equal to every
+    # other and a withdrawal matches any entry under the key — the exact defect
+    # G1 closes, reintroduced by one word in a derive list.
+    derive = re.search(
+        r"#\[derive\((?P<derives>[^)]*)\)\]\s*\nstruct PendingOpId\(", rpc_source
+    )
+    if derive is None:
+        failures.append(
+            "the derive list immediately above `struct PendingOpId` is missing or "
+            "reshaped in rpc.rs, so it cannot be checked for a derived equality"
+        )
+    else:
+        for forbidden in ("PartialEq", "Eq", "Hash", "PartialOrd", "Ord"):
+            if re.search(rf"\b{forbidden}\b", derive.group("derives")):
+                failures.append(
+                    f"PendingOpId derives {forbidden}; the marker it points at is "
+                    "zero-sized, so a derived comparison compares nothing and every "
+                    "identity matches every other — a withdrawal would then remove "
+                    "whatever holds the key, which is the defect this type exists to "
+                    "close"
+                )
+        for forbidden in ("Serialize", "Deserialize"):
+            if re.search(rf"\b{forbidden}\b", derive.group("derives")):
+                failures.append(
+                    f"PendingOpId derives {forbidden}; the identity is process-local "
+                    "and must never be representable on a wire, where a remote could "
+                    "supply one"
+                )
+    for hand_written in (
+        r"impl\s+PartialEq(?:<[^>]*>)?\s+for\s+PendingOpId\b",
+        r"impl\s+Eq\s+for\s+PendingOpId\b",
+    ):
+        if re.search(hand_written, rpc_source):
+            failures.append(
+                "PendingOpId has a hand-written equality impl in rpc.rs; identity is "
+                "decided by `Arc::ptr_eq` in `names` and nowhere else, so a second "
+                "way to compare two identities can only be a weaker one"
+            )
+
+    # `names` is that one decision, and it is pointer identity rather than any
+    # comparison of contents.
+    names_body = fn_body(rpc_source, "fn names(&self, other: &Self) -> bool")
+    if names_body is None:
+        failures.append(
+            "PendingOpId::names is missing or reshaped in rpc.rs; the sole identity "
+            "comparison cannot be checked"
+        )
+    else:
+        if "Arc::ptr_eq(&self.0, &other.0)" not in names_body:
+            failures.append(
+                "PendingOpId::names no longer decides identity with "
+                "`Arc::ptr_eq(&self.0, &other.0)`; anything that compares pointees "
+                "compares a zero-sized value and answers true for every pair"
+            )
+        if "==" in names_body:
+            failures.append(
+                "PendingOpId::names contains a value comparison; the whole point is "
+                "that two identities are the same exactly when they are the same live "
+                "allocation, which no `==` on this type can express"
+            )
+
+    # Both records carry the identity, under their own names. `PendingOp::id` is
+    # what the map holds; `LocalRequest::op_id` is the caller's copy of it, kept
+    # beside — never merged into — the routing key that goes on the wire.
+    if not re.search(r"^\s{4}id: PendingOpId,", rpc_source, re.MULTILINE):
+        failures.append(
+            "PendingOp no longer carries `id: PendingOpId`; without the identity on "
+            "the entry there is nothing for a withdrawal to match but the binding, "
+            "which names a class of operations rather than one"
+        )
+    if not re.search(r"^struct LocalRequest \{", rpc_source, re.MULTILINE):
+        failures.append(
+            "LocalRequest must stay a private struct in rpc.rs; it is the filed "
+            "operation as handed back to its own caller, and nothing else needs to "
+            "name it"
+        )
+    for field, declaration, consequence in (
+        (
+            "request_id",
+            r"^\s{4}request_id: String,",
+            "the routing key that goes on the wire",
+        ),
+        (
+            "op_id",
+            r"^\s{4}op_id: PendingOpId,",
+            "the identity that never does",
+        ),
+    ):
+        if not re.search(declaration, rpc_source, re.MULTILINE):
+            failures.append(
+                f"LocalRequest no longer carries `{field}`; it must keep both names "
+                f"apart — {consequence} — because the caller sends under one and "
+                "withdraws under the other"
+            )
+
+    # One draw, one claim, no retry. The bound this replaces read as a policy
+    # that would eventually take the id; the honest answer is that it will not
+    # try. Counted rather than asserted: a redraw is reintroduced by an
+    # ordinary-looking loop, and the difference is invisible to every control.
+    if "REQUEST_ID_ATTEMPTS" in rpc_source:
+        failures.append(
+            "rpc.rs still mentions REQUEST_ID_ATTEMPTS; the bounded redraw was "
+            "removed because a single claim that fails explicitly already makes "
+            "'never displace' total"
+        )
+    draws = len(re.findall(r"(?<!fn )\bnew_request_id\(", rpc_source))
+    if draws != 1:
+        failures.append(
+            f"rpc.rs draws a request id {draws} times outside its own definition; "
+            "exactly one call site is the invariant, and a second one is either a "
+            "redraw loop or a second registration path that can drift from this one"
+        )
+    for owner, signature in (
+        ("register_local_request", "fn register_local_request("),
+        ("insert_local_request", "pub(crate) fn insert_local_request("),
+    ):
+        body = fn_body(rpc_source, signature)
+        if body is None:
+            failures.append(f"RpcInner::{owner} is missing or reshaped in rpc.rs")
+            continue
+        for machinery, pattern in (
+            ("a loop", r"\b(?:for|while|loop)\b"),
+            ("an attempt counter", r"\battempts?\b"),
+            ("a generation", r"\bgeneration\b"),
+        ):
+            code = "\n".join(
+                line for line in body.splitlines() if not line.strip().startswith("//")
+            )
+            if re.search(pattern, code):
+                failures.append(
+                    f"RpcInner::{owner} contains {machinery}; the registration draws "
+                    "once and refuses, and anything that redraws or orders attempts "
+                    "is the retry policy this slice removed"
+                )
+    if not re.search(
+        r"self\.register_local_request\(expect_from, effect\)", rpc_source
+    ):
+        failures.append(
+            "insert_local_request no longer wraps `register_local_request`; a second "
+            "insertion path can drift from the one the engine's inbound controls "
+            "drive, and the controls would stop describing the real path"
+        )
+    # `insert_local_request` exists for controls and for nothing else. Its two
+    # callers in `rpc::tests` and its six in `engine::tests` are the whole set;
+    # no production path files an operation through it, because a production
+    # caller needs the identity back to withdraw its own failed send and this
+    # wrapper drops it. Under the workspace `-D warnings` gate an ungated
+    # crate-internal fn with no non-test caller is `dead_code`, so the normal
+    # lib build refuses it — which is the honest reading of what it is.
+    #
+    # Guarded fail-closed, and the gate is load-bearing rather than cosmetic:
+    # `pub(crate)` reaches every module in the crate, so an ungated wrapper is
+    # one a production path can start calling with nothing to notice, and the
+    # first sign would be a caller that files an entry it has no way to
+    # withdraw. The requirement is stated here rather than inferred, so
+    # removing the attribute fails this check instead of quietly widening the
+    # surface. The exact signature and the wrapper body are still required
+    # above: gating an item that has drifted into a second insertion path would
+    # not be a repair.
+    if not cfg_test_gated(rpc_source, r"fn insert_local_request\b", "#[cfg(test)]"):
+        failures.append(
+            "RpcInner::insert_local_request is not gated on `#[cfg(test)]` in rpc.rs; "
+            "every caller it has is a control, so an ungated `pub(crate)` wrapper is "
+            "both dead code under the workspace `-D warnings` gate and a crate-wide "
+            "insertion path a production caller could take, filing an entry whose "
+            "identity — the only thing that can withdraw it after a failed send — "
+            "this wrapper drops on the floor"
+        )
+
+    # The withdrawal itself: identity only. Every coordinate of the binding is
+    # forbidden here, because each one of them matches a newcomer under a
+    # recycled id exactly as well as it matches this caller's own entry.
+    abandon_body = fn_body(
+        rpc_source, "fn abandon_local_request(&self, filed: &LocalRequest)"
+    )
+    if abandon_body is None:
+        failures.append(
+            "RpcInner::abandon_local_request must take exactly `filed: &LocalRequest`; "
+            "a form that takes a request id, a device, or a class back is the "
+            "class-shaped predicate that removed a live operation"
+        )
+    else:
+        if "op.id.names(&filed.op_id)" not in abandon_body:
+            failures.append(
+                "abandon_local_request no longer conditions the removal on "
+                "`op.id.names(&filed.op_id)`; the identity is the only coordinate "
+                "that tells this caller's own entry from a later occupant of the "
+                "same key"
+            )
+        if "remove_if(" not in abandon_body:
+            failures.append(
+                "abandon_local_request no longer removes through `remove_if`; the "
+                "predicate and the removal have to be one shard-locked step, or the "
+                "entry can be replaced between them"
+            )
+        for coordinate in ("accepts(", "expect_from", "PendingClass"):
+            if coordinate in abandon_body:
+                failures.append(
+                    f"abandon_local_request still reads `{coordinate}`; the bound "
+                    "device and the response class describe a class of operations, "
+                    "and a stale withdrawal matching on them removes whichever live "
+                    "operation happens to have redrawn the id"
+                )
+
+    # The other direction, and the half that must not change: inbound settling
+    # matches the binding and never the identity. A frame cannot know an
+    # identity, so an inbound path that consulted one could only ever fail
+    # closed on every legitimate response.
+    for operation in ("take_single_response", "stream_chunk_sender", "take_stream_end"):
+        body = fn_body(rpc_source, f"pub(crate) fn {operation}")
+        if body is None:
+            # The F2 guard above already reports this operation as missing.
+            continue
+        for identity_marker in ("names(", "op_id", "PendingOpId"):
+            if identity_marker in body:
+                failures.append(
+                    f"RpcInner::{operation} reads `{identity_marker}`; inbound "
+                    "settling must match the bound device and response class and "
+                    "never the process-local identity, which no frame can carry"
+                )
 
     return failures
 
