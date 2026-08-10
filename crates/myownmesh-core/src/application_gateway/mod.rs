@@ -1,12 +1,20 @@
 //! Local-principal and application-queue capability boundary for V4.
 //!
-//! Arc 02 installs memory-only authority types. It does not choose the
-//! operating-system principal binding or redirect an application operation.
+//! The principal binding selected here is the **local process itself**: the
+//! application operations this crate serves run in-process with the embedder, so
+//! the operating-system principal that authenticated is the one already running
+//! this code. That is a real binding, not a placeholder, and it is deliberately
+//! the narrowest one that is true — there is no per-request principal inference,
+//! no client label, and no identity or attestation framework.
 
 use crate::runtime::RuntimeIncarnation;
 
 /// Local proof that an operating-system principal was authenticated and is
-/// eligible for a later Session Broker policy check.
+/// eligible for a Session Broker policy check.
+///
+/// One per process, minted by [`Self::for_local_process`] and shared through an
+/// `Arc` by every session that speaks for it. A second value would be a second
+/// principal, which is why there is no other constructor.
 ///
 /// A public user, client, request, or peer label cannot construct this type:
 ///
@@ -16,20 +24,35 @@ use crate::runtime::RuntimeIncarnation;
 /// let public_client_label = String::new();
 /// let _principal = LocalPrincipalCapability::from(public_client_label);
 /// ```
-#[allow(dead_code, reason = "Arc 06 moves the production gateway caller")]
 pub struct LocalPrincipalCapability {
     runtime: RuntimeIncarnation,
 }
 
-#[allow(dead_code, reason = "Arc 06 moves the production gateway caller")]
 impl LocalPrincipalCapability {
+    /// Bind the principal for this process's runtime.
+    ///
+    /// Crate-private and called once, by the Session Broker. The authority is
+    /// the running process's own: no evidence is parsed, because none is
+    /// transmitted — an in-process embedder cannot present a principal other
+    /// than the one it is.
+    ///
+    /// The daemon's control clients are deliberately **not** separate
+    /// principals. A Device value arriving over control IPC is a selector, and
+    /// which local process may call the daemon at all is the operating system's
+    /// socket boundary to decide. Each supervising application gets this
+    /// principal through its own daemon process, so per-client identities would
+    /// add a second identity system without adding a second trust boundary.
+    pub(crate) fn for_local_process(runtime: RuntimeIncarnation) -> Self {
+        Self { runtime }
+    }
+
     pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
         &self.runtime
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(runtime: RuntimeIncarnation) -> Self {
-        Self { runtime }
+        Self::for_local_process(runtime)
     }
 }
 

@@ -1,11 +1,8 @@
 //! Live two-connector endpoint-authentication controls.
 //!
-//! These are basal V4 controls, not compatibility ones. They previously lived
-//! in `legacy_v1` and so needed the deprecated compatibility feature to compile
-//! at all, which meant deleting LegacyV1 would have deleted the only controls
-//! that drive the production `engine::handshake::on_auth_response` over a real
-//! DTLS link. They are gated on `transport-lab` alone and reference no LegacyV1
-//! or legacy-media type.
+//! These are basal V4 controls. They are gated on `transport-lab` alone, and
+//! they are the only controls that drive the production
+//! `engine::handshake::on_auth_response` over a real DTLS link.
 //!
 //! The fixture opens two real WebRTC connectors, lets them complete ICE and
 //! DTLS, and builds each side's [`EndpointAuthTask`] exactly the way the
@@ -28,7 +25,10 @@
 
 use super::contribution::{LocalContribution, PeerContribution};
 use super::transcript;
-use super::{EndpointAuthContext, EndpointAuthError, EndpointAuthTask, LocalIdentitySigner};
+use super::{
+    EndpointAuthContext, EndpointAuthError, EndpointAuthSetupError, EndpointAuthTask,
+    LocalIdentitySigner,
+};
 use crate::connector::EndpointAuthBinding;
 use crate::engine::state::NetworkState;
 use crate::protocol::handshake::AuthResponseMessage;
@@ -42,28 +42,18 @@ use std::time::Duration;
 /// Two live connectors and the exact task each side owns for that channel.
 ///
 /// `left`, `left_auth` and `right` are read by the twins below and by the
-/// engine's captured-send control. The right endpoint's receiver and task are
-/// *read* only by the LegacyV1 routing control, but they must be **owned** in
-/// every configuration regardless: dropping the receiver stops that connector's
-/// event pump, and dropping the task returns its connected claim, either of
-/// which would quietly weaken the live-link controls that keep the right side
-/// up. So under `legacy-v1` they are named for their reader, and otherwise they
-/// are retained under underscore names as pure lifetime anchors — held, never
-/// read, never dropped early.
-///
-/// `_left_events` is an anchor in the same sense in every configuration.
+/// engine's captured-send control. The underscore-named fields are read by
+/// nothing and are **owned** regardless: dropping a receiver stops that
+/// connector's event pump, and dropping a task returns its connected claim,
+/// either of which would quietly weaken the live-link controls that keep the
+/// right side up. They are lifetime anchors — held, never read, never dropped
+/// early.
 pub(crate) struct TestLink {
     pub(crate) left: Arc<WebRtcConnectorWorker>,
     pub(crate) _left_events: WebRtcConnectorEventReceiver,
     pub(crate) left_auth: Arc<EndpointAuthTask>,
     pub(crate) right: Arc<WebRtcConnectorWorker>,
-    #[cfg(feature = "legacy-v1")]
-    pub(crate) right_events: Option<WebRtcConnectorEventReceiver>,
-    #[cfg(not(feature = "legacy-v1"))]
     pub(crate) _right_events: Option<WebRtcConnectorEventReceiver>,
-    #[cfg(feature = "legacy-v1")]
-    pub(crate) right_auth: Arc<EndpointAuthTask>,
-    #[cfg(not(feature = "legacy-v1"))]
     pub(crate) _right_auth: Arc<EndpointAuthTask>,
 }
 
@@ -129,11 +119,9 @@ pub(crate) async fn connect(
     let left = Arc::new(left);
     let right = Arc::new(right);
 
-    // Applied through the production V4 ingress entry point, not the LegacyV1
-    // one: `apply_remote_sdp` takes the exact SDP type and the owned string, so
+    // `apply_remote_sdp` takes the exact SDP type and the owned string, so
     // provider admission happens before the native dependency parses or retains
-    // anything. Using the compatibility path here would both need the deprecated
-    // feature and exercise an ingress order this control does not ship.
+    // anything.
     let offer = left.create_offer().await.expect("create offer");
     right
         .apply_remote_sdp(offer.sdp_type, offer.sdp)
@@ -203,10 +191,9 @@ pub(crate) async fn connect(
         }
     }
 
-    // Both sides are asserted to have come up in every configuration, before
-    // either is stored: the fixture's contract is a live link on both ends, and
-    // that must not become weaker in a build that happens not to read the right
-    // half.
+    // Both sides are asserted to have come up before either is stored: the
+    // fixture's contract is a live link on both ends, and that must not become
+    // weaker because nothing reads the right half.
     let left_auth = left_auth.expect("left data channel opens");
     let right_auth = right_auth.expect("right data channel opens");
     TestLink {
@@ -214,13 +201,7 @@ pub(crate) async fn connect(
         _left_events: left_events,
         left_auth,
         right,
-        #[cfg(feature = "legacy-v1")]
-        right_events: Some(right_events),
-        #[cfg(not(feature = "legacy-v1"))]
         _right_events: Some(right_events),
-        #[cfg(feature = "legacy-v1")]
-        right_auth,
-        #[cfg(not(feature = "legacy-v1"))]
         _right_auth: right_auth,
     }
 }
@@ -619,10 +600,14 @@ async fn v4_arc04_observed_fingerprint_promotes_through_the_live_handler() {
 /// The refusal lands at the only constructor, one step *before* a typed error
 /// is reachable: with no binding there is no context, so no task, transcript,
 /// proof, or capability can exist for a half pair. The typed
-/// `MissingTranscriptField` refusal asserted afterwards is that same
-/// missing-required-field rule at the next boundary down, where a typed cause
-/// does exist — stated here so the two are pinned together rather than assumed
-/// to agree.
+/// `EndpointAuthSetupError::MissingIdentityField` refusal asserted afterwards is
+/// that same missing-required-field rule at the next boundary down, where a
+/// typed cause does exist — stated here so the two are pinned together rather
+/// than assumed to agree.
+///
+/// That cause is a *setup* one and deliberately not a terminal one: nothing has
+/// been built yet, so there is no attempt for it to end. What fails this path
+/// closed is the production caller retiring the exact connector, not the value.
 #[tokio::test]
 #[ignore = "opens a native WebRTC link; run in the isolated native endpoint-auth control"]
 async fn v4_arc04d_missing_local_fingerprint_is_fail_closed_on_a_live_link() {
@@ -659,7 +644,7 @@ async fn v4_arc04d_missing_local_fingerprint_is_fail_closed_on_a_live_link() {
             attempt.observed_binding(),
         )
         .err(),
-        Some(EndpointAuthError::MissingTranscriptField),
+        Some(EndpointAuthSetupError::MissingIdentityField),
         "the missing local side fails with the typed missing-field cause"
     );
     attempt.close().await;
@@ -695,7 +680,7 @@ async fn v4_arc04d_missing_remote_fingerprint_is_fail_closed_on_a_live_link() {
             attempt.observed_binding(),
         )
         .err(),
-        Some(EndpointAuthError::MissingTranscriptField),
+        Some(EndpointAuthSetupError::MissingIdentityField),
         "the missing remote side fails with the typed missing-field cause"
     );
     attempt.close().await;
@@ -721,7 +706,7 @@ async fn v4_arc04d_unadvertised_profile_is_refused_by_the_live_handler() {
     );
     assert_eq!(
         super::negotiate_profile(&[]),
-        Err(EndpointAuthError::IncompatibleProfile),
+        Err(EndpointAuthSetupError::IncompatibleProfile),
         "an empty advertisement is the typed incompatible-profile refusal"
     );
 

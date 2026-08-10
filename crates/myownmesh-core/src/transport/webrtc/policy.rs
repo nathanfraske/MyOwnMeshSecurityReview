@@ -1,8 +1,8 @@
 //! WebRTC-specific connector policy.
 //!
-//! The process resource owner remains connector-neutral. ICE candidate work
-//! and the temporary legacy media provider are transport-edge choices owned by
-//! this profile.
+//! The process resource owner remains connector-neutral. ICE candidate work and
+//! the application's registered real-time codecs are transport-edge choices
+//! owned by this profile.
 
 use std::num::NonZeroUsize;
 
@@ -76,124 +76,17 @@ impl PendingRemoteCandidateLocalCeiling {
     }
 }
 
-/// Temporary provider-specific H.264 and Opus media compatibility profile.
-///
-/// Generic real-time ownership never creates media tracks. This explicit
-/// profile is the only construction input that can request the legacy WebRTC
-/// adapter. Lane suspension and finalization are explicit events.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(any(test, feature = "legacy-media")),
-    allow(
-        dead_code,
-        reason = "the compatibility profile is inert without legacy-media"
-    )
-)]
-pub struct LegacyWebRtcMediaProfile {
-    max_lanes_per_kind: NonZeroUsize,
-    preprovisioned_video_lanes: usize,
-    preprovisioned_audio_lanes: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(
-    not(any(test, feature = "legacy-media")),
-    allow(
-        dead_code,
-        reason = "the compatibility profile is inert without legacy-media"
-    )
-)]
-pub enum LegacyWebRtcMediaProfileError {
-    #[error(
-        "legacy WebRTC media lane ceiling {requested} exceeds the fixed compatibility provider ceiling {maximum}"
-    )]
-    LaneIdentitySpaceExceeded { requested: usize, maximum: usize },
-    #[error(
-        "legacy WebRTC media pre-provisions {preprovisioned} {kind} lanes but its per-kind ceiling is {maximum}"
-    )]
-    PreprovisionedLanesExceedCeiling {
-        kind: &'static str,
-        preprovisioned: usize,
-        maximum: usize,
-    },
-}
-
-#[cfg_attr(
-    not(any(test, feature = "legacy-media")),
-    allow(
-        dead_code,
-        reason = "the compatibility profile is inert without legacy-media"
-    )
-)]
-impl LegacyWebRtcMediaProfile {
-    pub fn h264_opus(
-        max_lanes_per_kind: NonZeroUsize,
-        preprovisioned_video_lanes: usize,
-        preprovisioned_audio_lanes: usize,
-    ) -> std::result::Result<Self, LegacyWebRtcMediaProfileError> {
-        let maximum = max_lanes_per_kind.get();
-        if maximum > LEGACY_MEDIA_MAX_LANES_PER_KIND {
-            return Err(LegacyWebRtcMediaProfileError::LaneIdentitySpaceExceeded {
-                requested: maximum,
-                maximum: LEGACY_MEDIA_MAX_LANES_PER_KIND,
-            });
-        }
-        for (kind, preprovisioned) in [
-            ("video", preprovisioned_video_lanes),
-            ("audio", preprovisioned_audio_lanes),
-        ] {
-            if preprovisioned > maximum {
-                return Err(
-                    LegacyWebRtcMediaProfileError::PreprovisionedLanesExceedCeiling {
-                        kind,
-                        preprovisioned,
-                        maximum,
-                    },
-                );
-            }
-        }
-        Ok(Self {
-            max_lanes_per_kind,
-            preprovisioned_video_lanes,
-            preprovisioned_audio_lanes,
-        })
-    }
-
-    pub const fn max_lanes_per_kind(self) -> NonZeroUsize {
-        self.max_lanes_per_kind
-    }
-
-    pub const fn preprovisioned_video_lanes(self) -> usize {
-        self.preprovisioned_video_lanes
-    }
-
-    pub const fn preprovisioned_audio_lanes(self) -> usize {
-        self.preprovisioned_audio_lanes
-    }
-
-    pub const fn preprovisioned_outbound_flows(self) -> Option<usize> {
-        self.preprovisioned_video_lanes
-            .checked_add(self.preprovisioned_audio_lanes)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WebRtcConnectorProfileError {
-    #[error("legacy WebRTC media compatibility requires enabled generic real-time ownership")]
-    LegacyMediaRequiresRealtime,
-    #[error("legacy WebRTC media compatibility requires an explicit local compatibility ceiling")]
-    LegacyMediaRequiresLocalCeiling,
-    #[error("legacy WebRTC media pre-provisioned flow count overflowed")]
-    LegacyMediaFlowCountOverflow,
+    #[error("a real-time codec profile requires the connector's real-time policy to be enabled")]
+    RealtimeProfileRequiresRealtime,
+    #[error("a real-time codec profile requires an owner-selected local flow ceiling")]
+    RealtimeProfileRequiresLocalCeiling,
     #[error(
-        "legacy WebRTC media pre-provisions {required_flows} outbound flows but the owner ceiling is {available_flows}"
+        "the real-time profile advertises {advertised} concurrent flows but the owner ceiling \
+         admits {enforced}"
     )]
-    LegacyMediaExceedsOutboundFlowCeiling {
-        required_flows: usize,
-        available_flows: usize,
-    },
-    #[error("legacy H.264 fragment ceiling {requested} exceeds the adapter hard stop {maximum}")]
-    LegacyH264FragmentCeilingExceeded { requested: usize, maximum: usize },
+    RealtimeProfileExceedsFlowCeiling { advertised: usize, enforced: usize },
 }
 
 /// WebRTC-specific construction and work policy for one Mesh runtime.
@@ -201,11 +94,15 @@ pub enum WebRtcConnectorProfileError {
 /// The process resource owner never inspects this profile. It owns only the
 /// connector-neutral resource ownership. WebRTC callback, ICE candidate,
 /// and temporary compatibility-provider choices stay at the transport edge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// No longer `Copy`: the real-time profile it now carries owns its codec
+/// registrations, and interning them to keep a marker copyable would buy
+/// nothing but a lifetime to get wrong. The getters take `&self` instead, so
+/// every existing `profile.callbacks()` call still reads the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebRtcConnectorProfile {
     callbacks: ConnectorCallbackPolicy,
     remote_candidates: PendingRemoteCandidatePolicy,
-    legacy_media: Option<LegacyWebRtcMediaProfile>,
+    realtime: Option<super::RealtimeProfile>,
 }
 
 impl WebRtcConnectorProfile {
@@ -216,145 +113,128 @@ impl WebRtcConnectorProfile {
         Self {
             callbacks,
             remote_candidates,
-            legacy_media: None,
+            realtime: None,
         }
     }
 
-    pub const fn callbacks(self) -> ConnectorCallbackPolicy {
-        self.callbacks
-    }
-
-    pub const fn remote_candidates(self) -> PendingRemoteCandidatePolicy {
-        self.remote_candidates
-    }
-
-    pub(crate) const fn legacy_media_internal(self) -> Option<LegacyWebRtcMediaProfile> {
-        self.legacy_media
-    }
-
-    #[cfg(feature = "legacy-media")]
-    #[deprecated(
-        since = "0.3.2",
-        note = "temporary legacy H.264 and Opus compatibility profile query"
-    )]
-    pub const fn legacy_media(self) -> Option<LegacyWebRtcMediaProfile> {
-        self.legacy_media
-    }
-
-    #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
-    pub fn with_legacy_webrtc_media(
+    /// Supply the application's real-time codec profile.
+    ///
+    /// The only public way a real-time profile reaches the connector, and it
+    /// takes an already-validated [`super::RealtimeProfile`] — so the shape
+    /// refusals happen once, at parse time, where the application can still
+    /// say which line of its configuration was wrong.
+    ///
+    /// It must be set before the peer connection exists, because codec
+    /// registration is a property of the media engine a connection is built
+    /// from. There is no later point at which core could accept one, and
+    /// therefore no point at which core could fall back to a built-in list.
+    /// Fallible because advertised capacity and enforced capacity must not be
+    /// able to diverge. `flow_capacity` is what the application tells its peer
+    /// it will carry; the owner's `ConnectorRealtimeFlowCapacities` is what
+    /// the registry will actually admit. If the first exceeds the second, the
+    /// application has promised flows that will be refused one at a time at
+    /// open, which reads as an intermittent fault rather than as the
+    /// misconfiguration it is.
+    ///
+    /// Checked here rather than counted anywhere: there is no second counter
+    /// and no shadow ceiling. The registry stays the sole enforcer, and this
+    /// only refuses a profile that claims more than the enforcer will give.
+    ///
+    /// **This is an aggregate ceiling, not a guarantee for every
+    /// distribution.** `flow_capacity` is one direction-agnostic number and
+    /// the owner's envelope is two, so a profile can pass here and still be
+    /// unsatisfiable in a particular mix: capacity 10 against a 9-inbound,
+    /// 1-outbound ceiling admits ten flows only if at most one of them is
+    /// outbound. A second outbound flow is refused with
+    /// [`super::RealtimeFlowError::FlowRefused`] at open, by the registry,
+    /// which is the component that actually knows the direction.
+    ///
+    /// That asymmetry is deliberate. Splitting the profile's capacity by
+    /// direction would move a connector-shaped decision into the application,
+    /// which does not own the resource envelope and should not have to model
+    /// it. What this check buys is that the clearly-wrong case — promising
+    /// more flows than exist in any arrangement — is a named configuration
+    /// error at construction rather than an intermittent-looking fault later.
+    pub fn with_realtime_profile(
         mut self,
-        profile: LegacyWebRtcMediaProfile,
+        profile: super::RealtimeProfile,
     ) -> std::result::Result<Self, WebRtcConnectorProfileError> {
         let enabled = match self.callbacks.realtime() {
             crate::runtime::attempt::RealtimeConnectorPolicy::Disabled => {
-                return Err(WebRtcConnectorProfileError::LegacyMediaRequiresRealtime)
+                return Err(WebRtcConnectorProfileError::RealtimeProfileRequiresRealtime)
             }
             crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(Some(enabled)) => enabled,
             crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(None) => {
-                return Err(WebRtcConnectorProfileError::LegacyMediaRequiresLocalCeiling)
+                return Err(WebRtcConnectorProfileError::RealtimeProfileRequiresLocalCeiling)
             }
         };
-        let required_flows = profile
-            .preprovisioned_outbound_flows()
-            .ok_or(WebRtcConnectorProfileError::LegacyMediaFlowCountOverflow)?;
-        let available_flows = enabled.flows().max_outbound_active_flows().get();
-        if required_flows > available_flows {
+        // The profile's capacity is a combined audio-plus-video count in one
+        // direction-agnostic number, so it is measured against the total the
+        // owner admits across both directions.
+        let enforced = enabled
+            .flows()
+            .max_inbound_active_flows()
+            .get()
+            .saturating_add(enabled.flows().max_outbound_active_flows().get());
+        let advertised = usize::from(profile.flow_capacity());
+        if advertised > enforced {
             return Err(
-                WebRtcConnectorProfileError::LegacyMediaExceedsOutboundFlowCeiling {
-                    required_flows,
-                    available_flows,
+                WebRtcConnectorProfileError::RealtimeProfileExceedsFlowCeiling {
+                    advertised,
+                    enforced,
                 },
             );
         }
-        let requested = enabled.flows().max_inbound_fragments_per_unit().get();
-        if requested > LEGACY_H264_MAX_FRAGMENTS_PER_UNIT {
-            return Err(
-                WebRtcConnectorProfileError::LegacyH264FragmentCeilingExceeded {
-                    requested,
-                    maximum: LEGACY_H264_MAX_FRAGMENTS_PER_UNIT,
-                },
-            );
-        }
-        self.legacy_media = Some(profile);
+        self.realtime = Some(profile);
         Ok(self)
+    }
+
+    pub const fn callbacks(&self) -> ConnectorCallbackPolicy {
+        self.callbacks
+    }
+
+    pub const fn remote_candidates(&self) -> PendingRemoteCandidatePolicy {
+        self.remote_candidates
+    }
+
+    /// The application's registered real-time codecs, if it supplied any.
+    ///
+    /// Borrowed, and crate-internal: the daemon supplies this profile and
+    /// core reads it. Handing a copy back out would invite a caller to treat
+    /// its own edit as configuration.
+    pub(crate) fn realtime(&self) -> Option<&super::RealtimeProfile> {
+        self.realtime.as_ref()
     }
 }
 
-/// Fixed hard stop implemented by the temporary H.264 adapter.
-pub const LEGACY_H264_MAX_FRAGMENTS_PER_UNIT: usize = 2_048;
-
-/// Fixed lane count implemented by the temporary H.264 and Opus adapter.
-#[cfg_attr(
-    not(any(test, feature = "legacy-media")),
-    allow(
-        dead_code,
-        reason = "the compatibility profile is inert without legacy-media"
-    )
-)]
-pub const LEGACY_MEDIA_MAX_LANES_PER_KIND: usize = 8;
+/// Hard stop on how many RTP fragments one Annex-B unit may retain.
+///
+/// A property of the framing adapter, not of any codec policy: a unit needing
+/// more fragments than this is a wedged stream rather than a large picture — a
+/// 40 Mbps keyframe runs to roughly four hundred — and continuing to retain
+/// them would grow without bound on an inbound path a peer controls.
+///
+pub const ANNEXB_MAX_FRAGMENTS_PER_UNIT: usize = 2_048;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::attempt::{
-        ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-        ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets,
-        ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-        ConnectorRealtimeInboundLimits, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
-    };
 
-    fn nz(value: usize) -> NonZeroUsize {
-        NonZeroUsize::new(value).expect("test fixture value is nonzero")
-    }
-
+    /// The Annex-B fragment hard stop is a real bound, not a placeholder.
+    ///
+    /// A unit is allowed to span many fragments — a large keyframe genuinely
+    /// does — and the stop is far enough above that to be a wedged-stream
+    /// detector rather than a picture-size limit.
     #[test]
-    fn v4_arc03h_legacy_lane_ceiling_matches_the_fixed_provider() {
+    fn v4_macro1_the_annexb_fragment_stop_is_above_any_real_unit() {
+        // ~400 fragments is a 40 Mbps keyframe at MTU-sized payloads.
         assert!(
-            LegacyWebRtcMediaProfile::h264_opus(nz(LEGACY_MEDIA_MAX_LANES_PER_KIND), 0, 0).is_ok()
+            ANNEXB_MAX_FRAGMENTS_PER_UNIT > 400,
+            "a stop at or below a real keyframe would drop valid media rather \
+             than catching a wedged stream"
         );
-        assert!(matches!(
-            LegacyWebRtcMediaProfile::h264_opus(nz(LEGACY_MEDIA_MAX_LANES_PER_KIND + 1), 0, 0),
-            Err(LegacyWebRtcMediaProfileError::LaneIdentitySpaceExceeded { .. })
-        ));
-    }
-
-    #[test]
-    fn v4_arc03h_legacy_h264_fragment_policy_cannot_exceed_adapter_hard_stop() {
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(nz(1), nz(1), nz(1)),
-            ConnectorRealtimeInboundLimits::new(
-                nz(1),
-                nz(LEGACY_H264_MAX_FRAGMENTS_PER_UNIT + 1),
-                nz(1),
-                nz(1),
-                nz(1),
-            ),
-            ConnectorRealtimeByteBudgets::new(nz(2), nz(1)),
-            RealtimeQueueOverflowRule::DropNewest,
-        );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(nz(1), flows)
-            .expect("test policy is otherwise structurally valid");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(nz(1), nz(1)),
-            ConnectorCallbackServiceWeights::new(nz(1), nz(1), nz(1)),
-            realtime,
-        )
-        .expect("test callback policy is otherwise structurally valid");
-        let profile = WebRtcConnectorProfile::new(
-            callbacks,
-            PendingRemoteCandidatePolicy::new(nz(1), nz(1), nz(1), nz(1)),
-        );
-        let legacy = LegacyWebRtcMediaProfile::h264_opus(nz(1), 0, 0)
-            .expect("test provider is structurally valid");
-
-        assert!(matches!(
-            profile.with_legacy_webrtc_media(legacy),
-            Err(WebRtcConnectorProfileError::LegacyH264FragmentCeilingExceeded {
-                requested,
-                maximum
-            }) if requested == LEGACY_H264_MAX_FRAGMENTS_PER_UNIT + 1
-                && maximum == LEGACY_H264_MAX_FRAGMENTS_PER_UNIT
-        ));
+        // And bounded, which is the whole point: an inbound path a peer drives
+        // must not be able to grow retention without limit.
+        assert!(ANNEXB_MAX_FRAGMENTS_PER_UNIT < usize::MAX);
     }
 }

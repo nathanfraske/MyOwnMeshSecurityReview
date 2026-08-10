@@ -6,7 +6,7 @@
 //! conventions: a local contribution can only come from the CSPRNG, and a peer
 //! contribution is decoded rather than measured.
 
-use super::EndpointAuthError;
+use super::EndpointAuthSetupError;
 
 /// A 32-byte draw encoded as lowercase BASE32 without padding.
 pub(crate) const CONTRIBUTION_BYTES: usize = 32;
@@ -62,18 +62,26 @@ pub(crate) struct PeerContribution(String);
 impl PeerContribution {
     /// Accept exactly the canonical lowercase BASE32-nopad encoding of
     /// [`CONTRIBUTION_BYTES`] bytes.
-    pub(crate) fn from_wire(value: &str) -> Result<Self, EndpointAuthError> {
+    ///
+    /// Refuses with an [`EndpointAuthSetupError`], which is a statement about
+    /// the value and nothing else. This is a parser: it holds no task, cannot
+    /// reach the exchange lock, and terminalizes nothing, so it must not be
+    /// able to hand back a cause that says an attempt is over. The caller that
+    /// refuses here still fails closed on its own state — the production
+    /// inbound path drops the exact current peer — but that is the caller's
+    /// act, not this function's claim.
+    pub(crate) fn from_wire(value: &str) -> Result<Self, EndpointAuthSetupError> {
         if value.is_empty() {
-            return Err(EndpointAuthError::MissingTranscriptField);
+            return Err(EndpointAuthSetupError::MissingContribution);
         }
         let decoded = data_encoding::BASE32_NOPAD
             .decode(value.to_ascii_uppercase().as_bytes())
-            .map_err(|_| EndpointAuthError::ContributionMalformed)?;
+            .map_err(|_| EndpointAuthSetupError::ContributionMalformed)?;
         if decoded.len() != CONTRIBUTION_BYTES {
-            return Err(EndpointAuthError::ContributionTooShort);
+            return Err(EndpointAuthSetupError::ContributionWrongWidth);
         }
         if data_encoding::BASE32_NOPAD.encode(&decoded).to_lowercase() != value {
-            return Err(EndpointAuthError::ContributionMalformed);
+            return Err(EndpointAuthSetupError::ContributionMalformed);
         }
         Ok(Self(value.to_owned()))
     }
@@ -109,7 +117,7 @@ mod tests {
 
         assert_eq!(
             PeerContribution::from_wire(""),
-            Err(EndpointAuthError::MissingTranscriptField)
+            Err(EndpointAuthSetupError::MissingContribution)
         );
         // A short value cannot carry a full-width draw, and accepting one would
         // silently shrink the freshness the transcript rests on.
@@ -119,14 +127,28 @@ mod tests {
         // flaky: lopping characters off an arbitrary encoding usually leaves
         // nonzero trailing bits, which `decode` rejects first, so the value
         // came back `ContributionMalformed` on some draws and
-        // `ContributionTooShort` on others. Zero bytes encode to zero trailing
-        // bits, so this decodes cleanly and fails on length alone — every run.
+        // `ContributionWrongWidth` on others. Zero bytes encode to zero trailing
+        // bits, so this decodes cleanly and fails on width alone — every run.
         let short = data_encoding::BASE32_NOPAD
             .encode(&[0u8; CONTRIBUTION_BYTES - 1])
             .to_lowercase();
         assert_eq!(
             PeerContribution::from_wire(&short),
-            Err(EndpointAuthError::ContributionTooShort)
+            Err(EndpointAuthSetupError::ContributionWrongWidth)
+        );
+        // And the other side of the same predicate. The guard is an equality
+        // against the full draw width, not a minimum, so an over-wide value is
+        // refused on the same footing — and with the same cause, which is why
+        // that cause is named for the width rather than for the short side of
+        // it. Built from zero bytes for the same reason as the short leg: the
+        // encoding decodes cleanly, so it fails on width alone rather than on
+        // trailing bits.
+        let over_wide = data_encoding::BASE32_NOPAD
+            .encode(&[0u8; CONTRIBUTION_BYTES + 1])
+            .to_lowercase();
+        assert_eq!(
+            PeerContribution::from_wire(&over_wide),
+            Err(EndpointAuthSetupError::ContributionWrongWidth)
         );
         // The companion case at full width: 32 zero bytes encode to 52
         // characters, so length is not what rejects this one. Altering the
@@ -143,18 +165,79 @@ mod tests {
         full_width.push('b');
         assert_eq!(
             PeerContribution::from_wire(&full_width),
-            Err(EndpointAuthError::ContributionMalformed)
+            Err(EndpointAuthSetupError::ContributionMalformed)
         );
         // Uppercase decodes to the same bytes but is not the canonical
         // spelling: one draw has exactly one accepted wire form.
         assert_eq!(
             PeerContribution::from_wire(&canonical.to_ascii_uppercase()),
-            Err(EndpointAuthError::ContributionMalformed)
+            Err(EndpointAuthSetupError::ContributionMalformed)
         );
         assert_eq!(
             PeerContribution::from_wire("not-base32!"),
-            Err(EndpointAuthError::ContributionMalformed)
+            Err(EndpointAuthSetupError::ContributionMalformed)
         );
         assert!(PeerContribution::from_wire(canonical).is_ok());
+    }
+
+    #[test]
+    fn v4_arc04h_every_wire_refusal_is_a_setup_cause_at_this_one_boundary() {
+        // The census for this parser's half of the setup type. The `match` is
+        // what makes it one: a variant added to `EndpointAuthSetupError` fails
+        // to compile here until it is either driven from a wire value below or
+        // stated as belonging to another boundary. Without it a new input cause
+        // could be introduced with no control ever producing it, and the claim
+        // that every refusal here is a *setup* refusal would rest on reading
+        // the source rather than on the compiler.
+        fn boundary_of(error: EndpointAuthSetupError) -> &'static str {
+            match error {
+                EndpointAuthSetupError::MissingContribution
+                | EndpointAuthSetupError::ContributionWrongWidth
+                | EndpointAuthSetupError::ContributionMalformed => "PeerContribution::from_wire",
+                EndpointAuthSetupError::MissingIdentityField => "EndpointAuthContext::new",
+                EndpointAuthSetupError::IncompatibleProfile => "negotiate_profile",
+            }
+        }
+
+        let short = data_encoding::BASE32_NOPAD
+            .encode(&[0u8; CONTRIBUTION_BYTES - 1])
+            .to_lowercase();
+        let over_wide = data_encoding::BASE32_NOPAD
+            .encode(&[0u8; CONTRIBUTION_BYTES + 1])
+            .to_lowercase();
+        // Every value this parser can refuse, and the cause each one carries.
+        // Driven rather than asserted about, so a cause that no wire value can
+        // actually produce cannot pass this control. Both sides of the width
+        // predicate are driven, because one cause covers both.
+        for (value, expected) in [
+            ("", EndpointAuthSetupError::MissingContribution),
+            (
+                short.as_str(),
+                EndpointAuthSetupError::ContributionWrongWidth,
+            ),
+            (
+                over_wide.as_str(),
+                EndpointAuthSetupError::ContributionWrongWidth,
+            ),
+            ("not-base32!", EndpointAuthSetupError::ContributionMalformed),
+        ] {
+            assert_eq!(PeerContribution::from_wire(value), Err(expected));
+            assert_eq!(
+                boundary_of(expected),
+                "PeerContribution::from_wire",
+                "a wire value is refused at the parser, and the cause says so"
+            );
+        }
+        // Non-vacuity: the two causes this boundary does *not* own are owned
+        // elsewhere, so the mapping above discriminates rather than answering
+        // the same way for everything.
+        assert_ne!(
+            boundary_of(EndpointAuthSetupError::MissingIdentityField),
+            "PeerContribution::from_wire"
+        );
+        assert_ne!(
+            boundary_of(EndpointAuthSetupError::IncompatibleProfile),
+            "PeerContribution::from_wire"
+        );
     }
 }

@@ -110,12 +110,12 @@ pub struct PeerStateData {
     /// connection state. `None` only for the session-less peers some unit
     /// tests insert; set in `ensure_peer_session` when the session opens.
     pub session_started_at: Option<Instant>,
-    /// A media lane opened or closed on this session and the SDP no
-    /// longer matches — the media-renegotiation pass owes this peer one
-    /// in-place offer. Coalesced: any number of lane changes between
-    /// passes costs a single renegotiation.
+    /// The connector's track set changed on this session and the SDP no
+    /// longer matches — the renegotiation pass owes this peer one in-place
+    /// offer. Coalesced: any number of changes between passes costs a
+    /// single renegotiation.
     pub media_reneg_pending: bool,
-    /// A media-renegotiation task is currently running for this peer
+    /// A renegotiation task is currently running for this peer
     /// (spawned off the driver — see `service_media_renegotiations`).
     /// Single-flight guard: the tick skips a peer whose offer is still
     /// in flight instead of stacking a second one onto webrtc-rs.
@@ -253,6 +253,20 @@ impl Default for PeerStateData {
     }
 }
 
+/// One promoted session and the realtime flows opened under it.
+///
+/// Bundled rather than adjacent so their lifetimes cannot separate. The flow
+/// set's label namespace is only meaningful for the exact session that owns it,
+/// and the session is only reachable while its connector is current — so the two
+/// die together or the namespace outlives its meaning.
+struct PromotedSession {
+    session: crate::runtime::session_broker::SessionCapability,
+    /// Opaque to the engine. Constructed by the worker the session was promoted
+    /// from, so the flows draw on that exact connector's registry; the engine
+    /// never names a label table, a flow, or a port.
+    flows: crate::transport::webrtc::SessionRealtimeFlows,
+}
+
 pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
@@ -266,7 +280,29 @@ pub struct PeerConnection {
     /// endpoint-auth task that owns the current connector, and it is dropped
     /// whenever that connector is retired or replaced.
     authenticated_channel: Mutex<Option<crate::endpoint_auth::AuthenticatedChannelCapability>>,
-    realtime_flow: Mutex<Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>>>,
+    /// The promoted session for the exact current channel.
+    ///
+    /// Promotion **moves** the authenticated capability out of the slot above
+    /// and into the session, so the two are never both occupied for one channel:
+    /// once promoted, the session is the sole owner of that channel's authority,
+    /// and its drop is what returns the connected claim to connector retention.
+    ///
+    /// Dropped by `retire_connector` for the same reason the capability is —
+    /// a session promoted under the retired connector must not survive into its
+    /// replacement.
+    ///
+    /// **One slot, both halves.** The capability and the flow set are bundled so
+    /// a single `take()` drops them together. Two independent slots would let
+    /// the two lifetimes drift: a flow set that outlived its session would hold
+    /// labels minted under a connector that is gone, and there is deliberately
+    /// no session id or generation that would let anything notice. No path may
+    /// drop or recreate one half alone.
+    ///
+    /// Dropping the bundle is also the only retirement signal there is, by
+    /// ruling: it closes the flow-owned queues, inbound pumps terminate from
+    /// queue closure, and outbound closes on a closed queue or
+    /// `SessionNotCurrent`. There is no separate engine retirement event.
+    promoted_session: Mutex<Option<PromotedSession>>,
     registry_retired: AtomicBool,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
     /// attempt, resource, or application authority.
@@ -284,7 +320,7 @@ impl PeerConnection {
             session: Mutex::new(session),
             endpoint_auth: Mutex::new(None),
             authenticated_channel: Mutex::new(None),
-            realtime_flow: Mutex::new(None),
+            promoted_session: Mutex::new(None),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -305,6 +341,11 @@ impl PeerConnection {
         // another between the same pair. A capability authenticated under the
         // retired connector must not survive into its replacement.
         drop(self.authenticated_channel.lock().take());
+        // The promoted session carries that same channel's authority, so it is
+        // dropped on the same edge. Dropping it also releases its
+        // post-authentication resource reservation, so a retired connector does
+        // not hold session capacity its replacement then has to compete for.
+        drop(self.promoted_session.lock().take());
         // Retire the endpoint-auth task at the source, so a superseded
         // connector refuses promotion rather than merely failing to install
         // afterwards. Without this the task stays live with its handoff
@@ -315,7 +356,6 @@ impl PeerConnection {
         if let Some(task) = self.endpoint_auth.lock().as_ref() {
             task.retire();
         }
-        drop(self.realtime_flow.lock().take());
         let worker = self.session.lock().clone();
         if let Some(worker) = worker {
             worker.retire();
@@ -332,6 +372,7 @@ impl PeerConnection {
             None => Ok(()),
         };
         drop(self.authenticated_channel.lock().take());
+        drop(self.promoted_session.lock().take());
         drop(self.endpoint_auth.lock().take());
         result
     }
@@ -451,7 +492,7 @@ impl PeerConnection {
     /// the gate is satisfied the same way production satisfies it — what is
     /// skipped is only the connector-provenance check, which is proven
     /// separately by the transport controls. This is deliberately not a way to
-    /// make [`Self::admitted_for_legacy_application`] answer `true` without a
+    /// make [`Self::has_authenticated_channel`] answer `true` without a
     /// capability present.
     #[cfg(test)]
     pub(crate) fn install_authenticated_channel_for_test(&self) {
@@ -460,42 +501,217 @@ impl PeerConnection {
         ));
     }
 
-    /// The single application-admission predicate for this entry.
+    /// Install a real authenticated capability **for this entry's own live
+    /// connector**, in this Mesh's own context.
     ///
-    /// Every production application, reliable, and real-time admission gate
-    /// must route through this rather than reading `PeerStateData::authenticated`
-    /// directly. The legacy bool records policy history and cannot be
-    /// invalidated by channel replacement: `retire_connector` drops the
-    /// authenticated capability but leaves the bool set, so a retired entry
-    /// would still read as admitted. Requiring a live capability makes the
-    /// Arc 04 artifact *enforced* rather than merely stored, and makes
-    /// replacement invalidation immediate.
+    /// The difference from [`Self::install_authenticated_channel_for_test`] is
+    /// the whole point: that one installs a capability bound to a fixture
+    /// connector, a fixture runtime, and a fixture context, which satisfies
+    /// `has_authenticated_channel` but can never promote — `promote` compares
+    /// the connector by pointer identity and the runtime by incarnation, and
+    /// `is_current_for` re-proves the mesh context and remote Device at every
+    /// use. A control that needs a *promoted session* therefore needs this
+    /// form, which takes the handoff the peer's own connector produced and
+    /// names this Mesh and this peer.
     ///
-    /// Protocol admission traffic — Hello, AuthResponse, Approve, Deny — is
-    /// deliberately outside this gate, as the existing admission
-    /// classification already intends; it is what establishes the capability
-    /// in the first place.
-    /// **Not a gate.** This is the admission half only, and it is private to
-    /// the registry: production reaches it exclusively through
-    /// `PeerRegistry::with_admitted_current` / `admit_application_operation`,
-    /// which additionally prove the owner is the installed peer and mint a
-    /// witness under the mutation lock. Read on its own it is a transient
-    /// boolean about a peer that may already have been replaced, which is
-    /// precisely the shape Arc 04B-3 removes.
-    pub(super) fn admitted_for_legacy_application(&self) -> bool {
-        self.has_authenticated_channel() && self.state.read().is_admitted()
+    /// Provenance is still the only thing skipped: no exchange ran, so the
+    /// task-issued path is bypassed exactly as above. Every conjunct promotion
+    /// actually evaluates is real, so promotion can still refuse — and does,
+    /// for a retired connector, an unadmitted peer, a foreign context, or
+    /// exhausted session capacity.
+    ///
+    /// `handoff` is moved: it carries the connected claim's retention
+    /// obligation, so a capability built from it and then dropped returns that
+    /// claim through the connector's own close owner rather than releasing it
+    /// early.
+    #[cfg(test)]
+    pub(crate) fn install_authenticated_channel_over_for_test(
+        &self,
+        handoff: crate::connector::ConnectedChannelHandoff,
+        mesh_context: &str,
+        local_device_id: &str,
+    ) {
+        let capability = crate::endpoint_auth::authenticated_over_for_test(
+            handoff,
+            mesh_context,
+            local_device_id,
+            &self.device_id,
+        );
+        *self.authenticated_channel.lock() = Some(capability);
     }
 
-    /// The admission half as the fence evaluates it. **Controls only.**
+    /// Promote this entry's authenticated channel into a live session, once.
     ///
-    /// The connector-provenance controls build a peer directly from a real
-    /// connector fixture and never install it in a registry, so they cannot
-    /// take the fence. They assert this half; the owner half is proven by the
-    /// engine's own replacement controls. Compiled out of production, so no
-    /// externally readable admission boolean survives there.
-    #[cfg(test)]
-    pub(crate) fn admitted_for_legacy_application_for_test(&self) -> bool {
-        self.admitted_for_legacy_application()
+    /// Called only from inside the registry mutation lock, which is what makes
+    /// the policy conjunct true of *this installation* rather than of a device
+    /// id a replacement may have taken over. It takes no registry lock itself.
+    ///
+    /// Idempotent by construction: a session already promoted for the live
+    /// connector is reused, so one channel yields at most one session and one
+    /// resource reservation. A cached session that no longer names the live
+    /// connector is dropped rather than returned — that is the replacement
+    /// invalidation, applied at use.
+    ///
+    /// The capability is taken out of its slot **only** once every free
+    /// precondition holds, because `promote` consumes it by value: taking it
+    /// before knowing policy admits would destroy a good capability while the
+    /// peer was merely still waiting for approval. Once taken, a refusal
+    /// destroys it deliberately — a capability whose own record does not match
+    /// this entry's context is one this entry must not keep.
+    ///
+    /// **Lock order: `session`, then `promoted_session`, then
+    /// `authenticated_channel`.** This is the only method that nests any of
+    /// them, and it is the reason the order exists at all: it holds
+    /// `promoted_session` across the capability take, because installing a
+    /// session and consuming the channel it was promoted from must be one step.
+    /// The worker is therefore cloned out of `session` and that guard released
+    /// *before* `promoted_session` is taken. Acquiring them the other way round
+    /// here — with `promoted_session` held while `session` is locked — is what
+    /// would close a cycle against [`Self::with_live_session_flow_and_worker`],
+    /// which reads `session` first on its way to the same pair.
+    ///
+    /// Reading the worker a moment early costs nothing: a connector that
+    /// retires in the gap fails the `is_current_for` recheck below, or the
+    /// `is_active` proof before promotion, or — for a session installed against
+    /// a connector that retired immediately after — the `belongs_to` check at
+    /// the next use. Every one of those refuses rather than admits.
+    pub(super) fn promote_session_if_needed(
+        &self,
+        broker: &crate::runtime::session_broker::SessionBroker,
+        mesh_context: &str,
+    ) -> bool {
+        let worker = self.session.lock().clone();
+        let live_connector = worker
+            .as_ref()
+            .and_then(|worker| worker.live_connector_incarnation().cloned());
+        let mut promoted = self.promoted_session.lock();
+
+        if let Some(session) = promoted.as_ref().map(|bundle| &bundle.session) {
+            // The use-time recheck, not merely a currentness test: connector,
+            // mesh context, remote Device, principal, and reservation runtime
+            // are all re-proved against the session's own record before it
+            // authorizes anything. A session that fails any conjunct is dropped
+            // rather than returned, which also releases its reservation.
+            let still_valid = live_connector.as_ref().is_some_and(|connector| {
+                session.is_current_for(connector, mesh_context, &self.device_id, broker.runtime())
+            });
+            if still_valid {
+                return true;
+            }
+            drop(promoted.take());
+            return false;
+        }
+
+        if self.registry_retired() || !self.state.read().is_admitted() {
+            return false;
+        }
+        let (Some(connector), Some(worker)) = (live_connector, worker) else {
+            return false;
+        };
+        // Re-proved under `promoted_session`, because the incarnation was read
+        // before that guard was taken. This is the narrow window the lock order
+        // opens, and closing it here means a connector that retired in the gap
+        // costs a refused promotion rather than a session installed against a
+        // connector that is already gone. Asked of the worker, which is where
+        // the adapter's retirement state lives — the incarnation itself is an
+        // identity token and answers no liveness question.
+        if worker.live_connector_incarnation().is_none() {
+            return false;
+        }
+        let Some(capability) = self.authenticated_channel.lock().take() else {
+            return false;
+        };
+
+        let policy = crate::runtime::session_broker::CurrentPolicyAdmission::from_admitted_peer(
+            mesh_context,
+            &self.device_id,
+            true,
+        );
+        match broker.promote(capability, &connector, policy) {
+            Ok(session) => {
+                // The flow set is built by the exact worker this session was
+                // promoted from, so its registry and the session's connector are
+                // the same one by construction rather than by a later check.
+                *promoted = Some(PromotedSession {
+                    session,
+                    flows: worker.new_session_flows(),
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Run one effect against this entry's live promoted session.
+    ///
+    /// The session is lent, never handed out: it is not `Clone`, and the borrow
+    /// ends with the closure, so a caller cannot retain application authority
+    /// past the fence that authorized it.
+    /// Lend this entry's live session together with a **freshly acquired** live
+    /// connector incarnation.
+    ///
+    /// The freshness is the whole point and it is structural, not a convention:
+    /// the incarnation handed to `effect` is obtained from the current worker on
+    /// this call, and `live_connector_incarnation` yields `None` once that
+    /// connector is retired. A caller therefore cannot reach the closure with a
+    /// stale identity, and cannot substitute one — it does not supply the
+    /// argument, this does.
+    ///
+    /// That distinction matters because a retained `Arc<ConnectorIncarnation>`
+    /// stays pointer-equal to itself forever. Validating a flow against the
+    /// `Arc` it stored at open time proves only that the flow is the flow; it
+    /// says nothing about whether the connector is still alive, so a retired
+    /// peer would keep passing its own gate. Every flow operation must compare
+    /// against an incarnation acquired now, which is what this hands out.
+    ///
+    /// The session is re-checked against that fresh identity before the effect
+    /// runs, so a session promoted from a superseded connector yields `None`
+    /// rather than an operation.
+    pub(super) fn with_live_session_flow<R>(
+        &self,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+        ) -> R,
+    ) -> Option<R> {
+        self.with_live_session_flow_and_worker(|session, flows, live, _worker| {
+            effect(session, flows, live)
+        })
+    }
+
+    /// The same fence, additionally lending the connector worker.
+    ///
+    /// The one body both forms share, so the currency rule is stated once: two
+    /// copies of a fence are two things that can drift, and the one that drifts
+    /// is the one nobody is reading.
+    ///
+    /// The worker is lent for the operations that must reach the *native*
+    /// connector — creating a transceiver or a track — which cannot happen
+    /// under this lock because they await. A caller clones the handle out,
+    /// releases the lock, does the async work, and re-enters to commit. The
+    /// handle is not authority: it grants nothing this fence has not already
+    /// proved, and re-entering proves it again rather than trusting the clone.
+    pub(super) fn with_live_session_flow_and_worker<R>(
+        &self,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+            &Arc<WebRtcConnectorWorker>,
+        ) -> R,
+    ) -> Option<R> {
+        let worker = self.session.lock().clone()?;
+        let live = worker.live_connector_incarnation()?;
+        let mut promoted = self.promoted_session.lock();
+        let bundle = promoted.as_mut()?;
+        if !bundle.session.belongs_to(live) {
+            return None;
+        }
+        // Disjoint field borrows: the session is read, the flow set is mutated,
+        // and they are lent together so an operation cannot pair one session's
+        // authority with another session's labels.
+        Some(effect(&bundle.session, &mut bundle.flows, live, &worker))
     }
 
     /// Whether this entry holds a live authenticated channel for its exact
@@ -504,58 +720,34 @@ impl PeerConnection {
     /// This is the provenance-carrying counterpart to
     /// `PeerStateData::authenticated`: a retired entry answers `false` even if
     /// the legacy bool is still set.
+    /// The two slots are read **one at a time, never nested**, and that is a
+    /// correctness requirement rather than a style choice.
+    ///
+    /// This entry's lock order is `session` → `promoted_session` →
+    /// `authenticated_channel`, and [`Self::promote_session_if_needed`] is the
+    /// only method that nests any of them. It holds `promoted_session` while it
+    /// takes `authenticated_channel`, so reading those two here in the opposite
+    /// order — which is what a single `||` tail expression would do, the first
+    /// operand's guard still alive when the second lock is reached — closes a
+    /// cycle against promotion running concurrently on another peer's task. The
+    /// `let` binding is what ends the first guard's temporary scope before the
+    /// second lock is taken.
+    ///
+    /// Every other acquisition on this entry, here and elsewhere, takes exactly
+    /// one of these locks per statement and releases it before the next, so no
+    /// other pair can be held at once in either direction.
     pub(crate) fn has_authenticated_channel(&self) -> bool {
-        !self.registry_retired() && self.authenticated_channel.lock().is_some()
-    }
-
-    /// Retained compatibility adapter for the legacy real-time flow.
-    ///
-    /// Endpoint Auth owns connected-channel provenance, and the Arc 04
-    /// channel-bound capability is implemented and enforced — this path is
-    /// gated on it by the registry admission fence, alongside the existing
-    /// mutual-approval policy state. The adapter itself is retained for
-    /// compatibility, not because the capability is still pending; Arc 05 owns
-    /// its deletion.
-    ///
-    /// Admission is **not** rechecked here. This is reachable only through an
-    /// `AdmittedLegacyOperation`, which is minted under the registry fence and
-    /// already proves the exact current owner, a live capability, and retained
-    /// policy. Rechecking would read peer state a second time, outside the
-    /// linearization point that authorized the call.
-    pub(super) fn install_legacy_realtime_flow(&self) -> bool {
-        let worker = self.session.lock().clone();
-        let task = self.endpoint_auth.lock().clone();
-        let Some((worker, task)) = worker.zip(task) else {
-            return false;
-        };
-        let Some(capability) = worker.admit_legacy_realtime_flow(&task) else {
-            return false;
-        };
-        let mut current = self.realtime_flow.lock();
-        if current.is_some() {
+        if self.registry_retired() {
             return false;
         }
-        *current = Some(capability);
-        true
-    }
-
-    /// The paired ports for the retained legacy real-time flow.
-    ///
-    /// Admission is not rechecked, for the same reason as
-    /// [`Self::install_legacy_realtime_flow`]: the only caller is the registry
-    /// witness, which already established it. The pair is returned together so
-    /// the witness can bind it into one owned operation rather than letting a
-    /// caller carry a loose worker and capability across an await.
-    pub(super) fn realtime_flow_ports(
-        &self,
-    ) -> Option<(
-        Arc<WebRtcConnectorWorker>,
-        Arc<crate::connector::ConnectorRealtimeFlowCapability>,
-    )> {
-        let worker = self.session.lock().clone()?;
-        let capability = self.realtime_flow.lock().clone()?;
-        worker
-            .owns_realtime_flow(&capability)
-            .then_some((worker, capability))
+        // Either slot counts. Promotion *moves* the capability into the session,
+        // so once a session exists the capability slot is empty and reading it
+        // alone would report a promoted peer as unauthenticated — which would
+        // un-admit the very peer that just satisfied every conjunct.
+        let holds_capability = self.authenticated_channel.lock().is_some();
+        if holds_capability {
+            return true;
+        }
+        self.promoted_session.lock().is_some()
     }
 }

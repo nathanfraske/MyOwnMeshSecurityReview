@@ -55,6 +55,16 @@
 //! never means "this call had nothing to do". A caller can therefore treat every
 //! `Err` as the end of the attempt without asking a second question of its own
 //! state to find out which sense was meant.
+//!
+//! Nor does it ever mean "this input was unusable". The transitions here are the
+//! only source of an [`EndpointAuthError`], and every one of them goes through
+//! [`EndpointAuthTask::terminalize`]. Refusing a malformed wire value, an
+//! unadvertised profile, or an empty identifier happens at a boundary that holds
+//! no task at all, so those causes are the separate
+//! [`super::EndpointAuthSetupError`] and are not expressible here. That is why
+//! this module names no parser and no negotiator: the type it returns is a
+//! lifecycle statement, and a value that could also carry a parse failure could
+//! not be one.
 
 use super::capability::{AuthenticatedBindingRecord, AuthenticatedChannelCapability};
 use super::context::EndpointAuthContext;
@@ -192,9 +202,9 @@ pub(crate) enum PeerProofAcceptance {
     /// capability this attempt will ever issue.
     ///
     /// Boxed purely for size. The capability carries the whole binding record
-    /// and is the larger part of this enum by two orders of magnitude, so
-    /// inlining it would make every `AlreadyPromoted` — the common outcome on a
-    /// retransmission — cost the same as a promotion. Nothing about the
+    /// and is the substantially larger of the two variants, so inlining it
+    /// would size every `AlreadyPromoted` — the common outcome on a
+    /// retransmission — to the promotion it is not. Nothing about the
     /// indirection is semantic: the box is opened at the single production
     /// consumer, which receives exactly the capability
     /// [`AuthenticatedChannelCapability::from_verified_exchange`] built, and no
@@ -748,7 +758,7 @@ impl EndpointAuthTask {
         // Leaving it live would keep a channel claim held open by a peer that
         // has already violated the one ordering the exchange has.
         let Some((peer_contribution, local_proof)) = bound else {
-            return Err(self.terminalize(&mut exchange, EndpointAuthError::MissingTranscriptField));
+            return Err(self.terminalize(&mut exchange, EndpointAuthError::NoBoundTranscript));
         };
 
         let peer_transcript = transcript::transcript_for_context(
@@ -945,6 +955,11 @@ pub(crate) fn peer_proof_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The pre-task refusal type, named here and nowhere else in this module.
+    // Production code in `task` cannot reach it — no transition can produce or
+    // consume a setup cause — so it is imported only by the controls that hold
+    // the two domains apart.
+    use super::super::EndpointAuthSetupError;
     use crate::connector::{counted_handoff_for_test, handoff_for_test, EndpointAuthBinding};
 
     const MESH: &str = "mesh-under-test";
@@ -1237,7 +1252,7 @@ mod tests {
 
         assert_eq!(
             fixture.task.accept_peer_proof("premature").err(),
-            Some(EndpointAuthError::MissingTranscriptField)
+            Some(EndpointAuthError::NoBoundTranscript)
         );
         assert_eq!(fixture.task.signature_count(), 0);
     }
@@ -1291,7 +1306,7 @@ mod tests {
 
         assert_eq!(
             EndpointAuthContext::new("", "device-a", "device-b", binding).err(),
-            Some(EndpointAuthError::MissingTranscriptField)
+            Some(EndpointAuthSetupError::MissingIdentityField)
         );
     }
 
@@ -1693,6 +1708,48 @@ mod tests {
         assert!(!fixture.task.issued(&foreign));
     }
 
+    /// The transition that produces each terminal cause, named exhaustively.
+    ///
+    /// This `match` is the census, and it is what makes the control below a
+    /// statement about the whole closed type rather than about six samples of
+    /// it. `EndpointAuthError` is closed to task transitions, so a variant added
+    /// to it fails to compile here until it is given a driver — and the control
+    /// then has to actually drive that driver and show the attempt is retired
+    /// afterwards. A variant no transition can produce would be a terminal cause
+    /// that terminalizes nothing, which is precisely the shape splitting the
+    /// setup causes out exists to remove.
+    ///
+    /// The names are distinct on purpose: they are compared for distinctness, so
+    /// the census cannot be satisfied by a mapping that collapses several causes
+    /// onto one driver and then drives it once.
+    fn driver_of(cause: EndpointAuthError) -> &'static str {
+        match cause {
+            EndpointAuthError::NoBoundTranscript => "accept_peer_proof with nothing bound",
+            EndpointAuthError::NotMutual => "accept_peer_hello on a self-paired context",
+            EndpointAuthError::ContributionNotFresh => "accept_peer_hello echoing our own draw",
+            EndpointAuthError::SignatureInvalid => "accept_peer_proof with an unverifiable half",
+            EndpointAuthError::ConflictingPeerContribution => {
+                "a second, different accept_peer_hello"
+            }
+            EndpointAuthError::ChannelNotCurrent => "retire",
+        }
+    }
+
+    /// Every variant of the closed terminal type.
+    ///
+    /// Kept beside [`driver_of`] rather than derived from it, because the two
+    /// guard different halves: the `match` fails to compile when a variant is
+    /// added, and this array is what the control iterates to prove each one was
+    /// genuinely observed coming out of a transition.
+    const EVERY_TERMINAL_CAUSE: [EndpointAuthError; 6] = [
+        EndpointAuthError::NoBoundTranscript,
+        EndpointAuthError::NotMutual,
+        EndpointAuthError::ContributionNotFresh,
+        EndpointAuthError::SignatureInvalid,
+        EndpointAuthError::ConflictingPeerContribution,
+        EndpointAuthError::ChannelNotCurrent,
+    ];
+
     #[test]
     fn v4_arc04f_every_task_owned_terminal_cause_agrees_on_the_lifecycle() {
         // The unification, stated over the whole closed set at once. Before it,
@@ -1703,9 +1760,15 @@ mod tests {
         // therefore hold a dead attempt that answered `belongs_to` with `true`.
         //
         // Enumerated rather than sampled, because the property is that no cause
-        // is special. Every one of these is a *task-owned* refusal: the
-        // encoding and profile causes are refused before a task exists and
-        // cannot be driven here at all.
+        // is special. Every one of these is a *task-owned* refusal, and since
+        // the split that is now the only kind there is: the encoding, identity
+        // and profile causes are refused at boundaries that hold no task and
+        // carry the separate `EndpointAuthSetupError`, so they cannot be spelled
+        // with this type at all, let alone driven here.
+        //
+        // Each block records the cause it actually observed, and the census
+        // below closes the enumeration against the type itself.
+        let mut observed: Vec<EndpointAuthError> = Vec::new();
 
         // A peer that echoed our own contribution back.
         {
@@ -1717,6 +1780,7 @@ mod tests {
                 Err(EndpointAuthError::ContributionNotFresh)
             );
             assert_terminal_agreement(&task, EndpointAuthError::ContributionNotFresh, retained());
+            observed.push(EndpointAuthError::ContributionNotFresh);
         }
 
         // A context with no second party. Built directly, because the whole
@@ -1734,6 +1798,7 @@ mod tests {
                 Err(EndpointAuthError::NotMutual)
             );
             assert_terminal_agreement(&task, EndpointAuthError::NotMutual, retention.count());
+            observed.push(EndpointAuthError::NotMutual);
         }
 
         // A peer half that does not verify.
@@ -1745,6 +1810,7 @@ mod tests {
                 Some(EndpointAuthError::SignatureInvalid)
             );
             assert_terminal_agreement(&task, EndpointAuthError::SignatureInvalid, retained());
+            observed.push(EndpointAuthError::SignatureInvalid);
         }
 
         // A second, different contribution for an attempt already bound.
@@ -1760,6 +1826,7 @@ mod tests {
                 EndpointAuthError::ConflictingPeerContribution,
                 retained(),
             );
+            observed.push(EndpointAuthError::ConflictingPeerContribution);
         }
 
         // A proof for an attempt that has bound nothing.
@@ -1767,9 +1834,10 @@ mod tests {
             let (task, _peer_key, retained) = counted_task();
             assert_eq!(
                 task.accept_peer_proof("premature").err(),
-                Some(EndpointAuthError::MissingTranscriptField)
+                Some(EndpointAuthError::NoBoundTranscript)
             );
-            assert_terminal_agreement(&task, EndpointAuthError::MissingTranscriptField, retained());
+            assert_terminal_agreement(&task, EndpointAuthError::NoBoundTranscript, retained());
+            observed.push(EndpointAuthError::NoBoundTranscript);
         }
 
         // And the lifecycle event itself, so the predicate is not one that only
@@ -1778,7 +1846,42 @@ mod tests {
             let (task, _peer_key, retained) = counted_task();
             task.retire();
             assert_terminal_agreement(&task, EndpointAuthError::ChannelNotCurrent, retained());
+            observed.push(EndpointAuthError::ChannelNotCurrent);
         }
+
+        // The census. Every variant of the closed terminal type was produced by
+        // a real transition above and shown to leave its attempt retired and
+        // belonging to no connector — so "every returned `EndpointAuthError` is
+        // terminal" is a statement about the type, not about the six cases
+        // somebody remembered to write down.
+        for cause in EVERY_TERMINAL_CAUSE {
+            assert!(
+                observed.contains(&cause),
+                "{cause:?} is a terminal cause no transition drove here; its driver \
+                 is `{}`, and an undriven variant is an error that terminalizes nothing",
+                driver_of(cause)
+            );
+        }
+        assert_eq!(
+            observed.len(),
+            EVERY_TERMINAL_CAUSE.len(),
+            "and nothing was driven twice to stand in for a cause that was not"
+        );
+        // Distinct drivers, so the census cannot be satisfied by a mapping that
+        // collapses several causes onto one transition and drives it once.
+        let mut drivers: Vec<&'static str> = EVERY_TERMINAL_CAUSE
+            .iter()
+            .copied()
+            .map(driver_of)
+            .collect();
+        drivers.sort_unstable();
+        let distinct = drivers.len();
+        drivers.dedup();
+        assert_eq!(
+            drivers.len(),
+            distinct,
+            "each terminal cause names its own transition"
+        );
     }
 
     #[test]
@@ -1793,10 +1896,10 @@ mod tests {
 
         assert_eq!(
             task.accept_peer_proof("premature").err(),
-            Some(EndpointAuthError::MissingTranscriptField)
+            Some(EndpointAuthError::NoBoundTranscript)
         );
 
-        assert_terminal_agreement(&task, EndpointAuthError::MissingTranscriptField, retained());
+        assert_terminal_agreement(&task, EndpointAuthError::NoBoundTranscript, retained());
         assert_eq!(
             task.signature_count(),
             0,
@@ -1809,13 +1912,13 @@ mod tests {
         let peer = peer_draw();
         assert_eq!(
             task.accept_peer_hello(peer.clone()),
-            Err(EndpointAuthError::MissingTranscriptField),
+            Err(EndpointAuthError::NoBoundTranscript),
             "a later Hello cannot revive an attempt a premature proof ended"
         );
         assert_eq!(
             task.accept_peer_proof(&peer_proof_for_test(&task, &peer, &peer_key))
                 .err(),
-            Some(EndpointAuthError::MissingTranscriptField),
+            Some(EndpointAuthError::NoBoundTranscript),
             "and neither can a proof that would otherwise have verified"
         );
         assert_eq!(task.signature_count(), 0);
@@ -2072,6 +2175,113 @@ mod tests {
             retained(),
             1,
             "the refused capability hands the channel claim back exactly once"
+        );
+    }
+
+    #[test]
+    fn v4_arc04h_a_setup_refusal_is_not_a_task_terminalization() {
+        // The discriminator for the split, asked of a live attempt. Every
+        // variant of the closed pre-task refusal type is driven here — all five
+        // of them, from the boundaries that actually produce them — while one
+        // real task is in flight, and none of them is a lifecycle event: the
+        // task is not retired, still belongs to its connector, holds no terminal
+        // cause, has signed nothing, and has not handed its channel claim back.
+        //
+        // Before the split every one of them answered with `EndpointAuthError` —
+        // the same type a dead attempt answers with — so a caller holding one could
+        // not tell "a task is over" from "a string did not parse" and had to
+        // consult its own state to find out. The types are what tell them apart
+        // now: none of the values below can even be compared against a terminal
+        // cause, let alone recorded as one.
+        let (task, peer_key, retained) = counted_task();
+
+        assert_eq!(
+            PeerContribution::from_wire(""),
+            Err(EndpointAuthSetupError::MissingContribution)
+        );
+        // Both sides of the width predicate, which one cause covers. Zero bytes
+        // encode with clear trailing bits, so each decodes cleanly and is
+        // refused on width alone rather than as a malformed spelling.
+        let full_width = super::super::contribution::CONTRIBUTION_BYTES;
+        for wrong_width in [full_width - 1, full_width + 1] {
+            let zeros = vec![0u8; wrong_width];
+            let value = data_encoding::BASE32_NOPAD.encode(&zeros).to_lowercase();
+            assert_eq!(
+                PeerContribution::from_wire(&value),
+                Err(EndpointAuthSetupError::ContributionWrongWidth)
+            );
+        }
+        assert_eq!(
+            PeerContribution::from_wire("not-base32!"),
+            Err(EndpointAuthSetupError::ContributionMalformed)
+        );
+        assert_eq!(
+            super::super::negotiate_profile(&[]),
+            Err(EndpointAuthSetupError::IncompatibleProfile)
+        );
+        assert_eq!(
+            EndpointAuthContext::new(
+                "",
+                "device-a",
+                "device-b",
+                EndpointAuthBinding::webrtc_certificate_fingerprints(LOCAL_FP, REMOTE_FP)
+                    .expect("both fixture components present"),
+            )
+            .err(),
+            Some(EndpointAuthSetupError::MissingIdentityField)
+        );
+
+        assert_eq!(
+            task.terminal_error(),
+            None,
+            "a setup refusal records no terminal cause on the attempt in flight"
+        );
+        assert!(
+            !task.is_retired(),
+            "and it retires nothing — it holds no task to retire"
+        );
+        assert!(
+            task.belongs_to(task.incarnation()),
+            "and the attempt goes on belonging to its connector"
+        );
+        assert_eq!(
+            task.signature_count(),
+            0,
+            "and nothing was signed on the way through"
+        );
+        assert_eq!(
+            retained(),
+            0,
+            "and no channel claim went back to its owner, because nothing closed"
+        );
+
+        // Non-vacuity, and the load-bearing half: the attempt is not merely
+        // un-terminalized, it is still fully usable. It binds, it promotes, and
+        // it vouches for exactly what it issued. A control that asserted only
+        // "nothing was terminalized" would pass just as well against a fixture
+        // that could never have got this far.
+        let peer = peer_draw();
+        assert!(
+            matches!(
+                task.accept_peer_hello(peer.clone())
+                    .expect("the first canonical contribution binds this attempt"),
+                AcceptedPeerHello::FirstBinding(_)
+            ),
+            "the attempt the setup refusals ran beside is still the one that binds"
+        );
+        let capability = task
+            .accept_peer_proof(&peer_proof_for_test(&task, &peer, &peer_key))
+            .expect("and still the one that promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
+        assert!(
+            task.issued(&capability),
+            "and it vouches for the capability it issued"
+        );
+        assert_eq!(
+            retained(),
+            0,
+            "the claim moved into the capability rather than back to its owner"
         );
     }
 }

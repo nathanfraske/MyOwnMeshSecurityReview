@@ -27,8 +27,6 @@ pub(crate) use incarnation::ConnectorIncarnation;
 
 use crate::runtime::attempt::ConnectorCandidateCapability;
 use crate::runtime::RuntimeIncarnation;
-use crate::transport::WebRtcConnectorIncarnation;
-use std::sync::Arc;
 
 /// Local proof that a connector candidate produced a working channel.
 ///
@@ -101,61 +99,26 @@ impl ConnectedChannelCapability {
     }
 }
 
-/// Compatibility-only, process-local authority for connector-native
-/// real-time work.
-///
-/// This type deliberately says nothing about codecs, media kinds, lanes, or
-/// application semantics. It only proves that the legacy admission path
-/// authorized real-time work on one exact live connector incarnation. It is
-/// not the generalized flow contract. That later authority must be bound to
-/// an authenticated session and principal, guarded by application policy, and
-/// backed by its own resource reservation.
-///
-/// It has no public constructor and is neither cloneable by value nor
-/// serializable. Runtime owners may share the exact instance through `Arc`.
-pub(crate) struct ConnectorRealtimeFlowCapability {
-    incarnation: Arc<WebRtcConnectorIncarnation>,
-    _resources: crate::resource::ResourceLease,
-}
-
-impl ConnectorRealtimeFlowCapability {
-    pub(super) fn new(
-        incarnation: Arc<WebRtcConnectorIncarnation>,
-        resources: crate::resource::ResourceLease,
-    ) -> Self {
-        Self {
-            incarnation,
-            _resources: resources,
-        }
-    }
-
-    pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
-        Arc::ptr_eq(&self.incarnation, incarnation) && incarnation.is_active()
-    }
-}
-
-pub(super) fn realtime_flow_capability_claim(
-) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
-    let bytes =
-        u64::try_from(std::mem::size_of::<ConnectorRealtimeFlowCapability>()).map_err(|_| {
-            crate::resource::ResourceClaimArithmeticError::Overflow {
-                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
-            }
-        })?;
-    crate::resource::ResourceClaim::try_from_entries([
-        (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
-        (crate::resource::ResourceClass::StorageObject, 1),
-        (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
-    ])
-}
+// The connector issues no real-time authority.
+//
+// Real-time work is authorized by the promoted `SessionCapability` and the flow
+// set that session owns. That set is the only thing that mints a label, and an
+// inbound track may attach only to a binding the set established, so a
+// connector holding no promoted session has nothing a track can attach to.
+//
+// There is exactly one admission decision, and it is promotion — which proves
+// the exact current connector, current policy, the authenticated local
+// principal, and a held post-authentication reservation atomically under the
+// engine's registry fence. No second connector-side capability or delivery
+// boolean exists to be kept in step with it.
 
 /// Temporary adapter for the existing live channel object.
 ///
 /// The adapter requires a capability that the connector already produced. A
 /// legacy object cannot mint the capability. Arc 04 endpoint authentication now
-/// consumes the connected channel directly — `EndpointAuthTask::authenticate`
-/// takes the whole handoff — but this wrapper was not removed by that change;
-/// its deletion belongs to Arc 05.
+/// consumes the connected channel directly: `EndpointAuthHandoff::into_generic`
+/// yields the `ConnectedChannelHandoff` moved into `EndpointAuthTask::begin`.
+/// This wrapper was not removed by that change; its deletion belongs to Arc 05.
 #[allow(
     dead_code,
     reason = "Arc 04 installs and deletes this migration adapter"

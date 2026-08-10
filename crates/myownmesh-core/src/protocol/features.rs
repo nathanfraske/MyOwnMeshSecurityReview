@@ -56,10 +56,15 @@ impl Feature {
     /// Unlike every other id here, this one is **not** an optional-frame
     /// gate. It is a hard precondition: a peer that does not advertise it
     /// cannot be authenticated at all, and the handshake fails closed with
-    /// `EndpointAuthError::IncompatibleProfile` rather than falling back to
-    /// anything. There is deliberately no negotiation and no second profile
+    /// `EndpointAuthSetupError::IncompatibleProfile` rather than falling back
+    /// to anything. There is deliberately no negotiation and no second profile
     /// to select — advertising is how a peer states it speaks the one closed
     /// profile, not how it chooses among several.
+    ///
+    /// A *setup* refusal, not a terminal one: the gate runs on the inbound
+    /// Hello before an endpoint-authentication attempt is reached, so nothing
+    /// has been terminalized when it fires. What closes the connection is the
+    /// handler's own drop of the exact current peer.
     pub const ENDPOINT_AUTH_V1: &'static str = "endpoint_auth_v1";
 }
 

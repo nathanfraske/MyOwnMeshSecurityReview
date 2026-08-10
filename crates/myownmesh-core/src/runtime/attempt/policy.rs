@@ -5,9 +5,9 @@ use crate::transport::webrtc::WebRtcConnectorProfile;
 
 /// Owner-selected bounds for the connector's closed callback-class set.
 ///
-/// Codec and media names belong to the WebRTC compatibility adapter. The
-/// connector resource owner accounts only for control, endpoint data, and
-/// codec-neutral real-time flow callbacks.
+/// Codec and media names belong to the WebRTC provider. The connector resource
+/// owner accounts only for control, endpoint data, and codec-neutral real-time
+/// flow callbacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCallbackMailboxCapacities {
     control: NonZeroUsize,
@@ -143,8 +143,6 @@ pub struct ConnectorRealtimeInboundLimits {
     max_fragment_bytes: NonZeroUsize,
     max_fragments_per_unit: NonZeroUsize,
     max_in_progress_units: NonZeroUsize,
-    max_pre_auth_packets: NonZeroUsize,
-    max_pre_auth_content_bytes: NonZeroUsize,
 }
 
 impl ConnectorRealtimeInboundLimits {
@@ -152,15 +150,11 @@ impl ConnectorRealtimeInboundLimits {
         max_fragment_bytes: NonZeroUsize,
         max_fragments_per_unit: NonZeroUsize,
         max_in_progress_units: NonZeroUsize,
-        max_pre_auth_packets: NonZeroUsize,
-        max_pre_auth_content_bytes: NonZeroUsize,
     ) -> Self {
         Self {
             max_fragment_bytes,
             max_fragments_per_unit,
             max_in_progress_units,
-            max_pre_auth_packets,
-            max_pre_auth_content_bytes,
         }
     }
 }
@@ -179,8 +173,6 @@ pub struct ConnectorRealtimeFlowPolicy {
     max_inbound_fragment_bytes: NonZeroUsize,
     max_inbound_fragments_per_unit: NonZeroUsize,
     max_in_progress_units_per_flow: NonZeroUsize,
-    max_pre_auth_packets: NonZeroUsize,
-    max_pre_auth_content_bytes: NonZeroUsize,
     byte_budgets: ConnectorRealtimeByteBudgets,
     overflow_rule: RealtimeQueueOverflowRule,
 }
@@ -226,8 +218,6 @@ impl ConnectorRealtimeFlowPolicy {
             max_inbound_fragment_bytes: inbound.max_fragment_bytes,
             max_inbound_fragments_per_unit: inbound.max_fragments_per_unit,
             max_in_progress_units_per_flow: inbound.max_in_progress_units,
-            max_pre_auth_packets: inbound.max_pre_auth_packets,
-            max_pre_auth_content_bytes: inbound.max_pre_auth_content_bytes,
             byte_budgets,
             overflow_rule,
         }
@@ -255,14 +245,6 @@ impl ConnectorRealtimeFlowPolicy {
 
     pub const fn max_in_progress_units_per_flow(self) -> NonZeroUsize {
         self.max_in_progress_units_per_flow
-    }
-
-    pub const fn max_pre_auth_packets(self) -> NonZeroUsize {
-        self.max_pre_auth_packets
-    }
-
-    pub const fn max_pre_auth_content_bytes(self) -> NonZeroUsize {
-        self.max_pre_auth_content_bytes
     }
 
     /// Bytes whose ownership is visible to this connector's real-time
@@ -459,7 +441,9 @@ impl WebRtcConnectorCapablePolicy {
         self.resources.clone()
     }
 
-    pub const fn webrtc(&self) -> WebRtcConnectorProfile {
-        self.webrtc
+    /// Borrowed since the profile stopped being `Copy`: it now carries the
+    /// application's real-time codec registrations, which are owned data.
+    pub const fn webrtc(&self) -> &WebRtcConnectorProfile {
+        &self.webrtc
     }
 }

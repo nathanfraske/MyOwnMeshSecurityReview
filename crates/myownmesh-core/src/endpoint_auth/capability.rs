@@ -139,16 +139,6 @@ impl AuthenticatedBindingRecord {
     }
 }
 
-/// Attestation of the connected-channel ownership a promotion is built on.
-///
-/// Deliberately **not** described as proof that bounded work was admitted:
-/// there is no independent Arc 04 resource admission. It carries the runtime
-/// ownership the connected capability already had. It has no public
-/// constructor, no serialization, and no cloning path.
-pub struct EndpointAuthPermit {
-    runtime: RuntimeIncarnation,
-}
-
 /// Local proof that both Device identities were freshly authenticated on one
 /// exact connected channel.
 ///
@@ -178,7 +168,6 @@ pub struct AuthenticatedChannelCapability {
     /// the connected claim to connector retention, so a capability dropped on
     /// retirement or a refused install cannot release the claim early.
     handoff: ConnectedChannelHandoff,
-    permit: EndpointAuthPermit,
 }
 
 impl AuthenticatedChannelCapability {
@@ -190,19 +179,16 @@ impl AuthenticatedChannelCapability {
         record: AuthenticatedBindingRecord,
         handoff: ConnectedChannelHandoff,
     ) -> Self {
-        let permit = EndpointAuthPermit {
-            runtime: record.runtime().clone(),
-        };
-        Self {
-            record,
-            handoff,
-            permit,
-        }
+        Self { record, handoff }
     }
 
     /// The runtime this capability is bound to.
+    ///
+    /// Read straight off the proved record. There is no separate permit token:
+    /// one would only re-state the runtime the record already carries, and a
+    /// second copy is a second thing that can disagree with the proof.
     pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.permit.runtime
+        self.record.runtime()
     }
 
     /// Whether this capability was promoted from that exact connector
@@ -261,27 +247,59 @@ fn digest_of(fields: &[&[u8]]) -> String {
 pub(crate) fn authenticated_for_test(
     runtime: RuntimeIncarnation,
 ) -> AuthenticatedChannelCapability {
-    let binding = crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
-        "fixture-local-fp",
-        "fixture-remote-fp",
-    )
-    .expect("both fixture components present");
-    let context = EndpointAuthContext::new(
+    authenticated_over_for_test(
+        crate::connector::handoff_for_test(runtime),
         "fixture-mesh",
         "fixture-device-local",
         "fixture-device-remote",
-        binding,
     )
-    .expect("non-empty fixture identifiers");
-    let handoff = crate::connector::handoff_for_test(runtime);
+}
+
+/// One genuine capability over **that exact connector's** handoff, in **that
+/// exact context**.
+///
+/// The same construction as [`authenticated_for_test`], with every identity
+/// taken from the caller's real values instead of fixture constants: the
+/// connector incarnation and the retention obligation come from the supplied
+/// handoff, and the runtime is read off the connected capability that handoff
+/// carries. A capability built here therefore satisfies `belongs_to` against
+/// the connector that produced it, `authenticated_for` against the mesh and
+/// remote Device named here, and the broker's runtime conjunct — because each
+/// is the real value rather than a stand-in that would have to be excused.
+///
+/// This exists so a control can reach a *genuinely promoted* session. Promotion
+/// is not bypassed by it: `SessionBroker::promote` still evaluates every
+/// conjunct against this capability and still refuses one that does not match
+/// the connector, policy, runtime, or available session capacity. What is
+/// skipped is only the proof exchange, exactly as for the fixture form above,
+/// and the task controls cover that separately.
+///
+/// The binding components are derived from the two Device ids so that two peers
+/// in one control do not share a binding digest — a shared digest would let a
+/// cross-peer confusion pass unnoticed.
+#[cfg(test)]
+pub(crate) fn authenticated_over_for_test(
+    handoff: ConnectedChannelHandoff,
+    mesh_context: &str,
+    local_device_id: &str,
+    remote_device_id: &str,
+) -> AuthenticatedChannelCapability {
+    let binding = crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
+        &format!("fp-local-{local_device_id}"),
+        &format!("fp-remote-{remote_device_id}"),
+    )
+    .expect("both binding components present");
+    let context =
+        EndpointAuthContext::new(mesh_context, local_device_id, remote_device_id, binding)
+            .expect("non-empty identifiers");
     let channel_runtime = handoff
         .capability()
-        .expect("fixture handoff holds its capability")
+        .expect("a fresh handoff holds its capability")
         .runtime()
         .clone();
     let record = AuthenticatedBindingRecord::from_verified_exchange(
         &context,
-        b"fixture-transcript",
+        format!("transcript-{mesh_context}-{remote_device_id}").as_bytes(),
         Arc::clone(handoff.incarnation()),
         channel_runtime,
     );
@@ -316,10 +334,16 @@ mod tests {
     #[test]
     fn v4_arc04_capability_context_and_runtime_are_exact_and_not_caller_supplied() {
         // Replacement for the old unreachable `RuntimeMismatch` control. The
-        // record answers for exactly one mesh, one remote Device, one runtime,
-        // and one proof, and two capabilities over different fixture channels
-        // are distinguishable by their transcript identity — which is what the
-        // install-side comparison relies on.
+        // record answers for exactly one mesh and one remote Device, read from
+        // itself rather than from the caller asking.
+        //
+        // The last two assertions are about *channel* identity, not about the
+        // proof: two capabilities built over different fixture channels carry
+        // the same context and therefore the same transcript, and what
+        // distinguishes them is the runtime and the connector incarnation each
+        // was minted against. Those are the two the install-side comparison
+        // rests on — a capability from another channel answers `false` to
+        // `belongs_to` even when its context matches exactly.
         let first = authenticated_for_test(crate::runtime::runtime_for_test());
         let second = authenticated_for_test(crate::runtime::runtime_for_test());
 

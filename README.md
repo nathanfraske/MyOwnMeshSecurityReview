@@ -323,7 +323,6 @@ relationship to the original TypeScript modules.
 [`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (role tiers, signed transitions, split + recovery) ·
 [`docs/NANOKVM.md`](docs/NANOKVM.md) — cross-building the daemon for a NanoKVM (riscv64 + musl) or NanoKVM-Pro (aarch64 + musl) ·
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, trust model, persistent state ·
-[`docs/v4-transition/ARC-00-BASELINE.md`](docs/v4-transition/ARC-00-BASELINE.md): exact V4 intake and baseline evidence ·
 [`CONNECTION-ENGINE-FIELD-NOTES.md`](CONNECTION-ENGINE-FIELD-NOTES.md): retained recovery evidence and tunables ·
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, conventions, testing ·
 [`RELEASE.md`](RELEASE.md) — cutting a release ·

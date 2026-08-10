@@ -72,11 +72,19 @@ base32-lowercase, accepted only in that exact canonical encoding. Both
 sides send one, and both are bound into the signed transcript.
 
 ### `auth_response`
-Proves possession of the secret key matching `hello.device_id`.
+Proves possession of the secret key matching `hello.device_id`, over the
+exact endpoint-auth transcript for this attempt — not over a bare nonce.
 
 | Field | Type | Notes |
 |---|---|---|
-| `signature` | string | Base32-lowercase ed25519 signature of the domain-tagged payload. |
+| `signature` | string | Base32-lowercase ed25519 signature over the Arc 04 endpoint-auth transcript (`ENDPOINT_AUTH_DOMAIN_TAG`, length-prefixed, role-canonical — see [Handshake signature](#handshake-signature)). Not the legacy `SIGN_DOMAIN_TAG` payload. |
+
+A peer's contribution binds an attempt exactly once, and an
+`auth_response` that arrives before anything is bound is terminal rather
+than merely refused. A second `auth_response` reaching an
+already-promoted attempt is a distinct non-error outcome and is never
+reported as a failure cause. Both rules are stated in full under
+[Handshake signature](#handshake-signature).
 
 ### `approve`
 Sent once the local side has cleared the peer (either auto-approved
@@ -324,6 +332,37 @@ this endpoint has drawn its half and no peer half exists — so the
 frame cannot become valid later, and leaving the attempt live would
 hold a channel claim open for a peer that has already violated the one
 ordering the exchange has.
+
+**Two refusal domains, and a receiver must not confuse them.** Refusing
+an *input* and terminating an *attempt* are separate outcomes with
+separate closed types, and there is no conversion between them in either
+direction.
+
+- **Setup refusals** (`EndpointAuthSetupError`) say the input was
+  unusable and nothing was harmed: an empty mesh or Device identifier,
+  an absent contribution, a contribution whose decoded value is not
+  exactly the full draw width, a contribution not in canonical
+  lowercase BASE32-nopad, or a `hello` that does not advertise
+  `endpoint_auth_v1`. These fire *before or beside* an attempt — the
+  advertisement gate in particular runs on the inbound `hello` before
+  the attempt is reached — so no attempt has been terminalized when one
+  of them fires.
+- **Terminal failures** (`EndpointAuthError`) say this attempt is over.
+  They come only from the two intake transitions, and there are exactly
+  six: no bound transcript, non-mutual Device pair, unfresh
+  contributions, invalid signature, channel no longer current, and a
+  conflicting peer contribution. Each means the attempt is retired,
+  belongs to no connector, and vouches for nothing.
+
+The receiver's behaviour on the wire is the same for both domains: it
+drops the exact current peer, keyed on the installation the frame was
+admitted for, so a replacement is never dropped for its predecessor's
+refusal. What differs is what the outcome *claims*. Sharing one
+vocabulary would have let "a string did not parse" read as "a task
+died".
+
+`AlreadyPromoted` is the one non-terminal proof outcome and is in
+neither domain: it is not a failure, and it is described in full below.
 
 Terminal causes are **first-cause**: an attempt that has already failed
 keeps the error that actually refused it. This matters because ordinary

@@ -46,22 +46,15 @@ jobs:
       - name: Tests
         run: cargo test --workspace --no-fail-fast
 
-      - name: Arc 03 final desktop compatibility artifact
-        run: |
-          cargo check -p myownmesh-core --all-targets --features "legacy-v1"
-          cargo check -p myownmesh-core --all-targets --features "legacy-media"
-          cargo check -p myownmesh-core --all-targets --features "legacy-v1,legacy-media"
-          cargo check -p myownmesh --all-targets --features "legacy-v1"
-          cargo check -p myownmesh --all-targets --features "legacy-media"
-          cargo check -p myownmesh --all-targets --features "legacy-v1,legacy-media"
-          cargo test -p myownmesh --features "legacy-v1" v4_arc03h_legacy_v1_daemon_option_is_explicit -- --nocapture
-          cargo test -p myownmesh --features "legacy-media" v4_arc03j_legacy_media_daemon_option_is_independent -- --nocapture
-          cargo test -p myownmesh --features "legacy-media" v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form -- --nocapture
-          cargo test -p myownmesh-core --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
-          cargo test -p myownmesh --features "legacy-v1,legacy-media" v4_arc03j -- --nocapture
+      # `--workspace` above runs default features only, so the transport-lab
+      # controls never compile there. One suite-wide run with the lab feature
+      # covers them. `transport-lab` is now the only optional feature in the
+      # workspace, so this is the whole non-default surface.
+      - name: Suite-wide transport-lab tests
+        run: cargo test -p myownmesh-core --features "transport-lab" --no-fail-fast
 
-  arc03-compatibility:
-    name: Arc 03 retained compatibility paths
+  boundaries-and-native:
+    name: Compile-fail boundaries and native connector controls
     runs-on: ubuntu-22.04
     env:
       RUSTFLAGS: "-D warnings"
@@ -76,67 +69,127 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: arc03-compatibility
+          key: boundaries-and-native
+
+      - name: Prefetch locked dependencies for the offline boundary harnesses
+        run: cargo fetch --locked
 
       - name: Reject deprecated use from normal V4 source
         run: |
           RUSTFLAGS="-D warnings -D deprecated" cargo check -p myownmesh-core --all-targets
           RUSTFLAGS="-D warnings -D deprecated" cargo check -p myownmesh --all-targets
 
-      - name: Compile and test retained feature paths
+      # Both compile-fail probe harnesses, side by side. These are what carry
+      # the negative boundary claims: each probe is an external crate that must
+      # fail to compile for the exact stated cause. Rust visibility, private
+      # constructors, and ordinary type checking carry the rest.
+      - name: Compiler boundary controls
         run: |
-          cargo test -p myownmesh-core --features "legacy-v1,legacy-media,transport-lab" --no-fail-fast
-          cargo test -p myownmesh --features "legacy-v1,legacy-media" --no-fail-fast
+          python3 scripts/check-v4-arc03-compiler-boundaries.py
+          python3 scripts/check-v4-arc04-compiler-boundaries.py
 
-      - name: Arc 03 compiler boundary controls
-        run: python3 scripts/check-v4-arc03-compiler-boundaries.py
-
-      - name: Arc 03 final native lifecycle, cleanup, restart, and provider controls
+      # A representative native set, not a census: connector cleanup ownership,
+      # endpoint-driven replacement, and the close fence. These open real peer
+      # connections and are `#[ignore]`d, so the suite-wide run in `check` does
+      # not reach them; the rest of the connector suite does run there.
+      - name: Native connector lifecycle controls
         run: |
           set -euo pipefail
+          # Same non-vacuity parse as the Arc 04 steps below, for the same
+          # reason: `cargo test` exits 0 when a filter matches nothing, so a
+          # renamed or deleted control would pass here silently and naming it
+          # would buy nothing. Each run must show exactly one test selected,
+          # that exact name reporting ok, and a 1 passed / 0 failed / 0 ignored
+          # summary.
+          #
+          # The tradeoff: this step used to pass `--nocapture` for readable
+          # native-connector output. `--nocapture` interleaves test stdout with
+          # the `test <name> ... ok` line, so that line can no longer be matched
+          # reliably -- and these controls are chatty. A parse that can be
+          # defeated by the output it reads is worth less than the log, so the
+          # parse wins and a failing control is diagnosed by re-running it
+          # locally. `--lib` keeps the run to one target so "running 1 test"
+          # means one test, not one of several per-target blocks.
+          run_exact_control() {
+            name="$1"
+            shift
+            log="$(mktemp)"
+            cargo test -p myownmesh-core --lib --features "transport-lab" \
+              "$name" -- --test-threads=1 "$@" | tee "$log"
+            grep -qx 'running 1 test' "$log" || {
+              echo "non-vacuity failure: '$name' selected no test, or more than one" >&2
+              exit 1
+            }
+            grep -qE "^test .*${name} \.\.\. ok\$" "$log" || {
+              echo "non-vacuity failure: '$name' did not report ok under that exact name" >&2
+              exit 1
+            }
+            grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored' "$log" || {
+              echo "non-vacuity failure: '$name' summary was not 1 passed / 0 failed / 0 ignored" >&2
+              exit 1
+            }
+          }
+
           for control in \
             v4_arc03_cancelled_construction_closes_partial_native_peer \
-            v4_arc03_cancelled_construction_with_native_close_error_retains_exact_claim \
-            v4_arc03_cancelled_delivered_result_closes_native_peer_before_release \
-            v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed \
-            v4_arc03_background_construction_failure_closes_partial_native_peer \
             v4_arc03j_native_local_ice_restart_commits_exact_replacement \
-            v4_arc03j_native_local_ice_restart_failure_retires_connector \
-            v4_arc03h_close_wins_before_open_promotion \
-            v4_arc03h_close_wins_before_legacy_realtime_admission \
-            v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks \
-            v4_arc03g_close_fence_rejects_endpoint_send_realtime_write_and_lane_open \
-            v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner \
-            v4_arc03h_legacy_v1_delivers_one_payload_across_two_native_hops \
-            v4_arc04_substituted_fingerprint_is_refused_by_the_live_handler
+            v4_arc03g_close_fence_rejects_endpoint_send \
+            v4_arc03_realtime_unit_requires_a_live_session_binding_table
           do
-            cargo test -p myownmesh-core \
-              --features "legacy-v1,legacy-media,transport-lab" \
-              "$control" -- --ignored --nocapture --test-threads=1
+            run_exact_control "$control" --ignored
           done
-          cargo test -p myownmesh-core \
-            --features "legacy-v1,legacy-media,transport-lab" \
-            v4_arc03h_failed_remove_track_retains_exact_lane_owner_and_blocks_reuse \
-            -- --nocapture --test-threads=1
 
       - name: Direct and TURN endpoint controls
         run: |
-          cargo test -p myownmesh-core --lib \
-            --features "legacy-v1,legacy-media,transport-lab" \
-            loopback_handshake_opens_data_channel \
-            -- --nocapture --test-threads=1
-          cargo test -p myownmesh-services \
-            --test turn_webrtc_endpoint_auth \
-            turn_selected_session_authenticates_endpoints_before_bidirectional_data \
-            -- --nocapture --test-threads=1
+          set -euo pipefail
+          # Parsed for non-vacuity like the steps above, and for the same
+          # reason: `cargo test` exits 0 when a filter matches nothing, so a
+          # renamed or deleted control would pass here silently.
+          #
+          # These two name the same behaviour over two ICE paths -- a direct
+          # in-process handshake and one that a real TURN server relayed -- so
+          # they live in different packages and target shapes. The helper
+          # therefore takes the selector arguments from the caller and keeps
+          # only what must not vary: the filter is the control's exact name,
+          # the harness runs single-threaded, and the three assertions are
+          # fixed. Neither control is `#[ignore]`d, so neither is selected with
+          # `--ignored` and `0 ignored` is a real assertion rather than an
+          # artefact of the flag.
+          #
+          # `--nocapture` is dropped here as elsewhere: it interleaves test
+          # stdout into the `test <name> ... ok` line these assertions match,
+          # and the TURN control in particular prints timing lines under
+          # MYOWNMESH_ARC03_OBSERVE_RAW. Reliable parsing is worth more than CI
+          # log detail; re-run locally with `--nocapture` to diagnose.
+          run_exact_control() {
+            name="$1"
+            shift
+            log="$(mktemp)"
+            cargo test "$@" "$name" -- --test-threads=1 | tee "$log"
+            grep -qx 'running 1 test' "$log" || {
+              echo "non-vacuity failure: '$name' selected no test, or more than one" >&2
+              exit 1
+            }
+            grep -qE "^test .*${name} \.\.\. ok\$" "$log" || {
+              echo "non-vacuity failure: '$name' did not report ok under that exact name" >&2
+              exit 1
+            }
+            grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored' "$log" || {
+              echo "non-vacuity failure: '$name' summary was not 1 passed / 0 failed / 0 ignored" >&2
+              exit 1
+            }
+          }
 
-  # Arc 04 endpoint authentication is basal V4 behaviour, so its evidence must
-  # not be reachable only through the deprecated compatibility features. This
-  # job builds and runs it with `transport-lab` alone: no legacy-v1, no
-  # legacy-media. Deleting the LegacyV1 subtree must not delete the proof that
-  # the endpoint-auth profile gate, the channel binding, and the promotion fence
-  # hold. It also gives the transport-lab-only configuration its own
-  # `-D warnings` gate, which no other job provides.
+          run_exact_control loopback_handshake_opens_data_channel \
+            -p myownmesh-core --lib --features "transport-lab"
+          run_exact_control turn_selected_session_authenticates_endpoints_before_bidirectional_data \
+            -p myownmesh-services --test turn_webrtc_endpoint_auth
+
+  # Endpoint authentication is basal V4 behaviour, so a small representative set
+  # of its controls is named explicitly and parsed for non-vacuity: a control
+  # that is renamed or deleted fails here rather than passing silently, which a
+  # suite-wide run cannot catch. The behavioural coverage itself lives in the
+  # suite-wide runs in `check`.
   arc04-endpoint-auth:
     name: Arc 04 basal endpoint authentication
     runs-on: ubuntu-22.04
@@ -164,9 +217,6 @@ jobs:
         # populates the cache; it does not relax the harness's offline mode.
         run: cargo fetch --locked
 
-      - name: Arc 04 compiler boundary controls
-        run: python3 scripts/check-v4-arc04-compiler-boundaries.py
-
       - name: Arc 04 basal endpoint-auth controls (transport-lab only)
         run: |
           set -euo pipefail
@@ -178,8 +228,14 @@ jobs:
           #
           # `--nocapture` is deliberately not used: it interleaves test stdout
           # into the `test <name> ... ok` line, which would make that parse
-          # unreliable. The Arc 03 native step keeps --nocapture for its
-          # human-readable evidence; this step is the machine-checked one.
+          # unreliable. Every parsed step in this file makes the same trade, so
+          # a failing control is diagnosed by re-running it locally with
+          # `--nocapture` rather than by reading CI output.
+          #
+          # The helper is repeated verbatim in each parsed step because every
+          # `run:` block is its own shell. Extracting it would mean a script
+          # file, and a shared file that drifts is worse than a duplicate that
+          # cannot.
           run_exact_control() {
             name="$1"
             shift
@@ -200,161 +256,105 @@ jobs:
             }
           }
 
+          # The named controls carry two different weights. For the ordinary
+          # ones the suite-wide transport-lab run in `check` already executes
+          # them, so naming them here adds only the rename-or-delete catch a
+          # suite-wide run passes silently. For the `#[ignore]`d ones -- which
+          # is nearly all of them -- this step is also the run: the suite-wide
+          # job never reaches them at all, so deleting a name here deletes its
+          # execution.
+          #
+          # Session admission on a real connector: an admitted peer delivers
+          # exactly one accounted unit, and a realtime open without both the
+          # capability and the policy is refused. The positive runs first, so
+          # the refusal cannot pass merely because the fixture never delivers
+          # anything at all. Both open a local WebRTC object and are therefore
+          # `#[ignore]`d, which is why they are selected with `--ignored`.
           for control in \
-            v4_arc04c_profile_negotiation_refuses_an_unadvertised_peer \
-            v4_arc04c_hello_without_the_profile_is_refused_before_any_proof_work \
-            v4_arc04c_auth_response_for_another_context_is_refused_before_promotion \
-            v4_arc04b_record_carries_the_connector_stated_binding_context \
-            v4_arc04b_binding_requires_both_components_and_names_its_profile \
-            v4_arc04b_connector_incarnation_is_exact_identity_only \
-            v4_arc04c_inbound_media_without_capability_delivers_zero_units \
-            v4_arc04c_legacy_policy_alone_delivers_zero_media_units \
-            v4_arc04c_capability_without_legacy_policy_delivers_zero_media_units \
-            v4_arc04c_capability_plus_policy_delivers_exactly_one_media_unit \
-            v4_arc04c_pre_auth_unit_is_not_released_by_later_authentication \
-            v4_arc04c_replacement_before_admission_commit_delivers_nothing_through_the_replacement
+            v4_arc04c_admitted_peer_delivers_exactly_one_accounted_unit \
+            v4_arc04c_realtime_without_capability_or_policy_is_refused
           do
-            run_exact_control "$control"
+            run_exact_control "$control" --ignored
           done
 
-          # Arc 04 E1: the inbound application path under the admission fence.
-          # The defect these pin was an `Option<bool>` that outlived the fence
-          # that produced it, after which the affected peer-directed dispatch
-          # arms re-resolved the peer by device id — so a replacement installed
-          # during the await could receive those peer-scoped effects, counters,
-          # and deliveries. Durable identity-keyed governance is intentionally
-          # outside the witness and is not what these controls cover. Each
-          # control names one consequence, because a single "replacement gets
-          # nothing" assertion passes when the frame reaches nobody at all.
-          for control in \
+          # The realtime close that returns the connected claim. It opens no
+          # native object, so it is the one control in this step that runs in
+          # the ordinary set. The captured-peer replacement control used to sit
+          # beside it and has moved into the `e1` group below: its arrangement
+          # now installs two real connectors, so it carries `#[ignore]` like its
+          # siblings and would select nothing here. It is named in exactly one
+          # place, so it executes once.
+          run_exact_control v4_arc04_promoted_capability_retains_the_connected_claim_until_native_close
+
+          # ---- Promoted-session controls, executed as groups -----------------
+          #
+          # Fourteen controls, four cargo invocations. Naming each one
+          # separately would be fourteen compiles-and-links of the same test
+          # binary for no extra guarantee, and the controlling review asked
+          # specifically not to grow dozens of one-test invocations. Two of
+          # them share no prefix with anything and stay singletons; the other
+          # twelve fall into two families that can be selected by prefix and
+          # then checked name by name.
+          #
+          # The group assertion is the same claim as the singleton one, made
+          # once per family: the run selected exactly the expected number of
+          # tests, every expected name reported ok, and the summary is all
+          # passed with nothing failed or ignored. Asserting the count *and*
+          # each name matters in both directions -- the count catches a control
+          # added to the family without being listed here, and the names catch
+          # one renamed out of it.
+          run_exact_group() {
+            prefix="$1"
+            expected="$2"
+            shift 2
+            log="$(mktemp)"
+            cargo test -p myownmesh-core --lib --features "transport-lab" \
+              "$prefix" -- --test-threads=1 --ignored | tee "$log"
+            grep -qx "running $expected tests" "$log" || {
+              echo "non-vacuity failure: '$prefix' did not select exactly $expected tests" >&2
+              exit 1
+            }
+            for name in "$@"; do
+              grep -qE "^test .*${name} \.\.\. ok\$" "$log" || {
+                echo "non-vacuity failure: '$name' did not report ok under that exact name" >&2
+                exit 1
+              }
+            done
+            grep -qE "^test result: ok\. $expected passed; 0 failed; 0 ignored" "$log" || {
+              echo "non-vacuity failure: '$prefix' summary was not $expected passed / 0 failed / 0 ignored" >&2
+              exit 1
+            }
+          }
+
+          # The two that carry no family prefix.
+          run_exact_control admission_gate_admits_application_traffic_from_active_peer --ignored
+          run_exact_control v4_arc03_outbound_application_send_requires_current_session_admission --ignored
+
+          # Inbound application effects against a replaced installation.
+          run_exact_group v4_arc04e1_ 6 \
             v4_arc04e1_admitted_inbound_effect_lands_on_the_captured_installation \
-            v4_arc04e1_captured_peer_effect_is_refused_after_replacement \
             v4_arc04e1_inbound_application_effect_never_reaches_a_replacement \
+            v4_arc04e1_captured_peer_effect_is_refused_after_replacement \
             v4_arc04e1_inbound_delivery_is_never_attributed_to_a_replacement \
             v4_arc04e1_stale_owner_application_frame_credits_the_replacement_nothing \
             v4_arc04e1_reliable_stream_state_moves_only_under_the_fence
-          do
-            run_exact_control "$control"
-          done
 
-          # Arc 04 E2: regressions that were previously non-deterministic or
-          # asserted a stale expectation. Each replaced a case that could pass
-          # for the wrong reason — a truncation whose typed cause varied by
-          # draw, a feature vector written before the profile became mandatory,
-          # and a post-refusal claim assertion that raced the dedicated cleanup
-          # thread. They are named here so a silent regression to the flaky
-          # form fails the gate rather than the nightly.
-          for control in \
-            v4_arc04_peer_contribution_rejects_short_and_noncanonical_wire_values \
-            v4_arc04b_duplicate_hello_replies_without_adopting_its_metadata \
-            v4_arc04_refused_remote_half_is_terminal_and_drives_exactly_one_native_close
-          do
-            run_exact_control "$control"
-          done
-
-          # Arc 04 E4: first-cause terminal semantics. A refused attempt must
-          # keep the error that actually refused it; ordinary teardown reaches
-          # the same terminal path, so without these the recorded cause of a
-          # conflict would depend on scheduling.
-          for control in \
-            v4_arc04e_a_conflict_keeps_its_cause_through_later_retirement \
-            v4_arc04e_later_frames_on_a_conflicted_task_report_the_conflict
-          do
-            run_exact_control "$control"
-          done
-
-          # Arc 04 F1: one locked lifecycle transition. `terminalize` is the
-          # sole writer of both the terminal state and the retired cache, and
-          # it runs with the exchange guard in hand, so a task can never report
-          # itself retired while an operation already inside the critical
-          # section is still free to sign or to move the handoff out. The
-          # racing pairs are ordered positive-first: the two controls where the
-          # operation wins the race and commits run before the two where
-          # retirement wins and refuses, so "refused" is measured against a
-          # path that demonstrably commits.
-          for control in \
-            v4_arc04f_every_task_owned_terminal_cause_agrees_on_the_lifecycle \
-            v4_arc04f_a_hello_holding_the_lock_commits_before_retirement_lands \
-            v4_arc04f_promotion_holding_the_lock_issues_a_capability_retirement_cannot_install \
-            v4_arc04f_retirement_holding_the_lock_refuses_the_signature \
-            v4_arc04f_retirement_holding_the_lock_refuses_the_handoff_move \
-            v4_arc04f_a_premature_proof_is_terminal_not_merely_refused
-          do
-            run_exact_control "$control"
-          done
-
-          # Arc 04 F2: a request id is a routing key, never an authority. Each
-          # pending operation additionally names the one canonical device that
-          # may settle it and the one response class it accepts. The positive
-          # runs first and is load-bearing: it is the legitimate settle — the
-          # same device returning over a freshly authenticated replacement
-          # connector — so without it every refusal below would pass just as
-          # well if nothing could ever settle at all.
-          for control in \
-            v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call \
+          # Who may settle a pending call. The last one is the negative that
+          # gives the family its point: a replacement connector for a
+          # *different* device still never settles.
+          #
+          # This prefix is not unique to the engine module -- `rpc.rs` has two
+          # `v4_arc04f2_` request-id collision controls. They are ordinary
+          # tests, so `--ignored` excludes them and the count is 6. If either
+          # ever gains `#[ignore]`, this selects 8 and fails here, which is the
+          # right way for that to surface.
+          run_exact_group v4_arc04f2_ 6 \
             v4_arc04f2_a_foreign_peer_cannot_settle_another_peers_pending_call \
-            v4_arc04f2_a_replacement_connector_for_a_different_device_still_never_settles \
-            v4_arc04f2_a_stream_chunk_from_a_foreign_device_is_ignored \
             v4_arc04f2_a_single_response_cannot_settle_a_pending_stream \
             v4_arc04f2_a_stream_end_cannot_settle_a_pending_single_call \
-            v4_arc04f2_request_id_collision_never_displaces_the_existing_pending_owner \
-            v4_arc04f2_a_colliding_draw_does_not_rebind_the_incumbents_device
-          do
-            run_exact_control "$control"
-          done
-
-          # Arc 04 G1: a local withdrawal names one entry, not a class of
-          # them. F2 above bound the *inbound* settle to a device and a
-          # response class; those two coordinates describe a class of
-          # operations, and a caller abandoning its own failed send needs to
-          # reach exactly one. Matching on the binding meant a stale
-          # abandonment — one whose own entry had already been settled by a
-          # response that raced the failing send — removed whatever now held
-          # the recycled id, if that newcomer was to the same device in the
-          # same class. The withdrawal is now conditional on a private
-          # process-local identity instead.
-          #
-          # The positive runs first and is load-bearing in the strongest
-          # sense available here: an identity predicate that matched nothing
-          # at all would satisfy the negative below perfectly, and would also
-          # leave every failed call pending forever. Only the positive rules
-          # that out.
-          for control in \
-            v4_arc04g1_abandonment_withdraws_the_operation_that_filed_it \
-            v4_arc04g1_a_stale_abandonment_never_removes_the_reinstalled_owner_of_a_recycled_id
-          do
-            run_exact_control "$control"
-          done
-
-          # Arc 04 G2: a second promotion is a typed non-error outcome, not a
-          # borrowed terminal cause. It used to be reported as
-          # `ChannelNotCurrent`, which made a live, intact, still-promoted
-          # task claim a terminal cause it never took and forced the engine to
-          # re-derive "benign duplicate" from its own state.
-          #
-          # Ordered so that each later control is measured against a path that
-          # demonstrably works. The first two are the positives: the task
-          # answers a second promotion without terminalizing anything, and the
-          # engine really does absorb a corroborated duplicate rather than
-          # dropping. `v4_arc04_duplicate_auth_response_after_promotion_is_idempotent`
-          # is a pre-existing control, named here for the first time because
-          # the fail-closed control below needs it: without a case where this
-          # handler does *not* drop, "already promoted with nothing installed
-          # drops" passes just as well for a handler that drops every
-          # duplicate it ever sees. The third holds `ChannelNotCurrent` to its
-          # reserved meaning — driving the same proof bytes at the same task,
-          # so the split cannot be an artefact of the frame — and the fourth
-          # is the fail-closed half: `AlreadyPromoted` states a lifecycle fact
-          # and neither that the replayed signature verified nor that the
-          # capability was installed, so an uncorroborated one drops the peer.
-          for control in \
-            v4_arc04g_second_promotion_is_benign_and_leaves_the_attempt_promoted \
-            v4_arc04_duplicate_auth_response_after_promotion_is_idempotent \
-            v4_arc04g_a_currentness_refusal_is_terminal_where_a_duplicate_is_not \
-            v4_arc04g_already_promoted_without_an_installed_channel_drops
-          do
-            run_exact_control "$control"
-          done
+            v4_arc04f2_a_stream_chunk_from_a_foreign_device_is_ignored \
+            v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call \
+            v4_arc04f2_a_replacement_connector_for_a_different_device_still_never_settles
 
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |
@@ -379,32 +379,12 @@ jobs:
             }
           }
 
-          # Live two-connector controls. The positive twin runs first: if the
-          # fixture cannot bring a real link up at all, every negative below
-          # would pass for the wrong reason.
+          # Endpoint authentication on a real two-connector link: the positive
+          # twin runs first, because if the fixture cannot bring a link up at
+          # all the refusal below would pass for the wrong reason.
           for control in \
             v4_arc04_observed_fingerprint_promotes_through_the_live_handler \
-            v4_arc04_substituted_fingerprint_is_refused_by_the_live_handler \
-            v4_arc04d_missing_local_fingerprint_is_fail_closed_on_a_live_link \
-            v4_arc04d_missing_remote_fingerprint_is_fail_closed_on_a_live_link \
-            v4_arc04d_unadvertised_profile_is_refused_by_the_live_handler \
-            v4_arc04c_send_uses_the_captured_session_and_records_only_the_captured_peer \
-            v4_arc04c_connector_replacement_blocks_later_media_from_the_old_incarnation
-          do
-            run_exact_control "$control" --ignored
-          done
-
-          # Arc 04 E3: the real missing-binding path, driven through the
-          # production open path on a live link rather than through a
-          # hand-built context. The positive twin runs first for the same
-          # reason as the block above: if stated components cannot open and
-          # start a handshake at all, "absent component fails closed" passes
-          # for the wrong reason.
-          for control in \
-            v4_arc04e_stated_binding_components_open_and_start_the_handshake \
-            v4_arc04e_absent_local_binding_component_fails_the_open_path_closed \
-            v4_arc04e_absent_remote_binding_component_fails_the_open_path_closed \
-            v4_arc04f3_refused_open_retains_its_claim_when_the_native_close_fails
+            v4_arc04_substituted_fingerprint_is_refused_by_the_live_handler
           do
             run_exact_control "$control" --ignored
           done

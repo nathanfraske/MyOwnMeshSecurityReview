@@ -72,8 +72,7 @@ deliberate zero. The current WebRTC connector does not yet charge
 not charge `RelayOrProviderAllocation` for a native TURN allocation. Supplying
 either value does not enforce that native resource today. Those allocations
 remain dependency or provider residuals until the adapter exposes an exact
-claim. See the
-[Arc 03 resource ownership report](v4-transition/ARC-03-RESOURCE-OWNERSHIP-REPORT.md#4-current-resource-ownership-and-residual-matrix).
+claim.
 
 Set `MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=none` for ordinary elastic
 construction. In that mode no Mesh, peer, connector, flow, or queue-item count
@@ -108,8 +107,6 @@ MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW
 MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES
 MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT
 MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW
-MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS
-MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_CONTENT_BYTES
 MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES
 MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES
 ```

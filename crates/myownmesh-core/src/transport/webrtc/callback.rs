@@ -13,7 +13,14 @@ impl ConnectorCallbackClass {
     pub(super) fn for_event(event: &TransportEvent) -> Self {
         match event {
             TransportEvent::Message(_) => Self::EndpointData,
-            TransportEvent::AudioSample(_) | TransportEvent::VideoSample(_) => Self::Realtime,
+            // `Realtime` has no callback mailbox, so classing a unit this way
+            // makes the general callback route fail *closed* — `emit_inner`
+            // answers `WrongOwnerPath` rather than dropping it on the control
+            // lane uncapped, where a media flood would displace ICE and
+            // peer-state events. Real-time units take `emit_realtime`, which
+            // is charged, observed and gated; this is the backstop for a route
+            // that should never be taken.
+            TransportEvent::RealtimeUnit(_) => Self::Realtime,
             _ => Self::Control,
         }
     }

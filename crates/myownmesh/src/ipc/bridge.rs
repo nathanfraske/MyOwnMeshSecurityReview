@@ -206,121 +206,77 @@ pub fn spawn_channel_pump(
     });
 }
 
-/// Spawn the per-network video fan-out for IPC subscribers.
-/// Caller spawns this only on the FIRST `subscribe_video(...)`;
-/// the task exits once the subscriber list empties (same passive
-/// teardown as the channel pump) or the network is torn down.
+/// Spawn the per-session realtime flow lifecycle pump.
 ///
-/// The engine's video broadcast is shallow by design: if this
-/// pump (or a slow client socket) lags, old samples are dropped
-/// at the broadcast and the stream resumes from the freshest one
-/// — video is freshness, never a backlog.
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "this pump is confined to the explicit deprecated legacy-media daemon surface"
-)]
-pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
-    let mut sub = network.state().subscribe_video();
+/// Note what this does *not* carry: units. The two pumps it replaces fanned
+/// decoded samples out of a per-network broadcast, and units no longer travel
+/// that way — they are pulled per session on an inbound `realtime_pipe` by the
+/// connection that will write them. Re-broadcasting them here would put a copy
+/// of every unit through a second queue for no reader.
+///
+/// What it carries is one thing: `realtime_flow_closed`. Every one a client sees
+/// comes from this stream and nowhere else — nothing is inferred from a refusal,
+/// because two sources for one fact would eventually disagree with no rule for
+/// which wins. There is no open event to carry, by design at both ends: a flow
+/// exists only because this side's application asked for one, and that ask is
+/// answered by the response to its own request.
+///
+/// Session retirement is not carried either, because it is not an event: the
+/// stream simply ends. That is deliberate on core's side — a retirement item
+/// could be dropped, reordered or delivered twice, and the end of a stream can
+/// be none of those. So a whole-session teardown arrives once, as `None`, not as
+/// one death per flow.
+///
+/// Lifetime: claimed once per session, so the caller spawns this on the first
+/// flow opened for a `(network, peer)` — a second claim answers `None` and no
+/// task starts. `None` from the stream is terminal and means the session ended,
+/// which is also the only way this task exits. A later session for the same peer
+/// is claimable again, so nothing has to be remembered between them.
+pub fn spawn_realtime_flow_events(
+    network: std::sync::Arc<JoinedNetwork>,
+    network_key: String,
+    peer: String,
+    registry: ClientRegistry,
+) {
+    let Some(events) = network.realtime_flow_events(&peer) else {
+        // Already claimed for this session, or the session is gone. Both mean
+        // this task would carry nothing.
+        return;
+    };
     tokio::spawn(async move {
         loop {
-            let subscribers = registry.video_subscribers(&network_key);
-            if subscribers.is_empty() {
-                debug!(network = %network_key, "video pump exiting (no subscribers)");
+            let Some(event) = network.next_realtime_flow_event(&events).await else {
+                debug!(
+                    network = %network_key,
+                    %peer,
+                    "realtime flow events ended (session over)"
+                );
                 break;
-            }
-            let inbound = match sub.recv().await {
-                Ok(s) => s,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    debug!(network = %network_key, "video pump lagged; dropped {n} samples");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    debug!(network = %network_key, "video pump exiting (network closed)");
-                    break;
-                }
             };
-            // Binary body for clients on a media-source pipe; built once.
-            let body = crate::control::encode_inbound_frame(
-                crate::control::MEDIA_KIND_VIDEO,
-                inbound.sample.key,
-                inbound.sample.lane,
-                inbound.sample.rtp_timestamp,
-                &inbound.from,
-                &inbound.sample.data,
-            );
-            for client_id in subscribers {
-                if let Some(client) = registry.client(client_id) {
-                    if let Some(sink) = client.media_sink() {
-                        let _ = sink.send(body.clone());
-                    } else {
-                        client.send(ServerOut::VideoInbound {
-                            network: network_key.clone(),
-                            from: inbound.from.clone(),
-                            stream: inbound.sample.lane,
-                            rtp_timestamp: inbound.sample.rtp_timestamp,
-                            key: inbound.sample.key,
-                            data: data_encoding::BASE64.encode(&inbound.sample.data),
-                        });
+            let subscribers = registry.realtime_subscribers(&network_key);
+            if subscribers.is_empty() {
+                // Nobody is listening, but the stream is still drained: leaving
+                // events unread would stall it, and a client that subscribes
+                // later should not inherit a backlog about flows that have
+                // already come and gone.
+                continue;
+            }
+            // One variant, and the match is exhaustive on it. There is no open
+            // event to discard here: a flow exists only because this side's
+            // application asked for one, and that ask is already answered by the
+            // response to its own request.
+            let frame = match event {
+                myownmesh_core::realtime::RealtimeFlowEvent::Closed { label } => {
+                    ServerOut::RealtimeFlowClosed {
+                        network: network_key.clone(),
+                        from: peer.clone(),
+                        flow_label: label,
                     }
                 }
-            }
-        }
-    });
-}
-
-/// Spawn the per-network audio fan-out for IPC subscribers — the
-/// audio twin of [`spawn_video_pump`], with the same passive
-/// teardown (exits once the subscriber list empties) and the same
-/// lag policy (a slow client sheds the oldest frames; live audio
-/// is freshness, never a backlog).
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "this pump is confined to the explicit deprecated legacy-media daemon surface"
-)]
-pub fn spawn_audio_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
-    let mut sub = network.state().subscribe_audio();
-    tokio::spawn(async move {
-        loop {
-            let subscribers = registry.audio_subscribers(&network_key);
-            if subscribers.is_empty() {
-                debug!(network = %network_key, "audio pump exiting (no subscribers)");
-                break;
-            }
-            let inbound = match sub.recv().await {
-                Ok(s) => s,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    debug!(network = %network_key, "audio pump lagged; dropped {n} frames");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    debug!(network = %network_key, "audio pump exiting (network closed)");
-                    break;
-                }
             };
-            // Binary body for clients on a media-source pipe; built once.
-            let body = crate::control::encode_inbound_frame(
-                crate::control::MEDIA_KIND_AUDIO,
-                false,
-                inbound.sample.lane,
-                inbound.sample.rtp_timestamp,
-                &inbound.from,
-                &inbound.sample.data,
-            );
             for client_id in subscribers {
                 if let Some(client) = registry.client(client_id) {
-                    if let Some(sink) = client.media_sink() {
-                        let _ = sink.send(body.clone());
-                    } else {
-                        client.send(ServerOut::AudioInbound {
-                            network: network_key.clone(),
-                            from: inbound.from.clone(),
-                            stream: inbound.sample.lane,
-                            rtp_timestamp: inbound.sample.rtp_timestamp,
-                            data: data_encoding::BASE64.encode(&inbound.sample.data),
-                        });
-                    }
+                    client.send(frame.clone());
                 }
             }
         }

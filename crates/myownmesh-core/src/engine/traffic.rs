@@ -94,10 +94,6 @@ pub struct TrafficCounters {
     app_rx: Lane,
     other_tx: Lane,
     other_rx: Lane,
-    /// Routed envelopes we re-forwarded for someone else (already
-    /// counted under `app` at the wire; this names the forwarding duty
-    /// itself so hubs can see the load they carry).
-    relayed_forwarded: AtomicU64,
     /// Signaling events, by discovery vs pairwise negotiation.
     announces_rx: AtomicU64,
     negotiation_rx: AtomicU64,
@@ -129,10 +125,6 @@ impl TrafficCounters {
         self.lane(class, false).record(bytes);
     }
 
-    pub fn record_forwarded(&self) {
-        self.relayed_forwarded.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn record_signaling_rx(&self, announce: bool) {
         if announce {
             self.announces_rx.fetch_add(1, Ordering::Relaxed);
@@ -162,7 +154,6 @@ impl TrafficCounters {
             app_rx: self.app_rx.read(),
             other_tx: self.other_tx.read(),
             other_rx: self.other_rx.read(),
-            relayed_forwarded: self.relayed_forwarded.load(Ordering::Relaxed),
             announces_rx: self.announces_rx.load(Ordering::Relaxed),
             negotiation_rx: self.negotiation_rx.load(Ordering::Relaxed),
             announces_tx: self.announces_tx.load(Ordering::Relaxed),
@@ -193,8 +184,6 @@ pub struct TrafficSnapshot {
     pub app_rx: LaneSnapshot,
     pub other_tx: LaneSnapshot,
     pub other_rx: LaneSnapshot,
-    /// Envelopes this node carried onward for other members.
-    pub relayed_forwarded: u64,
     /// Signaling: presence announces seen / published.
     pub announces_rx: u64,
     pub announces_tx: u64,
@@ -235,7 +224,6 @@ mod tests {
         t.record_rx(FrameClass::Keepalive, 10);
         t.record_signaling_rx(true);
         t.record_signaling_tx(false);
-        t.record_forwarded();
         let s = t.snapshot();
         assert_eq!(
             s.app_tx,
@@ -247,6 +235,5 @@ mod tests {
         assert_eq!(s.keepalive_rx.frames, 1);
         assert_eq!(s.announces_rx, 1);
         assert_eq!(s.negotiation_tx, 1);
-        assert_eq!(s.relayed_forwarded, 1);
     }
 }

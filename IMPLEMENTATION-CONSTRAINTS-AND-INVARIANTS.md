@@ -347,7 +347,7 @@ Those types express only session binding, direction, lifecycle, bounded delivery
 
 The basal core must not define or require:
 
-- `LaneKind::Video` or `LaneKind::Audio`;
+- a fixed video or audio flow kind;
 - H.264, Opus, screen, camera, microphone, or product-specific codec semantics;
 - a globally fixed media-lane count;
 - track numbers as application or mesh authority;
@@ -355,7 +355,7 @@ The basal core must not define or require:
 
 A WebRTC implementation may keep RTP, RTCP, transceivers, native track setup, m-line reuse, and drain behavior inside a WebRTC-specific extension. Application or compatibility adapters map application codec and purpose onto those native flows. A data-only connector that reports no real-time flow capability remains conforming.
 
-During migration, legacy `MediaLaneOpen`, `MediaLaneClose`, `VideoSample`, `AudioSample`, H.264, and Opus APIs may remain only as a compatibility facade over the optional real-time flow provider. No new product behavior may be added to that facade, and it must have a named deletion arc.
+No compatibility facade over the real-time flow provider exists or may be reintroduced. The `MediaLaneOpen`, `MediaLaneClose`, `VideoSample`, `AudioSample`, and fixed H.264/Opus APIs are deleted, and their absence from the public API is held by compile-fail controls in `scripts/check-v4-arc03-compiler-boundaries.py`.
 
 ## 7. Endpoint authentication and channel promotion
 
@@ -376,7 +376,7 @@ A signaling account, ICE username, DTLS certificate not bound to the Device ID, 
 **Implementation status (Arc 04).** This document claims no execution or audit result; citation requires exact-state local evidence and exact-head hosted/audit evidence recorded externally. The requirements above are unchanged; this records which permitted alternative was selected and how it is composed.
 
 - *Exact connected channel or channel exporter*: the **channel** alternative was selected, and it is satisfied by composition rather than by any single term. The peer-agreed cryptographic binding term is both endpoints' DTLS certificate fingerprints in role-canonical order. **The fingerprint pair alone does not establish exact-channel binding** — reused certificates make it non-session-unique. Exactness of the overall promotion comes from two further parts: the two fresh bilateral contributions, which bind the transcript to *this attempt*; and the non-transferable, connector-incarnation-owned handoff and capability, which bind the promotion to *this live connector*. The RFC 5705 exporter alternative is **deferred**: it is implemented in `webrtc-dtls` but unreachable, since `DTLSConn.state` and `RTCDtlsTransport::conn()` are both crate-private, so reaching it would require vendoring a third dependency while vendored-tree integrity remains an open gate.
-- *Negotiated cryptographic profile*: realised as a closed single-variant selection (`EndpointAuthProfile::V1Ed25519Dtls`), bound as a signed length-prefixed field. There is no negotiation source yet, so the requirement is met by construction — a caller cannot select a weaker profile because no other inhabitant exists — rather than by runtime agreement.
+- *Negotiated cryptographic profile*: realised as a closed single-variant selection (`EndpointAuthProfile::V1Ed25519Dtls`), **derived** from the connector's closed binding profile and bound into the transcript as a signed length-prefixed field. The requirement is met by construction rather than by runtime agreement: no other inhabitant exists, so no caller and no peer can select anything weaker. The one peer-facing input is the `endpoint_auth_v1` advertisement, and it is a **fail-closed compatibility precondition, not a weaker-profile negotiation**: it decides only whether an attempt begins at all. A peer that omits it is refused with a typed incompatible-profile cause before any transcript is assembled and before any signature is produced or verified, so there is no fallback, no downgrade path, no free-form profile string, and no third outcome. That refusal belongs to the setup vocabulary rather than the attempt-terminal one — the gate runs on the inbound Hello before the attempt is reached, so it terminalizes nothing, and what fails the connection closed is the handler's own drop of the exact current peer. Because the selected profile is itself a signed transcript field, an advertisement can never widen or replace what the transcript commits to.
 - *Residual, and it is load-bearing*: because the binding term is not session-unique, replay across channels is prevented by the two per-attempt CSPRNG contributions, and transfer or survival of an already-issued capability is prevented by exact connector-incarnation ownership. Ownership does not make an otherwise-valid signature invalid, and the binding does not separate sessions — neither mechanism substitutes for the other.
 
 ### 7.2 Promotion transition

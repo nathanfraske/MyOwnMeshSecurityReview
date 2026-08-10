@@ -17,8 +17,9 @@ Own native connector work and turn one admitted candidate into a live connected 
 ## Outputs
 
 - `ConnectedChannelCapability` after the channel is proven to work;
-- an optional compatibility-only `ConnectorRealtimeFlowCapability` after the current peer is admitted through exact Endpoint Auth provenance;
 - connector observations, failure, or cleanup completion.
+
+The connector issues no separate real-time authority. Real-time work is authorized by the promoted session that owns the flow set, which the engine mints under its registry fence; the connector only carries units for flows that session already opened.
 
 ## Dependencies
 
@@ -40,4 +41,4 @@ This worker does not mint session authority, decide mesh authorization, authenti
 
 `LegacyConnectedChannel<T>` keeps the current native channel object beside an already-created capability. It cannot create authority from the legacy value.
 
-Arc 04 endpoint authentication now consumes the connected channel directly: `EndpointAuthTask::authenticate` takes the whole `EndpointAuthHandoff` — capability, connector incarnation, and close owner together — so the close-owner retention travels with the promotion. `LegacyConnectedChannel<T>` was **not** deleted by that change and still exists; its removal remains Arc 05's.
+Arc 04 endpoint authentication now consumes the connected channel directly: the connector's `EndpointAuthHandoff` carries capability, connector incarnation, and close owner together, `EndpointAuthHandoff::into_generic` narrows it to the transport-neutral `ConnectedChannelHandoff`, and `EndpointAuthTask::begin` takes that whole value — so the close-owner retention travels with the promotion. `LegacyConnectedChannel<T>` was **not** deleted by that change and still exists; its removal remains Arc 05's.

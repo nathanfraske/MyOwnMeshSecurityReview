@@ -587,57 +587,6 @@ impl JoinedNetwork {
         }
     }
 
-    /// Open the lowest free media lane of `kind` toward `peer` and
-    /// return its id — the explicit reservation twin of the write-time
-    /// auto-open (writing to a closed lane opens it transparently).
-    /// The new m-line goes live on the next coalesced renegotiation;
-    /// writes before that are no-ops, exactly like stream start.
-    #[deprecated(
-        since = "0.3.2",
-        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
-    )]
-    #[cfg(feature = "legacy-media")]
-    pub async fn open_media_lane(
-        &self,
-        peer: &str,
-        kind: crate::transport::LaneKind,
-    ) -> Result<u8> {
-        self.state.media_lane_open(peer, kind).await
-    }
-
-    /// Suspend a media lane toward `peer`. The track remains negotiated until
-    /// an explicit resume or finalize event. No elapsed time changes its
-    /// ownership. Suspending a lane that is not open is a no-op.
-    #[deprecated(
-        since = "0.3.2",
-        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
-    )]
-    #[cfg(feature = "legacy-media")]
-    pub async fn close_media_lane(
-        &self,
-        peer: &str,
-        kind: crate::transport::LaneKind,
-        lane: u8,
-    ) -> Result<()> {
-        self.state.media_lane_close(peer, kind, lane).await
-    }
-
-    /// Finalize all explicitly suspended transient lanes for one peer and
-    /// schedule the resulting lane-set renegotiation. No elapsed time can
-    /// trigger this transition.
-    #[cfg(feature = "legacy-media")]
-    #[allow(
-        deprecated,
-        reason = "this exact method is the temporary legacy media finalization boundary"
-    )]
-    #[deprecated(
-        since = "0.3.2",
-        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
-    )]
-    pub async fn finalize_suspended_media_lanes(&self, peer: &str) -> Result<usize> {
-        self.state.media_lanes_finalize(peer).await
-    }
-
     /// Point-in-time traffic accounting for this network: frames and
     /// bytes by class (keepalive / control / gossip / app), signaling
     /// publish and receive counts split into presence vs pairwise
@@ -705,6 +654,172 @@ impl JoinedNetwork {
     #[doc(hidden)]
     pub fn state(&self) -> Arc<NetworkState> {
         self.state.clone()
+    }
+
+    /// Open one WebRTC realtime flow to `peer` on this network.
+    ///
+    /// **Named for its provider on purpose.** It carries WebRTC's own
+    /// vocabulary — RTP kind, MIME, clock rate, channels — which is meaningless
+    /// without a negotiated RTP clock and therefore is not a MyOwnMesh fact. A
+    /// caller reading this name knows which provider it has bound itself to;
+    /// the basal operations beside it carry no provider name because they carry
+    /// no provider vocabulary.
+    ///
+    /// `peer` is a Device **selector**, not authority: it names an installation
+    /// to resolve, and every fact that authorizes the flow — the promoted
+    /// session, the exact live connector, the local principal — is produced
+    /// inside the engine at the moment of use and never travels out here.
+    ///
+    /// `label` is the application's own choice and the application is the sole
+    /// allocator. It comes back unchanged, is scoped to one session, and grants
+    /// nothing on its own: presenting it later still resolves a live session
+    /// first. Core neither allocates a label nor enforces a capacity — the
+    /// bounded namespace refuses a duplicate as
+    /// [`RealtimeRefusal::LabelInUse`], and the application sizes its own pool
+    /// from the profile capacity it supplied at startup.
+    ///
+    /// The provider's configuration is validated **here**, before any session
+    /// is resolved, so an unusable request is refused as
+    /// [`RealtimeRefusal::ProviderConfigurationInvalid`] without costing a
+    /// fence acquisition — and the engine below never sees provider vocabulary
+    /// at all.
+    ///
+    /// Async because opening a flow brings its native half up with it: a
+    /// transceiver for an inbound flow, a sender and its pump for an outbound
+    /// one. Those await, and the fence they must be proved against is a
+    /// synchronous lock, so the operation is split around them rather than
+    /// holding anything across.
+    ///
+    /// Still one call and still all-or-nothing from the caller's side. A
+    /// refusal has released both halves — the label through the fence, the
+    /// native object through the connector — so a failed open leaves nothing
+    /// behind to collide with the next one.
+    pub async fn open_webrtc_realtime(
+        &self,
+        peer: &str,
+        open: crate::transport::webrtc::WebRtcRealtimeFlowOpen,
+    ) -> std::result::Result<u8, crate::realtime::RealtimeRefusal> {
+        let spec = crate::transport::webrtc::RealtimeFlowSpec::try_from(open)?;
+        self.state.open_realtime_negotiated(peer, spec).await
+    }
+
+    /// Hand one unit to an outbound WebRTC flow. Synchronous: it queues and
+    /// returns, and the connector drains to the native track on its own task.
+    pub fn send_webrtc_realtime(
+        &self,
+        peer: &str,
+        label: u8,
+        unit: crate::transport::webrtc::WebRtcRealtimeOutboundUnit,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        self.state.send_realtime(peer, label, unit.into())
+    }
+
+    /// Take one queued unit from an inbound WebRTC flow.
+    ///
+    /// `Ok(None)` is a live flow with nothing ready — an ordinary state, not a
+    /// refusal.
+    pub fn recv_webrtc_realtime(
+        &self,
+        peer: &str,
+        label: u8,
+    ) -> std::result::Result<
+        Option<crate::transport::webrtc::WebRtcRealtimeInboundUnit>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        self.state
+            .recv_realtime(peer, label)
+            .map(|unit| unit.map(Into::into))
+    }
+
+    /// Close one flow and release its label back to that session's namespace.
+    /// Async, and the await is the point: it returns after the flow's native
+    /// half has been asked to go, not merely after the label was released.
+    ///
+    /// A caller that pins a label and re-opens it is entitled to assume the
+    /// previous occupant is gone when this returns. Acking before the
+    /// retirement was attempted would make that assumption false in exactly the
+    /// case it matters — an immediate re-open onto the same label — so the ack
+    /// follows the attempt.
+    ///
+    /// Whole-connector retirement is not relied on anywhere in this path: the
+    /// same connector may host a replacement session, so a flow's native half
+    /// can outlive the flow while the connector stays healthy.
+    pub async fn close_realtime(
+        &self,
+        peer: &str,
+        label: u8,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        self.state.close_realtime_negotiated(peer, label).await
+    }
+
+    /// Whether that label still names a usable flow on `peer`'s current session.
+    ///
+    /// Answers `false` for every not-usable reason, because the question is only
+    /// ever "may I use this".
+    pub fn realtime_is_current(&self, peer: &str, label: u8) -> bool {
+        self.state.realtime_is_current(peer, label)
+    }
+
+    /// Claim the inbound stream of `peer`'s current session.
+    ///
+    /// One consumer at a time. `None` if a handle is already outstanding, and
+    /// `None` for a peer with no live session — the caller has proved nothing,
+    /// so it learns only that it does not have the stream. Dropping the
+    /// outstanding handle releases the claim and this answers `Some` again while
+    /// the session is still current.
+    ///
+    /// Poll-free receiving for an application with many flows — one task awaits
+    /// the whole session instead of one per flow, which is why the arrival
+    /// carries the label it arrived on.
+    pub fn realtime_inbound(&self, peer: &str) -> Option<crate::realtime::RealtimeInboundStream> {
+        self.state.claim_realtime_inbound(peer)
+    }
+
+    /// The next unit to arrive on any inbound flow of that session.
+    ///
+    /// `None` is terminal: the session ended, and the caller should close. That
+    /// is the only end-of-session signal there is — deliberately, because a
+    /// retirement flag would be a second fact that could disagree with the
+    /// first, and something would have to outlive the session to deliver it.
+    pub async fn recv_webrtc_realtime_any(
+        &self,
+        inbound: &crate::realtime::RealtimeInboundStream,
+    ) -> Option<crate::transport::webrtc::WebRtcRealtimeInboundArrival> {
+        self.state
+            .next_realtime_arrival(inbound)
+            .await
+            .map(
+                |(label, unit)| crate::transport::webrtc::WebRtcRealtimeInboundArrival {
+                    label,
+                    unit: unit.into(),
+                },
+            )
+    }
+
+    /// Claim the flow-close stream of `peer`'s current session.
+    ///
+    /// Separately leased from the inbound stream, with the same one-at-a-time
+    /// and release-on-drop rules: one wake goes to one waiter, so a lifecycle
+    /// consumer sharing the inbound signal would take wakes the receiver needed.
+    ///
+    /// Closes only. An open is answered by the response to the request that
+    /// asked for it, and a peer cannot mint a flow, so there is nothing else
+    /// for this stream to report.
+    pub fn realtime_flow_events(
+        &self,
+        peer: &str,
+    ) -> Option<crate::realtime::RealtimeFlowEventStream> {
+        self.state.claim_realtime_flow_events(peer)
+    }
+
+    /// The next close on that session's flows.
+    ///
+    /// `None` is terminal and means the session ended.
+    pub async fn next_realtime_flow_event(
+        &self,
+        events: &crate::realtime::RealtimeFlowEventStream,
+    ) -> Option<crate::realtime::RealtimeFlowEvent> {
+        self.state.next_realtime_flow_event(events).await
     }
 }
 

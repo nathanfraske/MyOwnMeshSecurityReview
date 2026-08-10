@@ -41,8 +41,7 @@ pub enum CtlCmd {
     /// Roster ops on a saved network.
     #[command(subcommand)]
     Roster(RosterCmd),
-    /// Host infrastructure services for the mesh: relay / signaling /
-    /// STUN / TURN.
+    /// Host infrastructure services for the mesh: signaling / STUN / TURN.
     #[command(subcommand)]
     Services(ServicesCmd),
     /// Closed-network governance: state, proposals, signing, and the
@@ -115,18 +114,18 @@ pub enum MfaCmd {
 pub enum ServicesCmd {
     /// Show which services this device hosts and their listen addresses.
     Status,
-    /// Turn a service on: node | relay | signaling | stun | turn.
+    /// Turn a service on: node | signaling | stun | turn.
     /// `node` is mesh participation itself (off = pure-infrastructure
     /// box). TURN also needs credentials + a public IP — set those in
     /// config.json (or the GUI) first; an enabled-but-unconfigured TURN
     /// shows as not running.
     Enable {
-        /// node | relay | signaling | stun | turn
+        /// node | signaling | stun | turn
         service: String,
     },
-    /// Turn a service off: node | relay | signaling | stun | turn.
+    /// Turn a service off: node | signaling | stun | turn.
     Disable {
-        /// node | relay | signaling | stun | turn
+        /// node | signaling | stun | turn
         service: String,
     },
 }
@@ -480,12 +479,16 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
         serde_json::from_value(config_val).context("parse current services config")?;
     match service {
         "node" => services.node.enabled = enabled,
-        "relay" => services.relay.enabled = enabled,
         "signaling" => services.signaling.enabled = enabled,
         "stun" => services.stun.enabled = enabled,
         "turn" => services.turn.enabled = enabled,
+        // `relay` was a name here. It selected ordinary-member application
+        // payload forwarding, not TURN — a device that relays packets for peers
+        // is `turn`. It falls through to the error below with the rest, which
+        // is the point: an operator who types it is told the name does not
+        // exist rather than quietly toggling something else.
         other => {
-            bail!("unknown service '{other}' — expected node | relay | signaling | stun | turn")
+            bail!("unknown service '{other}' — expected node | signaling | stun | turn")
         }
     }
     // Capture the TURN port plan before `services` is moved, so we can

@@ -622,11 +622,19 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("not admitted for application traffic"),
-            "the refusal must come from the admission fence, got: {error}"
+                .contains("no live promoted session for application traffic"),
+            "the refusal must come from the session gate, got: {error}"
         );
         assert!(
-            state.peers.with_admitted_current(owner, |_| ()).is_none(),
+            state
+                .peers
+                .with_admitted_current(
+                    owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                    |_| ()
+                )
+                .is_none(),
             "and the fence must mint no witness for it"
         );
     }
@@ -728,9 +736,17 @@ mod tests {
             "and the caller is still waiting"
         );
 
-        // With a real capability installed, the same fence that refused twice
-        // now mints a witness for the exact peer. That is the layer advancing:
-        // admission opened, so neither negative above was a transport failure.
+        // A real capability is installed, and the fence *still* mints nothing —
+        // which is the point after the session cutover. A capability plus policy
+        // no longer opens admission by itself; a promoted session does, and this
+        // fixture has neither a connector worker to promote from nor a broker,
+        // since it installs no resource provider.
+        //
+        // Stated rather than papered over: this control can no longer witness
+        // admission opening. That property moved to the broker's own positive
+        // control, which promotes with every conjunct satisfied. What is still
+        // proven here is the part that belongs to this layer — the entry stays
+        // retriable across all three states and never silently drops.
         state
             .peers
             .get("peer")
@@ -741,22 +757,33 @@ mod tests {
             Some(true),
             "readiness still unchanged across the whole control"
         );
-        assert_eq!(
+        assert!(
             state
                 .peers
-                .with_admitted_current(&owner, |admitted| admitted.device_id().to_string()),
-            Some("peer".to_string()),
-            "the admission fence now admits the exact peer"
+                .with_admitted_current(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                    |admitted| admitted.device_id().to_string()
+                )
+                .is_none(),
+            "an installed capability alone mints no witness without a session"
         );
-        // The send itself still cannot complete on this fixture, because
-        // `admit_application_operation` additionally requires a live connector
-        // worker and this peer has none by construction. That refusal is folded
-        // into the same `Option`, so it reports the same message — which is why
-        // the advance is asserted at the fence above rather than by comparing
-        // error strings.
+        // The send itself still cannot complete on this fixture. It now needs a
+        // promoted session, and this peer has neither a connector worker to
+        // promote from nor a broker on a fixture with no resource provider.
+        // Both refusals fold into the same `Option`, which is why the advance is
+        // asserted at the fence above rather than by comparing error strings.
         assert!(
-            state.peers.admit_application_operation(&owner).is_none(),
-            "an admitted peer with no connector still has nothing to write through"
+            state
+                .peers
+                .admit_application_operation(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id
+                )
+                .is_none(),
+            "an admitted peer with no promoted session has nothing to write through"
         );
         // Stated plainly rather than dressed up: this last flush also leaves the
         // entry queued. Admission opened — the fence above says so — but a

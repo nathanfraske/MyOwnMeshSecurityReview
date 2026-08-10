@@ -110,14 +110,12 @@ lto = true
 opt-level = "s"
 strip = true
 
-# A debug daemon must still *stream*. AllMyStuff's `just dev` (and this
-# repo's own) runs `target/debug/myownmesh` as the sidecar, which used to
-# push every media byte — DTLS-SRTP encryption, RTP packetization, H.264
-# access-unit reassembly, the base64/JSON control-socket framing — through
-# opt-level 0. On a 20+ Mbps screen stream that read as "the app is slow"
-# when it was the dev profile. The daemon's own code stays unoptimized for
-# fast iteration; the per-packet hot path below gets real codegen, the
-# same targeted-override trick AllMyStuff uses for its pixel loops.
+# A debug daemon must still *stream*. `just dev` runs `target/debug/myownmesh`,
+# which used to push every media byte — DTLS-SRTP encryption, RTP packetization,
+# access-unit reassembly, control-socket framing — through opt-level 0. On a
+# 20+ Mbps screen stream that reads as "the application is slow" when it is the
+# dev profile. The daemon's own code stays unoptimized for fast iteration; the
+# per-packet hot path below gets real codegen.
 [profile.dev.package.webrtc]
 opt-level = 3
 [profile.dev.package.webrtc-srtp]

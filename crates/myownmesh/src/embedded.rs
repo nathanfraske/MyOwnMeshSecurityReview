@@ -28,10 +28,6 @@ pub enum EmbeddedStartError {
 
     #[error("service policy: {0}")]
     ServicePolicy(#[from] crate::services::ServicePolicyError),
-
-    #[cfg(feature = "legacy-media")]
-    #[error("legacy media profile: {0}")]
-    LegacyMediaProfile(#[from] myownmesh_core::WebRtcConnectorProfileError),
 }
 
 /// A daemon running inside this process. Keep it alive for the daemon's
@@ -43,12 +39,6 @@ pub struct EmbeddedDaemon {
     registry: std::sync::Arc<NetworkRegistry>,
     service_manager: std::sync::Arc<ServiceManager>,
     shutdown_tx: broadcast::Sender<()>,
-}
-
-enum ServiceCompatibility {
-    V4,
-    #[cfg(feature = "legacy-v1")]
-    LegacyV1(myownmesh_core::legacy_v1::LegacyV1Runtime),
 }
 
 impl EmbeddedDaemon {
@@ -77,103 +67,21 @@ impl EmbeddedDaemon {
 ///
 /// This is the only Arc 03 daemon path that can establish connectors. No
 /// capacity, callback weight, or structural real-time limit is inferred here.
+///
+/// `realtime_flows` must be the `flow_capacity` of the realtime profile that
+/// was registered on `connector_policy`, or 0 if none was. It is passed
+/// separately rather than read back off the policy because it is published to
+/// clients as a promise about what this daemon will carry, and the caller that
+/// registered the profile is the only place that knows both halves. Passing a
+/// number the policy did not register for advertises capacity that does not
+/// exist.
 pub async fn start_connector_capable(
     cfg: myownmesh_core::MeshConfig,
     connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
-    ServiceManager::validate_config(&cfg.services)?;
-    let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
-    start_with_mesh(cfg, mesh, ServiceCompatibility::V4).await
-}
-
-/// Start the temporary H.264 and Opus compatibility adapter from an explicit,
-/// reviewed media profile. Normal V4 startup never infers or installs it.
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "this exact function is the temporary legacy media deployment boundary"
-)]
-#[deprecated(
-    since = "0.3.2",
-    note = "temporary H.264 and Opus deployment path for downstream migration"
-)]
-pub async fn start_connector_capable_with_legacy_media(
-    cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-    media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
-) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
-    let connector_policy = connector_policy_with_legacy_media(connector_policy, media_profile)?;
-    start_connector_capable(cfg, connector_policy).await
-}
-
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "this exact helper is confined to the temporary legacy media deployment boundary"
-)]
-fn connector_policy_with_legacy_media(
-    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-    media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
-) -> std::result::Result<
-    myownmesh_core::WebRtcConnectorCapablePolicy,
-    myownmesh_core::WebRtcConnectorProfileError,
-> {
-    let webrtc = connector_policy
-        .webrtc()
-        .with_legacy_webrtc_media(media_profile)?;
-    Ok(myownmesh_core::WebRtcConnectorCapablePolicy::new(
-        connector_policy.resources(),
-        webrtc,
-    ))
-}
-
-/// Start the connector-capable daemon with an explicit frozen LegacyV1
-/// compatibility runtime.
-///
-/// The normal V4 startup path cannot construct or reach this authority. This
-/// function exists only with the `legacy-v1` feature and is scheduled for
-/// deletion after downstream relay migration.
-#[cfg(feature = "legacy-v1")]
-#[allow(
-    deprecated,
-    reason = "this API is the explicit frozen LegacyV1 boundary"
-)]
-#[deprecated(
-    since = "0.3.2",
-    note = "LegacyV1 application routing is frozen and scheduled for removal after downstream migration"
-)]
-pub async fn start_connector_capable_with_legacy_v1(
-    cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-    runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
+    realtime_flows: u16,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
-    start_with_mesh(cfg, mesh, ServiceCompatibility::LegacyV1(runtime)).await
-}
-
-/// Start the frozen LegacyV1 routing runtime with the temporary reviewed
-/// H.264 and Opus provider attached as an explicit sidecar profile.
-///
-/// This is the only deployment form that composes both compatibility paths.
-/// Normal V4 startup cannot infer either authority.
-#[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
-#[allow(
-    deprecated,
-    reason = "this API is the explicit LegacyV1 plus legacy-media sidecar boundary"
-)]
-#[deprecated(
-    since = "0.3.2",
-    note = "temporary LegacyV1 and H.264/Opus sidecar for downstream migration"
-)]
-pub async fn start_connector_capable_with_legacy_v1_and_media(
-    cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-    runtime: myownmesh_core::legacy_v1::LegacyV1Runtime,
-    media_profile: myownmesh_core::LegacyWebRtcMediaProfile,
-) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
-    let connector_policy = connector_policy_with_legacy_media(connector_policy, media_profile)?;
-    let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
-    start_with_mesh(cfg, mesh, ServiceCompatibility::LegacyV1(runtime)).await
+    start_with_mesh(cfg, mesh, realtime_flows).await
 }
 
 /// Start a daemon that only hosts signaling, STUN, or TURN infrastructure.
@@ -187,15 +95,16 @@ pub async fn start_infrastructure_only(
     if cfg.services.node.enabled {
         return Err(EmbeddedStartError::InfrastructureOnlyRequiresNodeDisabled);
     }
-    ServiceManager::validate_config(&cfg.services)?;
     let mesh = myownmesh_core::Mesh::open_infrastructure_only(cfg.clone()).await?;
-    start_with_mesh(cfg, mesh, ServiceCompatibility::V4).await
+    // Infrastructure-only installs no connector policy at all, so there is no
+    // realtime capacity to advertise.
+    start_with_mesh(cfg, mesh, 0).await
 }
 
 async fn start_with_mesh(
     cfg: myownmesh_core::MeshConfig,
     mesh: myownmesh_core::MeshHandle,
-    compatibility: ServiceCompatibility,
+    realtime_flows: u16,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -217,18 +126,11 @@ async fn start_with_mesh(
         info!("node participation disabled — pure-infrastructure mode (hosting services only)");
     }
 
-    // Infrastructure services (relay / signaling / STUN / TURN); an all-off
-    // config (the default) starts nothing.
-    let service_manager = match compatibility {
-        ServiceCompatibility::V4 => ServiceManager::new(mesh.clone(), registry.clone()),
-        #[cfg(feature = "legacy-v1")]
-        ServiceCompatibility::LegacyV1(runtime) => {
-            ServiceManager::new_with_legacy_v1(mesh.clone(), registry.clone(), runtime)
-        }
-    };
+    // Infrastructure services (signaling / STUN / TURN); an all-off config
+    // (the default) starts nothing.
+    let service_manager = ServiceManager::new(mesh.clone(), registry.clone());
     let report = service_manager.apply(cfg.services.clone()).await?;
     info!(
-        relay = report.relay.enabled,
         signaling = report.signaling.running,
         stun = report.stun.running,
         turn = report.turn.running,
@@ -253,6 +155,7 @@ async fn start_with_mesh(
             ctl_registry,
             ctl_services,
             ctl_socket,
+            realtime_flows,
             ctl_shutdown,
         )
         .await
@@ -273,27 +176,21 @@ async fn start_with_mesh(
 mod tests {
     use super::*;
 
-    #[cfg(feature = "legacy-media")]
+    /// `Mesh` is one per process and owns one process identity anchor, so the
+    /// real-daemon startup fixtures must not manufacture a second concurrent
+    /// process incarnation inside the test binary.
     static CONNECTOR_DAEMON_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    #[cfg(feature = "legacy-media")]
     fn nz(value: usize) -> std::num::NonZeroUsize {
-        std::num::NonZeroUsize::new(value).expect("legacy-media deployment fixture is nonzero")
+        std::num::NonZeroUsize::new(value).expect("startup fixture is nonzero")
     }
 
-    #[cfg(feature = "legacy-media")]
-    fn legacy_media_test_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
+    fn connector_test_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
         // These values belong only to this one-process startup fixture. They
         // make no production sizing or queue-capacity recommendation.
         let realtime = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
             myownmesh_core::ConnectorRealtimeFlowCapacities::new(nz(2), nz(2), nz(2)),
-            myownmesh_core::ConnectorRealtimeInboundLimits::new(
-                nz(1_200),
-                nz(8),
-                nz(2),
-                nz(16),
-                nz(16_384),
-            ),
+            myownmesh_core::ConnectorRealtimeInboundLimits::new(nz(1_200), nz(8), nz(2)),
             myownmesh_core::ConnectorRealtimeByteBudgets::new(nz(32_768), nz(32_768)),
             myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
         );
@@ -304,9 +201,9 @@ mod tests {
                 nz(16_384),
                 realtime,
             )
-            .expect("legacy-media deployment fixture is internally consistent"),
+            .expect("startup fixture is internally consistent"),
         )
-        .expect("legacy-media callback fixture is internally consistent");
+        .expect("callback fixture is internally consistent");
         let webrtc = myownmesh_core::WebRtcConnectorProfile::new(
             callbacks,
             myownmesh_core::PendingRemoteCandidatePolicy::new(nz(8), nz(16_384), nz(8), nz(8)),
@@ -323,68 +220,22 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "legacy-media")]
-    #[allow(
-        deprecated,
-        reason = "this test proves the explicit temporary deployment boundary"
-    )]
+    /// There is one connector-capable startup form, and it takes only the
+    /// owner-supplied policy.
+    ///
+    /// Three of these existed: this one, a fixed H.264/Opus sidecar, and the
+    /// two composed. Each extra form installed an authority the caller could
+    /// not otherwise reach, so the assertion worth keeping is that the
+    /// surviving one really does stand a daemon up on its own — a policy
+    /// carrying no compatibility profile still produces a connector.
     #[tokio::test]
-    async fn v4_arc03h_legacy_media_profile_uses_the_supported_deployment_form() {
-        // `Mesh` is one per process and owns one process identity anchor. Keep
-        // the two real-daemon compatibility fixtures from manufacturing a
-        // second concurrent process incarnation inside the test binary.
-        let _fixture = CONNECTOR_DAEMON_FIXTURE.lock().await;
-        let temp = tempfile::tempdir().expect("temporary daemon state");
-        let mut daemon = myownmesh_core::MeshConfig::default().daemon;
-        daemon.control_socket = Some(temp.path().join("daemon.sock"));
-        let cfg = myownmesh_core::MeshConfig {
-            identity_path: Some(temp.path().join("identity.json")),
-            auto_update: myownmesh_core::AutoUpdateConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            daemon,
-            ..Default::default()
-        };
-
-        let media_profile = myownmesh_core::LegacyWebRtcMediaProfile::h264_opus(nz(2), 1, 1)
-            .expect("reviewed compatibility fixture is valid");
-        let policy = connector_policy_with_legacy_media(legacy_media_test_policy(), media_profile)
-            .expect("explicit compatibility profile attaches");
-        assert_eq!(policy.webrtc().legacy_media(), Some(media_profile));
-
-        let daemon = start_connector_capable_with_legacy_media(
-            cfg,
-            legacy_media_test_policy(),
-            media_profile,
-        )
-        .await
-        .expect("temporary legacy-media daemon starts only from the explicit profile");
-        assert!(daemon.mesh().connector_resource_report().is_some());
-        let mut relay_attempt = myownmesh_core::ServicesConfig::default();
-        relay_attempt.relay.enabled = true;
-        assert!(matches!(
-            daemon
-                .service_manager
-                .validate_config_for_runtime(&relay_attempt),
-            Err(crate::services::ServicePolicyError::LegacyPayloadRelayForbidden)
-        ));
-        daemon.shutdown().await;
-    }
-
-    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
-    #[allow(
-        deprecated,
-        reason = "this test proves the explicit temporary sidecar deployment boundary"
-    )]
-    #[tokio::test]
-    async fn v4_arc03j_legacy_media_sidecar_composes_only_with_explicit_legacy_v1_runtime() {
+    async fn the_connector_capable_daemon_starts_from_the_owner_policy_alone() {
         let _fixture = CONNECTOR_DAEMON_FIXTURE.lock().await;
         let temp = tempfile::tempdir().expect("temporary daemon state");
         let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
-        daemon_config.control_socket = Some(temp.path().join("daemon-sidecar.sock"));
+        daemon_config.control_socket = Some(temp.path().join("daemon.sock"));
         let cfg = myownmesh_core::MeshConfig {
-            identity_path: Some(temp.path().join("identity-sidecar.json")),
+            identity_path: Some(temp.path().join("identity.json")),
             auto_update: myownmesh_core::AutoUpdateConfig {
                 enabled: false,
                 ..Default::default()
@@ -392,23 +243,11 @@ mod tests {
             daemon: daemon_config,
             ..Default::default()
         };
-        let media_profile = myownmesh_core::LegacyWebRtcMediaProfile::h264_opus(nz(2), 1, 1)
-            .expect("reviewed sidecar fixture is valid");
-        let daemon = start_connector_capable_with_legacy_v1_and_media(
-            cfg,
-            legacy_media_test_policy(),
-            myownmesh_core::legacy_v1::LegacyV1Runtime::frozen(),
-            media_profile,
-        )
-        .await
-        .expect("the explicit combined compatibility constructor starts");
+
+        let daemon = start_connector_capable(cfg, connector_test_policy(), 0)
+            .await
+            .expect("the connector-capable daemon starts from the policy alone");
         assert!(daemon.mesh().connector_resource_report().is_some());
-        let mut relay_attempt = myownmesh_core::ServicesConfig::default();
-        relay_attempt.relay.enabled = true;
-        assert!(daemon
-            .service_manager
-            .validate_config_for_runtime(&relay_attempt)
-            .is_ok());
         daemon.shutdown().await;
     }
 }

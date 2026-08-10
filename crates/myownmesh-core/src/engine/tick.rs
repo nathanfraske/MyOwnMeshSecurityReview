@@ -163,15 +163,15 @@ impl Ticker for TopologyShapeTicker {
     }
 }
 
-/// Coalesced media renegotiation — one in-place offer per peer whose
-/// lane set changed since the last pass (see
-/// `engine::service_media_renegotiations`). No-op when no lanes moved.
+/// Coalesced renegotiation — one in-place offer per peer whose track set
+/// changed since the last pass (see
+/// `engine::service_media_renegotiations`). No-op when nothing moved.
 pub(crate) struct MediaRenegotiationTicker;
 
 #[async_trait]
 impl Ticker for MediaRenegotiationTicker {
     fn name(&self) -> &'static str {
-        "media-renegotiation"
+        "renegotiation"
     }
 
     async fn tick(&mut self, state: &Arc<NetworkState>) {

@@ -20,11 +20,11 @@ use anyhow::{Context, Result};
 use interprocess::local_socket::{
     tokio::prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions,
 };
+use myownmesh_core::realtime as core_realtime;
+use myownmesh_core::transport as core_webrtc;
 use myownmesh_core::{MeshConfig, MeshHandle, NetworkConfig, ServicesConfig, TopologyMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "legacy-media")]
-use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -38,6 +38,51 @@ use crate::services::ServiceManager;
 pub fn default_socket_name() -> String {
     "myownmesh.sock".to_string()
 }
+
+/// Which way units flow on a [`Request::RealtimePipe`] connection.
+///
+/// One request covers both directions because only the direction differed
+/// between the two pipes this replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimePipeDirection {
+    /// Client writes units; the daemon routes each to its flow.
+    Outbound,
+    /// Daemon writes units the client's subscriptions cover.
+    Inbound,
+}
+
+// A flow's direction and RTP kind are not redeclared here either.
+// `Request::RealtimeFlowOpen` carries `RealtimeFlowDirection` and
+// `WebRtcRtpKind` directly, so the value a client sends is the value handed to
+// core with no daemon-side mapping in between. A local pair of enums with the
+// same two variants would read as harmless and would be the place a translation
+// bug eventually lives — one `match` arm crossed, and every outbound flow
+// becomes an inbound one.
+//
+// The two come from different layers on purpose. Direction is basal: which way
+// units travel is true of any flow and names no media, so it lives in the
+// generic vocabulary. RTP kind is a WebRTC fact — it exists because RTP
+// allocates a transceiver per kind — so it is spelled `WebRtcRtpKind` and lives
+// at the provider edge. A client naming it is unambiguously naming a WebRTC
+// thing, which is what stops a fixed audio/video taxonomy leaking back into the
+// layer that is supposed to know nothing about media.
+//
+// [`RealtimePipeDirection`] stays local because it is not the same thing: it
+// names a socket's role, and there are no pipes in core.
+
+// Refusal codes are not redeclared here. `myownmesh_core::realtime::
+// RealtimeRefusal::code()` is the one source of the stable strings
+// (`session_not_current`, `label_in_use`, `flow_refused`,
+// `provider_configuration_invalid`),
+// and the daemon forwards what it is given. A daemon-side copy of the enum
+// would be a second place to add a variant and a silent way to drop one: a new
+// core variant would fall through a local `match` to some default string,
+// where forwarding `code()` makes the same change a compile error here.
+//
+// Note the absent `label_space_exhausted`. The caller supplies an exact label
+// and the connector claims that one — it never allocates — so a label is free
+// or in use and the space cannot be "full" from a request's point of view.
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -179,27 +224,8 @@ pub enum Request {
         #[serde(default)]
         wait_ms: u64,
     },
-    /// Open the lowest free media lane (`kind`: "video" | "audio")
-    /// toward a connected peer, returning `{ lane }`. Lanes also open
-    /// transparently on first write; this is the explicit reservation.
-    #[cfg(feature = "legacy-media")]
-    MediaLaneOpen {
-        network: String,
-        peer: String,
-        kind: String,
-    },
-    /// Close a media lane toward a peer (idempotent). The track is
-    /// removed and the next renegotiation drops its m-line send side —
-    /// media capacity is paid only while a session uses it.
-    #[cfg(feature = "legacy-media")]
-    MediaLaneClose {
-        network: String,
-        peer: String,
-        kind: String,
-        lane: u8,
-    },
     /// Snapshot which infrastructure services this device hosts
-    /// (relay / signaling / STUN / TURN): live runtime status plus the
+    /// (signaling / STUN / TURN): live runtime status plus the
     /// persisted config. The GUI's Services settings section reads this
     /// to render toggles and listen addresses.
     ServicesStatus,
@@ -468,85 +494,152 @@ pub enum Request {
         capabilities: myownmesh_core::protocol::CapabilityAdvert,
     },
 
-    // ---- video track lane ---------------------------------------------
-    /// Write one encoded H.264 access unit (Annex-B, base64) onto the
-    /// video track lane to `peer`. The lane is provisioned on every
-    /// connection at negotiation, so this works the moment the peer is
-    /// up — no renegotiation, no subscription required. `duration_us`
-    /// paces the RTP clock (1/fps).
-    #[cfg(feature = "legacy-media")]
-    VideoSend {
+    // ---- realtime flows -------------------------------------------------
+    //
+    // One codec-opaque protocol replaces the separate video and audio lane
+    // surfaces. The daemon carries `mime` and `clock_rate` and parses neither;
+    // there is no video/audio distinction anywhere below this point, and no
+    // fixed per-kind lane pool.
+    //
+    // There is deliberately no unit-carrying request here. Units ride a binary
+    // `RealtimePipe`; putting them in a JSON request would route low-latency
+    // media through the reliable path, costing a parse and 33% base64
+    // inflation per unit. `VideoSend`/`AudioSend` had no successor for exactly
+    // that reason — the pipe is the media path, in both directions.
+    /// Declare a realtime flow to `peer` under `flow_label`.
+    ///
+    /// `flow_label` is allocated by the caller from the session's shared
+    /// audio-and-video label space; the daemon allocates nothing and holds no
+    /// label state. One allocator, and it is the side that knows about routes.
+    /// The connector claims that exact label and never picks another, so the
+    /// only label failure is `label_in_use` — which is also what a caller's
+    /// exhausted space looks like from here.
+    ///
+    /// `rtp_kind`, `mime`, `clock_rate` and `channels` together select an
+    /// encoding *family* among the ones the application-supplied profile
+    /// registered — not one registration tuple. Deployed H.264 is five
+    /// payload-type/fmtp variants sharing all four values; every one of them is
+    /// registered on the `MediaEngine`, and which the connection uses is
+    /// settled by SDP negotiation with the peer. A request that named one exact
+    /// tuple would therefore fail against any peer that picked a different
+    /// variant, which is four of the five.
+    ///
+    /// All four fields are still needed, because a family is what they jointly
+    /// name: a lookup on `mime` alone would fold Opus's channel counts and any
+    /// two clock rates into one. `clock_rate` is additionally what makes an
+    /// inbound unit's `rtp_timestamp` interpretable, so it is a field rather
+    /// than something folded into `mime` and parsed back out.
+    RealtimeFlowOpen {
         network: String,
         peer: String,
-        /// Which of the peer's video lanes to write to (0–7, the lane pool).
-        /// Defaults to lane 0, so a client from before the lane pool — which
-        /// omits the field — still writes the single original lane.
-        #[serde(default)]
-        stream: u8,
-        duration_us: u64,
-        data: String,
+        flow_label: u8,
+        /// Which way this node carries units on this flow. Stated by the caller
+        /// rather than inferred: a flow this node sends on and one it receives
+        /// on need different transceiver directions, and inferring from later
+        /// traffic would let the first unit decide.
+        direction: core_realtime::RealtimeFlowDirection,
+        /// A connector primitive, not a codec name: RTP distinguishes audio from
+        /// video when allocating a transceiver, independently of which codec
+        /// occupies it. Carrying it explicitly is what lets the connector pick a
+        /// transceiver without parsing `mime`, so `video/H264` and `video/VP8`
+        /// are the same decision here and core never learns either name.
+        ///
+        /// The JSON spelling stays `"audio"` / `"video"`. Moving this type to
+        /// the provider edge changed which Rust module owns it and deliberately
+        /// changed nothing a client sends.
+        rtp_kind: core_webrtc::WebRtcRtpKind,
+        mime: String,
+        clock_rate: u32,
+        /// 0 for video, 2 for stereo Opus. Part of the family key, not
+        /// decoration: two registered families can differ only here.
+        channels: u16,
     },
-    /// Convert this connection into a dedicated **binary media-track pipe**:
-    /// after the ack, the client streams length-prefixed binary frames
-    /// (`[u32 len][body]`, see [`decode_media_frame`]) — H.264 access units and
-    /// Opus frames with no base64 and no per-frame JSON. Nothing else rides
-    /// this connection; MJPEG/PCM/route signalling stay on the JSON pipe.
-    #[cfg(feature = "legacy-media")]
-    MediaTrackPipe,
-    /// Convert this connection into a dedicated **binary media-source pipe**
-    /// for `client_id` (its `EventsSubscribe` id): after the ack, the daemon
-    /// pushes length-prefixed inbound media frames (`[u32 len][body]`, see
-    /// [`encode_inbound_frame`]) for everything that client is subscribed to —
-    /// no base64, no JSON. While registered, inbound media routes here instead
-    /// of as base64 `video_inbound`/`audio_inbound` on the event socket.
-    #[cfg(feature = "legacy-media")]
-    MediaSourcePipe {
-        client_id: crate::ipc::ClientId,
-    },
-    /// Route assembled video access units arriving from this network's
-    /// peers to this client's event socket as `video_inbound` frames.
-    #[cfg(feature = "legacy-media")]
-    VideoSubscribe {
-        client_id: crate::ipc::ClientId,
-        network: String,
-    },
-    /// Release a video subscription. No-op if not subscribed.
-    #[cfg(feature = "legacy-media")]
-    VideoUnsubscribe {
-        client_id: crate::ipc::ClientId,
-        network: String,
-    },
-
-    // ---- audio track lane ---------------------------------------------
-    /// Write one encoded Opus frame (base64) onto the audio track lane
-    /// to `peer`. Provisioned on every connection exactly like the video
-    /// lane — works the moment the peer is up, no subscription required.
-    /// `duration_us` is the frame length (20 000 for the canonical Opus
-    /// frame); it paces the RTP clock.
-    #[cfg(feature = "legacy-media")]
-    AudioSend {
+    /// Release a realtime flow and its label. No-op if not open.
+    ///
+    /// The response is the acknowledgement, and it follows the retirement of the
+    /// flow's native half rather than the release of its label. A caller may
+    /// therefore close a label and reopen it immediately, knowing the previous
+    /// occupant is gone. That ordering is the whole point: acking on the label
+    /// release would let a reopen land while the old transceiver or sender was
+    /// still alive, which is the one case a caller would have needed the
+    /// guarantee for.
+    ///
+    /// Which is also why a label must stay reserved until this answers. Freeing
+    /// it on send and reusing it before the ack reintroduces exactly the ABA
+    /// this ordering removes: the peer cannot tell the new flow from the old one
+    /// it has not finished tearing down. On a refusal the label stays reserved
+    /// too — a close that did not happen has retired nothing.
+    RealtimeFlowClose {
         network: String,
         peer: String,
-        /// Which of the peer's audio lanes to write to (0–7, the lane pool).
-        /// Defaults to lane 0 for pre-pool clients, exactly like
-        /// [`Request::VideoSend`].
+        flow_label: u8,
+    },
+    /// Route realtime flow *control* events for this network's peers to this
+    /// client's event socket. That is `realtime_flow_closed`, and only that:
+    /// there is no open event, because a flow exists only when this node's own
+    /// application asked for one and the response to that request is its
+    /// acknowledgement. Units are not delivered here either; they need an
+    /// inbound [`Request::RealtimePipe`].
+    RealtimeSubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+    },
+    /// Release a realtime subscription. No-op if not subscribed.
+    RealtimeUnsubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+    },
+    /// Convert this connection into a dedicated **binary realtime pipe**:
+    /// after the ack it carries only length-prefixed frames
+    /// (`[u32 len][body]`, see [`decode_realtime_send_unit`] and
+    /// [`encode_realtime_recv_unit`]) and no JSON.
+    ///
+    /// `Outbound` reads units from the client and writes each to its flow;
+    /// `Inbound` pushes units for everything `client_id` subscribes to.
+    ///
+    /// **Both** directions are bound to exactly one session by `network` +
+    /// `peer`. That binding is what makes a unit routable at all: a frame body
+    /// carries a `flow_label` and no strings, and the label is scoped to a
+    /// session, so on a peer-multiplexed pipe peer A's label 3 and peer B's
+    /// label 3 are indistinguishable. Binding the connection supplies the
+    /// session by construction, which keeps the body compact.
+    ///
+    /// Inbound is bound for the same reason and not a weaker one. The JSON
+    /// control events carry `from`, but the binary units do not, and it is the
+    /// units that need routing — an earlier event naming a peer does not
+    /// disambiguate a later frame on a shared connection.
+    ///
+    /// The binding is also a lifetime, and it is observed rather than
+    /// signalled — there is no retirement event to subscribe to, because a
+    /// separate signal is a second source of truth that can disagree with the
+    /// queue. Dropping the session's `PromotedSession` drops its flow set and
+    /// the queued units with it, and each direction learns that from the queue
+    /// it already holds:
+    ///
+    /// - inbound terminates when the session-owned recv queue closes;
+    /// - outbound terminates on a closed queue, or on `session_not_current`
+    ///   from the synchronous send.
+    ///
+    /// Either way the pipe ends with the session rather than outliving it,
+    /// which would be a send outliving its flow one layer up. The client then
+    /// reconnects and may immediately reuse the same labels — the old label
+    /// space died with the old session — so the binding is re-established per
+    /// session and never cached per peer.
+    ///
+    /// Field shapes are validated strictly and a wrong-shaped request is
+    /// refused rather than trimmed: `Outbound` requires `network` + `peer` and
+    /// no `client_id`; `Inbound` requires all three. Silently ignoring a
+    /// supplied `client_id` on an outbound pipe would let a client believe it
+    /// had bound a delivery target that the daemon never recorded.
+    RealtimePipe {
+        direction: RealtimePipeDirection,
+        /// The session both directions bind to.
+        network: String,
+        peer: String,
+        /// Required for `Inbound` — the client's `EventsSubscribe` id and the
+        /// delivery target. Must be absent for `Outbound`.
         #[serde(default)]
-        stream: u8,
-        duration_us: u64,
-        data: String,
-    },
-    /// Route audio frames arriving from this network's peers to this
-    /// client's event socket as `audio_inbound` frames.
-    #[cfg(feature = "legacy-media")]
-    AudioSubscribe {
-        client_id: crate::ipc::ClientId,
-        network: String,
-    },
-    /// Release an audio subscription. No-op if not subscribed.
-    #[cfg(feature = "legacy-media")]
-    AudioUnsubscribe {
-        client_id: crate::ipc::ClientId,
-        network: String,
+        client_id: Option<crate::ipc::ClientId>,
     },
 
     // ---- self-update -------------------------------------------------
@@ -594,6 +687,24 @@ impl Response {
     }
 }
 
+/// Turn a connector refusal into the one error shape realtime control uses.
+///
+/// Both halves are carried: `code` is the stable machine-readable string from
+/// [`core_realtime::RealtimeRefusal::code`], and the human message goes in the
+/// usual `error` field. Clients dispatch on `code` and display `error` — the
+/// message is prose and is deliberately not parseable.
+///
+/// Note that `session_not_current` also covers an unknown or replaced peer, by
+/// design on core's side: distinguishing "no such peer" would report peer
+/// existence to a caller that has proved nothing about its right to know.
+fn realtime_refused(refusal: core_realtime::RealtimeRefusal) -> Response {
+    Response {
+        ok: false,
+        error: Some(refusal.to_string()),
+        data: Some(serde_json::json!({ "code": refusal.code() })),
+    }
+}
+
 /// Resolve the platform-appropriate listener name. On Unix this
 /// is `~/.myownmesh/daemon.sock`; on Windows it's a named-pipe
 /// segment under the local namespace.
@@ -628,6 +739,7 @@ pub async fn serve(
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
     custom: Option<PathBuf>,
+    realtime_flows: u16,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let target = resolve_socket(custom)?;
@@ -639,6 +751,7 @@ pub async fn serve(
         registry,
         services,
         clients: crate::ipc::ClientRegistry::new(),
+        realtime_flows,
     });
 
     loop {
@@ -697,7 +810,33 @@ struct ControlState {
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
+    /// Concurrent realtime flows this node supports per peer, over the one
+    /// shared audio-and-video label space. Supplied by the application in its
+    /// realtime profile and published verbatim as the `realtime_flows` status
+    /// field: it is a ceiling that applications size their own allocation pool
+    /// against, never a live count. Reporting a count here would silently
+    /// undersize every pool that read it.
+    ///
+    /// One scalar, deliberately not split by direction. It is an aggregate
+    /// ceiling, not a promise that every inbound/outbound split of it is
+    /// feasible: directional resource envelopes sit underneath and can answer
+    /// `flow_refused` before this number is reached. Publishing a per-direction
+    /// pair would read as a guarantee the connector does not make, and a caller
+    /// that planned against it would still meet the same refusal.
+    ///
+    /// Zero when no realtime profile was registered, which is the honest report
+    /// for a daemon that has no codecs and can carry nothing.
+    realtime_flows: u16,
 }
+
+// The daemon keeps no realtime flow state of its own. There was a per-session
+// index of inbound labels here, because the old per-label `recv` gave a pipe no
+// way to learn which flows were live. `recv_webrtc_realtime_any` delivers the label
+// with the unit, so the index had exactly one job and no longer has it.
+//
+// Nothing replaced it. A cache of open flows would be a second answer to a
+// question core already answers, and the failure mode of a stale mirror on this
+// path is units routed to a flow that closed.
 
 async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> Result<()> {
     let (reader, mut writer) = stream.split();
@@ -767,45 +906,91 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
         }
-        // MediaTrackPipe converts the connection into a one-way binary stream
-        // of media frames (H.264/Opus), exactly the EventsSubscribe pattern but
-        // reading instead of writing. After the ack the connection speaks only
-        // length-prefixed binary frames — no per-frame JSON or base64.
-        #[cfg(feature = "legacy-media")]
-        if matches!(request, Request::MediaTrackPipe) {
-            let ack = Response::ok(serde_json::json!({ "media_track_pipe": true }));
-            let line = serde_json::to_string(&ack)? + "\n";
-            writer.write_all(line.as_bytes()).await?;
-            writer.flush().await?;
-            // Recover the buffered reader (it may already hold the first frame).
-            let reader = lines.into_inner();
-            run_media_track_pipe(&state, reader).await?;
-            break;
-        }
-        // MediaSourcePipe is the reverse: the daemon pushes inbound media frames
-        // (binary) to this connection for the named client, instead of base64
-        // events on its event socket. Register a sink on that client, then drain
-        // it to the wire until either side closes.
-        #[cfg(feature = "legacy-media")]
-        if let Request::MediaSourcePipe { client_id } = &request {
-            let client_id = *client_id;
-            let Some(client) = state.clients.client(client_id) else {
-                let resp = Response::err(format!("unknown client_id: {client_id}"));
+        // RealtimePipe converts the connection into a one-way binary stream of
+        // realtime units, the EventsSubscribe pattern in whichever direction was
+        // asked for. After the ack the connection speaks only length-prefixed
+        // binary frames — no per-frame JSON, no base64.
+        if let Request::RealtimePipe {
+            direction,
+            network,
+            peer,
+            client_id,
+        } = &request
+        {
+            // Field shapes are checked before the ack, and extras are refused
+            // rather than ignored. A pipe that acked and then behaved as though
+            // a field had not been sent would be indistinguishable, from the
+            // client's side, from one that honoured it.
+            let bound = match realtime_pipe_binding(*direction, network, peer, *client_id) {
+                Ok(bound) => bound,
+                Err(message) => {
+                    let resp = Response::err(message);
+                    writer
+                        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                        .await?;
+                    continue;
+                }
+            };
+            let Some(net) = state.registry.get(&bound.network) else {
+                let resp = Response::err(format!("unknown network: {}", bound.network));
                 writer
                     .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
                     .await?;
                 continue;
             };
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            client.set_media_sink(tx);
-            let ack = Response::ok(serde_json::json!({ "media_source_pipe": true }));
+            // An inbound pipe claims the session's unit stream BEFORE the ack.
+            // The claim is once per session, so it can legitimately fail — a
+            // second pipe for the same peer, or a session that is already gone —
+            // and those must be refusals, not an ack followed by a connection
+            // that silently never delivers anything.
+            //
+            // The claim is an exclusive lease, and the reader IS the lease:
+            // dropping it returns it. So when this pipe ends — cleanly, or
+            // because the client crashed and its socket died — the next pipe for
+            // the same session claims successfully and resumes. Nothing is lost
+            // in the gap, because units accumulate on the session's own queue
+            // and never in the reader.
+            //
+            // Which is why the daemon caches nothing here. Holding a reader
+            // across reconnects, or remembering which sessions were claimed,
+            // would give the daemon a lease to release correctly and a mirror to
+            // keep in step. The lease already releases itself, and the queue it
+            // guards belongs to the session.
+            //
+            // A refusal therefore means what it says: the session is gone, or a
+            // pipe for it is live right now. Neither is a lingering claim from a
+            // pipe that has already died.
+            let inbound_stream = match bound.direction {
+                RealtimePipeDirection::Inbound => match net.realtime_inbound(&bound.peer) {
+                    Some(stream) => Some(stream),
+                    None => {
+                        let resp = Response::err(format!(
+                            "no inbound realtime stream for {}: the session is not current, \
+                             or a live pipe already holds it — one inbound pipe per session, \
+                             and the lease returns when that pipe ends",
+                            bound.peer
+                        ));
+                        writer
+                            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                            .await?;
+                        continue;
+                    }
+                },
+                RealtimePipeDirection::Outbound => None,
+            };
+            let ack = Response::ok(serde_json::json!({ "realtime_pipe": true }));
             writer
                 .write_all((serde_json::to_string(&ack)? + "\n").as_bytes())
                 .await?;
             writer.flush().await?;
+            // Recover the buffered reader — it may already hold the first frame.
             let reader = lines.into_inner();
-            let result = run_media_source_pipe(reader, &mut writer, rx).await;
-            client.clear_media_sink();
+            let result = match inbound_stream {
+                None => run_realtime_outbound_pipe(&net, &bound.peer, reader).await,
+                Some(stream) => {
+                    run_realtime_inbound_pipe(&net, &bound, &stream, reader, &mut writer).await
+                }
+            };
             result?;
             break;
         }
@@ -816,103 +1001,224 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
     Ok(())
 }
 
-/// Read length-prefixed binary media frames off a [`Request::MediaTrackPipe`]
-/// connection and route each to its peer's track lane — the binary, base64-free
-/// twin of the [`Request::VideoSend`]/[`Request::AudioSend`] handlers. Sends
-/// nothing back per frame: errors are logged here (rate-limited by the caller's
-/// own cadence) rather than answered, which is the whole latency win. Returns
-/// when the client disconnects.
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "this function is the explicit deprecated legacy-media control adapter"
-)]
-async fn run_media_track_pipe<R>(state: &Arc<ControlState>, mut reader: R) -> Result<()>
+/// A realtime pipe's validated session binding.
+///
+/// `client_id` is validated but not carried, and that is worth stating plainly
+/// rather than leaving as an omission. It was required on an inbound pipe
+/// because the pipe used to decide which flows to carry from that client's
+/// subscriptions. `recv_webrtc_realtime_any` delivers every flow of the bound session
+/// with its label attached, so no subscription is consulted and nothing here
+/// reads the value. The request field is still refused when malformed — it is
+/// not silently accepted — but its former job is gone, and whether it should
+/// remain on the wire at all is a contract question, not one this struct should
+/// answer by quietly keeping a field nobody uses.
+struct RealtimePipeBinding {
+    direction: RealtimePipeDirection,
+    network: String,
+    peer: String,
+}
+
+/// Validate a [`Request::RealtimePipe`]'s fields against its direction.
+///
+/// Both directions are bound to exactly one session, so `network` and `peer`
+/// are required for each. That binding is what makes a unit routable at all: a
+/// frame body carries a `flow_label` and no strings, and a label is scoped to a
+/// session, so on a peer-multiplexed pipe peer A's label 3 and peer B's label 3
+/// are indistinguishable. Binding the connection supplies the session by
+/// construction and keeps the body compact.
+///
+/// `client_id` is required for `Inbound` and refused for `Outbound` rather than
+/// ignored there. An outbound pipe that accepted and dropped a `client_id`
+/// would read, from the client's side, exactly like one that honoured it.
+fn realtime_pipe_binding(
+    direction: RealtimePipeDirection,
+    network: &str,
+    peer: &str,
+    client_id: Option<crate::ipc::ClientId>,
+) -> std::result::Result<RealtimePipeBinding, String> {
+    if network.trim().is_empty() {
+        return Err("realtime_pipe requires a network".to_string());
+    }
+    if peer.trim().is_empty() {
+        return Err(
+            "realtime_pipe requires a peer: a flow_label is scoped to one \
+                    session, so a pipe that did not name one could not route a unit"
+                .to_string(),
+        );
+    }
+    match (direction, client_id) {
+        (RealtimePipeDirection::Outbound, Some(_)) => Err(
+            "realtime_pipe outbound takes no client_id: it writes to the session it \
+             is bound to, and no client's subscriptions are consulted"
+                .to_string(),
+        ),
+        (RealtimePipeDirection::Inbound, None) => Err(
+            "realtime_pipe inbound requires a client_id: it carries the flows that \
+             client subscribed to"
+                .to_string(),
+        ),
+        _ => Ok(RealtimePipeBinding {
+            direction,
+            network: network.to_string(),
+            peer: peer.to_string(),
+        }),
+    }
+}
+
+/// Read length-prefixed units off an outbound [`Request::RealtimePipe`] and hand
+/// each to its flow on the bound session.
+///
+/// Sends nothing back per unit: errors are logged rather than answered, which is
+/// the whole latency win — a per-unit acknowledgement would put a round trip on
+/// the media path. Returns when the client disconnects.
+async fn run_realtime_outbound_pipe<R>(
+    net: &myownmesh_core::JoinedNetwork,
+    peer: &str,
+    mut reader: R,
+) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    use tokio::io::AsyncReadExt as _;
+
     loop {
         let mut len_buf = [0u8; 4];
-        // A clean EOF (client closed the pipe) ends the loop; a short read is
-        // a torn frame and ends it too.
+        // A clean EOF (the client closed the pipe) ends the loop; a short read
+        // is a torn frame and ends it too — the stream is no longer framed, so
+        // nothing after this point can be trusted to be a unit boundary.
         if reader.read_exact(&mut len_buf).await.is_err() {
             return Ok(());
         }
         let len = u32::from_le_bytes(len_buf) as usize;
-        if len > MAX_MEDIA_FRAME_BYTES {
-            warn!("media-track frame too large ({len} bytes) — dropping connection");
+        if len > MAX_REALTIME_FRAME_BYTES {
+            warn!("realtime frame too large ({len} bytes) — dropping pipe");
             return Ok(());
         }
         let mut body = vec![0u8; len];
         if reader.read_exact(&mut body).await.is_err() {
             return Ok(());
         }
-        let Some(frame) = decode_media_frame(&body) else {
-            warn!("malformed media-track frame ({len} bytes) — skipped");
+        let Some(unit) = decode_realtime_send_unit(&body) else {
+            warn!("malformed realtime send unit ({len} bytes) — skipped");
             continue;
         };
-        let Some(net) = state.registry.get(&frame.network) else {
-            // The network went away between negotiation and this frame; the
-            // viewer reads it as a brief gap and the next IDR recovers.
-            continue;
+        let label = unit.flow_label;
+        // No marker: an outbound unit does not carry one, at any layer. The
+        // marker bit states something about packetization that the flow's
+        // framing policy decides and the packetizer alone is positioned to get
+        // right, so a value supplied from here could only contradict it. The
+        // wire byte that would have held it is reserved zero and refused
+        // otherwise, which is what stops a client from believing it still has a
+        // say.
+        let outbound = core_webrtc::WebRtcRealtimeOutboundUnit {
+            duration: std::time::Duration::from_micros(u64::from(unit.duration_us)),
+            data: unit.payload.into(),
         };
-        let dur = std::time::Duration::from_micros(frame.duration_us);
-        let result = match frame.kind {
-            MEDIA_KIND_VIDEO => {
-                net.state()
-                    .send_video_sample(&frame.peer, frame.stream, frame.data.into(), dur)
-                    .await
+        // Synchronous by design: the unit is authorized against the session and
+        // enqueued before this returns, so a refusal is attributable to the unit
+        // that caused it rather than surfacing later against an unrelated one.
+        if let Err(refusal) = net.send_webrtc_realtime(peer, label, outbound) {
+            // `SessionNotCurrent` ENDS THE PIPE. Every other refusal is about
+            // one unit and the next one may well succeed, but this one says the
+            // session this pipe was bound to is gone.
+            //
+            // Continuing past it is not merely futile, it is unsafe. Labels are
+            // session-scoped and are reused freely across sessions, so a pipe
+            // that kept writing would sit there until the peer's next session
+            // came up and then start delivering units — with labels it chose
+            // under the old one — into the new one. Label 3 meant a screen share
+            // to a session that no longer exists; in the successor it means
+            // whatever that session assigned. The client is still writing frames
+            // it believes are going one place and they arrive somewhere else,
+            // with nothing anywhere in the path to notice, because nothing is
+            // acknowledged per unit.
+            //
+            // Closing hands the failure to the one party that can resolve it:
+            // the client sees its pipe drop, and reopening forces a fresh
+            // binding against whatever session is current now.
+            if matches!(refusal, core_realtime::RealtimeRefusal::SessionNotCurrent) {
+                warn!(
+                    %peer,
+                    label,
+                    code = refusal.code(),
+                    "realtime outbound pipe closing: its session is no longer current"
+                );
+                return Ok(());
             }
-            MEDIA_KIND_AUDIO => {
-                net.state()
-                    .send_audio_sample(&frame.peer, frame.stream, frame.data.into(), dur)
-                    .await
-            }
-            other => {
-                warn!("unknown media-track frame kind {other} — skipped");
-                continue;
-            }
-        };
-        if let Err(e) = result {
-            debug!("media-track send failed: {e}");
+            debug!(%peer, label, code = refusal.code(), "realtime send refused");
         }
     }
 }
 
-/// Drain a client's binary media-source sink to its [`Request::MediaSourcePipe`]
-/// connection: each `body` (an `encode_inbound_frame` payload) goes out as
-/// `[u32 len][body]`. One-way (daemon → client); the only thing read back is
-/// EOF, which — like a dropped sink — ends the loop so the caller clears the
-/// client's sink and the pumps fall back to base64 events.
-#[cfg(feature = "legacy-media")]
-async fn run_media_source_pipe<R, W>(
+/// Push units for the bound session's inbound flows to a client's binary pipe.
+///
+/// One-way (daemon → client) apart from EOF, which ends the loop. Each unit goes
+/// out as `[u32 len][body]`, and the body's `flow_label` — delivered alongside
+/// the unit rather than looked up — names which flow it belongs to. The session
+/// is already fixed by the pipe's binding, which is what lets the body stay
+/// this small.
+///
+/// The two exits are the only two things that can happen: the client leaves, or
+/// the session ends. `None` from the stream is terminal and means the latter;
+/// there is no retirement flag to check and nothing to distinguish, because a
+/// session that ended has taken every flow with it.
+async fn run_realtime_inbound_pipe<R, W>(
+    net: &myownmesh_core::JoinedNetwork,
+    bound: &RealtimePipeBinding,
+    inbound: &core_realtime::RealtimeInboundStream,
     mut reader: R,
     writer: &mut W,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut probe = [0u8; 1];
     loop {
-        tokio::select! {
+        let arrival = tokio::select! {
             biased;
-            body = rx.recv() => {
-                let Some(body) = body else { return Ok(()) };
-                let len = (body.len() as u32).to_le_bytes();
-                if writer.write_all(&len).await.is_err() {
-                    return Ok(());
-                }
-                if writer.write_all(&body).await.is_err() {
-                    return Ok(());
-                }
-                if writer.flush().await.is_err() {
-                    return Ok(());
-                }
-            }
-            // The client never writes after the handshake, so any completion of
-            // this read — a stray byte or (normally) EOF — means it's gone.
-            _ = reader.read_u8() => return Ok(()),
+            // The client never writes on an inbound pipe, so any completed read
+            // — a stray byte, or normally EOF — means it is gone. Biased first
+            // so a departure is noticed on the same poll rather than waiting out
+            // an idle session that may never produce another unit.
+            _ = reader.read(&mut probe) => return Ok(()),
+            arrival = net.recv_webrtc_realtime_any(inbound) => arrival,
+        };
+        let Some(arrival) = arrival else {
+            debug!(peer = %bound.peer, "realtime inbound stream ended (session over)");
+            return Ok(());
+        };
+        let unit = RealtimeRecvUnit {
+            flow_label: arrival.label,
+            marker: arrival.unit.marker,
+            rtp_timestamp: arrival.unit.rtp_timestamp,
+            payload: arrival.unit.data.to_vec(),
+        };
+        let Some(body) = encode_realtime_recv_unit(&unit) else {
+            // Larger than the framing can express. Dropped here, and the pipe
+            // continues: the alternative is writing a frame whose length prefix
+            // or inner length is wrong, which the client cannot interpret and
+            // cannot resynchronise from — one unit it could not have used
+            // becomes every unit after it. One flow's oversized unit is not a
+            // reason to take down a session's whole inbound path.
+            warn!(
+                peer = %bound.peer,
+                label = unit.flow_label,
+                bytes = unit.payload.len(),
+                "realtime unit too large to frame — dropped"
+            );
+            continue;
+        };
+        // Cannot truncate: `encode_realtime_recv_unit` returned `Some`, so the
+        // body is within `MAX_REALTIME_FRAME_BYTES`, which is far below u32.
+        let len = (body.len() as u32).to_le_bytes();
+        if writer.write_all(&len).await.is_err()
+            || writer.write_all(&body).await.is_err()
+            || writer.flush().await.is_err()
+        {
+            return Ok(());
         }
     }
 }
@@ -924,14 +1230,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 "version": env!("CARGO_PKG_VERSION"),
                 "device_id": state.mesh.identity().display_id(),
                 "joined_networks": state.mesh.joined_network_ids(),
+                // Always present, not feature-gated: an application reads this
+                // to size its flow-label pool, and an absent field would be
+                // indistinguishable from a node that supports no flows.
+                "realtime_flows": state.realtime_flows,
             });
-            #[cfg(feature = "legacy-media")]
-            let status = {
-                let mut status = status;
-                status["media_lanes"] = serde_json::json!(legacy_media_lanes());
-                status["media_pipes"] = serde_json::json!(true);
-                status
-            };
             Response::ok(status)
         }
         Request::IdentityShow => Response::ok(serde_json::json!({
@@ -1072,51 +1375,74 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             network_connect_peer(state, &network, &peer, pin, wait_ms).await
         }
 
-        #[cfg(feature = "legacy-media")]
-        #[allow(
-            deprecated,
-            reason = "this match arm is the explicit deprecated legacy-media control adapter"
-        )]
-        Request::MediaLaneOpen {
+        // ---- realtime flows ----
+        Request::RealtimeFlowOpen {
             network,
             peer,
-            kind,
+            flow_label,
+            direction,
+            rtp_kind,
+            mime,
+            clock_rate,
+            channels,
         } => {
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
-            let Some(kind) = parse_lane_kind(&kind) else {
-                return Response::err(format!(
-                    "unknown lane kind '{kind}' — expected video | audio"
-                ));
+            let open = core_webrtc::WebRtcRealtimeFlowOpen {
+                label: flow_label,
+                direction,
+                kind: rtp_kind,
+                mime,
+                clock_rate,
+                channels,
             };
-            match net.open_media_lane(&peer, kind).await {
-                Ok(lane) => Response::ok(serde_json::json!({ "lane": lane })),
-                Err(e) => Response::err(e.to_string()),
+            // Synchronous: the label is claimed or refused before this returns,
+            // so a client that gets `ok` may start writing units immediately and
+            // one that gets a refusal knows the label is still its own to reuse.
+            // Awaits: opening a flow brings its native half up with it — a
+            // receive transceiver inbound, a sender and pump outbound. Still one
+            // call and still all-or-nothing from here, so a refusal has released
+            // both the label and the native object and leaves nothing behind.
+            match net.open_webrtc_realtime(&peer, open).await {
+                // Echoed back, not reassigned — core claims the exact label the
+                // caller chose. Returning it keeps the client's confirmation on
+                // the same path as its request rather than an event.
+                Ok(label) => {
+                    // First flow on this session starts its lifecycle pump. The
+                    // claim inside answers `None` if one is already running, so
+                    // this is safe to attempt on every open and needs no
+                    // daemon-side record of which sessions are pumped — which is
+                    // the point, since such a record could disagree with core
+                    // about whether a session is still live.
+                    crate::ipc::bridge::spawn_realtime_flow_events(
+                        net.clone(),
+                        network.clone(),
+                        peer.clone(),
+                        state.clients.clone(),
+                    );
+                    Response::ok(serde_json::json!({ "flow_label": label }))
+                }
+                Err(refusal) => realtime_refused(refusal),
             }
         }
-        #[cfg(feature = "legacy-media")]
-        #[allow(
-            deprecated,
-            reason = "this match arm is the explicit deprecated legacy-media control adapter"
-        )]
-        Request::MediaLaneClose {
+        Request::RealtimeFlowClose {
             network,
             peer,
-            kind,
-            lane,
+            flow_label,
         } => {
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
-            let Some(kind) = parse_lane_kind(&kind) else {
-                return Response::err(format!(
-                    "unknown lane kind '{kind}' — expected video | audio"
-                ));
-            };
-            match net.close_media_lane(&peer, kind, lane).await {
+            // Awaits, and the wait is the guarantee. Closing retires the flow's
+            // native half — a transceiver inbound, a sender outbound — and the
+            // ack follows that retirement rather than the label release. So a
+            // client that closes a label and immediately reopens it can rely on
+            // the previous occupant being gone; acking on the release would make
+            // that false in precisely the case where it matters.
+            match net.close_realtime(&peer, flow_label).await {
                 Ok(()) => Response::ok(serde_json::json!({ "closed": true })),
-                Err(e) => Response::err(e.to_string()),
+                Err(refusal) => realtime_refused(refusal),
             }
         }
 
@@ -1615,127 +1941,32 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Response::ok(serde_json::json!({ "advertised": true }))
         }
 
-        #[cfg(feature = "legacy-media")]
-        #[allow(
-            deprecated,
-            reason = "this match arm is the explicit deprecated legacy-media control adapter"
-        )]
-        Request::VideoSend {
-            network,
-            peer,
-            stream,
-            duration_us,
-            data,
-        } => {
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let bytes = match data_encoding::BASE64.decode(data.as_bytes()) {
-                Ok(b) => b,
-                Err(e) => return Response::err(format!("data not base64: {e}")),
-            };
-            match net
-                .state()
-                .send_video_sample(
-                    &peer,
-                    stream,
-                    bytes.into(),
-                    std::time::Duration::from_micros(duration_us),
-                )
-                .await
-            {
-                Ok(()) => Response::ok(serde_json::json!({ "sent": true })),
-                Err(e) => Response::err(e.to_string()),
-            }
-        }
-
-        #[cfg(feature = "legacy-media")]
-        Request::VideoSubscribe { client_id, network } => {
+        Request::RealtimeSubscribe { client_id, network } => {
             if state.clients.client(client_id).is_none() {
                 return Response::err(format!("unknown client_id: {client_id}"));
             }
-            let Some(net) = state.registry.get(&network) else {
+            if state.registry.get(&network).is_none() {
                 return Response::err(format!("unknown network: {network}"));
-            };
-            let first = state.clients.subscribe_video(network.clone(), client_id);
-            if first {
-                crate::ipc::bridge::spawn_video_pump(&net, network, state.clients.clone());
             }
+            // No task is spawned on the first subscriber. Realtime control
+            // events are synthesised at the point their evidence appears — a
+            // refusal on an inbound pipe's next poll — rather than pumped from a
+            // core event stream, because core publishes none. See the note in
+            // `ipc::bridge`.
+            state.clients.subscribe_realtime(network, client_id);
             Response::ok(serde_json::json!({ "subscribed": true }))
         }
 
-        #[cfg(feature = "legacy-media")]
-        Request::VideoUnsubscribe { client_id, network } => {
-            state.clients.unsubscribe_video(&network, client_id);
-            // The pump exits on its next sample once it sees an empty
-            // subscriber list — same passive teardown as channels.
+        Request::RealtimeUnsubscribe { client_id, network } => {
+            state.clients.unsubscribe_realtime(&network, client_id);
+            // The pump exits on its next event once it sees an empty subscriber
+            // list — the same passive teardown as channels.
             Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
 
-        #[cfg(feature = "legacy-media")]
-        #[allow(
-            deprecated,
-            reason = "this match arm is the explicit deprecated legacy-media control adapter"
-        )]
-        Request::AudioSend {
-            network,
-            peer,
-            stream,
-            duration_us,
-            data,
-        } => {
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let bytes = match data_encoding::BASE64.decode(data.as_bytes()) {
-                Ok(b) => b,
-                Err(e) => return Response::err(format!("data not base64: {e}")),
-            };
-            match net
-                .state()
-                .send_audio_sample(
-                    &peer,
-                    stream,
-                    bytes.into(),
-                    std::time::Duration::from_micros(duration_us),
-                )
-                .await
-            {
-                Ok(()) => Response::ok(serde_json::json!({ "sent": true })),
-                Err(e) => Response::err(e.to_string()),
-            }
-        }
-
-        #[cfg(feature = "legacy-media")]
-        Request::AudioSubscribe { client_id, network } => {
-            if state.clients.client(client_id).is_none() {
-                return Response::err(format!("unknown client_id: {client_id}"));
-            }
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let first = state.clients.subscribe_audio(network.clone(), client_id);
-            if first {
-                crate::ipc::bridge::spawn_audio_pump(&net, network, state.clients.clone());
-            }
-            Response::ok(serde_json::json!({ "subscribed": true }))
-        }
-
-        #[cfg(feature = "legacy-media")]
-        Request::AudioUnsubscribe { client_id, network } => {
-            state.clients.unsubscribe_audio(&network, client_id);
-            // Passive pump teardown, exactly like video.
-            Response::ok(serde_json::json!({ "unsubscribed": true }))
-        }
-
-        // Handled in `handle_client` (they convert the whole connection); never
-        // reach the per-request dispatcher.
-        #[cfg(feature = "legacy-media")]
-        Request::MediaTrackPipe => Response::err("media_track_pipe must open its own connection"),
-        #[cfg(feature = "legacy-media")]
-        Request::MediaSourcePipe { .. } => {
-            Response::err("media_source_pipe must open its own connection")
-        }
+        // Handled in `handle_client` (it converts the whole connection); never
+        // reaches the per-request dispatcher.
+        Request::RealtimePipe { .. } => Response::err("realtime_pipe must open its own connection"),
     }
 }
 
@@ -1790,9 +2021,8 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
     }
     state.registry.insert(joined, drivers);
 
-    // Start a relay forwarder for the new network if relay hosting is on,
-    // and refresh the service-role advert so the new network advertises
-    // what this device hosts.
+    // Refresh the service-role advert so the new network advertises what
+    // this device hosts.
     state.services.on_network_added(&config.id).await;
 
     // Persist to disk. We re-load the config rather than rely on
@@ -2151,8 +2381,8 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     }
     state.registry.insert(joined, drivers);
 
-    // The old network (and its relay forwarder) was torn down; rebind a
-    // fresh relay to the new network state if relay hosting is on.
+    // The old network was torn down and a fresh one registered under the
+    // same id; re-run both hooks so the advert tracks the replacement.
     state.services.on_network_removed(&config.id).await;
     state.services.on_network_added(&config.id).await;
 
@@ -2234,26 +2464,6 @@ fn persist_network_update(net: &NetworkConfig) -> Result<()> {
     }
     cfg.save().map_err(anyhow::Error::msg)?;
     Ok(())
-}
-
-/// Map the wire's lane-kind string onto the transport enum.
-#[cfg(feature = "legacy-media")]
-fn parse_lane_kind(kind: &str) -> Option<myownmesh_core::transport::LaneKind> {
-    use myownmesh_core::transport::LaneKind;
-    match kind {
-        "video" => Some(LaneKind::Video),
-        "audio" => Some(LaneKind::Audio),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "this query is confined to the explicit deprecated legacy-media daemon surface"
-)]
-fn legacy_media_lanes() -> usize {
-    myownmesh_core::transport::resolved_media_lanes()
 }
 
 fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<TopologyMode, String> {
@@ -2412,99 +2622,156 @@ where
 #[allow(dead_code)]
 static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(None);
 
-// ---- binary media-track pipe frame codec -----------------------------------
+// ---- binary realtime pipe frame codec ---------------------------------------
 //
-// Mirror of `allmystuff-protocol`'s codec (keep byte-for-byte identical): the
-// frames a [`Request::MediaTrackPipe`] connection carries. Each frame on the
-// wire is `[u32 len LE][body]`; `body` is what these encode/parse. Round-trip
-// tested below.
+// The frames a [`Request::RealtimePipe`] connection carries. Each frame on the
+// wire is `[u32 len LE][body]`; `body` is what these encode and parse.
+// Round-trip tested below.
+//
+// This codec is defined here and answers to nothing outside this crate. An
+// earlier version of this comment instructed maintainers to keep it
+// byte-for-byte identical to a client application's codec, which had it exactly
+// backwards — a client's encoder is a consumer of this format, not its
+// specification — and was in any case untrue, since that layout leads with a
+// kind byte this one does not have. Clients are held to this wire; it is not
+// held to theirs.
 
-/// `kind` byte for an H.264 access unit.
-#[cfg(feature = "legacy-media")]
-pub const MEDIA_KIND_VIDEO: u8 = 0;
-/// `kind` byte for an Opus frame.
-#[cfg(feature = "legacy-media")]
-pub const MEDIA_KIND_AUDIO: u8 = 1;
 /// Defensive cap on one frame body — a corrupt length never allocates more.
-#[cfg(feature = "legacy-media")]
-pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_REALTIME_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// One decoded media-track frame.
-#[cfg(feature = "legacy-media")]
+/// Fixed header width of a realtime frame body, identical in both directions:
+/// label, a one-byte slot, a four-byte slot, and the payload length.
+///
+/// Both slots are named by direction rather than here, because both mean
+/// different things each way: the one-byte slot is the marker inbound and
+/// reserved zero outbound, and the four-byte slot is an absolute timestamp
+/// inbound and a duration outbound. Equal width is what lets the two encoders be
+/// read against each other; it is not a shared meaning.
+const REALTIME_FRAME_HEADER: usize = 1 + 1 + 4 + 4;
+
+/// One unit read off an **outbound** pipe, on its way to a flow.
+///
+/// The pipe is bound to a session, so the body carries no network, peer, or
+/// codec — only which flow of that session, and what the connector needs to
+/// pace it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaFrame {
-    pub kind: u8,
-    pub stream: u8,
-    pub duration_us: u64,
-    pub network: String,
-    pub peer: String,
-    pub data: Vec<u8>,
+pub struct RealtimeSendUnit {
+    pub flow_label: u8,
+    /// Presentation duration of this unit. Paces the flow clock on the way
+    /// out; it is *not* a timestamp, and deliberately does not share a type
+    /// with one.
+    pub duration_us: u32,
+    pub payload: Vec<u8>,
 }
 
-/// Parse a media frame body (the bytes after the `u32` length prefix). Returns
-/// `None` on any truncation or non-UTF-8 id — a malformed frame is dropped,
-/// never panics.
-#[cfg(feature = "legacy-media")]
-pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
-    fn rd<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
-        let end = p.checked_add(n)?;
-        let s = b.get(*p..end)?;
-        *p = end;
-        Some(s)
+// There is no `marker` on an outbound unit, and the byte that would hold it is
+// reserved zero on the wire.
+//
+// It was never the application's to set. Under `AnnexB` framing the app hands
+// over whole access units and the transport library sets the RTP marker on the
+// last packet of each — the unit boundary IS the marker, so a field here would
+// be an input nothing reads. Keeping it would have been an invitation to set it
+// and to reason about what it did.
+//
+// The byte stays so both directions keep one header width, which is what lets
+// the two encoders be reviewed against each other. It is reserved rather than
+// free: a sender that writes anything but zero is refused, because a nonzero
+// value there means either a client that believes it is setting something or a
+// body from an encoder whose second byte means something else.
+
+/// One unit written to an **inbound** pipe, as received from a flow.
+///
+/// Deliberately a distinct type from [`RealtimeSendUnit`] even though the two
+/// bodies are the same width. The 4-byte slot means different things in each
+/// direction — a duration going out, an absolute timestamp coming in — and one
+/// shared `timestamp` field would let a value from one direction be used as
+/// the other with nothing to catch it. The layout is shared; the meaning is
+/// not, so the types are not either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealtimeRecvUnit {
+    pub flow_label: u8,
+    pub marker: bool,
+    /// Absolute, at the flow's declared `clock_rate`. Uninterpretable without
+    /// it, which is why that is a field on the flow rather than a codec detail.
+    pub rtp_timestamp: u32,
+    pub payload: Vec<u8>,
+}
+
+/// Parse an outbound unit body (the bytes after the `u32` length prefix).
+///
+/// Returns `None` on any truncation or a payload length that disagrees with
+/// the frame — a malformed frame is dropped, never panics, and never trusts a
+/// length it did not check against the bytes actually present.
+pub fn decode_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendUnit> {
+    let header = body.get(..REALTIME_FRAME_HEADER)?;
+    let payload_len = u32::from_le_bytes(header[6..10].try_into().ok()?) as usize;
+    let payload = body.get(REALTIME_FRAME_HEADER..)?;
+    if payload.len() != payload_len {
+        return None;
     }
-    let mut p = 0;
-    let kind = rd(body, &mut p, 1)?[0];
-    let stream = rd(body, &mut p, 1)?[0];
-    let duration_us = u64::from_le_bytes(rd(body, &mut p, 8)?.try_into().ok()?);
-    let net_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
-    let network = std::str::from_utf8(rd(body, &mut p, net_len)?)
-        .ok()?
-        .to_string();
-    let peer_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
-    let peer = std::str::from_utf8(rd(body, &mut p, peer_len)?)
-        .ok()?
-        .to_string();
-    let data = body.get(p..)?.to_vec();
-    Some(MediaFrame {
-        kind,
-        stream,
-        duration_us,
-        network,
-        peer,
-        data,
+    // Byte 1 is reserved and must be zero. Every other value is refused, which
+    // is the strongest check available at this offset: the encoders
+    // neighbouring this one put a stream index, a payload type or a keyframe
+    // flag here, and those are usually nonzero, so a body that arrived from the
+    // wrong encoder fails on its second byte rather than being interpreted.
+    //
+    // It also refuses a client that writes a marker it believes in. Nothing
+    // downstream would read it, and accepting the byte would let that belief
+    // survive indefinitely without ever being contradicted.
+    if header[1] != 0 {
+        return None;
+    }
+    Some(RealtimeSendUnit {
+        flow_label: header[0],
+        duration_us: u32::from_le_bytes(header[2..6].try_into().ok()?),
+        payload: payload.to_vec(),
     })
 }
 
-/// Serialize an inbound frame body (no length prefix). The daemon only encodes
-/// (it pushes inbound frames); the client decodes via `allmystuff-protocol`'s
-/// `decode_inbound_frame`, kept byte-for-byte identical. Layout:
-/// `kind u8 · key u8 · stream u8 · rtp_timestamp u32 · from_len u16 · from ·
-/// data…`, integers little-endian.
-#[cfg(feature = "legacy-media")]
-pub fn encode_inbound_frame(
-    kind: u8,
-    key: bool,
-    stream: u8,
-    rtp_timestamp: u32,
-    from: &str,
-    data: &[u8],
-) -> Vec<u8> {
-    let from = from.as_bytes();
-    let mut out = Vec::with_capacity(9 + from.len() + data.len());
-    out.push(kind);
-    out.push(key as u8);
-    out.push(stream);
-    out.extend_from_slice(&rtp_timestamp.to_le_bytes());
-    out.extend_from_slice(&(from.len() as u16).to_le_bytes());
-    out.extend_from_slice(from);
-    out.extend_from_slice(data);
-    out
+/// Serialize an inbound unit body (no length prefix).
+///
+/// Layout, integers little-endian:
+/// `flow_label u8 · marker u8 · rtp_timestamp u32 · len u32 · payload…`
+///
+/// The `len` is redundant with the frame's own length prefix and is kept
+/// anyway, because the redundancy is the check. Every neighbouring encoder in
+/// the tree starts with a `kind u8` this one does not have, so a sender that
+/// reaches for the wrong one produces a body shifted by exactly one byte —
+/// where `flow_label` reads a kind, `marker` reads a stream index, and every
+/// field is plausible. The inner length is the only field that cannot survive
+/// that shift, so checking it against the bytes actually present turns a silent
+/// misinterpretation into a refusal. Four bytes a unit is cheap for that.
+///
+/// See `a_neighbouring_encoders_frame_is_refused_not_reinterpreted`.
+pub fn encode_realtime_recv_unit(unit: &RealtimeRecvUnit) -> Option<Vec<u8>> {
+    // Both checks happen before anything is allocated, and both are checked
+    // rather than cast. `payload.len() as u32` would truncate a payload past
+    // 4 GiB and produce a body whose inner length disagreed with its own
+    // contents — the exact malformation the decoder on the other side refuses,
+    // manufactured by us. A frame that cannot be encoded correctly must not be
+    // half-encoded.
+    let payload_len = u32::try_from(unit.payload.len()).ok()?;
+    let total = REALTIME_FRAME_HEADER.checked_add(unit.payload.len())?;
+    if total > MAX_REALTIME_FRAME_BYTES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total);
+    out.push(unit.flow_label);
+    out.push(unit.marker as u8);
+    out.extend_from_slice(&unit.rtp_timestamp.to_le_bytes());
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&unit.payload);
+    Some(out)
 }
 
 #[cfg(test)]
-mod legacy_media_control_boundary_tests {
-    use super::Request;
+mod realtime_control_tests {
+    use super::*;
 
+    /// Kept as a wire literal rather than a Rust variant, because what this
+    /// control proves is that the *operation* is gone from the socket — not
+    /// merely that a variant was renamed. A client still sending base64 units
+    /// must be refused outright; there is no compatibility arm to catch it.
     const LEGACY_VIDEO_SEND: &str = r#"{
         "op":"video_send",
         "network":"test-network",
@@ -2514,80 +2781,225 @@ mod legacy_media_control_boundary_tests {
         "data":"AA=="
     }"#;
 
-    #[cfg(not(feature = "legacy-media"))]
     #[test]
-    fn v4_arc03h_normal_daemon_rejects_legacy_media_control_operations() {
-        assert!(serde_json::from_str::<Request>(LEGACY_VIDEO_SEND).is_err());
+    fn base64_unit_operations_are_gone_from_the_wire() {
+        assert!(
+            serde_json::from_str::<Request>(LEGACY_VIDEO_SEND).is_err(),
+            "video_send carried units as base64 over the reliable JSON path and \
+             has no successor: the binary pipe is the only media path"
+        );
     }
 
-    #[cfg(feature = "legacy-media")]
+    /// Both directions bind to one session, so `network` and `peer` are
+    /// required on each. A pipe that parsed without them would carry frames
+    /// whose `flow_label` names a flow on no particular peer.
     #[test]
-    fn v4_arc03h_legacy_media_feature_exposes_the_compatibility_control_operation() {
+    fn a_realtime_pipe_will_not_parse_without_its_session() {
+        let bound = r#"{"op":"realtime_pipe","direction":"outbound",
+            "network":"home","peer":"peerpub"}"#;
         assert!(matches!(
-            serde_json::from_str::<Request>(LEGACY_VIDEO_SEND),
-            Ok(Request::VideoSend { .. })
+            serde_json::from_str::<Request>(bound),
+            Ok(Request::RealtimePipe { .. })
         ));
+
+        let unbound = r#"{"op":"realtime_pipe","direction":"outbound"}"#;
+        assert!(
+            serde_json::from_str::<Request>(unbound).is_err(),
+            "an unbound pipe cannot route a session-scoped label"
+        );
     }
-}
 
-#[cfg(all(test, feature = "legacy-media"))]
-mod media_frame_tests {
-    use super::*;
+    /// A frame from a *neighbouring* encoder must be refused, never reinterpreted.
+    ///
+    /// The hazard is structural rather than particular to any one client. A
+    /// layout of `kind u8 · stream u8 · key u8 · timestamp u32 · len u32 ·
+    /// payload` — our tail behind one extra leading byte — is a shape encoders
+    /// in this problem space converge on, and a sender that reaches for one
+    /// produces a body shifted by exactly one byte where every field stays
+    /// plausible: `flow_label` reads a kind (0 or 1, both valid labels), the
+    /// reserved byte reads a stream index, and the u32 slot reads a keyframe
+    /// flag glued to three bytes of timestamp.
+    ///
+    /// Nothing is acknowledged per unit, so if this were interpreted rather than
+    /// refused the failure would be one hundred percent of media going nowhere
+    /// with no signal on the sending side. The inner length is what makes that
+    /// impossible: it cannot survive the shift, so the frame is rejected.
+    #[test]
+    fn a_neighbouring_encoders_frame_is_refused_not_reinterpreted() {
+        let payload = [7u8, 7, 7, 7, 7, 7];
+        // The shifted layout: ours plus one leading `kind` byte.
+        //
+        // `stream` is 0 deliberately, and this is the second time that choice
+        // has had to move. After the shift it lands in our reserved byte, which
+        // now accepts only zero — so a nonzero stream index would be refused
+        // there and this control would pass while never reaching the length
+        // check it exists to prove. Stream 0 gets past the reserved check and is
+        // caught by the length disagreement, which is the property under test.
+        //
+        // Stream 0 is also the commonest value a real sender uses, so this is
+        // the shift most likely to actually happen.
+        let mut foreign = Vec::new();
+        foreign.push(1u8); // kind
+        foreign.push(0u8); // stream
+        foreign.push(1u8); // key
+        foreign.extend_from_slice(&90_000u32.to_le_bytes()); // timestamp
+        foreign.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        foreign.extend_from_slice(&payload);
 
-    /// Local copy of the encoder (the daemon only needs to decode) so the
-    /// round-trip can be asserted against the exact layout the client writes.
-    fn encode_media_frame(
-        kind: u8,
-        stream: u8,
-        duration_us: u64,
-        network: &str,
-        peer: &str,
-        data: &[u8],
-    ) -> Vec<u8> {
-        let net = network.as_bytes();
-        let peer = peer.as_bytes();
-        let mut out = Vec::with_capacity(14 + net.len() + peer.len() + data.len());
-        out.push(kind);
-        out.push(stream);
+        assert_eq!(
+            foreign.len(),
+            REALTIME_FRAME_HEADER + 1 + payload.len(),
+            "the foreign header is ours plus exactly one leading byte — if this \
+             ever stops holding, the shift this test protects against has changed \
+             shape and the assertion below is no longer testing it"
+        );
+        assert!(
+            decode_realtime_send_unit(&foreign).is_none(),
+            "a one-byte-shifted body must be refused: with the reserved byte \
+             zeroed by the shift, the length check is the only thing standing \
+             between it and silently misrouted media"
+        );
+        // Non-vacuity: the reserved check must NOT be what rejected it, or this
+        // control would still pass if the length check were deleted tomorrow.
+        assert_eq!(
+            foreign[1], 0,
+            "the shifted body must reach the length check, not stop at the \
+             reserved byte"
+        );
+    }
+
+    /// Local copy of the client's writer, so the round-trip is asserted
+    /// against the exact layout the client produces rather than against our
+    /// own decoder's assumptions.
+    ///
+    /// `reserved` is a raw byte rather than a `bool`, because the field it
+    /// occupies is reserved zero and the interesting cases are the values a
+    /// correct client never writes.
+    fn encode_send_unit(flow_label: u8, reserved: u8, duration_us: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(REALTIME_FRAME_HEADER + payload.len());
+        out.push(flow_label);
+        out.push(reserved);
         out.extend_from_slice(&duration_us.to_le_bytes());
-        out.extend_from_slice(&(net.len() as u16).to_le_bytes());
-        out.extend_from_slice(net);
-        out.extend_from_slice(&(peer.len() as u16).to_le_bytes());
-        out.extend_from_slice(peer);
-        out.extend_from_slice(data);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
         out
     }
 
     #[test]
-    fn round_trips_video_and_audio() {
-        let v = encode_media_frame(
-            MEDIA_KIND_VIDEO,
-            3,
-            33_333,
-            "home",
-            "peerpub",
-            &[1, 2, 3, 9],
-        );
-        let f = decode_media_frame(&v).expect("decode");
-        assert_eq!(f.kind, MEDIA_KIND_VIDEO);
-        assert_eq!(f.stream, 3);
-        assert_eq!(f.duration_us, 33_333);
-        assert_eq!(f.network, "home");
-        assert_eq!(f.peer, "peerpub");
-        assert_eq!(f.data, vec![1, 2, 3, 9]);
+    fn send_units_round_trip_without_naming_a_codec() {
+        let body = encode_send_unit(3, 0, 33_333, &[1, 2, 3, 9]);
+        let unit = decode_realtime_send_unit(&body).expect("decode");
+        assert_eq!(unit.flow_label, 3);
+        assert_eq!(unit.duration_us, 33_333);
+        assert_eq!(unit.payload, vec![1, 2, 3, 9]);
 
-        let a = encode_media_frame(MEDIA_KIND_AUDIO, 0, 20_000, "n", "p", &[]);
-        let f = decode_media_frame(&a).expect("decode");
-        assert_eq!(f.kind, MEDIA_KIND_AUDIO);
-        assert!(f.data.is_empty());
+        // An empty payload is a legitimate unit, and the same decode path.
+        let empty =
+            decode_realtime_send_unit(&encode_send_unit(0, 0, 20_000, &[])).expect("decode empty");
+        assert!(empty.payload.is_empty());
     }
 
     #[test]
     fn truncation_is_none_not_panic() {
-        let body = encode_media_frame(MEDIA_KIND_VIDEO, 1, 1, "home", "peer", &[7, 7, 7]);
-        for cut in 0..14 + "home".len() + "peer".len() {
-            assert!(decode_media_frame(&body[..cut]).is_none(), "short {cut}");
+        let body = encode_send_unit(1, 0, 1, &[7, 7, 7]);
+        for cut in 0..body.len() {
+            assert!(
+                decode_realtime_send_unit(&body[..cut]).is_none(),
+                "short {cut}"
+            );
         }
+    }
+
+    /// The inner length is redundant with the frame's own prefix, which is
+    /// exactly why a disagreement between them must be refused rather than
+    /// resolved: silently trusting either one lets a corrupt frame hand a
+    /// truncated or over-long payload to a decoder as if it were whole.
+    #[test]
+    fn a_payload_length_that_disagrees_with_the_frame_is_refused() {
+        let mut body = encode_send_unit(1, 0, 1, &[7, 7, 7]);
+        body[6] = 9; // claim nine payload bytes where three are present
+        assert!(decode_realtime_send_unit(&body).is_none());
+
+        let mut over = encode_send_unit(1, 0, 1, &[7, 7, 7]);
+        over.push(0); // a fourth byte the stated length does not cover
+        assert!(decode_realtime_send_unit(&over).is_none());
+    }
+
+    /// Byte 1 of an outbound body is reserved: zero decodes, everything else is
+    /// refused.
+    ///
+    /// Not pedantry about an unused field. The byte is the one position where a
+    /// body from a neighbouring encoder differs most reliably — a stream index,
+    /// a payload type or a keyframe flag lands here after the one-byte shift,
+    /// and those are usually nonzero. Requiring zero turns that offset into a
+    /// check rather than a place to store a value nothing reads.
+    ///
+    /// It also refuses a client that writes a marker it believes in. Under
+    /// `AnnexB` framing the transport library sets the RTP marker from the unit
+    /// boundary, so an application-supplied one was never an input; accepting
+    /// the byte would let that belief survive without ever being contradicted.
+    #[test]
+    fn a_nonzero_reserved_byte_is_refused() {
+        let ok = encode_send_unit(1, 0, 1, &[7]);
+        let unit = decode_realtime_send_unit(&ok).expect("a zeroed reserved byte decodes");
+        assert_eq!(unit.flow_label, 1);
+        assert_eq!(unit.payload, vec![7]);
+
+        // Every nonzero value, not a sample. 1 is the important one — it is
+        // what a client that still thinks it is sending a marker would write,
+        // and the value most likely to be waved through by a `!= 0` reading.
+        for byte in 1u8..=255 {
+            let body = encode_send_unit(1, byte, 1, &[7]);
+            assert!(
+                decode_realtime_send_unit(&body).is_none(),
+                "reserved byte {byte} must be refused"
+            );
+        }
+    }
+
+    /// A unit too large to frame yields `None` rather than a malformed body.
+    ///
+    /// The failure this prevents is not the loss of one unit. An encoder that
+    /// cast the length would write an inner length disagreeing with its own
+    /// contents — precisely what the decoder at the far end refuses — so the
+    /// client could neither use that frame nor resynchronise after it, and one
+    /// unusable unit would cost every unit behind it.
+    #[test]
+    fn a_unit_too_large_to_frame_is_not_half_encoded() {
+        let ok = encode_realtime_recv_unit(&RealtimeRecvUnit {
+            flow_label: 4,
+            marker: true,
+            rtp_timestamp: 90_000,
+            payload: vec![1, 2, 3],
+        })
+        .expect("an ordinary unit encodes");
+        assert_eq!(ok.len(), REALTIME_FRAME_HEADER + 3);
+
+        // One byte past what the framing may carry. Allocated rather than
+        // faked, so the bound under test is the real one.
+        let oversize = RealtimeRecvUnit {
+            flow_label: 4,
+            marker: false,
+            rtp_timestamp: 0,
+            payload: vec![0u8; MAX_REALTIME_FRAME_BYTES - REALTIME_FRAME_HEADER + 1],
+        };
+        assert!(
+            encode_realtime_recv_unit(&oversize).is_none(),
+            "a body over MAX_REALTIME_FRAME_BYTES must not be encoded at all"
+        );
+
+        // The largest unit that still fits is accepted — the check is a ceiling,
+        // not an off-by-one that also rejects the boundary.
+        let exact = RealtimeRecvUnit {
+            flow_label: 4,
+            marker: false,
+            rtp_timestamp: 0,
+            payload: vec![0u8; MAX_REALTIME_FRAME_BYTES - REALTIME_FRAME_HEADER],
+        };
+        assert_eq!(
+            encode_realtime_recv_unit(&exact).map(|body| body.len()),
+            Some(MAX_REALTIME_FRAME_BYTES)
+        );
     }
 
     /// The `network_connect_peer` op is what a daemon-client embedder sends to
@@ -2595,7 +3007,7 @@ mod media_frame_tests {
     /// decode from the exact JSON a client writes, and round-trip.
     #[test]
     fn network_connect_peer_request_round_trips() {
-        let json = r#"{"op":"network_connect_peer","network":"cec-support","peer":"peerpubkey"}"#;
+        let json = r#"{"op":"network_connect_peer","network":"test-network","peer":"peerpubkey"}"#;
         let req: Request = serde_json::from_str(json).expect("decode network_connect_peer");
         match &req {
             Request::NetworkConnectPeer {
@@ -2604,7 +3016,7 @@ mod media_frame_tests {
                 pin,
                 wait_ms,
             } => {
-                assert_eq!(network, "cec-support");
+                assert_eq!(network, "test-network");
                 assert_eq!(peer, "peerpubkey");
                 // Wire-additive: an old client's op decodes with the
                 // defaults — no pin, no wait.
@@ -2621,28 +3033,76 @@ mod media_frame_tests {
         assert!(matches!(back, Request::NetworkConnectPeer { .. }));
     }
 
+    /// Pins the exact bytes, because this body is shared with the
+    /// applications' decoder: a silent layout change here desynchronises the
+    /// two ends rather than failing a build. Note there is no peer and no
+    /// codec on the wire — the pipe's session binding supplies the first and
+    /// the flow's declared encoding the second.
     #[test]
-    fn inbound_frame_layout_matches_spec() {
-        // Guards against drift from allmystuff-protocol's decode_inbound_frame:
-        // kind, key, stream, rtp(LE u32), from_len(LE u16), from, data.
-        let body = encode_inbound_frame(MEDIA_KIND_VIDEO, true, 2, 0x0001_0203, "ab", &[9, 8]);
+    fn recv_unit_layout_is_pinned() {
+        let body = encode_realtime_recv_unit(&RealtimeRecvUnit {
+            flow_label: 2,
+            marker: true,
+            rtp_timestamp: 0x0001_0203,
+            payload: vec![9, 8],
+        })
+        .expect("a two-byte payload is within the frame ceiling");
         assert_eq!(
             body,
             vec![
-                MEDIA_KIND_VIDEO,
-                1, // key
-                2, // stream
-                0x03,
-                0x02,
-                0x01,
-                0x00, // rtp_timestamp LE
-                2,
-                0, // from_len LE
-                b'a',
-                b'b', // from
-                9,
-                8, // data
+                2, // flow_label
+                1, // marker
+                0x03, 0x02, 0x01, 0x00, // rtp_timestamp LE
+                2, 0, 0, 0, // payload len LE
+                9, 8, // payload
             ]
+        );
+    }
+
+    /// Demonstrates the hazard the type split exists to remove: the two
+    /// directions share a body width, so an inbound unit's bytes can parse as an
+    /// outbound one, with the absolute timestamp landing silently in the
+    /// duration field. That is exactly why `RealtimeSendUnit` and
+    /// `RealtimeRecvUnit` are distinct types with distinct functions, so the
+    /// compiler catches what the bytes cannot. If they are ever merged back into
+    /// one type with a shared `timestamp`, this misreading becomes expressible
+    /// in ordinary code.
+    ///
+    /// The reserved outbound byte narrows this without closing it. An inbound
+    /// unit carrying a real marker has 1 where an outbound body must have 0, so
+    /// that half is now caught — which is a side benefit of the reserved rule
+    /// and not a reason to rely on it. Unmarked units are the ordinary case,
+    /// and they still cross undetected, as the second half of this asserts.
+    #[test]
+    fn wire_bytes_alone_cannot_distinguish_the_two_directions() {
+        // A marked inbound unit is now refused: its marker byte is 1 where the
+        // outbound reserved byte must be 0.
+        let marked = RealtimeRecvUnit {
+            flow_label: 4,
+            marker: true,
+            rtp_timestamp: 90_000,
+            payload: vec![1],
+        };
+        let marked_body = encode_realtime_recv_unit(&marked).expect("encodes");
+        assert!(
+            decode_realtime_send_unit(&marked_body).is_none(),
+            "the reserved byte catches a marked inbound unit read as outbound"
+        );
+
+        // An unmarked one still crosses silently, which is the case the type
+        // split has to cover, because no byte distinguishes it.
+        let recv = RealtimeRecvUnit {
+            flow_label: 4,
+            marker: false,
+            rtp_timestamp: 90_000,
+            payload: vec![1],
+        };
+        let body = encode_realtime_recv_unit(&recv).expect("a one-byte payload encodes");
+        let decoded = decode_realtime_send_unit(&body).expect("same width, so the bytes parse");
+        assert_eq!(decoded.flow_label, recv.flow_label);
+        assert_eq!(
+            decoded.duration_us, recv.rtp_timestamp,
+            "a 90 kHz timestamp read as a 90-millisecond duration, undetectably"
         );
     }
 }

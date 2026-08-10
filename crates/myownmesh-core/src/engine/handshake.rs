@@ -708,27 +708,11 @@ async fn maybe_activate_after_check(
         return;
     };
 
-    // Best-effort, and deliberately *after* the Active commit released the
-    // registry fence. The real-time install now needs an admitted witness, and
-    // minting one re-enters the same mutation lock — doing it inside the commit
-    // closure would deadlock on a non-reentrant lock. Splitting it costs
-    // nothing: the peer is Active by the time this runs, so admission is
-    // established, and a replacement in between simply yields no witness and no
-    // flow, which is the same outcome as a refused install.
-    let installed = state
-        .peers
-        .with_admitted_current(owner, |admitted| admitted.install_legacy_realtime_flow());
-    if installed != Some(true) {
-        state.log_diag_with(
-            crate::events::DiagLevel::Debug,
-            "connector",
-            format!(
-                "{} ACTIVE without an admitted connector-native real-time flow",
-                super::short_peer(device_id)
-            ),
-            serde_json::json!({ "peer": device_id }),
-        );
-    }
+    // Nothing is installed here, and that absence is the design. Real-time work
+    // is authorized by the promoted session, which the registry fence mints on
+    // demand at the moment of use — so reaching Active is already everything
+    // that has to be true, and a separate post-Active step could only be a
+    // second copy of the same fact, taken at a different instant, able to drift.
 
     if let Err(e) = roster_result {
         state.log_diag(
@@ -1054,19 +1038,19 @@ mod tests {
         );
         assert_eq!(
             crate::endpoint_auth::negotiate_profile(&[Feature::TYPED_CHANNELS.to_string()]),
-            Err(crate::endpoint_auth::EndpointAuthError::IncompatibleProfile),
+            Err(crate::endpoint_auth::EndpointAuthSetupError::IncompatibleProfile),
             "a peer that speaks other features but not this profile is refused"
         );
         assert_eq!(
             crate::endpoint_auth::negotiate_profile(&[]),
-            Err(crate::endpoint_auth::EndpointAuthError::IncompatibleProfile),
+            Err(crate::endpoint_auth::EndpointAuthSetupError::IncompatibleProfile),
             "an empty advertisement is refused, not defaulted"
         );
         // Exact-string matching: a near-miss must not resolve, or the id would
         // be an invitation to improvise rather than a closed selector.
         assert_eq!(
             crate::endpoint_auth::negotiate_profile(&["endpoint_auth_v2".to_string()]),
-            Err(crate::endpoint_auth::EndpointAuthError::IncompatibleProfile),
+            Err(crate::endpoint_auth::EndpointAuthSetupError::IncompatibleProfile),
             "no forward-compatible guessing: an unknown id is not this profile"
         );
         assert!(
@@ -1097,6 +1081,110 @@ mod tests {
             state.peers.get_if_current(&owner).is_none(),
             "an unadvertised peer is dropped rather than authenticated"
         );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04h_malformed_contribution_closes_the_exact_current_peer() {
+        // The production half of the setup/terminal split, on the inbound path.
+        //
+        // A refusal from `PeerContribution::from_wire` is an
+        // `EndpointAuthSetupError`: the parser holds no task, so it terminalizes
+        // nothing and its value makes no lifecycle claim. That is exactly why
+        // this control exists — with the cause no longer able to imply "the
+        // attempt is over", the thing that has to fail this closed is the
+        // handler's own act on its own state, and it must be asserted rather
+        // than inferred from the error type as it was when both senses shared
+        // one enum.
+        //
+        // The twins differ in one field. Both Hellos are otherwise identical
+        // and both advertise the closed profile, so the drop below is
+        // attributable to the contribution and not to an earlier gate.
+        fn fixture(
+            suffix: &str,
+        ) -> (
+            Arc<NetworkState>,
+            Arc<crate::endpoint_auth::EndpointAuthTask>,
+            PeerOwnerToken,
+        ) {
+            let state = crate::engine::build_test_state(suffix);
+            let task = Arc::new(crate::endpoint_auth::task_for_test(
+                crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
+            ));
+            crate::engine::install_peer(
+                &state.peers,
+                Arc::new(crate::engine::PeerConnection::with_endpoint_auth_for_test(
+                    "peer".to_string(),
+                    Arc::clone(&task),
+                )),
+            );
+            let owner = state.peers.owner("peer").expect("installed peer owner");
+            (state, task, owner)
+        }
+
+        // Non-vacuity: the canonical twin. The same handler, the same fixture,
+        // the same frame — with a contribution the parser accepts — keeps the
+        // peer and binds the attempt.
+        {
+            let (state, task, owner) = fixture("arc04h-canonical-contribution");
+            on_hello(
+                &state,
+                &owner,
+                hello_carrying(
+                    "peer",
+                    crate::endpoint_auth::LocalContribution::generate().as_str(),
+                    "label",
+                    "aaa111",
+                    "feature",
+                    false,
+                ),
+            )
+            .await;
+
+            assert!(
+                state.peers.get_if_current(&owner).is_some(),
+                "a canonical contribution keeps the exact current peer"
+            );
+            assert_eq!(
+                task.signature_count(),
+                1,
+                "and binds the attempt, producing the one local proof"
+            );
+        }
+
+        let (state, task, owner) = fixture("arc04h-malformed-contribution");
+        // The exact value under test, refused by the exact parser the handler
+        // calls, with the exact setup cause. Stated here so the drop below is
+        // pinned to that refusal rather than assumed to follow from it.
+        assert_eq!(
+            crate::endpoint_auth::PeerContribution::from_wire("not-base32!"),
+            Err(crate::endpoint_auth::EndpointAuthSetupError::ContributionMalformed),
+            "non-vacuity: this value really is refused, and as an input rather \
+             than as a lifecycle event"
+        );
+
+        on_hello(
+            &state,
+            &owner,
+            hello_carrying("peer", "not-base32!", "label", "aaa111", "feature", false),
+        )
+        .await;
+
+        // Fail-closed, and closed on the *exact* current owner: the entry is
+        // removed rather than left alive and unauthenticated. This is the
+        // synchronous half of the teardown; retiring the connector behind it
+        // runs on the peer's own owner path, so this control asserts the
+        // registry closure it can observe rather than racing that.
+        assert!(
+            state.peers.get_if_current(&owner).is_none(),
+            "a malformed contribution closes the exact current peer rather than \
+             leaving it alive and unauthenticated"
+        );
+        // And the attempt was never reached: a value the parser refuses cannot
+        // bind anything, so no transcript was built and no signature produced
+        // for it. The one draw the task made at construction is still its only
+        // draw.
+        assert_eq!(task.signature_count(), 0, "a refused input signs nothing");
+        assert_eq!(task.draw_count(), 1, "and causes no second draw");
     }
 
     #[tokio::test]

@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 pub mod attempt;
 pub mod relay;
-pub mod session_broker;
+// Crate-private: every production caller is inside this crate (the engine's
+// registry fence and the connector), and applications reach a session through
+// the daemon control boundary rather than by naming the type. A public path
+// would be a public identity surface for an authority that must not have one.
+pub(crate) mod session_broker;
 
 /// Memory-only witness for one process runtime.
 ///

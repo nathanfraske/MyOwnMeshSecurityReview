@@ -142,7 +142,7 @@ export interface MeshConfigSnapshot {
   [key: string]: unknown;
 }
 
-// ---- infrastructure services (relay / signaling / STUN / TURN) -------
+// ---- infrastructure services (signaling / STUN / TURN) ---------------
 //
 // Device-level service hosting. The *config* shapes mirror
 // `myownmesh_core::config::ServicesConfig` (the write shape sent into
@@ -152,11 +152,6 @@ export interface MeshConfigSnapshot {
 
 export interface NodeServiceConfig {
   enabled: boolean;
-}
-
-export interface RelayServiceConfig {
-  enabled: boolean;
-  max_fanout: number;
 }
 
 /** Flood-protection limits for the self-hosted signaling relay. `0`
@@ -203,7 +198,6 @@ export interface TurnServiceConfig {
 export interface ServicesConfig {
   /** Mesh participation. Off = pure-infrastructure box. */
   node: NodeServiceConfig;
-  relay: RelayServiceConfig;
   signaling: SignalingServerConfig;
   stun: StunServiceConfig;
   turn: TurnServiceConfig;
@@ -229,12 +223,6 @@ export interface EndpointReport {
   activity?: RelayStatsSnapshot | null;
 }
 
-export interface RelayReport {
-  enabled: boolean;
-  networks: number;
-  max_fanout: number;
-}
-
 export interface NodeReport {
   enabled: boolean;
   /** Networks joined as a node (0 in pure-infrastructure mode). */
@@ -243,7 +231,6 @@ export interface NodeReport {
 
 export interface ServicesReport {
   node: NodeReport;
-  relay: RelayReport;
   signaling: EndpointReport;
   stun: EndpointReport;
   turn: EndpointReport;

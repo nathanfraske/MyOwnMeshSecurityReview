@@ -10,9 +10,9 @@
 //! Everything else about the daemon is unchanged: it still listens on the
 //! control socket (a unix socket inside the app sandbox on iOS; sockets are
 //! allowed; processes aren't), speaks the same wire protocol, and hosts the
-//! same registry/services, so existing clients (`myownmesh ctl`, the GUIs,
-//! `allmystuff-serve`) work against it identically whether it runs as a
-//! process or embedded.
+//! same registry/services, so existing clients (`myownmesh ctl`, the GUIs, and
+//! any embedding application's own sidecar) work against it identically whether
+//! it runs as a process or embedded.
 
 pub mod control;
 pub mod embedded;

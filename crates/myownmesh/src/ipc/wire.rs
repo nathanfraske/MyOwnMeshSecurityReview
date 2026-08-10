@@ -68,29 +68,45 @@ pub enum ServerOut {
         channel: String,
         payload: Value,
     },
-    /// One assembled video access unit from a peer's track lane,
-    /// for a client that called `video_subscribe` on the network.
-    /// `data` is the Annex-B H.264 unit, base64; `rtp_timestamp`
-    /// ticks at the 90 kHz video clock; `key` marks an IDR.
-    VideoInbound {
+    // ---- realtime flows ------------------------------------------------
+    //
+    // Control-plane only. Realtime *units* never appear here: they ride an
+    // inbound `realtime_pipe`, which is binary and unframed by JSON. Carrying
+    // units as base64 on this socket would put low-latency media on the
+    // reliable JSON path, which is the one thing the realtime protocol exists
+    // to avoid — a parse and a 33% inflation per unit, on the latency-critical
+    // path. There is deliberately no `realtime_inbound` variant.
+    // There is deliberately no `realtime_flow_opened`.
+    //
+    // Peer-unilateral flow creation is not supported: a flow exists because this
+    // node's own application asked for one, so the only open that can be
+    // announced is one the caller already knows about. The successful response
+    // to `realtime_flow_open` IS the acknowledgement, and it arrives on the same
+    // connection as the request rather than out of order on an event socket.
+    //
+    // An event here would have been strictly worse than nothing. It could only
+    // ever report local opens, so a client watching for peers opening flows
+    // would see a stream that looked live and was structurally incapable of
+    // carrying the case it was watching for.
+    /// A realtime flow on the session with `from` ended.
+    ///
+    /// There is no `reason`. Core reports that the flow closed and not why, and
+    /// a daemon-authored string would be a guess formatted to look like a
+    /// finding.
+    RealtimeFlowClosed {
         network: String,
         from: String,
-        /// Which of the peer's video lanes the unit arrived on — lets a
-        /// subscriber keep several simultaneous streams from one peer apart.
-        stream: u8,
-        rtp_timestamp: u32,
-        key: bool,
-        data: String,
+        flow_label: u8,
     },
-    /// One Opus frame off a peer's audio track lane (base64 payload).
-    AudioInbound {
-        network: String,
-        from: String,
-        /// Which of the peer's audio lanes the frame arrived on.
-        stream: u8,
-        rtp_timestamp: u32,
-        data: String,
-    },
+    // There is deliberately no `realtime_dead_flow`.
+    //
+    // It was to carry a receiver citing back a label it could no longer resolve,
+    // synthesised from a refusal on the inbound path. Core now publishes real
+    // flow lifecycle events and they contain no retirement signal — a stream
+    // that ends means the session ended, full stop. Keeping a variant only this
+    // daemon could infer would put two sources behind one fact, certain to
+    // disagree eventually with no rule for which wins, and would have clients
+    // writing recovery for a frame with no producer.
     /// A more-recent client claimed a method this client had
     /// previously registered. The displaced client should stop
     /// expecting `RpcInbound` events for `method`; any

@@ -38,7 +38,6 @@ pub(super) enum RealtimeFlowDropReason {
     UnitOversize,
     InProgressLimit,
     AggregateBytes,
-    PreAuthEnvelope,
     FlowQueueFull,
     Retired,
     OwnershipMismatch,
@@ -124,8 +123,7 @@ impl QueuedRealtimeEvent {
         &mut self,
     ) -> std::result::Result<(), RealtimeFlowDropReason> {
         let reservation = match &mut self.event.event {
-            TransportEvent::VideoSample(sample) => sample._reservation.as_mut(),
-            TransportEvent::AudioSample(sample) => sample._reservation.as_mut(),
+            TransportEvent::RealtimeUnit(delivery) => delivery.payload_mut(),
             _ => None,
         }
         .ok_or(RealtimeFlowDropReason::OwnershipMismatch)?;
@@ -198,9 +196,6 @@ pub(super) struct RealtimeFlowRegistryState {
     pub(super) active_flows_by_domain: [usize; 2],
     pub(super) retained_bytes_by_domain: [usize; 2],
     pub(super) in_progress_units_by_domain: [usize; 2],
-    pub(super) pre_auth_packets: usize,
-    pub(super) pre_auth_content_bytes: usize,
-    pub(super) pre_auth_exhausted: bool,
     pub(super) accounting_poisoned_by_domain: [bool; 2],
     pub(super) retired: bool,
 }
@@ -218,12 +213,13 @@ pub(super) struct RealtimeFlowRegistry {
     observer: Option<Arc<dyn RealtimeFlowObserver>>,
 }
 
-/// Exact finite ownership for one native pre-authentication real-time callback.
+/// Exact finite ownership of the work one inbound RTP packet costs.
 ///
-/// The checked API returns this guard so a connector adapter can keep the
-/// packet's content and parsing-work claim through its whole iteration. The
-/// temporary bool compatibility API releases it after admission checking.
-pub(super) struct RealtimePreAuthWorkLease {
+/// Held by the pump for the whole of that packet's iteration — classification,
+/// reassembly, framing — and released when the iteration ends, whatever the
+/// outcome. Retention that outlives the packet takes its own longer-lived
+/// lease, so this one measures work rather than storage.
+pub(super) struct RealtimeSessionPacketWorkLease {
     _lease: ResourceLease,
 }
 
@@ -262,9 +258,6 @@ impl RealtimeFlowRegistry {
                 active_flows_by_domain: [0; 2],
                 retained_bytes_by_domain: [0; 2],
                 in_progress_units_by_domain: [0; 2],
-                pre_auth_packets: 0,
-                pre_auth_content_bytes: 0,
-                pre_auth_exhausted: false,
                 accounting_poisoned_by_domain: [false; 2],
                 retired: false,
             }),
@@ -279,10 +272,6 @@ impl RealtimeFlowRegistry {
                 observer.observe(observation);
             }));
         }
-    }
-
-    pub(super) fn is_enabled(&self) -> bool {
-        self.resources.is_some()
     }
 
     fn claim_arithmetic_unavailable(error: ResourceClaimArithmeticError) -> ResourceUnavailable {
@@ -344,23 +333,13 @@ impl RealtimeFlowRegistry {
         ])
     }
 
-    pub(super) fn fragment_claim(
-        content_bytes: usize,
-    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
-        Self::fragment_claim_with_dependency_nodes(content_bytes, 1)
-    }
-
+    /// The cost of retaining one inbound fragment until its unit completes.
+    ///
+    /// Two dependency nodes: one owns the fragment lease and one owns the
+    /// ordered payload entry the assembler keeps it in. Both persist for
+    /// exactly the assembly lifetime.
     pub(super) fn ordered_fragment_claim(
         content_bytes: usize,
-    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
-        // One node owns the fragment lease and one node owns the H.264 ordered
-        // payload entry. Both persist for exactly the assembly lifetime.
-        Self::fragment_claim_with_dependency_nodes(content_bytes, 2)
-    }
-
-    fn fragment_claim_with_dependency_nodes(
-        content_bytes: usize,
-        dependency_nodes: u64,
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         let retained_bytes = std::mem::size_of::<RealtimeFragmentLeaseNode>()
             .checked_add(content_bytes)
@@ -373,7 +352,7 @@ impl RealtimeFlowRegistry {
                 Self::measured_bytes(retained_bytes)?,
             ),
             (ResourceClass::ParsingOrCpuWork, 1),
-            (ResourceClass::OpaqueDependencyResidual, dependency_nodes),
+            (ResourceClass::OpaqueDependencyResidual, 2),
         ])
     }
 
@@ -428,7 +407,12 @@ impl RealtimeFlowRegistry {
         ])
     }
 
-    pub(super) fn pre_auth_work_claim(
+    /// The per-packet cost of classifying and framing one inbound RTP payload.
+    ///
+    /// Sized by the payload it covers, so a large packet costs more than a small
+    /// one and the provider is the thing that says no. Retained fragments and
+    /// complete outputs acquire their own longer-lived leases on top of this.
+    pub(super) fn session_packet_work_claim(
         content_bytes: usize,
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         Self::claim([
@@ -686,6 +670,7 @@ impl RealtimeFlowRegistry {
         self.open_flow_checked(RealtimeFlowDomain::OutboundCompatibility)
     }
 
+    #[cfg(test)]
     pub(super) fn open_outbound_flow(self: &Arc<Self>) -> Option<RealtimeFlowPort> {
         self.open_outbound_flow_checked().ok()
     }
@@ -885,63 +870,41 @@ impl RealtimeFlowRegistry {
         })
     }
 
-    pub(super) fn admit_pre_auth_packet_checked(
+    /// Admit the work of classifying one inbound RTP packet on an open flow.
+    ///
+    /// **Accounting, not admission.** The caller is the pump for a track that
+    /// already attached to a binding the promoted session established, so the
+    /// question of whether this packet may be processed at all was answered
+    /// before this pump existed. What is decided here is whether the provider
+    /// can currently afford the work, and whether this domain's accounting is
+    /// still trustworthy.
+    ///
+    /// There is deliberately no cumulative packet or byte envelope. A ceiling
+    /// that latches would end a long-lived session at an arbitrary packet
+    /// count, and one that resets would be a timer by another name. Sustained
+    /// inbound pressure is bounded where it is actually held — the per-packet
+    /// claim above, the per-flow in-progress and fragment limits, the queue
+    /// depth, and the aggregate retained-byte ceiling — every one of which
+    /// releases as the work completes.
+    pub(super) fn admit_session_packet_checked(
         &self,
         payload_bytes: usize,
-        promoted: bool,
-    ) -> std::result::Result<RealtimePreAuthWorkLease, RealtimeFlowDropReason> {
-        // This lease covers the connector-owned admission and classification
-        // work. Retained fragments and complete outputs acquire their own
-        // longer-lived leases before MyOwnMesh retains or queues them.
+    ) -> std::result::Result<RealtimeSessionPacketWorkLease, RealtimeFlowDropReason> {
         let work = self
-            .acquire(Self::pre_auth_work_claim(payload_bytes))
+            .acquire(Self::session_packet_work_claim(payload_bytes))
             .map_err(|reason| self.record_drop(None, reason, payload_bytes))?;
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let domain = RealtimeFlowDomain::InboundQuarantine;
         if state.retired {
             return Err(RealtimeFlowDropReason::Retired);
         }
-        if self.local_ceiling.is_some()
-            && (state.accounting_poisoned_by_domain[domain.index()] || state.pre_auth_exhausted)
-        {
-            return Err(RealtimeFlowDropReason::PreAuthEnvelope);
+        // Same answer as every other acquisition on a damaged domain: the
+        // aggregate is no longer trustworthy, so nothing more is admitted
+        // against it.
+        if self.local_ceiling.is_some() && state.accounting_poisoned_by_domain[domain.index()] {
+            return Err(RealtimeFlowDropReason::AggregateBytes);
         }
-        if promoted {
-            return Ok(RealtimePreAuthWorkLease { _lease: work });
-        }
-        let Some(policy) = self
-            .local_ceiling
-            .map(EnabledRealtimeConnectorPolicy::flows)
-        else {
-            // Without an optional cumulative local ceiling, provider pressure
-            // governs each finite admission operation. Time does not expire or
-            // replenish authority.
-            return Ok(RealtimePreAuthWorkLease { _lease: work });
-        };
-        let Some(packets) = state.pre_auth_packets.checked_add(1) else {
-            self.poison_domain_locked(&mut state, domain);
-            return Err(RealtimeFlowDropReason::PreAuthEnvelope);
-        };
-        let Some(bytes) = state.pre_auth_content_bytes.checked_add(payload_bytes) else {
-            self.poison_domain_locked(&mut state, domain);
-            return Err(RealtimeFlowDropReason::PreAuthEnvelope);
-        };
-        if packets > policy.max_pre_auth_packets().get()
-            || bytes > policy.max_pre_auth_content_bytes().get()
-        {
-            state.pre_auth_exhausted = true;
-            drop(state);
-            self.record(RealtimeFlowObservation::Drop {
-                key: None,
-                reason: RealtimeFlowDropReason::PreAuthEnvelope,
-                queue_age: Duration::ZERO,
-                payload_bytes,
-            });
-            return Err(RealtimeFlowDropReason::PreAuthEnvelope);
-        }
-        state.pre_auth_packets = packets;
-        state.pre_auth_content_bytes = bytes;
-        Ok(RealtimePreAuthWorkLease { _lease: work })
+        Ok(RealtimeSessionPacketWorkLease { _lease: work })
     }
 
     pub(super) fn begin_native_read_checked(
@@ -957,9 +920,8 @@ impl RealtimeFlowRegistry {
     }
 
     #[cfg(test)]
-    pub(super) fn admit_pre_auth_packet(&self, payload_bytes: usize, promoted: bool) -> bool {
-        self.admit_pre_auth_packet_checked(payload_bytes, promoted)
-            .is_ok()
+    pub(super) fn admit_session_packet(&self, payload_bytes: usize) -> bool {
+        self.admit_session_packet_checked(payload_bytes).is_ok()
     }
 
     pub(super) fn reserve_output_checked(
@@ -1315,25 +1277,11 @@ impl RealtimeAssemblyReservation {
         self.registry.poison_domain_locked(&mut state, self.domain);
     }
 
-    pub(super) fn retain_fragment_checked(
-        &mut self,
-        bytes: usize,
-    ) -> std::result::Result<(), RealtimeFlowDropReason> {
-        self.retain_fragment_with_claim(bytes, RealtimeFlowRegistry::fragment_claim(bytes))
-    }
-
     pub(super) fn retain_ordered_fragment_checked(
         &mut self,
         bytes: usize,
     ) -> std::result::Result<(), RealtimeFlowDropReason> {
-        self.retain_fragment_with_claim(bytes, RealtimeFlowRegistry::ordered_fragment_claim(bytes))
-    }
-
-    fn retain_fragment_with_claim(
-        &mut self,
-        bytes: usize,
-        claim: std::result::Result<ResourceClaim, ResourceUnavailable>,
-    ) -> std::result::Result<(), RealtimeFlowDropReason> {
+        let claim = RealtimeFlowRegistry::ordered_fragment_claim(bytes);
         let local_ceiling = self
             .registry
             .local_ceiling
@@ -1439,10 +1387,6 @@ impl RealtimeAssemblyReservation {
             retained_bytes,
         });
         Ok(())
-    }
-
-    pub(super) fn retain_fragment(&mut self, bytes: usize) -> bool {
-        self.retain_fragment_checked(bytes).is_ok()
     }
 
     pub(super) fn retain_ordered_fragment(&mut self, bytes: usize) -> bool {
@@ -1587,33 +1531,39 @@ mod elastic_resource_tests {
         _attempt: AttemptLifetime,
     }
 
+    /// Four payload bytes on a label, leaseless — `enqueue_checked` attaches
+    /// the output reservation these controls are actually measuring.
+    fn fixture_realtime_unit() -> TransportEvent {
+        TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
+            RealtimeFlowLabel::from_peer(0),
+            RealtimeRecvUnit {
+                timestamp: 0,
+                marker: true,
+                data: Bytes::from_static(b"test"),
+            },
+        ))
+    }
+
     /// Derive the finite test grant from the exact claims exercised by one
     /// scenario. `explicit_test_grant` also reserves capacity for one connector
-    /// operation and one compatibility real-time capability. This fixture owns
-    /// neither, so remove both claims and the provider reservation record paired
-    /// with each before adding the exact real-time leases under test.
+    /// operation. This fixture owns none, so remove that claim and the provider
+    /// reservation record paired with it before adding the exact real-time
+    /// leases under test.
     ///
     /// The remaining residuals account for the process, Mesh, and connector
     /// scope records, cleanup and candidate reservations, and one provider
     /// reservation record for each real-time lease. They are test accounting,
     /// not a product cardinality or production policy value.
     fn grant_for(realtime_claims: &[ResourceClaim]) -> ResourceClaim {
-        let mut grant = crate::runtime::attempt::explicit_test_grant(1, 1);
-        for unused_fixture_claim in [
-            crate::runtime::attempt::connector_operation_claim(),
-            crate::connector::realtime_flow_capability_claim()
-                .expect("the compatibility real-time capability claim is representable"),
-        ] {
-            grant = grant
-                .checked_sub(unused_fixture_claim)
-                .and_then(|grant| {
-                    grant.checked_sub(ResourceClaim::single(
-                        ResourceClass::OpaqueDependencyResidual,
-                        1,
-                    ))
-                })
-                .expect("the broad fixture contains each unused claim and reservation record");
-        }
+        let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
+            .checked_sub(crate::runtime::attempt::connector_operation_claim())
+            .and_then(|grant| {
+                grant.checked_sub(ResourceClaim::single(
+                    ResourceClass::OpaqueDependencyResidual,
+                    1,
+                ))
+            })
+            .expect("the broad fixture contains the unused claim and its reservation record");
         add_provider_reservations(grant, realtime_claims)
     }
 
@@ -1708,8 +1658,8 @@ mod elastic_resource_tests {
         let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
         let assembly_claim =
             RealtimeFlowRegistry::assembly_claim().expect("assembly claim is representable");
-        let fragment_claim =
-            RealtimeFlowRegistry::fragment_claim(4).expect("fragment claim is representable");
+        let fragment_claim = RealtimeFlowRegistry::ordered_fragment_claim(4)
+            .expect("fragment claim is representable");
         let fixture = context(&[flow_claim, assembly_claim, fragment_claim]);
         let flow = fixture
             .registry
@@ -1720,7 +1670,7 @@ mod elastic_resource_tests {
             .begin_unit_checked()
             .expect("the unit claim is available");
         assembly
-            .retain_fragment_checked(4)
+            .retain_ordered_fragment_checked(4)
             .expect("the exact fragment claim is available");
         let with_fragment = fixture.provider.in_use();
         assert_eq!(
@@ -1729,7 +1679,7 @@ mod elastic_resource_tests {
                 .amount(ResourceClass::AccountedMemoryBytes)
         );
         assert!(matches!(
-            assembly.retain_fragment_checked(1),
+            assembly.retain_ordered_fragment_checked(1),
             Err(RealtimeFlowDropReason::ResourceUnavailable(
                 ResourceUnavailable::Pressure(crate::resource::ResourcePressure {
                     dimension: ResourceClass::AccountedMemoryBytes,
@@ -1743,17 +1693,17 @@ mod elastic_resource_tests {
     }
 
     #[test]
-    fn pre_auth_work_guard_holds_capacity_through_the_caller_iteration() {
-        let work_claim =
-            RealtimeFlowRegistry::pre_auth_work_claim(4).expect("work claim is representable");
+    fn session_packet_work_guard_holds_capacity_through_the_caller_iteration() {
+        let work_claim = RealtimeFlowRegistry::session_packet_work_claim(4)
+            .expect("work claim is representable");
         let fixture = context(&[work_claim]);
         let before_work = fixture.provider.in_use();
         let work = fixture
             .registry
-            .admit_pre_auth_packet_checked(4, false)
+            .admit_session_packet_checked(4)
             .expect("the exact packet work claim is available");
         assert!(matches!(
-            fixture.registry.admit_pre_auth_packet_checked(1, false),
+            fixture.registry.admit_session_packet_checked(1),
             Err(RealtimeFlowDropReason::ResourceUnavailable(
                 ResourceUnavailable::Pressure(crate::resource::ResourcePressure {
                     dimension: ResourceClass::AccountedMemoryBytes,
@@ -1766,7 +1716,7 @@ mod elastic_resource_tests {
         assert_eq!(fixture.provider.in_use(), before_work);
         fixture
             .registry
-            .admit_pre_auth_packet_checked(1, false)
+            .admit_session_packet_checked(1)
             .expect("dropping the exact work guard restores provider capacity");
     }
 
@@ -1876,12 +1826,7 @@ mod elastic_resource_tests {
         );
         flow.enqueue_checked(
             QueuedTransportEvent {
-                event: TransportEvent::AudioSample(AudioSample {
-                    rtp_timestamp: 0,
-                    lane: 0,
-                    data: Bytes::from_static(b"test"),
-                    _reservation: None,
-                }),
+                event: fixture_realtime_unit(),
                 observation: None,
                 callback_work: None,
             },
@@ -1897,11 +1842,11 @@ mod elastic_resource_tests {
                 .expect("the exact payload is queued");
             assert_eq!(queued._queue_lease.claim(), queue_claim);
             let payload = match &queued.event.event {
-                TransportEvent::AudioSample(sample) => sample
-                    ._reservation
+                TransportEvent::RealtimeUnit(delivery) => delivery
+                    .payload
                     .as_ref()
                     .expect("the queued payload owns its output lease"),
-                _ => panic!("the fixture queues one audio payload"),
+                _ => panic!("the fixture queues one real-time unit"),
             };
             assert_eq!(payload.claim(), output_claim);
             assert_eq!(
@@ -1925,11 +1870,11 @@ mod elastic_resource_tests {
             .try_recv()
             .expect("the queued event remains available");
         let retained = match &event.event {
-            TransportEvent::AudioSample(sample) => sample
-                ._reservation
+            TransportEvent::RealtimeUnit(delivery) => delivery
+                .payload
                 .as_ref()
                 .expect("the delivered payload retains its exact lease"),
-            _ => panic!("the fixture delivers one audio payload"),
+            _ => panic!("the fixture delivers one real-time unit"),
         };
         assert_eq!(retained.claim(), retained_payload_claim);
         assert_eq!(
@@ -1965,12 +1910,7 @@ mod elastic_resource_tests {
             .expect("the output claim is available");
         flow.enqueue_checked(
             QueuedTransportEvent {
-                event: TransportEvent::AudioSample(AudioSample {
-                    rtp_timestamp: 0,
-                    lane: 0,
-                    data: Bytes::from_static(b"test"),
-                    _reservation: None,
-                }),
+                event: fixture_realtime_unit(),
                 observation: None,
                 callback_work: None,
             },

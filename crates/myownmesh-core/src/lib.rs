@@ -126,11 +126,10 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
-#[cfg(feature = "legacy-v1")]
-pub mod legacy_v1;
 pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
+pub mod realtime;
 pub mod resource;
 pub mod roster;
 pub mod rpc;
@@ -143,9 +142,9 @@ pub mod verification;
 
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, RelayServiceConfig,
-    ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig,
-    TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
+    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, ServicesConfig,
+    SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode,
+    TurnCredential, TurnServer, TurnServiceConfig,
 };
 pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;
@@ -183,14 +182,18 @@ pub use transport::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
     transport_lab_remote_description_fixture_grant,
 };
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "these are the explicit deprecated legacy-media compatibility exports"
-)]
-pub use transport::{LegacyWebRtcMediaProfile, LegacyWebRtcMediaProfileError};
+/// Every realtime name at the crate root is `WebRtc`-qualified.
+///
+/// The generic realtime vocabulary lives in [`realtime`] and names no codec, no
+/// media kind and no RTP fact; everything that does is a property of the WebRTC
+/// provider and says so in its own name. There is no unqualified spelling and no
+/// compatibility alias for the ones that used to be here — a caller updates the
+/// name or does not compile.
 pub use transport::{
     PendingRemoteCandidatePolicy, WebRtcConnectorProfile, WebRtcConnectorProfileError,
+    WebRtcRealtimeCodec, WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming,
+    WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit,
+    WebRtcRealtimeProfile, WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };
 
 /// Domain-separation tag prefixed to every signed handshake payload.

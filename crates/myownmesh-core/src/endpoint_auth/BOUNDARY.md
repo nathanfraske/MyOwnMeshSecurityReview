@@ -4,6 +4,15 @@
 
 Own fresh mutual Device authentication for one exact connected channel. Arc 03 moves the connected-channel capability into this owner and binds its installation to the exact connector incarnation. Arc 04 added the verified transcript and the authenticated-channel transition.
 
+Ownership is narrower than "endpoint authentication" as a whole, and the split matters because three other owners are involved on every attempt:
+
+- **This owner** holds the exchange state machine (`EndpointAuthTask`), the closed profile (`EndpointAuthProfile`, derived in `context` from the connector's binding profile), the signed transcript framing (`transcript`), both refusal vocabularies (`EndpointAuthSetupError` and `EndpointAuthError`), and the two frame-intake operations `EndpointAuthTask::accept_peer_hello` and `EndpointAuthTask::accept_peer_proof`. It is the sole issuer of `AuthenticatedChannelCapability`.
+- **The connector** supplies the channel-binding term and nothing else. `EndpointAuthBinding::webrtc_certificate_fingerprints` is read from the connector worker's live native session; this owner never reads SDP, a certificate, or a key.
+- **The engine handshake path** (`engine::handshake::on_hello`, `on_auth_response`) owns the wire frames, the peer registry effects, and the fail-closed corroboration after promotion. It calls the two intake operations; it does not decide authentication.
+- **The engine `DataChannelOpen` arm** owns the refusal-and-cleanup path when the binding supplier has nothing to supply. See "Fail-closed binding supply" below.
+
+This owner therefore never sees a `HelloMessage`, never sends a frame, and never touches the peer registry.
+
 ## Owned state
 
 The Arc 03 task owns connected-channel provenance. Its handoff records the exact process-local connector incarnation and cleanup owner. Arc 04 added the fresh transcript, ordered endpoint roles, exact mesh-context binding, the selected channel-binding terms (both endpoints' DTLS certificate fingerprints, which are not session-unique — see Residual), and the authenticated result. It added **no** independent resource admission: the permit attests the connected-channel ownership this task already holds. Exactness of channel identity is carried by the composition of per-attempt contribution freshness and process-local connector-incarnation ownership, not by the binding terms.
@@ -14,6 +23,36 @@ The Arc 03 task owns connected-channel provenance. Its handoff records the exact
 - one `EndpointAuthPermit` per attempt. **It is not backed by a separate Arc 04 resource admission.** The landed constructor derives it from the runtime of the `ConnectedChannelCapability` the task already owns, so what it actually attests is existing connected-channel ownership, not a fresh admission decision. A real pre-authentication admission remains unimplemented; the permit must not be cited as evidence of one;
 - fresh contributions from both endpoints in Arc 04;
 - exact local and remote Device IDs, mesh context, and the selected channel binding in Arc 04 — the DTLS certificate fingerprints of **both** endpoints, in role-canonical order. Not an exporter; see Residual.
+
+Exactly two operations take peer-supplied bytes, and each answers a closed outcome rather than a bool:
+
+- `accept_peer_hello` takes the peer's contribution and answers `AcceptedPeerHello::FirstBinding` or `AcceptedPeerHello::ExactDuplicate`. A retransmission carrying the same contribution is answered from the cached proof; a *different* contribution is the terminal `EndpointAuthError::ConflictingPeerContribution`, and none of the frame's other fields are ever adopted.
+- `accept_peer_proof` takes the peer's signature and answers `PeerProofAcceptance::Promoted(Box<AuthenticatedChannelCapability>)` or the payload-free `PeerProofAcceptance::AlreadyPromoted`.
+
+`AlreadyPromoted` is a lifecycle fact and nothing more. It does not say the replayed signature verified — a promoted attempt's state is read under the lock before any verification, so those bytes are never examined — and it does not say the capability was installed. It carries no payload precisely so a second caller cannot be handed, or lent, the capability the promoting caller already holds. Callers must corroborate installation and current-attempt ownership against their own state and fail closed without both.
+
+## Closed profile and the compatibility precondition
+
+The profile is a closed single-variant enum, `EndpointAuthProfile::V1Ed25519Dtls`, **derived** in `context` from the connector's closed `EndpointAuthBindingProfile`. It is never supplied by the engine and never by a peer.
+
+`negotiate_profile` resolves what to prove under from the peer's advertised `features`, and despite its name it is not a negotiation: advertising `endpoint_auth_v1` is how a peer states it speaks the one closed profile, not how it chooses among alternatives. There is no second inhabitant, no fallback, and no third outcome. Absence is `EndpointAuthSetupError::IncompatibleProfile`, refused **before** any proof work — no transcript is assembled, no signature is produced or verified, and no capability can be minted. Treat the advertisement as a fail-closed compatibility precondition against pre-Arc-04 peers, never as a profile-selection input a peer could steer.
+
+It is a *setup* refusal and deliberately not a terminal one: the gate runs on the inbound Hello before the attempt is reached, so nothing has been terminalized when it fires. What closes the connection is the handler's own fail-closed drop of the exact current peer.
+
+## Two refusal vocabularies, and no conversion between them
+
+- `EndpointAuthSetupError` — this input was unusable, and no attempt was harmed. `MissingIdentityField`, `MissingContribution`, `ContributionWrongWidth`, `ContributionMalformed`, `IncompatibleProfile`. These fire before or beside an attempt and terminalize nothing.
+- `EndpointAuthError` — this attempt is over. Returned only by the task's own lifecycle transitions, `accept_peer_hello` and `accept_peer_proof`: `NoBoundTranscript`, `NotMutual`, `ContributionNotFresh`, `SignatureInvalid`, `ChannelNotCurrent`, `ConflictingPeerContribution`. Every one of them means the attempt has been terminalized, is retired, belongs to no connector, and vouches for nothing.
+
+The closure holds in both directions, and there is deliberately no conversion either way. A setup refusal widened into a terminal cause would let a parse failure claim a lifecycle transition it never made; a terminal cause narrowed into a setup refusal would lose the retirement it actually performed. Neither type is ever used to say "this call had nothing to do" — that is the non-error `AcceptedPeerHello::ExactDuplicate` or `PeerProofAcceptance::AlreadyPromoted`.
+
+## Signed transcript commitment
+
+`transcript` owns the byte layout and nothing else, and it is the single implementation, so no second copy can drift from the bytes a peer verifies. Two properties are load-bearing: every paired field is ordered by role — derived from the Device pair by `transcript::role_of`, never chosen by a caller — so both endpoints derive byte-identical input from opposite views; and every field is length-prefixed rather than separator-joined, so no free-form value can shift a later field boundary and make two distinct field tuples serialize identically. The transcript commits to the domain tag, the mesh context, the selected profile, the signer's role, the ordered Device pair, the ordered contribution pair, and the ordered binding pair. Because the profile is a signed field, a peer cannot advertise one profile and prove another.
+
+## Fail-closed binding supply
+
+The binding is supplied, not derived here. When the connector's `endpoint_auth_binding()` yields nothing at `DataChannelOpen`, the engine arm fails closed and the refusal is a *cleanup* obligation as well as a refusal: the connector is fenced first via `refuse_data_channel_open`, which starts exactly one native close synchronously — there is no watchdog behind it, so a close not started there would never start — and only then `drop_peer_if_current` removes the peer, and only if it is still the exact entry the open was admitted for. A replacement installed for the same device while the binding was being read is left untouched: the refusal is about one channel, not about the device. No task is built, no `hello` is sent, no proof is computed, and no profile is resolved.
 
 ## Residual: the channel binding is not session-unique
 
@@ -40,9 +79,11 @@ Endpoint-authentication work remains pre-authentication work. The connected tran
 
 **Enforcement.** The capability is gated on, not merely stored. `PeerConnection::is_application_admitted` requires a live `AuthenticatedChannelCapability` **and** the existing approval policy, and every production application, reliable, and real-time admission gate routes through it. Reading `PeerStateData::authenticated` directly is not sufficient: that bool records policy history, survives channel replacement, and is deliberately left set by `retire_connector` — so a gate consulting it alone would keep admitting traffic after the authority artifact was dropped. Protocol admission traffic (Hello, AuthResponse, Approve, Deny) stays outside the gate, since it is what establishes the capability.
 
-**Implementation status.** Arc 04 has landed the production issuer: `EndpointAuthTask::authenticate` is the sole path that mints an `EndpointAuthPermit` and an `AuthenticatedChannelCapability`, and `PeerConnection` owns the capability, dropping it whenever the connector is retired or replaced. This makes the arc *reachable*; it does not mark the arc complete. The completion gate still requires the signaling-MITM, no-payload-before-auth, cross-channel replay, and DTLS binding controls to be run and cited — and given the residual above, the replay control is the one that actually carries the guarantee.
+**Implementation status.** Arc 04 has landed the production issuer. `EndpointAuthTask::accept_peer_proof` is the sole task transition that constructs `PeerProofAcceptance::Promoted`, and that variant is the only carrier of an `AuthenticatedChannelCapability`; the capability's own constructor, `AuthenticatedChannelCapability::from_verified_exchange`, mints the `EndpointAuthPermit` internally from the verified binding record, so there is no separate permit-issuing entry point to reach. `PeerConnection` owns the capability, dropping it whenever the connector is retired or replaced. This makes the arc *reachable*; it does not mark the arc complete. The completion gate still requires the signaling-MITM, no-payload-before-auth, cross-channel replay, and DTLS binding controls to be run and cited — and given the residual above, the replay control is the one that actually carries the guarantee.
 
-`EndpointAuthError::RuntimeMismatch` is **not** a production control on the issuer path: the permit is minted from the connected capability's own runtime, because the engine holds no independent `RuntimeIncarnation` to compare against. It guards only the move-only `EndpointAuthAttempt::begin` constructor.
+This file states the boundary, never an execution result. The Arc 04 control inventory, the guard claims, and every exact-head evidence statement live in [`red-teams/ARC-04-ENDPOINT-AUTH.md`](../../../../red-teams/ARC-04-ENDPOINT-AUTH.md). Do not record run identifiers, CI job status, or review identifiers here.
+
+There is no runtime-mismatch cause, and there deliberately is not one: the permit is minted from the connected capability's own runtime, because the engine holds no independent `RuntimeIncarnation` to compare it against, so such a variant could never fire on the issuer path. What carries exactness on install instead is the retained binding record — `EndpointAuthTask::issued` compares the capability's recorded mesh, remote Device, runtime, connector, and transcript identity against the exchange it ran under — together with connector-incarnation ownership. Two of the record's conjuncts, binding profile and provenance, each have exactly one variant today and become discriminating only when a second closed variant exists.
 
 ## Restart behavior
 
@@ -51,6 +92,8 @@ Possession of the permit or authenticated-channel capability grants the authorit
 ## Forbidden responsibilities
 
 This task does not decide mesh policy, mint `SessionCapability`, authorize an application, choose a route, mutate durable facts, or treat a working channel as authenticated without the complete fresh proof.
+
+It also does not own the inbound application-admission witnesses. `AdmittedInboundDispatch` and its siblings are `engine::state`'s, minted inside `PeerRegistry::with_current`; they name one exact peer installation for one synchronous effect and are unrelated to endpoint-authentication authority. Nor does it own `rpc::PendingOpId`, which is a process-local ownership token — a local capability for naming one filed pending entry again so a failed-send withdrawal removes that entry and not a newer occupant of the same key. `PendingOpId` is not network authority, not durable, not a route or session authority, not a credential, and not a generation counter; it is never serialized, never sent, never derived from anything a peer supplies, and no inbound path reads it.
 
 ## Compatibility adapter
 

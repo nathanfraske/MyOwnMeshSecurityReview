@@ -89,7 +89,62 @@ fn admitted(state: &Arc<NetworkState>, peer: &str) -> bool {
     })
 }
 
-async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node]) {
+/// One side's view of a peer, or the absence of a record for it.
+///
+/// Read from the existing `PeerInfo` snapshot; nothing new is exposed. Called
+/// only from the failure path, so an ordinary passing run never evaluates it.
+///
+/// **These describe whichever peer record exists under this device id at the
+/// instant of the read, and nothing else.** A record that was rebuilt has
+/// already replaced the one before it, so `hello_sent`, `local_approve_sent`,
+/// `remote_approve_seen` and `selected_pair` carry no evidence about an attempt
+/// that was abandoned first and must not be read as if they did.
+fn peer_state(state: &Arc<NetworkState>, peer: &str) -> String {
+    match state.peer_info(peer) {
+        Some(info) => format!(
+            "authenticated={} status={:?} local_shelved={} remote_shelved={} hello_sent={} local_approve_sent={} remote_approve_seen={} selected_pair={}",
+            info.authenticated,
+            info.status,
+            info.local_shelved,
+            info.remote_shelved,
+            info.verification_code_sent.is_some(),
+            info.local_approve_sent,
+            info.remote_approve_seen,
+            info.selected_pair.is_some(),
+        ),
+        None => "no peer record".to_string(),
+    }
+}
+
+/// Both sides' admission state for every member, plus the provider's own
+/// capacity, at the instant a wait gave up.
+///
+/// Built only on a failing path, so a passing run pays nothing for it. Both
+/// directions are reported because `admitted` is a conjunction over them: a
+/// member the operator still holds but which no longer holds the operator is a
+/// different fault from one that never came up. The two provider reports
+/// separate a refusal on capacity from a refusal with capacity to spare.
+fn admission_diagnostic(operator: &Node, spokes: &[Node], transport: &Transport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, spoke) in spokes.iter().enumerate() {
+        let _ = write!(
+            out,
+            "\n  member-{i}: operator sees [{}] · member sees [{}]",
+            peer_state(&operator.state, &spoke.id),
+            peer_state(&spoke.state, &operator.id),
+        );
+    }
+    let _ = write!(
+        out,
+        "\n  process resources: {:?}\n  mesh resources: {:?}",
+        transport.connector_resource_report(),
+        transport.mesh_connector_resource_report(),
+    );
+    out
+}
+
+async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node], transport: &Transport) {
     let deadline = Instant::now() + DIAL_TIMEOUT;
     let mut next_dial = Instant::now();
     loop {
@@ -112,8 +167,9 @@ async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node]) {
         }
         assert!(
             Instant::now() < deadline,
-            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline",
-            spokes.len()
+            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline{}",
+            spokes.len(),
+            admission_diagnostic(operator, spokes, transport)
         );
         tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
     }
@@ -214,8 +270,9 @@ async fn run_area(n_spokes: usize) {
             }
             assert!(
                 Instant::now() < deadline,
-                "operator dial to {} did not come up in 60s",
-                spoke.id
+                "operator dial to {} did not come up in 60s{}",
+                spoke.id,
+                admission_diagnostic(&operator, &spokes, &transport)
             );
             tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
         }
@@ -227,7 +284,7 @@ async fn run_area(n_spokes: usize) {
     // slow runner brings up later sessions. Re-drive only missing pairs and
     // require one simultaneous admitted snapshot before testing N-session
     // shape or application delivery.
-    converge_all_operator_sessions(&operator, &spokes).await;
+    converge_all_operator_sessions(&operator, &spokes, &transport).await;
 
     // ---- the area shape holds under N sessions --------------------------
     for (i, spoke) in spokes.iter().enumerate() {

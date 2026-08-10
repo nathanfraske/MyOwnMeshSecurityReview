@@ -4,8 +4,7 @@
 //! every boundary, so the wedge — invisible in the daemon because nothing in
 //! the window logs — names its own stage. Run on the device:
 //!
-//!   scp spin_probe root@<device>:/tmp/ && ssh root@<device> \
-//!     'MYOWNMESH_MEDIA_LANES=1 /tmp/spin_probe'
+//!   scp spin_probe root@<device>:/tmp/ && ssh root@<device> '/tmp/spin_probe'
 //!
 //! Stage D runs with empty ICE servers, stage F with the public-venue
 //! STUN+TURN defaults (what the daemon actually passes) — if only F wedges,
@@ -81,7 +80,7 @@ async fn main() {
         jiffies() - j0
     );
 
-    // B. transport (lane count from env, like the daemon).
+    // B. transport, constructed exactly as the daemon does.
     let Some(Ok(t)) = staged("B Transport::new", async {
         myownmesh_core::transport::Transport::new()
     })

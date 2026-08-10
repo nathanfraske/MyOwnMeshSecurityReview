@@ -26,17 +26,17 @@ mod context;
 mod contribution;
 /// Live two-connector controls over the production `on_auth_response` handler.
 ///
-/// Basal V4 behaviour, so it is gated on `transport-lab` alone: deleting the
-/// LegacyV1 compatibility subtree must not delete the only controls that prove
-/// the production handler refuses a substituted channel binding.
+/// Basal V4 behaviour, so it is gated on `transport-lab` alone — these are the
+/// only controls that prove the production handler refuses a substituted
+/// channel binding.
 #[cfg(all(test, feature = "transport-lab"))]
 pub(crate) mod native_link;
 mod task;
 mod transcript;
 
+pub use capability::AuthenticatedChannelCapability;
 #[cfg(test)]
-pub(crate) use capability::authenticated_for_test;
-pub use capability::{AuthenticatedChannelCapability, EndpointAuthPermit};
+pub(crate) use capability::{authenticated_for_test, authenticated_over_for_test};
 pub(crate) use context::EndpointAuthContext;
 // The peer's canonical value is parsed on the production inbound path, so it
 // stays a current re-export. The local draw is *not* exported for production
@@ -94,77 +94,111 @@ impl EndpointRole {
     }
 }
 
-/// Typed endpoint-authentication failure. Every variant is terminal for the
-/// attempt: no variant leaves a partially promoted capability behind.
+/// A **terminal** endpoint-authentication failure.
 ///
-/// "Terminal" is meant literally, and it is what makes this type readable on its
-/// own. An attempt that returns any of these has been terminalized — by the call
-/// that returned it or by an earlier one — so it is retired, belongs to no
-/// connector, and vouches for nothing. No variant is ever used to say "this call
-/// had nothing to do": a benign duplicate is a non-error outcome
-/// ([`AcceptedPeerHello::ExactDuplicate`], [`PeerProofAcceptance::AlreadyPromoted`])
-/// and never borrows a cause from here, so no caller has to consult its own
-/// state to find out which of the two sense was meant.
+/// Returned only by the task's lifecycle transitions
+/// ([`EndpointAuthTask::accept_peer_hello`], [`accept_peer_proof`]). An attempt
+/// that returns one of these is terminalized: retired, owned by no connector,
+/// and vouching for nothing.
+///
+/// Two things are therefore never spelled with this type. A benign duplicate is
+/// a non-error outcome ([`AcceptedPeerHello::ExactDuplicate`],
+/// [`PeerProofAcceptance::AlreadyPromoted`]), and an unusable *input* is an
+/// [`EndpointAuthSetupError`], which terminalizes nothing. There is no
+/// conversion in either direction: widening a setup refusal would let a parse
+/// failure claim a transition it never made.
+///
+/// [`accept_peer_proof`]: EndpointAuthTask::accept_peer_proof
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EndpointAuthError {
-    /// A required transcript field was empty.
-    MissingTranscriptField,
+    /// A peer proof arrived for an attempt that has bound nothing, so there is
+    /// no transcript for it to be a proof *of*: this endpoint drew its half and
+    /// no peer half exists.
+    NoBoundTranscript,
     /// Local and remote Device IDs are equal, so no mutual proof exists.
     NotMutual,
     /// Both endpoints supplied the same contribution, so neither is fresh.
     ContributionNotFresh,
-    /// A contribution did not decode to exactly the full draw width.
-    ContributionTooShort,
+    /// The remote signature did not verify over the exact transcript.
+    SignatureInvalid,
+    /// The task's channel was replaced or retired, so no connected claim is
+    /// left for this attempt to promote.
+    ///
+    /// A security condition, not housekeeping: the channel binding is not
+    /// session-unique, so exact connector-incarnation ownership is what
+    /// distinguishes two channels between the same pair, and refusing here is
+    /// what defeats cross-channel relay. A second promotion of a live attempt is
+    /// *not* filed here — that is the non-error
+    /// [`PeerProofAcceptance::AlreadyPromoted`].
+    ChannelNotCurrent,
+    /// A second, different peer contribution arrived after this attempt was
+    /// already bound to one. Terminal for this exact task.
+    ///
+    /// Distinct from [`Self::ChannelNotCurrent`]: nothing had gone stale, so
+    /// this separates a live peer sending what it cannot send from this endpoint
+    /// closing up. Retirement follows, but it is the consequence, not the cause.
+    ConflictingPeerContribution,
+}
+
+/// A **pre-task** refusal: an input this endpoint declined to build anything
+/// from. It makes no claim about any attempt's lifecycle.
+///
+/// Every variant here is refused at a boundary that runs *before* an
+/// [`EndpointAuthTask`] exists, or *beside* one without touching it:
+/// [`PeerContribution::from_wire`] parsing a wire value,
+/// [`negotiate_profile`] reading what a peer advertised, and
+/// [`EndpointAuthContext::new`] fixing the facts an attempt would
+/// authenticate under. None of them holds a task, none can reach the exchange
+/// lock, and none can terminalize anything — so an `Err` of this type says only
+/// that the value it was handed was refused.
+///
+/// That separation is the whole point of the type. These causes used to be
+/// variants of [`EndpointAuthError`], whose documented meaning is "this attempt
+/// is over"; a caller holding one could not tell a dead task from an unparseable
+/// string, and neither could the compiler. Now the two senses are distinct
+/// types, so the mistake is not expressible: a setup refusal cannot be recorded
+/// as a terminal cause, cannot be returned from a transition, and cannot be
+/// compared against one.
+///
+/// A caller that refuses on one of these must still fail closed — the
+/// production paths drop the exact current peer or retire the exact current
+/// connector — but that closure is the caller's own act on its own state, not
+/// something this value performed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointAuthSetupError {
+    /// An identifier an attempt would be fixed to was empty: the mesh, this
+    /// endpoint's Device ID, or the expected remote Device ID.
+    ///
+    /// Refused where the field is first fixed, so no attempt can exist with a
+    /// field that would produce an ambiguous signed record.
+    MissingIdentityField,
+    /// A peer contribution arrived empty, so it carries no draw at all.
+    MissingContribution,
+    /// A contribution decoded cleanly but not to exactly the full draw width.
+    ///
+    /// Named for the predicate rather than for one side of it: the check is
+    /// `decoded.len() != CONTRIBUTION_BYTES`, so an over-wide value is refused
+    /// on exactly the same footing as a short one. A short value cannot carry a
+    /// full-width draw; an over-wide one is not the draw either, and accepting
+    /// either would let the freshness the transcript rests on be set by the
+    /// peer rather than by the profile.
+    ContributionWrongWidth,
     /// A contribution was not in the canonical lowercase BASE32-nopad
     /// encoding: it failed to decode, or it decoded from a non-canonical
     /// spelling of the same bytes.
     ContributionMalformed,
-    /// The remote signature did not verify over the exact transcript.
-    SignatureInvalid,
     /// The peer did not advertise the one closed endpoint-authentication
     /// profile, so there is no agreed transcript to prove anything over.
     ///
     /// Refused *before* any proof work: no transcript is built, no signature
     /// is produced or verified, and no capability can be minted. There is no
-    /// fallback and no second profile to select, so this is terminal for the
-    /// attempt rather than a step in a negotiation.
+    /// fallback and no second profile to select.
+    ///
+    /// A setup refusal rather than a terminal one, and deliberately so. The
+    /// gate runs on the inbound Hello before the attempt is reached, so nothing
+    /// has been terminalized when it fires; what closes the connection is the
+    /// handler's own fail-closed drop of the exact current peer.
     IncompatibleProfile,
-    /// The task's channel is gone: it was replaced or retired, so there is no
-    /// connected claim left for this attempt to promote.
-    ///
-    /// This is a security condition, not housekeeping. Because the channel
-    /// binding is not session-unique, exact connector-incarnation ownership is
-    /// what distinguishes two channels between the same pair — so refusing here
-    /// is what defeats cross-channel relay.
-    ///
-    /// Reserved for retirement and currentness, and terminal like every other
-    /// variant. Two things are deliberately *not* filed under it:
-    ///
-    /// - A conflicting peer contribution. The channel was current and the
-    ///   attempt intact, so it has its own cause in
-    ///   [`Self::ConflictingPeerContribution`].
-    /// - A second promotion of the same attempt. That attempt is alive and still
-    ///   holds the authority it issued, so it is the non-error
-    ///   [`PeerProofAcceptance::AlreadyPromoted`]. Reporting it here made a
-    ///   promoted task claim a terminal cause it never took, and left every
-    ///   caller to separate the two from its own state.
-    ChannelNotCurrent,
-    /// A second, different peer contribution arrived after this attempt was
-    /// already bound to one. Terminal for this exact task.
-    ///
-    /// Deliberately distinct from [`Self::ChannelNotCurrent`]. Nothing about
-    /// the channel had gone stale: the attempt held its bound pair and its
-    /// cached proof, and a value that is neither that pair's peer half nor an
-    /// exact retransmission of it is an attempt to rebind an attempt that is
-    /// already bound. Recording it as a currentness failure would file a
-    /// peer-supplied conflict under the same cause as ordinary lifecycle
-    /// teardown, and the two need to be told apart: one is a live peer sending
-    /// something it cannot be sending, the other is this endpoint closing up.
-    ///
-    /// Retirement still follows — the conflict retires this exact task — but
-    /// retirement is the consequence, not the cause, and the cause is what is
-    /// kept.
-    ConflictingPeerContribution,
 }
 
 /// The closed set of endpoint-authentication crypto profiles.
@@ -187,16 +221,22 @@ pub(crate) enum EndpointAuthProfile {
 /// select a weaker profile is exactly what this must not become. Advertising
 /// [`Feature::ENDPOINT_AUTH_V1`] is how a peer states it speaks the closed
 /// profile, not how it chooses among alternatives.
+///
+/// The refusal is an [`EndpointAuthSetupError`], not a terminal one. This runs
+/// on an inbound Hello before the attempt is reached, so nothing has been
+/// terminalized when it fires and the value must not claim otherwise; the
+/// handler's own drop of the exact current peer is what fails the connection
+/// closed.
 pub(crate) fn negotiate_profile(
     peer_features: &[String],
-) -> Result<EndpointAuthProfile, EndpointAuthError> {
+) -> Result<EndpointAuthProfile, EndpointAuthSetupError> {
     if crate::protocol::features::peer_supports(
         peer_features,
         crate::protocol::features::Feature::ENDPOINT_AUTH_V1,
     ) {
         Ok(EndpointAuthProfile::V1Ed25519Dtls)
     } else {
-        Err(EndpointAuthError::IncompatibleProfile)
+        Err(EndpointAuthSetupError::IncompatibleProfile)
     }
 }
 

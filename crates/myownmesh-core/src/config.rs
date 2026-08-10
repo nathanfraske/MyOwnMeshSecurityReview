@@ -404,9 +404,6 @@ pub struct ServicesConfig {
     /// Whether this device participates as a regular mesh node. On by
     /// default; turn off for a pure-infrastructure box.
     pub node: NodeServiceConfig,
-    /// Frozen LegacyV1 ordinary-member application relay configuration.
-    /// Normal V4 startup rejects `enabled: true`.
-    pub relay: RelayServiceConfig,
     pub signaling: SignalingServerConfig,
     pub stun: StunServiceConfig,
     pub turn: TurnServiceConfig,
@@ -416,8 +413,7 @@ pub struct ServicesConfig {
 /// configured networks and participates as a peer. Enabled by default;
 /// disable it to run a **pure-infrastructure box** that only hosts
 /// signaling / STUN / TURN (advertising itself purely as an edge /
-/// ingress-egress point) without joining any network itself. Frozen LegacyV1
-/// ordinary-member forwarding requires node participation.
+/// ingress-egress point) without joining any network itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NodeServiceConfig {
@@ -428,22 +424,6 @@ impl Default for NodeServiceConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
-}
-
-/// Frozen LegacyV1 mesh-member application routing. When explicitly enabled
-/// by a LegacyV1 runtime, this device forwards typed-channel traffic between
-/// roster members on the reserved `__mesh_relay__/v1` channel. Forwarding is roster-gated: a
-/// frame is only relayed when both the sender and the destination are
-/// approved peers of this device.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct RelayServiceConfig {
-    /// Off by default. Retaining this compatibility behavior is explicit.
-    pub enabled: bool,
-    /// Ceiling on how many distinct destinations a single inbound frame
-    /// may fan out to in broadcast mode. 0 (the default) = unlimited. A
-    /// guard against one chatty peer turning the relay into an amplifier.
-    pub max_fanout: u32,
 }
 
 /// Self-hosted signaling server: a minimal Nostr-compatible relay
@@ -867,7 +847,6 @@ mod tests {
         // A fresh device IS a node by default; the hosted services are
         // all opt-in.
         assert!(s.node.enabled);
-        assert!(!s.relay.enabled);
         assert!(!s.signaling.enabled);
         assert!(!s.stun.enabled);
         assert!(!s.turn.enabled);

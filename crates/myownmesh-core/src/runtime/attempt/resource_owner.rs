@@ -285,6 +285,28 @@ impl MeshConnectorResourceScope {
         self.token.owner.cleanup_executor.fail_for_test();
     }
 
+    /// Reserve post-authentication session capacity from this Mesh's grant.
+    ///
+    /// `Admitted` authority, not `Speculative`: a promoted session is not
+    /// candidate work and must not be reclaimed as though it were. This is the
+    /// explicit resource transition promotion performs — a successful
+    /// pre-authentication lease is not reusable as proof that this capacity
+    /// exists, so the claim is acquired fresh here or the promotion refuses.
+    ///
+    /// The lease is returned bare rather than wrapped in a candidate
+    /// reservation: a session has no candidate lifecycle, no cleanup job, and no
+    /// reclaim subscription. Dropping it releases exactly this reservation.
+    pub(crate) fn reserve_session(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.token.owner.provider.acquire(
+            &self.token.scope,
+            ResourceAuthorityClass::Admitted,
+            claim,
+        )
+    }
+
     pub(super) fn reserve(
         &self,
         claim: ResourceClaim,

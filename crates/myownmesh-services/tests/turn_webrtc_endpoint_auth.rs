@@ -10,11 +10,6 @@ use myownmesh_core::config::{
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
 use myownmesh_core::identity::Identity;
-#[allow(
-    deprecated,
-    reason = "this import is used only by the frozen legacy media negative control"
-)]
-use myownmesh_core::transport::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
@@ -217,10 +212,6 @@ async fn wait_for_reported_relay_pair(peers: [(&myownmesh_core::engine::NetworkS
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(
-    deprecated,
-    reason = "this exact test proves TURN cannot bypass the frozen legacy media admission boundary"
-)]
 async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
     let observed_at = std::time::Instant::now();
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
@@ -343,12 +334,16 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     drop((alice, bob));
     tokio::task::yield_now().await;
 
-    // Negative controls on the same real TURN service. A relay-selected and
+    // Negative control on the same real TURN service: a relay-selected and
     // endpoint-authenticated channel without mutual application admission
-    // cannot send endpoint data. The codec-neutral data-only profile also
-    // cannot acquire the frozen legacy-media surface merely because TURN was
-    // selected. The latter is a profile-exclusion control, not a separate
-    // real-time admission control.
+    // cannot send endpoint data.
+    //
+    // A second control used to sit here, proving a data-only profile could not
+    // acquire the fixed video/audio lane surface merely because TURN was
+    // selected. That was a profile-exclusion control over a surface that no
+    // longer exists — there is no lane to open and no media entry point on this
+    // path — so it is gone rather than restated against realtime flows, which
+    // are reached through `JoinedNetwork` and not from an engine handle.
     let carol_id = Arc::new(Identity::ephemeral());
     let dave_id = Arc::new(Identity::ephemeral());
     let (carol, carol_driver) = spawn_network(
@@ -392,28 +387,6 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         .send_to(dave_id.public_id(), &"must-not-send".to_string())
         .await
         .expect_err("relay selection cannot bypass session admission");
-    carol
-        .send_video_sample(
-            dave_id.public_id(),
-            0,
-            b"must-not-send".to_vec().into(),
-            Duration::from_millis(1),
-        )
-        .await
-        .expect_err("relay selection cannot add legacy media to a data-only profile");
-    let (lane_reply, lane_result) = tokio::sync::oneshot::channel();
-    carol
-        .cmd_tx
-        .send(NetworkCmd::MediaLaneOpen {
-            peer: dave_id.public_id().to_string(),
-            kind: LaneKind::Video,
-            reply: lane_reply,
-        })
-        .expect("negative lane request reaches the engine");
-    lane_result
-        .await
-        .expect("engine returns the negative lane result")
-        .expect_err("a data-only profile cannot open a legacy media lane");
 
     carol
         .cmd_tx

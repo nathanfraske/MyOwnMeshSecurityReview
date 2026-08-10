@@ -109,17 +109,9 @@ pub struct ClientHandle {
     /// Channel subscriptions this client currently holds.
     /// Same disconnect-cleanup rationale.
     pub channel_subs: Arc<DashSet<ClaimKey>>,
-    /// Video-lane subscriptions (by network) this client holds.
+    /// Realtime subscriptions (by network) this client holds.
     /// Same disconnect-cleanup rationale.
-    pub video_subs: Arc<DashSet<String>>,
-    /// Audio-lane subscriptions (by network) this client holds.
-    pub audio_subs: Arc<DashSet<String>>,
-    /// When this client has opened a dedicated binary media-source pipe, the
-    /// sender that pushes pre-encoded inbound media frames (`[u32 len][body]`)
-    /// to it. `Some` means the media pumps route inbound H.264/Opus here as raw
-    /// binary instead of base64 `video_inbound`/`audio_inbound` on the event
-    /// socket. Cleared when the pipe disconnects.
-    pub media_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    pub realtime_subs: Arc<DashSet<String>>,
 }
 
 impl ClientHandle {
@@ -128,23 +120,13 @@ impl ClientHandle {
         // gone; the registry will clean up the handle shortly.
         let _ = self.writer_tx.send(frame);
     }
-
-    /// Register this client's binary media-source pipe sender.
-    pub fn set_media_sink(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
-        *self.media_tx.lock() = Some(tx);
-    }
-
-    /// Drop the media-source sender (pipe disconnected) — pumps fall back to
-    /// base64 events.
-    pub fn clear_media_sink(&self) {
-        *self.media_tx.lock() = None;
-    }
-
-    /// The current media-source sender, if a binary pipe is open.
-    pub fn media_sink(&self) -> Option<mpsc::UnboundedSender<Vec<u8>>> {
-        self.media_tx.lock().clone()
-    }
 }
+
+// There is no media sink on a client handle any more. It existed to let the
+// pumps choose between a binary pipe and base64 events per frame, and there is
+// no base64 fallback to choose against: units ride an inbound `realtime_pipe`
+// and nothing else. A pump that had a fallback would silently take it whenever
+// the pipe was missing, which is the case that should be visible.
 
 /// Daemon-wide registry of connected clients + their
 /// registrations.
@@ -160,10 +142,8 @@ struct RegistryInner {
     clients: DashMap<ClientId, Arc<ClientHandle>>,
     handler_claims: DashMap<ClaimKey, ClientId>,
     channel_subs: DashMap<ClaimKey, Arc<Mutex<Vec<ClientId>>>>,
-    /// Video-lane subscribers per network id.
-    video_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
-    /// Audio-lane subscribers per network id.
-    audio_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
+    /// Realtime subscribers per network id.
+    realtime_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
     pending_inbound: DashMap<String, PendingInbound>,
     /// Streaming methods that have a synthetic handler
     /// installed on the engine. `(network, method) → ()` —
@@ -194,9 +174,7 @@ impl ClientRegistry {
             writer_tx,
             method_claims: Arc::new(DashSet::new()),
             channel_subs: Arc::new(DashSet::new()),
-            video_subs: Arc::new(DashSet::new()),
-            audio_subs: Arc::new(DashSet::new()),
-            media_tx: Arc::new(Mutex::new(None)),
+            realtime_subs: Arc::new(DashSet::new()),
         });
         self.inner.clients.insert(id, handle.clone());
         handle
@@ -237,18 +215,11 @@ impl ClientRegistry {
                 subs.lock().retain(|c| *c != id);
             }
         }
-        // Video subscriptions clean up the same way; the video pump
-        // exits on its next sample once its subscriber list is empty.
-        for entry in handle.video_subs.iter() {
+        // Realtime subscriptions clean up the same way; the realtime pump exits
+        // on its next event once its subscriber list is empty.
+        for entry in handle.realtime_subs.iter() {
             let key = entry.key().clone();
-            if let Some(subs) = self.inner.video_subs.get(&key) {
-                subs.lock().retain(|c| *c != id);
-            }
-        }
-        // And audio subscriptions, identically.
-        for entry in handle.audio_subs.iter() {
-            let key = entry.key().clone();
-            if let Some(subs) = self.inner.audio_subs.get(&key) {
+            if let Some(subs) = self.inner.realtime_subs.get(&key) {
                 subs.lock().retain(|c| *c != id);
             }
         }
@@ -342,15 +313,20 @@ impl ClientRegistry {
         subs.is_empty()
     }
 
-    /// Returns `true` on the FIRST video subscriber for this network
-    /// — the caller's signal to spawn the network's video pump.
-    pub fn subscribe_video(&self, network: String, client: ClientId) -> bool {
+    /// Returns `true` on the FIRST realtime subscriber for this network
+    /// — the caller's signal to spawn the network's realtime pump.
+    ///
+    /// One subscription covers audio and video together. They were two here
+    /// only because there were two lane pools; a flow's media kind is now a
+    /// property of the flow, and a client that wanted a call had to hold both
+    /// subscriptions anyway.
+    pub fn subscribe_realtime(&self, network: String, client: ClientId) -> bool {
         if let Some(c) = self.client(client) {
-            c.video_subs.insert(network.clone());
+            c.realtime_subs.insert(network.clone());
         }
         let entry = self
             .inner
-            .video_subs
+            .realtime_subs
             .entry(network)
             .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
         let mut subs = entry.lock();
@@ -361,13 +337,13 @@ impl ClientRegistry {
         was_empty
     }
 
-    /// Release a video subscription. Returns `true` if no clients
-    /// remain on this network's video lane.
-    pub fn unsubscribe_video(&self, network: &str, client: ClientId) -> bool {
+    /// Release a realtime subscription. Returns `true` if no clients remain on
+    /// this network's realtime flows.
+    pub fn unsubscribe_realtime(&self, network: &str, client: ClientId) -> bool {
         if let Some(c) = self.client(client) {
-            c.video_subs.remove(network);
+            c.realtime_subs.remove(network);
         }
-        let Some(subs) = self.inner.video_subs.get(network) else {
+        let Some(subs) = self.inner.realtime_subs.get(network) else {
             return true;
         };
         let mut subs = subs.lock();
@@ -375,54 +351,11 @@ impl ClientRegistry {
         subs.is_empty()
     }
 
-    /// Snapshot the network's current video subscribers — used by
-    /// the video pump each sample.
-    pub fn video_subscribers(&self, network: &str) -> Vec<ClientId> {
+    /// Snapshot the network's current realtime subscribers — used by the
+    /// realtime pump each event.
+    pub fn realtime_subscribers(&self, network: &str) -> Vec<ClientId> {
         self.inner
-            .video_subs
-            .get(network)
-            .map(|subs| subs.lock().clone())
-            .unwrap_or_default()
-    }
-
-    /// Returns `true` on the FIRST audio subscriber for this network
-    /// — the caller's signal to spawn the network's audio pump.
-    pub fn subscribe_audio(&self, network: String, client: ClientId) -> bool {
-        if let Some(c) = self.client(client) {
-            c.audio_subs.insert(network.clone());
-        }
-        let entry = self
-            .inner
-            .audio_subs
-            .entry(network)
-            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
-        let mut subs = entry.lock();
-        let was_empty = subs.is_empty();
-        if !subs.contains(&client) {
-            subs.push(client);
-        }
-        was_empty
-    }
-
-    /// Release an audio subscription. Returns `true` if no clients
-    /// remain on this network's audio lane.
-    pub fn unsubscribe_audio(&self, network: &str, client: ClientId) -> bool {
-        if let Some(c) = self.client(client) {
-            c.audio_subs.remove(network);
-        }
-        let Some(subs) = self.inner.audio_subs.get(network) else {
-            return true;
-        };
-        let mut subs = subs.lock();
-        subs.retain(|c| *c != client);
-        subs.is_empty()
-    }
-
-    /// Snapshot the network's current audio subscribers — used by
-    /// the audio pump each frame.
-    pub fn audio_subscribers(&self, network: &str) -> Vec<ClientId> {
-        self.inner
-            .audio_subs
+            .realtime_subs
             .get(network)
             .map(|subs| subs.lock().clone())
             .unwrap_or_default()
