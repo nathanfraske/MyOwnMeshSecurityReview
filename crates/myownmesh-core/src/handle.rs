@@ -626,22 +626,29 @@ impl JoinedNetwork {
         self.state.remove_sticky(device_id);
     }
 
-    /// Send an application frame with the acknowledged-delivery
-    /// contract: parked until the peer's link is up, retransmitted
-    /// across session rebuilds, resolved when the peer's engine has
-    /// delivered it to the application layer (or with an error at TTL /
-    /// terminal failure / outbox backpressure). The everyday cure for
-    /// "my first frame raced the data channel and vanished" — no
-    /// application retry loop required.
+    /// Send an application frame with the acknowledged-delivery contract: the
+    /// frame is retained by the peer's current session and this resolves when
+    /// the peer's engine has delivered it to the application layer.
+    ///
+    /// Fail-closed at submission. It errs immediately when the peer has no live
+    /// session, when the peer does not advertise reliable channels — no silent
+    /// downgrade to a best-effort send — and when the resource provider will not
+    /// fund retaining the frame, which is what backpressure is. There is no
+    /// queue-until-later: a frame is retained under a session or not at all.
+    ///
+    /// It also errs, rather than retransmitting, if that session ends before the
+    /// peer acknowledges — a rebuild, a policy revocation, a peer replacement or
+    /// shutdown. The caller learns the frame was not delivered and decides
+    /// whether the payload still means anything, which it is in a position to
+    /// know and this layer is not.
     pub async fn send_reliable(
         &self,
         peer: &str,
         channel: &str,
         payload: serde_json::Value,
-        ttl: Option<std::time::Duration>,
     ) -> Result<()> {
         self.state
-            .send_channel_reliable(peer, channel, payload, ttl.map(|d| d.as_millis() as u64))
+            .send_channel_reliable(peer, channel, payload)
             .await
     }
 
@@ -739,23 +746,6 @@ impl JoinedNetwork {
             .send_realtime(peer, &flow_name(label)?, unit.into())
     }
 
-    /// Take one queued unit from an inbound WebRTC flow.
-    ///
-    /// `Ok(None)` is a live flow with nothing ready — an ordinary state, not a
-    /// refusal.
-    pub fn recv_webrtc_realtime(
-        &self,
-        peer: &str,
-        label: &[u8],
-    ) -> std::result::Result<
-        Option<crate::transport::webrtc::WebRtcRealtimeInboundUnit>,
-        crate::realtime::RealtimeRefusal,
-    > {
-        self.state
-            .recv_realtime(peer, &flow_name(label)?)
-            .map(|unit| unit.map(Into::into))
-    }
-
     /// Close one flow and release its label back to that session's namespace.
     /// Async, and the await is the point: it returns after the flow's native
     /// half has been asked to go, not merely after the label was released.
@@ -806,6 +796,12 @@ impl JoinedNetwork {
 
     /// The next unit to arrive on any inbound flow of that session.
     ///
+    /// The one way to receive. There is deliberately no per-flow receive beside
+    /// it: a second one would be a second place the same arrival could be
+    /// waiting, and the two could then disagree about whether it was still
+    /// there. One session, one inbound queue, one consumer — which is why the
+    /// arrival carries the label it came in on.
+    ///
     /// `None` is terminal: the session ended, and the caller should close. That
     /// is the only end-of-session signal there is — deliberately, because a
     /// retirement flag would be a second fact that could disagree with the
@@ -818,40 +814,15 @@ impl JoinedNetwork {
             .next_realtime_arrival(inbound)
             .await
             .map(
-                |(name, unit)| crate::transport::webrtc::WebRtcRealtimeInboundArrival {
-                    // A copy of the bytes. The session's leased label never
-                    // leaves the connector, so a consumer cannot become an
-                    // untracked holder of the lease that owns them.
-                    label: name.as_bytes().to_vec(),
+                |(label, unit)| crate::transport::webrtc::WebRtcRealtimeInboundArrival {
+                    // A copy of the bytes, made once on the way out. The
+                    // session's leased label never leaves the connector, so a
+                    // consumer cannot become an untracked holder of the lease
+                    // that owns them.
+                    label,
                     unit: unit.into(),
                 },
             )
-    }
-
-    /// Claim the flow-close stream of `peer`'s current session.
-    ///
-    /// Separately leased from the inbound stream, with the same one-at-a-time
-    /// and release-on-drop rules: one wake goes to one waiter, so a lifecycle
-    /// consumer sharing the inbound signal would take wakes the receiver needed.
-    ///
-    /// Closes only. An open is answered by the response to the request that
-    /// asked for it, and a peer cannot mint a flow, so there is nothing else
-    /// for this stream to report.
-    pub fn realtime_flow_events(
-        &self,
-        peer: &str,
-    ) -> Option<crate::realtime::RealtimeFlowEventStream> {
-        self.state.claim_realtime_flow_events(peer)
-    }
-
-    /// The next close on that session's flows.
-    ///
-    /// `None` is terminal and means the session ended.
-    pub async fn next_realtime_flow_event(
-        &self,
-        events: &crate::realtime::RealtimeFlowEventStream,
-    ) -> Option<crate::realtime::RealtimeFlowEvent> {
-        self.state.next_realtime_flow_event(events).await
     }
 }
 

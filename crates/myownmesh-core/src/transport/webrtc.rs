@@ -159,10 +159,9 @@ pub use session_flow::{
 /// unreachable from outside the connector. Widening the module would have
 /// exposed all of them.
 pub(crate) use session_flow::{
-    RealtimeDirection, RealtimeEncoding, RealtimeFlowError, RealtimeFlowEvent, RealtimeFlowEvents,
-    RealtimeFlowLabel, RealtimeFlowRemains, RealtimeFlowSetIdentity, RealtimeFlowSpec,
-    RealtimeInboundArrivals, RealtimeRecvUnit, RealtimeSendUnit, RealtimeTrackIdentity,
-    SessionRealtimeFlows,
+    RealtimeDirection, RealtimeEncoding, RealtimeFlowError, RealtimeFlowLabel, RealtimeFlowRemains,
+    RealtimeFlowSetIdentity, RealtimeFlowSpec, RealtimeInboundArrivals, RealtimeRecvUnit,
+    RealtimeSendUnit, RealtimeTrackIdentity, SessionRealtimeFlows,
 };
 mod unit_assembly;
 use callback::*;
@@ -178,21 +177,30 @@ pub use policy::*;
 use realtime::*;
 /// Private, not added to the `pub(crate)` re-export above, and deliberately so.
 ///
-/// All three are connector-internal: the binding table decides which flow a
+/// All four are connector-internal: the binding table decides which flow a
 /// negotiated track may attach to, the port handle is a pump's non-owning claim
-/// on an already-open flow, and the unit policy is how a flow's framing reaches
-/// it. Re-exporting any of them would put it in the engine's vocabulary, and the
-/// engine has no business naming a demux table it must not write to — still less
-/// a route to a flow's accounting that skips the session gate. A private `use`
-/// makes them nameable here and in this module's children — which is exactly the
-/// connector — and nowhere else.
+/// on an already-open flow, the unit policy is how a flow's framing reaches it,
+/// and the leased wake is the funded block a pump parks on. Re-exporting any of
+/// them would put it in the engine's vocabulary, and the engine has no business
+/// naming a demux table it must not write to — still less a route to a flow's
+/// accounting that skips the session gate. A private `use` makes them nameable
+/// here and in this module's children — which is exactly the connector — and
+/// nowhere else.
+///
+/// That reach is the whole reason `LeasedWake` is listed. `session_flow`
+/// re-exports it at connector visibility, but a re-export is reachable by path
+/// rather than by a sibling's `use super::*`: the inbound pump's owner names the
+/// type in a field, and this line is what puts it in the namespace that
+/// sibling globs.
 ///
 /// `RealtimeInboundAttachment` is deliberately absent even though this module
 /// uses one. `on_track` never writes the name: it binds the value `admit`
 /// returns and destructures it into the pump's owner. Importing a type only to
 /// leave it unwritten is an import that documents an intention rather than a
 /// dependency, and it goes stale silently the moment the intention changes.
-use session_flow::{RealtimeFlowPortHandle, RealtimeInboundBindings, RealtimeUnitPolicy};
+use session_flow::{
+    LeasedWake, RealtimeFlowPortHandle, RealtimeInboundBindings, RealtimeUnitPolicy,
+};
 use unit_assembly::*;
 
 /// Interface-name prefixes for virtual / container / overlay networks
@@ -9418,10 +9426,7 @@ mod tests {
                     label: "Lifecycle fixture".to_string(),
                     nonce: "nonce".to_string(),
                     verification_code: "code".to_string(),
-                    capabilities: None,
-                    max_connections: None,
                     features: Vec::new(),
-                    app_version: None,
                 },
             ))
             .expect("fixture Hello serializes"),

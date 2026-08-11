@@ -119,14 +119,14 @@ pub enum MeshMessage {
 
     // -- reliable channel delivery (gated by `reliable_channels_v1`) --
     /// A channel frame under the acknowledged-delivery contract: one
-    /// entry of the sender's per-peer outbox stream. `stream` is minted
-    /// once per outbox lifetime (a fresh daemon run = a fresh stream) so
-    /// the receiver can tell a retransmit from a reset; `seq` is
-    /// strictly increasing within a stream. Receivers deliver exactly
+    /// entry of the sender's per-session reliable stream. `stream` is
+    /// minted once per promoted session (a fresh session = a fresh
+    /// stream) so the receiver can tell a retransmit from a reset; `seq`
+    /// is strictly increasing within a stream. Receivers deliver exactly
     /// once (dropping seqs at or below their high-water mark), then
-    /// acknowledge cumulatively with [`Self::ChannelAck`]. Senders keep
-    /// each entry queued — across session rebuilds — until acked or its
-    /// TTL lapses. See `engine::reliable`.
+    /// acknowledge cumulatively with [`Self::ChannelAck`]. Senders retain
+    /// each entry for the life of the session that queued it, until it is
+    /// acked or that session ends. See `engine::reliable`.
     ChannelSeq {
         stream: u64,
         seq: u64,
@@ -168,10 +168,7 @@ mod tests {
             label: "Laptop".into(),
             nonce: "noncexyz".into(),
             verification_code: "abc123".into(),
-            capabilities: None,
-            max_connections: None,
             features: vec!["ring_topology".into()],
-            app_version: Some("0.1.0".into()),
         });
         let s = serde_json::to_string(&msg).unwrap();
         let back: MeshMessage = serde_json::from_str(&s).unwrap();

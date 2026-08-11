@@ -358,7 +358,7 @@ struct LiveAttempt {
     state_a: Arc<NetworkState>,
     state_b: Arc<NetworkState>,
     link: TestLink,
-    owner: crate::engine::state::PeerOwnerToken,
+    owner: crate::engine::peer_registry::PeerOwnerToken,
     /// The peer contribution bound into the left task, so the twin can derive
     /// exactly the bytes that task will verify.
     peer_contribution: PeerContribution,
@@ -718,11 +718,8 @@ async fn v4_arc04d_unadvertised_profile_is_refused_by_the_live_handler() {
         // cannot be attributed to a malformed or conflicting contribution.
         nonce: attempt.peer_contribution.as_str().to_owned(),
         verification_code: "zzz999".to_string(),
-        capabilities: None,
-        max_connections: None,
         // An older peer: it speaks other features, just not this profile.
         features: vec![crate::protocol::features::Feature::TYPED_CHANNELS.to_string()],
-        app_version: None,
     };
 
     let device_id = attempt.state_b.identity.public_id().to_string();

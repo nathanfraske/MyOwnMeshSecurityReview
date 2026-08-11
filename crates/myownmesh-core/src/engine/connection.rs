@@ -59,12 +59,11 @@ pub struct PeerStateData {
     pub local_shelved: bool,
     pub remote_shelved: bool,
     pub label: String,
-    pub capabilities: Option<CapabilityAdvert>,
-    // Both endpoint-authentication contributions used to live here. They now
-    // belong to the Endpoint Auth Task, which owns one draw and one bound peer
-    // value for its whole life. Keeping copies in mutable peer state is what
-    // allowed a later Hello to rewrite the transcript underneath a completed
-    // proof, so the fields are gone rather than merely unused.
+    /// The short codes the two endpoints display for out-of-band comparison.
+    ///
+    /// Presentation only. Neither is an authentication input: the Endpoint Auth
+    /// Task owns the contributions the transcript is built from, so nothing a
+    /// later frame writes here can move a proof.
     pub verification_code_sent: Option<String>,
     pub verification_code_received: Option<String>,
     pub last_recv_at: Option<Instant>,
@@ -192,14 +191,21 @@ impl PeerStateData {
         self.authenticated && matches!(self.status, PeerStatus::Active | PeerStatus::Shelved)
     }
 
-    pub fn snapshot(&self) -> PeerStateSnapshot {
+    /// The diagnostic view of this peer's *state*.
+    ///
+    /// `capabilities` is supplied rather than read, because it is no longer peer
+    /// state: it belongs to the promoted session, and only a caller holding the
+    /// entry can reach that. [`PeerConnection::snapshot`] is that caller. Passing
+    /// it in keeps the one public snapshot shape while making it impossible to
+    /// fill the field from anything that outlives the session.
+    pub fn snapshot(&self, capabilities: Option<CapabilityAdvert>) -> PeerStateSnapshot {
         PeerStateSnapshot {
             status: self.status,
             tier: self.tier,
             rtt_ms: self.rtt_ms,
             clock_skew_ms: self.clock_skew_ms,
             label: self.label.clone(),
-            capabilities: self.capabilities.clone(),
+            capabilities,
             local_shelved: self.local_shelved,
             remote_shelved: self.remote_shelved,
             authenticated: self.authenticated,
@@ -226,7 +232,6 @@ impl Default for PeerStateData {
             local_shelved: false,
             remote_shelved: false,
             label: String::new(),
-            capabilities: None,
             verification_code_sent: None,
             verification_code_received: None,
             last_recv_at: None,
@@ -253,20 +258,6 @@ impl Default for PeerStateData {
     }
 }
 
-/// One promoted session and the realtime flows opened under it.
-///
-/// Bundled rather than adjacent so their lifetimes cannot separate. The flow
-/// set's label namespace is only meaningful for the exact session that owns it,
-/// and the session is only reachable while its connector is current — so the two
-/// die together or the namespace outlives its meaning.
-struct PromotedSession {
-    session: crate::runtime::session_broker::SessionCapability,
-    /// Opaque to the engine. Constructed by the worker the session was promoted
-    /// from, so the flows draw on that exact connector's registry; the engine
-    /// never names a label table, a flow, or a port.
-    flows: crate::transport::webrtc::SessionRealtimeFlows,
-}
-
 pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
@@ -291,18 +282,12 @@ pub struct PeerConnection {
     /// a session promoted under the retired connector must not survive into its
     /// replacement.
     ///
-    /// **One slot, both halves.** The capability and the flow set are bundled so
-    /// a single `take()` drops them together. Two independent slots would let
-    /// the two lifetimes drift: a flow set that outlived its session would hold
-    /// labels minted under a connector that is gone, and there is deliberately
-    /// no session id or generation that would let anything notice. No path may
-    /// drop or recreate one half alone.
-    ///
-    /// Dropping the bundle is also the only retirement signal there is, by
-    /// ruling: it closes the flow-owned queues, inbound pumps terminate from
-    /// queue closure, and outbound closes on a closed queue or
-    /// `SessionNotCurrent`. There is no separate engine retirement event.
-    promoted_session: Mutex<Option<PromotedSession>>,
+    /// The slot, the bundle it holds and the use and revocation rules that
+    /// govern it all belong to
+    /// [`peer_session`](crate::runtime::peer_session): this entry owns the
+    /// connector and refers to its session owner rather than implementing that
+    /// owner's state machine.
+    promoted_session: crate::runtime::peer_session::PromotedSessionSlot,
     registry_retired: AtomicBool,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
     /// attempt, resource, or application authority.
@@ -320,15 +305,26 @@ impl PeerConnection {
             session: Mutex::new(session),
             endpoint_auth: Mutex::new(None),
             authenticated_channel: Mutex::new(None),
-            promoted_session: Mutex::new(None),
+            promoted_session: crate::runtime::peer_session::PromotedSessionSlot::new(),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
     /// Return a clonable diagnostic view without copying mutable ownership.
+    ///
+    /// The advertisement is read through the live session first and bound to a
+    /// local, **before** the state guard is taken. That order is required, not
+    /// stylistic: the lender runs promotion, which holds `promoted_session`
+    /// while re-reading `state`, so taking `state` first and the session second
+    /// would close a lock cycle. A peer with no current session reports `None`,
+    /// which is the truthful answer — nothing has been advertised over a session
+    /// that does not exist.
     pub fn snapshot(&self) -> PeerStateSnapshot {
-        self.state.read().snapshot()
+        let capabilities = self
+            .with_live_session_state(|_session, app| app.capabilities())
+            .flatten();
+        self.state.read().snapshot(capabilities)
     }
 
     /// Retire the exact connector worker owned by this registry entry.
@@ -345,7 +341,7 @@ impl PeerConnection {
         // dropped on the same edge. Dropping it also releases its
         // post-authentication resource reservation, so a retired connector does
         // not hold session capacity its replacement then has to compete for.
-        drop(self.promoted_session.lock().take());
+        self.promoted_session.clear();
         // Retire the endpoint-auth task at the source, so a superseded
         // connector refuses promotion rather than merely failing to install
         // afterwards. Without this the task stays live with its handoff
@@ -372,7 +368,7 @@ impl PeerConnection {
             None => Ok(()),
         };
         drop(self.authenticated_channel.lock().take());
-        drop(self.promoted_session.lock().take());
+        self.promoted_session.clear();
         drop(self.endpoint_auth.lock().take());
         result
     }
@@ -554,7 +550,7 @@ impl PeerConnection {
     /// tests module without it.
     #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) fn holds_promoted_session_for_test(&self) -> bool {
-        self.promoted_session.lock().is_some()
+        self.promoted_session.is_installed()
     }
 
     /// Promote this entry's authenticated channel into a live session, once.
@@ -603,26 +599,19 @@ impl PeerConnection {
         let live_connector = worker
             .as_ref()
             .and_then(|worker| worker.live_connector_incarnation().cloned());
-        let mut promoted = self.promoted_session.lock();
-
-        if let Some(session) = promoted.as_ref().map(|bundle| &bundle.session) {
-            // The use-time recheck, not merely a currentness test: current
-            // policy, connector, mesh context, remote Device, principal, and
-            // reservation runtime are all re-proved against the session's own
-            // record before it authorizes anything. A session that fails any
-            // conjunct is dropped rather than returned, which also releases its
-            // reservation.
-            //
-            // Policy is re-proved here and not only on the promotion path
-            // below. Admission is *retained* state: an eviction, a denial, or a
-            // topology change revokes it long after promotion, and a session
-            // promoted while it held would otherwise never be asked again. Every
-            // application operation this fence admits would keep running for a
-            // peer the mesh has since refused. Re-reading it at use is what makes
-            // a revocation take effect at the next operation rather than at the
-            // next reconnect, and dropping the session on refusal is what makes
-            // that operation have no effect at all rather than a partial one.
-            let still_valid = self.state.read().is_admitted()
+        // The use-time recheck, not merely a currentness test: current policy,
+        // connector, mesh context, remote Device, principal and reservation
+        // runtime are all re-proved against the session's own record before it
+        // authorizes anything.
+        //
+        // Policy belongs in that conjunction and not only on the promotion path
+        // below. Admission is *retained* state: an eviction, a denial or a
+        // topology change revokes it long after promotion, and a session
+        // promoted while it held would otherwise never be asked again — every
+        // operation this fence admits would keep running for a peer the mesh has
+        // since refused.
+        match self.promoted_session.reuse_or_revoke(|session| {
+            self.state.read().is_admitted()
                 && live_connector.as_ref().is_some_and(|connector| {
                     session.is_current_for(
                         connector,
@@ -630,12 +619,15 @@ impl PeerConnection {
                         &self.device_id,
                         broker.runtime(),
                     )
-                });
-            if still_valid {
-                return true;
-            }
-            drop(promoted.take());
-            return false;
+                })
+        }) {
+            crate::runtime::peer_session::Reuse::Current => return true,
+            // Refused outright rather than re-promoted. Promoting again here
+            // would take a fresh post-authentication reservation for authority
+            // that was just withdrawn, on the same call that observed the
+            // withdrawal.
+            crate::runtime::peer_session::Reuse::Revoked => return false,
+            crate::runtime::peer_session::Reuse::Vacant => {}
         }
 
         if self.registry_retired() || !self.state.read().is_admitted() {
@@ -675,10 +667,8 @@ impl PeerConnection {
                 // The flow set is built by the exact worker this session was
                 // promoted from, so its registry and the session's connector are
                 // the same one by construction rather than by a later check.
-                *promoted = Some(PromotedSession {
-                    session,
-                    flows: worker.new_session_flows(),
-                });
+                self.promoted_session
+                    .install(session, worker.new_session_flows());
                 true
             }
             Err(_) => false,
@@ -710,6 +700,55 @@ impl PeerConnection {
     /// The session is re-checked against that fresh identity before the effect
     /// runs, so a session promoted from a superseded connector yields `None`
     /// rather than an operation.
+    /// Lend this entry's live session, and nothing else.
+    ///
+    /// The same fence as [`Self::with_live_session_flow`] — current worker, a
+    /// freshly acquired live incarnation, a promoted session that belongs to it —
+    /// projected down to the authority alone. An operation that needs to prove a
+    /// session authorized it, but has no business touching the realtime flow set,
+    /// asks for this: lending the flow set to a caller that only needed the proof
+    /// would hand out a mutable namespace as a side effect of authorization.
+    ///
+    /// **Do not call this while holding a [`PeerStateData`] guard.** The lender
+    /// runs promotion, and promotion holds `promoted_session` while it re-reads
+    /// `state` for the retained-policy conjunct; entering here from inside a
+    /// `state` guard closes a cycle in the opposite direction. Bind the result
+    /// first, then take the guard.
+    pub(super) fn with_live_session<R>(
+        &self,
+        effect: impl FnOnce(&crate::runtime::session_broker::SessionCapability) -> R,
+    ) -> Option<R> {
+        self.with_live_session_flow_and_worker(|session, _flows, _live, _worker| effect(session))
+    }
+
+    /// Lend this entry's live session together with the application state that
+    /// session owns.
+    ///
+    /// The same fence again, projected to the pair that belongs to the
+    /// application side: the authority, and the record whose lifetime *is* that
+    /// authority's. Nothing here can outlive the session, because the borrow ends
+    /// with the closure and the record is a field of the thing being borrowed
+    /// from.
+    ///
+    /// Carries [`Self::with_live_session`]'s lock-order warning unchanged.
+    pub(super) fn with_live_session_state<R>(
+        &self,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::runtime::peer_session::PeerSessionState,
+        ) -> R,
+    ) -> Option<R> {
+        let worker = self.session.lock().clone()?;
+        let live = worker.live_connector_incarnation()?.clone();
+        self.promoted_session.with_live(
+            |session| self.session_is_current(session, &live),
+            |bundle| {
+                let (session, app) = bundle.app_mut();
+                effect(session, app)
+            },
+        )
+    }
+
     pub(super) fn with_live_session_flow<R>(
         &self,
         effect: impl FnOnce(
@@ -745,16 +784,39 @@ impl PeerConnection {
         ) -> R,
     ) -> Option<R> {
         let worker = self.session.lock().clone()?;
-        let live = worker.live_connector_incarnation()?;
-        let mut promoted = self.promoted_session.lock();
-        let bundle = promoted.as_mut()?;
-        if !bundle.session.belongs_to(live) {
-            return None;
-        }
-        // Disjoint field borrows: the session is read, the flow set is mutated,
-        // and they are lent together so an operation cannot pair one session's
-        // authority with another session's labels.
-        Some(effect(&bundle.session, &mut bundle.flows, live, &worker))
+        let live = worker.live_connector_incarnation()?.clone();
+        self.promoted_session.with_live(
+            |session| self.session_is_current(session, &live),
+            |bundle| {
+                let (session, flows) = bundle.flows_mut();
+                effect(session, flows, &live, &worker)
+            },
+        )
+    }
+
+    /// Both use-time conjuncts, evaluated under the session slot's own guard.
+    ///
+    /// The connector half is identity — a session promoted from a superseded
+    /// connector is not this connector's. The policy half is *retained* state:
+    /// an eviction, a denial or a topology change revokes admission long after
+    /// promotion, and a session promoted while it held would otherwise keep
+    /// authorizing operations for a peer the mesh has since refused.
+    ///
+    /// Reading policy here rather than only on the promotion path is what makes
+    /// every projection agree. Without it, a projection reached directly —
+    /// a diagnostic snapshot, a flush pass — would lend a revoked session until
+    /// some unrelated operation happened to go through the registry wrapper and
+    /// notice, which makes revocation take effect at a time no caller controls.
+    ///
+    /// Lock order is preserved: the slot evaluates this with its own guard held
+    /// and `state` is taken inside a single statement, which is the order
+    /// [`Self::promote_session_if_needed`] already establishes.
+    fn session_is_current(
+        &self,
+        session: &crate::runtime::session_broker::SessionCapability,
+        live: &Arc<crate::connector::ConnectorIncarnation>,
+    ) -> bool {
+        session.belongs_to(live) && self.state.read().is_admitted()
     }
 
     /// Whether this entry holds a live authenticated channel for its exact
@@ -791,6 +853,6 @@ impl PeerConnection {
         if holds_capability {
             return true;
         }
-        self.promoted_session.lock().is_some()
+        self.promoted_session.is_installed()
     }
 }

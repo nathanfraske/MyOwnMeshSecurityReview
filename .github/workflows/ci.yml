@@ -365,6 +365,27 @@ jobs:
             v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call \
             v4_arc04f2_a_replacement_connector_for_a_different_device_still_never_settles
 
+          # Session-owned retention: the reliable frames and the capability
+          # advertisement a promoted session holds, and what happens to them
+          # when that session ends or its provider refuses.
+          #
+          # The `v4_macro1_` prefix is heavily shared -- `transport/webrtc.rs`,
+          # `provider.rs` and `session_flow.rs` hold about twenty-five more --
+          # but all of those are ordinary tests, so `--ignored` excludes them
+          # and the count is 3. If any of them ever gains `#[ignore]`, this
+          # selects more than 3 and fails here, which is the right way for that
+          # to surface.
+          #
+          # `v4_macro1_reliable_submission_without_a_session_is_refused_and_retains_nothing`
+          # is deliberately absent: it carries no `#[ignore]`, so the suite-wide
+          # transport-lab run in `check` already executes it, and naming it here
+          # would make this group select 4 and fail. It is the negative these
+          # three positives are read against.
+          run_exact_group v4_macro1_ 3 \
+            v4_macro1_ending_a_session_releases_its_retained_frames_and_resolves_their_callers \
+            v4_macro1_retention_pressure_refuses_the_next_frame_and_releases_exactly_on_ack \
+            v4_macro1_capability_metadata_is_owned_by_the_session_that_receives_it
+
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |
           set -euo pipefail

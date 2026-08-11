@@ -87,7 +87,7 @@ pub(super) async fn send_ping(state: &Arc<NetworkState>, device_id: &str) {
 
 pub(super) async fn send_ping_to_owner(
     state: &Arc<NetworkState>,
-    owner: &super::state::PeerOwnerToken,
+    owner: &super::peer_registry::PeerOwnerToken,
 ) {
     let device_id = owner.device_id();
     let t = monotonic_ms();
@@ -111,7 +111,7 @@ pub(super) async fn send_ping_to_owner(
 // caller. Narrowing them is what keeps the witness private.
 pub(super) async fn on_ping(
     state: &Arc<NetworkState>,
-    dispatch: &super::state::AdmittedInboundDispatch,
+    dispatch: &super::peer_registry::AdmittedInboundDispatch,
     ping: PingMessage,
 ) {
     // A free clock-skew sample: `ping.t` is the sender's wall clock at
@@ -152,7 +152,7 @@ pub(super) async fn on_ping(
 
 pub(super) async fn on_pong(
     state: &Arc<NetworkState>,
-    dispatch: &super::state::AdmittedInboundDispatch,
+    dispatch: &super::peer_registry::AdmittedInboundDispatch,
     pong: PongMessage,
 ) {
     let now = monotonic_ms();

@@ -10,7 +10,9 @@
 //! On data channel open:
 //!   - Reads the task's own single contribution and a verification code.
 //!   - Sends `hello { device_id, label, nonce, verification_code,
-//!     capabilities, app_version, features }`.
+//!     features }`. No application capability metadata: the Hello is
+//!     admitted before a session exists, and what this node offers is
+//!     sent after promotion over `CapabilitiesUpdate`.
 //!   - Watchdog scheduled at `HANDSHAKE_TIMEOUT_MS`; up to three
 //!     hello retries on the [`HANDSHAKE_HELLO_RETRY_SCHEDULE_MS`].
 //!
@@ -23,8 +25,8 @@
 //!     second signature, or a conflicting value, which is the typed
 //!     terminal `ConflictingPeerContribution` for that exact task — its
 //!     own cause, never the currentness one.
-//!   - Only a first binding records the peer's label, verification code,
-//!     features, and capabilities, under the exact-current owner fence. A
+//!   - Only a first binding records the peer's label, verification code
+//!     and features, under the exact-current owner fence. A
 //!     retransmission is answered without adopting any of them.
 //!
 //! On inbound auth_response:
@@ -64,8 +66,9 @@ use crate::PROTOCOL_VERSION;
 
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
+use super::peer_registry::PeerOwnerToken;
 use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
-use super::state::{NetworkState, PeerOwnerToken};
+use super::state::NetworkState;
 use super::{phase, send_to_peer_owner};
 
 /// Kick off the handshake — called once the data channel opens.
@@ -89,22 +92,16 @@ pub(super) async fn initiate(
     // on the wire that this endpoint's own transcript does not contain.
     let contribution = auth_task.local_contribution();
     let code = verification::generate_code();
-    let caps = state
-        .rpc
-        .read()
-        .as_ref()
-        .map(|r| r.capability.lock().clone())
-        .unwrap_or_default();
+    // No capability advertisement travels here. The local advert is sent after
+    // promotion, over `CapabilitiesUpdate`, so this frame cannot disclose what
+    // this node offers to an endpoint that has not yet authenticated.
     let hello = HelloMessage {
         protocol: PROTOCOL_VERSION,
         device_id: state.identity.public_id().to_string(),
         label: state.identity.label().to_string(),
         nonce: contribution,
         verification_code: code.clone(),
-        capabilities: Some(caps),
-        max_connections: None,
         features: ADVERTISED_FEATURES.iter().map(|s| s.to_string()).collect(),
-        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     // `with_current` rather than `get_if_current`, for the same reason as the
     // first-Hello metadata write below: this is a synchronous multi-field write
@@ -326,11 +323,16 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
 
     // Peer-supplied metadata belongs to the Hello that established this
     // attempt. A retransmission carries the same contribution but is otherwise
-    // attacker-controlled input, so adopting its label, code, features, or
-    // capabilities would let a late frame rewrite the identity of an attempt
-    // that is already bound — or already promoted — while the proof it gets
-    // back is the cached one. Only the first binding records; the classification
-    // is matched, never inferred from peer state.
+    // attacker-controlled input, so adopting its label, code, or features would
+    // let a late frame rewrite the identity of an attempt that is already bound
+    // — or already promoted — while the proof it gets back is the cached one.
+    // Only the first binding records; the classification is matched, never
+    // inferred from peer state.
+    //
+    // What is recorded here is deliberately the smallest set: two cosmetic
+    // strings that authorize nothing and gate nothing, and the feature list,
+    // which only ever refuses. Application capability metadata is not among
+    // them and cannot be — the frame no longer carries any.
     match accepted {
         crate::endpoint_auth::AcceptedPeerHello::FirstBinding(_) => {
             // `with_current` rather than `get_if_current`, because this write
@@ -347,9 +349,6 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
                 // optional frame kind (acked channel delivery, governance wire,
                 // …) — record it, or `peer_supports` has nothing to consult.
                 data.features = hello.features.clone();
-                if let Some(caps) = &hello.capabilities {
-                    data.capabilities = Some(caps.clone());
-                }
             });
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
@@ -574,14 +573,17 @@ pub async fn on_auth_response(
     // The write itself linearizes against registry replacement rather than
     // merely observing that the owner was current a moment ago. It is
     // synchronous, has no await inside, and carries only owned values out.
-    let Some(caps) = state.peers.with_current(owner, |peer| {
-        let mut data = peer.state.write();
-        data.authenticated = true;
-        data.status = PeerStatus::PendingApproval;
-        data.capabilities.clone().unwrap_or_default()
-    }) else {
+    if state
+        .peers
+        .with_current(owner, |peer| {
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::PendingApproval;
+        })
+        .is_none()
+    {
         return;
-    };
+    }
 
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
@@ -611,7 +613,6 @@ pub async fn on_auth_response(
         device_id: device_id.to_string(),
         label: peer_label.clone(),
         verification_code,
-        capabilities: caps,
         rostered,
     }));
 
@@ -726,7 +727,7 @@ async fn maybe_activate_after_check(
     }
 
     phase::recompute(state);
-    super::reliable::flush_peer_owner(state, owner).await;
+    super::reliable::flush_owner(state, owner).await;
     if state.peers.get_if_current(owner).is_none() {
         return;
     }
@@ -979,7 +980,6 @@ mod tests {
         label: &str,
         code: &str,
         feature: &str,
-        advertise_capabilities: bool,
     ) -> HelloMessage {
         HelloMessage {
             protocol: PROTOCOL_VERSION,
@@ -987,12 +987,6 @@ mod tests {
             label: label.to_string(),
             nonce: contribution.to_string(),
             verification_code: code.to_string(),
-            capabilities: if advertise_capabilities {
-                Some(Default::default())
-            } else {
-                None
-            },
-            max_connections: None,
             // Every well-formed peer advertises the closed endpoint-auth
             // profile alongside whatever else it supports; without it the
             // handshake now fails closed before any proof work. `feature` is
@@ -1001,7 +995,6 @@ mod tests {
                 crate::protocol::features::Feature::ENDPOINT_AUTH_V1.to_string(),
                 feature.to_string(),
             ],
-            app_version: None,
         }
     }
 
@@ -1013,11 +1006,8 @@ mod tests {
             label: "unadvertised".to_string(),
             nonce: contribution.to_string(),
             verification_code: "zzz999".to_string(),
-            capabilities: None,
-            max_connections: None,
             // An older peer: it speaks other features, just not this profile.
             features: vec![crate::protocol::features::Feature::TYPED_CHANNELS.to_string()],
-            app_version: None,
         }
     }
 
@@ -1135,7 +1125,6 @@ mod tests {
                     "label",
                     "aaa111",
                     "feature",
-                    false,
                 ),
             )
             .await;
@@ -1165,7 +1154,7 @@ mod tests {
         on_hello(
             &state,
             &owner,
-            hello_carrying("peer", "not-base32!", "label", "aaa111", "feature", false),
+            hello_carrying("peer", "not-base32!", "label", "aaa111", "feature"),
         )
         .await;
 
@@ -1220,7 +1209,6 @@ mod tests {
                 "settled-label",
                 "aaa111",
                 "settled-feature",
-                false,
             ),
         )
         .await;
@@ -1243,7 +1231,6 @@ mod tests {
                     "settled-feature".to_string()
                 ]
             );
-            assert!(data.capabilities.is_none());
         }
         let draws = task.draw_count();
         let signatures = task.signature_count();
@@ -1259,7 +1246,6 @@ mod tests {
                 "rewritten-label",
                 "zzz999",
                 "injected-feature",
-                true,
             ),
         )
         .await;
@@ -1285,10 +1271,6 @@ mod tests {
                 "settled-feature".to_string()
             ],
             "and its advertised feature set, which gates every optional frame kind"
-        );
-        assert!(
-            data.capabilities.is_none(),
-            "and a late frame cannot introduce capabilities the first never advertised"
         );
         drop(data);
         // Ed25519 is deterministic, so equal proof bytes would prove nothing
@@ -1335,7 +1317,6 @@ mod tests {
                 "settled-label",
                 "aaa111",
                 "settled-feature",
-                false,
             ),
         )
         .await;
@@ -1353,7 +1334,6 @@ mod tests {
                 "rewritten-label",
                 "zzz999",
                 "injected-feature",
-                true,
             ),
         )
         .await;
@@ -1368,7 +1348,6 @@ mod tests {
             let data = peer.state.read();
             assert_eq!(data.label, "settled-label");
             assert_eq!(data.verification_code_received.as_deref(), Some("aaa111"));
-            assert!(data.capabilities.is_none());
         }
     }
 
@@ -1569,5 +1548,62 @@ mod tests {
             "a peer replaced before the persistence fence must not enter the roster"
         );
         state.shutdown().await;
+    }
+
+    /// A Hello cannot carry application capability metadata, and a peer that
+    /// sends one anyway changes nothing.
+    ///
+    /// This is the pre-promotion half of the capability boundary, and it is a
+    /// wire claim rather than a type claim: deleting the field from
+    /// `HelloMessage` stops *this* build from producing one, but says nothing
+    /// about what a peer may put on the wire. A sender that still emits the old
+    /// frame — or an attacker that emits it deliberately — must be unable to
+    /// place application metadata into this node before a session owns it.
+    ///
+    /// Three things are asserted, and each fails differently:
+    ///
+    /// 1. the frame still parses, so the removal is a hard cutover of *meaning*
+    ///    and not an accidental denial of service against every older peer;
+    /// 2. the parsed value has nowhere to put it — there is no field on
+    ///    `HelloMessage` that a `capabilities` key can land in, which is what
+    ///    makes step 3 structural rather than a matter of the handler
+    ///    remembering to ignore it;
+    /// 3. re-encoding what was parsed does not carry the key forward, so the
+    ///    metadata cannot be relayed onward either.
+    ///
+    /// The complementary post-promotion half — that `CapabilitiesUpdate` is
+    /// refused before a live session — is enforced by the admission gate in
+    /// `engine::mod` and by the live-session lender `on_capabilities_update`
+    /// runs under; a peer without a promoted session reaches neither.
+    #[test]
+    fn a_hello_advertising_capabilities_is_parsed_without_them() {
+        use crate::protocol::features::Feature;
+
+        let with_advert = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "device_id": "peer",
+            "label": "Phone",
+            "nonce": "noncexyz",
+            "verification_code": "aaa111",
+            "features": [Feature::ENDPOINT_AUTH_V1.to_string()],
+            // The retired fields, exactly as an older peer would send them.
+            "capabilities": { "tags": ["transcribe"], "app_version": "9.9.9" },
+            "max_connections": 8,
+            "app_version": "9.9.9",
+        });
+
+        let hello: HelloMessage =
+            serde_json::from_value(with_advert).expect("an older peer's hello still parses");
+        assert_eq!(hello.device_id, "peer");
+        assert_eq!(hello.features, vec![Feature::ENDPOINT_AUTH_V1.to_string()]);
+
+        let reencoded = serde_json::to_value(&hello).expect("hello re-encodes");
+        let object = reencoded.as_object().expect("hello is a JSON object");
+        for retired in ["capabilities", "max_connections", "app_version"] {
+            assert!(
+                !object.contains_key(retired),
+                "a retired hello field must not survive a parse: {reencoded}"
+            );
+        }
     }
 }

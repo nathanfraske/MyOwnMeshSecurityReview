@@ -677,12 +677,15 @@ export type DropReason =
 export type PeerEvent =
   | { kind: "sighted"; network_id: string; device_id: string }
   | {
+      // No `capabilities`: authentication happens before the peer's session is
+      // promoted, so nothing has yet received what the peer offers. It arrives
+      // on `capabilities_changed`, and `PeerInfo.capabilities` is null until
+      // then.
       kind: "authenticated";
       network_id: string;
       device_id: string;
       label: string;
       verification_code: string;
-      capabilities: CapabilityAdvert;
       rostered: boolean;
     }
   | { kind: "approved"; network_id: string; device_id: string; label: string }

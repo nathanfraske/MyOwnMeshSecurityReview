@@ -99,22 +99,18 @@ where
             })
     }
 
-    /// Send under the acknowledged-delivery contract: parked until the
-    /// peer's link is up, retransmitted across session rebuilds, and
-    /// resolved when the peer's engine has handed the frame to its
-    /// application layer (or with an error at TTL / terminal failure).
-    /// Unlike [`Self::send_to`], a peer that isn't connected *yet* is a
-    /// reason to queue, not an error — this is the primitive that
-    /// replaces application-level retransmit loops.
-    pub async fn send_to_acked(
-        &self,
-        peer: &str,
-        body: &T,
-        ttl: Option<std::time::Duration>,
-    ) -> Result<(), ChannelError> {
+    /// Send under the acknowledged-delivery contract: the frame is retained by
+    /// the peer's live session until that peer's engine acknowledges having
+    /// handed it to its application layer, and this call resolves when it does.
+    ///
+    /// Delivery is scoped to one session. A peer with no live session is an
+    /// error rather than a reason to park, and a frame still outstanding when
+    /// its session ends resolves with that fact. So a caller is always told
+    /// what became of its frame, and never waits on a session that is gone.
+    pub async fn send_to_acked(&self, peer: &str, body: &T) -> Result<(), ChannelError> {
         let payload = serde_json::to_value(body)?;
         self.network
-            .send_channel_reliable(peer, &self.name, payload, ttl.map(|d| d.as_millis() as u64))
+            .send_channel_reliable(peer, &self.name, payload)
             .await
             .map_err(|e| match e {
                 crate::error::Error::Transport(msg) => ChannelError::Transport(msg),

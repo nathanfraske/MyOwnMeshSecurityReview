@@ -109,9 +109,6 @@ pub struct ClientHandle {
     /// Channel subscriptions this client currently holds.
     /// Same disconnect-cleanup rationale.
     pub channel_subs: Arc<DashSet<ClaimKey>>,
-    /// Realtime subscriptions (by network) this client holds.
-    /// Same disconnect-cleanup rationale.
-    pub realtime_subs: Arc<DashSet<String>>,
 }
 
 impl ClientHandle {
@@ -142,8 +139,6 @@ struct RegistryInner {
     clients: DashMap<ClientId, Arc<ClientHandle>>,
     handler_claims: DashMap<ClaimKey, ClientId>,
     channel_subs: DashMap<ClaimKey, Arc<Mutex<Vec<ClientId>>>>,
-    /// Realtime subscribers per network id.
-    realtime_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
     pending_inbound: DashMap<String, PendingInbound>,
     /// Streaming methods that have a synthetic handler
     /// installed on the engine. `(network, method) → ()` —
@@ -174,7 +169,6 @@ impl ClientRegistry {
             writer_tx,
             method_claims: Arc::new(DashSet::new()),
             channel_subs: Arc::new(DashSet::new()),
-            realtime_subs: Arc::new(DashSet::new()),
         });
         self.inner.clients.insert(id, handle.clone());
         handle
@@ -212,14 +206,6 @@ impl ClientRegistry {
         for entry in handle.channel_subs.iter() {
             let key = entry.key().clone();
             if let Some(subs) = self.inner.channel_subs.get(&key) {
-                subs.lock().retain(|c| *c != id);
-            }
-        }
-        // Realtime subscriptions clean up the same way; the realtime pump exits
-        // on its next event once its subscriber list is empty.
-        for entry in handle.realtime_subs.iter() {
-            let key = entry.key().clone();
-            if let Some(subs) = self.inner.realtime_subs.get(&key) {
                 subs.lock().retain(|c| *c != id);
             }
         }
@@ -311,54 +297,6 @@ impl ClientRegistry {
         let mut subs = subs.lock();
         subs.retain(|c| *c != client);
         subs.is_empty()
-    }
-
-    /// Returns `true` on the FIRST realtime subscriber for this network
-    /// — the caller's signal to spawn the network's realtime pump.
-    ///
-    /// One subscription covers audio and video together. They were two here
-    /// only because there were two lane pools; a flow's media kind is now a
-    /// property of the flow, and a client that wanted a call had to hold both
-    /// subscriptions anyway.
-    pub fn subscribe_realtime(&self, network: String, client: ClientId) -> bool {
-        if let Some(c) = self.client(client) {
-            c.realtime_subs.insert(network.clone());
-        }
-        let entry = self
-            .inner
-            .realtime_subs
-            .entry(network)
-            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
-        let mut subs = entry.lock();
-        let was_empty = subs.is_empty();
-        if !subs.contains(&client) {
-            subs.push(client);
-        }
-        was_empty
-    }
-
-    /// Release a realtime subscription. Returns `true` if no clients remain on
-    /// this network's realtime flows.
-    pub fn unsubscribe_realtime(&self, network: &str, client: ClientId) -> bool {
-        if let Some(c) = self.client(client) {
-            c.realtime_subs.remove(network);
-        }
-        let Some(subs) = self.inner.realtime_subs.get(network) else {
-            return true;
-        };
-        let mut subs = subs.lock();
-        subs.retain(|c| *c != client);
-        subs.is_empty()
-    }
-
-    /// Snapshot the network's current realtime subscribers — used by the
-    /// realtime pump each event.
-    pub fn realtime_subscribers(&self, network: &str) -> Vec<ClientId> {
-        self.inner
-            .realtime_subs
-            .get(network)
-            .map(|subs| subs.lock().clone())
-            .unwrap_or_default()
     }
 
     /// Snapshot the current set of subscribers — used by the

@@ -466,19 +466,28 @@ pub enum Request {
         payload: serde_json::Value,
     },
     /// Send a frame on a typed channel under the acknowledged-delivery
-    /// contract: queued until the peer's link is up, retransmitted
-    /// across session rebuilds, resolved when the peer's engine has
-    /// delivered it (or with an error at TTL / terminal failure). The
-    /// primitive that replaces application-level retransmit loops.
+    /// contract: resolved when the peer's engine has delivered it, or with an
+    /// error. The primitive that replaces application-level retransmit loops.
+    ///
+    /// The contract is **within one live session**, and that bounds every part
+    /// of it. Submission acquires the peer's current session or is refused, so
+    /// a frame is never accepted for a peer this node cannot currently reach;
+    /// the frame is retained under that session's own lease; and session
+    /// replacement, policy revocation, connector replacement or restart resolve
+    /// the caller with an error naming what happened rather than carrying the
+    /// frame into a session that did not accept it.
+    ///
+    /// There is therefore no expiry to state and none to configure. A frame
+    /// outlives neither its session nor the caller's own await, so the two
+    /// things a deadline used to protect against — an undeliverable frame
+    /// retained forever, and a caller left waiting on one — cannot happen.
+    /// Backpressure is the resource provider refusing the frame's own lease,
+    /// which is a real bound rather than a fixed queue depth.
     ChannelSendReliable {
         network: String,
         channel: String,
         peer: String,
         payload: serde_json::Value,
-        /// Milliseconds before an undelivered frame expires (0 = the
-        /// engine default).
-        #[serde(default)]
-        ttl_ms: u64,
     },
     /// Broadcast a frame on a typed channel to every active
     /// peer. Returns the number of peers the send was
@@ -584,28 +593,15 @@ pub enum Request {
         peer: String,
         flow_label: String,
     },
-    /// Route realtime flow *control* events for this network's peers to this
-    /// client's event socket. That is `realtime_flow_closed`, and only that:
-    /// there is no open event, because a flow exists only when this node's own
-    /// application asked for one and the response to that request is its
-    /// acknowledgement. Units are not delivered here either; they need an
-    /// inbound [`Request::RealtimePipe`].
-    RealtimeSubscribe {
-        client_id: crate::ipc::ClientId,
-        network: String,
-    },
-    /// Release a realtime subscription. No-op if not subscribed.
-    RealtimeUnsubscribe {
-        client_id: crate::ipc::ClientId,
-        network: String,
-    },
     /// Convert this connection into a dedicated **binary realtime pipe**:
     /// after the ack it carries only length-prefixed frames
     /// (`[u32 len][body]`, see [`decode_realtime_send_unit`] and
     /// [`encode_realtime_recv_unit`]) and no JSON.
     ///
     /// `Outbound` reads units from the client and writes each to its flow;
-    /// `Inbound` pushes units for everything `client_id` subscribes to.
+    /// `Inbound` pushes every unit arriving on the bound session, whichever
+    /// flow it arrived on — the frame carries the name, so no subscription
+    /// selects which flows are delivered.
     ///
     /// **Both** directions are bound to exactly one session by `network` +
     /// `peer`. That binding is what makes a unit routable at all: a frame body
@@ -615,15 +611,14 @@ pub enum Request {
     /// says it means. Binding the connection supplies the session by
     /// construction, which keeps the body compact.
     ///
-    /// Inbound is bound for the same reason and not a weaker one. The JSON
-    /// control events carry `from`, but the binary units do not, and it is the
-    /// units that need routing — an earlier event naming a peer does not
-    /// disambiguate a later frame on a shared connection.
+    /// Inbound is bound for the same reason and not a weaker one: a binary unit
+    /// carries no peer, and it is the units that need routing.
     ///
     /// The binding is also a lifetime, and it is observed rather than
-    /// signalled — there is no retirement event to subscribe to, because a
-    /// separate signal is a second source of truth that can disagree with the
-    /// queue. Dropping the session's `PromotedSession` drops its flow set and
+    /// signalled. There is no flow or session event on any socket: a separate
+    /// signal would be a second source of truth that can disagree with the
+    /// queue, and this is where the end is actually observable. Dropping the
+    /// session's `PromotedSession` drops its flow set and
     /// the queued units with it, and each direction learns that from the queue
     /// it already holds:
     ///
@@ -1500,21 +1495,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 // core answers with the bytes it now holds, and those are the
                 // bytes of this string, so re-decoding would only introduce a
                 // failure mode where the two could differ.
-                Ok(_claimed) => {
-                    // First flow on this session starts its lifecycle pump. The
-                    // claim inside answers `None` if one is already running, so
-                    // this is safe to attempt on every open and needs no
-                    // daemon-side record of which sessions are pumped — which is
-                    // the point, since such a record could disagree with core
-                    // about whether a session is still live.
-                    crate::ipc::bridge::spawn_realtime_flow_events(
-                        net.clone(),
-                        network.clone(),
-                        peer.clone(),
-                        state.clients.clone(),
-                    );
-                    Response::ok(serde_json::json!({ "flow_label": chosen }))
-                }
+                Ok(_claimed) => Response::ok(serde_json::json!({ "flow_label": chosen })),
                 Err(refusal) => realtime_refused(refusal),
             }
         }
@@ -1991,17 +1972,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             channel,
             peer,
             payload,
-            ttl_ms,
         } => {
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
-            let ttl = if ttl_ms == 0 {
-                None
-            } else {
-                Some(std::time::Duration::from_millis(ttl_ms))
-            };
-            match net.send_reliable(&peer, &channel, payload, ttl).await {
+            match net.send_reliable(&peer, &channel, payload).await {
                 Ok(()) => Response::ok(serde_json::json!({ "delivered": true })),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -2031,29 +2006,6 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             };
             net.advertise(capabilities);
             Response::ok(serde_json::json!({ "advertised": true }))
-        }
-
-        Request::RealtimeSubscribe { client_id, network } => {
-            if state.clients.client(client_id).is_none() {
-                return Response::err(format!("unknown client_id: {client_id}"));
-            }
-            if state.registry.get(&network).is_none() {
-                return Response::err(format!("unknown network: {network}"));
-            }
-            // No task is spawned on the first subscriber. Realtime control
-            // events are synthesised at the point their evidence appears — a
-            // refusal on an inbound pipe's next poll — rather than pumped from a
-            // core event stream, because core publishes none. See the note in
-            // `ipc::bridge`.
-            state.clients.subscribe_realtime(network, client_id);
-            Response::ok(serde_json::json!({ "subscribed": true }))
-        }
-
-        Request::RealtimeUnsubscribe { client_id, network } => {
-            state.clients.unsubscribe_realtime(&network, client_id);
-            // The pump exits on its next event once it sees an empty subscriber
-            // list — the same passive teardown as channels.
-            Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
 
         // Handled in `handle_client` (it converts the whole connection); never

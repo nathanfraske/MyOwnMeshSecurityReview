@@ -3,8 +3,21 @@
 //! The provider submodule grants finite resource leases. The existing
 //! accountant below remains observation-only and cannot authorize work.
 //! Keeping those roles distinct prevents measurements from becoming permits.
+//!
+//! The queue and map submodules are containers built on those leases rather
+//! than a second kind of permit: they store what an owner already paid for, one
+//! funded allocation per entry, and they grant nothing of their own. Both exist
+//! because the standard collections cannot state an entry's cost — a ring's
+//! spare capacity belongs to no entry, and a B-tree's node belongs to several —
+//! so an owner using one can charge per entry or release per entry, but not
+//! both truthfully.
 
+pub(crate) mod map;
 pub mod provider;
+pub(crate) mod queue;
+
+pub(crate) use map::LeasedMap;
+pub(crate) use queue::LeasedQueue;
 
 pub use provider::{
     FiniteResourceProvider, ReclaimResult, ResourceAcquireDemand, ResourceAdmission,

@@ -1,8 +1,15 @@
 //! The **basal** realtime vocabulary: what is true of any flow, on any provider.
 //!
 //! A basal flow is a labelled, directed stream of opaque byte units inside a
-//! session. Direction, refusal, the fact that a flow closed, and the leases on a
-//! session's streams need no clock, no codec and no transport to mean something.
+//! session. Direction, refusal, and the lease on a session's inbound stream
+//! need no clock, no codec and no transport to mean something.
+//!
+//! A flow ending is not among them, and that is a contract rather than an
+//! omission. A close is the result of the local operation that performed it,
+//! returned to that caller; a session ending is the inbound stream ending. So
+//! there is nothing left for a lifecycle event to say that its reader was not
+//! already told, and an event naming only a reusable name could not say it
+//! unambiguously anyway.
 //!
 //! Anything that does — media kind, MIME, clock rate, channels, pacing
 //! duration, RTP timestamp, marker — belongs to the provider that negotiates
@@ -67,33 +74,6 @@ pub enum RealtimeFlowDirection {
     Inbound,
 }
 
-/// A flow of this session went away.
-///
-/// One variant, and that is the whole vocabulary.
-///
-/// There is deliberately **no open variant**. A flow exists only because this
-/// side's authenticated application asked for one, and that ask is already
-/// answered by the response to its own request — an event would be a second,
-/// weaker account of something the caller was told directly, and two accounts
-/// can disagree. An open event is also the shape a peer-minted flow would
-/// arrive in, and a peer cannot mint one: inbound negotiation may only attach
-/// to a flow this side already opened. Publishing the variant would advertise a
-/// capability that does not exist.
-///
-/// There is deliberately **no retirement variant** either. A session ending is
-/// the stream ending — `None` from the awaiting call — not an item on it. An
-/// item would have to be delivered by something that outlived the session,
-/// which is exactly the retention this design removes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RealtimeFlowEvent {
-    /// The flow under this name is gone and the name is free to claim again.
-    ///
-    /// A copy of the bytes, not the connector's leased label: a consumer
-    /// holding the label itself would be an untracked holder of the session's
-    /// lease, and this event routinely outlives the flow it reports.
-    Closed { label: Vec<u8> },
-}
-
 /// An exclusive lease on one session's whole inbound stream.
 ///
 /// One consumer at a time, held for as long as the handle is: a request made
@@ -114,58 +94,28 @@ pub enum RealtimeFlowEvent {
 /// The handle grants nothing. It cannot reach a flow, a port, or a session; the
 /// only thing it can do is be handed back to
 /// [`JoinedNetwork::recv_webrtc_realtime_any`](crate::JoinedNetwork::recv_webrtc_realtime_any),
-/// which resolves the session again before it takes anything. It also carries
-/// the selector it was claimed for, so a handle for one peer can never be used
-/// to receive another's units, and it names the exact stream it was claimed on,
-/// so a handle outliving a replacement cannot receive the *next* session's
-/// units under a label that meant something else on the previous one.
+/// which takes from the one queue this handle already names.
+///
+/// **Naming the stream is what binds it, and nothing else needs to.** The reader
+/// holds a weak reference to the exact queue the claiming session's flow set
+/// owns, so a handle can only ever take units that set put there: not another
+/// peer's, and not those of a session that replaced it under the same selector.
+/// A retained copy of the selector would be a second fact saying the same thing,
+/// and the two could only ever agree or be a bug.
 ///
 /// Holding one does not keep a session alive. When the session ends the stream
 /// ends — the awaiting call answers `None`, permanently — and that is the only
 /// notification of the end there is.
 pub struct RealtimeInboundStream {
-    peer: String,
     reader: crate::transport::webrtc::RealtimeInboundArrivals,
 }
 
 impl RealtimeInboundStream {
-    pub(crate) fn new(
-        peer: String,
-        reader: crate::transport::webrtc::RealtimeInboundArrivals,
-    ) -> Self {
-        Self { peer, reader }
-    }
-
-    pub(crate) fn peer(&self) -> &str {
-        &self.peer
-    }
-
-    pub(crate) fn reader(&self) -> &crate::transport::webrtc::RealtimeInboundArrivals {
-        &self.reader
-    }
-}
-
-/// An exclusive lease on one session's flow-close stream.
-///
-/// Exclusive, releasable on drop, and inert for the same reasons as
-/// [`RealtimeInboundStream`]: one consumer at a time, a second request while a
-/// handle is alive answers `None`, dropping the handle lets the stream be
-/// claimed again while the session is current, and the session ending is
-/// terminal rather than a release.
-///
-/// A separate lease from the inbound one, not a second view of it, because one
-/// signal wakes one waiter — a lifecycle consumer sharing the inbound stream
-/// would take wakes the receiver needed.
-pub struct RealtimeFlowEventStream {
-    reader: crate::transport::webrtc::RealtimeFlowEvents,
-}
-
-impl RealtimeFlowEventStream {
-    pub(crate) fn new(reader: crate::transport::webrtc::RealtimeFlowEvents) -> Self {
+    pub(crate) fn new(reader: crate::transport::webrtc::RealtimeInboundArrivals) -> Self {
         Self { reader }
     }
 
-    pub(crate) fn reader(&self) -> &crate::transport::webrtc::RealtimeFlowEvents {
+    pub(crate) fn reader(&self) -> &crate::transport::webrtc::RealtimeInboundArrivals {
         &self.reader
     }
 }

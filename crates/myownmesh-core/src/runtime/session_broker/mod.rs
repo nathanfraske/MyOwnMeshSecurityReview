@@ -28,68 +28,11 @@ use std::sync::Arc;
 use crate::application_gateway::LocalPrincipalCapability;
 use crate::connector::ConnectorIncarnation;
 use crate::endpoint_auth::AuthenticatedChannelCapability;
-use crate::resource::{ResourceClaim, ResourceClass, ResourceLease, ResourceUnavailable};
+use crate::resource::{ResourceClaim, ResourceLease, ResourceUnavailable};
 use crate::runtime::attempt::MeshConnectorResourceScope;
 use crate::runtime::RuntimeIncarnation;
 
 pub(crate) use policy::CurrentPolicyAdmission;
-
-/// The post-authentication reservation one promoted session holds.
-///
-/// Mechanically derived from the state a promotion actually creates, so these
-/// numbers cannot drift from the objects they pay for. A promotion constructs
-/// exactly one of each of these and holds both for the session's whole life:
-///
-/// - the session record — [`SessionCapability`], which owns by value the
-///   authenticated channel it was promoted from, the shared local principal
-///   handle, the connector identity, and the permit carrying this very
-///   reservation; and
-/// - the session-owned realtime flow set —
-///   [`SessionRealtimeFlows`](crate::transport::webrtc::SessionRealtimeFlows),
-///   built by the exact connector this session was promoted from and dropped
-///   with the session that owns it.
-///
-/// Both terms are `size_of`, read from the types themselves. There is no
-/// estimate, no per-peer multiplier, and no number written out that a later
-/// field addition could silently invalidate.
-///
-/// Two exclusions are **by design**. The `RealtimeFlowRegistry` the flow set
-/// holds is the connector's own and preexisting — promotion clones the handle,
-/// it does not allocate the registry — so charging it here would bill a session
-/// for something that outlives it. And every per-flow, queue and payload lease
-/// is charged where it is taken, against limits the connector's realtime policy
-/// chooses; a session that opens no flow must not pre-pay for flows.
-///
-/// The third term is the heap `SessionRealtimeFlows::new` allocates for the set
-/// promotion builds: the flow-set token, the arrival stream, the lifecycle
-/// stream, and the inbound bindings, each with its `Arc` counter words. Those
-/// three of four types are private to the connector, so the size is asked of the
-/// connector rather than restated here — restating it is precisely the
-/// hand-written cost this claim exists to remove, and a field added to
-/// `SessionStream` would silently stop being paid for.
-///
-/// It is worth knowing that the third term is exhaustive *by maintenance*, not
-/// by construction: a fifth root added to `new` and not added there is a mistake
-/// no compiler catches. The mitigation is that the function lives beside `new`.
-///
-/// Deliberately not derived from anything measured before authentication — a
-/// pre-authentication lease cannot be reused as proof that this capacity exists.
-fn session_claim() -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
-    let bytes = std::mem::size_of::<SessionCapability>()
-        .checked_add(std::mem::size_of::<
-            crate::transport::webrtc::SessionRealtimeFlows,
-        >())
-        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::AccountedMemoryBytes,
-        })?;
-    let bytes = u64::try_from(bytes).map_err(|_| {
-        crate::resource::ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::AccountedMemoryBytes,
-        }
-    })?;
-    ResourceClaim::try_from_entries([(ResourceClass::AccountedMemoryBytes, bytes)])?
-        .checked_add(crate::transport::webrtc::SessionRealtimeFlows::promotion_root_claim()?)
-}
 
 /// Proof that post-authentication session capacity was reserved.
 ///
@@ -99,6 +42,17 @@ fn session_claim() -> Result<ResourceClaim, crate::resource::ResourceClaimArithm
 /// permit releases exactly the reservation it took and nothing else.
 pub(crate) struct SessionPermit {
     runtime: RuntimeIncarnation,
+    /// The Mesh grant this reservation came out of, retained so the session can
+    /// pay for what it goes on to retain.
+    ///
+    /// A promoted session holds application state whose size it does not know at
+    /// promotion time — one retained frame per un-acknowledged reliable send.
+    /// Pre-paying a ceiling for that at promotion is the fixed cap the
+    /// transition removes; charging each retention against this scope as it
+    /// happens is what makes the provider, rather than a constant, the bound.
+    /// The scope grants nothing by itself: every acquisition through it is the
+    /// provider's own decision.
+    scope: MeshConnectorResourceScope,
     /// Held for its `Drop`. The reservation exists for as long as the permit
     /// does, which is for as long as the session it was promoted into.
     _lease: ResourceLease,
@@ -109,13 +63,27 @@ impl SessionPermit {
         scope: &MeshConnectorResourceScope,
         runtime: RuntimeIncarnation,
     ) -> Result<Self, ResourceUnavailable> {
-        let lease = scope.reserve_session(session_claim().expect(
-            "the session claim is `size_of` arithmetic over fixed types and cannot overflow",
-        ))?;
+        let lease = scope.reserve_session(
+            crate::runtime::peer_session::PromotedSession::promotion_claim().expect(
+                "the promoted record claim is `size_of` arithmetic over fixed types and cannot                  overflow",
+            ),
+        )?;
         Ok(Self {
             runtime,
+            scope: scope.clone(),
             _lease: lease,
         })
+    }
+
+    /// Reserve capacity this session retains on top of its own promotion charge.
+    ///
+    /// `Admitted` authority, like the promotion reservation itself, because what
+    /// it pays for belongs to a promoted session and must not be reclaimed as
+    /// though it were candidate work. The lease is returned bare: whatever holds
+    /// it decides how long the retention lasts, and dropping it releases exactly
+    /// that retention.
+    fn reserve_retained(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
+        self.scope.reserve_session(claim)
     }
 
     /// The runtime this reservation was taken under.
@@ -232,6 +200,26 @@ impl SessionCapability {
 
     pub(crate) fn local_principal(&self) -> &LocalPrincipalCapability {
         &self.local_principal
+    }
+
+    /// Reserve capacity this session will hold for as long as it holds the
+    /// thing it pays for.
+    ///
+    /// Reachable only through a live session, which is the point: capacity taken
+    /// out of a Mesh's grant on a peer's behalf should be traceable to the
+    /// session that authorized it, and released by that session ending. There is
+    /// no way to acquire this without holding the capability, and no way to hold
+    /// the capability past replacement.
+    ///
+    /// The claim is the caller's to derive from what it actually retains. This
+    /// deliberately does not know what is being paid for — a size decided here
+    /// would be a second, weaker account of a representation this module cannot
+    /// see.
+    pub(crate) fn reserve_retained(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.permit.reserve_retained(claim)
     }
 }
 
@@ -405,7 +393,8 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
     crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
 }
 
-/// What one promoted session actually costs the provider: [`session_claim`]
+/// What one promoted session actually costs the provider:
+/// [`PromotedSession::promotion_claim`](crate::runtime::peer_session::PromotedSession::promotion_claim)
 /// plus the record it keeps for the reservation carrying it.
 ///
 /// Mechanically derived, and `pub(crate)` so every fixture that has to leave
@@ -416,7 +405,8 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
 #[cfg(any(test, feature = "transport-lab"))]
 pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
     crate::resource::FiniteResourceProvider::reservation_charge_for_test(
-        session_claim().expect("the session claim is `size_of` arithmetic and cannot overflow"),
+        crate::runtime::peer_session::PromotedSession::promotion_claim()
+            .expect("the promoted record claim is `size_of` arithmetic and cannot overflow"),
     )
     .expect("one session claim plus the provider's reservation record is representable")
 }

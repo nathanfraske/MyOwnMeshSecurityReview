@@ -41,10 +41,20 @@ First frame on a fresh data channel from each side.
 | `label` | string | Self-reported human label. Cosmetic. |
 | `nonce` | string | Random 32-byte challenge, base32-lowercase. |
 | `verification_code` | string | 6-char `[a-z0-9]`. Read aloud over voice. |
-| `capabilities` | object? | `CapabilityAdvert` — see below. Optional. |
-| `max_connections` | u32? | Hint to the topology selector. |
-| `features` | string[] | Capability ids the sender claims. Must include `endpoint_auth_v1` — see below. |
-| `app_version` | string? | Cosmetic. |
+| `features` | string[] | Protocol-feature ids the sender claims. Must include `endpoint_auth_v1` — see below. |
+
+`hello` carries **no application capability metadata**. It is admitted before a
+session exists, so anything it carried would place application-level metadata
+into the receiver ahead of the application-payload boundary; a receiver that
+treated absence as a default would additionally manufacture an advertisement no
+peer ever sent. What a node offers is exchanged after promotion, on
+[`capabilities_update`](#capabilities_update), under a live session. A `hello`
+that still carries `capabilities`, `max_connections` or `app_version` parses —
+the unknown keys are ignored — and none of them reach any state.
+
+`features` is read pre-session because that is what it is for: it gates which
+frame kinds the sender may later emit, and its absence refuses rather than
+enabling. It advertises no application capability.
 
 **The endpoint-authentication profile is advertised, and it is a hard
 precondition rather than an optional-frame gate.** A `hello` whose
@@ -140,6 +150,13 @@ when either flag is set.
 ### `capabilities_update`
 Push an updated `CapabilityAdvert` to peers. Receivers replace their
 cached copy wholesale.
+
+This is the only path by which a capability advertisement crosses. It is
+application traffic: a sender emits it only to peers whose session is live, and
+a receiver applies it only under the live session that owns the record — an
+admitted-but-unpromoted peer's update is a no-op that retains nothing and emits
+no event. The record dies with that session, so an advertisement cannot outlive
+the authority that accepted it.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -321,8 +338,8 @@ A peer's contribution binds an attempt exactly once. A retransmitted
 `hello` carrying the *same* contribution is answered from the cached
 proof — no second draw, no second signature — and none of its other
 fields are adopted, so a late frame cannot rewrite the label,
-verification code, advertised features, or capabilities of an attempt
-that is already bound. A `hello` carrying a *different* contribution is
+verification code, or advertised features of an attempt that is already
+bound. A `hello` carrying a *different* contribution is
 not a retransmission; it is a typed terminal conflict that retires the
 attempt.
 

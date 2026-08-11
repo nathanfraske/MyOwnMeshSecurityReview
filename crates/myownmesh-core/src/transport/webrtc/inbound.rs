@@ -30,7 +30,7 @@ pub(super) struct SessionInboundTrackOwner {
     /// Without it a close would leave this task parked in `read_rtp` until the
     /// peer happened to send again — holding a native read lease against a flow
     /// that no longer exists.
-    pub(super) end: Arc<tokio::sync::Notify>,
+    pub(super) end: Arc<LeasedWake>,
     /// The connector's track table and this track's token, for the one
     /// retirement this task may perform.
     ///
@@ -86,7 +86,7 @@ pub(super) async fn pump_session_flow_track(
     };
     // Created once and polled repeatedly rather than rebuilt each turn, so a
     // wake that lands between two turns is still there on the next poll.
-    let ended = end.notified();
+    let ended = end.notify().notified();
     tokio::pin!(ended);
     loop {
         // Upgraded per packet and held across nothing that awaits. This is the

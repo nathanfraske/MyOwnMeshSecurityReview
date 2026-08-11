@@ -209,11 +209,11 @@ pub(super) struct RealtimeFlowRegistry {
     local_ceiling: Option<EnabledRealtimeConnectorPolicy>,
     /// The owner's per-unit byte ceiling, when the owner selected one.
     ///
-    /// `None` is absence, and absence is not zero. It used to be stored as `0`
-    /// with the two readers below testing `local_ceiling.is_some()` first, so
-    /// the real meaning lived in a second field and a reader that forgot the
-    /// guard would refuse every unit. `Option` puts the absence in the value,
-    /// where it cannot be read past.
+    /// `None` is absence, and absence is not zero. The absence lives in the
+    /// value rather than in a companion field a reader has to consult first: a
+    /// sentinel `0` guarded by `local_ceiling.is_some()` puts the real meaning
+    /// somewhere a reader can forget to look, and forgetting refuses every
+    /// unit. `Option` cannot be read past.
     pub(super) max_unit_bytes: Option<NonZeroUsize>,
     pub(super) state: SyncMutex<RealtimeFlowRegistryState>,
     pub(super) ready: tokio::sync::Notify,
@@ -403,6 +403,42 @@ impl RealtimeFlowRegistry {
         ])
     }
 
+    /// Fund one node of a caller-owned [`crate::resource::LeasedMap`] against
+    /// this owner.
+    ///
+    /// Generic over the map's key and value rather than taking a byte count, so
+    /// the node's size is read from the concrete node type by the map's own
+    /// calibration and is never restated here. One entry is one allocation and
+    /// this lease lives in it — which is the property an ordered map of shared
+    /// nodes cannot offer, because there an entry's departure says nothing about
+    /// whether an allocation departed with it.
+    pub(super) fn acquire_map_entry<K, V>(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(
+            crate::resource::LeasedMap::<K, V>::entry_claim(ResourceClaim::ZERO)
+                .map_err(Self::claim_arithmetic_unavailable),
+        )
+    }
+
+    /// Fund one node of a caller-owned [`crate::resource::LeasedQueue`] against
+    /// this owner.
+    ///
+    /// Generic over the queue's element rather than taking a byte count, so the
+    /// node's size is read from the concrete node type by the queue's own
+    /// calibration and is never restated here. Nothing is added for what the
+    /// element points at off-heap: those allocations hold their own leases
+    /// already, and charging them again would bill one allocation twice and
+    /// release it once.
+    pub(super) fn acquire_queue_record<T>(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(
+            crate::resource::LeasedQueue::<T>::entry_claim(ResourceClaim::ZERO)
+                .map_err(Self::claim_arithmetic_unavailable),
+        )
+    }
+
     pub(super) fn ready_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         // Ready links are embedded in RealtimeFlowQueue and were included in
         // flow_claim. This lease owns only the live scheduling obligation.
@@ -510,6 +546,60 @@ impl RealtimeFlowRegistry {
         ])
     }
 
+    /// One shared block a flow's constructors allocate, and the counters the
+    /// `Arc` around it puts beside the contents.
+    ///
+    /// Deliberately per block rather than per flow. The blocks an open
+    /// allocates do not share a lifetime: the outbound queue is reached only
+    /// through the flow's own strong pointer, while both wakes are handed to a
+    /// pump strongly *because* they have to outlive the thing whose death they
+    /// announce. A combined claim would have to be released at whichever of
+    /// those moments the caller chose, and either choice is wrong for the other
+    /// blocks — early for the wakes, or late for the queue. One claim per block
+    /// lets each lease live inside the block it funds and be released by that
+    /// block's last holder.
+    ///
+    /// Three terms, the same shape as [`Self::label_claim`] and for the same
+    /// reason: the record itself, the strong/weak counter pair the `Arc` puts
+    /// beside it, and one residual for the one allocation. There is no separate
+    /// content term because these records point at nothing further — anything
+    /// they do point at holds its own lease and would otherwise be charged
+    /// twice.
+    pub(super) fn flow_root_claim(
+        content_bytes: usize,
+    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        let overflow = || ResourceUnavailable::ProviderInvariant {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        };
+        let arc_counters = std::mem::size_of::<usize>()
+            .checked_mul(2)
+            .ok_or_else(overflow)?;
+        let retained_bytes = content_bytes
+            .checked_add(arc_counters)
+            .ok_or_else(overflow)?;
+        Self::claim([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                Self::measured_bytes(retained_bytes)?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+    }
+
+    /// Take the lease that owns one such block, before the block exists.
+    ///
+    /// Separate from the flow's own admission because the lifetimes are
+    /// separate: this lease is stored inside the record it funds and released
+    /// when the last holder of that record drops, which for a wake is later
+    /// than the close and for the queue is exactly the close.
+    pub(super) fn acquire_flow_root(
+        &self,
+        content_bytes: usize,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::flow_root_claim(content_bytes))
+            .map_err(|reason| self.record_drop(None, reason, 0))
+    }
+
     pub(super) fn native_read_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         Self::claim([
             (ResourceClass::CallbackOrScheduledWork, 1),
@@ -582,10 +672,10 @@ impl RealtimeFlowRegistry {
     /// Everything one shared real-time profile costs on the heap.
     ///
     /// A profile is deep: a `Vec` of codecs, each carrying a `mime` and `fmtp`
-    /// `String` and a `Vec` of feedback entries with two `String`s apiece. Every
-    /// promotion used to clone all of it and pay for none of it. It is now
-    /// shared behind an `Arc` instead, so this is charged once — by the
-    /// connector that registered it — and a promotion clones a pointer.
+    /// `String` and a `Vec` of feedback entries with two `String`s apiece.
+    /// Deep enough that cloning it per promotion would cost more than any
+    /// promotion accounts for, so it is shared behind an `Arc`: charged once, by
+    /// the connector that registered it, and a promotion clones a pointer.
     ///
     /// Measured by walking the actual strings and vectors rather than by any
     /// per-codec estimate: the deployed profile is five H.264 variants whose
@@ -1468,6 +1558,14 @@ impl RealtimeFlowPort {
         reservation: RealtimeOutputReservation,
     ) -> bool {
         self.enqueue_checked(event, reservation).unwrap_or(false)
+    }
+
+    /// Fund one node of a caller-owned [`crate::resource::LeasedQueue`] against
+    /// the owner this flow was admitted by.
+    pub(super) fn reserve_queue_record_checked<T>(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.lifetime.registry.acquire_queue_record::<T>()
     }
 }
 

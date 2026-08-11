@@ -41,9 +41,14 @@ impl Feature {
 
     /// Peer honours the acknowledged-delivery channel contract —
     /// accepts `channel_seq` frames, delivers them exactly once, and
-    /// answers with cumulative `channel_ack`s. Senders fall back to
-    /// plain `channel` frames (queued locally until the link is up,
-    /// but unacknowledged) against peers that don't advertise this.
+    /// answers with cumulative `channel_ack`s. A reliable send to a
+    /// peer that does not advertise this is refused, and the caller
+    /// is told so: there is no fallback to plain `channel` frames,
+    /// because a local send success answers for this process's socket
+    /// and the caller asked about the peer's application layer.
+    /// Nothing is retained on that arm either — the refusal precedes
+    /// the hand-off to the session record that would have held the
+    /// frame, so an unadvertised peer accumulates no queue.
     /// See the engine's `reliable` module.
     pub const RELIABLE_CHANNELS: &'static str = "reliable_channels_v1";
 

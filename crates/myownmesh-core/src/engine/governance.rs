@@ -45,7 +45,8 @@ use crate::protocol::{
 };
 
 use super::connection::PeerStatus;
-use super::state::{NetworkCmd, NetworkState as EngineState, PeerOwnerToken};
+use super::peer_registry::PeerOwnerToken;
+use super::state::{NetworkCmd, NetworkState as EngineState};
 
 // ---- helpers --------------------------------------------------------
 
@@ -991,7 +992,7 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
 /// through strict-extension adoption, so a spoofed deny changes nothing.
 pub(super) async fn deny_if_evicted(
     state: &Arc<EngineState>,
-    owner: &super::state::PeerOwnerToken,
+    owner: &super::peer_registry::PeerOwnerToken,
 ) -> bool {
     let device_id = owner.device_id();
     if !log_evicted(state, device_id) {

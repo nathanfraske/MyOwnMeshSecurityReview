@@ -14,13 +14,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::rpc::CapabilityAdvert;
 use crate::network_state::Transition;
 
 /// Sent immediately on channel open by both ends. Carries the
-/// sender's claimed Device ID, this endpoint's per-attempt
-/// contribution, and an optional capabilities blob. Both sides' hellos
-/// are required: each contribution is bound into the signed transcript.
+/// sender's claimed Device ID and this endpoint's per-attempt
+/// contribution. Both sides' hellos are required: each contribution is
+/// bound into the signed transcript.
+///
+/// **This frame is admitted before a session exists**, so it carries only what
+/// endpoint authentication and the approval gate need in order to run. It
+/// carries no application capability metadata: that is exchanged after
+/// promotion, through `CapabilitiesUpdate` under a live `SessionCapability`,
+/// which is the only path where a peer's advertisement can reach application
+/// state at all. A capability blob here would be attacker-controlled input
+/// mutating and announcing application-level metadata before the
+/// application-payload boundary — and an "absent means default" rule would
+/// additionally manufacture an advertisement no peer ever sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloMessage {
     /// Wire-protocol version. v1 senders MAY omit features the
@@ -50,27 +59,18 @@ pub struct HelloMessage {
     /// think it is. Not load-bearing — the ed25519 signatures
     /// authenticate identity; this is just the UX anchor.
     pub verification_code: String,
-    /// Capabilities the sender advertises. Optional — omitted by
-    /// older peers; receivers treat absence as
-    /// [`CapabilityAdvert::default`].
-    #[serde(default)]
-    pub capabilities: Option<CapabilityAdvert>,
-    /// Maximum concurrent connections this peer is willing to
-    /// maintain. Feeds the topology selector — a peer that says
-    /// "I can hold 8" absorbs more of the load when nearby ones
-    /// are at the floor. Omitted by older peers; the engine
-    /// defaults to 6 when missing.
-    #[serde(default)]
-    pub max_connections: Option<u32>,
-    /// Capability-negotiation list — see [`super::features`]. Older
-    /// peers omit; receivers treat absence as an empty list.
+    /// Protocol-feature list — see [`super::features`]. Read before a session
+    /// exists because that is what it is for: `endpoint_auth_v1` is how a peer
+    /// states it speaks the one closed authentication profile, and its absence
+    /// is a fail-closed refusal. It gates which frame kinds the sender may
+    /// later emit; it advertises no application capability and names no
+    /// application semantics.
+    ///
+    /// `#[serde(default)]` here is not an older-peer accommodation: an empty
+    /// list is the honest reading of a peer that advertised nothing, and it
+    /// refuses rather than enabling anything.
     #[serde(default)]
     pub features: Vec<String>,
-    /// Sender's app version. Cosmetic only; surfaced in the peer
-    /// detail UI so users can see when a peer is on an older /
-    /// newer release than them.
-    #[serde(default)]
-    pub app_version: Option<String>,
 }
 
 /// Response to [`HelloMessage`] proving the sender controls the

@@ -207,7 +207,7 @@ The sixteen-arc queue is retired as a delivery plan. It produced sixteen
 miniature products, each with its own review gate, evidence essay, and guard
 suite, around a product that could not yet hold a session. Work is now
 delivered as two atomic macro-slices, and the arcs survive only as the coverage
-checklist in 7.3 -- not as future PRs.
+checklist in 7.4 -- not as future PRs.
 
 ### 7.1. Macro-slice 1: Live Runtime Cutover (PR #6)
 
@@ -247,9 +247,44 @@ require; a final resource-closure pass over the completed owner graph; deletion
 of the remaining `NetworkState`/legacy-driver ownership, ordinary forwarding,
 obsolete governance, compatibility adapters, and dead APIs; and one coherent
 new-mode MyOwnMesh release. Downstream consumer migration begins only when the
-owner separately authorizes that program.
+owner separately authorizes that program. Its last phase is the closure gate in
+7.3, which is what makes the deletions above verifiable rather than asserted.
 
-### 7.3. Coverage checklist (internal, not a PR queue)
+### 7.3. Repository Closure and Nodularity Gate
+
+The final phase of Macro-slice 2, and the last thing that happens before the
+transition is declared complete. It is not a third macro-slice and not another
+architecture program: it introduces no product semantics, and every item it
+requires is a deletion, a consolidation, or a move to the owner that should
+already have held the thing. Nothing here can be satisfied by adding a layer.
+
+The gate is met only when all of the following are absent from the repository:
+
+```text
+no LegacyV1 or mixed-version path
+no temporary compatibility adapter
+no obsolete protocol variant or config field
+no dead permit, constructor, feature or public re-export
+no old peer-string / socket / route authority bypass
+no stale direct-send or media-lane API
+no transition-only #[allow(dead_code)] keeping removed design alive
+no obsolete CI job, regex guard, mutation harness or evidence dossier
+no unused dependency
+no duplicate mutable truth beside the accepted capability owner
+no application or transport semantics in the wrong architectural node
+no grab-bag module owning unrelated state classes
+canonical documentation describes the code that actually remains
+```
+
+Two of those are easy to satisfy dishonestly and are therefore stated exactly.
+"No duplicate mutable truth" means one owner per mutable state class, not one
+owner plus a cache that agrees today. "Canonical documentation describes the
+code that actually remains" means the current contract and nothing else: a
+comment recording what a file used to contain is not documentation of what
+remains, and a removed variant does not keep a grave marker in production
+source.
+
+### 7.4. Coverage checklist (internal, not a PR queue)
 
 | Former arc | Disposition |
 | --- | --- |
@@ -261,67 +296,9 @@ owner separately authorizes that program.
 | 12 Relay profiles, 14 Durable persistence, 15 Resource closure, 16 Legacy removal, 18 Release rollout | Macro-slice 2. |
 | 17 Causal-contract/application domains | Optional. Out of the completion critical path. |
 
-## 8. Critical-path and parallel work
+## 8. Test and evidence program
 
-```mermaid
-flowchart LR
-    A0[Arc 00-01\nBaseline + inventory] --> A2[Arc 02\nCapabilities + permits]
-    A2 --> A3[Arc 03\nWebRTC connector]
-    A3 --> A4[Arc 04\nEndpoint Auth]
-    A4 --> A5[Arc 05\nFirst promoted payload]
-    A5 --> A6[Arc 06\nAll payload gating]
-    A5 --> A7[Arc 07\nSignaling lanes]
-    A7 --> A8[Arc 08\nOpen semantics]
-    A8 --> A9[Arc 09\nClosed semantics]
-    A3 --> A10[Arc 10\nAttempt runtime]
-    A5 --> A11[Arc 11\nPeer Session + recovery]
-    A10 --> A11
-    A11 --> A12[Arc 12\nRelay]
-    A7 --> A13[Arc 13\nReachability]
-    A9 --> A14[Arc 14\nPersistence]
-    A6 --> A15[Arc 15\nResource closure]
-    A12 --> A15
-    A13 --> A15
-    A14 --> A15
-    A15 --> A16[Arc 16\nLegacy deletion]
-    A16 --> A17[Arc 17\nOptional contracts]
-    A16 --> A18[Arc 18\nRelease]
-```
-
-The earliest usable target milestone is Arc 05. Open/Closed semantic replacement and full modular extraction continue after the promotion boundary is already running in the existing product.
-
-## 9. First pull-request queue
-
-The first PRs should be deliberately small:
-
-1. **`docs: adopt hybrid architecture and transition ownership`**  
-   Add this package, baseline record, no product behavior change.
-2. **`core: introduce private channel and session capability spine`**  
-   Types, compile-fail tests, no production authority change.
-3. **`transport: wrap existing webrtc session as connector capability`**  
-   Preserve transport behavior, no app dispatch.
-4. **`auth: extract channel-bound device authentication`**  
-   Produce `AuthenticatedChannelCapability`. *(Implemented and enforced at the admission gates; no execution or audit result is claimed here. Binding term is the certificate-fingerprint pair, not an exporter.)*
-5. **`session: promote one authenticated channel into one capability`**  
-   Temporary policy adapter, one typed Channel positive control.
-6. **`session: gate directed channel and rpc operations`**  
-   Remove their old bypasses.
-7. **`session: gate media send, receive, and ipc delivery`**  
-   Preserve pre-auth bounded transport setup; block application exposure.
-8. **`transport: generalize media lanes into optional realtime flows`**  
-   Keep WebRTC RTP performance; move H.264, Opus, video/audio meaning, and fixed lane policy out of the basal core.
-9. **`signaling: classify durable and ephemeral lanes before parsing`**  
-   Preserve Nostr/mDNS/LocalBroker behavior.
-10. **`semantics: add open participation projector and policy guards`**  
-   Differential observation, then new-mode admission.
-11. **`attempt: own speculative candidates and racing per attempt`**  
-    Shrink `NetworkState` and driver ownership.
-
-Do not start by rewriting governance, compaction, or optional contracts. The first proof must be that the existing repository can create a useful session through the new promotion boundary.
-
-## 10. Test and evidence program
-
-### 10.1 Compile-time boundaries
+### 8.1 Compile-time boundaries
 
 Require compile-fail or visibility tests proving:
 
@@ -332,15 +309,15 @@ Require compile-fail or visibility tests proving:
 - public IDs cannot reconstruct local capabilities;
 - durable semantic code imports no transport runtime.
 
-### 10.2 Pure semantic tests
+### 8.2 Pure semantic tests
 
 Cover canonical encoding, signatures, exact context, Open self-participation, Closed proof confinement, independent/joinable/exclusive concurrency, compaction equivalence, and store-opening non-revival.
 
-### 10.3 Deterministic networking simulation
+### 8.3 Deterministic networking simulation
 
 Build fakes for signaling carriers, connectors, connected channels, relay, time, entropy, resources, and fault injection. Exercise every callback order, duplicate, cancellation, crash boundary, and policy invalidation relevant to promotion and recovery.
 
-### 10.4 Real integration matrix
+### 8.4 Real integration matrix
 
 Preserve and expand current cross-platform and field scenarios:
 
@@ -357,7 +334,7 @@ Preserve and expand current cross-platform and field scenarios:
 - process restart;
 - mixed-version behavior where supported.
 
-### 10.5 Performance evidence
+### 8.5 Performance evidence
 
 Measure at minimum:
 
@@ -381,7 +358,7 @@ These measurements are required, and they are never capacity. Producing them is 
 
 **A passing CI run proves only what it has controls for, and only about the commit it ran on.** Accepted CI at exact head `7e2ba9e`, and at `6a22911` before it, is runtime non-regression evidence only: retained runtime behavior still runs as accepted at that commit. **Once the branch moves past a head, its run becomes prior-head evidence** — it describes a commit that is no longer current and carries no claim about the new head. In neither case does such a run prove P6 partition non-amplification, grant contraction over `S`, `Gc`, `O`, `T`, `E`, or `B`, hostile-ingress progress or backpressure, an enforceable isolation envelope, an actual reserved guarantee, or Slice C closure. No control for any of those exists at those heads, so the runs cannot have exercised them, and no part of those results may be cited toward them. State this limit wherever such a run is cited as evidence.
 
-## 11. Upstream intake during transition
+## 9. Upstream intake during transition
 
 1. Fetch upstream on a regular owner-selected cadence and before every release.
 2. Create an `intake/` branch at the exact upstream commit.
@@ -394,7 +371,7 @@ These measurements are required, and they are never capacity. Producing them is 
 
 A field fix is not lost because its old module is rejected. The bug reproduction and mechanism are preserved in the correct owner.
 
-## 12. Stop conditions
+## 10. Stop conditions
 
 Pause the arc and surface an owner decision when:
 
@@ -409,7 +386,7 @@ Pause the arc and surface an owner decision when:
 - a supported platform or required transport profile regresses;
 - the proposed change would reintroduce a durable route, global current path, or transport-removed design.
 
-## 13. Definition of architecture-complete
+## 11. Definition of architecture-complete
 
 The transition is complete when all of the following are true:
 
@@ -429,11 +406,11 @@ The transition is complete when all of the following are true:
 14. store opening restores durable state but no live networking capability;
 15. every protected resource family has a live lease, a named provider, typed pressure behavior, and an explicit exactness or residual classification, with the Arc 15 property gate satisfied and no arbitration algorithm required of a conforming provider;
 16. every mutable state class has one owner;
-17. the legacy driver, `NetworkState` grab bag, authority bypasses, and compatibility adapters are deleted;
+17. the legacy driver, `NetworkState` grab bag, authority bypasses, and compatibility adapters are deleted, and the Repository Closure and Nodularity Gate in 7.3 is met in full;
 18. the full conformance and red-team suite passes on built artifacts;
 19. supported deployment, GUI, daemon, installer, updater, and platform behavior remains accepted by the owner.
 
-## 14. Owner decisions that remain explicit
+## 12. Owner decisions that remain explicit
 
 The playbook does not invent:
 

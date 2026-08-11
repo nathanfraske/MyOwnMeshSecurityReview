@@ -19,10 +19,11 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
+use super::peer_registry::PeerOwnerToken;
 use super::scheduler::{
     DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, RESTART_TRAFFIC_GRACE_MS,
 };
-use super::state::{NetworkState, PeerOwnerToken};
+use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
 /// After this many consecutive ICE failures with zero relay

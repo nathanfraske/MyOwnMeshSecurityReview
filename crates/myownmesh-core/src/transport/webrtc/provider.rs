@@ -13,7 +13,7 @@
 //! and the only thing it gains is the inability to say what they are. A value
 //! that cannot be interpreted where it lives does not belong there. So the units
 //! are whole here, and the generic layer carries what is actually generic — a
-//! session binding, a direction, a label, a lifecycle, leases, and bytes.
+//! session binding, a direction, a label, leases, and bytes.
 //!
 //! The outbound duration belongs here for the same reason, and it is worth being
 //! exact about because it looks generic. It is not a rate limit and nothing
@@ -222,32 +222,6 @@ impl From<RealtimeFlowError> for crate::realtime::RealtimeRefusal {
     }
 }
 
-impl From<RealtimeFlowEvent> for crate::realtime::RealtimeFlowEvent {
-    /// A flow lifecycle event, in the generic vocabulary.
-    ///
-    /// One variant on each side, and the conversion exists only to turn the
-    /// connector's leased label into a plain copy of the bounded opaque bytes
-    /// the application chose — which is the entire difference between the two
-    /// enums, and is exactly why the leased one must not cross: it owns the
-    /// session's charge for those bytes and would read as a handle that grants
-    /// something.
-    ///
-    /// The copy is made **here, at the dequeue**, not at the close. The queued
-    /// internal event holds the leased label for as long as it sits on the
-    /// lifecycle stream, so the bytes a consumer eventually reads were accounted
-    /// for the whole time they were retained.
-    fn from(event: RealtimeFlowEvent) -> Self {
-        match event {
-            // The leased label stays inside the connector; what leaves is a
-            // copy of its bytes. A consumer that held the label itself would be
-            // an untracked holder of the session's lease.
-            RealtimeFlowEvent::Closed { label } => Self::Closed {
-                label: label.name().as_bytes().to_vec(),
-            },
-        }
-    }
-}
-
 // There is deliberately no constructor for [`WebRtcRealtimeInboundArrival`].
 //
 // Its two fields are public and the engine hands out a
@@ -261,37 +235,6 @@ impl From<RealtimeFlowEvent> for crate::realtime::RealtimeFlowEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A leased label over an elastic control registry, with the resources it
-    /// stands on held alongside it.
-    ///
-    /// Minted rather than hand-built: a label with no lease is not the type
-    /// these conversions handle, and a control that constructed one would be
-    /// proving something about a shape production never produces. The returned
-    /// resources must outlive the label — dropping them retires the scope the
-    /// lease was taken against.
-    fn control_label(name: &[u8]) -> (RealtimeFlowLabel, ElasticControlResources) {
-        let (registry, resources) =
-            RealtimeFlowRegistry::elastic_for_control(control_label_grant());
-        let label = RealtimeFlowLabel::mint(
-            RealtimeFlowName::new(name.to_vec()).expect("a control name is within the frame bound"),
-            &registry,
-        )
-        .expect("the elastic control grant admits one label");
-        (label, resources)
-    }
-
-    /// A grant generous enough that nothing in these conversion controls is
-    /// refused for capacity. They are testing the conversion, not admission;
-    /// admission has its own controls in `realtime.rs`, where the grant is
-    /// derived exactly.
-    ///
-    /// One definition for the whole crate, in the parent module: the structural
-    /// half has to match the scope stack `elastic_for_control` really builds,
-    /// and a per-file copy could only match it by luck.
-    fn control_label_grant() -> crate::resource::ResourceClaim {
-        super::super::elastic_control_grant()
-    }
 
     /// The daemon wire spelling of the provider's RTP kind is pinned.
     ///
@@ -460,33 +403,6 @@ mod tests {
         assert_eq!(
             crate::realtime::RealtimeRefusal::from(RealtimeFlowError::EncodingInvalid),
             crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid
-        );
-    }
-
-    /// A close crosses the boundary naming the exact flow it closed.
-    ///
-    /// The label is the only thing a close carries, and an application frees its
-    /// own bookkeeping on it: reporting a close under the wrong label would have
-    /// it tear down a flow that is still live and keep one that is gone.
-    #[test]
-    fn v4_macro1_a_close_crosses_the_boundary_naming_the_exact_flow_it_closed() {
-        let (seven, _seven_resources) = control_label(b"seven");
-        let closed = RealtimeFlowEvent::Closed { label: seven };
-        assert_eq!(
-            crate::realtime::RealtimeFlowEvent::from(closed.clone()),
-            crate::realtime::RealtimeFlowEvent::Closed {
-                label: b"seven".to_vec()
-            }
-        );
-
-        // Non-vacuity: a close of a different flow converts to a different
-        // public event, so the equality above is the conversion carrying the
-        // label and not a type that compares equal to everything.
-        let (eight, _eight_resources) = control_label(b"eight");
-        let other = RealtimeFlowEvent::Closed { label: eight };
-        assert_ne!(
-            crate::realtime::RealtimeFlowEvent::from(closed),
-            crate::realtime::RealtimeFlowEvent::from(other)
         );
     }
 }
