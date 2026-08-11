@@ -68,20 +68,22 @@ impl EmbeddedDaemon {
 /// This is the only Arc 03 daemon path that can establish connectors. No
 /// capacity, callback weight, or structural real-time limit is inferred here.
 ///
-/// `realtime_flows` must be the `flow_capacity` of the realtime profile that
-/// was registered on `connector_policy`, or 0 if none was. It is passed
-/// separately rather than read back off the policy because it is published to
-/// clients as a promise about what this daemon will carry, and the caller that
-/// registered the profile is the only place that knows both halves. Passing a
-/// number the policy did not register for advertises capacity that does not
-/// exist.
+/// `realtime` must describe the profile that was actually registered on
+/// `connector_policy` — [`RealtimeAdvert::unsupported`] if none was. It travels
+/// separately rather than being read back off the policy because core keeps a
+/// registered profile's codecs and capacity crate-private, so the caller that
+/// registered it is the only place that can still see both halves.
+///
+/// It carries no promise: support, the registered encoding families, and a
+/// ceiling only where the owner stated one. Whether a particular flow can open
+/// is answered by the typed refusal at open time.
 pub async fn start_connector_capable(
     cfg: myownmesh_core::MeshConfig,
     connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-    realtime_flows: u16,
+    realtime: control::RealtimeAdvert,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
-    start_with_mesh(cfg, mesh, realtime_flows).await
+    start_with_mesh(cfg, mesh, realtime).await
 }
 
 /// Start a daemon that only hosts signaling, STUN, or TURN infrastructure.
@@ -97,14 +99,14 @@ pub async fn start_infrastructure_only(
     }
     let mesh = myownmesh_core::Mesh::open_infrastructure_only(cfg.clone()).await?;
     // Infrastructure-only installs no connector policy at all, so there is no
-    // realtime capacity to advertise.
-    start_with_mesh(cfg, mesh, 0).await
+    // realtime path to advertise.
+    start_with_mesh(cfg, mesh, control::RealtimeAdvert::unsupported()).await
 }
 
 async fn start_with_mesh(
     cfg: myownmesh_core::MeshConfig,
     mesh: myownmesh_core::MeshHandle,
-    realtime_flows: u16,
+    realtime: control::RealtimeAdvert,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -155,7 +157,7 @@ async fn start_with_mesh(
             ctl_registry,
             ctl_services,
             ctl_socket,
-            realtime_flows,
+            realtime,
             ctl_shutdown,
         )
         .await
@@ -221,13 +223,9 @@ mod tests {
     }
 
     /// There is one connector-capable startup form, and it takes only the
-    /// owner-supplied policy.
-    ///
-    /// Three of these existed: this one, a fixed H.264/Opus sidecar, and the
-    /// two composed. Each extra form installed an authority the caller could
-    /// not otherwise reach, so the assertion worth keeping is that the
-    /// surviving one really does stand a daemon up on its own — a policy
-    /// carrying no compatibility profile still produces a connector.
+    /// owner-supplied policy: a policy carrying no sidecar profile still
+    /// produces a connector, so no second form is needed and none can install an
+    /// authority the caller could not otherwise reach.
     #[tokio::test]
     async fn the_connector_capable_daemon_starts_from_the_owner_policy_alone() {
         let _fixture = CONNECTOR_DAEMON_FIXTURE.lock().await;
@@ -244,9 +242,13 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = start_connector_capable(cfg, connector_test_policy(), 0)
-            .await
-            .expect("the connector-capable daemon starts from the policy alone");
+        let daemon = start_connector_capable(
+            cfg,
+            connector_test_policy(),
+            control::RealtimeAdvert::unsupported(),
+        )
+        .await
+        .expect("the connector-capable daemon starts from the policy alone");
         assert!(daemon.mesh().connector_resource_report().is_some());
         daemon.shutdown().await;
     }

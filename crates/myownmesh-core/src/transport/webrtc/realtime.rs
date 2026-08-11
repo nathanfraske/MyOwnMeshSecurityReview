@@ -207,10 +207,56 @@ pub(super) struct RealtimeFlowRegistry {
     /// Optional local or compatibility ceilings. Basal admission never
     /// requires these values and is governed by provider leases.
     local_ceiling: Option<EnabledRealtimeConnectorPolicy>,
-    pub(super) max_unit_bytes: usize,
+    /// The owner's per-unit byte ceiling, when the owner selected one.
+    ///
+    /// `None` is absence, and absence is not zero. It used to be stored as `0`
+    /// with the two readers below testing `local_ceiling.is_some()` first, so
+    /// the real meaning lived in a second field and a reader that forgot the
+    /// guard would refuse every unit. `Option` puts the absence in the value,
+    /// where it cannot be read past.
+    pub(super) max_unit_bytes: Option<NonZeroUsize>,
     pub(super) state: SyncMutex<RealtimeFlowRegistryState>,
     pub(super) ready: tokio::sync::Notify,
     observer: Option<Arc<dyn RealtimeFlowObserver>>,
+}
+
+/// The resource objects an elastic control registry stands on.
+///
+/// Held by the control for as long as the registry is used. They are never
+/// read — dropping them would retire the scope the registry acquires against,
+/// so a control that discarded them would be measuring a dead provider rather
+/// than an elastic one.
+///
+/// `cfg(test)` rather than the lab feature: every caller is an in-crate
+/// control, and the lab controls are `#[test]`s too, so a feature-only library
+/// build has nothing that could construct one.
+#[cfg(test)]
+pub(super) struct ElasticControlResources {
+    /// The provider underneath, so a control can read what its registry is
+    /// actually holding. Without it an elastic control could only assert that
+    /// operations succeed — which is exactly what a path that charged nothing
+    /// would also do.
+    provider: crate::resource::FiniteResourceProvider,
+    /// Retention, and nothing else. Dropping any of these retires the scope the
+    /// registry acquires against, so a control that discarded them would be
+    /// measuring a dead provider.
+    _owner: crate::runtime::attempt::ConnectorResourceOwnerPort,
+    _candidate: ConnectorCandidateCapability,
+    _attempt: AttemptLifetime,
+}
+
+#[cfg(test)]
+impl ElasticControlResources {
+    /// How many accounted bytes the provider is currently holding out.
+    ///
+    /// One dimension rather than the whole claim, because what an elastic
+    /// control needs to distinguish is "charged something" from "charged
+    /// nothing", and bytes is the dimension every real-time lease touches.
+    pub(super) fn accounted_bytes(&self) -> u64 {
+        self.provider
+            .in_use()
+            .amount(ResourceClass::AccountedMemoryBytes)
+    }
 }
 
 /// Exact finite ownership of the work one inbound RTP packet costs.
@@ -240,6 +286,46 @@ impl RealtimeFlowRegistry {
         Self::with_observer(resources, local_ceiling, None)
     }
 
+    /// An elastic registry over a real provider: resources, and **no** owner
+    /// ceilings.
+    ///
+    /// `Enabled(None)` as a deployment actually states it. Controls that mint a
+    /// label or move a unit against this are proving the elastic path admits
+    /// through real leases — absence of a ceiling is not absence of accounting
+    /// — rather than proving that admission was skipped.
+    #[cfg(test)]
+    pub(super) fn elastic_for_control(
+        grant: ResourceClaim,
+    ) -> (Arc<Self>, ElasticControlResources) {
+        use crate::resource::{FiniteResourceProvider, ResourceProviderPort};
+        use crate::runtime::attempt::{
+            admit_single_connector_candidate, ConnectorResourceOwnerPort,
+        };
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone())
+            .expect("the control grant accounts for the process scope");
+        let owner = ConnectorResourceOwnerPort::new(port);
+        let mesh_scope = owner
+            .issue_mesh_scope()
+            .expect("the control grant accounts for the Mesh scope");
+        let (permit, attempt, claim) =
+            admit_single_connector_candidate(crate::runtime::RuntimeIncarnation::new(), mesh_scope);
+        let candidate = permit
+            .reserve_connector_candidate_checked(claim)
+            .expect("the control grant has no provider invariant failure")
+            .expect("the exact attempt remains active");
+        let registry = Self::new(Some(candidate.work_resource_scope()), None);
+        (
+            registry,
+            ElasticControlResources {
+                provider,
+                _owner: owner,
+                _candidate: candidate,
+                _attempt: attempt,
+            },
+        )
+    }
+
     pub(super) fn with_observer(
         resources: Option<ConnectorWorkResourceScope>,
         local_ceiling: Option<EnabledRealtimeConnectorPolicy>,
@@ -248,10 +334,10 @@ impl RealtimeFlowRegistry {
         Arc::new(Self {
             resources,
             local_ceiling,
-            // Zero is the fail-closed compatibility value when no structural
-            // unit limit was supplied. Generic provider-backed work does not
-            // interpret zero as an unlimited sentinel.
-            max_unit_bytes: local_ceiling.map_or(0, |enabled| enabled.max_unit_bytes().get()),
+            // Absence stays absence. An owner that selected no ceiling is
+            // elastic — admission is the provider's leases — not capped at
+            // zero and not unlimited.
+            max_unit_bytes: local_ceiling.map(|enabled| enabled.max_unit_bytes()),
             state: SyncMutex::new(RealtimeFlowRegistryState {
                 flows: std::collections::BTreeMap::new(),
                 ready: RealtimeReadyQueue::default(),
@@ -429,6 +515,130 @@ impl RealtimeFlowRegistry {
             (ResourceClass::CallbackOrScheduledWork, 1),
             (ResourceClass::OpaqueDependencyResidual, 1),
         ])
+    }
+
+    /// Everything one shared label record costs, for as long as anything holds
+    /// it.
+    ///
+    /// `record_bytes` is `size_of::<LeasedLabel>()` — the struct itself, which
+    /// contains the name's boxed-slice header and the lease handle.
+    /// `content_bytes` is the byte buffer that header points at, and it is
+    /// exact rather than approximate: the name is a `Box<[u8]>`, so it has no
+    /// spare capacity and its length *is* its allocation. `arc_counters` is the
+    /// strong/weak pair the `Arc` puts beside the record. Three terms because
+    /// the allocation genuinely has three parts, and stating fewer would
+    /// under-charge by whichever was omitted.
+    ///
+    /// The residual is 2 because the representation retains two allocations:
+    /// the `Arc` block and the byte buffer. It follows the representation — an
+    /// inline single-allocation DST would make it 1 — and it counts allocator
+    /// overhead, which has no portable size. It is a count, never a substitute
+    /// for the bytes above.
+    ///
+    /// Charged once against the record every copy of the label shares, so a
+    /// label sitting simultaneously in the held set, the flows map, a queued
+    /// arrival, an inbound binding and a close event is paid for once and paid
+    /// for until the *last* of those drops, not until the flow does.
+    pub(super) fn label_claim(
+        record_bytes: usize,
+        content_bytes: usize,
+    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        let overflow = || ResourceUnavailable::ProviderInvariant {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        };
+        let arc_counters = std::mem::size_of::<usize>()
+            .checked_mul(2)
+            .ok_or_else(overflow)?;
+        let retained_bytes = record_bytes
+            .checked_add(content_bytes)
+            .and_then(|bytes| bytes.checked_add(arc_counters))
+            .ok_or_else(overflow)?;
+        Self::claim([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                Self::measured_bytes(retained_bytes)?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+    }
+
+    /// Take the lease that owns one label's bytes.
+    ///
+    /// Separate from every other acquisition here because a label is not a
+    /// flow: it is minted when a session accepts the name and released when the
+    /// last retained copy drops, and those are different moments from the
+    /// flow's open and close. Refusal is the ordinary typed refusal — a
+    /// provider under pressure declines the name and the open fails closed,
+    /// rather than retaining bytes nothing accounted for.
+    pub(super) fn acquire_label_lease(
+        &self,
+        record_bytes: usize,
+        content_bytes: usize,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::label_claim(record_bytes, content_bytes))
+            .map_err(|reason| self.record_drop(None, reason, 0))
+    }
+
+    /// Everything one shared real-time profile costs on the heap.
+    ///
+    /// A profile is deep: a `Vec` of codecs, each carrying a `mime` and `fmtp`
+    /// `String` and a `Vec` of feedback entries with two `String`s apiece. Every
+    /// promotion used to clone all of it and pay for none of it. It is now
+    /// shared behind an `Arc` instead, so this is charged once — by the
+    /// connector that registered it — and a promotion clones a pointer.
+    ///
+    /// Measured by walking the actual strings and vectors rather than by any
+    /// per-codec estimate: the deployed profile is five H.264 variants whose
+    /// `fmtp` lines differ in length, so an average would be wrong in both
+    /// directions.
+    /// Three terms, the same shape as [`Self::label_claim`] and for the same
+    /// reason: the record itself, the heap it points at, and the strong/weak
+    /// counter pair the `Arc` puts beside the record. The counters are not
+    /// optional bookkeeping — they are retained for exactly as long as the
+    /// record is — and omitting them here while charging them for a label
+    /// would have made two shared records of the same shape cost differently.
+    pub(super) fn profile_claim(
+        record_bytes: usize,
+        content_bytes: usize,
+        allocations: u64,
+    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        let overflow = || ResourceUnavailable::ProviderInvariant {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        };
+        let arc_counters = std::mem::size_of::<usize>()
+            .checked_mul(2)
+            .ok_or_else(overflow)?;
+        let retained_bytes = record_bytes
+            .checked_add(content_bytes)
+            .and_then(|bytes| bytes.checked_add(arc_counters))
+            .ok_or_else(overflow)?;
+        Self::claim([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                Self::measured_bytes(retained_bytes)?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, allocations),
+        ])
+    }
+
+    /// Take the lease that owns one shared profile record.
+    ///
+    /// Separate from every other acquisition here for the same reason the
+    /// label's is: a profile is minted when the connector accepts the
+    /// application's registration and released when the last session holding it
+    /// drops, and neither moment is a flow's open or close.
+    pub(super) fn acquire_profile_lease(
+        &self,
+        record_bytes: usize,
+        content_bytes: usize,
+        allocations: u64,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::profile_claim(
+            record_bytes,
+            content_bytes,
+            allocations,
+        ))
+        .map_err(|reason| self.record_drop(None, reason, 0))
     }
 
     fn acquire(
@@ -929,7 +1139,9 @@ impl RealtimeFlowRegistry {
         key: RealtimeFlowKey,
         bytes: usize,
     ) -> std::result::Result<RealtimeOutputReservation, RealtimeFlowDropReason> {
-        if self.local_ceiling.is_some() && bytes > self.max_unit_bytes {
+        // No ceiling selected means no oversize refusal: the lease below is the
+        // admission, and a provider under pressure is what says no.
+        if self.max_unit_bytes.is_some_and(|max| bytes > max.get()) {
             return Err(self.record_drop(Some(key), RealtimeFlowDropReason::UnitOversize, bytes));
         }
         let lease = self
@@ -1322,7 +1534,11 @@ impl RealtimeAssemblyReservation {
                 },
             ));
         };
-        if self.registry.local_ceiling.is_some() && unit_bytes > self.registry.max_unit_bytes {
+        if self
+            .registry
+            .max_unit_bytes
+            .is_some_and(|max| unit_bytes > max.get())
+        {
             self.registry.record(RealtimeFlowObservation::Drop {
                 key: Some(self.key),
                 reason: RealtimeFlowDropReason::UnitOversize,
@@ -1531,11 +1747,21 @@ mod elastic_resource_tests {
         _attempt: AttemptLifetime,
     }
 
+    /// The name every delivery in these controls arrives on.
+    fn fixture_flow_name() -> RealtimeFlowName {
+        RealtimeFlowName::new(b"fixture".to_vec()).expect("the fixture name is within the bound")
+    }
+
     /// Four payload bytes on a label, leaseless — `enqueue_checked` attaches
     /// the output reservation these controls are actually measuring.
-    fn fixture_realtime_unit() -> TransportEvent {
+    ///
+    /// The label is a real minted one, cloned per delivery. A hand-built label
+    /// would be bytes nothing had paid for, and the exact grants below would
+    /// then be exact about everything except the one thing the delivery carries
+    /// for as long as it is queued.
+    fn fixture_realtime_unit(label: &RealtimeFlowLabel) -> TransportEvent {
         TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
-            RealtimeFlowLabel::from_peer(0),
+            label.clone(),
             RealtimeRecvUnit {
                 timestamp: 0,
                 marker: true,
@@ -1810,7 +2036,21 @@ mod elastic_resource_tests {
             RealtimeFlowRegistry::ready_claim().expect("ready claim is representable");
         let retained_payload_claim = RealtimeFlowRegistry::retained_payload_claim(4)
             .expect("retained payload claim is representable");
-        let fixture = context(&[flow_claim, output_claim, queue_claim, ready_claim]);
+        let name = fixture_flow_name();
+        let label_claim = RealtimeFlowLabel::mint_claim(name.as_bytes().len())
+            .expect("label claim is representable");
+        let fixture = context(&[
+            flow_claim,
+            output_claim,
+            queue_claim,
+            ready_claim,
+            label_claim,
+        ]);
+        // Minted ahead of the baseline, so the label's own lease is part of the
+        // constant this control measures its deltas against. It is held for the
+        // whole test on purpose: a label outlives the units that carry it.
+        let label =
+            RealtimeFlowLabel::mint(name, &fixture.registry).expect("the label claim is available");
         let flow = fixture
             .registry
             .open_inbound_flow_checked()
@@ -1826,7 +2066,7 @@ mod elastic_resource_tests {
         );
         flow.enqueue_checked(
             QueuedTransportEvent {
-                event: fixture_realtime_unit(),
+                event: fixture_realtime_unit(&label),
                 observation: None,
                 callback_work: None,
             },
@@ -1899,7 +2139,20 @@ mod elastic_resource_tests {
             RealtimeFlowRegistry::queue_claim(4).expect("queue claim is representable");
         let ready_claim =
             RealtimeFlowRegistry::ready_claim().expect("ready claim is representable");
-        let fixture = context(&[flow_claim, output_claim, queue_claim, ready_claim]);
+        let name = fixture_flow_name();
+        let label_claim = RealtimeFlowLabel::mint_claim(name.as_bytes().len())
+            .expect("label claim is representable");
+        let fixture = context(&[
+            flow_claim,
+            output_claim,
+            queue_claim,
+            ready_claim,
+            label_claim,
+        ]);
+        // Minted before the baseline and held past the flow drop: the label is
+        // not the flow's, so a flow going away must not be what releases it.
+        let label =
+            RealtimeFlowLabel::mint(name, &fixture.registry).expect("the label claim is available");
         let before_flow = fixture.provider.in_use();
         let flow = fixture
             .registry
@@ -1910,7 +2163,7 @@ mod elastic_resource_tests {
             .expect("the output claim is available");
         flow.enqueue_checked(
             QueuedTransportEvent {
-                event: fixture_realtime_unit(),
+                event: fixture_realtime_unit(&label),
                 observation: None,
                 callback_work: None,
             },

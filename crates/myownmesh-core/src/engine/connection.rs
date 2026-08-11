@@ -540,6 +540,23 @@ impl PeerConnection {
         *self.authenticated_channel.lock() = Some(capability);
     }
 
+    /// Whether this entry currently holds a promoted session.
+    ///
+    /// Observation only: it cannot lend one, clone one, or revive one, and it
+    /// answers nothing about whether that session would still be admitted.
+    /// Controls need it to separate "the fence refused and dropped the session"
+    /// from "the fence refused and left it installed" — which is the whole
+    /// difference between a revocation that takes effect and one that merely
+    /// declines the next call while the authority stays alive behind it.
+    /// Gated to exactly its caller. The only control that asks this stands on a
+    /// live connector with a real promoted session, which only the
+    /// `transport-lab` harness builds, so a plain `cargo test` compiles the
+    /// tests module without it.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn holds_promoted_session_for_test(&self) -> bool {
+        self.promoted_session.lock().is_some()
+    }
+
     /// Promote this entry's authenticated channel into a live session, once.
     ///
     /// Called only from inside the registry mutation lock, which is what makes
@@ -552,12 +569,14 @@ impl PeerConnection {
     /// connector is dropped rather than returned — that is the replacement
     /// invalidation, applied at use.
     ///
-    /// The capability is taken out of its slot **only** once every free
-    /// precondition holds, because `promote` consumes it by value: taking it
-    /// before knowing policy admits would destroy a good capability while the
-    /// peer was merely still waiting for approval. Once taken, a refusal
-    /// destroys it deliberately — a capability whose own record does not match
-    /// this entry's context is one this entry must not keep.
+    /// The capability is never taken out of its slot here. The slot is lent to
+    /// the broker, which borrows the channel for every fallible step and moves
+    /// it out only after the post-authentication reservation succeeds. A
+    /// capacity refusal therefore leaves the exact channel installed, and the
+    /// next operation retries it; a terminal refusal — superseded connector,
+    /// refused policy, runtime disagreement — empties the slot inside the
+    /// broker, because a capability whose own record does not match this entry's
+    /// context is one this entry must not keep.
     ///
     /// **Lock order: `session`, then `promoted_session`, then
     /// `authenticated_channel`.** This is the only method that nests any of
@@ -587,14 +606,31 @@ impl PeerConnection {
         let mut promoted = self.promoted_session.lock();
 
         if let Some(session) = promoted.as_ref().map(|bundle| &bundle.session) {
-            // The use-time recheck, not merely a currentness test: connector,
-            // mesh context, remote Device, principal, and reservation runtime
-            // are all re-proved against the session's own record before it
-            // authorizes anything. A session that fails any conjunct is dropped
-            // rather than returned, which also releases its reservation.
-            let still_valid = live_connector.as_ref().is_some_and(|connector| {
-                session.is_current_for(connector, mesh_context, &self.device_id, broker.runtime())
-            });
+            // The use-time recheck, not merely a currentness test: current
+            // policy, connector, mesh context, remote Device, principal, and
+            // reservation runtime are all re-proved against the session's own
+            // record before it authorizes anything. A session that fails any
+            // conjunct is dropped rather than returned, which also releases its
+            // reservation.
+            //
+            // Policy is re-proved here and not only on the promotion path
+            // below. Admission is *retained* state: an eviction, a denial, or a
+            // topology change revokes it long after promotion, and a session
+            // promoted while it held would otherwise never be asked again. Every
+            // application operation this fence admits would keep running for a
+            // peer the mesh has since refused. Re-reading it at use is what makes
+            // a revocation take effect at the next operation rather than at the
+            // next reconnect, and dropping the session on refusal is what makes
+            // that operation have no effect at all rather than a partial one.
+            let still_valid = self.state.read().is_admitted()
+                && live_connector.as_ref().is_some_and(|connector| {
+                    session.is_current_for(
+                        connector,
+                        mesh_context,
+                        &self.device_id,
+                        broker.runtime(),
+                    )
+                });
             if still_valid {
                 return true;
             }
@@ -618,16 +654,23 @@ impl PeerConnection {
         if worker.live_connector_incarnation().is_none() {
             return false;
         }
-        let Some(capability) = self.authenticated_channel.lock().take() else {
-            return false;
-        };
-
         let policy = crate::runtime::session_broker::CurrentPolicyAdmission::from_admitted_peer(
             mesh_context,
             &self.device_id,
             true,
         );
-        match broker.promote(capability, &connector, policy) {
+        // The slot is lent to the broker, not its contents. The channel is
+        // borrowed for every fallible step and moved out only once the
+        // post-authentication reservation has been taken, so a capacity refusal
+        // leaves this entry's exact authenticated channel installed and the next
+        // application operation retries that same proven channel. The terminal
+        // refusals — superseded connector, refused policy, runtime disagreement —
+        // still empty the slot, inside the broker, where the decision is made.
+        let promotion = {
+            let mut channel = self.authenticated_channel.lock();
+            broker.promote(&mut channel, &connector, policy)
+        };
+        match promotion {
             Ok(session) => {
                 // The flow set is built by the exact worker this session was
                 // promoted from, so its registry and the session's connector are

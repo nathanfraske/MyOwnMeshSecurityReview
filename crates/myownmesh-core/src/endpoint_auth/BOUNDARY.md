@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Own fresh mutual Device authentication for one exact connected channel. Arc 03 moves the connected-channel capability into this owner and binds its installation to the exact connector incarnation. Arc 04 added the verified transcript and the authenticated-channel transition.
+Own fresh mutual Device authentication for one exact connected channel. The connected-channel capability lives in this owner, its installation is bound to the exact connector incarnation, and this owner runs the verified transcript and the authenticated-channel transition.
 
 Ownership is narrower than "endpoint authentication" as a whole, and the split matters because three other owners are involved on every attempt:
 
@@ -15,14 +15,14 @@ This owner therefore never sees a `HelloMessage`, never sends a frame, and never
 
 ## Owned state
 
-The Arc 03 task owns connected-channel provenance. Its handoff records the exact process-local connector incarnation and cleanup owner. Arc 04 added the fresh transcript, ordered endpoint roles, exact mesh-context binding, the selected channel-binding terms (both endpoints' DTLS certificate fingerprints, which are not session-unique — see Residual), and the authenticated result. It added **no** independent resource admission: the permit attests the connected-channel ownership this task already holds. Exactness of channel identity is carried by the composition of per-attempt contribution freshness and process-local connector-incarnation ownership, not by the binding terms.
+The task owns connected-channel provenance. Its handoff records the exact process-local connector incarnation and cleanup owner. It also owns the fresh transcript, ordered endpoint roles, exact mesh-context binding, the selected channel-binding terms (both endpoints' DTLS certificate fingerprints, which are not session-unique — see Residual), and the authenticated result. It performs **no** independent resource admission: the permit attests the connected-channel ownership this task already holds. Exactness of channel identity is carried by the composition of per-attempt contribution freshness and process-local connector-incarnation ownership, not by the binding terms.
 
 ## Inputs
 
 - one `ConnectedChannelCapability`;
-- one `EndpointAuthPermit` per attempt. **It is not backed by a separate Arc 04 resource admission.** The landed constructor derives it from the runtime of the `ConnectedChannelCapability` the task already owns, so what it actually attests is existing connected-channel ownership, not a fresh admission decision. A real pre-authentication admission remains unimplemented; the permit must not be cited as evidence of one;
-- fresh contributions from both endpoints in Arc 04;
-- exact local and remote Device IDs, mesh context, and the selected channel binding in Arc 04 — the DTLS certificate fingerprints of **both** endpoints, in role-canonical order. Not an exporter; see Residual.
+- one `EndpointAuthPermit` per attempt. **It is not backed by a separate resource admission.** The constructor derives it from the runtime of the `ConnectedChannelCapability` the task already owns, so what it attests is existing connected-channel ownership, not a fresh admission decision. A real pre-authentication admission is unimplemented; the permit must not be cited as evidence of one;
+- fresh contributions from both endpoints;
+- exact local and remote Device IDs, mesh context, and the selected channel binding — the DTLS certificate fingerprints of **both** endpoints, in role-canonical order. Not an exporter; see Residual.
 
 Exactly two operations take peer-supplied bytes, and each answers a closed outcome rather than a bool:
 
@@ -75,13 +75,13 @@ This task depends on the connected-channel capability and the selected cryptogra
 
 ## Resources
 
-Endpoint-authentication work remains pre-authentication work. The connected transport claim stays owned until native close succeeds. Arc 02 defines the authentication permit type, but Arc 03 does not create a production issuer, admit authentication resources, verify the Arc 04 transcript, or infer a limit.
+Endpoint-authentication work remains pre-authentication work. The connected transport claim stays owned until native close succeeds. No authentication resource class is admitted here and no limit is inferred.
 
 **Enforcement.** The capability is gated on, not merely stored. `PeerConnection::is_application_admitted` requires a live `AuthenticatedChannelCapability` **and** the existing approval policy, and every production application, reliable, and real-time admission gate routes through it. Reading `PeerStateData::authenticated` directly is not sufficient: that bool records policy history, survives channel replacement, and is deliberately left set by `retire_connector` — so a gate consulting it alone would keep admitting traffic after the authority artifact was dropped. Protocol admission traffic (Hello, AuthResponse, Approve, Deny) stays outside the gate, since it is what establishes the capability.
 
-**Implementation status.** Arc 04 has landed the production issuer. `EndpointAuthTask::accept_peer_proof` is the sole task transition that constructs `PeerProofAcceptance::Promoted`, and that variant is the only carrier of an `AuthenticatedChannelCapability`; the capability's own constructor, `AuthenticatedChannelCapability::from_verified_exchange`, mints the `EndpointAuthPermit` internally from the verified binding record, so there is no separate permit-issuing entry point to reach. `PeerConnection` owns the capability, dropping it whenever the connector is retired or replaced. This makes the arc *reachable*; it does not mark the arc complete. The completion gate still requires the signaling-MITM, no-payload-before-auth, cross-channel replay, and DTLS binding controls to be run and cited — and given the residual above, the replay control is the one that actually carries the guarantee.
+**Sole issuer.** `EndpointAuthTask::accept_peer_proof` is the only task transition that constructs `PeerProofAcceptance::Promoted`, and that variant is the only carrier of an `AuthenticatedChannelCapability`; the capability's own constructor, `AuthenticatedChannelCapability::from_verified_exchange`, mints the `EndpointAuthPermit` internally from the verified binding record, so there is no separate permit-issuing entry point to reach. `PeerConnection` owns the capability, dropping it whenever the connector is retired or replaced. Reachability is not completion: the completion gate requires the signaling-MITM, no-payload-before-auth, cross-channel replay, and DTLS binding controls to be run and cited — and given the residual above, the replay control is the one that carries the guarantee.
 
-This file states the boundary, never an execution result. The Arc 04 control inventory, the guard claims, and every exact-head evidence statement live in [`red-teams/ARC-04-ENDPOINT-AUTH.md`](../../../../red-teams/ARC-04-ENDPOINT-AUTH.md). Do not record run identifiers, CI job status, or review identifiers here.
+This file states the boundary, never an execution result. The control inventory, the guard claims, and every exact-head evidence statement live in [`red-teams/ARC-04-ENDPOINT-AUTH.md`](../../../../red-teams/ARC-04-ENDPOINT-AUTH.md). Do not record run identifiers, CI job status, or review identifiers here.
 
 There is no runtime-mismatch cause, and there deliberately is not one: the permit is minted from the connected capability's own runtime, because the engine holds no independent `RuntimeIncarnation` to compare it against, so such a variant could never fire on the issuer path. What carries exactness on install instead is the retained binding record — `EndpointAuthTask::issued` compares the capability's recorded mesh, remote Device, runtime, connector, and transcript identity against the exchange it ran under — together with connector-incarnation ownership. Two of the record's conjuncts, binding profile and provenance, each have exactly one variant today and become discriminating only when a second closed variant exists.
 
@@ -95,6 +95,4 @@ This task does not decide mesh policy, mint `SessionCapability`, authorize an ap
 
 It also does not own the inbound application-admission witnesses. `AdmittedInboundDispatch` and its siblings are `engine::state`'s, minted inside `PeerRegistry::with_current`; they name one exact peer installation for one synchronous effect and are unrelated to endpoint-authentication authority. Nor does it own `rpc::PendingOpId`, which is a process-local ownership token — a local capability for naming one filed pending entry again so a failed-send withdrawal removes that entry and not a newer occupant of the same key. `PendingOpId` is not network authority, not durable, not a route or session authority, not a credential, and not a generation counter; it is never serialized, never sent, never derived from anything a peer supplies, and no inbound path reads it.
 
-## Compatibility adapter
-
-`LegacyAuthenticatedChannel<T>` can hold a legacy object only beside an already-issued capability. It cannot create authentication or expose the raw object outside this owner. Arc 05 deletes it when Session Broker consumes the typed channel directly.
+There is no adapter that pairs an authenticated-channel capability with an unauthenticated object. Session Broker consumes the typed channel directly.

@@ -258,6 +258,27 @@ impl MeshHandle {
     }
 }
 
+/// Validate an application-supplied flow name at the public boundary.
+///
+/// The name is the application's own opaque bytes and this side never allocates
+/// one, so the only thing to decide here is whether the representation can carry
+/// it — the encoded name is length-prefixed by a single byte, which bounds one
+/// name's width and says nothing about how many may exist.
+///
+/// Refused as [`RealtimeRefusal::ProviderConfigurationInvalid`] for the same
+/// reason an unusable provider configuration is: it is an unusable *request*,
+/// caught before any session is resolved, so it costs no fence acquisition and
+/// tells a caller that has proved nothing only that its own argument was wrong.
+/// It is deliberately not `SessionNotCurrent`, which would be untrue, and not
+/// `FlowRefused`, which would claim the connector saw it.
+fn flow_name(
+    label: &[u8],
+) -> std::result::Result<crate::transport::webrtc::RealtimeFlowName, crate::realtime::RealtimeRefusal>
+{
+    crate::transport::webrtc::RealtimeFlowName::new(label.to_vec())
+        .ok_or(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)
+}
+
 /// One joined network's user-facing handle.
 pub struct JoinedNetwork {
     mesh: Mesh,
@@ -698,9 +719,12 @@ impl JoinedNetwork {
         &self,
         peer: &str,
         open: crate::transport::webrtc::WebRtcRealtimeFlowOpen,
-    ) -> std::result::Result<u8, crate::realtime::RealtimeRefusal> {
+    ) -> std::result::Result<Vec<u8>, crate::realtime::RealtimeRefusal> {
         let spec = crate::transport::webrtc::RealtimeFlowSpec::try_from(open)?;
-        self.state.open_realtime_negotiated(peer, spec).await
+        self.state
+            .open_realtime_negotiated(peer, spec)
+            .await
+            .map(|name| name.as_bytes().to_vec())
     }
 
     /// Hand one unit to an outbound WebRTC flow. Synchronous: it queues and
@@ -708,10 +732,11 @@ impl JoinedNetwork {
     pub fn send_webrtc_realtime(
         &self,
         peer: &str,
-        label: u8,
+        label: &[u8],
         unit: crate::transport::webrtc::WebRtcRealtimeOutboundUnit,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
-        self.state.send_realtime(peer, label, unit.into())
+        self.state
+            .send_realtime(peer, &flow_name(label)?, unit.into())
     }
 
     /// Take one queued unit from an inbound WebRTC flow.
@@ -721,13 +746,13 @@ impl JoinedNetwork {
     pub fn recv_webrtc_realtime(
         &self,
         peer: &str,
-        label: u8,
+        label: &[u8],
     ) -> std::result::Result<
         Option<crate::transport::webrtc::WebRtcRealtimeInboundUnit>,
         crate::realtime::RealtimeRefusal,
     > {
         self.state
-            .recv_realtime(peer, label)
+            .recv_realtime(peer, &flow_name(label)?)
             .map(|unit| unit.map(Into::into))
     }
 
@@ -747,17 +772,21 @@ impl JoinedNetwork {
     pub async fn close_realtime(
         &self,
         peer: &str,
-        label: u8,
+        label: &[u8],
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
-        self.state.close_realtime_negotiated(peer, label).await
+        self.state
+            .close_realtime_negotiated(peer, &flow_name(label)?)
+            .await
     }
 
     /// Whether that label still names a usable flow on `peer`'s current session.
     ///
     /// Answers `false` for every not-usable reason, because the question is only
-    /// ever "may I use this".
-    pub fn realtime_is_current(&self, peer: &str, label: u8) -> bool {
-        self.state.realtime_is_current(peer, label)
+    /// ever "may I use this" — including a name the representation cannot carry,
+    /// which cannot name a flow on any session.
+    pub fn realtime_is_current(&self, peer: &str, label: &[u8]) -> bool {
+        crate::transport::webrtc::RealtimeFlowName::new(label.to_vec())
+            .is_some_and(|name| self.state.realtime_is_current(peer, &name))
     }
 
     /// Claim the inbound stream of `peer`'s current session.
@@ -789,8 +818,11 @@ impl JoinedNetwork {
             .next_realtime_arrival(inbound)
             .await
             .map(
-                |(label, unit)| crate::transport::webrtc::WebRtcRealtimeInboundArrival {
-                    label,
+                |(name, unit)| crate::transport::webrtc::WebRtcRealtimeInboundArrival {
+                    // A copy of the bytes. The session's leased label never
+                    // leaves the connector, so a consumer cannot become an
+                    // untracked holder of the lease that owns them.
+                    label: name.as_bytes().to_vec(),
                     unit: unit.into(),
                 },
             )

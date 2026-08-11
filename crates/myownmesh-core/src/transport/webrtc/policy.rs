@@ -76,17 +76,18 @@ impl PendingRemoteCandidateLocalCeiling {
     }
 }
 
+/// Why a connector profile was refused.
+///
+/// One variant, and the two that stood beside it are gone rather than
+/// deprecated. `RealtimeProfileRequiresLocalCeiling` refused the elastic
+/// deployment this release exists to support, and
+/// `RealtimeProfileExceedsFlowCeiling` compared a number the profile no longer
+/// carries against a ceiling that is now enforced where it is held. Neither can
+/// be reached any more, so neither is described any more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WebRtcConnectorProfileError {
     #[error("a real-time codec profile requires the connector's real-time policy to be enabled")]
     RealtimeProfileRequiresRealtime,
-    #[error("a real-time codec profile requires an owner-selected local flow ceiling")]
-    RealtimeProfileRequiresLocalCeiling,
-    #[error(
-        "the real-time profile advertises {advertised} concurrent flows but the owner ceiling \
-         admits {enforced}"
-    )]
-    RealtimeProfileExceedsFlowCeiling { advertised: usize, enforced: usize },
 }
 
 /// WebRTC-specific construction and work policy for one Mesh runtime.
@@ -128,62 +129,35 @@ impl WebRtcConnectorProfile {
     /// registration is a property of the media engine a connection is built
     /// from. There is no later point at which core could accept one, and
     /// therefore no point at which core could fall back to a built-in list.
-    /// Fallible because advertised capacity and enforced capacity must not be
-    /// able to diverge. `flow_capacity` is what the application tells its peer
-    /// it will carry; the owner's `ConnectorRealtimeFlowCapacities` is what
-    /// the registry will actually admit. If the first exceeds the second, the
-    /// application has promised flows that will be refused one at a time at
-    /// open, which reads as an intermittent fault rather than as the
-    /// misconfiguration it is.
     ///
-    /// Checked here rather than counted anywhere: there is no second counter
-    /// and no shadow ceiling. The registry stays the sole enforcer, and this
-    /// only refuses a profile that claims more than the enforcer will give.
+    /// It refuses exactly one thing: a profile on a connector whose realtime
+    /// policy is `Disabled`. That is a contradiction the owner can only have
+    /// stated by mistake — codecs registered on a connector that will admit no
+    /// flow at all.
     ///
-    /// **This is an aggregate ceiling, not a guarantee for every
-    /// distribution.** `flow_capacity` is one direction-agnostic number and
-    /// the owner's envelope is two, so a profile can pass here and still be
-    /// unsatisfiable in a particular mix: capacity 10 against a 9-inbound,
-    /// 1-outbound ceiling admits ten flows only if at most one of them is
-    /// outbound. A second outbound flow is refused with
-    /// [`super::RealtimeFlowError::FlowRefused`] at open, by the registry,
-    /// which is the component that actually knows the direction.
+    /// **`Enabled(None)` is accepted, and that is the elastic case, not a
+    /// missing one.** A profile states *which encodings the application can
+    /// carry* and nothing else. How many concurrent flows may exist is the
+    /// owner's to say through its envelope, or the owner's to leave open — so a
+    /// profile carries no capacity of its own and is checked against none. A
+    /// second number here would describe the same thing the envelope already
+    /// describes, and requiring one would make "I have codecs and no fixed
+    /// ceiling" — the ordinary elastic deployment — unstateable.
     ///
-    /// That asymmetry is deliberate. Splitting the profile's capacity by
-    /// direction would move a connector-shaped decision into the application,
-    /// which does not own the resource envelope and should not have to model
-    /// it. What this check buys is that the clearly-wrong case — promising
-    /// more flows than exist in any arrangement — is a named configuration
-    /// error at construction rather than an intermittent-looking fault later.
+    /// Nothing is counted here, and nothing needs to be. The registry remains
+    /// the sole enforcer of concurrency, and it enforces the owner's real
+    /// ceilings when there are ceilings and the provider's real leases when
+    /// there are not. There is no shadow ceiling in this file and no second
+    /// counter to drift from the first.
     pub fn with_realtime_profile(
         mut self,
         profile: super::RealtimeProfile,
     ) -> std::result::Result<Self, WebRtcConnectorProfileError> {
-        let enabled = match self.callbacks.realtime() {
+        match self.callbacks.realtime() {
             crate::runtime::attempt::RealtimeConnectorPolicy::Disabled => {
                 return Err(WebRtcConnectorProfileError::RealtimeProfileRequiresRealtime)
             }
-            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(Some(enabled)) => enabled,
-            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(None) => {
-                return Err(WebRtcConnectorProfileError::RealtimeProfileRequiresLocalCeiling)
-            }
-        };
-        // The profile's capacity is a combined audio-plus-video count in one
-        // direction-agnostic number, so it is measured against the total the
-        // owner admits across both directions.
-        let enforced = enabled
-            .flows()
-            .max_inbound_active_flows()
-            .get()
-            .saturating_add(enabled.flows().max_outbound_active_flows().get());
-        let advertised = usize::from(profile.flow_capacity());
-        if advertised > enforced {
-            return Err(
-                WebRtcConnectorProfileError::RealtimeProfileExceedsFlowCeiling {
-                    advertised,
-                    enforced,
-                },
-            );
+            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(_) => {}
         }
         self.realtime = Some(profile);
         Ok(self)
@@ -207,34 +181,12 @@ impl WebRtcConnectorProfile {
     }
 }
 
-/// Hard stop on how many RTP fragments one Annex-B unit may retain.
-///
-/// A property of the framing adapter, not of any codec policy: a unit needing
-/// more fragments than this is a wedged stream rather than a large picture — a
-/// 40 Mbps keyframe runs to roughly four hundred — and continuing to retain
-/// them would grow without bound on an inbound path a peer controls.
-///
-pub const ANNEXB_MAX_FRAGMENTS_PER_UNIT: usize = 2_048;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The Annex-B fragment hard stop is a real bound, not a placeholder.
-    ///
-    /// A unit is allowed to span many fragments — a large keyframe genuinely
-    /// does — and the stop is far enough above that to be a wedged-stream
-    /// detector rather than a picture-size limit.
-    #[test]
-    fn v4_macro1_the_annexb_fragment_stop_is_above_any_real_unit() {
-        // ~400 fragments is a 40 Mbps keyframe at MTU-sized payloads.
-        assert!(
-            ANNEXB_MAX_FRAGMENTS_PER_UNIT > 400,
-            "a stop at or below a real keyframe would drop valid media rather \
-             than catching a wedged stream"
-        );
-        // And bounded, which is the whole point: an inbound path a peer drives
-        // must not be able to grow retention without limit.
-        assert!(ANNEXB_MAX_FRAGMENTS_PER_UNIT < usize::MAX);
-    }
-}
+// A guessed Annex-B fragment stop used to live here: one constant, 2048,
+// chosen against an estimate of a large keyframe. It is gone, and nothing
+// replaces it in this file. Retention on an inbound path is bounded where the
+// bound can be exact — `RealtimeAssemblyReservation::retain_ordered_fragment`,
+// which admits each fragment against the owner's selected ceilings and against
+// a real provider claim. A second bound in front of that could only be a guess,
+// and a guess that fires first is the one that decides: it would cap a stream
+// the owner had deliberately provisioned for, and would do it in units the
+// owner never chose.

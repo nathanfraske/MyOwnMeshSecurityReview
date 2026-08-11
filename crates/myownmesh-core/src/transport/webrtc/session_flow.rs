@@ -48,40 +48,176 @@ type FlowResult<T> = std::result::Result<T, RealtimeFlowError>;
 /// only once the flow that held it is gone. Nothing orders two labels or
 /// advances one.
 ///
-/// `u8` deliberately, matching the coordinate it replaces: a wider identifier
-/// would be a larger name adopted without evidence that the old width was the
-/// constraint.
+/// **Opaque bytes, not a number.** What bounds a name's *size* is the frame
+/// that carries it — [`crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES`], the
+/// width of the encoded length prefix. What bounds how many exist at once is
+/// admission, which answers with leases rather than with a fixed space. Those
+/// are separate questions and neither is allowed to stand in for the other: a
+/// numeric label makes the name's width into a concurrency ceiling, and a
+/// concurrency ceiling stated anywhere but the owner's envelope is a second
+/// number to drift from the first. The `Ord` below exists to key a map, not to
+/// rank: nothing orders two labels meaningfully and nothing advances one.
 ///
 /// The one property that is easy to lose and is load-bearing: a receiver that
 /// has lost its entire route table can still cite a label back to the sender,
 /// and the sender can resolve it. That is the only way to report a dead flow
 /// whose name is exactly what was lost, so a label must stay meaningful to the
 /// *peer*, not merely inside the process that minted it.
-/// How many flows one session can name at once.
 ///
-/// Not a tunable and not a policy ceiling: it is the size of the label space
-/// itself, fixed by [`RealtimeFlowLabel`] being a `u8`.
-const REALTIME_LABEL_SPACE: u16 = u8::MAX as u16 + 1;
+/// **One shared record and one lease, carried by every copy.** Not one
+/// allocation: the record is an `Arc` block and the name is a `Box<[u8]>`
+/// beside it, which is two, and `label_claim` charges both. What is singular
+/// here is the record and the lease it holds, which is the property that
+/// matters — cloning a label clones an `Arc`, so the held set, the flows map, a
+/// queued arrival, an inbound binding and a close event all name the same bytes
+/// and the same charge — released when the last of them drops, which is
+/// deliberately *not* when the flow closes. A close event exists precisely to
+/// outlive its flow, and a queued arrival can too; charging the flow's own
+/// lease for the label would have released bytes that were still retained.
+///
+/// Equality, ordering and hashing are by bytes, never by allocation address:
+/// two labels naming the same bytes are the same label, which is what lets a
+/// peer cite one back after this side has rebuilt everything else.
+#[derive(Clone, Debug)]
+pub(crate) struct RealtimeFlowLabel(Arc<LeasedLabel>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct RealtimeFlowLabel(u8);
+/// The one *record* behind every copy of a label — two allocations, one
+/// lifetime.
+///
+/// The `Arc` block holds this struct; the name's `Box<[u8]>` is a second
+/// allocation it points at. Both die together when the last copy drops, which
+/// is why one lease covers both, and `label_claim` counts two residuals.
+///
+/// `_lease` is never read. Its whole job is to exist for exactly as long as the
+/// name beside it and to release when this record drops.
+#[derive(Debug)]
+struct LeasedLabel {
+    name: RealtimeFlowName,
+    _lease: crate::resource::ResourceLease,
+}
 
 impl RealtimeFlowLabel {
-    /// The wire value. Only the application control path calls this; nothing
-    /// in the flow path reads a label back as authority.
-    pub(crate) fn get(self) -> u8 {
-        self.0
+    /// Mint the leased label for a name a session is accepting.
+    ///
+    /// The only way one is made, and it is made *at admission*. Before this
+    /// point a name is unowned bytes costing a decode buffer and nothing else,
+    /// so a refused open — a malformed name, a name already held, a provider
+    /// under pressure — retains nothing this side accounted for. Minting first
+    /// and refusing afterwards would let a peer drive retention with opens that
+    /// never succeed.
+    pub(super) fn mint(
+        name: RealtimeFlowName,
+        registry: &RealtimeFlowRegistry,
+    ) -> FlowResult<Self> {
+        let content_bytes = name.as_bytes().len();
+        let lease = registry
+            .acquire_label_lease(std::mem::size_of::<LeasedLabel>(), content_bytes)
+            .map_err(realtime_drop_refusal)?;
+        Ok(Self(Arc::new(LeasedLabel {
+            name,
+            _lease: lease,
+        })))
     }
 
-    /// Rebuild a label a peer cited back at us.
+    /// The name this label carries.
     ///
-    /// Deliberately fallible-looking in use rather than in type: any `u8` is a
-    /// syntactically valid label, so this cannot reject a hostile one. It
-    /// grants nothing on its own — resolving it to a flow is a lookup in the
-    /// session's own table, and a label naming no live flow simply finds
-    /// nothing. Treat the result as a question, never as a claim.
-    pub(crate) fn from_peer(value: u8) -> Self {
-        Self(value)
+    /// Only the application control path reads it; nothing in the flow path
+    /// treats a label as authority.
+    pub(crate) fn name(&self) -> &RealtimeFlowName {
+        &self.0.name
+    }
+
+    /// Exactly what minting a name of this length will cost.
+    ///
+    /// Fixtures that derive a finite grant from the claims they exercise need
+    /// this number, and `size_of::<LeasedLabel>()` is not theirs to compute —
+    /// the record is private to this file, which is what keeps the production
+    /// arithmetic and the fixture arithmetic the same expression rather than
+    /// two that agree until the record gains a field.
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(super) fn mint_claim(
+        content_bytes: usize,
+    ) -> std::result::Result<crate::resource::ResourceClaim, crate::resource::ResourceUnavailable>
+    {
+        RealtimeFlowRegistry::label_claim(std::mem::size_of::<LeasedLabel>(), content_bytes)
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for RealtimeFlowLabel {
+    /// Lets a collection keyed by label be looked up with the raw bytes a peer
+    /// sent, without minting a lease merely to ask a question. Consistent with
+    /// `Eq`, `Ord` and `Hash` because all four read the same bytes.
+    fn borrow(&self) -> &[u8] {
+        self.0.name.as_bytes()
+    }
+}
+
+impl PartialEq for RealtimeFlowLabel {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.name == other.0.name
+    }
+}
+
+impl Eq for RealtimeFlowLabel {}
+
+impl PartialOrd for RealtimeFlowLabel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RealtimeFlowLabel {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.name.cmp(&other.0.name)
+    }
+}
+
+impl std::hash::Hash for RealtimeFlowLabel {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.name.hash(state);
+    }
+}
+
+/// A label's bytes before anything has agreed to keep them.
+///
+/// This is what crosses the boundary in both directions: an application names
+/// one to open or address a flow, and one comes back out on an arrival or a
+/// close. It owns no lease and is not authority — it is a question, and
+/// resolving it to a flow is a lookup in one session's own table, where a name
+/// matching nothing simply finds nothing.
+///
+/// The bound is the frame's, not this type's invention:
+/// [`crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES`] is the width of the
+/// encoded label's single length byte, so a name is 1..=255 bytes and anything
+/// longer could not have been transmitted. That constant lives in the basal
+/// vocabulary because the daemon and this file must not each spell it. Empty is
+/// refused rather than accepted as a degenerate name, so the binary and JSON
+/// paths cannot disagree about what an absent label means.
+///
+/// `Box<[u8]>`, not `Vec<u8>`, and the difference is the accounting: a boxed
+/// slice has no spare capacity, so its allocation is exactly its length and the
+/// claim can charge the length rather than guess at a capacity the caller
+/// happened to hand over.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RealtimeFlowName(Box<[u8]>);
+
+impl RealtimeFlowName {
+    /// Accept bytes as a name, or refuse them.
+    ///
+    /// Both refusals are shape, and both are cheap: they happen before any
+    /// lease exists, so a peer sending unusable names pays for a decode buffer
+    /// and nothing this side retains.
+    pub fn new(bytes: Vec<u8>) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES {
+            return None;
+        }
+        // Boxing drops any spare capacity, so what the lease is later asked to
+        // charge is what is actually held.
+        Some(Self(bytes.into_boxed_slice()))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -224,16 +360,6 @@ impl RealtimeCodec {
 pub enum RealtimeProfileError {
     #[error("real-time profile registers no codecs")]
     NoCodecs,
-    #[error("real-time profile declares a zero concurrent flow capacity")]
-    NoCapacity,
-    #[error(
-        "real-time profile declares a concurrent flow capacity of {flow_capacity}, but a session \
-         names its flows with a u8 label and so can hold at most {label_space}"
-    )]
-    CapacityExceedsLabelSpace {
-        flow_capacity: u16,
-        label_space: u16,
-    },
     #[error("real-time codec with payload type {payload_type} has an empty MIME name")]
     EmptyMime { payload_type: u8 },
     #[error("real-time codec {mime} with payload type {payload_type} has a zero clock rate")]
@@ -263,7 +389,6 @@ pub enum RealtimeProfileError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealtimeProfile {
     codecs: Vec<RealtimeCodec>,
-    flow_capacity: u16,
 }
 
 impl RealtimeProfile {
@@ -272,33 +397,24 @@ impl RealtimeProfile {
     /// The refusals are all shape, never codec judgement: something to
     /// register, no duplicate payload type (which would make negotiation
     /// ambiguous), no empty MIME or zero clock rate (which would make a
-    /// capability unmatchable), no encoding family whose variants disagree on
-    /// framing, and a non-zero capacity.
+    /// capability unmatchable), and no encoding family whose variants disagree
+    /// on framing.
+    ///
+    /// A profile says **which encodings this application can carry** and
+    /// nothing about how many flows may exist at once. Concurrency is the
+    /// owner's, stated by its resource envelope and enforced by the registry;
+    /// a capacity here would be the application stating a second number for
+    /// something the envelope already decides, and it would leave an elastic
+    /// deployment — codecs, no fixed ceiling — with nothing it could truthfully
+    /// say.
     ///
     /// Note what is deliberately *not* refused: two registrations agreeing on
     /// all four family fields. Deployed H.264 is five registrations differing
     /// only in payload type and fmtp, and rejecting that would reject the
     /// profile the daemon actually ships.
-    pub fn new(
-        codecs: Vec<RealtimeCodec>,
-        flow_capacity: u16,
-    ) -> std::result::Result<Self, RealtimeProfileError> {
+    pub fn new(codecs: Vec<RealtimeCodec>) -> std::result::Result<Self, RealtimeProfileError> {
         if codecs.is_empty() {
             return Err(RealtimeProfileError::NoCodecs);
-        }
-        if flow_capacity == 0 {
-            return Err(RealtimeProfileError::NoCapacity);
-        }
-        // A session names its flows with a `u8`, so 256 is not a policy
-        // ceiling to be tuned — it is the whole label space, and a capacity
-        // above it is unsatisfiable rather than merely optimistic. Refused
-        // here so it is a configuration error with a number attached, rather
-        // than a `LabelInUse` on the 257th flow.
-        if flow_capacity > REALTIME_LABEL_SPACE {
-            return Err(RealtimeProfileError::CapacityExceedsLabelSpace {
-                flow_capacity,
-                label_space: REALTIME_LABEL_SPACE,
-            });
         }
         let mut payload_types = std::collections::BTreeSet::new();
         let mut families: std::collections::BTreeMap<
@@ -336,20 +452,12 @@ impl RealtimeProfile {
                 }
             }
         }
-        Ok(Self {
-            codecs,
-            flow_capacity,
-        })
+        Ok(Self { codecs })
     }
 
     /// Everything to register with the media engine, in the order supplied.
     pub(crate) fn codecs(&self) -> &[RealtimeCodec] {
         &self.codecs
-    }
-
-    /// Combined concurrent audio+video flows this peer will carry.
-    pub(crate) fn flow_capacity(&self) -> u16 {
-        self.flow_capacity
     }
 
     /// Every registered variant of the family an encoding names, in
@@ -404,6 +512,69 @@ impl RealtimeProfile {
         self.variants(encoding).next().map(|codec| codec.framing)
     }
 
+    /// Everything this profile holds on the heap, walked rather than estimated.
+    ///
+    /// Three levels, because the profile has three: the codec vector's own
+    /// buffer, each codec's two `String`s and its feedback vector's buffer, and
+    /// each feedback entry's two `String`s. The deployed profile is five H.264
+    /// variants whose `fmtp` lines differ in length, so any per-codec average
+    /// would be wrong in both directions.
+    ///
+    /// `capacity`, not `len`, for every buffer: what is held is what was
+    /// allocated, and a `Vec` built by `push` routinely holds more than it uses.
+    fn heap_bytes(&self) -> usize {
+        let codec_records = self.codecs.capacity() * std::mem::size_of::<RealtimeCodec>();
+        self.codecs.iter().fold(codec_records, |total, codec| {
+            let feedback_records =
+                codec.rtcp_feedback.capacity() * std::mem::size_of::<RealtimeRtcpFeedback>();
+            let feedback_strings = codec
+                .rtcp_feedback
+                .iter()
+                .map(|entry| entry.mechanism.capacity() + entry.parameter.capacity())
+                .sum::<usize>();
+            total
+                + codec.mime.capacity()
+                + codec.fmtp.capacity()
+                + feedback_records
+                + feedback_strings
+        })
+    }
+
+    /// How many separate allocations those bytes are spread across.
+    ///
+    /// Counted because allocator overhead has no portable size and the byte
+    /// total cannot express it — the same arithmetic the label claim uses.
+    ///
+    /// **By capacity, not by presence.** An empty `String` or `Vec` owns no
+    /// buffer, so counting one per field would charge a residual for something
+    /// that was never allocated. That matters here rather than being pedantry:
+    /// `fmtp` is routinely empty and `rtcp_feedback` usually is, so a
+    /// per-field count would over-charge every ordinary profile — and an
+    /// arithmetic that says "exact" while being conservative is worse than one
+    /// that admits which it is.
+    fn heap_allocations(&self) -> u64 {
+        /// One allocation exists exactly when a container owns a buffer.
+        fn allocated(capacity: usize) -> u64 {
+            u64::from(capacity != 0)
+        }
+
+        let codec_vector = allocated(self.codecs.capacity());
+        self.codecs.iter().fold(codec_vector, |total, codec| {
+            let feedback_strings = codec
+                .rtcp_feedback
+                .iter()
+                .map(|entry| {
+                    allocated(entry.mechanism.capacity()) + allocated(entry.parameter.capacity())
+                })
+                .sum::<u64>();
+            total
+                + allocated(codec.mime.capacity())
+                + allocated(codec.fmtp.capacity())
+                + allocated(codec.rtcp_feedback.capacity())
+                + feedback_strings
+        })
+    }
+
     // An `admits(kind, mime, clock_rate, channels)` was here and is deliberately
     // gone rather than wired up. It asked whether a *shape* was registered,
     // which is a strictly weaker question than the one inbound admission
@@ -414,6 +585,100 @@ impl RealtimeProfile {
     // beside the exact one invites a future caller to reach for whichever it
     // finds first, and the weaker one answers `Some` for media the exact one
     // would refuse.
+}
+
+/// One application profile, and the lease that owns its heap.
+///
+/// **The lease lives inside the shared record, beside the profile it pays
+/// for.** A promoted session's flow set holds one of these, and a set can
+/// outlive the connector field it was cloned from; a lease held as a sibling of
+/// an `Arc<RealtimeProfile>` would release at the moment that *field* dropped
+/// while the profile itself was still retained. Here the charge and the bytes
+/// are one object, so the release is the last clone's drop and cannot be
+/// anything else.
+///
+/// Minted once, by the connector, at the point the profile becomes the
+/// session's. Every promotion after that is a refcount: a profile is immutable
+/// registration data, so there is nothing for two sessions to disagree about
+/// and no reason for either to hold its own deep copy. That is the defect this
+/// replaces — every promotion used to clone the codec vector, both `String`s
+/// per codec and every feedback entry, and pay for none of it.
+///
+/// Charged on the same three terms as a leased label — record, content, and
+/// the `Arc`'s counter pair — because it is the same shape of object. Two
+/// shared records costing differently would be an accident of which one was
+/// written first.
+#[derive(Clone, Debug)]
+pub(crate) struct LeasedRealtimeProfile(Arc<LeasedProfile>);
+
+/// The record a [`LeasedRealtimeProfile`] shares: one immutable profile and the
+/// one lease that owns its bytes.
+///
+/// `_lease` is never read. Its whole job is to exist for exactly as long as the
+/// profile beside it and to release when this record drops.
+#[derive(Debug)]
+struct LeasedProfile {
+    profile: RealtimeProfile,
+    _lease: crate::resource::ResourceLease,
+}
+
+impl LeasedRealtimeProfile {
+    /// Take the lease that owns one profile's heap, or refuse it.
+    ///
+    /// Refusal is ordinary: a provider under pressure declines the profile and
+    /// the connector fails to come up, rather than registering codecs whose
+    /// retention nothing accounted for.
+    pub(super) fn mint(
+        profile: RealtimeProfile,
+        registry: &RealtimeFlowRegistry,
+    ) -> FlowResult<Self> {
+        let (record_bytes, content_bytes, allocations) = Self::record_terms(&profile);
+        let lease = registry
+            .acquire_profile_lease(record_bytes, content_bytes, allocations)
+            .map_err(realtime_drop_refusal)?;
+        Ok(Self(Arc::new(LeasedProfile {
+            profile,
+            _lease: lease,
+        })))
+    }
+
+    /// The profile this record carries.
+    pub(crate) fn profile(&self) -> &RealtimeProfile {
+        &self.0.profile
+    }
+
+    /// Everything the claim for one shared profile record is built from.
+    ///
+    /// **One expression, two callers.** The live mint and the fixture claim
+    /// have to agree exactly or a derived grant is wrong by however much they
+    /// differ, and two copies of this arithmetic would agree only until one of
+    /// them was edited. So neither computes it: both ask here.
+    ///
+    /// The record term is the `LeasedProfile` struct; the content term is every
+    /// buffer the profile points at; the allocation count is the `Arc` block,
+    /// which always exists, plus each buffer the profile actually owns —
+    /// counted by capacity, so an empty `fmtp` or an empty feedback list costs
+    /// nothing rather than costing a residual for a buffer that was never
+    /// allocated. The `Arc`'s strong/weak counter pair is added by
+    /// `profile_claim`, in the same place and the same way the label's is.
+    fn record_terms(profile: &RealtimeProfile) -> (usize, usize, u64) {
+        (
+            std::mem::size_of::<LeasedProfile>(),
+            profile.heap_bytes(),
+            1 + profile.heap_allocations(),
+        )
+    }
+
+    /// Exactly what minting this profile will cost, for fixtures that derive a
+    /// finite grant from the claims they exercise.
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(super) fn mint_claim(
+        profile: &RealtimeProfile,
+    ) -> std::result::Result<crate::resource::ResourceClaim, crate::resource::ResourceUnavailable>
+    {
+        let (record_bytes, content_bytes, allocations) = Self::record_terms(profile);
+        RealtimeFlowRegistry::profile_claim(record_bytes, content_bytes, allocations)
+    }
 }
 
 /// Which RTP media kind a flow negotiates.
@@ -608,17 +873,16 @@ pub(crate) trait RealtimeSessionBinding {
 /// only then may the same value be handed out again.
 #[derive(Default)]
 pub(crate) struct RealtimeFlowLabels {
-    held: std::collections::BTreeSet<u8>,
+    held: std::collections::BTreeSet<RealtimeFlowLabel>,
 }
 
 impl RealtimeFlowLabels {
-    /// Claim the lowest free label, the way the lane pool it replaces did.
-    ///
-    /// Lowest-free is deliberate rather than incidental: it keeps the space
-    /// dense, so a `u8` stays sufficient for the handful of concurrent flows a
-    /// peer actually runs, and it makes the value a human reads in a trace the
-    /// same one they would have read before this change.
     /// Claim the one label the application chose.
+    ///
+    /// Takes the raw name and mints the leased label only once the name is
+    /// known to be free, so a collision costs no lease. The order matters in
+    /// the other direction too: the mint is what pays for the bytes this set is
+    /// about to retain, so nothing enters `held` unaccounted for.
     ///
     /// The only way a label is ever taken. There is deliberately no
     /// lowest-free allocator here: the application owns route binding and
@@ -627,11 +891,14 @@ impl RealtimeFlowLabels {
     /// a live flow rather than a refusal at open.
     pub(crate) fn claim_exact(
         &mut self,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
+        registry: &RealtimeFlowRegistry,
     ) -> FlowResult<RealtimeFlowLabel> {
-        if !self.held.insert(label.0) {
+        if self.held.contains(name.as_bytes()) {
             return Err(RealtimeFlowError::LabelInUse);
         }
+        let label = RealtimeFlowLabel::mint(name.clone(), registry)?;
+        self.held.insert(label.clone());
         Ok(label)
     }
 
@@ -642,8 +909,8 @@ impl RealtimeFlowLabels {
     /// and the label stays held until this side actually drops its flow. That
     /// ordering is what stops a stale report from freeing a label the next
     /// flow would immediately reuse.
-    pub(crate) fn release(&mut self, label: RealtimeFlowLabel) {
-        self.held.remove(&label.0);
+    pub(crate) fn release(&mut self, label: &RealtimeFlowLabel) {
+        self.held.remove(label.name().as_bytes());
     }
 
     /// Whether this label is currently held by a live flow of this session.
@@ -660,8 +927,8 @@ impl RealtimeFlowLabels {
     /// a label is *released* at the exact moment its flow is dropped, which is
     /// not observable from the flow map because the entry is already gone.
     #[cfg(test)]
-    pub(crate) fn holds(&self, label: RealtimeFlowLabel) -> bool {
-        self.held.contains(&label.0)
+    pub(crate) fn holds(&self, name: &RealtimeFlowName) -> bool {
+        self.held.contains(name.as_bytes())
     }
 }
 
@@ -984,8 +1251,8 @@ pub(crate) struct RealtimeFlow {
 }
 
 impl RealtimeFlow {
-    pub(crate) fn label(&self) -> RealtimeFlowLabel {
-        self.label
+    pub(crate) fn label(&self) -> &RealtimeFlowLabel {
+        &self.label
     }
 
     pub(crate) fn encoding(&self) -> &RealtimeEncoding {
@@ -1106,7 +1373,7 @@ pub(super) fn open_session_flow(
     // this side claims exactly that value or refuses. There is no lowest-free
     // path in production: a second allocator over one space would collide on a
     // live flow rather than fail at open.
-    let label = labels.claim_exact(spec.label)?;
+    let label = labels.claim_exact(&spec.name, registry)?;
     // The checked forms deliberately, not the `Option` twins: those are
     // `#[cfg(test)]` or discard the reason, and a refused open is worth
     // knowing the cause of even where this layer answers one variant for all
@@ -1123,7 +1390,7 @@ pub(super) fn open_session_flow(
     let port = match port {
         Ok(port) => port,
         Err(refused) => {
-            labels.release(label);
+            labels.release(&label);
             return Err(realtime_drop_refusal(refused));
         }
     };
@@ -1148,8 +1415,12 @@ pub(super) fn open_session_flow(
 pub(crate) struct RealtimeFlowSpec {
     pub(crate) direction: RealtimeDirection,
     pub(crate) encoding: RealtimeEncoding,
-    /// The label the application chose. Required: this side never allocates.
-    pub(crate) label: RealtimeFlowLabel,
+    /// The name the application chose. Required: this side never allocates one.
+    ///
+    /// Raw and unleased, because at this point nothing has agreed to keep it.
+    /// The leased label is minted from it only once the session has accepted
+    /// the name.
+    pub(crate) name: RealtimeFlowName,
 }
 
 /// Every real-time flow one promoted session holds, and the label namespace
@@ -1334,7 +1605,9 @@ impl<T> SessionStreamReader<T> {
 /// There is no retirement variant either. The session going away is the
 /// stream ending, which is the drop itself and cannot be dropped, reordered,
 /// or emitted twice the way a message could.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// No longer `Copy`: the label it carries owns a lease, and a bitwise copy
+/// would be a second holder the accounting never learned about.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RealtimeFlowEvent {
     /// A flow that existed under this label no longer does, and the label is
     /// free for the application to claim again.
@@ -1373,32 +1646,41 @@ fn realtime_drop_refusal(reason: RealtimeFlowDropReason) -> RealtimeFlowError {
 /// module's controls are written to avoid.
 #[cfg(test)]
 pub(super) fn control_realtime_profile() -> RealtimeProfile {
-    RealtimeProfile::new(
-        vec![
-            RealtimeCodec {
-                kind: WebRtcRtpKind::Video,
-                payload_type: 102,
-                mime: "video/H264".to_string(),
-                clock_rate: 90_000,
-                channels: 0,
-                fmtp: "packetization-mode=1".to_string(),
-                framing: RealtimeFraming::AnnexB,
-                rtcp_feedback: Vec::new(),
-            },
-            RealtimeCodec {
-                kind: WebRtcRtpKind::Audio,
-                payload_type: 111,
-                mime: "audio/opus".to_string(),
-                clock_rate: 48_000,
-                channels: 2,
-                fmtp: "minptime=10".to_string(),
-                framing: RealtimeFraming::Whole,
-                rtcp_feedback: Vec::new(),
-            },
-        ],
-        REALTIME_LABEL_SPACE,
-    )
+    RealtimeProfile::new(vec![
+        RealtimeCodec {
+            kind: WebRtcRtpKind::Video,
+            payload_type: 102,
+            mime: "video/H264".to_string(),
+            clock_rate: 90_000,
+            channels: 0,
+            fmtp: "packetization-mode=1".to_string(),
+            framing: RealtimeFraming::AnnexB,
+            rtcp_feedback: Vec::new(),
+        },
+        RealtimeCodec {
+            kind: WebRtcRtpKind::Audio,
+            payload_type: 111,
+            mime: "audio/opus".to_string(),
+            clock_rate: 48_000,
+            channels: 2,
+            fmtp: "minptime=10".to_string(),
+            framing: RealtimeFraming::Whole,
+            rtcp_feedback: Vec::new(),
+        },
+    ])
     .expect("the control profile registers two well-formed families")
+}
+
+/// The control profile as a session actually holds it: shared, and leased.
+///
+/// Minted rather than hand-built for the same reason a control label is. A
+/// profile with no lease is not the shape a flow set ever carries, and a
+/// fixture that built one would be proving something about a state production
+/// cannot reach.
+#[cfg(test)]
+pub(super) fn leased_control_profile(registry: &RealtimeFlowRegistry) -> LeasedRealtimeProfile {
+    LeasedRealtimeProfile::mint(control_realtime_profile(), registry)
+        .expect("the fixture grant accounts for one control profile")
 }
 
 /// What a negotiated inbound track has to be in order to attach to a flow.
@@ -1558,10 +1840,10 @@ impl RealtimeInboundBindings {
     }
 
     /// Forget every binding for one label, when its flow closes.
-    pub(crate) fn release(&self, label: RealtimeFlowLabel) {
+    pub(crate) fn release(&self, label: &RealtimeFlowLabel) {
         self.bound
             .lock()
-            .retain(|entry| entry.binding.label != label);
+            .retain(|entry| &entry.binding.label != label);
     }
 
     /// The single admission decision for a negotiated inbound track.
@@ -1598,7 +1880,7 @@ impl RealtimeInboundBindings {
             && expected.channels() == channels
             && expected.mime().eq_ignore_ascii_case(mime))
         .then(|| RealtimeInboundAttachment {
-            label: entry.binding.label,
+            label: entry.binding.label.clone(),
             policy: entry.binding.unit_policy(),
             port: entry.port.clone(),
             end: Arc::clone(&entry.end),
@@ -1627,7 +1909,7 @@ struct RealtimeFlowSetToken;
 /// on the **same live connector incarnation**, so a caller that opened a flow,
 /// released the fence to do async work, and re-entered can find a different
 /// flow set behind an identical incarnation — holding a live flow under the
-/// same `u8`. Neither the label nor the incarnation separates those two. This
+/// same name. Neither the label nor the incarnation separates those two. This
 /// does.
 ///
 /// Holds a `Weak` deliberately: a token must never keep a flow set alive, or
@@ -1637,7 +1919,10 @@ pub(crate) struct RealtimeFlowSetIdentity(std::sync::Weak<RealtimeFlowSetToken>)
 
 pub(crate) struct SessionRealtimeFlows {
     labels: RealtimeFlowLabels,
-    flows: std::collections::BTreeMap<u8, RealtimeFlow>,
+    /// Keyed by the leased label, so the map entry is one of the shared copies
+    /// rather than a second allocation of the same bytes. Lookups take raw
+    /// bytes through `Borrow<[u8]>`, so asking about a name costs no lease.
+    flows: std::collections::BTreeMap<RealtimeFlowLabel, RealtimeFlow>,
     /// This set's identity. Nothing reads it but [`SessionRealtimeFlows::identity`]
     /// and [`SessionRealtimeFlows::is_same`]; it exists to be an address that
     /// belongs to exactly one flow set and dies with it.
@@ -1673,7 +1958,12 @@ pub(crate) struct SessionRealtimeFlows {
     /// with no registered profile, which can hold no inbound bindings at all —
     /// a flow whose family nothing registered has no framer to install, so
     /// refusing is the only available answer.
-    profile: Option<RealtimeProfile>,
+    ///
+    /// Shared and leased rather than owned outright: promotion clones the
+    /// pointer, and the charge for the codecs behind it is paid once by the
+    /// connector that registered them and released by whichever holder drops
+    /// last.
+    profile: Option<LeasedRealtimeProfile>,
 }
 
 impl SessionRealtimeFlows {
@@ -1688,7 +1978,7 @@ impl SessionRealtimeFlows {
     /// which is the whole reason that accessor exists.
     pub(super) fn new(
         registry: Arc<RealtimeFlowRegistry>,
-        profile: Option<RealtimeProfile>,
+        profile: Option<LeasedRealtimeProfile>,
     ) -> Self {
         Self {
             labels: RealtimeFlowLabels::default(),
@@ -1701,6 +1991,81 @@ impl SessionRealtimeFlows {
             bindings: Arc::new(RealtimeInboundBindings::default()),
         }
     }
+
+    /// The heap roots one promotion allocates for a session's flow set.
+    ///
+    /// Exactly what [`Self::new`] creates and the session then owns for its
+    /// whole life: the flow-set token, both session streams, and the inbound
+    /// bindings, each with the two counter words its `Arc` carries.
+    ///
+    /// It lives here, next to the constructor, because three of the four types
+    /// are private to this module and the fourth is `pub(crate)`. A caller
+    /// outside this file could only account for them by copying their sizes
+    /// into its own arithmetic, and a field added to `SessionStream` would then
+    /// stop being paid for without anything saying so. Adding a root to `new`
+    /// and not to this function is a mistake the compiler cannot catch, so the
+    /// two sit adjacent and the omission is at least visible.
+    ///
+    /// Two exclusions, both deliberate. `registry` is cloned, not allocated —
+    /// it is the connector's and predates the session, so charging it here
+    /// would bill one object to every session standing on it. And nothing
+    /// per-flow, per-queue or per-payload appears: those are taken as their own
+    /// leases where the work happens, which is what lets a session's cost track
+    /// what it is actually carrying rather than what it might.
+    pub(crate) fn promotion_root_claim() -> std::result::Result<
+        crate::resource::ResourceClaim,
+        crate::resource::ResourceClaimArithmeticError,
+    > {
+        let overflow = || crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        };
+        // Two words per `Arc`: strong and weak. The same pattern the connector
+        // uses for its own `Arc`-rooted claims.
+        let arc_counters = std::mem::size_of::<usize>()
+            .checked_mul(2)
+            .ok_or_else(overflow)?;
+        let root = |contents: usize| contents.checked_add(arc_counters);
+        let accounted = root(std::mem::size_of::<RealtimeFlowSetToken>())
+            .and_then(|bytes| {
+                bytes.checked_add(root(
+                    std::mem::size_of::<SessionStream<RealtimeFlowLabel>>(),
+                )?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(root(
+                    std::mem::size_of::<SessionStream<RealtimeFlowEvent>>(),
+                )?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(root(std::mem::size_of::<RealtimeInboundBindings>())?)
+            })
+            .ok_or_else(overflow)?;
+        crate::resource::ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                u64::try_from(accounted).map_err(|_| overflow())?,
+            ),
+            // One residual per allocation, matching the connector's own
+            // `Arc`-rooted claims. The byte term above measures what the roots
+            // *contain*; this counts the allocations themselves, whose
+            // allocator overhead has no portable size. Charging only the bytes
+            // would state that the roots are fully represented when the
+            // per-allocation cost is exactly what is missing.
+            (
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                Self::PROMOTION_ROOT_ALLOCATIONS,
+            ),
+        ])
+    }
+
+    /// How many separate allocations [`Self::new`] makes for a session's flow
+    /// set: the flow-set token, both session streams, and the inbound bindings.
+    ///
+    /// Named beside the claim that spends it so the two cannot drift silently,
+    /// and stated as a count rather than derived from the byte arithmetic
+    /// above, because the two answer different questions — how much the roots
+    /// hold, and how many objects the allocator is holding it in.
+    const PROMOTION_ROOT_ALLOCATIONS: u64 = 4;
 
     /// A token naming this exact flow set.
     pub(crate) fn identity(&self) -> RealtimeFlowSetIdentity {
@@ -1791,7 +2156,7 @@ impl SessionRealtimeFlows {
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
         spec: RealtimeFlowSpec,
-    ) -> FlowResult<RealtimeFlowLabel> {
+    ) -> FlowResult<RealtimeFlowName> {
         // Asked here, before anything is acquired, and for both directions.
         //
         // `open` is the contract boundary: an encoding the application never
@@ -1808,16 +2173,19 @@ impl SessionRealtimeFlows {
         // `bind_inbound` still resolves framing from this same profile rather
         // than caching it here: this answers whether the family is registered,
         // that one answers what its framing is, and both come from one place.
-        if !self
+        if self
             .profile
             .as_ref()
-            .is_some_and(|profile| profile.admits_encoding(&spec.encoding).is_some())
+            .is_none_or(|profile| profile.profile().admits_encoding(&spec.encoding).is_none())
         {
             return Err(RealtimeFlowError::EncodingInvalid);
         }
         let registry = Arc::clone(&self.registry);
         let flow = open_session_flow(session, live, &registry, &mut self.labels, spec)?;
-        let label = flow.label();
+        // A refcount on the flow's own label record, not a second name: the key
+        // and the flow's field are the same leased bytes, so the map costs one
+        // Arc counter rather than another accounted allocation.
+        let label = flow.label().clone();
         // The label was claimed inside `open_session_flow` against this very
         // namespace, so an occupied slot here would mean the two had diverged.
         // Insert and assert the slot was free by construction rather than
@@ -1827,14 +2195,15 @@ impl SessionRealtimeFlows {
         // dropped — so answering `LabelInUse` at that point would report a
         // refusal having already destroyed a live flow. The defensive branch
         // has to refuse without mutating, or it is not defensive.
-        if self.flows.contains_key(&label.get()) {
+        if self.flows.contains_key(label.name().as_bytes()) {
             return Err(RealtimeFlowError::LabelInUse);
         }
-        self.flows.insert(label.get(), flow);
+        let name = label.name().clone();
+        self.flows.insert(label, flow);
         // No event. The caller asked for this flow and is being handed the
-        // label right now; telling it again on a stream would be a second
+        // name right now; telling it again on a stream would be a second
         // account of the same fact.
-        Ok(label)
+        Ok(name)
     }
 
     /// Record what the connector is about to negotiate for an already-open
@@ -1858,10 +2227,10 @@ impl SessionRealtimeFlows {
         &mut self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
         identity: Arc<RealtimeTrackIdentity>,
     ) -> FlowResult<()> {
-        let Some(flow) = self.flows.get(&label.get()) else {
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err(RealtimeFlowError::FlowRefused);
         };
         flow.port_if_current(session, live)?;
@@ -1878,11 +2247,14 @@ impl SessionRealtimeFlows {
         let Some(framing) = self
             .profile
             .as_ref()
-            .and_then(|profile| profile.admits_encoding(flow.encoding()))
+            .and_then(|profile| profile.profile().admits_encoding(flow.encoding()))
         else {
             return Err(RealtimeFlowError::EncodingInvalid);
         };
-        let binding = RealtimeInboundBinding::new(label, flow.encoding().clone(), framing);
+        // Cloned from the map's own key, so the binding shares the label's one
+        // allocation and its one lease rather than minting a second.
+        let binding =
+            RealtimeInboundBinding::new(flow.label().clone(), flow.encoding().clone(), framing);
         // The pump's two handles on this flow, taken here because this is the
         // last point at which the flow and the table are both in hand. Both are
         // non-owning in the sense that matters: the port claim cannot keep the
@@ -1902,7 +2274,7 @@ impl SessionRealtimeFlows {
         // Recorded only once the table has accepted, so a refused bind leaves
         // nothing for close to hand back. Reached by a second lookup because the
         // checks above hold the flow immutably; the entry is known to exist.
-        if let Some(flow) = self.flows.get_mut(&label.get()) {
+        if let Some(flow) = self.flows.get_mut(name.as_bytes()) {
             flow.native = RealtimeFlowRemains::Inbound(identity);
         }
         Ok(())
@@ -1923,10 +2295,10 @@ impl SessionRealtimeFlows {
         &mut self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
         track: RealtimeOutboundTrack,
     ) -> std::result::Result<(), (RealtimeFlowError, RealtimeOutboundTrack)> {
-        let Some(flow) = self.flows.get(&label.get()) else {
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err((RealtimeFlowError::FlowRefused, track));
         };
         if let Err(refusal) = flow.port_if_current(session, live) {
@@ -1955,7 +2327,7 @@ impl SessionRealtimeFlows {
         // Recorded after the spawn, so the lease on the flow always names a pump
         // that exists. `attach_outbound` is reached once per flow — the pump
         // claim above is single-issue — so this cannot overwrite an earlier one.
-        if let Some(flow) = self.flows.get_mut(&label.get()) {
+        if let Some(flow) = self.flows.get_mut(name.as_bytes()) {
             flow.native = RealtimeFlowRemains::Outbound(remains);
         }
         Ok(())
@@ -1979,9 +2351,9 @@ impl SessionRealtimeFlows {
         &mut self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
     ) -> FlowResult<RealtimeFlowRemains> {
-        let Some(flow) = self.flows.get(&label.get()) else {
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err(RealtimeFlowError::FlowRefused);
         };
         flow.port_if_current(session, live)?;
@@ -1989,9 +2361,12 @@ impl SessionRealtimeFlows {
         // label is only free once nothing holds the flow it named. The gate
         // above has already passed, so this removal cannot be the mutation of a
         // refused close.
-        let mut flow = self
+        // The map key is one of the label's shared copies, so taking it out here
+        // is what hands this scope a leased label to release below — no mint,
+        // no second allocation of the same bytes.
+        let (label, mut flow) = self
             .flows
-            .remove(&label.get())
+            .remove_entry(name.as_bytes())
             .expect("the flow was just read under this same borrow");
         // Taken before the drop, because the drop is what makes it unreachable.
         let remains = std::mem::take(&mut flow.native);
@@ -2004,8 +2379,11 @@ impl SessionRealtimeFlows {
         // Before the label is free: a negotiated identity still pointing at
         // this label after the label could be reclaimed would attach a peer's
         // media to whatever flow took the name next.
-        self.bindings.release(label);
-        self.labels.release(label);
+        self.bindings.release(&label);
+        self.labels.release(&label);
+        // The event takes the last strong reference this scope holds. Its bytes
+        // and its lease live on inside the event for as long as the event does,
+        // which is the whole point: a close outlives the flow it reports.
         self.lifecycle.push(RealtimeFlowEvent::Closed { label });
         Ok(remains)
     }
@@ -2029,10 +2407,10 @@ impl SessionRealtimeFlows {
         &self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
         unit: RealtimeSendUnit,
     ) -> FlowResult<()> {
-        let Some(flow) = self.flows.get(&label.get()) else {
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err(RealtimeFlowError::FlowRefused);
         };
         let port = flow.port_if_current(session, live)?;
@@ -2058,9 +2436,9 @@ impl SessionRealtimeFlows {
         &self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
     ) -> FlowResult<Option<RealtimeRecvUnit>> {
-        let Some(flow) = self.flows.get(&label.get()) else {
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err(RealtimeFlowError::FlowRefused);
         };
         flow.port_if_current(session, live)?;
@@ -2104,19 +2482,77 @@ impl SessionRealtimeFlows {
     #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) fn accounted_delivery_for_test(
         &self,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
         unit: RealtimeRecvUnit,
     ) -> Option<RealtimeInboundDelivery> {
-        let flow = self.flows.get(&label.get())?;
+        let (label, flow) = self.flows.get_key_value(name.as_bytes())?;
+        // The real reservation, taken from the flow's own port against the
+        // owner's envelope — not a mint. A caller that has bypassed the session
+        // flow has no port to reserve against and gets `None` here, which is
+        // what makes a control built on this fail rather than pass on a fiction.
         let payload = flow
             .port
             .reserve_output(unit.data.len())?
             .into_payload_lease();
-        let mut delivery = RealtimeInboundDelivery::new(label, unit);
+        let mut delivery = RealtimeInboundDelivery::new(label.clone(), unit);
         delivery
             .attach(payload)
             .expect("a freshly built delivery has no lease to displace");
         Some(delivery)
+    }
+
+    /// **Controls only.** One delivery taken through the *whole* accounting
+    /// path: reserved on the flow's own port, enqueued by `enqueue_checked`,
+    /// and taken back off the registry exactly as the connector's event loop
+    /// takes it.
+    ///
+    /// This is the seam [`Self::accounted_delivery_for_test`] cannot be. That
+    /// one reserves and converts by hand, which skips the three things
+    /// `enqueue_checked` alone does: validating the reservation against this
+    /// registry, this key and this flow's liveness; taking the queue and ready
+    /// claims; and performing the queued-to-delivered lease transition on the
+    /// way back out. A control built on this is therefore standing on the real
+    /// path rather than on a faithful imitation of it.
+    ///
+    /// It is deliberately **not** the lab seam. `try_recv` is the connector
+    /// event loop's call, and in a fixture with a live connector this would
+    /// race that loop for the event it just queued — sometimes losing it, and
+    /// sometimes taking one the loop was about to deliver. It is gated to plain
+    /// `test` for that reason: the controls that use it own their registry
+    /// outright and nothing else is draining it.
+    ///
+    /// `None` when the name holds no flow, when the envelope refuses the bytes,
+    /// or when the enqueue is refused — all of which a control should read as a
+    /// fixture that cannot express what it wanted.
+    #[cfg(test)]
+    pub(super) fn enqueued_delivery_for_test(
+        &self,
+        name: &RealtimeFlowName,
+        unit: RealtimeRecvUnit,
+    ) -> Option<RealtimeInboundDelivery> {
+        let (label, flow) = self.flows.get_key_value(name.as_bytes())?;
+        let reservation = flow.port.reserve_output(unit.data.len())?;
+        let queued = flow
+            .port
+            .enqueue_checked(
+                QueuedTransportEvent {
+                    event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
+                        label.clone(),
+                        unit,
+                    )),
+                    observation: None,
+                    callback_work: None,
+                },
+                reservation,
+            )
+            .ok()?;
+        if !queued {
+            return None;
+        }
+        match self.registry.try_recv()?.event {
+            TransportEvent::RealtimeUnit(delivery) => Some(delivery),
+            _ => None,
+        }
     }
 
     /// Deliver one assembled unit onto an inbound flow.
@@ -2147,7 +2583,7 @@ impl SessionRealtimeFlows {
         let Some((label, unit, payload)) = delivery.into_parts() else {
             return false;
         };
-        let Some(flow) = self.flows.get(&label.get()) else {
+        let Some(flow) = self.flows.get(label.name().as_bytes()) else {
             return false;
         };
         match &flow.queue {
@@ -2178,12 +2614,14 @@ impl SessionRealtimeFlows {
         &self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
-    ) -> FlowResult<Option<(RealtimeFlowLabel, RealtimeRecvUnit)>> {
-        if !self.flows.contains_key(&label.get()) {
+        name: &RealtimeFlowName,
+    ) -> FlowResult<Option<(RealtimeFlowName, RealtimeRecvUnit)>> {
+        if !self.flows.contains_key(name.as_bytes()) {
             return Ok(None);
         }
-        Ok(self.recv(session, live, label)?.map(|unit| (label, unit)))
+        Ok(self
+            .recv(session, live, name)?
+            .map(|unit| (name.clone(), unit)))
     }
 
     /// Whether `label` names a live flow of this session that may still be
@@ -2192,10 +2630,10 @@ impl SessionRealtimeFlows {
         &self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
     ) -> bool {
         self.flows
-            .get(&label.get())
+            .get(name.as_bytes())
             .is_some_and(|flow| flow.port_if_current(session, live).is_ok())
     }
 
@@ -2258,6 +2696,37 @@ impl SessionRealtimeFlows {
 mod tests {
     use super::*;
 
+    /// A name from a literal, for controls that care about identity rather
+    /// than about the bytes.
+    fn control_name(bytes: &[u8]) -> RealtimeFlowName {
+        RealtimeFlowName::new(bytes.to_vec()).expect("a control name is within the frame bound")
+    }
+
+    /// An elastic registry: a real provider scope, and **no** owner ceilings.
+    ///
+    /// This is `Enabled(None)` as a deployment actually states it, and it is
+    /// the arrangement the label controls run against on purpose. A label still
+    /// takes a real lease here — absence of a ceiling is not absence of
+    /// accounting — so a control that mints one is proving the elastic path
+    /// admits, not that admission was skipped.
+    fn control_label_registry() -> (
+        Arc<RealtimeFlowRegistry>,
+        super::super::realtime::ElasticControlResources,
+    ) {
+        RealtimeFlowRegistry::elastic_for_control(control_label_grant())
+    }
+
+    /// Generous enough that nothing in the label controls is refused for
+    /// capacity. Admission under pressure has its own controls; these are about
+    /// what a label *is*.
+    ///
+    /// One definition for the whole crate, in the parent module: the structural
+    /// half has to match the scope stack `elastic_for_control` really builds,
+    /// and a per-file copy could only match it by luck.
+    fn control_label_grant() -> crate::resource::ResourceClaim {
+        super::super::elastic_control_grant()
+    }
+
     /// A label names one flow, and a released one is reusable only after its
     /// flow is gone.
     ///
@@ -2266,35 +2735,316 @@ mod tests {
     /// freeing a live flow's name.
     #[test]
     fn v4_macro1_a_label_is_held_for_its_flows_lifetime_and_reusable_only_after() {
+        let (registry, _resources) = control_label_registry();
         let mut labels = RealtimeFlowLabels::default();
+        let alpha = control_name(b"alpha");
+        let beta = control_name(b"beta");
 
         let first = labels
-            .claim_exact(RealtimeFlowLabel::from_peer(0))
+            .claim_exact(&alpha, &registry)
             .expect("the space starts empty");
         let second = labels
-            .claim_exact(RealtimeFlowLabel::from_peer(1))
-            .expect("a second flow takes the value the application chose for it");
+            .claim_exact(&beta, &registry)
+            .expect("a second flow takes the name the application chose for it");
         assert_ne!(first, second, "two live flows never share a label");
 
-        // While held, the exact value is refused rather than quietly aliased.
+        // While held, the exact name is refused rather than quietly aliased.
         assert_eq!(
-            labels.claim_exact(first),
-            Err(RealtimeFlowError::LabelInUse),
+            labels.claim_exact(&alpha, &registry).err(),
+            Some(RealtimeFlowError::LabelInUse),
             "a live flow's label cannot be taken from under it"
         );
-        assert!(labels.holds(first));
+        assert!(labels.holds(&alpha));
 
         // Released only when the flow itself is gone; then, and not before,
-        // the value is available again.
-        labels.release(first);
-        assert!(!labels.holds(first));
+        // the name is available again.
+        labels.release(&first);
+        assert!(!labels.holds(&alpha));
         let reused = labels
-            .claim_exact(first)
-            .expect("the freed value is available again");
-        assert_eq!(reused, first, "and it is the same value, not a new one");
+            .claim_exact(&alpha, &registry)
+            .expect("the freed name is available again");
+        assert_eq!(
+            reused.name(),
+            &alpha,
+            "and it is the same name, not a new one"
+        );
         assert!(
-            labels.holds(second),
+            labels.holds(&beta),
             "releasing one flow's label never disturbs another's"
+        );
+    }
+
+    /// A fixture session bound to one connector incarnation.
+    struct ControlSession {
+        incarnation: Arc<crate::connector::ConnectorIncarnation>,
+    }
+
+    impl RealtimeSessionBinding for ControlSession {
+        fn is_current_on(&self, incarnation: &Arc<crate::connector::ConnectorIncarnation>) -> bool {
+            Arc::ptr_eq(&self.incarnation, incarnation)
+        }
+    }
+
+    /// The encoding the elastic controls open against.
+    fn control_encoding() -> RealtimeEncoding {
+        RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
+            .expect("the control encoding names a family the control profile registers")
+    }
+
+    /// An elastic session — `Enabled(None)`, no owner ceilings anywhere — opens
+    /// a flow and carries a unit all the way through the accounting path.
+    ///
+    /// **The discriminating positive for the elastic case.** Every ceiling this
+    /// registry could consult is `None`, so nothing here is admitted by a limit
+    /// comparison: the label, the flow, the output bytes, the queue slot and the
+    /// ready node are each a real provider lease or they do not exist. A build
+    /// that treated absent ceilings as zero would refuse at the first
+    /// acquisition, and one that treated them as unlimited would skip the leases
+    /// entirely — and the release assertion at the end is what tells those two
+    /// apart, because an unaccounted path has nothing to give back.
+    ///
+    /// It goes through `enqueue_checked` rather than around it. That call is
+    /// where the reservation is validated against this registry and this flow,
+    /// where the queue and ready claims are taken, and where the queued lease
+    /// becomes a delivered one, so a control that reserved and converted by hand
+    /// would be proving something about its own arithmetic.
+    #[test]
+    fn v4_macro1_an_elastic_session_moves_a_unit_through_real_leases_end_to_end() {
+        let (registry, resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
+
+        let name = flows
+            .open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding: control_encoding(),
+                    name: control_name(b"elastic"),
+                },
+            )
+            .expect("an owner that selected no ceiling still admits a flow");
+
+        let idle = resources.accounted_bytes();
+        assert!(
+            idle > 0,
+            "the open really did take leases — without this every assertion \
+             below would be about a path that charges nothing"
+        );
+
+        let delivery = flows
+            .enqueued_delivery_for_test(
+                &name,
+                RealtimeRecvUnit {
+                    timestamp: 90_000,
+                    marker: true,
+                    data: Bytes::from_static(b"unit"),
+                },
+            )
+            .expect("the elastic flow reserves, enqueues and delivers one unit");
+        assert!(
+            resources.accounted_bytes() > idle,
+            "the delivered unit is holding its own payload lease, so the \
+             elastic path accounted for the bytes rather than waving them \
+             through"
+        );
+
+        assert!(
+            flows.deliver_inbound(delivery),
+            "and the flow set takes a delivery the accounting path built"
+        );
+        assert_eq!(
+            flows
+                .recv_arrival(&session, Some(&incarnation), &name)
+                .expect("the session is current")
+                .map(|(arrived, unit)| (arrived, unit.data)),
+            Some((name.clone(), Bytes::from_static(b"unit"))),
+            "exactly the unit that was delivered comes off the flow it named"
+        );
+
+        // The release half. Closing returns everything the flow took; the label
+        // is the one thing that stays, because the close event still names it.
+        let _remains = flows
+            .close(&session, Some(&incarnation), &name)
+            .expect("the session that opened this flow may close it");
+        assert!(
+            resources.accounted_bytes() < idle,
+            "closing gave the flow's leases back — an elastic path that had \
+             skipped accounting would have nothing to return here"
+        );
+    }
+
+    /// A provider under pressure refuses, and the refusal is the only thing
+    /// that happened.
+    ///
+    /// The negative half of the elastic pair, and it discriminates in both
+    /// directions. Absent ceilings do not mean unlimited: with the provider
+    /// exhausted, the next acquisition is refused as a typed refusal rather
+    /// than admitted. And the refusal is not a leak: releasing the holder makes
+    /// the very same acquisition succeed, so what refused was pressure rather
+    /// than a claim that had gone missing.
+    #[test]
+    fn v4_macro1_an_elastic_registry_refuses_under_provider_pressure_and_recovers() {
+        let name = control_name(b"pressure");
+        // A grant sized for exactly one label and nothing more, derived from the
+        // claim itself rather than chosen. Anything larger would leave the
+        // refusal below to some other exhaustion.
+        let grant = control_label_grant()
+            .checked_add(
+                RealtimeFlowLabel::mint_claim(name.as_bytes().len())
+                    .expect("the label claim is representable"),
+            )
+            .expect("the pressure grant is representable");
+        let (registry, _resources) = RealtimeFlowRegistry::elastic_for_control(grant);
+        let mut labels = RealtimeFlowLabels::default();
+
+        // Drain everything the grant will give, so the provider is genuinely at
+        // its ceiling rather than merely busy.
+        let mut held = Vec::new();
+        while let Ok(label) = labels.claim_exact(
+            &control_name(format!("fill-{}", held.len()).as_bytes()),
+            &registry,
+        ) {
+            held.push(label);
+        }
+        assert!(
+            !held.is_empty(),
+            "the fixture admitted something before it refused — without this \
+             the refusal below could be a registry that refuses everything"
+        );
+
+        assert_eq!(
+            labels.claim_exact(&name, &registry).err(),
+            Some(RealtimeFlowError::FlowRefused),
+            "an elastic registry under provider pressure refuses the name \
+             rather than retaining bytes nothing accounted for"
+        );
+
+        // Release exactly one holder and the same claim succeeds. This is what
+        // makes the refusal above pressure rather than a lost claim.
+        let released = held.pop().expect("the fill loop admitted at least one");
+        labels.release(&released);
+        drop(released);
+        let recovered = labels
+            .claim_exact(&name, &registry)
+            .expect("the released charge is available again to the next claim");
+        assert_eq!(recovered.name(), &name);
+    }
+
+    /// A name is bytes, and the two shapes that are not a name are refused
+    /// before anything can be charged for them.
+    ///
+    /// Both refusals matter for the same reason: they happen ahead of the mint,
+    /// so a peer sending them drives no retention at all. The upper bound is
+    /// the frame's own length prefix rather than a number chosen here, and the
+    /// positive case sits between them so neither refusal can be passing
+    /// because nothing is ever accepted.
+    #[test]
+    fn v4_macro1_a_flow_name_is_bounded_by_the_frame_and_never_empty() {
+        assert!(
+            RealtimeFlowName::new(Vec::new()).is_none(),
+            "an empty name is not a degenerate name, it is not a name"
+        );
+        assert!(
+            RealtimeFlowName::new(vec![b'x'; crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES])
+                .is_some(),
+            "the largest name the length prefix can carry is a name"
+        );
+        assert!(
+            RealtimeFlowName::new(vec![
+                b'x';
+                crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES + 1
+            ])
+            .is_none(),
+            "one byte past what the frame can encode could never have arrived"
+        );
+    }
+
+    /// The label's bytes outlive the flow, and the lease goes with them —
+    /// through the queue, not merely in a hand-built event.
+    ///
+    /// **This is the property the shared record exists for, asserted where it
+    /// can actually fail.** A close queues its event on the lifecycle stream
+    /// and the consumer may not read it for arbitrarily long. If the queued
+    /// item carried a *copy of the bytes* instead of the leased label, the
+    /// charge would be released at close while the bytes were still retained —
+    /// which is precisely the counterexample the shared lease is for. So the
+    /// control drives the real close, observes that the charge is still held
+    /// while nothing has dequeued, and only then takes the event.
+    ///
+    /// The name is free to claim again the whole time. Reusability and
+    /// accounting are separate facts: the label space is the session's and the
+    /// charge belongs to the bytes, so a reclaim while a close event is still
+    /// queued is ordinary rather than a conflict.
+    #[tokio::test]
+    async fn v4_macro1_a_queued_close_event_still_owns_the_labels_lease() {
+        let (registry, resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
+        let events = flows
+            .flow_events()
+            .expect("a fresh flow set issues its lifecycle lease once");
+
+        let empty = resources.accounted_bytes();
+        let name = flows
+            .open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding: control_encoding(),
+                    name: control_name(b"outlives"),
+                },
+            )
+            .expect("the space starts empty");
+
+        let _remains = flows
+            .close(&session, Some(&incarnation), &name)
+            .expect("the session that opened this flow may close it");
+
+        // Nothing has dequeued. The flow is gone and its name is free, and the
+        // charge for the bytes the queued event holds is still outstanding.
+        assert!(
+            !flows.labels.holds(&name),
+            "the name is claimable again the moment the flow is gone"
+        );
+        assert!(
+            resources.accounted_bytes() > empty,
+            "and the queued close event is still holding the label's lease — a \
+             design that copied the bytes out at close would have released it \
+             here, with the bytes still retained"
+        );
+
+        let event = events
+            .next()
+            .await
+            .expect("the close is waiting on the lifecycle stream");
+        let RealtimeFlowEvent::Closed { label: retained } = &event;
+        assert_eq!(
+            retained.name(),
+            &name,
+            "the event names the flow after every other copy is gone"
+        );
+
+        // And only the consumer taking it releases the charge.
+        drop(event);
+        assert_eq!(
+            resources.accounted_bytes(),
+            empty,
+            "the last holder dropping is what returns the bytes, not the close"
         );
     }
 
@@ -2377,32 +3127,37 @@ mod tests {
     /// the session to do anything with the answer.
     #[test]
     fn v4_macro1_a_peer_cited_label_is_a_lookup_not_a_claim() {
+        let (registry, _resources) = control_label_registry();
         let mut labels = RealtimeFlowLabels::default();
-        let live = labels
-            .claim_exact(RealtimeFlowLabel::from_peer(0))
+        let held = control_name(b"held");
+        let cited = control_name(b"cited");
+        labels
+            .claim_exact(&held, &registry)
             .expect("the space starts empty");
 
-        // Every byte is a syntactically valid label, so nothing is rejected
-        // here — which is exactly why the answer has to be a lookup.
+        // Any bytes within the frame bound are a syntactically valid name, so
+        // nothing is rejected here — which is exactly why the answer has to be
+        // a lookup rather than a judgement.
         assert!(
-            labels.holds(RealtimeFlowLabel::from_peer(live.get())),
+            labels.holds(&held),
             "a peer can name a flow this session really does hold"
         );
         assert!(
-            !labels.holds(RealtimeFlowLabel::from_peer(live.get().wrapping_add(1))),
+            !labels.holds(&cited),
             "and naming one it does not hold finds nothing"
         );
         assert!(
-            !labels.holds(RealtimeFlowLabel::from_peer(u8::MAX)),
-            "including the far end of the space"
+            !labels.holds(&control_name(
+                &[b'z'; crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES]
+            )),
+            "including the largest name the frame can carry"
         );
 
-        // The cited label did not become held by being mentioned.
-        assert_eq!(
-            labels.claim_exact(RealtimeFlowLabel::from_peer(live.get().wrapping_add(1))),
-            Ok(RealtimeFlowLabel(live.get().wrapping_add(1))),
-            "a name a peer said is still free until this side claims it"
-        );
+        // The cited name did not become held by being mentioned.
+        let claimed = labels
+            .claim_exact(&cited, &registry)
+            .expect("a name a peer said is still free until this side claims it");
+        assert_eq!(claimed.name(), &cited);
     }
 
     /// A reader is a lease, not a one-shot: one holder at a time, returned on
@@ -2469,7 +3224,7 @@ mod tests {
     /// session-scoped demux data awaited *outside* the registry mutation lock,
     /// so a session can be replaced in the gap; the fence then resolves the
     /// replacement entirely correctly and finds a live flow under the same
-    /// `u8`. Nothing already in that fence separates the two, which is what
+    /// name. Nothing already in that fence separates the two, which is what
     /// this predicate is for.
     ///
     /// The setup is deliberately bare — two flow sets over one registry, no
@@ -2480,23 +3235,29 @@ mod tests {
     /// would fail.
     #[test]
     fn v4_macro1_a_an_arrivals_reader_is_owned_by_the_session_that_issued_it() {
-        // No resources and no ceiling: this control never opens a flow, and a
-        // registry that cannot admit one is the smallest thing that proves the
-        // registry is not what tells two sessions apart.
-        let registry = RealtimeFlowRegistry::new(None, None);
-        let mut first =
-            SessionRealtimeFlows::new(Arc::clone(&registry), Some(control_realtime_profile()));
+        // A real provider scope and no ceiling. This control never opens a
+        // flow, but it does claim a name in each namespace, and a name costs a
+        // real lease — so the elastic registry is the smallest thing that both
+        // admits the claims and holds the registry identical across the two
+        // sets.
+        let (registry, _resources) = control_label_registry();
+        let mut first = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
         // Allocated while `first` is still alive, so the two streams cannot
         // share an address and the drop case below cannot pass by accident.
-        let mut second =
-            SessionRealtimeFlows::new(Arc::clone(&registry), Some(control_realtime_profile()));
+        let mut second = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
 
-        // The same label is live in both namespaces. A session's label space
-        // is its own, so this is the ordinary state after a replacement — the
-        // application reuses the value it always used.
-        let label = RealtimeFlowLabel::from_peer(3);
-        assert!(first.labels.claim_exact(label).is_ok());
-        assert!(second.labels.claim_exact(label).is_ok());
+        // The same name is live in both namespaces. A session's label space is
+        // its own, so this is the ordinary state after a replacement — the
+        // application reuses the name it always used.
+        let name = control_name(b"shared");
+        assert!(first.labels.claim_exact(&name, &registry).is_ok());
+        assert!(second.labels.claim_exact(&name, &registry).is_ok());
 
         let from_first = first
             .inbound_arrivals()
@@ -2518,8 +3279,8 @@ mod tests {
         // equal across the two sets.
         assert!(
             !second.owns_arrivals(&from_first),
-            "and by no other — a label taken from one session's stream cannot \
-             be spent against another's flow of the same number"
+            "and by no other — a reader taken from one session's stream cannot \
+             be spent against another's flow of the same name"
         );
         assert!(!first.owns_arrivals(&from_second));
 
@@ -2530,8 +3291,10 @@ mod tests {
         // whatever now sits there.
         drop(from_second);
         drop(second);
-        let replacement =
-            SessionRealtimeFlows::new(Arc::clone(&registry), Some(control_realtime_profile()));
+        let replacement = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
         assert!(
             !replacement.owns_arrivals(&from_first),
             "a reader claimed on a retired session names nothing the session \
@@ -2572,10 +3335,17 @@ mod tests {
     #[test]
     fn v4_macro1_a_a_negotiated_track_attaches_only_to_a_flow_we_opened() {
         let bindings = RealtimeInboundBindings::default();
-        let label = RealtimeFlowLabel::from_peer(3);
+        // Minted, not hand-built: a binding retains its label for as long as it
+        // exists, so the copy it holds is one the session paid for.
+        let (registry, _resources) = control_label_registry();
+        let label = RealtimeFlowLabel::mint(control_name(b"bound"), &registry)
+            .expect("the elastic control grant admits one label");
         let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the fixture encoding is one a flow can carry");
-        let binding = RealtimeInboundBinding::new(label, encoding, RealtimeFraming::AnnexB);
+        // Cloned into the binding, exactly as `bind_inbound` clones from the
+        // flows map's own key: the binding and the releasing scope name the
+        // same record and the same lease, not two copies of the bytes.
+        let binding = RealtimeInboundBinding::new(label.clone(), encoding, RealtimeFraming::AnnexB);
 
         // The token for the transceiver this side negotiated, and one for a
         // transceiver it never did.
@@ -2623,7 +3393,7 @@ mod tests {
             bindings
                 .admit(&ours, WebRtcRtpKind::Video, "video/h264", 90_000, 0)
                 .map(|admitted| admitted.label),
-            Some(label),
+            Some(label.clone()),
             "the track this side negotiated reaches the flow it was negotiated for"
         );
 
@@ -2658,7 +3428,7 @@ mod tests {
         );
 
         // Negative: the flow closed, so the binding is gone with it.
-        bindings.release(label);
+        bindings.release(&label);
         assert!(
             bindings
                 .admit(&ours, WebRtcRtpKind::Video, "video/h264", 90_000, 0)
@@ -2706,16 +3476,13 @@ mod tests {
     /// surface as a refusal — it surfaces as black video.
     #[test]
     fn v4_macro1_a_an_encoding_names_a_family_not_a_payload_type() {
-        let profile = RealtimeProfile::new(
-            vec![
-                h264_variant(102, "packetization-mode=1;profile-level-id=42001f"),
-                h264_variant(127, "packetization-mode=0;profile-level-id=42001f"),
-                h264_variant(125, "packetization-mode=1;profile-level-id=42e01f"),
-                h264_variant(108, "packetization-mode=0;profile-level-id=42e01f"),
-                h264_variant(123, "packetization-mode=1;profile-level-id=640032"),
-            ],
-            4,
-        )
+        let profile = RealtimeProfile::new(vec![
+            h264_variant(102, "packetization-mode=1;profile-level-id=42001f"),
+            h264_variant(127, "packetization-mode=0;profile-level-id=42001f"),
+            h264_variant(125, "packetization-mode=1;profile-level-id=42e01f"),
+            h264_variant(108, "packetization-mode=0;profile-level-id=42e01f"),
+            h264_variant(123, "packetization-mode=1;profile-level-id=640032"),
+        ])
         .expect("the deployed five-variant H.264 profile is a shape core can act on");
 
         assert_eq!(
@@ -2748,7 +3515,7 @@ mod tests {
     #[test]
     fn v4_macro1_a_profile_refuses_only_the_shapes_it_cannot_act_on() {
         assert_eq!(
-            RealtimeProfile::new(vec![h264_variant(102, "a"), h264_variant(102, "b")], 4),
+            RealtimeProfile::new(vec![h264_variant(102, "a"), h264_variant(102, "b")]),
             Err(RealtimeProfileError::DuplicatePayloadType { payload_type: 102 }),
             "two registrations on one payload type make negotiation ambiguous"
         );
@@ -2756,7 +3523,7 @@ mod tests {
         let mut disagrees = h264_variant(127, "b");
         disagrees.framing = RealtimeFraming::Whole;
         assert_eq!(
-            RealtimeProfile::new(vec![h264_variant(102, "a"), disagrees], 4),
+            RealtimeProfile::new(vec![h264_variant(102, "a"), disagrees]),
             Err(RealtimeProfileError::FamilyFramingConflict {
                 mime: "video/H264".to_string(),
                 clock_rate: 90_000,
@@ -2766,7 +3533,7 @@ mod tests {
         );
 
         assert!(
-            RealtimeProfile::new(vec![h264_variant(102, "a"), h264_variant(127, "b")], 4).is_ok(),
+            RealtimeProfile::new(vec![h264_variant(102, "a"), h264_variant(127, "b")]).is_ok(),
             "but two variants of one family are exactly the deployed shape and \
              must not be refused"
         );

@@ -13,19 +13,16 @@ use anyhow::{anyhow, Context, Result};
 
 /// Run the daemon in the foreground.
 ///
-/// There is one way to start, and that is the point. This used to select among
-/// four compatibility deployments — plain, frozen pre-V4 routing, a fixed
-/// H.264/Opus lane provider, and both — chosen by CLI flags. All three
-/// compatibility forms and the enum that carried them are gone, so there is no
-/// authority left for a flag to select and no branch left to take by mistake.
+/// There is one way to start, and that is the point: no CLI flag selects a
+/// deployment variant, so there is no authority a flag can install and no
+/// branch here to take by mistake. What the daemon can do is decided by the
+/// owner's configuration and environment, which this reads once.
 pub async fn run() -> Result<()> {
     let cfg = myownmesh_core::MeshConfig::load().context("load config")?;
     let daemon = if cfg.services.node.enabled {
-        let ConnectorStartup {
-            policy,
-            realtime_flows,
-        } = connector_policy_from_lookup(|name| std::env::var(name).ok())?;
-        myownmesh::embedded::start_connector_capable(cfg, policy, realtime_flows).await?
+        let ConnectorStartup { policy, realtime } =
+            connector_policy_from_lookup(|name| std::env::var(name).ok())?;
+        myownmesh::embedded::start_connector_capable(cfg, policy, realtime).await?
     } else {
         myownmesh::embedded::start_infrastructure_only(cfg).await?
     };
@@ -70,7 +67,7 @@ pub struct RealtimeRtcpFeedback {
 /// Supplied, never inferred from `mime`: which transceiver a codec occupies is
 /// a connector decision, and deriving it by matching on `video/` would be the
 /// same hardcoded branch the profile exists to remove.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RealtimeKind {
     Audio,
@@ -166,17 +163,14 @@ pub struct RealtimeCodec {
 /// mime, clock rate and channel count, so a flow that had to name one exact
 /// tuple could not be opened against a peer that chose a different variant. A
 /// flow never introduces a codec that was not registered here.
+///
+/// The profile says which encodings this application can carry, and nothing
+/// about how many flows may exist at once: concurrency is the owner's resource
+/// envelope to state and the connector's to enforce.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealtimeProfile {
     pub codecs: Vec<RealtimeCodec>,
-    /// Combined concurrent audio+video capacity per peer, over the one shared
-    /// flow-label space. A ceiling, not a live count. This is the value the
-    /// daemon publishes as the required `realtime_flows` status field, and
-    /// applications size their allocation pool off it — so it is deliberately
-    /// stated once by the application rather than derived from a per-kind
-    /// figure that would halve it silently.
-    pub flow_capacity: u16,
 }
 
 /// Parse and validate the application-supplied realtime profile.
@@ -197,9 +191,6 @@ fn realtime_profile_from_lookup(
 
     if profile.codecs.is_empty() {
         return Err(anyhow!("{VAR} registers no codecs"));
-    }
-    if profile.flow_capacity == 0 {
-        return Err(anyhow!("{VAR} flow_capacity must be nonzero"));
     }
     let mut seen = std::collections::HashSet::new();
     let mut families: std::collections::HashMap<(String, u32, u16), RealtimeFraming> =
@@ -279,7 +270,7 @@ fn realtime_profile_into_core(
                 .collect(),
         })
         .collect();
-    myownmesh_core::WebRtcRealtimeProfile::new(codecs, profile.flow_capacity).map_err(|error| {
+    myownmesh_core::WebRtcRealtimeProfile::new(codecs).map_err(|error| {
         anyhow!(
             "realtime profile was accepted by the daemon and refused by the \
              connector ({error}); the two validations have drifted apart"
@@ -287,27 +278,15 @@ fn realtime_profile_into_core(
     })
 }
 
-// There is no legacy media profile reader here any more.
-//
-// It parsed three owner-selected environment values — a per-kind lane ceiling
-// and preprovisioned video and audio lane counts — into a fixed H.264/Opus
-// provider. Every part of that is retired: lanes are not a per-kind pool, the
-// codec set is supplied by the application through `MYOWNMESH_REALTIME_PROFILE`
-// rather than fixed in the daemon, and a flow's capacity is one combined figure
-// over a shared label space. Reading those variables now would configure
-// nothing.
-
-/// The connector policy plus the one number the control socket has to publish
-/// alongside it.
+/// The connector policy plus what the control socket publishes alongside it.
 ///
-/// They travel together because they have one origin: `realtime_flows` is the
-/// `flow_capacity` of the profile that was actually registered on `policy`, so
-/// a daemon cannot advertise a ceiling it did not register for. Reading the
-/// capacity from configuration a second time somewhere else is exactly how the
-/// two would drift.
+/// They travel together because they have one origin: `realtime` describes the
+/// profile that was actually registered on `policy`. Rebuilding the advert from
+/// configuration a second time somewhere else is exactly how the two would
+/// drift into a daemon advertising encodings it never registered.
 struct ConnectorStartup {
     policy: myownmesh_core::WebRtcConnectorCapablePolicy,
-    realtime_flows: u16,
+    realtime: myownmesh::control::RealtimeAdvert,
 }
 
 fn connector_policy_from_lookup(
@@ -406,7 +385,11 @@ fn connector_policy_from_lookup(
             ))
         }
     };
-    let (callbacks, remote_candidates) = match local_ceiling_mode.as_str() {
+    // The third element is the ceiling the daemon may publish: `Some` only where
+    // the owner selected an enforced envelope, and read from the very values
+    // that envelope was built out of. Elastic deployments publish nothing,
+    // because there is nothing they could publish that anything would enforce.
+    let (callbacks, remote_candidates, owner_flow_ceiling) = match local_ceiling_mode.as_str() {
         "none" => (
             if realtime_enabled {
                 myownmesh_core::ConnectorCallbackPolicy::elastic_realtime()
@@ -414,6 +397,7 @@ fn connector_policy_from_lookup(
                 myownmesh_core::ConnectorCallbackPolicy::elastic_data_only()
             },
             myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
+            None,
         ),
         "enabled" => {
             let pending_candidate_items =
@@ -435,7 +419,7 @@ fn connector_policy_from_lookup(
                 nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY")?;
             let control_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT")?;
             let endpoint_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT")?;
-            let (service_weights, realtime) = if realtime_enabled {
+            let (service_weights, realtime, flow_ceiling) = if realtime_enabled {
                 let realtime_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT")?;
                 let max_realtime_unit_bytes =
                     nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES")?;
@@ -498,6 +482,14 @@ fn connector_policy_from_lookup(
                         max_realtime_unit_bytes,
                         flows,
                     )?,
+                    // The same two values the envelope above enforces, so the
+                    // advert cannot drift from what refuses.
+                    Some(myownmesh::control::RealtimeFlowCeiling {
+                        max_inbound_flows: u64::try_from(max_inbound_flows.get())
+                            .context("MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS fits u64")?,
+                        max_outbound_flows: u64::try_from(max_outbound_flows.get())
+                            .context("MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS fits u64")?,
+                    }),
                 )
             } else {
                 (
@@ -506,6 +498,7 @@ fn connector_policy_from_lookup(
                         endpoint_weight,
                     ),
                     myownmesh_core::RealtimeConnectorPolicy::Disabled,
+                    None,
                 )
             };
             (
@@ -523,6 +516,7 @@ fn connector_policy_from_lookup(
                     pending_candidate_duplicates,
                     pending_candidate_application_work,
                 ),
+                flow_ceiling,
             )
         }
         _ => {
@@ -533,16 +527,13 @@ fn connector_policy_from_lookup(
     };
 
     // Codec registration happens here, before any `PeerConnection` exists, and
-    // only where the connector can actually accept it. `with_realtime_profile`
-    // refuses a policy whose realtime is `Disabled`, and refuses an elastic
-    // realtime policy too — with no owner ceiling there is nothing to check the
-    // advertised `flow_capacity` against. Requiring the profile in those
-    // configurations would make them unstartable rather than honest, so the
-    // rule is: register exactly where flows can be carried.
-    let realtime_registration = if realtime_enabled && local_ceiling_mode == "enabled" {
+    // wherever the connector can carry flows at all — which is exactly where
+    // realtime is enabled, with an owner ceiling or without one. An elastic
+    // connector registers its codecs and publishes no ceiling.
+    let realtime_registration = if realtime_enabled {
         let parsed = realtime_profile_from_lookup(&mut lookup)?;
-        let advertised = parsed.flow_capacity;
-        Some((realtime_profile_into_core(parsed)?, advertised))
+        let advert = realtime_advert_for(&parsed, owner_flow_ceiling);
+        Some((realtime_profile_into_core(parsed)?, advert))
     } else {
         // Refused, not ignored. A profile supplied to a daemon that cannot
         // register it would otherwise be read as configured-and-working right
@@ -552,26 +543,67 @@ fn connector_policy_from_lookup(
             return Err(anyhow!(
                 "MYOWNMESH_REALTIME_PROFILE was supplied but this daemon cannot register \
                  it: realtime codec registration requires \
-                 MYOWNMESH_CONNECTOR_REALTIME_POLICY=enabled together with \
-                 MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=enabled, because the advertised \
-                 flow_capacity is checked against the owner's flow ceiling"
+                 MYOWNMESH_CONNECTOR_REALTIME_POLICY=enabled"
             ));
         }
         None
     };
 
     let webrtc = myownmesh_core::WebRtcConnectorProfile::new(callbacks, remote_candidates);
-    let (webrtc, realtime_flows) = match realtime_registration {
-        Some((profile, advertised)) => (webrtc.with_realtime_profile(profile)?, advertised),
-        // Honestly disabled: no codecs registered, so no flows can be carried,
-        // and the status field says so rather than naming a capacity that would
-        // invite a caller to allocate labels against nothing.
-        None => (webrtc, 0),
+    let (webrtc, realtime) = match realtime_registration {
+        Some((profile, advert)) => (webrtc.with_realtime_profile(profile)?, advert),
+        // Honestly unsupported: no codecs registered, so no flow can be carried,
+        // and the status says exactly that rather than naming an encoding or a
+        // capacity a caller could plan against.
+        None => (webrtc, myownmesh::control::RealtimeAdvert::unsupported()),
     };
     Ok(ConnectorStartup {
         policy: myownmesh_core::WebRtcConnectorCapablePolicy::new(resources, webrtc),
-        realtime_flows,
+        realtime,
     })
+}
+
+/// Describe a parsed profile for clients: its encoding families, and the
+/// ceiling the owner stated if the owner stated one.
+///
+/// Deduplicated on `(kind, mime, clock_rate, channels)` — the four fields that
+/// identify a family — because that is what a flow open selects. Deployed
+/// H.264 is several payload/fmtp variants sharing all four, and publishing them
+/// separately would present one negotiation choice as several caller choices.
+/// Case is folded on `mime` for the same reason the startup validation folds
+/// it: `video/H264` and `video/h264` are one family, and listing both would
+/// invite a client to treat them as two.
+fn realtime_advert_for(
+    profile: &RealtimeProfile,
+    flow_ceiling: Option<myownmesh::control::RealtimeFlowCeiling>,
+) -> myownmesh::control::RealtimeAdvert {
+    let mut seen = std::collections::HashSet::new();
+    let encodings = profile
+        .codecs
+        .iter()
+        .filter(|codec| {
+            seen.insert((
+                codec.kind,
+                codec.mime.trim().to_ascii_lowercase(),
+                codec.clock_rate,
+                codec.channels,
+            ))
+        })
+        .map(|codec| myownmesh::control::RealtimeEncoding {
+            kind: match codec.kind {
+                RealtimeKind::Audio => "audio".to_string(),
+                RealtimeKind::Video => "video".to_string(),
+            },
+            mime: codec.mime.trim().to_string(),
+            clock_rate: codec.clock_rate,
+            channels: codec.channels,
+        })
+        .collect();
+    // The ceiling is passed in rather than read off the profile, because it is
+    // not the application's to state: it comes from the owner's enforced
+    // envelope, and is `None` for an elastic connector. Publishing a number
+    // nobody chose is the one thing this must not do.
+    myownmesh::control::RealtimeAdvert::registered(encodings, flow_ceiling)
 }
 
 async fn wait_for_shutdown_signal() {
@@ -652,13 +684,9 @@ mod tests {
     ///
     /// Two codecs with different framings, because that is the deployed shape
     /// and because a one-codec profile would not exercise the per-family
-    /// framing check at all. `flow_capacity` is 2, which is exactly what the
-    /// fixture's owner ceiling admits: `ENABLED_REALTIME_KEYS` sets both the
-    /// inbound and outbound flow maxima to 1, and the connector measures a
-    /// profile's combined audio-plus-video capacity against their sum. A
-    /// larger number here is refused at registration, which is the behaviour
-    /// [`realtime_profile_into_core`] exists to surface rather than a fixture
-    /// detail to tune around.
+    /// framing check at all. It states no capacity: how many flows may exist at
+    /// once is the owner's envelope to say, and this is the application's half
+    /// of the vector.
     const REALTIME_PROFILE_FIXTURE: &str = r#"{
         "codecs": [
             {
@@ -669,8 +697,7 @@ mod tests {
                 "kind": "audio", "payload_type": 111, "mime": "audio/opus",
                 "clock_rate": 48000, "channels": 2, "framing": "whole"
             }
-        ],
-        "flow_capacity": 2
+        ]
     }"#;
 
     fn fixture_values(realtime: &str, local_ceiling: bool) -> HashMap<&'static str, String> {
@@ -690,11 +717,8 @@ mod tests {
                     .map(|key| (key, "1".to_string())),
             );
         }
-        // The profile is added under exactly the condition that makes it
-        // required, which is the same condition `connector_policy_from_lookup`
-        // uses to register it. Supplying it in any other configuration is a
-        // startup error there, not a harmless extra, so a fixture that always
-        // set it would make the other vectors invalid rather than complete.
+        // The numeric flow and queue vector is read only where the owner
+        // selected an enforced ceiling; the elastic connector never looks at it.
         if local_ceiling && realtime == "enabled" {
             values.extend(
                 ENABLED_REALTIME_KEYS
@@ -705,6 +729,14 @@ mod tests {
                 "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
                 "2".to_string(),
             );
+        }
+        // The profile is added under exactly the condition that makes it
+        // required, which is the same condition `connector_policy_from_lookup`
+        // uses to register it: realtime enabled, ceiling or no ceiling.
+        // Supplying it to a realtime-disabled daemon is a startup error there,
+        // not a harmless extra, so a fixture that always set it would make the
+        // other vectors invalid rather than complete.
+        if realtime == "enabled" {
             values.insert(
                 "MYOWNMESH_REALTIME_PROFILE",
                 REALTIME_PROFILE_FIXTURE.to_string(),
@@ -746,11 +778,9 @@ mod tests {
     #[test]
     fn optional_local_ceiling_is_present_only_when_explicitly_selected() {
         let values = fixture_values("enabled", true);
-        let ConnectorStartup {
-            policy,
-            realtime_flows,
-        } = connector_policy_from_lookup(|name| values.get(name).cloned())
-            .expect("the complete explicit test vector is accepted");
+        let ConnectorStartup { policy, realtime } =
+            connector_policy_from_lookup(|name| values.get(name).cloned())
+                .expect("the complete explicit test vector is accepted");
         assert!(policy.webrtc().callbacks().local_mailboxes().is_some());
         assert!(policy
             .webrtc()
@@ -761,12 +791,87 @@ mod tests {
             policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Enabled(Some(_))
         ));
-        // The published ceiling comes from the profile that was registered, not
-        // from a default. Asserting the exact number is what makes the profile
-        // half of this vector load-bearing: a build that accepted the vector
-        // and registered nothing would still satisfy the three assertions
-        // above, and would advertise 0 here.
-        assert_eq!(realtime_flows, 2);
+        // The advert describes the profile that was registered, not a default.
+        // This is what makes the profile half of the vector load-bearing: a
+        // build that accepted the vector and registered nothing would still
+        // satisfy the three assertions above, and would report `supported:
+        // false` with no encodings here.
+        assert!(realtime.supported);
+        // The ceiling published is the owner's own enforced envelope, per
+        // direction, and `ENABLED_REALTIME_KEYS` set both maxima to 1. Nothing
+        // here is derived from the application profile, and no aggregate is
+        // synthesised from the two.
+        assert_eq!(
+            realtime.flow_ceiling,
+            Some(myownmesh::control::RealtimeFlowCeiling {
+                max_inbound_flows: 1,
+                max_outbound_flows: 1,
+            })
+        );
+        // Both families, and only the fields that identify a family — the two
+        // fixture codecs differ in every one of them.
+        assert_eq!(
+            realtime.encodings,
+            vec![
+                myownmesh::control::RealtimeEncoding {
+                    kind: "video".to_string(),
+                    mime: "video/H264".to_string(),
+                    clock_rate: 90000,
+                    channels: 0,
+                },
+                myownmesh::control::RealtimeEncoding {
+                    kind: "audio".to_string(),
+                    mime: "audio/opus".to_string(),
+                    clock_rate: 48000,
+                    channels: 2,
+                },
+            ]
+        );
+    }
+
+    /// Several payload types in one family are advertised once.
+    ///
+    /// Deployed H.264 is five payload/fmtp variants sharing kind, mime, clock
+    /// rate and channel count. A flow open names the family and negotiation
+    /// picks the variant, so listing the variants separately would present one
+    /// negotiation outcome as five caller choices — and a caller that picked
+    /// one would be naming something it does not get to decide.
+    #[test]
+    fn one_encoding_family_is_advertised_once_however_many_payload_types_it_has() {
+        let family = |payload_type: u8, fmtp: &str| RealtimeCodec {
+            kind: RealtimeKind::Video,
+            payload_type,
+            // Case differs deliberately: the same family, spelled two ways.
+            mime: if payload_type % 2 == 0 {
+                "video/H264".to_string()
+            } else {
+                "video/h264".to_string()
+            },
+            clock_rate: 90000,
+            channels: 0,
+            fmtp: fmtp.to_string(),
+            rtcp_feedback: Vec::new(),
+            framing: RealtimeFraming::AnnexB,
+        };
+        let profile = RealtimeProfile {
+            codecs: vec![
+                family(96, "profile-level-id=42e01f"),
+                family(97, "profile-level-id=42001f"),
+                family(98, "profile-level-id=4d001f"),
+            ],
+        };
+
+        let advert = realtime_advert_for(&profile, None);
+        assert_eq!(
+            advert.encodings.len(),
+            1,
+            "three payload types of one family are one advertised encoding: {:?}",
+            advert.encodings
+        );
+        assert_eq!(advert.encodings[0].clock_rate, 90000);
+        // A registered profile with no owner ceiling publishes no ceiling. The
+        // number of families is not one, and neither is anything else here.
+        assert_eq!(advert.flow_ceiling, None);
     }
 
     /// The profile is required, and this vector's completeness is what carries
@@ -814,43 +919,65 @@ mod tests {
         ));
     }
 
+    /// Codecs, no ceiling: the ordinary elastic deployment starts and registers.
+    ///
+    /// Three things have to hold together, and each fails differently: the
+    /// connector is elastic, the codecs really were registered, and the advert
+    /// invents no ceiling to stand in for the one the owner declined to state.
     #[test]
-    fn elastic_realtime_connector_requires_no_flow_or_queue_count() {
+    fn elastic_realtime_connector_registers_codecs_and_publishes_no_ceiling() {
         let values = fixture_values("enabled", false);
-        let ConnectorStartup { policy, .. } =
+        let ConnectorStartup { policy, realtime } =
             connector_policy_from_lookup(|name| values.get(name).cloned())
                 .expect("elastic generic real-time construction needs no local count vector");
         assert!(matches!(
             policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Enabled(None)
         ));
+        assert!(realtime.supported);
+        assert_eq!(realtime.encodings.len(), 2);
+        assert_eq!(realtime.flow_ceiling, None);
     }
 
     /// The retired lane variables configure nothing, and are not quietly
     /// tolerated either.
     ///
-    /// A profile that still named per-kind lane counts would be a live
-    /// configuration file describing a surface that no longer exists. Because
-    /// the realtime profile is parsed with `deny_unknown_fields`, an operator
-    /// who ports one across gets a startup error naming the offending key rather
-    /// than a daemon that silently ignores half its configuration and then
-    /// carries no media.
+    /// A profile that still named per-kind lane counts, or its own flow
+    /// capacity, would be a live configuration file describing a surface that no
+    /// longer exists. Because the realtime profile is parsed with
+    /// `deny_unknown_fields`, an operator who ports one across gets a startup
+    /// error naming the offending key rather than a daemon that silently ignores
+    /// half its configuration and then carries no media.
+    ///
+    /// `flow_capacity` is here for the same reason as the lane field and not as
+    /// a lesser case: an accepted-and-ignored capacity key would leave the
+    /// operator believing they had set a ceiling that nothing enforces.
     #[test]
-    fn a_profile_naming_retired_lane_configuration_is_refused() {
-        let with_lanes = r#"{
-            "codecs": [{
-                "kind": "video", "payload_type": 96, "mime": "video/H264",
-                "clock_rate": 90000, "framing": "annex_b"
-            }],
-            "flow_capacity": 4,
-            "max_lanes_per_kind": 2
-        }"#;
-        let error = realtime_profile_from_lookup(|_| Some(with_lanes.to_string()))
-            .err()
-            .expect("a retired lane field is not a valid realtime profile");
-        assert!(
-            error.to_string().contains("max_lanes_per_kind"),
-            "the error must name the offending key so it can be removed: {error}"
-        );
+    fn a_profile_naming_retired_lane_or_capacity_configuration_is_refused() {
+        for (retired, key) in [
+            (
+                r#"{"codecs": [{"kind": "video", "payload_type": 96,
+                    "mime": "video/H264", "clock_rate": 90000,
+                    "framing": "annex_b"}], "max_lanes_per_kind": 2}"#,
+                "max_lanes_per_kind",
+            ),
+            (
+                r#"{"codecs": [{"kind": "video", "payload_type": 96,
+                    "mime": "video/H264", "clock_rate": 90000,
+                    "framing": "annex_b"}], "flow_capacity": 4}"#,
+                "flow_capacity",
+            ),
+        ] {
+            // `expect_err` here, unlike the `connector_policy_from_lookup`
+            // controls above: this call's `Ok` is a `RealtimeProfile`, which
+            // already derives `Debug`, so formatting it on failure costs
+            // nothing and exposes nothing.
+            let error = realtime_profile_from_lookup(|_| Some(retired.to_string()))
+                .expect_err("a retired field is not a valid realtime profile");
+            assert!(
+                error.to_string().contains(key),
+                "the error must name the offending key so it can be removed: {error}"
+            );
+        }
     }
 }

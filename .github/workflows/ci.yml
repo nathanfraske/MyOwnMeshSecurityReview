@@ -326,9 +326,18 @@ jobs:
             }
           }
 
-          # The two that carry no family prefix.
+          # The three that carry no family prefix.
           run_exact_control admission_gate_admits_application_traffic_from_active_peer --ignored
           run_exact_control v4_arc03_outbound_application_send_requires_current_session_admission --ignored
+
+          # Revocation of a *retained* admission. The controls above prove a
+          # session is refused when it was never admitted; this one proves an
+          # already-promoted session stops authorizing once policy is revoked,
+          # and stays refused when policy is restored. It is
+          # `#[cfg(feature = "transport-lab")]` and `#[ignore]`d, so neither the
+          # default workspace run nor the suite-wide transport-lab run ever
+          # reaches it: this line is its only execution anywhere in CI.
+          run_exact_control v4_arc05_revoking_policy_refuses_the_next_operation_and_drops_the_session --ignored
 
           # Inbound application effects against a replaced installation.
           run_exact_group v4_arc04e1_ 6 \

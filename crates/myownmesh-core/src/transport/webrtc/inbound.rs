@@ -172,7 +172,11 @@ pub(super) async fn pump_session_flow_track(
                 )
             }
         };
-        let delivery = RealtimeInboundDelivery::new(label, unit);
+        // Cloned per unit: the pump keeps its own copy for the next iteration,
+        // and the delivery carries one that lives as long as the queued unit
+        // does. Both are the same shared record, so this is a refcount rather
+        // than a second name.
+        let delivery = RealtimeInboundDelivery::new(label.clone(), unit);
         if !tx.emit_realtime(&flow, TransportEvent::RealtimeUnit(delivery), output) {
             break;
         }

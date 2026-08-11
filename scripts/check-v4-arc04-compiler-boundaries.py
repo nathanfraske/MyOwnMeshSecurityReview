@@ -150,7 +150,7 @@ fn main() { let _ = std::mem::size_of::<LocalIdentitySigner>(); }
         ("LocalIdentitySigner", "private"),
     ),
     # ---- authenticated capability ----
-    # The capability type itself is deliberately public: Arc 05 consumers must be
+    # The capability type itself is deliberately public: Session Broker must be
     # able to *hold* one. What must be impossible is minting one or reading its
     # private provenance, so these two probes target the constructor and the
     # readback rather than the type.

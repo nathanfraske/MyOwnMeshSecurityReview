@@ -91,6 +91,45 @@ pub fn test_transport() -> Transport {
         let grant = structural
             .checked_add(workload)
             .expect("the fixture provider grant is representable");
+        // One post-authentication Session Broker reservation per connector.
+        //
+        // The connector count is the ceiling on *concurrent promoted sessions*,
+        // not an estimate of them: a session is promoted from the authenticated
+        // channel of exactly one live connector and is dropped with it, so no
+        // fixture here can hold more sessions than it has connector slots to
+        // promote them from. Scaling by anything else would be a guess.
+        //
+        // The charge is taken from the broker rather than restated. It is
+        // denominated in the accounted memory of the session record and the
+        // roots promotion allocates, plus the record the provider keeps for the
+        // lease carrying it — none of which this fixture may name for itself,
+        // and all of which change on the broker's side rather than this one.
+        //
+        // Budgeting it explicitly is the point. The session claim used to be one
+        // `WorkerOrTask` unit, which could bind on slack the connector
+        // structural capacity above happened to leave, so an unbudgeted session
+        // was invisible until some unrelated term moved. Nothing else here is
+        // denominated in what the session claim now names, so a shortfall
+        // surfaces as a refused promotion rather than as a fixture that quietly
+        // stopped promoting.
+        //
+        // Gated with the accessor, and the reason is narrower than it looks.
+        // Default-feature integration tests *do* promote ordinary sessions — a
+        // session is post-authentication, not post-realtime — so this is not a
+        // case of feature-off needing no capacity. It is that the accessor is
+        // deliberately not in the default public API, and an integration test is
+        // a separate crate that can only call what is `pub`.
+        //
+        // The authoritative workspace gate unifies `transport-lab`, so the run
+        // that decides this branch gets the exact term. A standalone feature-off
+        // `cargo test -p myownmesh-core --test ...` keeps the conservative
+        // process grant above and budgets no session — the same position it has
+        // always been in, and a real residual rather than a claim of exactness.
+        #[cfg(feature = "transport-lab")]
+        let grant = myownmesh_core::transport_lab_session_reservation_claim()
+            .checked_scale(connectors)
+            .and_then(|sessions| grant.checked_add(sessions))
+            .expect("the fixture session reservation capacity is representable");
         ResourceProviderPort::new(FiniteResourceProvider::new(grant))
             .expect("the fixture provider accounts for its process scope")
     });

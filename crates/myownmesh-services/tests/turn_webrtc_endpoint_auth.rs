@@ -96,7 +96,10 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
         frame_bytes,
     )
     .expect("fixture remote-SDP claims are representable");
-    let profiles = vec![webrtc; four.get()];
+    // The grant is priced against four identical connector profiles, and the
+    // policy the fixture actually installs is that same profile. Clone for the
+    // pricing slice so the one profile stays owned here for the policy below.
+    let profiles = vec![webrtc.clone(); four.get()];
     let mesh_scopes =
         std::num::NonZeroU64::new(4).expect("the two-scenario fixture Mesh scope count is nonzero");
     let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes)

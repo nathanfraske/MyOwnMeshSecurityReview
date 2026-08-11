@@ -24,7 +24,7 @@ use crate::rpc::RpcInner;
 use crate::runtime::session_broker::SessionBroker;
 use crate::topology::Topology;
 use crate::transport::webrtc::{
-    RealtimeDirection, RealtimeFlowError, RealtimeFlowLabel, RealtimeFlowRemains,
+    RealtimeDirection, RealtimeFlowError, RealtimeFlowName, RealtimeFlowRemains,
     RealtimeFlowSetIdentity, RealtimeFlowSpec, RealtimeRecvUnit, RealtimeSendUnit,
     SessionRealtimeFlows,
 };
@@ -1673,8 +1673,9 @@ impl NetworkState {
     /// configuration is parsed and refused at the public boundary, before any
     /// session is resolved, so an unusable request never reaches the fence and
     /// the engine never inspects what a provider's vocabulary means. Answers
-    /// the label the flow was filed under, which is the same `u8` the caller
-    /// supplied.
+    /// the [`RealtimeFlowName`] the flow was filed under, which carries the same
+    /// bytes the caller supplied: the application is the sole allocator of a
+    /// name and this side never invents one.
     ///
     /// `peer` is a **selector**, not authority: it names an installation to
     /// resolve, and everything that authorizes the open is produced inside the
@@ -1714,30 +1715,30 @@ impl NetworkState {
         &self,
         peer: &str,
         spec: RealtimeFlowSpec,
-    ) -> std::result::Result<u8, crate::realtime::RealtimeRefusal> {
+    ) -> std::result::Result<RealtimeFlowName, crate::realtime::RealtimeRefusal> {
         let encoding = spec.encoding.clone();
 
         // Phase 1.
-        let (label, worker, flow_set, identity) =
+        let (name, worker, flow_set, identity) =
             self.with_realtime_flows_and_worker(peer, |session, flows, live, worker| {
                 let inbound = spec.direction == RealtimeDirection::Inbound;
-                let label = flows.open(session, Some(live), spec)?;
+                let name = flows.open(session, Some(live), spec)?;
                 let identity = if inbound {
                     let identity = crate::transport::webrtc::RealtimeTrackIdentity::new();
-                    // A bind that fails leaves a flow holding a label against a
-                    // negotiation that will never happen, so the label goes back
+                    // A bind that fails leaves a flow holding a name against a
+                    // negotiation that will never happen, so the name goes back
                     // now rather than at the next open that collides with it.
                     if let Err(error) =
-                        flows.bind_inbound(session, Some(live), label, Arc::clone(&identity))
+                        flows.bind_inbound(session, Some(live), &name, Arc::clone(&identity))
                     {
-                        let _ = flows.close(session, Some(live), label);
+                        let _ = flows.close(session, Some(live), &name);
                         return Err(error);
                     }
                     Some(identity)
                 } else {
                     None
                 };
-                Ok((label, Arc::clone(worker), flows.identity(), identity))
+                Ok((name, Arc::clone(worker), flows.identity(), identity))
             })?;
 
         // Phase 2. Branching on the minted identity rather than re-deriving the
@@ -1754,9 +1755,9 @@ impl NetworkState {
         };
         let Ok(mut track) = native else {
             // The connector cleaned up its own failed construction; what is
-            // left is the flow, its label, and — for an inbound open — a
+            // left is the flow, its name, and — for an inbound open — a
             // binding to an identity nothing will ever present.
-            self.abandon_realtime_open(peer, &flow_set, label).await;
+            self.abandon_realtime_open(peer, &flow_set, &name).await;
             return Err(crate::realtime::RealtimeRefusal::FlowRefused);
         };
 
@@ -1769,7 +1770,7 @@ impl NetworkState {
             }
             match track.take() {
                 Some(outbound) => flows
-                    .attach_outbound(session, Some(live), label, outbound)
+                    .attach_outbound(session, Some(live), &name, outbound)
                     .map_err(|(error, outbound)| {
                         track = Some(outbound);
                         error
@@ -1784,7 +1785,7 @@ impl NetworkState {
             worker.close_outbound_realtime_track(outbound).await;
         }
         match committed {
-            Ok(()) => Ok(label.get()),
+            Ok(()) => Ok(name),
             Err(error) => {
                 // Ordered so the transceiver is retired exactly once. If the
                 // flow set is still ours, `abandon` closed the flow and the
@@ -1793,7 +1794,7 @@ impl NetworkState {
                 // owned it and took the binding with it — but not the
                 // transceiver, which is still on a live connector and is only
                 // reachable through the identity minted in phase 1.
-                if !self.abandon_realtime_open(peer, &flow_set, label).await {
+                if !self.abandon_realtime_open(peer, &flow_set, &name).await {
                     if let Some(identity) = identity.as_ref() {
                         worker.close_inbound_realtime_transceiver(identity).await;
                     }
@@ -1811,10 +1812,10 @@ impl NetworkState {
     pub(crate) fn send_realtime(
         &self,
         peer: &str,
-        label: u8,
+        name: &RealtimeFlowName,
         unit: RealtimeSendUnit,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
-        self.send_realtime_unit(peer, RealtimeFlowLabel::from_peer(label), unit)
+        self.send_realtime_unit(peer, name, unit)
             .map_err(Into::into)
     }
 
@@ -1825,10 +1826,9 @@ impl NetworkState {
     pub(crate) fn recv_realtime(
         &self,
         peer: &str,
-        label: u8,
+        name: &RealtimeFlowName,
     ) -> std::result::Result<Option<RealtimeRecvUnit>, crate::realtime::RealtimeRefusal> {
-        self.recv_realtime_unit(peer, RealtimeFlowLabel::from_peer(label))
-            .map_err(Into::into)
+        self.recv_realtime_unit(peer, name).map_err(Into::into)
     }
 
     /// Close one flow and retire the native half it was standing on.
@@ -1856,21 +1856,20 @@ impl NetworkState {
     pub(crate) async fn close_realtime_negotiated(
         &self,
         peer: &str,
-        label: u8,
+        name: &RealtimeFlowName,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
-        let label = RealtimeFlowLabel::from_peer(label);
         let (worker, remains) =
             self.with_realtime_flows_and_worker(peer, |session, flows, live, worker| {
-                let remains = flows.close(session, Some(live), label)?;
+                let remains = flows.close(session, Some(live), name)?;
                 Ok((Arc::clone(worker), remains))
             })?;
         retire_realtime_remains(&worker, remains).await;
         Ok(())
     }
 
-    /// Whether that label still names a usable flow on `peer`'s current session.
-    pub(crate) fn realtime_is_current(&self, peer: &str, label: u8) -> bool {
-        self.realtime_flow_is_current(peer, RealtimeFlowLabel::from_peer(label))
+    /// Whether that name still names a usable flow on `peer`'s current session.
+    pub(crate) fn realtime_is_current(&self, peer: &str, name: &RealtimeFlowName) -> bool {
+        self.realtime_flow_is_current(peer, name)
     }
 
     /// Deliver one inbound realtime unit onto the flow it names.
@@ -1968,11 +1967,11 @@ impl NetworkState {
     /// retirement event to consume; a caller that gets `None` closes.
     ///
     /// The stream identity check inside the fence is load-bearing and is not
-    /// redundant with resolving the peer. A label is session-scoped demux data:
-    /// the same `u8` names a different flow on a different session. Awaiting
-    /// outside the lock is what makes that exploitable — a label can be taken
+    /// redundant with resolving the peer. A name is session-scoped demux data:
+    /// the same bytes name a different flow on a different session. Awaiting
+    /// outside the lock is what makes that exploitable — a name can be taken
     /// from session N's stream, N can be replaced, and the fence will then
-    /// resolve N+1 quite correctly and find a live flow under the same number.
+    /// resolve N+1 quite correctly and find a live flow under the same bytes.
     /// The unit delivered would be real and current, and attributed to a flow
     /// the consumer's own bookkeeping maps to something else.
     ///
@@ -1985,16 +1984,21 @@ impl NetworkState {
     pub(crate) async fn next_realtime_arrival(
         &self,
         inbound: &crate::realtime::RealtimeInboundStream,
-    ) -> Option<(u8, RealtimeRecvUnit)> {
+    ) -> Option<(RealtimeFlowName, RealtimeRecvUnit)> {
         loop {
             let label = inbound.reader().next().await?;
             match self.with_realtime_flows(inbound.peer(), |session, flows, live| {
                 if !flows.owns_arrivals(inbound.reader()) {
                     return Err(RealtimeFlowError::SessionNotCurrent);
                 }
-                flows.recv_arrival(session, Some(live), label)
+                // The stream yields the session's own leased label; what leaves
+                // this bridge is a copy of its bytes. A consumer holding the
+                // label itself would be an untracked holder of the session's
+                // lease, which is the one thing the leased form exists to
+                // prevent.
+                flows.recv_arrival(session, Some(live), label.name())
             }) {
-                Ok(Some((label, unit))) => return Some((label.get(), unit)),
+                Ok(Some((name, unit))) => return Some((name, unit)),
                 // The flow went away between the arrival and the take.
                 Ok(None) => continue,
                 // The session did. Terminal, like the stream ending.
@@ -2057,13 +2061,13 @@ impl NetworkState {
         &self,
         peer: &str,
         flow_set: &RealtimeFlowSetIdentity,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
     ) -> bool {
         let closed = self.with_realtime_flows_and_worker(peer, |session, flows, live, worker| {
             if !flows.is_same(flow_set) {
                 return Err(RealtimeFlowError::SessionNotCurrent);
             }
-            let remains = flows.close(session, Some(live), label)?;
+            let remains = flows.close(session, Some(live), name)?;
             Ok((Arc::clone(worker), remains))
         });
         let Ok((worker, remains)) = closed else {
@@ -2088,11 +2092,11 @@ impl NetworkState {
     pub(crate) fn send_realtime_unit(
         &self,
         peer: &str,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
         unit: RealtimeSendUnit,
     ) -> std::result::Result<(), RealtimeFlowError> {
         self.with_realtime_flows(peer, |session, flows, live| {
-            flows.send(session, Some(live), label, unit)
+            flows.send(session, Some(live), name, unit)
         })
     }
 
@@ -2102,10 +2106,10 @@ impl NetworkState {
     pub(crate) fn recv_realtime_unit(
         &self,
         peer: &str,
-        label: RealtimeFlowLabel,
+        name: &RealtimeFlowName,
     ) -> std::result::Result<Option<RealtimeRecvUnit>, RealtimeFlowError> {
         self.with_realtime_flows(peer, |session, flows, live| {
-            flows.recv(session, Some(live), label)
+            flows.recv(session, Some(live), name)
         })
     }
 
@@ -2114,9 +2118,9 @@ impl NetworkState {
     /// Answers `false` rather than an error when nothing resolves, because the
     /// question is only ever "may I use this", and every not-usable reason has
     /// the same answer.
-    pub(crate) fn realtime_flow_is_current(&self, peer: &str, label: RealtimeFlowLabel) -> bool {
+    pub(crate) fn realtime_flow_is_current(&self, peer: &str, name: &RealtimeFlowName) -> bool {
         self.with_realtime_flows(peer, |session, flows, live| {
-            Ok(flows.is_current(session, Some(live), label))
+            Ok(flows.is_current(session, Some(live), name))
         })
         .unwrap_or(false)
     }

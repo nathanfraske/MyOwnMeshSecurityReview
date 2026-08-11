@@ -267,10 +267,27 @@ pub fn spawn_realtime_flow_events(
             // response to its own request.
             let frame = match event {
                 myownmesh_core::realtime::RealtimeFlowEvent::Closed { label } => {
+                    // Every flow reported here is one this node's own
+                    // application opened, and it named it with a JSON string, so
+                    // the bytes are that string's. A name that does not decode
+                    // therefore means the assumption has broken rather than that
+                    // a client sent something odd — it is logged and dropped,
+                    // because the alternatives are a lossy rendering the client
+                    // could not match against its own record, or a panic on a
+                    // path a peer's traffic can reach.
+                    let Ok(flow_label) = String::from_utf8(label) else {
+                        warn!(
+                            network = %network_key,
+                            %peer,
+                            "realtime flow closed under a name this daemon could not have \
+                             opened — event dropped"
+                        );
+                        continue;
+                    };
                     ServerOut::RealtimeFlowClosed {
                         network: network_key.clone(),
                         from: peer.clone(),
-                        flow_label: label,
+                        flow_label,
                     }
                 }
             };

@@ -1,6 +1,6 @@
 //! Private provenance for an authenticated channel.
 //!
-//! Arc 05 must be able to read what was actually authenticated without
+//! Session Broker must be able to read what was actually authenticated without
 //! reconstructing it from parallel mutable engine state, and without a caller
 //! being able to supply a replacement. That is what this record is: an exact,
 //! immutable, non-serializable statement of the facts one completed exchange
@@ -319,16 +319,6 @@ mod tests {
 
         assert!(capability.runtime().is_same(&runtime));
         assert!(capability.record().runtime().is_same(&runtime));
-    }
-
-    #[test]
-    fn v4_arc02_legacy_adapter_cannot_manufacture_authentication() {
-        // The adapter accepts an already-issued capability and cannot mint one:
-        // there is no constructor that takes a legacy value alone.
-        let capability = authenticated_for_test(crate::runtime::runtime_for_test());
-        let wrapper = super::super::LegacyAuthenticatedChannel::new(capability, "legacy channel");
-
-        let _ = wrapper.capability();
     }
 
     #[test]

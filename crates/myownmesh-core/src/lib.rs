@@ -175,6 +175,8 @@ pub use runtime::attempt::{
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
     WebRtcConnectorCapablePolicy,
 };
+#[cfg(feature = "transport-lab")]
+pub use runtime::session_broker::transport_lab_session_reservation_claim;
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 #[cfg(feature = "transport-lab")]

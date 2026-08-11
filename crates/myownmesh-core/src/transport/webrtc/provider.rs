@@ -57,7 +57,12 @@ use crate::realtime::RealtimeFlowDirection;
 /// is parsed — they are compared for equality against what was registered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebRtcRealtimeFlowOpen {
-    pub label: u8,
+    /// The application's opaque name for this flow, as raw bytes.
+    ///
+    /// Unowned and unleased here on purpose: nothing has agreed to keep it
+    /// until the session accepts it, so a refused open retains nothing. Bounds
+    /// are checked when it is converted, not when it is built.
+    pub label: Vec<u8>,
     pub direction: RealtimeFlowDirection,
     pub kind: WebRtcRtpKind,
     /// Compared for equality against a registered capability. Not parsed.
@@ -114,7 +119,8 @@ pub struct WebRtcRealtimeInboundUnit {
 /// within one session and means nothing outside it.
 #[derive(Clone, Debug)]
 pub struct WebRtcRealtimeInboundArrival {
-    pub label: u8,
+    /// A copy of the flow's name. The leased label stays inside the connector.
+    pub label: Vec<u8>,
     pub unit: WebRtcRealtimeInboundUnit,
 }
 
@@ -160,9 +166,14 @@ impl TryFrom<WebRtcRealtimeFlowOpen> for RealtimeFlowSpec {
     fn try_from(open: WebRtcRealtimeFlowOpen) -> std::result::Result<Self, Self::Error> {
         let encoding = RealtimeEncoding::new(open.kind, &open.mime, open.clock_rate, open.channels)
             .ok_or(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)?;
+        // Refused here, at the edge, before anything has agreed to keep the
+        // bytes: an empty or over-long name could not have crossed the frame,
+        // so it is a shape defect rather than a flow that fails later.
+        let name = crate::transport::webrtc::RealtimeFlowName::new(open.label)
+            .ok_or(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)?;
         Ok(RealtimeFlowSpec {
             direction: open.direction.into(),
-            label: RealtimeFlowLabel::from_peer(open.label),
+            name,
             encoding,
         })
     }
@@ -215,21 +226,33 @@ impl From<RealtimeFlowEvent> for crate::realtime::RealtimeFlowEvent {
     /// A flow lifecycle event, in the generic vocabulary.
     ///
     /// One variant on each side, and the conversion exists only to turn the
-    /// connector's typed label into the `u8` the application chose — which is
-    /// the entire difference between the two enums, and is exactly why the typed
-    /// one must not cross: it participates in the connector's ownership checks
-    /// and would read as a handle that grants something.
+    /// connector's leased label into a plain copy of the bounded opaque bytes
+    /// the application chose — which is the entire difference between the two
+    /// enums, and is exactly why the leased one must not cross: it owns the
+    /// session's charge for those bytes and would read as a handle that grants
+    /// something.
+    ///
+    /// The copy is made **here, at the dequeue**, not at the close. The queued
+    /// internal event holds the leased label for as long as it sits on the
+    /// lifecycle stream, so the bytes a consumer eventually reads were accounted
+    /// for the whole time they were retained.
     fn from(event: RealtimeFlowEvent) -> Self {
         match event {
-            RealtimeFlowEvent::Closed { label } => Self::Closed { label: label.get() },
+            // The leased label stays inside the connector; what leaves is a
+            // copy of its bytes. A consumer that held the label itself would be
+            // an untracked holder of the session's lease.
+            RealtimeFlowEvent::Closed { label } => Self::Closed {
+                label: label.name().as_bytes().to_vec(),
+            },
         }
     }
 }
 
 // There is deliberately no constructor for [`WebRtcRealtimeInboundArrival`].
 //
-// Its two fields are public and the engine hands out a `(u8, RealtimeRecvUnit)`
-// pair, so the boundary assembles one with a struct literal and a `.into()`.
+// Its two fields are public and the engine hands out a
+// `(RealtimeFlowName, RealtimeRecvUnit)` pair, so the boundary assembles one
+// with a struct literal and a `.into()`.
 // A constructor taking a [`RealtimeFlowLabel`] would be the only reason that
 // connector-local type had to travel any further than it does — and it must not,
 // because it participates in the connector's ownership checks and reads like a
@@ -238,6 +261,37 @@ impl From<RealtimeFlowEvent> for crate::realtime::RealtimeFlowEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leased label over an elastic control registry, with the resources it
+    /// stands on held alongside it.
+    ///
+    /// Minted rather than hand-built: a label with no lease is not the type
+    /// these conversions handle, and a control that constructed one would be
+    /// proving something about a shape production never produces. The returned
+    /// resources must outlive the label — dropping them retires the scope the
+    /// lease was taken against.
+    fn control_label(name: &[u8]) -> (RealtimeFlowLabel, ElasticControlResources) {
+        let (registry, resources) =
+            RealtimeFlowRegistry::elastic_for_control(control_label_grant());
+        let label = RealtimeFlowLabel::mint(
+            RealtimeFlowName::new(name.to_vec()).expect("a control name is within the frame bound"),
+            &registry,
+        )
+        .expect("the elastic control grant admits one label");
+        (label, resources)
+    }
+
+    /// A grant generous enough that nothing in these conversion controls is
+    /// refused for capacity. They are testing the conversion, not admission;
+    /// admission has its own controls in `realtime.rs`, where the grant is
+    /// derived exactly.
+    ///
+    /// One definition for the whole crate, in the parent module: the structural
+    /// half has to match the scope stack `elastic_for_control` really builds,
+    /// and a per-file copy could only match it by luck.
+    fn control_label_grant() -> crate::resource::ResourceClaim {
+        super::super::elastic_control_grant()
+    }
 
     /// The daemon wire spelling of the provider's RTP kind is pinned.
     ///
@@ -265,12 +319,12 @@ mod tests {
         assert!(serde_json::from_str::<WebRtcRtpKind>("\"media\"").is_err());
     }
 
-    /// An unusable encoding is refused at the provider edge, before any session
-    /// is resolved, and reported in the generic vocabulary.
+    /// An unusable encoding or label is refused at the provider edge, before any
+    /// session is resolved, and reported in the generic vocabulary.
     #[test]
     fn v4_macro1_an_unusable_provider_open_is_refused_before_any_session() {
         let open = WebRtcRealtimeFlowOpen {
-            label: 0,
+            label: b"named".to_vec(),
             direction: RealtimeFlowDirection::Outbound,
             kind: WebRtcRtpKind::Video,
             mime: String::new(),
@@ -282,10 +336,42 @@ mod tests {
             Some(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)
         );
 
-        // Non-vacuity: the same request with a usable MIME converts, so the
-        // refusal above is the empty name and not the fixture.
+        // The label is refused here too, and by the same code. An empty label
+        // could not have crossed the frame — its length prefix says one byte at
+        // least — so it is a shape defect this edge answers rather than a flow
+        // that fails somewhere further in.
+        let empty_label = WebRtcRealtimeFlowOpen {
+            label: Vec::new(),
+            direction: RealtimeFlowDirection::Outbound,
+            kind: WebRtcRtpKind::Video,
+            mime: "video/H264".to_string(),
+            clock_rate: 90_000,
+            channels: 0,
+        };
+        assert_eq!(
+            RealtimeFlowSpec::try_from(empty_label).err(),
+            Some(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)
+        );
+
+        // And so is one longer than the frame's single length byte can spell.
+        let over_long_label = WebRtcRealtimeFlowOpen {
+            label: vec![b'x'; crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES + 1],
+            direction: RealtimeFlowDirection::Outbound,
+            kind: WebRtcRtpKind::Video,
+            mime: "video/H264".to_string(),
+            clock_rate: 90_000,
+            channels: 0,
+        };
+        assert_eq!(
+            RealtimeFlowSpec::try_from(over_long_label).err(),
+            Some(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)
+        );
+
+        // Non-vacuity: the same request with a usable MIME and a label of the
+        // longest admissible length converts, so the three refusals above are
+        // the defects named and not the fixture.
         let usable = WebRtcRealtimeFlowOpen {
-            label: 0,
+            label: vec![b'x'; crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES],
             direction: RealtimeFlowDirection::Outbound,
             kind: WebRtcRtpKind::Video,
             mime: "video/H264".to_string(),
@@ -306,9 +392,9 @@ mod tests {
     #[test]
     fn v4_macro1_an_arrival_names_its_flow_and_preserves_its_rtp_facts() {
         // Assembled exactly as the public boundary assembles one, from the
-        // `(u8, RealtimeRecvUnit)` pair the engine hands out.
+        // `(Vec<u8>, RealtimeRecvUnit)` pair the engine hands out.
         let arrival = WebRtcRealtimeInboundArrival {
-            label: 7,
+            label: b"seven".to_vec(),
             unit: RealtimeRecvUnit {
                 timestamp: 90_000,
                 marker: true,
@@ -316,7 +402,7 @@ mod tests {
             }
             .into(),
         };
-        assert_eq!(arrival.label, 7);
+        assert_eq!(arrival.label, b"seven".to_vec());
         assert_eq!(arrival.unit.rtp_timestamp, 90_000);
         assert!(arrival.unit.marker);
         assert_eq!(arrival.unit.data, Bytes::from_static(b"unit"));
@@ -384,20 +470,20 @@ mod tests {
     /// it tear down a flow that is still live and keep one that is gone.
     #[test]
     fn v4_macro1_a_close_crosses_the_boundary_naming_the_exact_flow_it_closed() {
-        let closed = RealtimeFlowEvent::Closed {
-            label: RealtimeFlowLabel::from_peer(7),
-        };
+        let (seven, _seven_resources) = control_label(b"seven");
+        let closed = RealtimeFlowEvent::Closed { label: seven };
         assert_eq!(
-            crate::realtime::RealtimeFlowEvent::from(closed),
-            crate::realtime::RealtimeFlowEvent::Closed { label: 7 }
+            crate::realtime::RealtimeFlowEvent::from(closed.clone()),
+            crate::realtime::RealtimeFlowEvent::Closed {
+                label: b"seven".to_vec()
+            }
         );
 
         // Non-vacuity: a close of a different flow converts to a different
         // public event, so the equality above is the conversion carrying the
         // label and not a type that compares equal to everything.
-        let other = RealtimeFlowEvent::Closed {
-            label: RealtimeFlowLabel::from_peer(8),
-        };
+        let (eight, _eight_resources) = control_label(b"eight");
+        let other = RealtimeFlowEvent::Closed { label: eight };
         assert_ne!(
             crate::realtime::RealtimeFlowEvent::from(closed),
             crate::realtime::RealtimeFlowEvent::from(other)

@@ -96,7 +96,12 @@ pub enum ServerOut {
     RealtimeFlowClosed {
         network: String,
         from: String,
-        flow_label: u8,
+        /// The name the flow was opened under, echoed back so a client can
+        /// match it against its own record. The same string it supplied to
+        /// `realtime_flow_open`: every flow this daemon reports on is one its
+        /// own application named, so the bytes round-trip through UTF-8 by
+        /// construction.
+        flow_label: String,
     },
     // There is deliberately no `realtime_dead_flow`.
     //

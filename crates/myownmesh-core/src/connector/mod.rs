@@ -112,40 +112,6 @@ impl ConnectedChannelCapability {
 // engine's registry fence. No second connector-side capability or delivery
 // boolean exists to be kept in step with it.
 
-/// Temporary adapter for the existing live channel object.
-///
-/// The adapter requires a capability that the connector already produced. A
-/// legacy object cannot mint the capability. Arc 04 endpoint authentication now
-/// consumes the connected channel directly: `EndpointAuthHandoff::into_generic`
-/// yields the `ConnectedChannelHandoff` moved into `EndpointAuthTask::begin`.
-/// This wrapper was not removed by that change; its deletion belongs to Arc 05.
-#[allow(
-    dead_code,
-    reason = "Arc 04 installs and deletes this migration adapter"
-)]
-pub(crate) struct LegacyConnectedChannel<T> {
-    capability: ConnectedChannelCapability,
-    legacy: T,
-}
-
-#[allow(
-    dead_code,
-    reason = "Arc 04 installs and deletes this migration adapter"
-)]
-impl<T> LegacyConnectedChannel<T> {
-    pub(crate) fn new(capability: ConnectedChannelCapability, legacy: T) -> Self {
-        Self { capability, legacy }
-    }
-
-    pub(crate) fn capability(&self) -> &ConnectedChannelCapability {
-        &self.capability
-    }
-
-    fn into_parts(self) -> (ConnectedChannelCapability, T) {
-        (self.capability, self.legacy)
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn connected_for_test(runtime: RuntimeIncarnation) -> ConnectedChannelCapability {
     let (candidate, _lifetime) = crate::runtime::attempt::connector_candidate_for_test(runtime);
@@ -175,15 +141,5 @@ mod tests {
             connector_candidate_for_test(crate::runtime::runtime_for_test());
         retired_lifetime.retire();
         assert!(mark_connected(retired_candidate).is_none());
-    }
-
-    #[test]
-    fn v4_arc02_legacy_adapter_requires_an_existing_capability() {
-        let connected = connected_for_test(crate::runtime::runtime_for_test());
-        let wrapper = LegacyConnectedChannel::new(connected, "legacy channel");
-        let _ = wrapper.capability();
-        let (_capability, legacy) = wrapper.into_parts();
-
-        assert_eq!(legacy, "legacy channel");
     }
 }

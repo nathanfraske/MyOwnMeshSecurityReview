@@ -56,77 +56,15 @@ impl LocalPrincipalCapability {
     }
 }
 
-/// Proof that post-authentication application-queue capacity was admitted.
-///
-/// Arc 02 creates no production issuer and supplies no conversion from any
-/// pre-authentication permit.
-#[allow(dead_code, reason = "Arc 06 moves the production gateway caller")]
-pub struct ApplicationQueuePermit {
-    runtime: RuntimeIncarnation,
-}
-
-impl ApplicationQueuePermit {
-    #[cfg(test)]
-    pub(crate) fn for_test(runtime: RuntimeIncarnation) -> Self {
-        Self { runtime }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.runtime
-    }
-}
-
-/// Arc 06 compatibility container for an already-authenticated local
-/// principal.
-#[allow(
-    dead_code,
-    reason = "Arc 06 installs and deletes this migration adapter"
-)]
-pub(crate) struct LegacyPrincipal<T> {
-    capability: LocalPrincipalCapability,
-    legacy: T,
-}
-
-#[allow(
-    dead_code,
-    reason = "Arc 06 installs and deletes this migration adapter"
-)]
-impl<T> LegacyPrincipal<T> {
-    pub(crate) fn new(capability: LocalPrincipalCapability, legacy: T) -> Self {
-        Self { capability, legacy }
-    }
-
-    pub(crate) fn capability(&self) -> &LocalPrincipalCapability {
-        &self.capability
-    }
-
-    fn into_parts(self) -> (LocalPrincipalCapability, T) {
-        (self.capability, self.legacy)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn v4_arc02_principal_and_queue_permit_are_runtime_bound() {
+    fn v4_arc02_local_principal_is_runtime_bound() {
         let runtime = crate::runtime::runtime_for_test();
         let principal = LocalPrincipalCapability::for_test(runtime.clone());
-        let queue = ApplicationQueuePermit::for_test(runtime.clone());
 
         assert!(principal.runtime().is_same(&runtime));
-        assert!(queue.runtime().is_same(&runtime));
-    }
-
-    #[test]
-    fn v4_arc02_legacy_principal_requires_existing_authority() {
-        let principal = LocalPrincipalCapability::for_test(crate::runtime::runtime_for_test());
-        let wrapper = LegacyPrincipal::new(principal, "legacy principal");
-        let _ = wrapper.capability();
-        let (_capability, legacy) = wrapper.into_parts();
-
-        assert_eq!(legacy, "legacy principal");
     }
 }

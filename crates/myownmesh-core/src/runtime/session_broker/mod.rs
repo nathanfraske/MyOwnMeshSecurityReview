@@ -36,11 +36,60 @@ pub(crate) use policy::CurrentPolicyAdmission;
 
 /// The post-authentication reservation one promoted session holds.
 ///
-/// Finite and explicit: one accounted session object plus the worker the
-/// connector's application path drives it through. It is deliberately not
-/// derived from anything measured before authentication — a pre-authentication
-/// lease cannot be reused as proof that this capacity exists.
-const SESSION_CLAIM: ResourceClaim = ResourceClaim::single(ResourceClass::WorkerOrTask, 1);
+/// Mechanically derived from the state a promotion actually creates, so these
+/// numbers cannot drift from the objects they pay for. A promotion constructs
+/// exactly one of each of these and holds both for the session's whole life:
+///
+/// - the session record — [`SessionCapability`], which owns by value the
+///   authenticated channel it was promoted from, the shared local principal
+///   handle, the connector identity, and the permit carrying this very
+///   reservation; and
+/// - the session-owned realtime flow set —
+///   [`SessionRealtimeFlows`](crate::transport::webrtc::SessionRealtimeFlows),
+///   built by the exact connector this session was promoted from and dropped
+///   with the session that owns it.
+///
+/// Both terms are `size_of`, read from the types themselves. There is no
+/// estimate, no per-peer multiplier, and no number written out that a later
+/// field addition could silently invalidate.
+///
+/// Two exclusions are **by design**. The `RealtimeFlowRegistry` the flow set
+/// holds is the connector's own and preexisting — promotion clones the handle,
+/// it does not allocate the registry — so charging it here would bill a session
+/// for something that outlives it. And every per-flow, queue and payload lease
+/// is charged where it is taken, against limits the connector's realtime policy
+/// chooses; a session that opens no flow must not pre-pay for flows.
+///
+/// The third term is the heap `SessionRealtimeFlows::new` allocates for the set
+/// promotion builds: the flow-set token, the arrival stream, the lifecycle
+/// stream, and the inbound bindings, each with its `Arc` counter words. Those
+/// three of four types are private to the connector, so the size is asked of the
+/// connector rather than restated here — restating it is precisely the
+/// hand-written cost this claim exists to remove, and a field added to
+/// `SessionStream` would silently stop being paid for.
+///
+/// It is worth knowing that the third term is exhaustive *by maintenance*, not
+/// by construction: a fifth root added to `new` and not added there is a mistake
+/// no compiler catches. The mitigation is that the function lives beside `new`.
+///
+/// Deliberately not derived from anything measured before authentication — a
+/// pre-authentication lease cannot be reused as proof that this capacity exists.
+fn session_claim() -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    let bytes = std::mem::size_of::<SessionCapability>()
+        .checked_add(std::mem::size_of::<
+            crate::transport::webrtc::SessionRealtimeFlows,
+        >())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    let bytes = u64::try_from(bytes).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    ResourceClaim::try_from_entries([(ResourceClass::AccountedMemoryBytes, bytes)])?
+        .checked_add(crate::transport::webrtc::SessionRealtimeFlows::promotion_root_claim()?)
+}
 
 /// Proof that post-authentication session capacity was reserved.
 ///
@@ -60,7 +109,9 @@ impl SessionPermit {
         scope: &MeshConnectorResourceScope,
         runtime: RuntimeIncarnation,
     ) -> Result<Self, ResourceUnavailable> {
-        let lease = scope.reserve_session(SESSION_CLAIM)?;
+        let lease = scope.reserve_session(session_claim().expect(
+            "the session claim is `size_of` arithmetic over fixed types and cannot overflow",
+        ))?;
         Ok(Self {
             runtime,
             _lease: lease,
@@ -237,49 +288,84 @@ impl SessionBroker {
         &self.runtime
     }
 
-    /// Promote one authenticated channel into a live session, or refuse.
+    /// Promote the authenticated channel held in `slot` into a live session, or
+    /// refuse without disturbing it.
     ///
-    /// Every conjunct of the promotion guard is evaluated here, in one call. The
-    /// capability is taken **by value**, so a refused promotion consumes it and
-    /// drops it — there is no arm on which a caller keeps an authenticated
-    /// channel that failed to promote and retries it against a different
-    /// principal, policy answer, or connector.
+    /// The channel is **borrowed** for every fallible step and moved out of the
+    /// slot only once the post-authentication reservation has been taken. That
+    /// ordering is the contract, not an implementation detail: a
+    /// [`ResourcesUnavailable`](SessionPromotionError::ResourcesUnavailable)
+    /// refusal leaves the exact authenticated channel installed, so the next
+    /// attempt retries the same proven channel rather than having to
+    /// re-authenticate one that a transient capacity shortfall destroyed — a
+    /// shortfall the peer had no part in and cannot be asked to prove its way
+    /// out of again.
     ///
-    /// The reservation is taken last, after every free check has passed, so a
-    /// refusal costs no provider capacity. It is released by dropping the permit
-    /// if any later step fails, which is why the commit is all-or-nothing: the
-    /// only thing constructed after the reservation is the capability itself,
-    /// and it cannot fail.
+    /// The three *terminal* refusals still consume it, deliberately and
+    /// visibly: a channel whose connector is superseded, whose peer policy
+    /// refuses, or whose runtime disagrees is not one this entry may keep, and
+    /// retrying it could only ever produce the same answer.
+    ///
+    /// Lending the slot rather than the value is what makes both halves
+    /// structural. A caller cannot commit a channel other than the one that was
+    /// validated, because it never holds one: the move happens in here, after
+    /// the last fallible step, and nothing between the two can substitute a
+    /// different value.
     pub(crate) fn promote(
         &self,
-        authenticated_channel: AuthenticatedChannelCapability,
+        slot: &mut Option<AuthenticatedChannelCapability>,
         connector: &Arc<ConnectorIncarnation>,
         policy: CurrentPolicyAdmission,
     ) -> Result<SessionCapability, SessionPromotionError> {
-        // The channel must have been promoted from the exact connector the
-        // caller is promoting for. Trusting the caller's connector alone would
-        // accept a capability from a superseded channel whenever the current one
-        // was supplied alongside it.
-        if !authenticated_channel.belongs_to(connector) {
-            return Err(SessionPromotionError::ChannelNotCurrent);
+        // Every free conjunct, decided against a borrow so that nothing is
+        // consumed while an answer is still in doubt. The borrow ends with this
+        // block — the value it yields carries no reference — which is what lets
+        // the terminal arm below take the slot at all.
+        let terminal = match slot.as_ref() {
+            // No channel to promote. Spelled as `ChannelNotCurrent` because that
+            // is what an absent channel means here: the entry holds no live
+            // authenticated channel for this connector.
+            None => Some(SessionPromotionError::ChannelNotCurrent),
+            Some(authenticated_channel) => {
+                if !authenticated_channel.belongs_to(connector) {
+                    // The channel must have been promoted from the exact
+                    // connector the caller is promoting for. Trusting the
+                    // caller's connector alone would accept a capability from a
+                    // superseded channel whenever the current one was supplied
+                    // alongside it.
+                    Some(SessionPromotionError::ChannelNotCurrent)
+                } else if !policy.admits(authenticated_channel) {
+                    // Policy is read from the adapter's proof value rather than
+                    // re-derived here, so the broker cannot disagree with the
+                    // fence that produced it.
+                    Some(SessionPromotionError::PolicyRefused)
+                } else if !authenticated_channel.runtime().is_same(&self.runtime)
+                    || !self.principal.runtime().is_same(&self.runtime)
+                {
+                    // One process, one runtime. A principal from a replaced
+                    // runtime object cannot be combined with a channel from this
+                    // one.
+                    Some(SessionPromotionError::RuntimeMismatch)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(error) = terminal {
+            drop(slot.take());
+            return Err(error);
         }
 
-        // Policy is read from the adapter's proof value rather than re-derived
-        // here, so the broker cannot disagree with the fence that produced it.
-        if !policy.admits(&authenticated_channel) {
-            return Err(SessionPromotionError::PolicyRefused);
-        }
-
-        // One process, one runtime. A principal from a replaced runtime object
-        // cannot be combined with a channel from this one.
-        if !authenticated_channel.runtime().is_same(&self.runtime)
-            || !self.principal.runtime().is_same(&self.runtime)
-        {
-            return Err(SessionPromotionError::RuntimeMismatch);
-        }
-
+        // The last fallible step, and the only one that can refuse a channel
+        // which is in every other respect promotable. Until it succeeds the slot
+        // still holds its channel, so `?` here retries cleanly.
         let permit = SessionPermit::reserve(&self.resources, self.runtime.clone())
             .map_err(|_| SessionPromotionError::ResourcesUnavailable)?;
+
+        // Infallible from here: the move out of the slot *is* the commit.
+        let authenticated_channel = slot
+            .take()
+            .expect("the slot held a channel through every check above and nothing released it");
 
         Ok(SessionCapability {
             authenticated_channel,
@@ -319,18 +405,41 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
     crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
 }
 
-/// What one promoted session actually costs the provider: [`SESSION_CLAIM`]
+/// What one promoted session actually costs the provider: [`session_claim`]
 /// plus the record it keeps for the reservation carrying it.
 ///
 /// Mechanically derived, and `pub(crate)` so every fixture that has to leave
-/// room for a session charges the same thing. A fixture that hand-adds
-/// `SESSION_CLAIM` alone is short by exactly the record the provider keeps, and
-/// is short *silently* until the grant happens to bind — which is the defect
-/// this exists to make unrepeatable.
-#[cfg(test)]
+/// room for a session charges the same thing. A fixture that hand-adds the
+/// session claim alone is short by exactly the record the provider keeps, and is
+/// short *silently* until the grant happens to bind — which is the defect this
+/// exists to make unrepeatable.
+#[cfg(any(test, feature = "transport-lab"))]
 pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
-    crate::resource::FiniteResourceProvider::reservation_charge_for_test(SESSION_CLAIM)
-        .expect("one session claim plus the provider's reservation record is representable")
+    crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+        session_claim().expect("the session claim is `size_of` arithmetic and cannot overflow"),
+    )
+    .expect("one session claim plus the provider's reservation record is representable")
+}
+
+/// The exact reservation one promoted session takes out of a fixture's grant.
+///
+/// Public so an **external** integration-test fixture can leave room for the
+/// sessions it promotes, and unavailable without `transport-lab` so it stays out
+/// of the default public API — the same shape as
+/// [`transport_lab_connector_fixture_grant`](crate::transport_lab_connector_fixture_grant).
+/// An integration test is a separate crate: it sees only `pub` items and links
+/// the library built *without* `cfg(test)`, so neither the `pub(crate)` helper
+/// above nor the provider's own charge is reachable from one. This is.
+///
+/// It is the **reservation** charge, not the bare claim. The provider charges
+/// the claim together with the record it keeps for the lease carrying it, so a
+/// fixture that budgets the claim alone is short by exactly one record per
+/// session — and short *silently*, binding or refusing on whatever slack some
+/// unrelated term happened to leave. Deriving it here is what stops a fixture
+/// from restating a number the broker owns.
+#[cfg(feature = "transport-lab")]
+pub fn transport_lab_session_reservation_claim() -> ResourceClaim {
+    session_reservation_charge_for_test()
 }
 
 /// What the fixture's own scaffolding costs, before a single session.
@@ -341,9 +450,10 @@ pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
 /// executor holds for as long as it lives, which carries the provider's record
 /// on top of the infrastructure claim itself.
 ///
-/// A grant that names only `WorkerOrTask` is refused at provider construction,
-/// in the `OpaqueDependencyResidual` dimension, before any control can express
-/// what it meant to test.
+/// A grant that names only the session claim's own dimension is refused at
+/// provider construction, in the `OpaqueDependencyResidual` dimension, before
+/// any control can express what it meant to test — which is why every control
+/// here adds this scaffolding rather than granting session capacity alone.
 ///
 /// Every term is derived rather than written out. The executor's claim is the
 /// connector's to choose and the records are the provider's; restating either
@@ -414,14 +524,19 @@ mod tests {
         let channel = crate::endpoint_auth::authenticated_for_test(runtime.clone());
         let connector = Arc::clone(channel.record().connector());
 
+        let mut slot = Some(channel);
         let session = broker
             .promote(
-                channel,
+                &mut slot,
                 &connector,
                 CurrentPolicyAdmission::admitted_for_test(),
             )
             .expect("every promotion conjunct holds");
 
+        assert!(
+            slot.is_none(),
+            "a committed promotion moves the channel out of the slot"
+        );
         assert!(session.belongs_to(&connector));
         assert!(session.runtime().is_same(&runtime));
         assert!(session.local_principal().runtime().is_same(&runtime));
@@ -439,15 +554,20 @@ mod tests {
         let replacement = crate::endpoint_auth::authenticated_for_test(runtime);
         let other_connector = Arc::clone(replacement.record().connector());
 
+        let mut slot = Some(channel);
         assert_eq!(
             broker
                 .promote(
-                    channel,
+                    &mut slot,
                     &other_connector,
                     CurrentPolicyAdmission::admitted_for_test()
                 )
                 .err(),
             Some(SessionPromotionError::ChannelNotCurrent)
+        );
+        assert!(
+            slot.is_none(),
+            "a terminal refusal consumes the channel: it can never promote here"
         );
     }
 
@@ -460,15 +580,20 @@ mod tests {
         let channel = crate::endpoint_auth::authenticated_for_test(runtime);
         let connector = Arc::clone(channel.record().connector());
 
+        let mut slot = Some(channel);
         assert_eq!(
             broker
                 .promote(
-                    channel,
+                    &mut slot,
                     &connector,
                     CurrentPolicyAdmission::refused_for_test()
                 )
                 .err(),
             Some(SessionPromotionError::PolicyRefused)
+        );
+        assert!(
+            slot.is_none(),
+            "a policy refusal is terminal, so the channel does not survive it"
         );
     }
 
@@ -481,15 +606,20 @@ mod tests {
         let channel = crate::endpoint_auth::authenticated_for_test(foreign);
         let connector = Arc::clone(channel.record().connector());
 
+        let mut slot = Some(channel);
         assert_eq!(
             broker
                 .promote(
-                    channel,
+                    &mut slot,
                     &connector,
                     CurrentPolicyAdmission::admitted_for_test()
                 )
                 .err(),
             Some(SessionPromotionError::RuntimeMismatch)
+        );
+        assert!(
+            slot.is_none(),
+            "a runtime disagreement is terminal, so the channel does not survive it"
         );
     }
 
@@ -502,13 +632,14 @@ mod tests {
     /// and every control reads as a broken conjunct rather than as a grant that
     /// never described the fixture it was paying for.
     ///
-    /// The second half is what keeps that scaffolding honest. The scaffolding
-    /// alone carries a `WorkerOrTask` unit for the executor, and if a session
-    /// could be promoted out of it then `fixture_grant(1)` would really admit
-    /// two — and the exhaustion control below would be measuring slack instead
-    /// of its own stated capacity. It cannot: the executor holds that unit for
-    /// as long as it lives, and the scaffolding's bookkeeping is spent on the
-    /// two scopes and the executor's own reservation.
+    /// The second half is what keeps that scaffolding honest. Every dimension
+    /// the scaffolding names is already spoken for — the executor's own
+    /// reservation covers its infrastructure claim, including the accounted
+    /// memory a session claim is denominated in, and the bookkeeping is spent on
+    /// the two scopes and that reservation. If a session could still be promoted
+    /// out of the scaffolding alone, then `fixture_grant(1)` would really admit
+    /// two, and the exhaustion control below would be measuring slack rather
+    /// than its own stated capacity.
     #[test]
     fn v4_arc05_the_fixture_grant_pays_for_its_own_scaffolding_and_no_session() {
         let runtime = crate::runtime::runtime_for_test();
@@ -519,7 +650,7 @@ mod tests {
         assert!(
             broker
                 .promote(
-                    channel,
+                    &mut Some(channel),
                     &connector,
                     CurrentPolicyAdmission::admitted_for_test()
                 )
@@ -533,9 +664,10 @@ mod tests {
         );
         let channel = crate::endpoint_auth::authenticated_for_test(runtime);
         let connector = Arc::clone(channel.record().connector());
+        let mut slot = Some(channel);
         assert_eq!(
             bare.promote(
-                channel,
+                &mut slot,
                 &connector,
                 CurrentPolicyAdmission::admitted_for_test()
             )
@@ -543,6 +675,10 @@ mod tests {
             Some(SessionPromotionError::ResourcesUnavailable),
             "and the scaffolding on its own admits no session, so the capacity \
              in a fixture grant is the only thing that ever admits one"
+        );
+        assert!(
+            slot.is_some(),
+            "a capacity refusal is not terminal: the exact channel stays installed"
         );
     }
 
@@ -554,10 +690,10 @@ mod tests {
         // a typed cause, not a silent unpromoted channel.
         //
         // The scaffolding is added rather than the session claim being used as
-        // the whole grant: a grant naming only `WorkerOrTask` cannot construct
-        // a provider at all, so this control would have panicked before
-        // reaching its own subject. The one session remains the only session
-        // capacity, which is what keeps it discriminating.
+        // the whole grant: a grant naming only the session's own dimension
+        // cannot construct a provider at all, so this control would have
+        // panicked before reaching its own subject. The one session remains the
+        // only session capacity, which is what keeps it discriminating.
         //
         // The grant is exact in every dimension a promotion touches, so the
         // second one exceeds it in both the session dimension and the
@@ -571,7 +707,7 @@ mod tests {
         let first_connector = Arc::clone(first.record().connector());
         let held = broker
             .promote(
-                first,
+                &mut Some(first),
                 &first_connector,
                 CurrentPolicyAdmission::admitted_for_test(),
             )
@@ -579,30 +715,42 @@ mod tests {
 
         let second = crate::endpoint_auth::authenticated_for_test(runtime);
         let second_connector = Arc::clone(second.record().connector());
+        let mut retryable = Some(second);
         assert_eq!(
             broker
                 .promote(
-                    second,
+                    &mut retryable,
                     &second_connector,
                     CurrentPolicyAdmission::admitted_for_test()
                 )
                 .err(),
             Some(SessionPromotionError::ResourcesUnavailable)
         );
+        assert!(
+            retryable.is_some(),
+            "capacity is the one refusal that leaves the channel installed — the \
+             peer proved this channel and a shortfall it had no part in must not \
+             cost it that proof"
+        );
 
-        // Non-vacuity: the capacity is genuinely released with the session, so
-        // the refusal above was exhaustion and not a broker that never admits
-        // twice.
+        // Non-vacuity, and the retry contract in one step: the capacity is
+        // genuinely released with the session, and what promotes afterwards is
+        // the *exact* channel the shortfall refused — not a freshly minted one.
+        // A broker that destroyed the channel on `ResourcesUnavailable` could
+        // not reach this line at all, and one that never admits twice would fail
+        // it.
         drop(held);
-        let third = crate::endpoint_auth::authenticated_for_test(broker.runtime().clone());
-        let third_connector = Arc::clone(third.record().connector());
         assert!(broker
             .promote(
-                third,
-                &third_connector,
+                &mut retryable,
+                &second_connector,
                 CurrentPolicyAdmission::admitted_for_test()
             )
             .is_ok());
+        assert!(
+            retryable.is_none(),
+            "and the successful retry is the commit that finally moves it"
+        );
     }
 
     #[test]

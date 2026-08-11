@@ -247,34 +247,3 @@ impl EndpointAuthProfile {
         }
     }
 }
-
-/// Arc 04 compatibility container.
-///
-/// The adapter accepts an already-issued capability. It cannot authenticate a
-/// legacy value, and the raw value remains private to this owner module.
-#[allow(
-    dead_code,
-    reason = "Arc 05 installs and deletes this migration adapter"
-)]
-pub(crate) struct LegacyAuthenticatedChannel<T> {
-    capability: AuthenticatedChannelCapability,
-    legacy: T,
-}
-
-#[allow(
-    dead_code,
-    reason = "Arc 05 installs and deletes this migration adapter"
-)]
-impl<T> LegacyAuthenticatedChannel<T> {
-    pub(crate) fn new(capability: AuthenticatedChannelCapability, legacy: T) -> Self {
-        Self { capability, legacy }
-    }
-
-    pub(crate) fn capability(&self) -> &AuthenticatedChannelCapability {
-        &self.capability
-    }
-
-    fn into_parts(self) -> (AuthenticatedChannelCapability, T) {
-        (self.capability, self.legacy)
-    }
-}

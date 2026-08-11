@@ -29,10 +29,6 @@ impl RealtimeUnitFraming for H264Framing {
         payload_starts_au(payload)
     }
 
-    fn max_fragments_per_unit(&self) -> usize {
-        MAX_AU_PARTS
-    }
-
     fn framed_len(&self, fragments: UnitFragments<'_>) -> Result<usize> {
         annexb_output_len(fragments)
     }
@@ -46,9 +42,6 @@ impl RealtimeUnitFraming for H264Framing {
     }
 }
 
-/// More packets than any sane unit (a 40 Mbps keyframe is ~400): a unit
-/// this size means the stream is wedged — drop it rather than balloon.
-pub(super) const MAX_AU_PARTS: usize = super::ANNEXB_MAX_FRAGMENTS_PER_UNIT;
 const ANNEXB_START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 fn output_length_overflow() -> Error {

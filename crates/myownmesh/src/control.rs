@@ -80,9 +80,11 @@ pub enum RealtimePipeDirection {
 // core variant would fall through a local `match` to some default string,
 // where forwarding `code()` makes the same change a compile error here.
 //
-// Note the absent `label_space_exhausted`. The caller supplies an exact label
-// and the connector claims that one — it never allocates — so a label is free
-// or in use and the space cannot be "full" from a request's point of view.
+// Note the absent `label_space_exhausted`. The caller supplies an exact name
+// and the connector claims that one — it never allocates — and there is no
+// enumerable space of names to exhaust, so a name is free or in use and nothing
+// can be "full" from a request's point of view. How many flows may be open at
+// once is a separate question, answered by `flow_refused` from admission.
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -508,12 +510,20 @@ pub enum Request {
     // that reason — the pipe is the media path, in both directions.
     /// Declare a realtime flow to `peer` under `flow_label`.
     ///
-    /// `flow_label` is allocated by the caller from the session's shared
-    /// audio-and-video label space; the daemon allocates nothing and holds no
-    /// label state. One allocator, and it is the side that knows about routes.
-    /// The connector claims that exact label and never picks another, so the
-    /// only label failure is `label_in_use` — which is also what a caller's
-    /// exhausted space looks like from here.
+    /// `flow_label` is a name the caller chose, opaque to the daemon and to
+    /// core: it is compared for equality against that session's own table and
+    /// never parsed, ordered, or ranged over. The daemon names nothing and
+    /// holds no label state. The connector claims that exact name and never
+    /// picks another, so the only name failure is `label_in_use`.
+    ///
+    /// It is scoped to one session and freely reusable after close. There is no
+    /// label space and therefore no exhaustion: what bounds a name is its size,
+    /// 1..=255 bytes, because the binary pipe length-prefixes it with one byte.
+    /// How many may exist at once is admission's question, answered by the
+    /// connector's flow policy and the provider's leases.
+    ///
+    /// Carried here as a string, which is the JSON-representable half of the
+    /// byte name core holds. The binary pipe carries the same name as raw bytes.
     ///
     /// `rtp_kind`, `mime`, `clock_rate` and `channels` together select an
     /// encoding *family* among the ones the application-supplied profile
@@ -532,7 +542,7 @@ pub enum Request {
     RealtimeFlowOpen {
         network: String,
         peer: String,
-        flow_label: u8,
+        flow_label: String,
         /// Which way this node carries units on this flow. Stated by the caller
         /// rather than inferred: a flow this node sends on and one it receives
         /// on need different transceiver directions, and inferring from later
@@ -572,7 +582,7 @@ pub enum Request {
     RealtimeFlowClose {
         network: String,
         peer: String,
-        flow_label: u8,
+        flow_label: String,
     },
     /// Route realtime flow *control* events for this network's peers to this
     /// client's event socket. That is `realtime_flow_closed`, and only that:
@@ -599,10 +609,11 @@ pub enum Request {
     ///
     /// **Both** directions are bound to exactly one session by `network` +
     /// `peer`. That binding is what makes a unit routable at all: a frame body
-    /// carries a `flow_label` and no strings, and the label is scoped to a
-    /// session, so on a peer-multiplexed pipe peer A's label 3 and peer B's
-    /// label 3 are indistinguishable. Binding the connection supplies the
-    /// session by construction, which keeps the body compact.
+    /// carries a `flow_label` and no peer, and the label is scoped to a
+    /// session, so on a peer-multiplexed pipe peer A's `screen` and peer B's
+    /// `screen` are indistinguishable — a name means whatever its own session
+    /// says it means. Binding the connection supplies the session by
+    /// construction, which keeps the body compact.
     ///
     /// Inbound is bound for the same reason and not a weaker one. The JSON
     /// control events carry `from`, but the binary units do not, and it is the
@@ -622,9 +633,9 @@ pub enum Request {
     ///
     /// Either way the pipe ends with the session rather than outliving it,
     /// which would be a send outliving its flow one layer up. The client then
-    /// reconnects and may immediately reuse the same labels — the old label
-    /// space died with the old session — so the binding is re-established per
-    /// session and never cached per peer.
+    /// reconnects and may immediately reuse the same names — a name belongs to
+    /// the session that claimed it and died with it — so the binding is
+    /// re-established per session and never cached per peer.
     ///
     /// Field shapes are validated strictly and a wrong-shaped request is
     /// refused rather than trimmed: `Outbound` requires `network` + `peer` and
@@ -732,6 +743,83 @@ enum SocketTarget {
     Name(String),
 }
 
+/// One encoding family this daemon has registered, as published to clients.
+///
+/// A family, not a registration tuple. Deployed H.264 is several payload/fmtp
+/// variants sharing these four fields; a flow open names the family and SDP
+/// negotiation picks the variant. Publishing payload types would invite a
+/// caller to name one, which is not a choice it gets to make.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RealtimeEncoding {
+    /// `audio` or `video` — which transceiver the family occupies.
+    pub kind: String,
+    pub mime: String,
+    pub clock_rate: u32,
+    /// 0 for video; 2 for stereo Opus.
+    pub channels: u16,
+}
+
+/// What this daemon can carry on the realtime path.
+///
+/// Three facts, and no promise: whether the daemon supports the path at all,
+/// which encoding families it registered, and the ceiling **only when the owner
+/// explicitly selected one**. A flat capacity number would be a promise, because
+/// a caller would size its concurrent flows against it — and the directional resource
+/// envelopes underneath answer `flow_refused` before any aggregate is reached.
+/// Feasibility is learned where it is decided, from the typed refusal on
+/// `realtime_flow_open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RealtimeAdvert {
+    /// False when no profile was registered: no codecs, so nothing can be
+    /// carried. Stated rather than implied by an empty list, so a client can
+    /// tell "this build has no realtime path" from "it has one and I could not
+    /// read its encodings".
+    pub supported: bool,
+    /// The registered families, deduplicated. Empty when unsupported.
+    pub encodings: Vec<RealtimeEncoding>,
+    /// Present only when the owner selected an explicit ceiling. Absent means
+    /// no ceiling was stated — not that the ceiling is zero or unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_ceiling: Option<RealtimeFlowCeiling>,
+}
+
+/// The owner's explicitly selected per-peer concurrent-flow ceiling.
+///
+/// Reported per direction, because that is how the connector holds it and how
+/// it refuses. A single combined figure would have to be invented here — the
+/// sum is not a bound anything enforces, and a caller that opened against it
+/// would be refused by whichever direction ran out first, which is the exact
+/// failure the flat count produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RealtimeFlowCeiling {
+    pub max_inbound_flows: u64,
+    pub max_outbound_flows: u64,
+}
+
+impl RealtimeAdvert {
+    /// A daemon that registered no realtime profile and can carry nothing.
+    pub fn unsupported() -> Self {
+        Self {
+            supported: false,
+            encodings: Vec::new(),
+            flow_ceiling: None,
+        }
+    }
+
+    /// A daemon that registered `encodings`, with the owner's explicit ceiling
+    /// if one was selected.
+    pub fn registered(
+        encodings: Vec<RealtimeEncoding>,
+        flow_ceiling: Option<RealtimeFlowCeiling>,
+    ) -> Self {
+        Self {
+            supported: true,
+            encodings,
+            flow_ceiling,
+        }
+    }
+}
+
 /// Start the control socket listener. Returns when the shutdown
 /// broadcast fires.
 pub async fn serve(
@@ -739,7 +827,7 @@ pub async fn serve(
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
     custom: Option<PathBuf>,
-    realtime_flows: u16,
+    realtime: RealtimeAdvert,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let target = resolve_socket(custom)?;
@@ -751,7 +839,7 @@ pub async fn serve(
         registry,
         services,
         clients: crate::ipc::ClientRegistry::new(),
-        realtime_flows,
+        realtime,
     });
 
     loop {
@@ -810,33 +898,14 @@ struct ControlState {
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
-    /// Concurrent realtime flows this node supports per peer, over the one
-    /// shared audio-and-video label space. Supplied by the application in its
-    /// realtime profile and published verbatim as the `realtime_flows` status
-    /// field: it is a ceiling that applications size their own allocation pool
-    /// against, never a live count. Reporting a count here would silently
-    /// undersize every pool that read it.
-    ///
-    /// One scalar, deliberately not split by direction. It is an aggregate
-    /// ceiling, not a promise that every inbound/outbound split of it is
-    /// feasible: directional resource envelopes sit underneath and can answer
-    /// `flow_refused` before this number is reached. Publishing a per-direction
-    /// pair would read as a guarantee the connector does not make, and a caller
-    /// that planned against it would still meet the same refusal.
-    ///
-    /// Zero when no realtime profile was registered, which is the honest report
-    /// for a daemon that has no codecs and can carry nothing.
-    realtime_flows: u16,
+    realtime: RealtimeAdvert,
 }
 
-// The daemon keeps no realtime flow state of its own. There was a per-session
-// index of inbound labels here, because the old per-label `recv` gave a pipe no
-// way to learn which flows were live. `recv_webrtc_realtime_any` delivers the label
-// with the unit, so the index had exactly one job and no longer has it.
-//
-// Nothing replaced it. A cache of open flows would be a second answer to a
-// question core already answers, and the failure mode of a stale mirror on this
-// path is units routed to a flow that closed.
+// The daemon keeps no realtime flow state of its own, and deliberately holds
+// nothing keyed by label. `recv_webrtc_realtime_any` delivers the label with the
+// unit, so a local index of open flows would be a second answer to a question
+// core already answers — and the failure mode of a stale mirror on this path is
+// units routed to a flow that closed.
 
 async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> Result<()> {
     let (reader, mut writer) = stream.split();
@@ -1003,15 +1072,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
 
 /// A realtime pipe's validated session binding.
 ///
-/// `client_id` is validated but not carried, and that is worth stating plainly
-/// rather than leaving as an omission. It was required on an inbound pipe
-/// because the pipe used to decide which flows to carry from that client's
-/// subscriptions. `recv_webrtc_realtime_any` delivers every flow of the bound session
-/// with its label attached, so no subscription is consulted and nothing here
-/// reads the value. The request field is still refused when malformed — it is
-/// not silently accepted — but its former job is gone, and whether it should
-/// remain on the wire at all is a contract question, not one this struct should
-/// answer by quietly keeping a field nobody uses.
+/// `client_id` is required on an inbound pipe and validated, but not carried,
+/// and that is worth stating plainly rather than leaving as an omission.
+/// `recv_webrtc_realtime_any` delivers every flow of the bound session with its
+/// label attached, so no subscription is consulted and nothing here reads the
+/// value. Malformed input is still refused rather than silently accepted;
+/// whether the field should remain on the wire at all is a contract question,
+/// not one this struct should answer by quietly keeping a field nobody uses.
 struct RealtimePipeBinding {
     direction: RealtimePipeDirection,
     network: String,
@@ -1022,10 +1089,10 @@ struct RealtimePipeBinding {
 ///
 /// Both directions are bound to exactly one session, so `network` and `peer`
 /// are required for each. That binding is what makes a unit routable at all: a
-/// frame body carries a `flow_label` and no strings, and a label is scoped to a
-/// session, so on a peer-multiplexed pipe peer A's label 3 and peer B's label 3
-/// are indistinguishable. Binding the connection supplies the session by
-/// construction and keeps the body compact.
+/// frame body carries a `flow_label` and no peer, and a label is scoped to a
+/// session, so on a peer-multiplexed pipe peer A's `screen` and peer B's
+/// `screen` are indistinguishable. Binding the connection supplies the session
+/// by construction and keeps the body compact.
 ///
 /// `client_id` is required for `Inbound` and refused for `Outbound` rather than
 /// ignored there. An outbound pipe that accepted and dropped a `client_id`
@@ -1102,6 +1169,11 @@ where
             warn!("malformed realtime send unit ({len} bytes) — skipped");
             continue;
         };
+        // Two forms of the same name, and only one of them is authority: the
+        // bytes go to core, and the lossy rendering exists solely so a refusal
+        // can name the flow in a log line. A label is opaque application bytes,
+        // so it has no guaranteed text form and none is invented for the wire.
+        let logged = label_for_log(&unit.flow_label);
         let label = unit.flow_label;
         // No marker: an outbound unit does not carry one, at any layer. The
         // marker bit states something about packetization that the flow's
@@ -1117,7 +1189,7 @@ where
         // Synchronous by design: the unit is authorized against the session and
         // enqueued before this returns, so a refusal is attributable to the unit
         // that caused it rather than surfacing later against an unrelated one.
-        if let Err(refusal) = net.send_webrtc_realtime(peer, label, outbound) {
+        if let Err(refusal) = net.send_webrtc_realtime(peer, &label, outbound) {
             // `SessionNotCurrent` ENDS THE PIPE. Every other refusal is about
             // one unit and the next one may well succeed, but this one says the
             // session this pipe was bound to is gone.
@@ -1126,9 +1198,9 @@ where
             // session-scoped and are reused freely across sessions, so a pipe
             // that kept writing would sit there until the peer's next session
             // came up and then start delivering units — with labels it chose
-            // under the old one — into the new one. Label 3 meant a screen share
-            // to a session that no longer exists; in the successor it means
-            // whatever that session assigned. The client is still writing frames
+            // under the old one — into the new one. `screen` meant a screen
+            // share to a session that no longer exists; in the successor it
+            // means whatever that session named. The client is still writing frames
             // it believes are going one place and they arrive somewhere else,
             // with nothing anywhere in the path to notice, because nothing is
             // acknowledged per unit.
@@ -1139,15 +1211,25 @@ where
             if matches!(refusal, core_realtime::RealtimeRefusal::SessionNotCurrent) {
                 warn!(
                     %peer,
-                    label,
+                    label = %logged,
                     code = refusal.code(),
                     "realtime outbound pipe closing: its session is no longer current"
                 );
                 return Ok(());
             }
-            debug!(%peer, label, code = refusal.code(), "realtime send refused");
+            debug!(%peer, label = %logged, code = refusal.code(), "realtime send refused");
         }
     }
+}
+
+/// Render a flow label for a log line, and for nothing else.
+///
+/// A label is opaque application bytes with no guaranteed text form, so this is
+/// lossy by construction and its output must never reach the wire, a response,
+/// or a lookup: two distinct labels can render identically, which is harmless in
+/// a diagnostic and would be a routing bug anywhere else.
+fn label_for_log(label: &[u8]) -> String {
+    String::from_utf8_lossy(label).into_owned()
 }
 
 /// Push units for the bound session's inbound flows to a client's binary pipe.
@@ -1205,7 +1287,7 @@ where
             // reason to take down a session's whole inbound path.
             warn!(
                 peer = %bound.peer,
-                label = unit.flow_label,
+                label = %label_for_log(&unit.flow_label),
                 bytes = unit.payload.len(),
                 "realtime unit too large to frame — dropped"
             );
@@ -1230,10 +1312,10 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 "version": env!("CARGO_PKG_VERSION"),
                 "device_id": state.mesh.identity().display_id(),
                 "joined_networks": state.mesh.joined_network_ids(),
-                // Always present, not feature-gated: an application reads this
-                // to size its flow-label pool, and an absent field would be
-                // indistinguishable from a node that supports no flows.
-                "realtime_flows": state.realtime_flows,
+                // Always present: `supported: false` is a definite answer, and
+                // an absent object would be indistinguishable from a client
+                // that failed to read it.
+                "realtime": state.realtime,
             });
             Response::ok(status)
         }
@@ -1389,8 +1471,14 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
+            // The name crosses as bytes; the string is only how JSON carries
+            // it. Bounds are core's to enforce — an empty or over-long name is
+            // refused there, in the one place that also owns the frame width it
+            // is bounded by, rather than re-checked here against a copy of the
+            // rule that could drift.
+            let chosen = flow_label.clone();
             let open = core_webrtc::WebRtcRealtimeFlowOpen {
-                label: flow_label,
+                label: flow_label.into_bytes(),
                 direction,
                 kind: rtp_kind,
                 mime,
@@ -1405,10 +1493,14 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // call and still all-or-nothing from here, so a refusal has released
             // both the label and the native object and leaves nothing behind.
             match net.open_webrtc_realtime(&peer, open).await {
-                // Echoed back, not reassigned — core claims the exact label the
+                // Echoed back, not reassigned — core claims the exact name the
                 // caller chose. Returning it keeps the client's confirmation on
-                // the same path as its request rather than an event.
-                Ok(label) => {
+                // the same path as its request rather than an event. It is the
+                // caller's own string, not a re-decode of what core answered:
+                // core answers with the bytes it now holds, and those are the
+                // bytes of this string, so re-decoding would only introduce a
+                // failure mode where the two could differ.
+                Ok(_claimed) => {
                     // First flow on this session starts its lifecycle pump. The
                     // claim inside answers `None` if one is already running, so
                     // this is safe to attempt on every open and needs no
@@ -1421,7 +1513,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                         peer.clone(),
                         state.clients.clone(),
                     );
-                    Response::ok(serde_json::json!({ "flow_label": label }))
+                    Response::ok(serde_json::json!({ "flow_label": chosen }))
                 }
                 Err(refusal) => realtime_refused(refusal),
             }
@@ -1440,7 +1532,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // client that closes a label and immediately reopens it can rely on
             // the previous occupant being gone; acking on the release would make
             // that false in precisely the case where it matters.
-            match net.close_realtime(&peer, flow_label).await {
+            match net.close_realtime(&peer, flow_label.as_bytes()).await {
                 Ok(()) => Response::ok(serde_json::json!({ "closed": true })),
                 Err(refusal) => realtime_refused(refusal),
             }
@@ -2639,15 +2731,35 @@ static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(No
 /// Defensive cap on one frame body — a corrupt length never allocates more.
 pub const MAX_REALTIME_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// Fixed header width of a realtime frame body, identical in both directions:
-/// label, a one-byte slot, a four-byte slot, and the payload length.
+/// Fixed prefix width of a realtime frame body, identical in both directions:
+/// the label's length, a one-byte slot, a four-byte slot, and the payload
+/// length. The label's bytes and then the payload's follow it, in that order.
 ///
 /// Both slots are named by direction rather than here, because both mean
 /// different things each way: the one-byte slot is the marker inbound and
 /// reserved zero outbound, and the four-byte slot is an absolute timestamp
 /// inbound and a duration outbound. Equal width is what lets the two encoders be
 /// read against each other; it is not a shared meaning.
+///
+/// The leading byte is a *length*, not a label. A label is opaque bytes chosen
+/// by the application, so it cannot be a fixed-width field, and length-prefixing
+/// it with one byte is what makes [`MAX_REALTIME_FLOW_LABEL_BYTES`] 255 —
+/// the bound is the field's width, not a policy. Both variable-length runs are
+/// counted, so a body's total width is fully determined by its prefix, and a
+/// body whose bytes disagree with its own prefix is refused rather than
+/// resolved.
 const REALTIME_FRAME_HEADER: usize = 1 + 1 + 4 + 4;
+
+/// The longest label the frame above can carry, and therefore the longest core
+/// will accept.
+///
+/// Re-exported rather than restated. The bound is a representation fact about
+/// the single length byte in this frame, and the frame encoder here, the
+/// provider edge that refuses an over-long open, and the name constructor in the
+/// connector all have to agree on it — so there is one constant, in the basal
+/// vocabulary, and this is a second spelling of that one value rather than a
+/// second value.
+pub use myownmesh_core::realtime::MAX_REALTIME_FLOW_LABEL_BYTES;
 
 /// One unit read off an **outbound** pipe, on its way to a flow.
 ///
@@ -2656,7 +2768,12 @@ const REALTIME_FRAME_HEADER: usize = 1 + 1 + 4 + 4;
 /// pace it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealtimeSendUnit {
-    pub flow_label: u8,
+    /// The flow's opaque name, exactly as the application chose it. Never
+    /// parsed, ordered, or ranged over here; it is carried to core, which
+    /// resolves it by equality against one session's own table. Empty is
+    /// refused rather than accepted as a degenerate name, so the binary and
+    /// JSON paths cannot disagree about what an absent label means.
+    pub flow_label: Vec<u8>,
     /// Presentation duration of this unit. Paces the flow clock on the way
     /// out; it is *not* a timestamp, and deliberately does not share a type
     /// with one.
@@ -2689,7 +2806,9 @@ pub struct RealtimeSendUnit {
 /// not, so the types are not either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealtimeRecvUnit {
-    pub flow_label: u8,
+    /// The flow's opaque name, as core reported it on arrival. A copy of the
+    /// bytes, not a handle: it grants nothing and outlives nothing.
+    pub flow_label: Vec<u8>,
     pub marker: bool,
     /// Absolute, at the flow's declared `clock_rate`. Uninterpretable without
     /// it, which is why that is a field on the flow rather than a codec detail.
@@ -2704,11 +2823,14 @@ pub struct RealtimeRecvUnit {
 /// length it did not check against the bytes actually present.
 pub fn decode_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendUnit> {
     let header = body.get(..REALTIME_FRAME_HEADER)?;
-    let payload_len = u32::from_le_bytes(header[6..10].try_into().ok()?) as usize;
-    let payload = body.get(REALTIME_FRAME_HEADER..)?;
-    if payload.len() != payload_len {
+    let label_len = header[0] as usize;
+    // Zero is refused rather than read as "no label". A flow is always named,
+    // and a body that named nothing could only be resolved by guessing which
+    // flow it meant.
+    if label_len == 0 {
         return None;
     }
+    let payload_len = u32::from_le_bytes(header[6..10].try_into().ok()?) as usize;
     // Byte 1 is reserved and must be zero. Every other value is refused, which
     // is the strongest check available at this offset: the encoders
     // neighbouring this one put a stream index, a payload type or a keyframe
@@ -2721,8 +2843,19 @@ pub fn decode_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendUnit> {
     if header[1] != 0 {
         return None;
     }
+    // The two counted runs must account for the body exactly. Not `>=`: a body
+    // longer than its own prefix describes is as malformed as a short one, and
+    // accepting the excess would let a trailing tail ride along unread. This is
+    // also the check a one-byte-shifted body from a neighbouring encoder cannot
+    // survive, which is why it is arithmetic on both lengths rather than a
+    // bounds test on one.
+    let rest = body.get(REALTIME_FRAME_HEADER..)?;
+    if rest.len() != label_len.checked_add(payload_len)? {
+        return None;
+    }
+    let (label, payload) = rest.split_at(label_len);
     Some(RealtimeSendUnit {
-        flow_label: header[0],
+        flow_label: label.to_vec(),
         duration_us: u32::from_le_bytes(header[2..6].try_into().ok()?),
         payload: payload.to_vec(),
     })
@@ -2731,35 +2864,47 @@ pub fn decode_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendUnit> {
 /// Serialize an inbound unit body (no length prefix).
 ///
 /// Layout, integers little-endian:
-/// `flow_label u8 · marker u8 · rtp_timestamp u32 · len u32 · payload…`
+/// `label_len u8 · marker u8 · rtp_timestamp u32 · payload_len u32 · label… ·
+/// payload…`
 ///
-/// The `len` is redundant with the frame's own length prefix and is kept
-/// anyway, because the redundancy is the check. Every neighbouring encoder in
-/// the tree starts with a `kind u8` this one does not have, so a sender that
+/// Both lengths are redundant with the frame's own `u32` prefix and both are
+/// kept anyway, because the redundancy is the check. Every neighbouring encoder
+/// in the tree starts with a `kind u8` this one does not have, so a sender that
 /// reaches for the wrong one produces a body shifted by exactly one byte —
-/// where `flow_label` reads a kind, `marker` reads a stream index, and every
-/// field is plausible. The inner length is the only field that cannot survive
-/// that shift, so checking it against the bytes actually present turns a silent
-/// misinterpretation into a refusal. Four bytes a unit is cheap for that.
+/// where `label_len` reads a kind, `marker` reads a stream index, and every
+/// field is plausible. The two counted runs are what cannot survive that shift:
+/// they must account for the body exactly, and a shifted body's do not. Five
+/// bytes a unit is cheap for turning a silent misinterpretation into a refusal.
 ///
 /// See `a_neighbouring_encoders_frame_is_refused_not_reinterpreted`.
 pub fn encode_realtime_recv_unit(unit: &RealtimeRecvUnit) -> Option<Vec<u8>> {
-    // Both checks happen before anything is allocated, and both are checked
-    // rather than cast. `payload.len() as u32` would truncate a payload past
-    // 4 GiB and produce a body whose inner length disagreed with its own
+    // Every check happens before anything is allocated, and every one is
+    // checked rather than cast. `payload.len() as u32` would truncate a payload
+    // past 4 GiB and produce a body whose inner length disagreed with its own
     // contents — the exact malformation the decoder on the other side refuses,
     // manufactured by us. A frame that cannot be encoded correctly must not be
     // half-encoded.
+    //
+    // The label bound is the same rule the decoder enforces, applied here so a
+    // name that could not be framed is never half-written: empty is refused,
+    // and so is anything the one-byte length prefix could not count.
+    if unit.flow_label.is_empty() || unit.flow_label.len() > MAX_REALTIME_FLOW_LABEL_BYTES {
+        return None;
+    }
+    let label_len = u8::try_from(unit.flow_label.len()).ok()?;
     let payload_len = u32::try_from(unit.payload.len()).ok()?;
-    let total = REALTIME_FRAME_HEADER.checked_add(unit.payload.len())?;
+    let total = REALTIME_FRAME_HEADER
+        .checked_add(unit.flow_label.len())?
+        .checked_add(unit.payload.len())?;
     if total > MAX_REALTIME_FRAME_BYTES {
         return None;
     }
     let mut out = Vec::with_capacity(total);
-    out.push(unit.flow_label);
+    out.push(label_len);
     out.push(unit.marker as u8);
     out.extend_from_slice(&unit.rtp_timestamp.to_le_bytes());
     out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&unit.flow_label);
     out.extend_from_slice(&unit.payload);
     Some(out)
 }
@@ -2790,6 +2935,17 @@ mod realtime_control_tests {
         );
     }
 
+    /// A label of two or more bytes, used everywhere a fixture needs one.
+    ///
+    /// Deliberately not one byte. A single-byte label makes the length prefix
+    /// and the label indistinguishable in width, so a body built by hand would
+    /// pass several of the checks below by coincidence — the shift control in
+    /// particular would stop testing what it exists to test. It is also not
+    /// valid UTF-8, because the binary path carries bytes and must not quietly
+    /// acquire a text assumption from the JSON path that happens to sit beside
+    /// it.
+    const LABEL: &[u8] = &[b's', b'c', b'r', 0xff];
+
     /// Both directions bind to one session, so `network` and `peer` are
     /// required on each. A pipe that parsed without them would carry frames
     /// whose `flow_label` names a flow on no particular peer.
@@ -2813,31 +2969,31 @@ mod realtime_control_tests {
     ///
     /// The hazard is structural rather than particular to any one client. A
     /// layout of `kind u8 · stream u8 · key u8 · timestamp u32 · len u32 ·
-    /// payload` — our tail behind one extra leading byte — is a shape encoders
-    /// in this problem space converge on, and a sender that reaches for one
-    /// produces a body shifted by exactly one byte where every field stays
-    /// plausible: `flow_label` reads a kind (0 or 1, both valid labels), the
-    /// reserved byte reads a stream index, and the u32 slot reads a keyframe
-    /// flag glued to three bytes of timestamp.
+    /// payload` — our fixed prefix behind one extra leading byte — is a shape
+    /// encoders in this problem space converge on, and a sender that reaches for
+    /// one produces a body shifted by exactly one byte where every field stays
+    /// plausible: `label_len` reads a kind (1 or 2, both perfectly good label
+    /// lengths), the reserved byte reads a stream index, and the u32 slots read
+    /// a keyframe flag glued to three bytes of timestamp and then a length
+    /// glued to a byte of its own.
     ///
     /// Nothing is acknowledged per unit, so if this were interpreted rather than
     /// refused the failure would be one hundred percent of media going nowhere
-    /// with no signal on the sending side. The inner length is what makes that
-    /// impossible: it cannot survive the shift, so the frame is rejected.
+    /// with no signal on the sending side. The two counted runs are what make
+    /// that impossible: `label_len + payload_len` must account for the body
+    /// exactly, and a shifted body's cannot.
     #[test]
     fn a_neighbouring_encoders_frame_is_refused_not_reinterpreted() {
         let payload = [7u8, 7, 7, 7, 7, 7];
-        // The shifted layout: ours plus one leading `kind` byte.
+        // The shifted layout: our prefix plus one leading `kind` byte.
         //
-        // `stream` is 0 deliberately, and this is the second time that choice
-        // has had to move. After the shift it lands in our reserved byte, which
-        // now accepts only zero — so a nonzero stream index would be refused
-        // there and this control would pass while never reaching the length
-        // check it exists to prove. Stream 0 gets past the reserved check and is
-        // caught by the length disagreement, which is the property under test.
-        //
-        // Stream 0 is also the commonest value a real sender uses, so this is
-        // the shift most likely to actually happen.
+        // `kind` is 1 and `stream` is 0, and neither choice is incidental.
+        // After the shift `kind` lands in `label_len`, so it must be nonzero or
+        // the empty-label check rejects the body before the arithmetic runs;
+        // `stream` lands in the reserved byte, which accepts only zero, so a
+        // nonzero stream index would be refused there instead. Both are the
+        // commonest values a real sender writes, and both are chosen here so the
+        // body reaches the one check this control exists to prove.
         let mut foreign = Vec::new();
         foreign.push(1u8); // kind
         foreign.push(0u8); // stream
@@ -2849,22 +3005,39 @@ mod realtime_control_tests {
         assert_eq!(
             foreign.len(),
             REALTIME_FRAME_HEADER + 1 + payload.len(),
-            "the foreign header is ours plus exactly one leading byte — if this \
-             ever stops holding, the shift this test protects against has changed \
-             shape and the assertion below is no longer testing it"
+            "the foreign body is our prefix plus exactly one leading byte — if \
+             this ever stops holding, the shift this test protects against has \
+             changed shape and the assertion below is no longer testing it"
         );
         assert!(
             decode_realtime_send_unit(&foreign).is_none(),
             "a one-byte-shifted body must be refused: with the reserved byte \
-             zeroed by the shift, the length check is the only thing standing \
-             between it and silently misrouted media"
+             zeroed and the label length nonzero, the counted-run arithmetic is \
+             the only thing standing between it and silently misrouted media"
         );
-        // Non-vacuity: the reserved check must NOT be what rejected it, or this
-        // control would still pass if the length check were deleted tomorrow.
+        // Non-vacuity, both halves. Neither cheap check may be what rejected
+        // this body, or the control would keep passing after the arithmetic it
+        // exists to protect was deleted.
+        assert_ne!(
+            foreign[0], 0,
+            "the shifted body must reach the length arithmetic, not stop at the \
+             empty-label check"
+        );
         assert_eq!(
             foreign[1], 0,
-            "the shifted body must reach the length check, not stop at the \
+            "the shifted body must reach the length arithmetic, not stop at the \
              reserved byte"
+        );
+        // And the arithmetic really is what disagrees: the shifted body claims
+        // one label byte plus six payload bytes, and carries eleven after the
+        // prefix.
+        let shifted_claim = foreign[0] as usize
+            + u32::from_le_bytes(foreign[6..10].try_into().expect("ten bytes present")) as usize;
+        assert_ne!(
+            shifted_claim,
+            foreign.len() - REALTIME_FRAME_HEADER,
+            "if a shifted body's counted runs ever add up, this control proves \
+             nothing and the layout must be reconsidered"
         );
     }
 
@@ -2874,34 +3047,84 @@ mod realtime_control_tests {
     ///
     /// `reserved` is a raw byte rather than a `bool`, because the field it
     /// occupies is reserved zero and the interesting cases are the values a
-    /// correct client never writes.
-    fn encode_send_unit(flow_label: u8, reserved: u8, duration_us: u32, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(REALTIME_FRAME_HEADER + payload.len());
-        out.push(flow_label);
+    /// correct client never writes. `label_len` is taken separately from
+    /// `label` so a fixture can state a length its bytes do not back, which is
+    /// the malformation the decoder has to refuse.
+    fn encode_send_unit_parts(
+        label_len: u8,
+        label: &[u8],
+        reserved: u8,
+        duration_us: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(REALTIME_FRAME_HEADER + label.len() + payload.len());
+        out.push(label_len);
         out.push(reserved);
         out.extend_from_slice(&duration_us.to_le_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(label);
         out.extend_from_slice(payload);
         out
     }
 
+    /// The well-formed case: the stated length is the label's own.
+    fn encode_send_unit(label: &[u8], reserved: u8, duration_us: u32, payload: &[u8]) -> Vec<u8> {
+        encode_send_unit_parts(
+            u8::try_from(label.len()).expect("a fixture label is within the prefix width"),
+            label,
+            reserved,
+            duration_us,
+            payload,
+        )
+    }
+
     #[test]
     fn send_units_round_trip_without_naming_a_codec() {
-        let body = encode_send_unit(3, 0, 33_333, &[1, 2, 3, 9]);
+        let body = encode_send_unit(LABEL, 0, 33_333, &[1, 2, 3, 9]);
         let unit = decode_realtime_send_unit(&body).expect("decode");
-        assert_eq!(unit.flow_label, 3);
+        // Exact opaque bytes, not a rendering of them: the label is four bytes
+        // and the last is not valid UTF-8, so anything that went through a
+        // string on the way here would come back changed.
+        assert_eq!(unit.flow_label, LABEL.to_vec());
         assert_eq!(unit.duration_us, 33_333);
         assert_eq!(unit.payload, vec![1, 2, 3, 9]);
 
-        // An empty payload is a legitimate unit, and the same decode path.
-        let empty =
-            decode_realtime_send_unit(&encode_send_unit(0, 0, 20_000, &[])).expect("decode empty");
+        // An empty payload is a legitimate unit, and the same decode path. An
+        // empty *label* is not — see `a_frame_naming_no_flow_is_refused`.
+        let empty = decode_realtime_send_unit(&encode_send_unit(LABEL, 0, 20_000, &[]))
+            .expect("decode empty");
         assert!(empty.payload.is_empty());
+        assert_eq!(empty.flow_label, LABEL.to_vec());
+
+        // The longest label the prefix can count still round-trips whole.
+        let longest = vec![0xab; MAX_REALTIME_FLOW_LABEL_BYTES];
+        let long = decode_realtime_send_unit(&encode_send_unit(&longest, 0, 1, &[4]))
+            .expect("a 255-byte label is within the prefix width");
+        assert_eq!(long.flow_label, longest);
+    }
+
+    /// A body that names no flow is refused rather than read as naming none.
+    ///
+    /// Zero is the one label length that would otherwise decode into something
+    /// — a unit with an empty name, which core could only resolve by guessing.
+    /// Refusing it here is also what keeps the binary path and the JSON path
+    /// agreeing: neither has a spelling for "a flow with no name".
+    #[test]
+    fn a_frame_naming_no_flow_is_refused() {
+        let body = encode_send_unit_parts(0, &[], 0, 1, &[7, 7, 7]);
+        assert!(
+            decode_realtime_send_unit(&body).is_none(),
+            "a zero-length label must be refused, not read as an absent one"
+        );
+        // Non-vacuity: with a real label of the same shape the body decodes, so
+        // it is the zero that was rejected and not the rest of the frame.
+        let ok = encode_send_unit(LABEL, 0, 1, &[7, 7, 7]);
+        assert!(decode_realtime_send_unit(&ok).is_some());
     }
 
     #[test]
     fn truncation_is_none_not_panic() {
-        let body = encode_send_unit(1, 0, 1, &[7, 7, 7]);
+        let body = encode_send_unit(LABEL, 0, 1, &[7, 7, 7]);
         for cut in 0..body.len() {
             assert!(
                 decode_realtime_send_unit(&body[..cut]).is_none(),
@@ -2910,19 +3133,54 @@ mod realtime_control_tests {
         }
     }
 
-    /// The inner length is redundant with the frame's own prefix, which is
+    /// The two counted runs are redundant with the frame's own prefix, which is
     /// exactly why a disagreement between them must be refused rather than
-    /// resolved: silently trusting either one lets a corrupt frame hand a
-    /// truncated or over-long payload to a decoder as if it were whole.
+    /// resolved: silently trusting any one of them lets a corrupt frame hand a
+    /// truncated or over-long payload — or a label sliced out of a payload — to
+    /// a decoder as if it were whole.
     #[test]
-    fn a_payload_length_that_disagrees_with_the_frame_is_refused() {
-        let mut body = encode_send_unit(1, 0, 1, &[7, 7, 7]);
-        body[6] = 9; // claim nine payload bytes where three are present
+    fn a_length_that_disagrees_with_the_frame_is_refused() {
+        // A payload length larger than the bytes present.
+        let mut body = encode_send_unit(LABEL, 0, 1, &[7, 7, 7]);
+        body[6] = 9;
         assert!(decode_realtime_send_unit(&body).is_none());
 
-        let mut over = encode_send_unit(1, 0, 1, &[7, 7, 7]);
-        over.push(0); // a fourth byte the stated length does not cover
+        // A body longer than its own counted runs describe. The excess is not
+        // ignored: accepting it would let a trailing tail ride along unread.
+        let mut over = encode_send_unit(LABEL, 0, 1, &[7, 7, 7]);
+        over.push(0);
         assert!(decode_realtime_send_unit(&over).is_none());
+
+        // A label length longer than the label actually written. Every field
+        // after the prefix stays plausible — the decoder would simply take
+        // payload bytes as name bytes — so only the total can catch it.
+        let overlong_label = encode_send_unit_parts(
+            u8::try_from(LABEL.len() + 1).expect("fits"),
+            LABEL,
+            0,
+            1,
+            &[7, 7, 7],
+        );
+        assert!(
+            decode_realtime_send_unit(&overlong_label).is_none(),
+            "a label length its bytes do not back must be refused, not filled \
+             from the payload"
+        );
+
+        // And shorter, which would otherwise silently rename the flow and
+        // prepend the leftover byte to its payload.
+        let short_label = encode_send_unit_parts(
+            u8::try_from(LABEL.len() - 1).expect("fits"),
+            LABEL,
+            0,
+            1,
+            &[7, 7, 7],
+        );
+        assert!(
+            decode_realtime_send_unit(&short_label).is_none(),
+            "a label length shorter than its bytes must be refused, not read as \
+             a different flow"
+        );
     }
 
     /// Byte 1 of an outbound body is reserved: zero decodes, everything else is
@@ -2940,16 +3198,16 @@ mod realtime_control_tests {
     /// the byte would let that belief survive without ever being contradicted.
     #[test]
     fn a_nonzero_reserved_byte_is_refused() {
-        let ok = encode_send_unit(1, 0, 1, &[7]);
+        let ok = encode_send_unit(LABEL, 0, 1, &[7]);
         let unit = decode_realtime_send_unit(&ok).expect("a zeroed reserved byte decodes");
-        assert_eq!(unit.flow_label, 1);
+        assert_eq!(unit.flow_label, LABEL.to_vec());
         assert_eq!(unit.payload, vec![7]);
 
         // Every nonzero value, not a sample. 1 is the important one — it is
         // what a client that still thinks it is sending a marker would write,
         // and the value most likely to be waved through by a `!= 0` reading.
         for byte in 1u8..=255 {
-            let body = encode_send_unit(1, byte, 1, &[7]);
+            let body = encode_send_unit(LABEL, byte, 1, &[7]);
             assert!(
                 decode_realtime_send_unit(&body).is_none(),
                 "reserved byte {byte} must be refused"
@@ -2967,21 +3225,24 @@ mod realtime_control_tests {
     #[test]
     fn a_unit_too_large_to_frame_is_not_half_encoded() {
         let ok = encode_realtime_recv_unit(&RealtimeRecvUnit {
-            flow_label: 4,
+            flow_label: LABEL.to_vec(),
             marker: true,
             rtp_timestamp: 90_000,
             payload: vec![1, 2, 3],
         })
         .expect("an ordinary unit encodes");
-        assert_eq!(ok.len(), REALTIME_FRAME_HEADER + 3);
+        assert_eq!(ok.len(), REALTIME_FRAME_HEADER + LABEL.len() + 3);
 
-        // One byte past what the framing may carry. Allocated rather than
-        // faked, so the bound under test is the real one.
+        // One byte past what the framing may carry. The label counts toward the
+        // ceiling too, which is why it is subtracted here: a bound that only
+        // considered the payload would emit bodies a byte over. Allocated rather
+        // than faked, so the bound under test is the real one.
+        let headroom = MAX_REALTIME_FRAME_BYTES - REALTIME_FRAME_HEADER - LABEL.len();
         let oversize = RealtimeRecvUnit {
-            flow_label: 4,
+            flow_label: LABEL.to_vec(),
             marker: false,
             rtp_timestamp: 0,
-            payload: vec![0u8; MAX_REALTIME_FRAME_BYTES - REALTIME_FRAME_HEADER + 1],
+            payload: vec![0u8; headroom + 1],
         };
         assert!(
             encode_realtime_recv_unit(&oversize).is_none(),
@@ -2991,15 +3252,51 @@ mod realtime_control_tests {
         // The largest unit that still fits is accepted — the check is a ceiling,
         // not an off-by-one that also rejects the boundary.
         let exact = RealtimeRecvUnit {
-            flow_label: 4,
+            flow_label: LABEL.to_vec(),
             marker: false,
             rtp_timestamp: 0,
-            payload: vec![0u8; MAX_REALTIME_FRAME_BYTES - REALTIME_FRAME_HEADER],
+            payload: vec![0u8; headroom],
         };
         assert_eq!(
             encode_realtime_recv_unit(&exact).map(|body| body.len()),
             Some(MAX_REALTIME_FRAME_BYTES)
         );
+    }
+
+    /// A label the framing cannot express is refused outright, not truncated.
+    ///
+    /// Both ends of the rule, because both are reachable: an empty name would
+    /// produce a body the decoder must refuse, and a name past the one-byte
+    /// prefix would have its length silently wrapped into a different, valid
+    /// number — which is worse than a dropped unit, since it names a real flow
+    /// that is not this one.
+    #[test]
+    fn a_label_the_frame_cannot_carry_is_not_half_encoded() {
+        let unnamed = RealtimeRecvUnit {
+            flow_label: Vec::new(),
+            marker: false,
+            rtp_timestamp: 0,
+            payload: vec![1],
+        };
+        assert!(encode_realtime_recv_unit(&unnamed).is_none());
+
+        let overlong = RealtimeRecvUnit {
+            flow_label: vec![b'x'; MAX_REALTIME_FLOW_LABEL_BYTES + 1],
+            marker: false,
+            rtp_timestamp: 0,
+            payload: vec![1],
+        };
+        assert!(encode_realtime_recv_unit(&overlong).is_none());
+
+        // The boundary itself encodes, so the rule is a ceiling and not an
+        // off-by-one that also rejects the longest usable name.
+        let longest = RealtimeRecvUnit {
+            flow_label: vec![b'x'; MAX_REALTIME_FLOW_LABEL_BYTES],
+            marker: false,
+            rtp_timestamp: 0,
+            payload: vec![1],
+        };
+        assert!(encode_realtime_recv_unit(&longest).is_some());
     }
 
     /// The `network_connect_peer` op is what a daemon-client embedder sends to
@@ -3041,7 +3338,7 @@ mod realtime_control_tests {
     #[test]
     fn recv_unit_layout_is_pinned() {
         let body = encode_realtime_recv_unit(&RealtimeRecvUnit {
-            flow_label: 2,
+            flow_label: vec![b'a', b'b', 0xff],
             marker: true,
             rtp_timestamp: 0x0001_0203,
             payload: vec![9, 8],
@@ -3050,10 +3347,11 @@ mod realtime_control_tests {
         assert_eq!(
             body,
             vec![
-                2, // flow_label
+                3, // label_len
                 1, // marker
                 0x03, 0x02, 0x01, 0x00, // rtp_timestamp LE
                 2, 0, 0, 0, // payload len LE
+                b'a', b'b', 0xff, // label, verbatim and not text
                 9, 8, // payload
             ]
         );
@@ -3078,7 +3376,7 @@ mod realtime_control_tests {
         // A marked inbound unit is now refused: its marker byte is 1 where the
         // outbound reserved byte must be 0.
         let marked = RealtimeRecvUnit {
-            flow_label: 4,
+            flow_label: LABEL.to_vec(),
             marker: true,
             rtp_timestamp: 90_000,
             payload: vec![1],
@@ -3092,7 +3390,7 @@ mod realtime_control_tests {
         // An unmarked one still crosses silently, which is the case the type
         // split has to cover, because no byte distinguishes it.
         let recv = RealtimeRecvUnit {
-            flow_label: 4,
+            flow_label: LABEL.to_vec(),
             marker: false,
             rtp_timestamp: 90_000,
             payload: vec![1],

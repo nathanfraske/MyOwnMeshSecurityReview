@@ -118,10 +118,6 @@ pub(crate) trait RealtimeUnitFraming: Send + Sync {
     /// loss; that is the cost of the answer, and it is the framing's to pay.
     fn payload_starts_unit(&self, payload: &Bytes) -> bool;
 
-    /// The most fragments one unit may hold before the stream is treated as
-    /// wedged and the unit is dropped whole.
-    fn max_fragments_per_unit(&self) -> usize;
-
     /// Validate the chain and answer the exact output length, allocating no
     /// output storage.
     ///
@@ -197,9 +193,11 @@ pub(crate) struct RealtimeUnitAssembler {
 }
 
 impl RealtimeUnitAssembler {
-    /// An assembler with no flow, and so no resource accounting. Controls and
-    /// the raw lab use this; a real inbound pump uses [`Self::guarded`].
-    pub(crate) fn new(framing: Arc<dyn RealtimeUnitFraming>) -> Self {
+    /// The shared empty state. Private, because an assembler's retention bound
+    /// comes entirely from the flow it accounts against: the two constructors
+    /// below differ only in whether they supply one, and that difference is the
+    /// whole of the difference between bounded and unbounded.
+    fn empty(framing: Arc<dyn RealtimeUnitFraming>) -> Self {
         Self {
             timestamp: 0,
             parts: std::collections::BTreeMap::new(),
@@ -212,13 +210,28 @@ impl RealtimeUnitAssembler {
         }
     }
 
+    /// An assembler with no flow, and so no resource accounting at all.
+    ///
+    /// `#[cfg(test)]` deliberately. Retention is bounded by the flow's own
+    /// fragment admission and by nothing else, so an assembler without a flow
+    /// is an assembler without a bound — it will retain whatever a peer sends
+    /// for one timestamp. That is acceptable for a control feeding it a
+    /// scripted packet sequence and is not acceptable anywhere a peer chooses
+    /// the input, so the production path cannot construct one: the compiler
+    /// enforces that rather than a comment asking.
+    #[cfg(test)]
+    pub(crate) fn new(framing: Arc<dyn RealtimeUnitFraming>) -> Self {
+        Self::empty(framing)
+    }
+
+    /// The production constructor: every fragment is admitted against `flow`.
     pub(crate) fn guarded(
         framing: Arc<dyn RealtimeUnitFraming>,
         flow: RealtimeFlowPortHandle,
     ) -> Self {
         Self {
             flow: Some(flow),
-            ..Self::new(framing)
+            ..Self::empty(framing)
         }
     }
 
@@ -281,14 +294,6 @@ impl RealtimeUnitAssembler {
                 // the live stream still needs.
                 return Ok(None);
             }
-        }
-        if self.parts.len() >= self.framing.max_fragments_per_unit() {
-            self.clear_current();
-            self.marker_seq = None;
-            self.prev_end = None;
-            return Err(Error::Transport(
-                "real-time unit overflowed reassembly".into(),
-            ));
         }
         if self.parts.contains_key(&seq) {
             if pkt.header.marker {

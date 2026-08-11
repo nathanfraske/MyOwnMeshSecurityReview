@@ -22,12 +22,33 @@
 //! whose they are in its name — so nothing is left to validate and nothing in a
 //! payload can name an authority.
 //!
-//! A label is a `u8`. Publishing the connector's typed label, flow handles or
-//! ports would invite reading one as a handle that grants something; here it is
-//! the number an application chose, and it grants nothing because every
-//! operation resolves a live session first.
+//! A label here is a bounded opaque name: 1..=255 bytes the application chose,
+//! carried verbatim and never interpreted. Bounded because that is what the
+//! encoded frame can spell, opaque because nothing on this side reads it, and
+//! session-scoped because it means something only against the flow set that
+//! accepted it.
+//!
+//! Publishing the connector's leased label, flow handles or ports would invite
+//! reading one as a handle that grants something. What crosses instead is a
+//! copy of the bytes, and it grants nothing: every operation resolves a live
+//! session first, and the copy owns no part of the session's accounting for the
+//! name it spells.
 
 use serde::{Deserialize, Serialize};
+
+/// The largest label the encoded frame can carry.
+///
+/// **A representation fact, not a policy ceiling and not tunable.** The frame's
+/// label is prefixed by one length byte, so this is the width of that field and
+/// nothing more. It bounds one label's size and says nothing about how many
+/// labels may exist at once — that is admission's question, and admission
+/// answers it with leases.
+///
+/// It lives in the basal vocabulary because the daemon, the provider edge and
+/// the connector all have to agree on it, and three copies of `255` would agree
+/// until one of them was changed. Anything that speaks the wire refers to this
+/// one constant.
+pub const MAX_REALTIME_FLOW_LABEL_BYTES: usize = u8::MAX as usize;
 
 /// Which way units travel on one flow.
 ///
@@ -65,8 +86,12 @@ pub enum RealtimeFlowDirection {
 /// which is exactly the retention this design removes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RealtimeFlowEvent {
-    /// The flow under this label is gone and the label is free to claim again.
-    Closed { label: u8 },
+    /// The flow under this name is gone and the name is free to claim again.
+    ///
+    /// A copy of the bytes, not the connector's leased label: a consumer
+    /// holding the label itself would be an untracked holder of the session's
+    /// lease, and this event routinely outlives the flow it reports.
+    Closed { label: Vec<u8> },
 }
 
 /// An exclusive lease on one session's whole inbound stream.

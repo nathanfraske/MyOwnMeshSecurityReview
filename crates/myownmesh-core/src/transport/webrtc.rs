@@ -146,8 +146,9 @@ pub use session_flow::WebRtcRtpKind;
 /// module that has no other kind of profile, and the qualification is only owed
 /// to callers who see it next to other providers' vocabularies.
 pub use session_flow::{
-    RealtimeCodec as WebRtcRealtimeCodec, RealtimeFraming as WebRtcRealtimeFraming,
-    RealtimeProfile as WebRtcRealtimeProfile, RealtimeProfileError as WebRtcRealtimeProfileError,
+    RealtimeCodec as WebRtcRealtimeCodec, RealtimeFlowName,
+    RealtimeFraming as WebRtcRealtimeFraming, RealtimeProfile as WebRtcRealtimeProfile,
+    RealtimeProfileError as WebRtcRealtimeProfileError,
     RealtimeRtcpFeedback as WebRtcRealtimeRtcpFeedback,
 };
 /// The per-session flow vocabulary, and nothing else from that module.
@@ -372,6 +373,40 @@ impl RealtimeInboundDelivery {
         }
     }
 
+    /// **Controls only.** A delivery for `name` that never passed the
+    /// accounting path.
+    ///
+    /// The engine's unaccounted-delivery negative needs exactly one thing that
+    /// production cannot produce: a delivery naming a live flow while carrying
+    /// no payload lease. It is named for that, rather than reached by widening
+    /// [`RealtimeFlowLabel::mint`] — a caller able to mint could make a *real*
+    /// label outside admission, which is the opposite of what this proves.
+    ///
+    /// What is unaccounted is the **payload**. The label itself takes a real
+    /// lease, against a control-only elastic scope created once here, because
+    /// there is no such thing as an unleased label and a fixture that faked one
+    /// would be proving something about a shape that cannot exist. That is also
+    /// why the scope is never retired: a fixture label may outlive the control
+    /// that made it.
+    /// `pub(crate)`, matching [`RealtimeRecvUnit`]'s own visibility. The
+    /// engine's lab control is in this crate, so that is the whole audience;
+    /// a `pub` signature naming a `pub(crate)` type would be a private
+    /// interface, and widening the unit to reach for `pub` would publish an
+    /// inbound unit type nothing outside core has any use for.
+    ///
+    /// Gated on **both**, because its one caller is. The engine's negative is a
+    /// `#[tokio::test]` that is itself `cfg(feature = "transport-lab")`, so
+    /// `test` alone leaves this uncalled in a default-feature test build and
+    /// the lab feature alone leaves it uncallable in a library build. The
+    /// conjunction is the exact audience.
+    ///
+    /// The helper it calls stays plain `cfg(test)` on purpose: that one has a
+    /// second caller in this module's own controls, which do not need the lab.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn unaccounted_for_test(name: &RealtimeFlowName, unit: RealtimeRecvUnit) -> Self {
+        Self::new(control_label_for_test(name), unit)
+    }
+
     /// How many payload bytes this delivery carries.
     ///
     /// Read at callback admission, which charges the delivery against the
@@ -427,6 +462,79 @@ impl RealtimeInboundDelivery {
     fn into_parts(self) -> Option<(RealtimeFlowLabel, RealtimeRecvUnit, RealtimePayloadLease)> {
         Some((self.label, self.unit, self.payload?))
     }
+}
+
+/// A real leased label for a control, over a scope that is never retired.
+///
+/// One shared elastic registry for every fixture label in the crate. Controls
+/// and lab harnesses need labels that are *real* — minted at admission, holding
+/// a real lease — without owning a session to mint them from, and a per-call
+/// provider stack would be both slower and a second thing to keep in step.
+///
+/// The scope is created once and deliberately leaked. A fixture label can be
+/// retained by a queued event that outlives the control that made it, so tying
+/// the scope to any one control's lifetime would retire it under a live lease.
+#[cfg(test)]
+fn control_label_for_test(name: &RealtimeFlowName) -> RealtimeFlowLabel {
+    static CONTROL_REGISTRY: std::sync::OnceLock<Arc<RealtimeFlowRegistry>> =
+        std::sync::OnceLock::new();
+    let registry = CONTROL_REGISTRY.get_or_init(|| {
+        let (registry, resources) =
+            RealtimeFlowRegistry::elastic_for_control(elastic_control_grant());
+        std::mem::forget(resources);
+        registry
+    });
+    RealtimeFlowLabel::mint(name.clone(), registry)
+        .expect("the control grant admits one fixture label")
+}
+
+/// The grant every elastic control registry in this crate stands on.
+///
+/// **Two halves, and only one of them is a number anyone chose.** The
+/// structural half is `explicit_test_grant(1, 1)` — the same mechanical
+/// derivation the rest of the fixtures use, covering the process cleanup
+/// infrastructure, one Mesh scope and one connector candidate with its
+/// operation and reservation bookkeeping. That is what
+/// [`RealtimeFlowRegistry::elastic_for_control`] actually builds, so listing
+/// its dimensions by hand meant omitting whichever one nobody thought of; a
+/// missing `SocketOrHandle` was exactly that.
+///
+/// The second half is deliberate headroom for the real-time leases the elastic
+/// controls take — labels, profiles, flows, output and queued bytes, ready
+/// records and packet work. It is generous on purpose and states nothing about
+/// policy: an elastic control is about what the path *charges*, not about where
+/// it stops, and the controls that care about stopping derive their own grant
+/// exactly from the claim under test.
+///
+/// **The entries are the six dimensions the real-time claim constructors in
+/// `realtime.rs` actually name**, not a list of the ones that happened to be
+/// needed when it was written — the two byte-denominated classes
+/// (`AccountedMemoryBytes` for retention, `QueuedBytes` for what
+/// `queue_claim` charges) and the four counted ones. A dimension omitted here
+/// is not a smaller grant, it is a zero, so the way this goes wrong is a
+/// control failing on a class nobody thought to list. Re-derive by grepping
+/// `ResourceClass::` in `realtime.rs` if a claim gains a term.
+#[cfg(test)]
+fn elastic_control_grant() -> crate::resource::ResourceClaim {
+    crate::runtime::attempt::explicit_test_grant(1, 1)
+        .checked_add(
+            crate::resource::ResourceClaim::try_from_entries([
+                (
+                    crate::resource::ResourceClass::AccountedMemoryBytes,
+                    1 << 24,
+                ),
+                (crate::resource::ResourceClass::QueuedBytes, 1 << 24),
+                (crate::resource::ResourceClass::WorkerOrTask, 64),
+                (crate::resource::ResourceClass::CallbackOrScheduledWork, 64),
+                (crate::resource::ResourceClass::ParsingOrCpuWork, 64),
+                (
+                    crate::resource::ResourceClass::OpaqueDependencyResidual,
+                    4_096,
+                ),
+            ])
+            .expect("the elastic control headroom is representable"),
+        )
+        .expect("the elastic control grant is representable")
 }
 
 /// One negotiated native track for an outbound session flow.
@@ -4003,7 +4111,7 @@ impl WebRtcConnectorWorker {
             .session
             .realtime_profile
             .as_ref()
-            .is_some_and(|profile| profile.admits_encoding(encoding).is_some());
+            .is_some_and(|profile| profile.profile().admits_encoding(encoding).is_some());
         if !registered {
             return Err(Error::Transport(
                 "realtime encoding names no registered capability".to_string(),
@@ -5201,7 +5309,13 @@ fn realtime_media_codecs(
                     payload_type: codec.payload_type,
                     ..Default::default()
                 },
-                match WebRtcRtpKind::from(codec.kind) {
+                // `codec.kind` is already a `WebRtcRtpKind`; the `from` that
+                // used to wrap it dated from when the two sides of this match
+                // were different types and had become an identity conversion.
+                // Matching the value directly keeps the total map — every
+                // variant still names its `RTPCodecType`, so adding one is
+                // still a compile error here — without the round trip.
+                match codec.kind {
                     WebRtcRtpKind::Audio => RTPCodecType::Audio,
                     WebRtcRtpKind::Video => RTPCodecType::Video,
                 },
@@ -5747,6 +5861,27 @@ impl Transport {
             };
             let realtime_flows =
                 RealtimeFlowRegistry::new(realtime_resources, realtime_local_ceiling);
+            // The application's codecs become a shared, leased record here —
+            // once, against this connector's own work scope — and every session
+            // promoted on this connector then holds a pointer to it. Each
+            // promotion used to deep-clone the codec vector, both `String`s per
+            // codec and every feedback entry, and pay for none of it.
+            //
+            // Refusal is ordinary and fails the connector rather than the
+            // session: registering codecs whose retention nothing accounted for
+            // is the state this exists to make unreachable.
+            let realtime_profile = match realtime_profile {
+                Some(profile) => Some(
+                    session_flow::LeasedRealtimeProfile::mint(profile, &realtime_flows).map_err(
+                        |_| {
+                            Error::Transport(
+                                "connector resources refused the real-time profile".to_string(),
+                            )
+                        },
+                    )?,
+                ),
+                None => None,
+            };
             let lifecycle = Arc::new(ConnectorLifecycleOwner::with_reserved_lifecycle_work(
                 reserved_open_work,
                 reserved_close_work,
@@ -7320,7 +7455,11 @@ pub struct PeerSession {
     /// "which framing does this family want". Re-deriving the second from the
     /// first is not possible — the media engine keeps no framing — so the
     /// profile is held rather than consumed.
-    realtime_profile: Option<RealtimeProfile>,
+    ///
+    /// Leased and shared: this is the connector's one charged copy, and a
+    /// promoted session's flow set holds a pointer to the same record rather
+    /// than a deep clone of it.
+    realtime_profile: Option<session_flow::LeasedRealtimeProfile>,
     /// The current session's inbound realtime wiring, shared with the
     /// `on_track` callback that reads it when a track arrives.
     realtime_tracks: Arc<RealtimeSessionTracks>,
@@ -7751,6 +7890,16 @@ fn realtime_fixture_provider_grant(
     for _ in 0..total_flows {
         add_lease(&mut grant, RealtimeFlowRegistry::flow_claim()?)?;
         add_lease(&mut grant, RealtimeFlowRegistry::ready_claim()?)?;
+        // One label per flow, sized by the longest name the frame can carry.
+        // The fixture cannot know what an application will call its flows, and
+        // a grant derived from a shorter guess would refuse opens the policy
+        // itself admits.
+        add_lease(
+            &mut grant,
+            session_flow::RealtimeFlowLabel::mint_claim(
+                crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES,
+            )?,
+        )?;
     }
     for _ in 0..inbound_flows {
         add_lease(&mut grant, RealtimeFlowRegistry::native_read_claim()?)?;
@@ -7882,6 +8031,21 @@ pub fn transport_lab_connector_fixture_grant(
                 &mut grant,
                 realtime_fixture_provider_grant(local)?,
                 "connector real-time fixture envelope",
+            )?;
+        }
+
+        // The connector's one shared, leased copy of the application's codecs.
+        // Charged per profile that registers any, and only once each: a
+        // promotion clones the pointer rather than the codecs.
+        if let Some(realtime) = profile.realtime() {
+            add(
+                &mut grant,
+                FiniteResourceProvider::reservation_charge_for_test(
+                    session_flow::LeasedRealtimeProfile::mint_claim(realtime)
+                        .map_err(Error::from)?,
+                )
+                .map_err(Error::from)?,
+                "connector real-time profile record",
             )?;
         }
     }
@@ -8322,11 +8486,22 @@ mod tests {
     fn test_realtime_resource_scope(
         local: EnabledRealtimeConnectorPolicy,
     ) -> ConnectorWorkResourceScope {
+        // One control profile per fixture registry, charged here rather than in
+        // the shared envelope helper: the envelope describes flows, and which
+        // profile a fixture registers is this module's fact.
+        let profile_claim = FiniteResourceProvider::reservation_charge_for_test(
+            session_flow::LeasedRealtimeProfile::mint_claim(
+                &session_flow::control_realtime_profile(),
+            )
+            .expect("the control profile claim is representable"),
+        )
+        .expect("the control profile reservation is representable");
         let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
             .checked_add(
                 realtime_fixture_provider_grant(local)
                     .expect("fixture real-time envelope is representable"),
             )
+            .and_then(|grant| grant.checked_add(profile_claim))
             .expect("fixture provider grant is representable");
 
         let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
@@ -8573,7 +8748,14 @@ mod tests {
             ),
             ConnectorRealtimeInboundLimits::new(
                 nonzero(max_inbound_fragment_bytes, "fragment limit"),
-                nonzero(MAX_AU_PARTS, "compatibility per-unit fragment count"),
+                // The fixture is the owner here, so it names its own ceiling
+                // rather than borrowing a core constant. It used to read a
+                // shared `MAX_AU_PARTS`; core no longer has one, because a
+                // per-unit fragment count is exactly the kind of number an
+                // owner chooses and core cannot. The value is the one these
+                // controls were written against, so their arithmetic is
+                // unchanged — it is now stated where it is chosen.
+                nonzero(2_048, "fixture per-unit fragment count"),
                 nonzero(
                     max_in_progress_units_per_flow,
                     "per-flow in-progress unit limit",
@@ -8624,12 +8806,38 @@ mod tests {
         }
     }
 
+    /// A leased label for one fixture flow.
+    ///
+    /// The controls in this module care *which* flow a delivery is on rather
+    /// than what its name spells, so they keep naming flows by number — but
+    /// what they get back is a real minted label over a shared elastic control
+    /// registry, because a hand-built label is not the shape production ever
+    /// produces. Two calls with the same number compare equal, which is what
+    /// the demultiplexing assertions rely on.
+    ///
+    /// It stands on the crate's shared control scope, which is deliberately
+    /// never retired: a fixture label can be retained by a queued event that
+    /// outlives the control that made it.
+    fn test_label(number: u8) -> RealtimeFlowLabel {
+        control_label_for_test(
+            &RealtimeFlowName::new(format!("flow-{number}").into_bytes())
+                .expect("a fixture name is within the frame bound"),
+        )
+    }
+
+    /// The raw name a fixture flow is opened under, before any session has
+    /// accepted it and minted a lease for it.
+    fn fixture_flow_name() -> RealtimeFlowName {
+        RealtimeFlowName::new(b"fixture-flow".to_vec())
+            .expect("the fixture name is within the frame bound")
+    }
+
     /// One inbound delivery shaped exactly as the session pump builds one: a
     /// label this side minted and an opaque unit, with no lease attached —
     /// the queue mints that at enqueue.
     fn test_realtime_event(label: u8, timestamp: u32, data: &'static [u8]) -> TransportEvent {
         TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
-            RealtimeFlowLabel::from_peer(label),
+            test_label(label),
             RealtimeRecvUnit {
                 timestamp,
                 marker: true,
@@ -9396,13 +9604,13 @@ mod tests {
         assert!(matches!(
             registry.try_recv().map(|queued| queued.event),
             Some(TransportEvent::RealtimeUnit(delivery))
-                if delivery.label == RealtimeFlowLabel::from_peer(0)
+                if delivery.label == test_label(0)
                     && delivery.unit.timestamp == 1
         ));
         assert!(matches!(
             registry.try_recv().map(|queued| queued.event),
             Some(TransportEvent::RealtimeUnit(delivery))
-                if delivery.label == RealtimeFlowLabel::from_peer(1)
+                if delivery.label == test_label(1)
                     && delivery.unit.timestamp == 1
         ));
         assert!(registry.try_recv().is_none());
@@ -12309,9 +12517,7 @@ mod tests {
                 assert!(flow.enqueue(
                     QueuedTransportEvent {
                         event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
-                            RealtimeFlowLabel::from_peer(
-                                u8::try_from(flow_index).unwrap_or(u8::MAX),
-                            ),
+                            test_label(u8::try_from(flow_index).unwrap_or(u8::MAX)),
                             RealtimeRecvUnit {
                                 timestamp: unit_index as u32,
                                 marker: false,
@@ -12370,8 +12576,8 @@ mod tests {
             retained_bytes,
         );
         let registry = test_realtime_registry(policy);
-        let saturated_label = RealtimeFlowLabel::from_peer(0);
-        let latency_label = RealtimeFlowLabel::from_peer(1);
+        let saturated_label = test_label(0);
+        let latency_label = test_label(1);
         let saturated = registry
             .open_inbound_flow()
             .expect("observation admits the saturated flow");
@@ -12390,7 +12596,7 @@ mod tests {
             assert!(saturated.enqueue(
                 QueuedTransportEvent {
                     event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
-                        saturated_label,
+                        saturated_label.clone(),
                         RealtimeRecvUnit {
                             timestamp: u32::try_from(index).unwrap_or(u32::MAX),
                             marker: false,
@@ -12412,7 +12618,7 @@ mod tests {
             assert!(latency.enqueue(
                 QueuedTransportEvent {
                     event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
-                        latency_label,
+                        latency_label.clone(),
                         RealtimeRecvUnit {
                             timestamp: u32::try_from(index).unwrap_or(u32::MAX),
                             marker: false,
@@ -14027,8 +14233,8 @@ mod tests {
     /// Replacing a session frees its labels and its resources, and the
     /// replaced session's label stops working.
     ///
-    /// The single control for the bundle-drop invariant. Label 0 throughout on
-    /// purpose: it is the value an application is most likely to ask for again
+    /// The single control for the bundle-drop invariant. One name throughout on
+    /// purpose: it is the name an application is most likely to ask for again
     /// the instant it reconnects, so a retired session's hold on it outliving
     /// the session would show here first.
     ///
@@ -14060,7 +14266,7 @@ mod tests {
 
         let registry =
             test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
-        let label = RealtimeFlowLabel::from_peer(0);
+        let name = fixture_flow_name();
         let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the fixture encoding names a shape a flow can carry");
 
@@ -14070,7 +14276,7 @@ mod tests {
         };
         let mut flows = SessionRealtimeFlows::new(
             Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
+            Some(session_flow::leased_control_profile(&registry)),
         );
 
         assert_eq!(
@@ -14080,14 +14286,14 @@ mod tests {
                 RealtimeFlowSpec {
                     direction: RealtimeDirection::Outbound,
                     encoding: encoding.clone(),
-                    label,
+                    name: name.clone(),
                 },
             ),
-            Ok(label),
-            "the application names its own label and this side claims it exactly"
+            Ok(name.clone()),
+            "the application names its own flow and this side claims it exactly"
         );
         flows
-            .send(&session, Some(&incarnation), label, fixture_unit())
+            .send(&session, Some(&incarnation), &name, fixture_unit())
             .expect("a live flow of a current session takes a unit");
 
         let queued = {
@@ -14102,7 +14308,7 @@ mod tests {
 
         // Retirement: the worker no longer has a live incarnation to offer.
         assert_eq!(
-            flows.send(&session, None, label, fixture_unit()),
+            flows.send(&session, None, &name, fixture_unit()),
             Err(RealtimeFlowError::SessionNotCurrent),
             "a retired connector cannot keep feeding a torn-down peer"
         );
@@ -14111,7 +14317,7 @@ mod tests {
         // the session's own belief that it is current is not enough.
         let replacement = crate::connector::ConnectorIncarnation::new();
         assert_eq!(
-            flows.send(&session, Some(&replacement), label, fixture_unit()),
+            flows.send(&session, Some(&replacement), &name, fixture_unit()),
             Err(RealtimeFlowError::SessionNotCurrent),
             "the replaced session's label is unusable against the connector \
              that replaced it"
@@ -14141,7 +14347,7 @@ mod tests {
         };
         let mut next = SessionRealtimeFlows::new(
             Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
+            Some(session_flow::leased_control_profile(&registry)),
         );
         assert_eq!(
             next.open(
@@ -14150,11 +14356,11 @@ mod tests {
                 RealtimeFlowSpec {
                     direction: RealtimeDirection::Outbound,
                     encoding,
-                    label,
+                    name: name.clone(),
                 },
             ),
-            Ok(label),
-            "the label an application is most likely to reuse is available again"
+            Ok(name),
+            "the name an application is most likely to reuse is available again"
         );
     }
 
@@ -14197,7 +14403,7 @@ mod tests {
     fn v4_macro1_one_inbound_flow_holds_exactly_one_active_flow_slot() {
         let registry =
             test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
-        let label = RealtimeFlowLabel::from_peer(0);
+        let name = fixture_flow_name();
         let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the fixture encoding names a shape a flow can carry");
         let incarnation = crate::connector::ConnectorIncarnation::new();
@@ -14206,7 +14412,7 @@ mod tests {
         };
         let mut flows = SessionRealtimeFlows::new(
             Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
+            Some(session_flow::leased_control_profile(&registry)),
         );
 
         assert_eq!(
@@ -14216,10 +14422,10 @@ mod tests {
                 RealtimeFlowSpec {
                     direction: RealtimeDirection::Inbound,
                     encoding: encoding.clone(),
-                    label,
+                    name: name.clone(),
                 },
             ),
-            Ok(label),
+            Ok(name.clone()),
             "the one inbound slot this fixture has is taken by the application's \
              own open"
         );
@@ -14227,7 +14433,7 @@ mod tests {
         // Exactly what the fence does: mint, then bind, then negotiate.
         let identity = RealtimeTrackIdentity::new();
         flows
-            .bind_inbound(&session, Some(&incarnation), label, Arc::clone(&identity))
+            .bind_inbound(&session, Some(&incarnation), &name, Arc::clone(&identity))
             .expect("an open inbound flow of a current session takes a binding");
 
         // Exactly what `on_track` does. No second open anywhere on this path.
@@ -14238,7 +14444,7 @@ mod tests {
         let attachment = bindings
             .admit(&identity, WebRtcRtpKind::Video, "video/h264", 90_000, 0)
             .expect("the track this side negotiated is admitted to its own flow");
-        assert_eq!(attachment.label, label);
+        assert_eq!(attachment.label.name(), &name);
 
         // Positive: the handle reaches this flow's accounting while it is open.
         // Without this the capacity assertion below could pass because the
@@ -14251,7 +14457,7 @@ mod tests {
         // The attachment stays alive across the close, exactly as a running pump
         // would be. If it owned a lease, this is where the leak would start.
         let remains = flows
-            .close(&session, Some(&incarnation), label)
+            .close(&session, Some(&incarnation), &name)
             .expect("the session that opened this flow may close it");
         assert!(
             matches!(remains, RealtimeFlowRemains::Inbound(ref token) if Arc::ptr_eq(token, &identity)),
@@ -14271,10 +14477,10 @@ mod tests {
                 RealtimeFlowSpec {
                     direction: RealtimeDirection::Inbound,
                     encoding,
-                    label,
+                    name: name.clone(),
                 },
             ),
-            Ok(label),
+            Ok(name),
             "the one slot is free again while the closed flow's attachment is \
              still held — so the attachment never owned one"
         );
@@ -14296,14 +14502,14 @@ mod tests {
     fn v4_macro1_an_unregistered_outbound_open_costs_no_label_and_no_capacity() {
         let registry =
             test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
-        let label = RealtimeFlowLabel::from_peer(0);
+        let name = fixture_flow_name();
         let incarnation = crate::connector::ConnectorIncarnation::new();
         let session = FlowFixtureSession {
             incarnation: Arc::clone(&incarnation),
         };
         let mut flows = SessionRealtimeFlows::new(
             Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
+            Some(session_flow::leased_control_profile(&registry)),
         );
 
         let unregistered = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/VP8", 90_000, 0)
@@ -14315,7 +14521,7 @@ mod tests {
                 RealtimeFlowSpec {
                     direction: RealtimeDirection::Outbound,
                     encoding: unregistered,
-                    label,
+                    name: name.clone(),
                 },
             ),
             Err(RealtimeFlowError::EncodingInvalid),
@@ -14333,11 +14539,11 @@ mod tests {
                 RealtimeFlowSpec {
                     direction: RealtimeDirection::Outbound,
                     encoding: registered,
-                    label,
+                    name: name.clone(),
                 },
             ),
-            Ok(label),
-            "the same label and the only outbound slot are both still free, so \
+            Ok(name),
+            "the same name and the only outbound slot are both still free, so \
              the refusal above acquired neither"
         );
     }
@@ -14421,7 +14627,7 @@ mod tests {
             test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
         let flows = SessionRealtimeFlows::new(
             Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
+            Some(session_flow::leased_control_profile(&registry)),
         );
         let data = Bytes::from_static(b"unit");
 
@@ -14447,7 +14653,7 @@ mod tests {
         // because that is the only shape the engine can hand over — it cannot
         // name the lease inside, let alone separate it.
         let mut delivery = RealtimeInboundDelivery::new(
-            RealtimeFlowLabel::from_peer(7),
+            test_label(7),
             RealtimeRecvUnit {
                 timestamp: 90_000,
                 marker: true,
@@ -14707,6 +14913,13 @@ mod tests {
     /// identically, and would fail only here.
     #[test]
     fn v4_macro1_the_connector_binding_slot_cannot_outlive_its_session() {
+        // No resources and no ceiling, and **no profile either**. What this
+        // control exercises is the slot's `Weak`, which never consults codecs:
+        // nothing here opens a flow or admits a track. A registry with no
+        // resources could not pay for a profile record in any case — the
+        // acquisition answers `OwnerPolicyMissing` before capacity is even a
+        // question — so asking for one would make the fixture, rather than the
+        // slot, the thing under test.
         let registry = RealtimeFlowRegistry::new(None, None);
         // Shared, because the table owns the retirement of the transceivers it
         // records and hands a clone of itself to whichever task performs one.
@@ -14719,10 +14932,7 @@ mod tests {
             "a connector with no promoted session admits no inbound track"
         );
 
-        let flows = SessionRealtimeFlows::new(
-            Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
-        );
+        let flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
         tracks.install(flows.inbound_bindings());
         let installed = tracks
             .current()
@@ -14751,10 +14961,7 @@ mod tests {
 
         // A replacement session installs its own, and the slot points only at
         // the new one.
-        let replacement = SessionRealtimeFlows::new(
-            Arc::clone(&registry),
-            Some(session_flow::control_realtime_profile()),
-        );
+        let replacement = SessionRealtimeFlows::new(Arc::clone(&registry), None);
         tracks.install(replacement.inbound_bindings());
         let current = tracks
             .current()

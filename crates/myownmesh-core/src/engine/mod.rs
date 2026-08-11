@@ -3788,19 +3788,20 @@ fn build_test_state_parts_with(
     let grant = crate::transport::webrtc::one_mesh_connector_fixture_grant(&profiles)
         .expect("engine fixture construction grant is mechanically representable");
     // One post-authentication session reservation per simultaneous connector
-    // slot, at the full price the provider charges for one: `SESSION_CLAIM`'s
-    // `WorkerOrTask` *plus* the `OpaqueDependencyResidual` record the provider
-    // keeps for the reservation carrying it. A promoted session holds that for
-    // the session's whole life, and no fixture here can hold more sessions than
-    // it has connectors to promote them from.
+    // slot, at the full price the provider charges for one: the broker's own
+    // session claim — the accounted memory of the session record and the
+    // session-owned flow set — *plus* the `OpaqueDependencyResidual` record the
+    // provider keeps for the reservation carrying it. A promoted session holds
+    // that for the session's whole life, and no fixture here can hold more
+    // sessions than it has connectors to promote them from.
     //
-    // The charge is taken from the broker rather than restated, in both of its
-    // dimensions. Naming only `WorkerOrTask` leaves the grant short by exactly
-    // one record per session, and short *silently* — it binds or refuses on
-    // whatever slack the connector and signaling grants above happen to leave,
-    // which is not capacity this fixture asked for. Refusing on capacity is a
-    // real refusal, and would make every positive control below vacuous for the
-    // wrong reason.
+    // The charge is taken from the broker rather than restated, in every
+    // dimension it names. Restating it leaves the grant short by exactly one
+    // record per session, and short *silently* — it binds or refuses on whatever
+    // slack the connector and signaling grants above happen to leave, which is
+    // not capacity this fixture asked for. Refusing on capacity is a real
+    // refusal, and would make every positive control below vacuous for the wrong
+    // reason.
     let session_grant = crate::runtime::session_broker::session_reservation_charge_for_test()
         .checked_scale(connectors.get())
         .expect("engine fixture session capacity is mechanically representable");
@@ -3836,9 +3837,10 @@ fn build_test_state_parts_with(
 /// assertions after it vacuous rather than failing.
 ///
 /// One family, and video only, because a flow selects on the family and the
-/// controls open exactly one. `flow_capacity` is 2 against the owner's 2
-/// inbound + 2 outbound, so the advertised ceiling is satisfiable in every
-/// arrangement the controls use.
+/// controls open exactly one. The profile no longer declares a flow capacity of
+/// its own: how many flows may exist at once is the owner's `2 inbound + 2
+/// outbound` and the provider's leases, and there is no second advertised
+/// number that could disagree with them.
 ///
 /// No pre-provisioned tracks: what the controls need is flow authority, not
 /// m-lines. Nothing is added to the SDP, so the existing one-media-section /
@@ -3887,26 +3889,23 @@ pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> A
         realtime,
     )
     .expect("engine real-time fixture callback policy is valid");
-    let realtime_profile = crate::WebRtcRealtimeProfile::new(
-        vec![crate::WebRtcRealtimeCodec {
-            kind: crate::WebRtcRtpKind::Video,
-            payload_type: 102,
-            mime: "video/H264".to_string(),
-            clock_rate: 90_000,
-            channels: 0,
-            fmtp: "packetization-mode=1".to_string(),
-            framing: crate::WebRtcRealtimeFraming::AnnexB,
-            rtcp_feedback: Vec::new(),
-        }],
-        2,
-    )
+    let realtime_profile = crate::WebRtcRealtimeProfile::new(vec![crate::WebRtcRealtimeCodec {
+        kind: crate::WebRtcRtpKind::Video,
+        payload_type: 102,
+        mime: "video/H264".to_string(),
+        clock_rate: 90_000,
+        channels: 0,
+        fmtp: "packetization-mode=1".to_string(),
+        framing: crate::WebRtcRealtimeFraming::AnnexB,
+        rtcp_feedback: Vec::new(),
+    }])
     .expect("engine real-time fixture registers one well-formed family");
     let profile = crate::WebRtcConnectorProfile::new(
         callbacks,
         crate::PendingRemoteCandidatePolicy::elastic(),
     )
     .with_realtime_profile(realtime_profile)
-    .expect("engine real-time fixture capacity fits the owner's flow envelope");
+    .expect("the engine real-time fixture enables real-time, so a profile is accepted");
     let (state, _cmd_rx) =
         build_test_state_parts_with(network_id_suffix, Some(profile), FIXTURE_CONNECTOR_SLOTS);
     state
@@ -3915,6 +3914,29 @@ pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> A
 /// The encoding every real-time control opens against — the one family the
 /// fixture above registers, named field for field so a drift between them is a
 /// refused open rather than a silently different flow.
+#[cfg(all(test, feature = "transport-lab"))]
+/// The control flow name for `tag`, deliberately **wider than one byte**.
+///
+/// Load-bearing rather than cosmetic. A one-byte name is exactly what the old
+/// `u8` label could carry, so a control built on one would pass against either
+/// shape and prove nothing about the opaque-name boundary it exists to hold. A
+/// name this wide cannot be expressed as a `u8` at all, so a build that reverted
+/// to the numeric label fails to compile here rather than passing quietly.
+///
+/// The tag stays numeric so every control keeps naming its flow the way it
+/// always did; what changed is only what that number becomes on the wire.
+/// Gated to exactly its callers. Every one of them stands on a live connector
+/// with a real promoted session, which only the `transport-lab` harness builds,
+/// so a plain `cargo test` compiles the tests module without them and this would
+/// otherwise be dead code there.
+#[cfg(all(test, feature = "transport-lab"))]
+fn realtime_test_name(tag: u8) -> crate::transport::webrtc::RealtimeFlowName {
+    crate::transport::webrtc::RealtimeFlowName::new(format!("arc04c-flow-{tag}").into_bytes())
+        .expect("the control flow name fits the one-byte length prefix")
+}
+
+/// Gated for the same reason as [`realtime_test_name`]: its two callers are the
+/// `transport-lab` real-time controls and nothing else.
 #[cfg(all(test, feature = "transport-lab"))]
 fn realtime_test_encoding() -> crate::transport::webrtc::RealtimeEncoding {
     crate::transport::webrtc::RealtimeEncoding::new(
@@ -4777,6 +4799,165 @@ mod tests {
         );
     }
 
+    /// Revoking retained policy refuses the *next* application operation on an
+    /// already-promoted session, and drops that session rather than parking it.
+    ///
+    /// This is the use-time half of the policy conjunct, and it is a different
+    /// claim from the control below: that one withholds policy before anything
+    /// promotes, so it exercises the promotion path. Admission is *retained*
+    /// state, and an eviction, a denial, or a topology change revokes it long
+    /// after a session was promoted under it. Without a recheck on the cached
+    /// branch, that session would keep authorizing application operations for a
+    /// peer the mesh has since refused, and would go on doing so until the
+    /// connector was replaced or the process restarted.
+    ///
+    /// Three passes through one fence on one peer make it discriminating:
+    ///
+    /// 1. it admits while policy holds — so the refusal that follows cannot be a
+    ///    fixture that never admitted anything;
+    /// 2. it refuses once policy is revoked, with the connector, capability,
+    ///    context and runtime all untouched — so policy is the only conjunct
+    ///    that changed, and a build with the recheck deleted fails here; and
+    /// 3. it still refuses when policy is *restored*, because the refusal
+    ///    dropped the session and the channel it was promoted from was consumed
+    ///    by that first promotion. A revocation takes the authority away; it
+    ///    does not set it aside for later. A fence that had merely declined one
+    ///    call while leaving the session installed would admit again here.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_arc05_revoking_policy_refuses_the_next_operation_and_drops_the_session() {
+        let state = build_test_state_with_realtime_flows("arc05-policy-revocation");
+        let fixture = insert_promoted_peer(&state, "revoked-peer").await;
+        let owner = state
+            .peers
+            .owner("revoked-peer")
+            .expect("the fixture peer is installed");
+
+        // ---- the promoted positive, on both representative effects ---------
+        //
+        // Both families are exercised once rather than permuted: Channel, RPC
+        // and reliable all reach the same `admit_application_operation`, so a
+        // second data permutation would re-prove one gate and tell us nothing
+        // new. What is genuinely separate is the realtime acquisition, which
+        // enters through `with_live_session_flow` instead.
+        assert!(
+            fence_admits(&state, "revoked-peer"),
+            "non-vacuity: every conjunct holds, so the fence admits and promotes"
+        );
+        assert!(
+            fixture.peer.holds_promoted_session_for_test(),
+            "and that admission really did install a session to revoke"
+        );
+        state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |session, flows, live| {
+                    flows.open(
+                        session,
+                        Some(live),
+                        crate::transport::webrtc::RealtimeFlowSpec {
+                            direction: crate::transport::webrtc::RealtimeDirection::Inbound,
+                            encoding: realtime_test_encoding(),
+                            name: realtime_test_name(3),
+                        },
+                    )
+                },
+            )
+            .expect("the admitted peer reaches its own session flow set")
+            .expect("and opens one inbound flow on it");
+
+        // Accounted while policy still holds, so the refusal below is policy's
+        // and not the accounting path's — this unit is the one thing a revoked
+        // peer could otherwise still get delivered.
+        let in_flight = state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |_session, flows, _live| {
+                    flows.accounted_delivery_for_test(
+                        &realtime_test_name(3),
+                        crate::transport::webrtc::RealtimeRecvUnit {
+                            timestamp: 41,
+                            marker: true,
+                            data: Bytes::from_static(b"u"),
+                        },
+                    )
+                },
+            )
+            .expect("the admitted peer mints against its own flow set")
+            .expect("and the fixture flow accounts one unit");
+
+        let before = state.traffic.snapshot();
+
+        // ---- revoke, and nothing else -------------------------------------
+        //
+        // No replacement: the same connector, the same installed capability,
+        // the same Mesh context and the same runtime. Policy is the only
+        // conjunct that moves, so a build with the use-time recheck deleted
+        // fails every assertion below.
+        set_admission(&state, "revoked-peer", false, PeerStatus::Offline);
+
+        let error = send_channel_frame(
+            &state,
+            "revoked-peer",
+            "revocation-control",
+            serde_json::json!("must-not-send"),
+        )
+        .await
+        .expect_err("a revoked peer cannot receive outbound application data");
+        assert!(
+            error
+                .to_string()
+                .contains("no live promoted session for application traffic"),
+            "the send must be refused by the admission fence, got: {error}"
+        );
+
+        assert!(
+            !state.deliver_realtime_unit(&owner, in_flight),
+            "and the accounted unit is refused too, though it was charged while \
+             this peer was still admitted"
+        );
+        assert!(
+            state
+                .peers
+                .with_live_session_flow(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                    |_session, _flows, _live| ()
+                )
+                .is_none(),
+            "no realtime acquisition is authorized at all after revocation"
+        );
+
+        // ---- and neither refusal had an effect -----------------------------
+        assert_eq!(
+            state.traffic.snapshot(),
+            before,
+            "the refused send moved no traffic counter in any lane"
+        );
+        assert!(
+            !fixture.peer.holds_promoted_session_for_test(),
+            "the refusal dropped the session, so the queues that unit would have \
+             been enqueued on no longer exist — the operation had no effect at \
+             all, not a partial one"
+        );
+
+        // ---- and the revocation is a teardown, not a pause -----------------
+        set_admission(&state, "revoked-peer", true, PeerStatus::Active);
+        assert!(
+            !fence_admits(&state, "revoked-peer"),
+            "restoring policy does not restore the session: the channel it was \
+             promoted from was consumed by the first promotion"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn v4_arc03_outbound_application_send_requires_current_session_admission() {
@@ -4786,12 +4967,10 @@ mod tests {
         // A connector-less fixture would refuse too, but for the missing
         // connector — and would still pass with the policy check deleted.
         //
-        // Policy is withdrawn *before* anything promotes, and the non-vacuity
-        // check is deferred to the end. Order matters: promotion proves policy
-        // once and caches the session, and the cached branch re-proves the
-        // connector, mesh, Device and runtime rather than policy — so a control
-        // that promoted first and demoted afterwards would be admitted by the
-        // cached session and would prove nothing about the fence.
+        // Policy is withdrawn *before* anything promotes, so this control's
+        // subject is the promotion path's own policy conjunct. Withdrawing it
+        // *after* a promotion is a different fence — the cached branch's use-time
+        // recheck — and has its own control, immediately below.
         let fixture = insert_promoted_peer(&state, "pending-peer").await;
         set_admission(&state, "pending-peer", true, PeerStatus::PendingApproval);
         {
@@ -4951,11 +5130,41 @@ mod tests {
             set_admission(&self.state, &self.device_id, true, PeerStatus::Active);
         }
 
-        /// Install a real authenticated-channel capability on the exact current
-        /// peer. The capability is genuine; only connector provenance is
-        /// bypassed, which the transport controls prove separately.
+        /// Install a real authenticated-channel capability over **this peer's
+        /// own live connector handoff**, in this Mesh's own context.
+        ///
+        /// The handoff is taken from the current worker at the moment of the
+        /// grant, and that is what makes the promotion which follows a real one:
+        /// the broker compares the connector by pointer identity, `is_current_for`
+        /// re-proves this Mesh's context and this peer's Device id at every use,
+        /// and a genuine post-authentication reservation comes out of the
+        /// fixture's own grant.
+        ///
+        /// It deliberately does not use the fixture-provenance installer. A
+        /// capability bound to a fixture connector, runtime, and context
+        /// satisfies `has_authenticated_channel` and can *never* promote —
+        /// `belongs_to` fails on pointer identity — so every control built on one
+        /// would refuse at the fence for a reason that has nothing to do with
+        /// what the control is testing, and would read as a broken conjunct
+        /// rather than as a fixture that could not express its own premise.
         fn grant_capability(&self) {
-            self.peer().install_authenticated_channel_for_test();
+            let peer = self.peer();
+            let worker = peer
+                .session
+                .lock()
+                .clone()
+                .expect("the real-time fixture peer holds its own connector");
+            let handoff = match worker.confirm_data_channel_open() {
+                DataChannelOpenOwnership::Connected(handoff) => handoff,
+                _ => panic!("the fixture connector yields exactly one connected handoff"),
+            };
+            peer.install_authenticated_channel_over_for_test(
+                handoff
+                    .into_generic()
+                    .expect("a fresh handoff still carries its capability"),
+                &self.state.network_id,
+                self.state.identity.public_id(),
+            );
         }
 
         /// Whether the delivery fence admits an operation for `owner` — which a
@@ -4997,9 +5206,7 @@ mod tests {
                             crate::transport::webrtc::RealtimeFlowSpec {
                                 direction: crate::transport::webrtc::RealtimeDirection::Inbound,
                                 encoding: realtime_test_encoding(),
-                                label: crate::transport::webrtc::RealtimeFlowLabel::from_peer(
-                                    label,
-                                ),
+                                name: realtime_test_name(label),
                             },
                         )
                     },
@@ -5034,7 +5241,7 @@ mod tests {
                     &self.state.network_id,
                     |_session, flows, _live| {
                         flows.accounted_delivery_for_test(
-                            crate::transport::webrtc::RealtimeFlowLabel::from_peer(label),
+                            &realtime_test_name(label),
                             crate::transport::webrtc::RealtimeRecvUnit {
                                 timestamp: marker,
                                 marker: true,
@@ -5073,11 +5280,7 @@ mod tests {
                     &self.state.network_id,
                     |session, flows, live| {
                         flows
-                            .recv_arrival(
-                                session,
-                                Some(live),
-                                crate::transport::webrtc::RealtimeFlowLabel::from_peer(label),
-                            )
+                            .recv_arrival(session, Some(live), &realtime_test_name(label))
                             .ok()
                             .flatten()
                             .map(|(_label, unit)| unit.timestamp)
@@ -5278,8 +5481,15 @@ mod tests {
         );
         assert_eq!(gate.drain(&gate.owner, 4), Some(41));
 
-        let unaccounted = crate::transport::webrtc::RealtimeInboundDelivery::new(
-            crate::transport::webrtc::RealtimeFlowLabel::from_peer(4),
+        // What is unaccounted here is the *payload*: this delivery carries no
+        // payload lease, which is exactly what `deliver_inbound` refuses. The
+        // label is a genuinely minted one — there is no such thing as an
+        // unleased label, and faking one would prove something about a state
+        // production cannot reach. So the pair still discriminates on the one
+        // difference that matters: the accounted mint above took a real payload
+        // lease through the queue, and this one never went near it.
+        let unaccounted = crate::transport::webrtc::RealtimeInboundDelivery::unaccounted_for_test(
+            &realtime_test_name(4),
             crate::transport::webrtc::RealtimeRecvUnit {
                 timestamp: 42,
                 marker: true,
