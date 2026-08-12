@@ -70,20 +70,70 @@ impl RealtimeInboundBinding {
 /// grants nothing on its own — it only answers "is this the track we built for
 /// that flow".
 pub(crate) struct RealtimeTrackIdentity {
-    /// Zero fields, but not a unit struct: the `Arc` allocation *is* the
-    /// identity, and a unit struct invites someone to construct one by value.
-    _minted: (),
+    /// The charge for this identity's own allocation, held **inside** it.
+    ///
+    /// The allocation is the identity, so it is named by everyone who can reach
+    /// the track: the flow's binding, the retirement, a claim carried out of the
+    /// table, the engine's phase-2 and phase-3 locals. Those outlive the table's
+    /// record — a claim taken during a sweep is exactly a holder that survives
+    /// `forget` — so the lease cannot live on the record. Put here, it releases
+    /// when the last of them drops, which is the only moment the allocation is
+    /// actually gone.
+    _lease: crate::resource::ResourceLease,
 }
 
 impl RealtimeTrackIdentity {
-    /// Mint one identity.
+    /// Mint one identity around the lease that funds it.
     ///
-    /// `pub(crate)` so the engine can mint one inside the same fence
-    /// acquisition that claims the label and records the binding. That
-    /// atomicity is what makes the ordering above structural rather than
-    /// merely usual.
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self { _minted: () })
+    /// The lease arrives already acquired, so the decision was made before the
+    /// allocation existed. There is no path that mints one and then finds out it
+    /// could not be paid for.
+    pub(crate) fn mint(lease: crate::resource::ResourceLease) -> Arc<Self> {
+        Arc::new(Self { _lease: lease })
+    }
+
+    /// One identity funded from a control's own provider fixture.
+    ///
+    /// Controls only, and it still acquires: a fixture that skipped the lease
+    /// would be exercising a different constructor from the one production uses,
+    /// and the retention this record exists to prove would be untested.
+    #[cfg(test)]
+    pub(crate) fn mint_for_test(
+        scope: &crate::runtime::attempt::ConnectorWorkResourceScope,
+    ) -> Arc<Self> {
+        let lease = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                Self::mint_claim().expect("the identity claim is representable"),
+            )
+            .expect("the fixture grant funds this identity");
+        Self::mint(lease)
+    }
+
+    /// Exactly what minting one costs.
+    ///
+    /// Derived here because `size_of::<Self>()` is this module's fact, the same
+    /// reason [`RealtimeFlowLabel::mint_claim`] lives beside its record. Content
+    /// bytes plus the `Arc` counter pair, and one residual for the block itself.
+    pub(crate) fn mint_claim() -> std::result::Result<
+        crate::resource::ResourceClaim,
+        crate::resource::ResourceClaimArithmeticError,
+    > {
+        let counters = std::mem::size_of::<usize>().checked_mul(2).ok_or(
+            crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            },
+        )?;
+        let bytes = std::mem::size_of::<Self>()
+            .checked_add(counters)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            })?;
+        crate::resource::ResourceClaim::try_from_entries([
+            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ])
     }
 }
 

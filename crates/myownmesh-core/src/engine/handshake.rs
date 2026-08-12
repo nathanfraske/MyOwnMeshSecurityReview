@@ -71,6 +71,36 @@ use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::NetworkState;
 use super::{phase, send_to_peer_owner};
 
+/// The Hello this node sends, built in exactly one place.
+///
+/// No capability advertisement travels here. The local advert is sent after
+/// promotion, over `CapabilitiesUpdate`, so this frame cannot disclose what this
+/// node offers to an endpoint that has not yet authenticated.
+///
+/// That absence is why this is a named builder rather than a struct literal
+/// inline in [`initiate`]. A control asserting the absence against a Hello it
+/// constructed itself proves only that the control declined to add one — it
+/// would still pass if this builder started reading the local advertisement, or
+/// if the field came back as an `Option` that a fresh value leaves `None`.
+/// Asserting against *this* function is what makes the claim about production.
+///
+/// Everything it reads is a pre-session fact: identity, the profile list this
+/// build advertises, and the two per-attempt values the caller draws.
+pub(super) fn local_hello(
+    state: &Arc<NetworkState>,
+    contribution: String,
+    verification_code: String,
+) -> HelloMessage {
+    HelloMessage {
+        protocol: PROTOCOL_VERSION,
+        device_id: state.identity.public_id().to_string(),
+        label: state.identity.label().to_string(),
+        nonce: contribution,
+        verification_code,
+        features: ADVERTISED_FEATURES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// Kick off the handshake — called once the data channel opens.
 /// Sends the first hello and schedules the timeout watchdog.
 pub(super) async fn initiate(
@@ -92,17 +122,7 @@ pub(super) async fn initiate(
     // on the wire that this endpoint's own transcript does not contain.
     let contribution = auth_task.local_contribution();
     let code = verification::generate_code();
-    // No capability advertisement travels here. The local advert is sent after
-    // promotion, over `CapabilitiesUpdate`, so this frame cannot disclose what
-    // this node offers to an endpoint that has not yet authenticated.
-    let hello = HelloMessage {
-        protocol: PROTOCOL_VERSION,
-        device_id: state.identity.public_id().to_string(),
-        label: state.identity.label().to_string(),
-        nonce: contribution,
-        verification_code: code.clone(),
-        features: ADVERTISED_FEATURES.iter().map(|s| s.to_string()).collect(),
-    };
+    let hello = local_hello(state, contribution, code.clone());
     // `with_current` rather than `get_if_current`, for the same reason as the
     // first-Hello metadata write below: this is a synchronous multi-field write
     // that must linearize against registry replacement, not merely observe that
@@ -204,6 +224,15 @@ fn schedule_watchdog(state: Arc<NetworkState>, owner: PeerOwnerToken) {
 }
 
 pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: HelloMessage) {
+    on_hello_with_retention(state, owner, hello, None).await
+}
+
+pub(super) async fn on_hello_with_retention(
+    state: &Arc<NetworkState>,
+    owner: &PeerOwnerToken,
+    hello: HelloMessage,
+    retention: Option<crate::resource::ResourceLease>,
+) {
     let device_id = owner.device_id();
     // Sanity-check: the device id the peer claimed in the hello
     // must match the connection id we're using to route this
@@ -229,6 +258,12 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
             claimed = %hello.device_id,
             "hello claimed a different device id than the connection — dropping"
         );
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
+        return;
+    }
+
+    if !crate::protocol::handshake::verification_code_has_protocol_shape(&hello.verification_code) {
+        warn!(peer = %device_id, "hello carried a malformed verification code — dropping");
         super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     }
@@ -349,6 +384,7 @@ pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: 
                 // optional frame kind (acked channel delivery, governance wire,
                 // …) — record it, or `peer_supports` has nothing to consult.
                 data.features = hello.features.clone();
+                data.hello_retention = retention;
             });
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
@@ -569,7 +605,12 @@ pub async fn on_auth_response(
     // policy write two separate atoms for no benefit — neither read depends on
     // this peer's state.
     let rostered = state.is_rostered(device_id);
-    let auto_approve = state.config.read().auto_approve || rostered;
+    let policy_admits = super::governance::current_policy_admits(
+        &state.governance_state.read(),
+        state.identity.public_id(),
+        device_id,
+    );
+    let auto_approve = policy_admits && (state.config.read().auto_approve || rostered);
     // The write itself linearizes against registry replacement rather than
     // merely observing that the owner was current a moment ago. It is
     // synchronous, has no await inside, and carries only owned values out.
@@ -676,7 +717,14 @@ async fn maybe_activate_after_check(
         // unauthenticated peer could be promoted to ACTIVE and gain the run of
         // every application and control plane. The early latch is harmless: the
         // transition simply completes the moment authentication lands.
-        let active = data.authenticated && data.local_approve_sent && data.remote_approve_seen;
+        let active = data.authenticated
+            && data.local_approve_sent
+            && data.remote_approve_seen
+            && super::governance::current_policy_admits(
+                &state.governance_state.read(),
+                state.identity.public_id(),
+                device_id,
+            );
         if !active || was_active {
             return None;
         }
@@ -728,6 +776,19 @@ async fn maybe_activate_after_check(
 
     phase::recompute(state);
     super::reliable::flush_owner(state, owner).await;
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
+    // The ordinary first establishment: a peer that reaches Active with a
+    // session it can promote is told what this node offers, without waiting for
+    // the application to advertise again.
+    //
+    // This installs nothing and is not the second copy of a fact the note above
+    // warns against — it is a send, and it asks the same lender every other
+    // application send asks. Nor is it the only place the debt can be paid: if
+    // promotion resource-refuses here, nothing is minted, nothing is consumed,
+    // and the first later successful promotion still owes it.
+    super::replay_local_capabilities_to_owner(state, owner).await;
     if state.peers.get_if_current(owner).is_none() {
         return;
     }
@@ -1506,7 +1567,14 @@ mod tests {
         let stale_owner = state.peers.owner("peer").expect("first peer owner");
         let mut events = state.events_tx.subscribe();
         let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
-        state.register_connect_waiter("peer", waiter_tx);
+        state.register_connect_waiter(
+            "peer",
+            crate::engine::state::ConnectWaiterRegistration {
+                id: 1,
+                reply: waiter_tx,
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
         state.record_reconnect_intent("peer", false);
         {
             let peer = state

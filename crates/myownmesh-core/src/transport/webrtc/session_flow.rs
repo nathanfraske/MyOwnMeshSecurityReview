@@ -42,8 +42,8 @@ type FlowResult<T> = std::result::Result<T, RealtimeFlowError>;
 /// authority — it carries the lease that funds the name — and stays inside.
 mod name;
 
-pub(crate) use name::RealtimeFlowLabel;
 pub use name::RealtimeFlowName;
+pub(crate) use name::{RealtimeFlowIdentity, RealtimeFlowLabel};
 
 /// What an application declares it can carry, and what holding that costs.
 ///
@@ -167,97 +167,6 @@ pub(crate) trait RealtimeSessionBinding {
     // invites a caller to route on what it was given instead of presenting the
     // session again. A diagnostic that wants the Device asks the session
     // directly, where reading it is not adjacent to being authorized.
-}
-
-/// The labels one session has handed out.
-///
-/// Lives with the session, not with the registry: the label space is the
-/// session's, so it dies with the session and cannot outlive the incarnation
-/// its flows were bound to. A label is released when its flow is dropped, and
-/// only then may the same value be handed out again.
-/// A [`crate::resource::LeasedMap`] keyed by the label, and the value is `()`
-/// because the name *is* the entry — what the entry costs is its node, and the
-/// node's lease lives in the node.
-///
-/// This collection grows with the session's live flows, so it is exactly the
-/// shape that must not grow unaccounted. It is not a `BTreeSet` and not a
-/// `BTreeMap`: there, several entries share a node and the node is freed only
-/// when it empties, so releasing a per-entry allocation on release would give
-/// back memory the allocator is still holding. Here one held name is one funded
-/// allocation, and releasing the name releases exactly it.
-#[derive(Default)]
-pub(crate) struct RealtimeFlowLabels {
-    held: crate::resource::LeasedMap<RealtimeFlowLabel, ()>,
-}
-
-impl RealtimeFlowLabels {
-    /// Claim the one label the application chose.
-    ///
-    /// Takes the raw name and mints the leased label only once the name is
-    /// known to be free, so a collision costs no lease. The order matters in
-    /// the other direction too: the mint is what pays for the bytes this set is
-    /// about to retain, so nothing enters `held` unaccounted for.
-    ///
-    /// The only way a label is ever taken. There is deliberately no
-    /// lowest-free allocator here: the application owns route binding and
-    /// dead-flow recovery, so it is the sole allocator, and a second one over
-    /// the same space would agree until it did not — producing a collision on
-    /// a live flow rather than a refusal at open.
-    pub(crate) fn claim_exact(
-        &mut self,
-        name: &RealtimeFlowName,
-        registry: &RealtimeFlowRegistry,
-    ) -> FlowResult<RealtimeFlowLabel> {
-        if self.held.contains_key(name.as_bytes()) {
-            return Err(RealtimeFlowError::LabelInUse);
-        }
-        let label = RealtimeFlowLabel::mint(name.clone(), registry)?;
-        // The node this set is about to occupy, funded before it exists. A
-        // refusal here drops the label that was just minted, so its own lease
-        // goes back too and nothing is retained by a claim that failed.
-        let entry = registry
-            .acquire_map_entry::<RealtimeFlowLabel, ()>()
-            .map_err(realtime_drop_refusal)?;
-        // The duplicate was refused above, under the same borrow, so this
-        // cannot be a replacement. The `Err` half exists for callers that race;
-        // here it would mean the check and the insert disagreed.
-        self.held
-            .insert(label.clone(), (), entry)
-            .expect("the name was checked free under this same borrow");
-        Ok(label)
-    }
-
-    /// Release a label, making it available again.
-    ///
-    /// Called when the flow that held it is gone, never merely because a peer
-    /// said the flow was dead: a peer's report is a request to stop sending,
-    /// and the label stays held until this side actually drops its flow. That
-    /// ordering is what stops a stale report from freeing a label the next
-    /// flow would immediately reuse.
-    pub(crate) fn release(&mut self, label: &RealtimeFlowLabel) {
-        // Removing the entry drops its node, which releases the funding that
-        // node held. Freeing the name and releasing what holding it cost are
-        // one step, so neither can happen without the other.
-        self.held.remove(label.name().as_bytes());
-    }
-
-    /// Whether this label is currently held by a live flow of this session.
-    ///
-    /// **Controls only, and gated rather than merely documented as such.**
-    /// Production never asks: `claim_exact` already answers "was this free" as
-    /// part of taking it, and every other question about a label is really a
-    /// question about the flow behind it, which the flow map answers. A second
-    /// predicate over a second collection is a fact that can disagree with the
-    /// first, and an ungated one reads as a check production could be expected
-    /// to make.
-    ///
-    /// What the controls need it for is the opposite direction: asserting that
-    /// a label is *released* at the exact moment its flow is dropped, which is
-    /// not observable from the flow map because the entry is already gone.
-    #[cfg(test)]
-    pub(crate) fn holds(&self, name: &RealtimeFlowName) -> bool {
-        self.held.contains_key(name.as_bytes())
-    }
 }
 
 /// One shared wake, and the lease that owns the block it lives in.
@@ -455,12 +364,18 @@ struct RealtimeFlowSetToken;
 /// A token naming one flow set, for a caller that has to prove it is
 /// committing to the set it started against.
 ///
-/// The window it closes: a promotion can drop a cached session and re-promote
-/// on the **same live connector incarnation**, so a caller that opened a flow,
-/// released the fence to do async work, and re-entered can find a different
-/// flow set behind an identical incarnation — holding a live flow under the
-/// same name. Neither the label nor the incarnation separates those two. This
-/// does.
+/// What it names is the flow set itself, and therefore the promoted session
+/// that owns it. That is deliberately a *direct* statement rather than one
+/// inferred from the peer entry or the connector incarnation: a caller that
+/// opened a flow, released the fence to do async work, and re-entered has to
+/// prove the same set answered, and the label cannot say it — labels are
+/// session-scoped and freely reused — while the incarnation says only that the
+/// transport is the same one, which is a weaker fact than the caller needs.
+///
+/// It is also the only one of the three that carries the set's own liveness. A
+/// `Weak` that no longer upgrades means the set is gone, which is the true
+/// answer for a session that ended even where every coarser identity around it
+/// still resolves.
 ///
 /// Holds a `Weak` deliberately: a token must never keep a flow set alive, or
 /// the retirement it exists to detect could not happen while one was
@@ -480,20 +395,25 @@ pub(crate) struct RealtimeFlowSetIdentity(std::sync::Weak<RealtimeFlowSetToken>)
 /// below, each of which borrows the current session and takes the connector's
 /// freshly acquired live incarnation; the namespace itself is not reachable
 /// from outside this module. No durable id, no generation, no timer.
-/// `pub(crate)` so the peer entry can hold one, and no wider. The two things
-/// worth protecting stay private: `RealtimeFlowLabels` and the `RealtimeFlow`
-/// handles are fields, not API, and every method answers a label or a unit —
-/// never a `RealtimeFlowPort`, which stays private to the connector.
+/// `pub(crate)` so the peer entry can hold one, and no wider. What is worth
+/// protecting stays private: the flow map is a field, not API, and every method
+/// answers a name or a unit — never a `RealtimeFlowPort`, which stays private to
+/// the connector.
+///
+/// **The flow map is the namespace, and there is no second one.** A name is in
+/// use exactly when this session has a flow keyed by it, so "is this free",
+/// "does this session hold that" and "which flow does that name" are one lookup
+/// in one place. A separate table of held names would be a second fact about the
+/// same thing, agreeing until it did not — and the moment it disagreed, one of
+/// them would be answering for a flow that no longer existed.
 pub(crate) struct SessionRealtimeFlows {
-    labels: RealtimeFlowLabels,
     /// Keyed by the leased label, so the map entry is one of the shared copies
     /// rather than a second allocation of the same bytes. Lookups take raw
     /// bytes through `Borrow<[u8]>`, so asking about a name costs no lease.
     ///
-    /// A [`crate::resource::LeasedMap`] for the reason the held-name table is
-    /// one: this grows with what a session opens, and one entry has to be one
-    /// funded allocation for a close to be able to release exactly what that
-    /// flow was occupying.
+    /// A [`crate::resource::LeasedMap`] because this grows with what a session
+    /// opens, and one entry has to be one funded allocation for a close to
+    /// release exactly what that flow was occupying.
     flows: crate::resource::LeasedMap<RealtimeFlowLabel, RealtimeFlow>,
     /// This set's identity. Nothing reads it but [`SessionRealtimeFlows::identity`]
     /// and [`SessionRealtimeFlows::is_same`]; it exists to be an address that
@@ -552,7 +472,6 @@ impl SessionRealtimeFlows {
         profile: Option<LeasedRealtimeProfile>,
     ) -> Self {
         Self {
-            labels: RealtimeFlowLabels::default(),
             flows: crate::resource::LeasedMap::new(),
             identity: Arc::new(RealtimeFlowSetToken),
             registry,
@@ -650,6 +569,37 @@ impl SessionRealtimeFlows {
         std::ptr::eq(identity.0.as_ptr(), Arc::as_ptr(&self.identity))
     }
 
+    /// The exact identity of the flow `name` currently resolves to.
+    ///
+    /// Handed out once, at open, so a caller can present it back instead of
+    /// presenting a name and hoping the name still means what it meant.
+    pub(crate) fn flow_identity(&self, name: &RealtimeFlowName) -> Option<RealtimeFlowIdentity> {
+        self.flows
+            .get(name.as_bytes())
+            .map(|flow| flow.label().identity())
+    }
+
+    /// Whether `name` currently names the exact flow `identity` was taken from.
+    ///
+    /// The second half of a handle's proof, and it is not redundant with
+    /// [`Self::is_same`]. The flow-set check rules out a *replacement session*
+    /// answering for a name; this rules out a **replacement flow inside the same
+    /// session**. A label may be closed and claimed again without the session
+    /// changing at all, and at that moment the name, the session and the flow set
+    /// are all identical — only the record differs.
+    ///
+    /// Answers `false` for a name that no longer resolves, so a caller cannot
+    /// tell "closed" from "replaced" and does not need to.
+    pub(crate) fn is_same_flow(
+        &self,
+        name: &RealtimeFlowName,
+        identity: &RealtimeFlowIdentity,
+    ) -> bool {
+        self.flows
+            .get(name.as_bytes())
+            .is_some_and(|flow| flow.label().is_identity(identity))
+    }
+
     /// The negotiated-track table for this session, as a **`Weak`**.
     ///
     /// `pub(super)`: the connector reads it when a track arrives. The engine
@@ -732,32 +682,29 @@ impl SessionRealtimeFlows {
         {
             return Err(RealtimeFlowError::EncodingInvalid);
         }
+        // The one namespace, asked once and before anything is minted. This map
+        // is keyed by the live label, so "is this name in use" and "does this
+        // session have a flow called that" are the same question — and asking
+        // it here means a collision costs neither a lease nor a flow slot.
+        if self.flows.contains_key(spec.name.as_bytes()) {
+            return Err(RealtimeFlowError::LabelInUse);
+        }
         let registry = Arc::clone(&self.registry);
-        let (flow, map_entry) =
-            open_session_flow(session, live, &registry, &mut self.labels, spec)?;
+        let (flow, map_entry) = open_session_flow(session, live, &registry, spec)?;
         // A refcount on the flow's own label record, not a second name: the key
         // and the flow's field are the same leased bytes, so the map costs one
         // Arc counter rather than another accounted allocation.
         let label = flow.label().clone();
-        // The label was claimed inside `open_session_flow` against this very
-        // namespace, so an occupied slot here would mean the two had diverged.
-        // Insert and assert the slot was free by construction rather than
-        // silently replacing a live flow.
-        // Checked before the insert, never after. `insert` returning the old
-        // value would mean the flow it named had already been replaced and
-        // dropped — so answering `LabelInUse` at that point would report a
-        // refusal having already destroyed a live flow. The defensive branch
-        // has to refuse without mutating, or it is not defensive.
-        if self.flows.contains_key(label.name().as_bytes()) {
-            return Err(RealtimeFlowError::LabelInUse);
-        }
         let name = label.name().clone();
         // `map_entry` was acquired by the open, beside the label and the port,
         // and is handed to the map that will hold the node it paid for.
+        // `insert` refuses rather than replaces, and the name was checked free at
+        // the top of this call under this same borrow — so this branch is
+        // unreachable, and if it were ever reached nothing live would have been
+        // destroyed and the refused flow would release everything it held. A
+        // defensive branch has to refuse without mutating, or it is not
+        // defensive.
         if self.flows.insert(label, flow, map_entry).is_err() {
-            // Unreachable by the check above, under this same borrow. `insert`
-            // refuses rather than replaces, so even here nothing live has been
-            // destroyed and the refused flow releases everything it held.
             return Err(RealtimeFlowError::LabelInUse);
         }
         // No event. The caller asked for this flow and is being handed the
@@ -783,12 +730,18 @@ impl SessionRealtimeFlows {
     /// side did not open inbound: an outbound flow has nothing to attach, and
     /// a binding on one could only ever be a mistake this table would then make
     /// look deliberate.
+    ///
+    /// Takes the token's [`RealtimeInboundRetirement`] by value, which is what
+    /// makes the flow — rather than a caller who remembers — the thing that owes
+    /// the transceiver its stop. Whether this succeeds or refuses, the
+    /// retirement ends up somewhere that submits it.
     pub(crate) fn bind_inbound(
         &mut self,
         session: &impl RealtimeSessionBinding,
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
         name: &RealtimeFlowName,
         identity: Arc<RealtimeTrackIdentity>,
+        retirement: RealtimeInboundRetirement,
     ) -> FlowResult<()> {
         let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err(RealtimeFlowError::FlowRefused);
@@ -837,13 +790,23 @@ impl SessionRealtimeFlows {
             end,
             record,
         ) {
+            // `retirement` is dropped by this return, as it is by every refusal
+            // above it. That submits a retirement for a token whose transceiver
+            // does not exist yet, which is not a wasted stop but the exactly
+            // correct one: it finds no record and completes. Were the ordering
+            // ever to change so that it did exist, the same drop would retire
+            // it, which is why the retirement is taken by value here rather
+            // than being handed over only on the success path.
             return Err(RealtimeFlowError::FlowRefused);
         }
         // Recorded only once the table has accepted, so a refused bind leaves
         // nothing for close to hand back. Reached by a second lookup because the
         // checks above hold the flow immutably; the entry is known to exist.
+        //
+        // From here the flow owns the retirement, so every way the flow can end
+        // ends with a submission — including the ways that call nothing.
         if let Some(flow) = self.flows.get_mut(name.as_bytes()) {
-            flow.native = RealtimeFlowRemains::Inbound(identity);
+            flow.native = RealtimeFlowRemains::Inbound(retirement);
         }
         Ok(())
     }
@@ -916,11 +879,13 @@ impl SessionRealtimeFlows {
     ///
     /// **The return value is not optional bookkeeping.** A flow's native half
     /// outlives this call — retiring either kind awaits, and this runs under a
-    /// sync fence — so the caller has to finish it outside. Discarding the
-    /// [`RealtimeFlowRemains`] is not a leak in the outbound case (the pump
-    /// retires regardless; the receipt is only how a caller learns it happened)
-    /// but it is one in the inbound case, where the token is the only handle on
-    /// a transceiver still offering to receive.
+    /// sync fence — so the caller has to finish it outside.
+    ///
+    /// Discarding the [`RealtimeFlowRemains`] is no longer a leak in either
+    /// direction: both arms retire what they hold when they are dropped. What it
+    /// costs is the *acknowledgement* — a caller that drops it has told someone
+    /// the flow is closed while the transceiver or the sender may still be
+    /// coming down, which is exactly what an explicit close exists to avoid.
     pub(crate) fn close(
         &mut self,
         session: &impl RealtimeSessionBinding,
@@ -954,7 +919,21 @@ impl SessionRealtimeFlows {
         // this label after the label could be reclaimed would attach a peer's
         // media to whatever flow took the name next.
         self.bindings.release(&label);
-        self.labels.release(&label);
+        // And for the same reason, nothing already queued may survive the name.
+        //
+        // Arrivals wait on one session-wide queue and carry the label they
+        // arrived on. A unit queued for this flow and still undrained when the
+        // flow closes is addressed to a name this call is about to make
+        // claimable again, so a consumer reading it afterwards would attribute
+        // the old flow's media to whatever flow took the name next — the exact
+        // misattribution the single-queue design removed everywhere else.
+        //
+        // Compared on the leased record rather than on the bytes: two flows can
+        // spell their name the same way, and only one of them is this one.
+        // Dropping each matched item here is what releases its payload lease and
+        // its queue-record lease, at the moment it stops being deliverable.
+        self.arrivals
+            .purge(|queued| RealtimeFlowLabel::is_same_record(&queued.label, &label));
         // The last strong reference this scope holds, dropped here. Nothing
         // outlives the close carrying the name: the caller is handed the
         // outcome by this very return, so the name is free to claim again the
@@ -1189,6 +1168,23 @@ impl SessionRealtimeFlows {
     /// builds the set and there is no second candidate to distinguish from. An
     /// ungated accessor would read as a check production could be expected to
     /// make, and the next reader would wonder why it does not.
+    /// Whether this session currently has a flow by that name.
+    ///
+    /// **Controls only, and gated rather than merely documented as such.**
+    /// Production never asks: `open` answers "was this free" as part of taking
+    /// it, and every other question about a name is really a question about the
+    /// flow behind it, which the caller already has. An ungated predicate reads
+    /// as a check production could be expected to make first, and a caller that
+    /// asked and then acted would be acting on an answer that could have changed
+    /// in between.
+    ///
+    /// It reads the flow map because that map *is* the namespace. There is no
+    /// second collection of held names for it to disagree with.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, name: &RealtimeFlowName) -> bool {
+        self.flows.contains_key(name.as_bytes())
+    }
+
     #[cfg(test)]
     pub(super) fn owns_bindings(&self, bindings: &Arc<RealtimeInboundBindings>) -> bool {
         Arc::ptr_eq(&self.bindings, bindings)
@@ -1230,50 +1226,61 @@ mod tests {
         super::super::elastic_control_grant()
     }
 
-    /// A label names one flow, and a released one is reusable only after its
-    /// flow is gone.
+    /// A name is held for its flow's lifetime and reusable only after.
     ///
-    /// The positive half of the label contract: lowest-free allocation, exact
-    /// reclaim, and the reuse ordering that stops a stale peer report from
-    /// freeing a live flow's name.
+    /// The positive half of the label contract, asked of the one namespace that
+    /// answers it: exact claim, exact reclaim, and the reuse ordering that stops
+    /// a stale peer report from freeing a live flow's name. A name is in use
+    /// exactly when this session has a flow keyed by it, so every assertion here
+    /// reads the same map the open and the close write.
     #[test]
     fn v4_macro1_a_label_is_held_for_its_flows_lifetime_and_reusable_only_after() {
         let (registry, _resources) = control_label_registry();
-        let mut labels = RealtimeFlowLabels::default();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
         let alpha = control_name(b"alpha");
         let beta = control_name(b"beta");
+        let open = |flows: &mut SessionRealtimeFlows, name: &RealtimeFlowName| {
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding: control_encoding(),
+                    name: name.clone(),
+                },
+            )
+        };
 
-        let first = labels
-            .claim_exact(&alpha, &registry)
-            .expect("the space starts empty");
-        let second = labels
-            .claim_exact(&beta, &registry)
-            .expect("a second flow takes the name the application chose for it");
-        assert_ne!(first, second, "two live flows never share a label");
+        let first = open(&mut flows, &alpha).expect("the space starts empty");
+        let second = open(&mut flows, &beta).expect("a second flow takes the name chosen for it");
+        assert_ne!(first, second, "two live flows never share a name");
 
         // While held, the exact name is refused rather than quietly aliased.
         assert_eq!(
-            labels.claim_exact(&alpha, &registry).err(),
+            open(&mut flows, &alpha).err(),
             Some(RealtimeFlowError::LabelInUse),
-            "a live flow's label cannot be taken from under it"
+            "a live flow's name cannot be taken from under it"
         );
-        assert!(labels.holds(&alpha));
+        assert!(flows.holds(&alpha));
 
         // Released only when the flow itself is gone; then, and not before,
         // the name is available again.
-        labels.release(&first);
-        assert!(!labels.holds(&alpha));
-        let reused = labels
-            .claim_exact(&alpha, &registry)
-            .expect("the freed name is available again");
-        assert_eq!(
-            reused.name(),
-            &alpha,
-            "and it is the same name, not a new one"
-        );
+        let _remains = flows
+            .close(&session, Some(&incarnation), &alpha)
+            .expect("the session that opened this flow may close it");
+        assert!(!flows.holds(&alpha));
+        let reused = open(&mut flows, &alpha).expect("the freed name is available again");
+        assert_eq!(reused, alpha, "and it is the same name, not a new one");
         assert!(
-            labels.holds(&beta),
-            "releasing one flow's label never disturbs another's"
+            flows.holds(&beta),
+            "releasing one flow's name never disturbs another's"
         );
     }
 
@@ -1409,13 +1416,14 @@ mod tests {
             )
             .expect("the pressure grant is representable");
         let (registry, _resources) = RealtimeFlowRegistry::elastic_for_control(grant);
-        let mut labels = RealtimeFlowLabels::default();
 
         // Drain everything the grant will give, so the provider is genuinely at
-        // its ceiling rather than merely busy.
+        // its ceiling rather than merely busy. The mint is what this control is
+        // about — the acquisition a name costs — so it is exercised directly
+        // rather than through an open that would exhaust some other claim first.
         let mut held = Vec::new();
-        while let Ok(label) = labels.claim_exact(
-            &control_name(format!("fill-{}", held.len()).as_bytes()),
+        while let Ok(label) = RealtimeFlowLabel::mint(
+            control_name(format!("fill-{}", held.len()).as_bytes()),
             &registry,
         ) {
             held.push(label);
@@ -1427,21 +1435,117 @@ mod tests {
         );
 
         assert_eq!(
-            labels.claim_exact(&name, &registry).err(),
+            RealtimeFlowLabel::mint(name.clone(), &registry).err(),
             Some(RealtimeFlowError::FlowRefused),
             "an elastic registry under provider pressure refuses the name \
              rather than retaining bytes nothing accounted for"
         );
 
-        // Release exactly one holder and the same claim succeeds. This is what
-        // makes the refusal above pressure rather than a lost claim.
-        let released = held.pop().expect("the fill loop admitted at least one");
-        labels.release(&released);
-        drop(released);
-        let recovered = labels
-            .claim_exact(&name, &registry)
-            .expect("the released charge is available again to the next claim");
+        // Release exactly one holder and the same mint succeeds. This is what
+        // makes the refusal above pressure rather than a lost claim. Dropping
+        // the label *is* the release: the record holds its own lease, so there
+        // is no table to take it out of first.
+        drop(held.pop().expect("the fill loop admitted at least one"));
+        let recovered = RealtimeFlowLabel::mint(name.clone(), &registry)
+            .expect("the released charge is available again to the next mint");
         assert_eq!(recovered.name(), &name);
+    }
+
+    /// A close takes its flow's queued arrivals with it, so a name reused
+    /// afterwards never delivers the previous flow's media.
+    ///
+    /// Arrivals wait on one session-wide queue, which is what removed the
+    /// duplicate retained notification — but it also means a unit outlives the
+    /// flow it was addressed to unless the close says otherwise. Within one
+    /// session a name is releasable and immediately re-claimable, so an
+    /// undrained unit from A is a unit a consumer would read *after* B has taken
+    /// A's name, and would attribute to B.
+    ///
+    /// Three assertions, and each fails for a different omission. The provider
+    /// reading after the close proves the purged unit's payload and queue-record
+    /// leases went back rather than the item merely being skipped. The delivered
+    /// unit proves the purge is scoped to the closing flow and did not empty the
+    /// queue. And the fresh unit arriving at all proves the reused name is fully
+    /// live rather than collaterally broken by the purge.
+    #[tokio::test]
+    async fn v4_arc05_a_close_purges_the_units_queued_for_the_name_it_frees() {
+        let (registry, resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
+        let x = control_name(b"x");
+        let open = |flows: &mut SessionRealtimeFlows| {
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding: control_encoding(),
+                    name: x.clone(),
+                },
+            )
+        };
+        let queue_one = |flows: &mut SessionRealtimeFlows, payload: &'static [u8]| {
+            let delivery = flows
+                .enqueued_delivery_for_test(
+                    &x,
+                    RealtimeRecvUnit {
+                        timestamp: 90_000,
+                        marker: true,
+                        data: Bytes::from_static(payload),
+                    },
+                )
+                .expect("the flow reserves, enqueues and delivers one unit");
+            assert!(
+                flows.deliver_inbound(delivery),
+                "the unit lands on this session's one inbound queue"
+            );
+        };
+
+        let empty = resources.accounted_bytes();
+
+        // A takes the name, and one unit is queued for it and left undrained.
+        open(&mut flows).expect("the space starts empty");
+        let a_open = resources.accounted_bytes();
+        queue_one(&mut flows, b"from-A");
+        assert!(
+            resources.accounted_bytes() > a_open,
+            "the queued unit really is retained — without this the release \
+             assertion below would pass on a queue that holds nothing"
+        );
+
+        // A closes. Its queued unit is not deliverable to anything, so it goes.
+        let _remains = flows
+            .close(&session, Some(&incarnation), &x)
+            .expect("the session that opened this flow may close it");
+        assert_eq!(
+            resources.accounted_bytes(),
+            empty,
+            "the close released A's own leases and the payload and queue-record \
+             leases of the unit still queued for it — a skipped item would have \
+             left both behind"
+        );
+
+        // B takes the very same name and gets its own unit.
+        open(&mut flows).expect("the freed name is available again");
+        queue_one(&mut flows, b"from-B");
+
+        let arrivals = flows
+            .inbound_arrivals()
+            .expect("this session's consumer claims its reader");
+        let (arrived, unit) = arrivals.next().await.expect("B's unit is queued");
+        assert_eq!(
+            unit.data,
+            Bytes::from_static(b"from-B"),
+            "the first unit a consumer reads after the reuse is B's — A's would \
+             have been ahead of it in this queue and would have been read as B's"
+        );
+        assert_eq!(arrived.name(), &x, "and it arrived on the reused name");
     }
 
     /// A name is bytes, and the two shapes that are not a name are refused
@@ -1753,11 +1857,13 @@ mod tests {
     ///
     /// **Nothing here is guessed and nothing loops to find a limit.** The
     /// headroom left is computed from the four claims an open takes before it
-    /// reaches a root — the label, the held-name map node, the connector flow,
-    /// and the flows map node — each read from the same `claim` expression
-    /// production uses. The filler that consumes the rest is a single exact
-    /// acquisition, and the assertion right after it proves the remaining
-    /// headroom is those four claims and not a byte more.
+    /// reaches a root — the label, the connector flow, the connector-flow map
+    /// node, and the session-flow map node — each read from the same `claim`
+    /// expression production uses. Those include two distinct map nodes; there
+    /// is no held-name table. The filler consumes the remaining accounted bytes
+    /// in one exact acquisition. Other dimensions are not artificially filled:
+    /// they are checked only for sufficient headroom for those four production
+    /// charges, while bytes are the exact ceiling that makes the root refuse.
     ///
     /// The recovery leg is what makes the refusal *pressure* rather than a
     /// fixture that refuses everything: releasing the filler makes the very same
@@ -1769,25 +1875,28 @@ mod tests {
             claim.amount(crate::resource::ResourceClass::AccountedMemoryBytes)
         };
         let name = control_name(b"root-refusal");
-        let label = bytes(
+        let pre_root_claims = [
             RealtimeFlowLabel::mint_claim(name.as_bytes().len())
                 .expect("the label claim is representable"),
-        );
-        let held_node = bytes(
-            crate::resource::LeasedMap::<RealtimeFlowLabel, ()>::entry_claim(
-                crate::resource::ResourceClaim::ZERO,
-            )
-            .expect("the held-name node claim is representable"),
-        );
-        let connector_flow =
-            bytes(RealtimeFlowRegistry::flow_claim().expect("the flow claim is representable"));
-        let flows_node = bytes(
-            crate::resource::LeasedMap::<RealtimeFlowLabel, RealtimeFlow>::entry_claim(
-                crate::resource::ResourceClaim::ZERO,
-            )
-            .expect("the flows node claim is representable"),
-        );
-        let before_the_root = label + held_node + connector_flow + flows_node;
+            RealtimeFlowRegistry::flow_claim().expect("the flow claim is representable"),
+            RealtimeFlowRegistry::flow_map_node_claim()
+                .expect("the connector flow node claim is representable"),
+            crate::resource::LeasedMap::<RealtimeFlowLabel, RealtimeFlow>::entry_claim()
+                .expect("the session-flow node claim is representable"),
+        ];
+        let before_the_root =
+            pre_root_claims
+                .iter()
+                .fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+                    total
+                        .checked_add(
+                            crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+                                *claim,
+                            )
+                            .expect("the pre-root reservation charge is representable"),
+                        )
+                        .expect("the four pre-root reservation charges compose")
+                });
 
         let (registry, resources) = control_label_registry();
         let incarnation = crate::connector::ConnectorIncarnation::new();
@@ -1799,24 +1908,33 @@ mod tests {
             Some(leased_control_profile(&registry)),
         );
 
-        // Consume everything except those four claims, in one exact
+        // Consume all accounted bytes except those four claims, in one exact
         // acquisition. The filler's own `Arc` counters are subtracted because
         // `acquire_flow_root` adds them to whatever it is asked for.
         let arc_counters =
             2 * u64::try_from(std::mem::size_of::<usize>()).expect("a counter pair is small");
         let filler = bytes(control_label_grant())
             .checked_sub(resources.accounted_bytes())
-            .and_then(|free| free.checked_sub(before_the_root))
+            .and_then(|free| free.checked_sub(bytes(before_the_root)))
             .and_then(|free| free.checked_sub(arc_counters))
             .expect("the control grant is larger than one open's pre-root claims");
         let filler = registry
             .acquire_flow_root(usize::try_from(filler).expect("the filler is representable"))
             .expect("the control grant funds the filler");
-        let at_ceiling = resources.accounted_bytes();
+        let at_ceiling = resources.in_use();
+        let remaining = control_label_grant()
+            .checked_sub(at_ceiling)
+            .expect("the in-use claim remains within the provider grant");
+        for dimension in crate::resource::ResourceClass::ALL {
+            assert!(
+                remaining.amount(dimension) >= before_the_root.amount(dimension),
+                "the provider has sufficient headroom for every pre-root reservation charge in {dimension:?}",
+            );
+        }
         assert_eq!(
-            bytes(control_label_grant()) - at_ceiling,
-            before_the_root,
-            "the provider now holds exactly enough for the label, both map \
+            remaining.amount(crate::resource::ResourceClass::AccountedMemoryBytes),
+            before_the_root.amount(crate::resource::ResourceClass::AccountedMemoryBytes),
+            "the provider now holds exactly enough accounted memory for the label, two map \
              nodes and the connector flow — and nothing for a root block"
         );
 
@@ -1840,10 +1958,10 @@ mod tests {
              before it is allocated, not after"
         );
         assert_eq!(
-            resources.accounted_bytes(),
+            resources.in_use(),
             at_ceiling,
-            "and the refusal retained nothing: not the label, not the held-name \
-             node, not the connector flow, not the flows node, and no block"
+            "and the refusal retained nothing: not the label, not the connector flow, \
+             not either map node, and no block"
         );
 
         drop(filler);
@@ -1866,36 +1984,51 @@ mod tests {
     #[test]
     fn v4_macro1_a_peer_cited_label_is_a_lookup_not_a_claim() {
         let (registry, _resources) = control_label_registry();
-        let mut labels = RealtimeFlowLabels::default();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
         let held = control_name(b"held");
         let cited = control_name(b"cited");
-        labels
-            .claim_exact(&held, &registry)
-            .expect("the space starts empty");
+        let open = |flows: &mut SessionRealtimeFlows, name: &RealtimeFlowName| {
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding: control_encoding(),
+                    name: name.clone(),
+                },
+            )
+        };
+        open(&mut flows, &held).expect("the space starts empty");
 
         // Any bytes within the frame bound are a syntactically valid name, so
         // nothing is rejected here — which is exactly why the answer has to be
         // a lookup rather than a judgement.
         assert!(
-            labels.holds(&held),
+            flows.holds(&held),
             "a peer can name a flow this session really does hold"
         );
         assert!(
-            !labels.holds(&cited),
+            !flows.holds(&cited),
             "and naming one it does not hold finds nothing"
         );
         assert!(
-            !labels.holds(&control_name(
+            !flows.holds(&control_name(
                 &[b'z'; crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES]
             )),
             "including the largest name the frame can carry"
         );
 
         // The cited name did not become held by being mentioned.
-        let claimed = labels
-            .claim_exact(&cited, &registry)
-            .expect("a name a peer said is still free until this side claims it");
-        assert_eq!(claimed.name(), &cited);
+        let claimed = open(&mut flows, &cited)
+            .expect("a name a peer said is still free until this side opens it");
+        assert_eq!(claimed, cited);
     }
 
     /// A reader is a lease, not a one-shot: one holder at a time, returned on
@@ -2115,9 +2248,13 @@ mod tests {
         let binding = RealtimeInboundBinding::new(label.clone(), encoding, RealtimeFraming::AnnexB);
 
         // The token for the transceiver this side negotiated, and one for a
-        // transceiver it never did.
-        let ours = RealtimeTrackIdentity::new();
-        let never_offered = RealtimeTrackIdentity::new();
+        // transceiver it never did. Funded from a real scope, because an
+        // identity is a leased allocation and a fixture that skipped the lease
+        // would be exercising a constructor production does not have.
+        let (_identity_candidate, _identity_lifetime, identity_scope) =
+            super::super::identity_test_scope(2, 0);
+        let ours = RealtimeTrackIdentity::mint_for_test(&identity_scope);
+        let never_offered = RealtimeTrackIdentity::mint_for_test(&identity_scope);
 
         // Detached handles, and honestly so: what this control exercises is the
         // demux decision, which never upgrades the port. That one flow feeds one

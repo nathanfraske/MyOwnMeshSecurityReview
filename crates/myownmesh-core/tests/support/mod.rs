@@ -10,6 +10,28 @@ use myownmesh_core::{
 
 static TEST_RESOURCE_PROVIDER: OnceLock<ResourceProviderPort> = OnceLock::new();
 
+/// The largest JSON frame these fixtures fund the *parse* of.
+///
+/// Its own number, deliberately not borrowed from the callback payload ceilings
+/// below. Those bound what a connector may hold queued; this bounds what the
+/// application gateway may allocate turning one frame into a `serde_json::Value`
+/// tree, which is a different quantity with a different denomination — the
+/// tree's claim is per input byte because a JSON value can hold as many
+/// independent allocations as it has bytes.
+///
+/// Test workload capacity only, and no wire gate: a frame is admitted against
+/// its own actual length. This fixture's grant used to leave that claim funded
+/// only by a residual counted in records, which is why it passed at eight
+/// libtest workers and failed the same handshake at one — the record count
+/// happened to exceed the frame length, or happened not to.
+const FIXTURE_JSON_FRAME_BYTES: usize = 8 * 1024;
+
+/// Simultaneous JSON input claims one connector can hold: the peer's `Hello`,
+/// whose claim is retained for the connection's whole life, plus one protocol
+/// or application frame being parsed. One would fund the retained `Hello` and
+/// refuse everything after it; more would be capacity with no nameable holder.
+const FIXTURE_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
+
 /// Explicit integration-test resource owner.
 ///
 /// These values cover the known in-process multi-device test fixtures. They
@@ -39,8 +61,30 @@ pub fn test_transport() -> Transport {
     )
     .expect("derived integration-test process connector bound is nonzero");
     let callback_capacity = NonZeroUsize::new(16).expect("fixture callback capacity is nonzero");
+    // The largest single payload this fixture funds, stated per callback class.
+    //
+    // This provider is minted here rather than drawn from a process owner, so
+    // these two numbers are the only thing that can size its byte grant, and the
+    // arithmetic below reads them back off the policy rather than repeating
+    // them. They are fixture inputs and make no production sizing claim, and
+    // neither is borrowed from another layer — not the protocol's endpoint frame
+    // maximum, not the signaling frame limit.
+    //
+    // Control covers one gathered ICE candidate's JSON. Endpoint covers the
+    // application payloads these multi-device fixtures exchange; it keeps the
+    // byte figure this fixture has always run with, now stated as what it is
+    // instead of appearing once as an unnamed multiplier.
+    let control_payload_ceiling =
+        NonZeroUsize::new(4_096).expect("fixture control payload ceiling is nonzero");
+    let endpoint_payload_ceiling =
+        NonZeroUsize::new(16 * 1024 * 1024).expect("fixture endpoint payload ceiling is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
+        ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
+            callback_capacity,
+            callback_capacity,
+            control_payload_ceiling,
+            endpoint_payload_ceiling,
+        ),
         ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
         RealtimeConnectorPolicy::Disabled,
     )
@@ -57,11 +101,43 @@ pub fn test_transport() -> Transport {
                 u64::try_from(callback_capacity.get()).expect("fixture callback count fits u64"),
             )
             .expect("fixture queued-item envelope fits u64");
-        let retained_bytes = queued_items
-            .checked_mul(
-                u64::try_from(myownmesh_core::engine::MAX_ENDPOINT_FRAME_BYTES)
-                    .expect("the protocol frame limit fits u64"),
+        // Both ceilings are read back off the policy this fixture actually
+        // installs, not restated here. That is what keeps the two from drifting:
+        // an edit that changes the declared policy without changing this
+        // arithmetic — or the reverse — is the shape of the defect this replaces,
+        // and reading through the policy makes it unrepresentable rather than
+        // merely discouraged.
+        let stated = callbacks
+            .local_mailboxes()
+            .expect("the fixture policy states its local mailboxes");
+        let ceiling = |bytes: Option<NonZeroUsize>, class: &str| -> u64 {
+            u64::try_from(
+                bytes
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "the self-funded fixture policy must state its {class} payload ceiling"
+                        )
+                    })
+                    .get(),
             )
+            .unwrap_or_else(|_| panic!("the stated {class} payload ceiling fits u64"))
+        };
+        // Each class funds its own slots from its own stated ceiling, summed.
+        // One number multiplied across the combined slot count is what this
+        // replaces: it made the endpoint figure silently pay for every control
+        // callback too, so neither class's budget meant what it said and removing
+        // the figure would have left control funded for nothing.
+        let control_bytes = queued_items
+            .checked_mul(ceiling(stated.local_control_payload_bytes(), "control"))
+            .expect("fixture control byte envelope fits u64");
+        let endpoint_bytes = queued_items
+            .checked_mul(ceiling(
+                stated.local_endpoint_payload_bytes(),
+                "endpoint-data",
+            ))
+            .expect("fixture endpoint byte envelope fits u64");
+        let retained_bytes = control_bytes
+            .checked_add(endpoint_bytes)
             .expect("fixture retained-byte envelope fits u64");
         let residual = 1u64
             .checked_add(mesh_scopes)
@@ -88,8 +164,25 @@ pub fn test_transport() -> Transport {
             (ResourceClass::OpaqueDependencyResidual, residual),
         ])
         .expect("the fixture workload claim is representable");
+        // JSON input work, as its own term. The claim comes from the gateway
+        // rather than being restated here, so the grant and the admission it has
+        // to satisfy cannot be derived from two different formulas. Added apart
+        // from the provider-record `residual` above because the two are
+        // different quantities that merely share a dimension: one counts this
+        // fixture's bookkeeping objects, the other a decoded JSON tree's
+        // allocations.
+        let json_input_work =
+            myownmesh_core::application_gateway::json_input_work_claim(FIXTURE_JSON_FRAME_BYTES)
+                .expect("the fixture JSON input claim is representable")
+                .checked_scale(
+                    connectors
+                        .checked_mul(FIXTURE_JSON_CLAIMS_PER_CONNECTOR)
+                        .expect("the fixture JSON claim count is representable"),
+                )
+                .expect("the fixture JSON input grant is representable");
         let grant = structural
             .checked_add(workload)
+            .and_then(|claim| claim.checked_add(json_input_work))
             .expect("the fixture provider grant is representable");
         // One post-authentication Session Broker reservation per connector.
         //
@@ -113,20 +206,10 @@ pub fn test_transport() -> Transport {
         // surfaces as a refused promotion rather than as a fixture that quietly
         // stopped promoting.
         //
-        // Gated with the accessor, and the reason is narrower than it looks.
-        // Default-feature integration tests *do* promote ordinary sessions — a
-        // session is post-authentication, not post-realtime — so this is not a
-        // case of feature-off needing no capacity. It is that the accessor is
-        // deliberately not in the default public API, and an integration test is
-        // a separate crate that can only call what is `pub`.
-        //
-        // The authoritative workspace gate unifies `transport-lab`, so the run
-        // that decides this branch gets the exact term. A standalone feature-off
-        // `cargo test -p myownmesh-core --test ...` keeps the conservative
-        // process grant above and budgets no session — the same position it has
-        // always been in, and a real residual rather than a claim of exactness.
-        #[cfg(feature = "transport-lab")]
-        let grant = myownmesh_core::transport_lab_session_reservation_claim()
+        // Unconditional because default-feature connectors promote the same
+        // sessions as transport-lab connectors. Omitting this exact broker term
+        // would make promotion depend on unrelated residual slack.
+        let grant = myownmesh_core::session_reservation_planning_claim()
             .checked_scale(connectors)
             .and_then(|sessions| grant.checked_add(sessions))
             .expect("the fixture session reservation capacity is representable");

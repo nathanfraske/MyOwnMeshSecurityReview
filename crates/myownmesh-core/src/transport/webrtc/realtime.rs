@@ -113,9 +113,22 @@ struct QueuedRealtimeEvent {
     event: QueuedTransportEvent,
     queued_at: Instant,
     payload_bytes: usize,
-    /// Exact ownership of the queue record and its logical queued bytes.
-    /// The payload lease remains attached to `event` after dequeue.
+    /// Exact ownership of the logical queued bytes. The queue node has its own
+    /// lease and is released on dequeue; this lease follows the returned value
+    /// until its transition to delivered payload completes.
     _queue_lease: ResourceLease,
+    #[cfg(test)]
+    _drop_probe: Option<TestQueuedRealtimeEventDropProbe>,
+}
+
+#[cfg(test)]
+struct TestQueuedRealtimeEventDropProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for TestQueuedRealtimeEventDropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl QueuedRealtimeEvent {
@@ -182,7 +195,7 @@ impl Drop for RealtimeFragmentLeases {
 
 pub(super) struct RealtimeFlowQueue {
     domain: RealtimeFlowDomain,
-    events: std::collections::LinkedList<QueuedRealtimeEvent>,
+    events: crate::resource::LeasedQueue<QueuedRealtimeEvent>,
     scheduled: bool,
     ready_previous: Option<RealtimeFlowKey>,
     ready_next: Option<RealtimeFlowKey>,
@@ -191,13 +204,17 @@ pub(super) struct RealtimeFlowQueue {
 }
 
 pub(super) struct RealtimeFlowRegistryState {
-    pub(super) flows: std::collections::BTreeMap<RealtimeFlowKey, RealtimeFlowQueue>,
+    pub(super) flows: crate::resource::LeasedMap<RealtimeFlowKey, RealtimeFlowQueue>,
     pub(super) ready: RealtimeReadyQueue,
     pub(super) active_flows_by_domain: [usize; 2],
     pub(super) retained_bytes_by_domain: [usize; 2],
     pub(super) in_progress_units_by_domain: [usize; 2],
     pub(super) accounting_poisoned_by_domain: [bool; 2],
     pub(super) retired: bool,
+    #[cfg(test)]
+    fail_next_ready_push: bool,
+    #[cfg(test)]
+    next_queued_event_drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 pub(super) struct RealtimeFlowRegistry {
@@ -256,6 +273,10 @@ impl ElasticControlResources {
         self.provider
             .in_use()
             .amount(ResourceClass::AccountedMemoryBytes)
+    }
+
+    pub(super) fn in_use(&self) -> ResourceClaim {
+        self.provider.in_use()
     }
 }
 
@@ -339,13 +360,17 @@ impl RealtimeFlowRegistry {
             // zero and not unlimited.
             max_unit_bytes: local_ceiling.map(|enabled| enabled.max_unit_bytes()),
             state: SyncMutex::new(RealtimeFlowRegistryState {
-                flows: std::collections::BTreeMap::new(),
+                flows: crate::resource::LeasedMap::new(),
                 ready: RealtimeReadyQueue::default(),
                 active_flows_by_domain: [0; 2],
                 retained_bytes_by_domain: [0; 2],
                 in_progress_units_by_domain: [0; 2],
                 accounting_poisoned_by_domain: [false; 2],
                 retired: false,
+                #[cfg(test)]
+                fail_next_ready_push: false,
+                #[cfg(test)]
+                next_queued_event_drop_probe: None,
             }),
             ready: tokio::sync::Notify::new(),
             observer,
@@ -381,9 +406,8 @@ impl RealtimeFlowRegistry {
     }
 
     pub(super) fn flow_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
-        let record_bytes = std::mem::size_of::<RealtimeFlowQueue>()
-            .checked_add(std::mem::size_of::<RealtimeFlowLifetime>())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RealtimeFlowKey>()))
+        let record_bytes = std::mem::size_of::<RealtimeFlowLifetime>()
+            .checked_add(std::mem::size_of::<RealtimeFlowIdentity>())
             .ok_or(ResourceUnavailable::ProviderInvariant {
                 dimension: ResourceClass::AccountedMemoryBytes,
             })?;
@@ -396,11 +420,27 @@ impl RealtimeFlowRegistry {
             // flows may satisfy it without a dedicated task, but no provider
             // can admit the obligation without finite worker capacity.
             (ResourceClass::WorkerOrTask, 1),
-            // The identity and lifetime allocations plus one ordered-map node
-            // are allocator-owned residuals for this exact live flow. Ready
-            // scheduling has a separate lease that follows the ready state.
-            (ResourceClass::OpaqueDependencyResidual, 3),
+            // The identity and lifetime allocations belong to the flow value.
+            // The registry map node is a separate exact LeasedMap allocation.
+            (ResourceClass::OpaqueDependencyResidual, 2),
         ])
+    }
+
+    pub(super) fn flow_map_node_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        crate::resource::LeasedMap::<RealtimeFlowKey, RealtimeFlowQueue>::entry_claim()
+            .map_err(Self::claim_arithmetic_unavailable)
+    }
+
+    /// What one node of a [`crate::resource::LeasedQueue`] costs this owner.
+    ///
+    /// Split out from [`Self::acquire_queue_record`] so that the acquisition and
+    /// any caller that needs to *predict* the acquisition read one expression.
+    /// A control that restated the claim would keep passing after the queue's
+    /// calibration changed, which is the failure a resource control exists to
+    /// catch. Computing a claim charges nothing — only `acquire` does — so the
+    /// two callers cannot bill the same node twice.
+    pub(super) fn queue_node_claim<T>() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        crate::resource::LeasedQueue::<T>::entry_claim().map_err(Self::claim_arithmetic_unavailable)
     }
 
     /// Fund one node of a caller-owned [`crate::resource::LeasedMap`] against
@@ -416,7 +456,7 @@ impl RealtimeFlowRegistry {
         &self,
     ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
         self.acquire(
-            crate::resource::LeasedMap::<K, V>::entry_claim(ResourceClaim::ZERO)
+            crate::resource::LeasedMap::<K, V>::entry_claim()
                 .map_err(Self::claim_arithmetic_unavailable),
         )
     }
@@ -433,15 +473,12 @@ impl RealtimeFlowRegistry {
     pub(super) fn acquire_queue_record<T>(
         &self,
     ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
-        self.acquire(
-            crate::resource::LeasedQueue::<T>::entry_claim(ResourceClaim::ZERO)
-                .map_err(Self::claim_arithmetic_unavailable),
-        )
+        self.acquire(Self::queue_node_claim::<T>())
     }
 
     pub(super) fn ready_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
-        // Ready links are embedded in RealtimeFlowQueue and were included in
-        // flow_claim. This lease owns only the live scheduling obligation.
+        // Ready links are embedded in the map value and funded by its exact map
+        // node. This lease owns only the live scheduling obligation.
         Self::claim([(ResourceClass::CallbackOrScheduledWork, 1)])
     }
 
@@ -516,17 +553,10 @@ impl RealtimeFlowRegistry {
     pub(super) fn queue_claim(
         content_bytes: usize,
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
-        Self::claim([
-            (
-                ResourceClass::AccountedMemoryBytes,
-                Self::measured_bytes(std::mem::size_of::<QueuedRealtimeEvent>())?,
-            ),
-            (
-                ResourceClass::QueuedBytes,
-                Self::measured_bytes(content_bytes)?,
-            ),
-            (ResourceClass::OpaqueDependencyResidual, 1),
-        ])
+        Self::claim([(
+            ResourceClass::QueuedBytes,
+            Self::measured_bytes(content_bytes)?,
+        )])
     }
 
     /// The per-packet cost of classifying and framing one inbound RTP payload.
@@ -769,6 +799,10 @@ impl RealtimeFlowRegistry {
         key: RealtimeFlowKey,
         lease: ResourceLease,
     ) -> std::result::Result<(), ResourceLease> {
+        #[cfg(test)]
+        if std::mem::take(&mut state.fail_next_ready_push) {
+            return Err(lease);
+        }
         let previous = state.ready.tail;
         let can_link = state
             .flows
@@ -802,6 +836,13 @@ impl RealtimeFlowRegistry {
         state.ready.tail = Some(key);
         state.ready.len = next_len;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_ready_push_for_test(&self, drop_probe: Arc<std::sync::atomic::AtomicUsize>) {
+        let mut state = self.state.lock();
+        state.fail_next_ready_push = true;
+        state.next_queued_event_drop_probe = Some(drop_probe);
     }
 
     fn pop_ready_locked(
@@ -887,6 +928,9 @@ impl RealtimeFlowRegistry {
         let lease = self
             .acquire(Self::flow_claim())
             .map_err(|reason| self.record_drop(None, reason, 0))?;
+        let map_node = self
+            .acquire(Self::flow_map_node_claim())
+            .map_err(|reason| self.record_drop(None, reason, 0))?;
         let identity = Arc::new(RealtimeFlowIdentity);
         let key = RealtimeFlowKey::from_identity(&identity);
         let mut state = self.state.lock();
@@ -915,21 +959,28 @@ impl RealtimeFlowRegistry {
                 ));
             }
         }
-        state.flows.insert(
-            key,
-            RealtimeFlowQueue {
-                domain,
-                events: std::collections::LinkedList::new(),
-                scheduled: false,
-                ready_previous: None,
-                ready_next: None,
-                ready_lease: None,
-                in_progress_units: 0,
-            },
-        );
+        if state
+            .flows
+            .insert(
+                key,
+                RealtimeFlowQueue {
+                    domain,
+                    events: crate::resource::LeasedQueue::new(),
+                    scheduled: false,
+                    ready_previous: None,
+                    ready_next: None,
+                    ready_lease: None,
+                    in_progress_units: 0,
+                },
+                map_node,
+            )
+            .is_err()
+        {
+            return Err(RealtimeFlowDropReason::OwnershipMismatch);
+        }
         let Some(active_flows) = active_in_domain.checked_add(1) else {
             self.poison_domain_locked(&mut state, domain);
-            state.flows.remove(&key);
+            state.flows.remove_entry(&key);
             return Err(RealtimeFlowDropReason::ResourceUnavailable(
                 ResourceUnavailable::ProviderInvariant {
                     dimension: ResourceClass::AccountedMemoryBytes,
@@ -978,7 +1029,7 @@ impl RealtimeFlowRegistry {
     fn remove_flow(&self, key: RealtimeFlowKey) {
         let mut state = self.state.lock();
         let ready_lease = Self::unlink_ready_locked(&mut state, key);
-        if let Some(flow) = state.flows.remove(&key) {
+        if let Some((_stored_key, flow)) = state.flows.remove_entry(&key) {
             let domain = flow.domain;
             let active_flows = match state.active_flows_by_domain[domain.index()].checked_sub(1) {
                 Some(active) => {
@@ -1301,6 +1352,7 @@ impl RealtimeFlowRegistry {
         let queue_lease = self
             .acquire(Self::queue_claim(reservation.bytes))
             .map_err(|reason| self.record_drop(Some(key), reason, reservation.bytes))?;
+        let queue_node = self.acquire_queue_record::<QueuedRealtimeEvent>()?;
         let now = Instant::now();
         let domain = reservation.domain;
         let payload_bytes = reservation.bytes;
@@ -1311,6 +1363,7 @@ impl RealtimeFlowRegistry {
         }
         let mut event = Some(event);
         let mut queue_lease = Some(queue_lease);
+        let mut queue_node = Some(queue_node);
         let mut ready_lease = None;
         let (units, retained_bytes) = loop {
             let mut state = self.state.lock();
@@ -1362,21 +1415,33 @@ impl RealtimeFlowRegistry {
                 continue;
             }
 
+            #[cfg(test)]
+            let drop_probe = state
+                .next_queued_event_drop_probe
+                .take()
+                .map(TestQueuedRealtimeEventDropProbe);
             state
                 .flows
                 .get_mut(&key)
                 .expect("the validated flow remains under the registry lock")
                 .events
-                .push_back(QueuedRealtimeEvent {
-                    event: event
+                .push(
+                    QueuedRealtimeEvent {
+                        event: event
+                            .take()
+                            .expect("the event is moved exactly once into its admitted queue"),
+                        queued_at: now,
+                        payload_bytes,
+                        _queue_lease: queue_lease
+                            .take()
+                            .expect("the queue lease is moved with its exact queue record"),
+                        #[cfg(test)]
+                        _drop_probe: drop_probe,
+                    },
+                    queue_node
                         .take()
-                        .expect("the event is moved exactly once into its admitted queue"),
-                    queued_at: now,
-                    payload_bytes,
-                    _queue_lease: queue_lease
-                        .take()
-                        .expect("the queue lease is moved with its exact queue record"),
-                });
+                        .expect("the node lease moves with its exact node"),
+                );
             if needs_ready {
                 let lease = ready_lease
                     .take()
@@ -1453,11 +1518,11 @@ impl RealtimeFlowRegistry {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.state
+        !self
+            .state
             .lock()
             .flows
-            .values()
-            .all(|flow| flow.events.is_empty())
+            .any_value(|flow| !flow.events.is_empty())
     }
 
     /// Stop all later flow work and release every queued complete unit.
@@ -1481,15 +1546,19 @@ impl RealtimeFlowRegistry {
             };
             drop(ready_lease);
         }
-        let queued = {
-            let mut state = self.state.lock();
-            let mut queued = std::collections::LinkedList::new();
-            for flow in state.flows.values_mut() {
-                queued.append(&mut flow.events);
-            }
-            queued
-        };
-        drop(queued);
+        loop {
+            let queued = {
+                let mut state = self.state.lock();
+                state
+                    .flows
+                    .find_value_mut(|flow| !flow.events.is_empty())
+                    .and_then(|flow| flow.events.pop_front())
+            };
+            let Some(queued) = queued else {
+                break;
+            };
+            drop(queued);
+        }
         self.ready.notify_waiters();
     }
 }
@@ -1946,7 +2015,9 @@ mod elastic_resource_tests {
     #[test]
     fn elastic_flow_admission_uses_provider_capacity_not_a_product_count() {
         let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
-        let fixture = context(&[flow_claim, flow_claim]);
+        let map_node = RealtimeFlowRegistry::flow_map_node_claim()
+            .expect("flow map node claim is representable");
+        let fixture = context(&[flow_claim, map_node, flow_claim, map_node]);
 
         let first = fixture
             .registry
@@ -1980,11 +2051,13 @@ mod elastic_resource_tests {
     #[test]
     fn every_retained_fragment_keeps_its_exact_provider_lease() {
         let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
+        let map_node = RealtimeFlowRegistry::flow_map_node_claim()
+            .expect("flow map node claim is representable");
         let assembly_claim =
             RealtimeFlowRegistry::assembly_claim().expect("assembly claim is representable");
         let fragment_claim = RealtimeFlowRegistry::ordered_fragment_claim(4)
             .expect("fragment claim is representable");
-        let fixture = context(&[flow_claim, assembly_claim, fragment_claim]);
+        let fixture = context(&[flow_claim, map_node, assembly_claim, fragment_claim]);
         let flow = fixture
             .registry
             .open_inbound_flow_checked()
@@ -1999,7 +2072,7 @@ mod elastic_resource_tests {
         let with_fragment = fixture.provider.in_use();
         assert_eq!(
             with_fragment.amount(ResourceClass::AccountedMemoryBytes),
-            grant_for(&[flow_claim, assembly_claim, fragment_claim])
+            grant_for(&[flow_claim, map_node, assembly_claim, fragment_claim])
                 .amount(ResourceClass::AccountedMemoryBytes)
         );
         assert!(matches!(
@@ -2075,11 +2148,13 @@ mod elastic_resource_tests {
     #[test]
     fn slow_fragment_owner_does_not_expire_without_an_owner_transition() {
         let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
+        let map_node = RealtimeFlowRegistry::flow_map_node_claim()
+            .expect("flow map node claim is representable");
         let assembly_claim =
             RealtimeFlowRegistry::assembly_claim().expect("assembly claim is representable");
         let fragment_claim = RealtimeFlowRegistry::ordered_fragment_claim(4)
             .expect("ordered fragment claim is representable");
-        let fixture = context(&[flow_claim, assembly_claim, fragment_claim]);
+        let fixture = context(&[flow_claim, map_node, assembly_claim, fragment_claim]);
         let flow = fixture
             .registry
             .open_inbound_flow_checked()
@@ -2126,10 +2201,14 @@ mod elastic_resource_tests {
     #[test]
     fn dequeue_releases_queue_ownership_but_payload_clones_keep_content_ownership() {
         let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
+        let map_node = RealtimeFlowRegistry::flow_map_node_claim()
+            .expect("flow map node claim is representable");
         let output_claim =
             RealtimeFlowRegistry::output_claim(4).expect("output claim is representable");
         let queue_claim =
             RealtimeFlowRegistry::queue_claim(4).expect("queue claim is representable");
+        let queue_node = RealtimeFlowRegistry::queue_node_claim::<QueuedRealtimeEvent>()
+            .expect("queue node claim is representable");
         let ready_claim =
             RealtimeFlowRegistry::ready_claim().expect("ready claim is representable");
         let retained_payload_claim = RealtimeFlowRegistry::retained_payload_claim(4)
@@ -2139,8 +2218,10 @@ mod elastic_resource_tests {
             .expect("label claim is representable");
         let fixture = context(&[
             flow_claim,
+            map_node,
             output_claim,
             queue_claim,
+            queue_node,
             ready_claim,
             label_claim,
         ]);
@@ -2172,10 +2253,14 @@ mod elastic_resource_tests {
         )
         .expect("the queue claim is available");
         {
-            let state = fixture.registry.state.lock();
+            // `get_mut`, and the guard is `mut` for it: `LeasedQueue::front`
+            // may reverse the push chain into the pop chain before returning
+            // the head. That is structural mutation only; it neither moves nor
+            // releases any lease or changes any accounting.
+            let mut state = fixture.registry.state.lock();
             let queued = state
                 .flows
-                .get(&flow.key())
+                .get_mut(&flow.key())
                 .and_then(|flow| flow.events.front())
                 .expect("the exact payload is queued");
             assert_eq!(queued._queue_lease.claim(), queue_claim);
@@ -2199,8 +2284,11 @@ mod elastic_resource_tests {
         }
         assert_eq!(
             fixture.provider.in_use(),
-            add_provider_reservations(flow_only, &[output_claim, queue_claim, ready_claim]),
-            "the queued unit owns output, queue, and ready claims",
+            add_provider_reservations(
+                flow_only,
+                &[output_claim, queue_claim, queue_node, ready_claim],
+            ),
+            "the queued unit owns output, value-retention, node, and ready claims",
         );
 
         let event = fixture
@@ -2229,12 +2317,16 @@ mod elastic_resource_tests {
     }
 
     #[test]
-    fn dropping_a_scheduled_flow_releases_its_embedded_ready_node() {
+    fn failed_post_insertion_ready_transition_unwinds_event_and_every_queue_lease() {
         let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
+        let map_node = RealtimeFlowRegistry::flow_map_node_claim()
+            .expect("flow map node claim is representable");
         let output_claim =
             RealtimeFlowRegistry::output_claim(4).expect("output claim is representable");
         let queue_claim =
             RealtimeFlowRegistry::queue_claim(4).expect("queue claim is representable");
+        let queue_node = RealtimeFlowRegistry::queue_node_claim::<QueuedRealtimeEvent>()
+            .expect("queue node claim is representable");
         let ready_claim =
             RealtimeFlowRegistry::ready_claim().expect("ready claim is representable");
         let name = fixture_flow_name();
@@ -2242,8 +2334,81 @@ mod elastic_resource_tests {
             .expect("label claim is representable");
         let fixture = context(&[
             flow_claim,
+            map_node,
             output_claim,
             queue_claim,
+            queue_node,
+            ready_claim,
+            label_claim,
+        ]);
+        let label =
+            RealtimeFlowLabel::mint(name, &fixture.registry).expect("the label claim is available");
+        let flow = fixture
+            .registry
+            .open_inbound_flow_checked()
+            .expect("the flow claim is available");
+        let flow_only = fixture.provider.in_use();
+        let output = flow
+            .reserve_output_checked(4)
+            .expect("the output claim is available");
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        fixture
+            .registry
+            .fail_next_ready_push_for_test(Arc::clone(&drops));
+
+        assert_eq!(
+            flow.enqueue_checked(
+                QueuedTransportEvent {
+                    event: fixture_realtime_unit(&label),
+                    observation: None,
+                    callback_work: None,
+                },
+                output,
+            ),
+            Err(RealtimeFlowDropReason::OwnershipMismatch),
+            "the injected failure is reached only after queue insertion",
+        );
+        {
+            let state = fixture.registry.state.lock();
+            assert!(
+                state
+                    .flows
+                    .get(&flow.key())
+                    .is_some_and(|flow| flow.events.is_empty()),
+                "the inserted queue node and value are removed on refusal",
+            );
+            assert!(state.ready.is_empty(), "no ready node was linked");
+        }
+        assert_claim_dimensions(fixture.provider.in_use(), flow_only);
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the inserted payload/event wrapper is destroyed exactly once",
+        );
+    }
+
+    #[test]
+    fn dropping_a_scheduled_flow_releases_its_embedded_ready_node() {
+        let flow_claim = RealtimeFlowRegistry::flow_claim().expect("flow claim is representable");
+        let map_node = RealtimeFlowRegistry::flow_map_node_claim()
+            .expect("flow map node claim is representable");
+        let output_claim =
+            RealtimeFlowRegistry::output_claim(4).expect("output claim is representable");
+        let queue_claim =
+            RealtimeFlowRegistry::queue_claim(4).expect("queue claim is representable");
+        let queue_node = RealtimeFlowRegistry::queue_node_claim::<QueuedRealtimeEvent>()
+            .expect("queue node claim is representable");
+        let ready_claim =
+            RealtimeFlowRegistry::ready_claim().expect("ready claim is representable");
+        let name = fixture_flow_name();
+        let label_claim = RealtimeFlowLabel::mint_claim(name.as_bytes().len())
+            .expect("label claim is representable");
+        let fixture = context(&[
+            flow_claim,
+            map_node,
+            output_claim,
+            queue_claim,
+            queue_node,
             ready_claim,
             label_claim,
         ]);

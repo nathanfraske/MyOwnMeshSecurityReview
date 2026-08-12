@@ -56,7 +56,6 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::RpcResponse(_)
         | MeshMessage::RpcStreamChunk(_)
         | MeshMessage::RpcStreamEnd(_) => FrameClass::App,
-        MeshMessage::Unknown => FrameClass::Other,
     }
 }
 
@@ -213,7 +212,6 @@ mod tests {
             }),
             FrameClass::App
         );
-        assert_eq!(class_of(&MeshMessage::Unknown), FrameClass::Other);
     }
 
     #[test]

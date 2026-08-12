@@ -1851,11 +1851,20 @@ mod finite {
             }
         }
 
+        /// Provider-owned planning charge for one future reservation: the
+        /// requested claim plus the exact bookkeeping record the provider will
+        /// retain for its lease. This computes capacity only and acquires none.
+        pub(crate) fn reservation_planning_charge(
+            claim: ResourceClaim,
+        ) -> Result<ResourceClaim, ResourceUnavailable> {
+            Self::reservation_charge(claim)
+        }
+
         #[cfg(any(test, feature = "transport-lab"))]
         pub(crate) fn reservation_charge_for_test(
             claim: ResourceClaim,
         ) -> Result<ResourceClaim, ResourceUnavailable> {
-            Self::reservation_charge(claim)
+            Self::reservation_planning_charge(claim)
         }
 
         #[cfg(any(test, feature = "transport-lab"))]

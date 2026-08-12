@@ -120,6 +120,120 @@ impl RealtimeInboundStream {
     }
 }
 
+/// One open flow, and the only thing that authorizes operating on it.
+///
+/// **The coordinate-based API this replaces had an ABA hole.** A caller kept a
+/// Device selector and a label; send and close re-resolved the selector into
+/// whichever session was current at that moment and looked the label up there.
+/// Labels are session-scoped and freely reused, so a caller whose session had
+/// ended and been replaced would have its units accepted by the *replacement's*
+/// flow of the same name — silently, since nothing on a realtime path is
+/// acknowledged per unit. `screen` meant one thing to the session that opened it
+/// and whatever the successor chose to it.
+///
+/// So a handle names three things, all of them established at open and none of
+/// them re-derivable afterwards:
+///
+/// - the **exact session owner**, so no Device selector is ever resolved again;
+/// - the **exact flow set**, so a replacement session cannot answer for it;
+/// - the **exact flow record**, so a reopen of the same name inside the *same*
+///   session cannot answer for it either.
+///
+/// The label is a **wire coordinate and nothing more**. It still travels, still
+/// names the flow in the application's own control messages, and still grants
+/// nothing on its own.
+///
+/// **Move-only, not `Clone`, not serializable.** Two copies would let one be
+/// closed while the other still looked valid, which is the same class of bug one
+/// layer up; and a handle that could be written to a socket would be authority
+/// crossing a boundary it means nothing on the far side of. Nothing here is
+/// serialized, and nothing is transmissible.
+///
+/// **Holding one keeps no session alive.** Both identities are non-owning, so a
+/// handle for a flow that has closed simply stops resolving — it does not fund
+/// the flow, the label, or the session it came from.
+///
+/// This carries a provider's identities in private fields, exactly as
+/// [`RealtimeInboundStream`] carries a provider's reader: they are lifetime and
+/// identity mechanisms with no media meaning, and nothing about them is exposed
+/// or interpreted here.
+pub struct RealtimeFlowHandle {
+    /// The exact installation this flow was opened on. Re-resolving a selector
+    /// is what the review's ABA path did; carrying the owner is how this one
+    /// does not.
+    owner: crate::engine::peer_registry::PeerOwnerToken,
+    /// The exact flow set — which is to say the exact promoted session, named
+    /// directly rather than inferred from the installation that holds it.
+    ///
+    /// The owner above proves the *installation*. Reading a session's identity
+    /// off it would be sound only while one installation can promote only one
+    /// session, and that property is real but lives three modules away, in the
+    /// endpoint-auth and promotion refusals. A handle that depended on it would
+    /// be silently wrong the day any of those changed. This says what it means.
+    flow_set: crate::transport::webrtc::RealtimeFlowSetIdentity,
+    /// The exact flow record. Closing a name and reopening it in the same
+    /// session produces a different record, so this fails a same-session reuse
+    /// that every other check would pass.
+    flow: crate::transport::webrtc::RealtimeFlowIdentity,
+    /// The application's own coordinate, kept so operations can name the flow to
+    /// the session that owns it. It proves nothing; the two identities above do.
+    name: crate::transport::webrtc::RealtimeFlowName,
+}
+
+impl RealtimeFlowHandle {
+    pub(crate) fn new(
+        owner: crate::engine::peer_registry::PeerOwnerToken,
+        flow_set: crate::transport::webrtc::RealtimeFlowSetIdentity,
+        flow: crate::transport::webrtc::RealtimeFlowIdentity,
+        name: crate::transport::webrtc::RealtimeFlowName,
+    ) -> Self {
+        Self {
+            owner,
+            flow_set,
+            flow,
+            name,
+        }
+    }
+
+    /// The label this flow was opened under.
+    ///
+    /// For the wire and for logs. A caller that has this handle does not need it
+    /// to operate on the flow, and a caller that has only this cannot.
+    pub fn label(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+
+    pub(crate) fn owner(&self) -> &crate::engine::peer_registry::PeerOwnerToken {
+        &self.owner
+    }
+
+    pub(crate) fn flow_set(&self) -> &crate::transport::webrtc::RealtimeFlowSetIdentity {
+        &self.flow_set
+    }
+
+    pub(crate) fn flow(&self) -> &crate::transport::webrtc::RealtimeFlowIdentity {
+        &self.flow
+    }
+
+    pub(crate) fn name(&self) -> &crate::transport::webrtc::RealtimeFlowName {
+        &self.name
+    }
+}
+
+impl std::fmt::Debug for RealtimeFlowHandle {
+    /// Names the flow and says nothing about what authorizes it.
+    ///
+    /// Hand-written rather than derived: a derived form would print the two
+    /// identities, and a pointer address in a log is both meaningless to a
+    /// reader and a hint about process layout that nothing needs.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RealtimeFlowHandle")
+            .field("label", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Why a realtime operation was refused.
 ///
 /// Four cases, each a distinct fact a client can act on. There is deliberately

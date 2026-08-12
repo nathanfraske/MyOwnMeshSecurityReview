@@ -11,7 +11,8 @@
 //!   synthetic `Rpc::serve` that routes inbound peer calls to
 //!   the claiming client's event socket as `RpcInbound` events.
 //!   The client posts `RpcRespond` / `RpcStreamChunk` /
-//!   `RpcStreamEnd` requests back over the same connection;
+//!   `RpcStreamEnd` requests over command connections carrying the exact
+//!   capability minted for that event connection;
 //!   those resolve the engine-side `oneshot` / `mpsc` the
 //!   library handler returned.
 //!
@@ -41,5 +42,5 @@ pub mod clients;
 pub mod wire;
 
 #[allow(unused_imports)]
-pub use clients::{ClientHandle, ClientId, ClientRegistry};
+pub use clients::{ClientHandle, ClientId, ClientRegistry, RealtimeFlowCapability};
 pub use wire::ServerOut;

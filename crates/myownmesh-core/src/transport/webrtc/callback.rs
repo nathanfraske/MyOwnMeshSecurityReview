@@ -102,6 +102,14 @@ impl CallbackProducerClaims {
 pub(super) enum CallbackProducerOverload {
     #[cfg(any(test, feature = "transport-lab"))]
     LocalPolicyRequired,
+    /// The lab path was asked to mint a provider from a policy that states no
+    /// byte ceiling for this class. Separate from [`Self::LocalPolicyRequired`]
+    /// because the missing thing is different: the mailboxes are present and
+    /// the slot counts are usable, and only the byte grant cannot be derived.
+    #[cfg(any(test, feature = "transport-lab"))]
+    LocalPayloadCeilingRequired {
+        class: ConnectorCallbackClass,
+    },
     PayloadSizeUnrepresentable {
         class: ConnectorCallbackClass,
     },
@@ -298,6 +306,24 @@ impl CallbackProducerOwner {
     /// explicit local mailbox ceilings and derives its finite grant from those
     /// ceilings plus the exact callback record shapes. It does not select a
     /// production policy or create a basal product-object limit.
+    ///
+    /// **Each class is funded from its own stated ceiling, at both phases.**
+    /// Control and endpoint data both carry payload bytes into
+    /// [`callback_phase_claim`], which charges `QueuedBytes` on the queued
+    /// phase, so a grant that funds only one class funds neither reliably — the
+    /// provider is a single pool and whichever class draws first decides whether
+    /// the other is refused. That is not a hypothetical: this path previously
+    /// derived its whole byte grant from an endpoint frame maximum and control
+    /// ICE candidates were admitted out of it, so removing that maximum left the
+    /// grant with zero `QueuedBytes` and every gathered candidate was refused.
+    ///
+    /// One ceiling shared by both classes would be the same defect in a softer
+    /// form — the grant would carry `max(control, endpoint)` for each and the
+    /// generously-sized class would pay for the other — so the two are stated
+    /// and applied separately. The reserved lifecycle deliveries are funded at
+    /// their real payload of zero rather than at either ceiling, because payload
+    /// surplus reserved for callbacks that carry no payload is exactly the
+    /// undeclared pool this whole repair exists to remove.
     #[cfg(any(test, feature = "transport-lab"))]
     pub(super) fn for_local_lab_policy(
         policy: ConnectorCallbackPolicy,
@@ -311,21 +337,34 @@ impl CallbackProducerOwner {
         let endpoint_slots = u64::try_from(mailboxes.endpoint_data().get())
             .map_err(|_| CallbackProducerOverload::PayloadSizeUnrepresentable { class })?;
 
+        // The two numbers this path cannot infer, one per class. An owner that
+        // mints its own provider states the largest payload it will fund for
+        // each; core picks neither, and neither class's limit is borrowed to
+        // stand in for the other's.
+        let control_payload = local_payload_ceiling(
+            mailboxes.local_control_payload_bytes(),
+            ConnectorCallbackClass::Control,
+        )?;
+        let endpoint_payload = local_payload_ceiling(
+            mailboxes.local_endpoint_payload_bytes(),
+            ConnectorCallbackClass::EndpointData,
+        )?;
+
         let structural = CallbackProducerClaims::structural_only();
         let control = structural.for_class(ConnectorCallbackClass::Control);
         let endpoint = structural.for_class(ConnectorCallbackClass::EndpointData);
-        let control_slot = callback_phase_claim(control.queued, 0, true)
+        // Queued *and* executing, summed rather than maxed, because the native
+        // pump reaches both at once: a callback that has converted its payload
+        // holds the executing lease while the handoff behind it takes a queued
+        // one. Control carries payload bytes like any other queued class — a
+        // local ICE candidate is converted to JSON and queued, and those bytes
+        // are charged against `QueuedBytes` on the queued phase.
+        let control_slot = callback_phase_claim(control.queued, control_payload, true)
             .and_then(|queued| {
-                callback_phase_claim(control.executing, 0, false)
+                callback_phase_claim(control.executing, control_payload, false)
                     .and_then(|executing| queued.checked_add(executing))
             })
             .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?;
-        let endpoint_payload =
-            u64::try_from(crate::engine::MAX_ENDPOINT_FRAME_BYTES).map_err(|_| {
-                CallbackProducerOverload::PayloadSizeUnrepresentable {
-                    class: ConnectorCallbackClass::EndpointData,
-                }
-            })?;
         let endpoint_slot = callback_phase_claim(endpoint.queued, endpoint_payload, true)
             .and_then(|queued| {
                 callback_phase_claim(endpoint.executing, endpoint_payload, false)
@@ -335,6 +374,18 @@ impl CallbackProducerOwner {
                 class: ConnectorCallbackClass::EndpointData,
                 error,
             })?;
+        // The reserved lifecycle deliveries are funded at the payload they
+        // actually carry, which is none, and componentwise-maxed exactly as
+        // `reserve_lifecycle_delivery` reserves them. Handing them the control
+        // ceiling instead would be payload surplus for callbacks that never
+        // carry a payload — a pool five candidates deep that nothing declared,
+        // sitting where a real control admission could quietly draw on it.
+        let lifecycle_slot = callback_phase_claim(control.queued, 0, true)
+            .and_then(|queued| {
+                callback_phase_claim(control.executing, 0, false)
+                    .and_then(|executing| componentwise_max_claim(queued, executing))
+            })
+            .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?;
         let containers = scale_claim(
             callback_mailbox_container_claim()
                 .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?,
@@ -345,15 +396,11 @@ impl CallbackProducerOwner {
         // Reserved open and close plus the three independently pending
         // observations: renegotiation, ICE state, and peer-connection state.
         const LIFECYCLE_SLOTS: u64 = 5;
-        let control_and_lifecycle_slots = control_slots.checked_add(LIFECYCLE_SLOTS).ok_or(
-            CallbackProducerOverload::ClaimArithmetic {
-                class,
-                error: crate::resource::ResourceClaimArithmeticError::Overflow {
-                    dimension: crate::resource::ResourceClass::CallbackOrScheduledWork,
-                },
-            },
-        )?;
-        let callback_claims = scale_claim(control_slot, control_and_lifecycle_slots)
+        let callback_claims = scale_claim(control_slot, control_slots)
+            .and_then(|claim| {
+                scale_claim(lifecycle_slot, LIFECYCLE_SLOTS)
+                    .and_then(|lifecycle| claim.checked_add(lifecycle))
+            })
             .and_then(|claim| {
                 scale_claim(endpoint_slot, endpoint_slots)
                     .and_then(|endpoint| claim.checked_add(endpoint))
@@ -419,6 +466,20 @@ impl CallbackProducerOwner {
             claims,
         }
     }
+}
+
+/// One class's owner-stated payload ceiling, as bytes, or a typed refusal.
+///
+/// The class travels into the error so a policy missing its ceiling names which
+/// one it was asked for rather than reporting a generic gap.
+#[cfg(any(test, feature = "transport-lab"))]
+fn local_payload_ceiling(
+    stated: Option<NonZeroUsize>,
+    class: ConnectorCallbackClass,
+) -> std::result::Result<u64, CallbackProducerOverload> {
+    let stated = stated.ok_or(CallbackProducerOverload::LocalPayloadCeilingRequired { class })?;
+    u64::try_from(stated.get())
+        .map_err(|_| CallbackProducerOverload::PayloadSizeUnrepresentable { class })
 }
 
 #[cfg(any(test, feature = "transport-lab"))]
@@ -575,10 +636,19 @@ pub(super) fn connector_construction_claims() -> std::result::Result<
 /// each local mailbox slot in both its queued and executing forms, plus one
 /// executing native-track callback for every track surface declared by the
 /// temporary compatibility profile. Production grants remain owner supplied.
+///
+/// The two payload ceilings arrive as arguments rather than being read off the
+/// policy here, and that is deliberate. This function has no way to refuse: its
+/// error type is claim arithmetic, so a missing ceiling could only become a
+/// silent zero — which is precisely the underfunding being repaired. The caller
+/// resolves them from the profile and refuses by name when one is absent, so
+/// there is no path on which a declared mailbox is funded for no payload.
 #[cfg(any(test, feature = "transport-lab"))]
 pub(super) fn connector_fixture_operation_claims(
     policy: ConnectorCallbackPolicy,
     native_realtime_surfaces: usize,
+    control_payload: u64,
+    endpoint_payload: u64,
 ) -> std::result::Result<
     Vec<crate::resource::ResourceClaim>,
     crate::resource::ResourceClaimArithmeticError,
@@ -591,17 +661,15 @@ pub(super) fn connector_fixture_operation_claims(
 
     let control = structural.for_class(ConnectorCallbackClass::Control);
     for _ in 0..mailboxes.control().get() {
-        claims.push(callback_phase_claim(control.queued, 0, true)?);
-        claims.push(callback_phase_claim(control.executing, 0, false)?);
+        claims.push(callback_phase_claim(control.queued, control_payload, true)?);
+        claims.push(callback_phase_claim(
+            control.executing,
+            control_payload,
+            false,
+        )?);
     }
 
     let endpoint = structural.for_class(ConnectorCallbackClass::EndpointData);
-    let endpoint_payload =
-        u64::try_from(crate::engine::MAX_ENDPOINT_FRAME_BYTES).map_err(|_| {
-            crate::resource::ResourceClaimArithmeticError::Overflow {
-                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
-            }
-        })?;
     for _ in 0..mailboxes.endpoint_data().get() {
         claims.push(callback_phase_claim(
             endpoint.queued,

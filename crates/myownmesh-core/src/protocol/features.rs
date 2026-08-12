@@ -2,7 +2,10 @@
 //! of feature ids in its `HelloMessage::features`. A sender consults
 //! the receiver's advertised set before sending optional frame kinds
 //! — if the receiver doesn't claim support, the sender skips the
-//! frame rather than relying on the receiver's `Unknown` drop path.
+//! frame rather than leaving the receiver to refuse it. Refusal is
+//! what a receiver does: the frame set is closed, so a `kind` it does
+//! not implement fails to deserialize. Skipping is the sender's half
+//! of that, not a way around it.
 //!
 //! Stable strings: changing an id breaks rolling upgrades. New
 //! features get new ids; the matrix is append-only.
@@ -25,8 +28,16 @@ impl Feature {
     pub const TYPED_CHANNELS: &'static str = "typed_channels";
 
     /// Peer publishes [`CapabilitiesUpdateMessage`] when its local
-    /// advertised capabilities change. Receivers that lack this
-    /// only see the snapshot included in `hello`.
+    /// advertised capabilities change, and on each session it
+    /// establishes.
+    ///
+    /// Unlike the optional-frame ids above, this build does not
+    /// consult the flag before sending: the frame is application
+    /// traffic, gated on a live session rather than on what the peer
+    /// claims to parse. A receiver that lacks the id refuses the
+    /// frame — an unimplemented `kind` does not deserialize — and
+    /// learns nothing about what this node offers, since there is no
+    /// `hello` snapshot left to fall back on.
     pub const CAPABILITIES_UPDATE: &'static str = "capabilities_update";
 
     /// Peer speaks the closed-network governance wire — emits and
@@ -34,8 +45,8 @@ impl Feature {
     /// `network_state_ack`, `network_state_split`, and the
     /// `roster_summary` / `roster_request` / `roster_entries`
     /// triad. Senders only emit these frames against peers that
-    /// advertise this flag, since older peers would drop them via
-    /// the `Unknown` catch-all. See
+    /// advertise this flag, since a peer that does not implement
+    /// them cannot deserialize them at all. See
     /// [`docs/NETWORK-TYPES.md`](../../../../docs/NETWORK-TYPES.md).
     pub const NETWORK_STATE_V1: &'static str = "network_state_v1";
 

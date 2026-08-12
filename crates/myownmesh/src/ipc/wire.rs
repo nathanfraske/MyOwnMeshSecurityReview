@@ -41,6 +41,7 @@ pub enum ServerOut {
         network: String,
         from: String,
         request_id: String,
+        operation_id: u64,
         method: String,
         payload: Value,
         /// `true` if the peer asked for a streaming response.
@@ -73,9 +74,8 @@ pub enum ServerOut {
     // requested it. See [`crate::control::Request::RealtimePipe`].
     /// A more-recent client claimed a method this client had
     /// previously registered. The displaced client should stop
-    /// expecting `RpcInbound` events for `method`; any
-    /// in-flight calls are left to resolve naturally (the
-    /// displaced client can still answer them).
+    /// expecting `RpcInbound` events for `method`; the displaced claim's
+    /// in-flight calls are cancelled and truthfully failed.
     HandlerDisplaced {
         network: String,
         method: String,

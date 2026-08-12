@@ -38,15 +38,18 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         // user-clicked approve. Reaching ACTIVE now also persists each
         // peer into the other's roster (the mutual-confirmation =
         // membership rule), which is exactly what the closed-network
-        // quorum needs. The explicit `cross_approve` below is kept as a
-        // belt-and-braces seed so the test doesn't depend on that
-        // handshake side effect's timing.
+        // quorum needs. `cross_approve`'s roster stamps below may
+        // therefore overlap that side effect; they are kept so no test
+        // depends on its timing. Its signed `RoleGrant` is a different
+        // matter and is not redundant with anything here: an unsigned
+        // roster row is discovery state, Closed authorization is an
+        // owner's signature, and nothing the handshake does authors one.
         auto_approve: true,
     }
 }
 
-/// Stamp the peer into each side's on-disk roster so the closed-
-/// network quorum check has a real member set to evaluate against.
+/// Stamp the peer into each side's on-disk roster and establish Bob's signed
+/// membership before the network closes.
 /// In production, this happens via the user's "approve" click in
 /// the GUI; in the integration test we drive it directly so the
 /// test doesn't depend on the wire-level approve flow's side
@@ -64,6 +67,60 @@ async fn cross_approve(
     bob.approve_roster(alice_id.public_id(), "alice")
         .await
         .expect("bob roster-approve alice");
+
+    // An unsigned roster entry is discovery state, not Closed authorization.
+    // While the network is still Open, Alice authors the explicit membership
+    // that the later KindChange carries across the policy boundary. Role grants
+    // live in `member_log`, so this does not add a governance transition or
+    // disturb the founder/genesis transition-count assertions below.
+    myownmesh_core::engine::governance::propose(
+        alice,
+        TransitionVariant::RoleGrant {
+            target: bob_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("alice signs bob's open-network membership");
+    // First prove local ratification. Keeping this barrier separate from Bob's
+    // adoption makes a failure identify the exact side of the boundary instead
+    // of timing out on a combined predicate that says neither.
+    wait_for(Duration::from_secs(10), || {
+        member_granted(
+            &alice.governance_state.read().member_log,
+            bob_id.public_id(),
+        )
+    })
+    .await;
+
+    // Separately prove that production anti-entropy delivered the exact signed
+    // member-tier seed to Bob. Both sides must carry it before crossing the
+    // Closed policy boundary: local ratification projects the governance and
+    // member tiers together, and a Bob without this seed would project himself
+    // as absent and synchronously revoke the link needed for later convergence.
+    // This wait performs no replay, broadcast, sleep, or local mutation.
+    wait_for(Duration::from_secs(10), || {
+        member_granted(&bob.governance_state.read().member_log, bob_id.public_id())
+    })
+    .await;
+}
+
+/// Whether a signed member log carries a ratified `RoleGrant` admitting
+/// `target` as a plain `Member`.
+///
+/// One matcher for every reader of this log. Three hand-written copies of the
+/// same `matches!` is how one of them comes to match nothing — and a member-log
+/// predicate that matches nothing reads exactly like a membership that is
+/// correctly absent.
+fn member_granted(log: &[myownmesh_core::network_state::Transition], target: &str) -> bool {
+    log.iter().any(|entry| {
+        matches!(
+            &entry.variant,
+            TransitionVariant::RoleGrant { target: granted, role: Role::Member }
+                if granted == target
+        )
+    })
 }
 
 #[tokio::test]
@@ -111,10 +168,15 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
     // co-signed genesis is fine too, but no co-signer is *required*.
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
-    // Sanity: both sides start in `Open` with no transitions logged.
+    // Sanity: both sides remain `Open` with no governance transitions logged;
+    // Bob's independently signed membership is present in `member_log`.
     assert_eq!(alice_state.governance_state.read().kind, NetworkKind::Open);
     assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Open);
     assert!(alice_state.governance_state.read().transitions.is_empty());
+    assert!(member_granted(
+        &alice_state.governance_state.read().member_log,
+        bob_id.public_id()
+    ));
 
     // Alice proposes `KindChange { to: Closed }`. She self-signs at issue time,
     // which alone satisfies the genesis quorum — so this ratifies on Alice
@@ -649,21 +711,49 @@ async fn deny_invalidates_proposal_on_both_sides() {
     })
     .await;
 
+    // Pending convergence can precede member-tier anti-entropy: Bob may
+    // self-ratify the genesis and clear the proposal before Alice's signed Bob
+    // grant has merged. Wait for that exact seed before using its presence to
+    // make Carol's absence non-vacuous below.
+    wait_for(Duration::from_secs(10), || {
+        member_granted(
+            &bob_state.governance_state.read().member_log,
+            bob_id.public_id(),
+        )
+    })
+    .await;
+
     assert!(
         !rostered(&alice_state, carol_id.public_id()),
         "a denied admit must not add the target to the roster"
     );
     // The denied admit was recorded in neither tier of the log (a member admit
     // would ride the member log; only the genesis close should be present).
+    //
+    // The member log is not asserted *empty*: `cross_approve` seeded Bob's
+    // open-network membership there, and that entry is what keeps this check
+    // non-vacuous. An empty log would satisfy "Carol is absent" for the trivial
+    // reason that nothing is present at all — including had the log never been
+    // read. Carol must be absent from a member log that demonstrably carries
+    // somebody.
     {
         let a = alice_state.governance_state.read();
         assert_eq!(a.transitions.len(), 1, "only the genesis close is logged");
         assert!(
-            a.member_log.is_empty(),
+            !member_granted(&a.member_log, carol_id.public_id()),
             "the denied admit must not ride the member log"
         );
+        assert!(
+            member_granted(&a.member_log, bob_id.public_id()),
+            "Bob's seeded membership must still be there, or Carol's absence \
+             proves nothing"
+        );
     }
-    assert!(bob_state.governance_state.read().member_log.is_empty());
+    {
+        let b = bob_state.governance_state.read();
+        assert!(!member_granted(&b.member_log, carol_id.public_id()));
+        assert!(member_granted(&b.member_log, bob_id.public_id()));
+    }
 }
 
 #[tokio::test]

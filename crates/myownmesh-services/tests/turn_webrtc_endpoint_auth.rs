@@ -47,8 +47,29 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
     let four = std::num::NonZeroUsize::new(4)
         .expect("the four-connector fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
+    // This fixture mints its own finite provider from these profiles via
+    // `transport_lab_connector_fixture_grant`, so it has to state the largest
+    // payload it will fund for each callback class — nothing else can derive
+    // the byte grant, and a declared mailbox funded for no payload is what left
+    // gathered ICE candidates refused for want of `QueuedBytes`.
+    //
+    // Both are fixture numbers chosen here and stated here. Deliberately *not*
+    // the signaling frame limit used for the candidate and SDP envelopes below:
+    // that limit belongs to another layer, and a borrowed number that happens to
+    // be large enough is exactly how the original underfunding stayed invisible.
+    // Control covers one gathered ICE candidate's JSON; endpoint data covers the
+    // handshake frames this two-peer scenario exchanges.
+    let control_payload_ceiling =
+        std::num::NonZeroUsize::new(4_096).expect("the fixture control payload ceiling is nonzero");
+    let endpoint_payload_ceiling = std::num::NonZeroUsize::new(16_384)
+        .expect("the fixture endpoint payload ceiling is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::new(callback, callback),
+        ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
+            callback,
+            callback,
+            control_payload_ceiling,
+            endpoint_payload_ceiling,
+        ),
         ConnectorCallbackServiceWeights::data_only(callback, callback),
         RealtimeConnectorPolicy::Disabled,
     )
@@ -102,10 +123,39 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
     let profiles = vec![webrtc.clone(); four.get()];
     let mesh_scopes =
         std::num::NonZeroU64::new(4).expect("the two-scenario fixture Mesh scope count is nonzero");
+    // Gateway parsing capacity, which none of the grants above price: they cover
+    // building connectors and moving signaling through them, while this covers
+    // turning one inbound frame into a `serde_json::Value` tree. It is added
+    // here, at the full-engine owner that runs a real handshake, rather than
+    // inside `transport_lab_connector_fixture_grant` — that helper prices
+    // transport construction and has no business naming what the application
+    // gateway may allocate.
+    //
+    // Two simultaneous claims per connector, both with a named holder: the
+    // peer's `Hello` retains its claim for the connection's whole life, and one
+    // further protocol or application frame is being parsed at any moment.
+    //
+    // This fixture's own frame size, not borrowed from the signaling frame limit
+    // used for the candidate and SDP envelopes above, and the claim itself comes
+    // from the gateway rather than being restated here. It funds a parse and
+    // gates nothing on the wire.
+    const JSON_FRAME_BYTES: usize = 8 * 1024;
+    const JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
+    let json_input_work =
+        myownmesh_core::application_gateway::json_input_work_claim(JSON_FRAME_BYTES)
+            .expect("the fixture JSON input claim is representable")
+            .checked_scale(
+                connectors
+                    .get()
+                    .checked_mul(JSON_CLAIMS_PER_CONNECTOR)
+                    .expect("the fixture JSON claim count is representable"),
+            )
+            .expect("the fixture JSON input capacity is representable");
     let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes)
         .expect("fixture structural and callback claims are representable")
         .checked_add(candidate_workload)
         .and_then(|claim| claim.checked_add(remote_descriptions))
+        .and_then(|claim| claim.checked_add(json_input_work))
         .expect("the fixture provider grant is representable");
     let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
         .expect("the fixture provider accounts for its process scope");

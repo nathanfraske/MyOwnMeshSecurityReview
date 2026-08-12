@@ -40,6 +40,7 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 data-encoding = { workspace = true }
+getrandom = { workspace = true }
 
 interprocess = { workspace = true }
 parking_lot = { workspace = true }
@@ -51,6 +52,10 @@ dirs = { workspace = true }
 # message and never touches libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+widestring = { workspace = true }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 myownmesh-signaling = { workspace = true }

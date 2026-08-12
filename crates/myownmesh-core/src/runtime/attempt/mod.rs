@@ -588,14 +588,17 @@ mod tests {
         drop(candidate);
         assert_eq!(owner.report().active_candidates, 1);
 
-        scopes[0]
-            .submit_cleanup(
-                cleanup,
-                Box::pin(async {}),
-                Box::new(|| {}),
-                Box::new(|_| {}),
-            )
-            .unwrap_or_else(|_| panic!("the exact Mesh owner accepts its cleanup capability"));
+        assert!(
+            !scopes[0]
+                .submit_cleanup(
+                    cleanup,
+                    Box::pin(async {}),
+                    Box::new(|| {}),
+                    Box::new(|_| {}),
+                )
+                .was_refused(),
+            "the exact Mesh owner accepts its cleanup capability"
+        );
         for _ in 0..10_000 {
             if owner.report().cleanup.completed_jobs == 1 {
                 break;
@@ -627,14 +630,17 @@ mod tests {
                 .expect("cleanup begins under the pre-reserved claim");
             drop(candidate);
             let job_gate = Arc::clone(&gate);
-            scopes[0]
-                .submit_cleanup(
-                    cleanup,
-                    Box::pin(async move { job_gate.notified().await }),
-                    Box::new(|| {}),
-                    Box::new(|_| {}),
-                )
-                .unwrap_or_else(|_| panic!("the exact Mesh owner accepts its cleanup claim"));
+            assert!(
+                !scopes[0]
+                    .submit_cleanup(
+                        cleanup,
+                        Box::pin(async move { job_gate.notified().await }),
+                        Box::new(|| {}),
+                        Box::new(|_| {}),
+                    )
+                    .was_refused(),
+                "the exact Mesh owner accepts its cleanup claim"
+            );
         }
 
         for _ in 0..10_000 {

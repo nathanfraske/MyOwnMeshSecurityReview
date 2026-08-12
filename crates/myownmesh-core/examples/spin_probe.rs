@@ -23,7 +23,17 @@ fn callback_policy() -> myownmesh_core::ConnectorCallbackPolicy {
     )
     .expect("MYOWNMESH_LAB_CALLBACK_CAPACITY must be nonzero");
     myownmesh_core::ConnectorCallbackPolicy::new(
-        myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+        // Same reason as `spin_min`: this probe's transport installs no
+        // connector resource policy, so the connector funds itself from this
+        // policy and the byte ceiling has to be stated.
+        myownmesh_core::ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
+            capacity,
+            capacity,
+            std::num::NonZeroUsize::new(4_096)
+                .expect("the probe control payload ceiling is nonzero"),
+            std::num::NonZeroUsize::new(4_096)
+                .expect("the probe endpoint payload ceiling is nonzero"),
+        ),
         myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
         myownmesh_core::RealtimeConnectorPolicy::Disabled,
     )

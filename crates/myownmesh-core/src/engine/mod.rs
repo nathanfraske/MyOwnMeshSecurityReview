@@ -204,8 +204,6 @@ pub async fn run_driver(
     // relay/signaling feed dying.
     let stop_reason: &str = loop {
         tokio::select! {
-            biased;
-
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break "command channel closed" };
                 if !handle_command(&state, cmd).await {
@@ -341,6 +339,14 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         }
         NetworkCmd::BroadcastCapabilities { caps, reply } => {
             let _ = reply.send(broadcast_capabilities(state, caps).await);
+        }
+        // The registry fence enqueued this at the moment it minted a session, and
+        // it is handled here because the send awaits and no fence lock may be held
+        // across it. Nothing is answered to a caller: the command carries no reply
+        // channel because no local caller is waiting on it — the session it names
+        // is what asked, by coming into existence owing an advertisement.
+        NetworkCmd::ReplayCapabilities { owner } => {
+            replay_local_capabilities_to_owner(state, &owner).await;
         }
         // ---- governance ops ----
         NetworkCmd::ProposeTransition {
@@ -1067,6 +1073,10 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         };
         let state = state.clone();
         tokio::spawn(async move {
+            if !renegotiation.is_live() {
+                renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+                return;
+            }
             let outcome = if renegotiation.session().signaling_state()
                 != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
             {
@@ -1077,33 +1087,38 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
             } else {
                 // The connector already changed its transceiver set. One offer
                 // now carries the complete pending delta.
-                match renegotiation.session().create_offer().await {
+                let offer = tokio::select! {
+                    biased;
+                    () = renegotiation.revoked() => {
+                        renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+                        return;
+                    }
+                    offer = renegotiation.session().create_offer() => offer,
+                };
+                match offer {
                     Ok(desc) => {
-                        if !renegotiation.is_current(&state.peers) {
-                            // Dropping the operation here is safe precisely
-                            // because this installation is already gone:
-                            // `complete` would find nothing current and write
-                            // nothing, and the replacement carries its own
-                            // in-flight guard.
+                        let emitted = renegotiation.with_live(&state.peers, || {
+                            let device_id = renegotiation.device_id();
+                            state.log_diag_with(
+                                crate::events::DiagLevel::Debug,
+                                "realtime",
+                                format!(
+                                    "renegotiation offer to {} (track set changed)",
+                                    short_peer(device_id)
+                                ),
+                                serde_json::json!({
+                                    "peer": device_id,
+                                    "sdp_bytes": desc.sdp.len(),
+                                }),
+                            );
+                            let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                                device_id: device_id.to_string(),
+                                sdp: desc.sdp,
+                            });
+                        });
+                        if emitted.is_none() {
                             return;
                         }
-                        let device_id = renegotiation.device_id();
-                        state.log_diag_with(
-                            crate::events::DiagLevel::Debug,
-                            "realtime",
-                            format!(
-                                "renegotiation offer to {} (track set changed)",
-                                short_peer(device_id)
-                            ),
-                            serde_json::json!({
-                                "peer": device_id,
-                                "sdp_bytes": desc.sdp.len(),
-                            }),
-                        );
-                        let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                            device_id: device_id.to_string(),
-                            sdp: desc.sdp,
-                        });
                         Ok(())
                     }
                     Err(e) => Err(e.to_string()),
@@ -1433,7 +1448,7 @@ async fn connect_peer(
     state: &Arc<NetworkState>,
     device_id: &str,
     sticky: bool,
-    reply: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    reply: Option<state::ConnectWaiterRegistration>,
 ) {
     if sticky {
         state.add_sticky(device_id);
@@ -1447,7 +1462,7 @@ async fn connect_peer(
             .map(|p| matches!(p.state.read().status, PeerStatus::Active))
             .unwrap_or(false);
         if already_active {
-            let _ = reply.send(Ok(()));
+            let _ = reply.reply.send(Ok(()));
         } else {
             state.register_connect_waiter(device_id, reply);
         }
@@ -2499,22 +2514,6 @@ async fn handle_pc_state_change(
     }
 }
 
-/// The largest inbound frame we'll even attempt to decode (MOM-04). A peer
-/// can't drive memory growth by sending a giant JSON frame: anything past this
-/// is dropped *before* `serde_json` allocates the (potentially far larger)
-/// parsed value — the opaque user-channel payloads are `serde_json::Value`,
-/// which a crafted frame can amplify well beyond its wire size. Generous — far
-/// above any real handshake / roster / governance / RPC / user-channel frame —
-/// so it only ever bites a pathological one. (Per-peer byte-rate budgets are a
-/// deeper follow-up; this is the hard per-frame ceiling.)
-pub const MAX_ENDPOINT_FRAME_BYTES: usize = 16 * 1024 * 1024;
-
-/// Whether an inbound frame is small enough to decode. Split out so the
-/// [`MAX_ENDPOINT_FRAME_BYTES`] boundary is unit-tested.
-fn frame_within_cap(len: usize) -> bool {
-    len <= MAX_ENDPOINT_FRAME_BYTES
-}
-
 /// Which admission phase an inbound frame requires before it may move peer
 /// state or reach a handler. Enforced by the gate in [`handle_inbound_frame`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2557,21 +2556,9 @@ async fn handle_inbound_frame_from(
     bytes: Bytes,
 ) {
     let device_id = owner.device_id();
-    // Reject an oversize frame before the deserializer allocates for it.
-    if !frame_within_cap(bytes.len()) {
-        warn!(
-            peer = %device_id,
-            len = bytes.len(),
-            "dropping oversize inbound endpoint frame (> {MAX_ENDPOINT_FRAME_BYTES} bytes)"
-        );
+    let Some(admission) = crate::protocol::classify_frame(&bytes) else {
+        warn!(peer = %device_id, "discarding frame without a canonical bounded kind envelope");
         return;
-    }
-    let msg: MeshMessage = match serde_json::from_slice(&bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(peer = %device_id, "discarding undeserializable frame: {e}");
-            return;
-        }
     };
     // Admission gate, folded into the per-frame liveness touch below so it
     // costs no extra lookup or lock. Admission is a per-connection property
@@ -2587,7 +2574,7 @@ async fn handle_inbound_frame_from(
     // `handshake::on_approve`). This check is synchronous, not swept: a
     // never-admitted peer must get *zero* application processing, so there is
     // no grace window a periodic revalidation could open.
-    let application = matches!(message_admission(&msg), Admission::Application);
+    let application = matches!(admission, crate::protocol::FrameAdmission::Application);
     // The liveness commit for an inbound frame. Protocol frames take the plain
     // owner fence, because they are what *establishes* admission and must not
     // require it. An application frame takes the admission fence instead, so the
@@ -2616,6 +2603,25 @@ async fn handle_inbound_frame_from(
         }
     };
     if !application {
+        let Some(protocol_work) = state
+            .peers
+            .with_current(owner, |peer| {
+                let worker = peer.session.lock().clone()?;
+                let claim = crate::application_gateway::structural_json_claim(bytes.len()).ok()?;
+                worker.reserve_attempt_work(claim).ok()
+            })
+            .flatten()
+        else {
+            trace!(peer = %device_id, "protocol frame refused by connector attempt resources");
+            return;
+        };
+        let msg: MeshMessage = match serde_json::from_slice(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(peer = %device_id, "discarding undeserializable protocol frame: {e}");
+                return;
+            }
+        };
         // Protocol frames take the plain owner fence and dispatch on the owner
         // token they arrived with. They establish admission rather than
         // requiring it, and every handler below is already owner-bound.
@@ -2626,7 +2632,10 @@ async fn handle_inbound_frame_from(
             .traffic
             .record_rx(traffic::class_of(&msg), bytes.len());
         match msg {
-            MeshMessage::Hello(hello) => handshake::on_hello(state, owner, hello).await,
+            MeshMessage::Hello(hello) => {
+                handshake::on_hello_with_retention(state, owner, hello, Some(protocol_work)).await;
+                return;
+            }
             MeshMessage::AuthResponse(resp) => {
                 handshake::on_auth_response(state, owner, resp).await
             }
@@ -2638,6 +2647,7 @@ async fn handle_inbound_frame_from(
             // panicked on: this is peer-supplied input.
             _ => trace!(peer = %device_id, "discarding misclassified protocol frame"),
         }
+        drop(protocol_work);
         return;
     }
 
@@ -2655,7 +2665,6 @@ async fn handle_inbound_frame_from(
     // authorized it; only the caller waits it owes travel out. The receive-side
     // high-water mark is *not* settled here — it moves together with the
     // delivery, under the dispatch's own fence, in `on_channel_seq_admitted`.
-    let mut reliable = reliable::InboundReliableAdmission::Nothing;
     let admitted = state
         .peers
         .with_admitted_current_or_refused(
@@ -2664,8 +2673,17 @@ async fn handle_inbound_frame_from(
             &state.network_id,
             |admitted| {
                 admitted.record_inbound(commit);
-                reliable = reliable::admit_inbound_reliable(admitted, &msg);
-                Some(admitted.inbound_application_operation(msg))
+                let decoded = admitted
+                    .with_session_state(|session, _record| {
+                        crate::application_gateway::AdmittedApplicationFrame::admit(
+                            session,
+                            bytes.clone(),
+                        )
+                        .and_then(|frame| frame.decode())
+                    })
+                    .and_then(std::result::Result::ok)?;
+                reliable::admit_inbound_reliable(admitted, decoded.message());
+                Some(admitted.inbound_application_operation(decoded))
             },
             |peer| {
                 // Counted under the same acquisition that refused it, so the
@@ -2695,7 +2713,7 @@ async fn handle_inbound_frame_from(
     let Some(operation) = admitted else {
         return;
     };
-    let (msg, dispatch) = operation.into_dispatch();
+    let (msg, application_claim, application_work, dispatch) = operation.into_dispatch();
     state
         .traffic
         .record_rx(traffic::class_of(&msg), bytes.len());
@@ -2719,7 +2737,15 @@ async fn handle_inbound_frame_from(
         MeshMessage::RpcStreamChunk(c) => on_rpc_stream_chunk(state, &dispatch, c).await,
         MeshMessage::RpcStreamEnd(e) => on_rpc_stream_end(state, &dispatch, e).await,
         MeshMessage::Channel { channel, payload } => {
-            on_channel_frame(state, &dispatch, channel, payload).await
+            on_channel_frame(
+                state,
+                &dispatch,
+                application_claim,
+                application_work,
+                channel,
+                payload,
+            )
+            .await
         }
         // The high-water mark and the delivery move together, under one fence,
         // inside the handler. Nothing about this frame was decided above: the
@@ -2730,14 +2756,25 @@ async fn handle_inbound_frame_from(
             channel,
             payload,
         } => {
-            reliable::on_channel_seq_admitted(state, &dispatch, stream, seq, channel, payload).await
+            reliable::on_channel_seq_admitted(
+                state,
+                &dispatch,
+                application_claim,
+                application_work,
+                reliable::InboundChannelSeq {
+                    stream,
+                    seq,
+                    channel,
+                    payload,
+                },
+            )
+            .await
         }
-        // The outbox was already settled inside the fence, against the entries
-        // as they stood at admission — nothing out here can drain a
-        // replacement's. All that is left is resolving the local caller waits
-        // it owes, which is not peer state and not anything a replacement can
-        // observe. See `InboundReliableAdmission::settle`.
-        MeshMessage::ChannelAck { .. } => reliable.settle(),
+        // Wholly settled inside the fence, against the frames as they stood at
+        // admission: the acknowledged frames were released and their callers
+        // resolved there, while each frame and its lease were still together.
+        // Nothing is owed out here, which is why this arm does nothing.
+        MeshMessage::ChannelAck { .. } => {}
         MeshMessage::NetworkState(b) => governance::on_state_broadcast(state, owner, b).await,
         // The four arms below mutate durable, pubkey-keyed governance and
         // roster facts. They resolve no peer entry, send nothing to the sender,
@@ -2769,9 +2806,6 @@ async fn handle_inbound_frame_from(
         | MeshMessage::Approve(_)
         | MeshMessage::Deny(_) => {
             trace!(peer = %device_id, "discarding misclassified protocol frame");
-        }
-        MeshMessage::Unknown => {
-            trace!(peer = %device_id, "discarding unknown frame variant");
         }
     }
 }
@@ -2919,6 +2953,7 @@ struct AdmittedRpcCall {
     handler: PreparedRpcHandler,
     call: crate::rpc::RpcCall,
     owner: peer_registry::PeerOwnerToken,
+    _task_lease: crate::resource::ResourceLease,
 }
 
 async fn on_rpc_request(
@@ -2928,7 +2963,7 @@ async fn on_rpc_request(
 ) {
     let owner = dispatch.owner();
     let device_id = owner.device_id();
-    let Some(rpc) = state.rpc.read().clone() else {
+    let Some(rpc) = state.application_gateway.rpc() else {
         // No RPC bound yet — send a transient error so the peer
         // doesn't hang on the oneshot.
         let _ = send_to_peer_owner(
@@ -2993,11 +3028,22 @@ async fn on_rpc_request(
         crate::rpc::HandlerEntry::Stream(h) => PreparedRpcHandler::Stream(h.clone()),
     };
     drop(handler);
-    let Some(admitted) = dispatch.with_captured_peer(&state.peers, move |_peer| AdmittedRpcCall {
-        handler: prepared,
-        call,
-        owner: owner.clone(),
-    }) else {
+    let task_claim = match crate::rpc::handler_task_claim(&call) {
+        Ok(claim) => claim,
+        Err(_) => return,
+    };
+    let Some(admitted) = dispatch
+        .with_captured_session_state(&state.peers, move |session, _app| {
+            let task_lease = session.reserve_retained(task_claim).ok()?;
+            Some(AdmittedRpcCall {
+                handler: prepared,
+                call,
+                owner: owner.clone(),
+                _task_lease: task_lease,
+            })
+        })
+        .flatten()
+    else {
         return;
     };
     // Lock released. Consume the authority exactly once.
@@ -3005,6 +3051,7 @@ async fn on_rpc_request(
         handler,
         call,
         owner,
+        _task_lease,
     } = admitted;
     let request_id = req.request_id;
     let state = state.clone();
@@ -3012,6 +3059,7 @@ async fn on_rpc_request(
         PreparedRpcHandler::Single(h) => {
             let fut = h(call);
             tokio::spawn(async move {
+                let _task_lease = _task_lease;
                 let resp = fut.await;
                 let frame = match resp {
                     Ok(r) => RpcResponseMessage {
@@ -3031,6 +3079,7 @@ async fn on_rpc_request(
         PreparedRpcHandler::Stream(h) => {
             let fut = h(call);
             tokio::spawn(async move {
+                let _task_lease = _task_lease;
                 let mut rx = match fut.await {
                     Ok(rx) => rx,
                     Err(e) => {
@@ -3047,7 +3096,22 @@ async fn on_rpc_request(
                     }
                 };
                 let mut seq = 0u64;
-                while let Some(payload) = rx.recv().await {
+                while let Some(item) = rx.recv().await {
+                    let payload = match item {
+                        crate::rpc::RpcStreamItem::Chunk(payload) => payload,
+                        crate::rpc::RpcStreamItem::End(result) => {
+                            let _ = send_to_peer_owner(
+                                &state,
+                                &owner,
+                                &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+                                    request_id,
+                                    error: result.err(),
+                                }),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                     seq += 1;
                     let _ = send_to_peer_owner(
                         &state,
@@ -3065,7 +3129,7 @@ async fn on_rpc_request(
                     &owner,
                     &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                         request_id,
-                        error: None,
+                        error: Some("RPC stream handler disappeared without terminal state".into()),
                     }),
                 )
                 .await;
@@ -3109,13 +3173,15 @@ async fn on_rpc_response(
     dispatch: &peer_registry::AdmittedInboundDispatch,
     resp: RpcResponseMessage,
 ) {
-    let Some(rpc) = state.rpc.read().clone() else {
-        return;
-    };
     // Removes only for the bound device and only a single-response
     // operation; a wrong source or a streaming operation leaves the
     // entry untouched and settles nothing.
-    let Some(tx) = rpc.take_single_response(&resp.request_id, dispatch.owner().device_id()) else {
+    let Some(tx) = dispatch
+        .with_captured_session_state(&state.peers, |_session, app| {
+            app.rpc_mut().take_single_response(&resp.request_id)
+        })
+        .flatten()
+    else {
         return;
     };
     let result = if let Some(err) = resp.error {
@@ -3133,17 +3199,35 @@ async fn on_rpc_stream_chunk(
     dispatch: &peer_registry::AdmittedInboundDispatch,
     chunk: RpcStreamChunkMessage,
 ) {
-    let Some(rpc) = state.rpc.read().clone() else {
-        return;
-    };
     // Clones the sender for the bound device's open stream and
     // removes nothing — the stream stays pending until its end
     // frame. A chunk from any other device is dropped, so a foreign
     // peer cannot inject an item into someone else's stream.
-    let Some(tx) = rpc.stream_chunk_sender(&chunk.request_id, dispatch.owner().device_id()) else {
-        return;
-    };
-    let _ = tx.send(Ok(chunk.payload));
+    // The outcome is deliberately not acted on here. Every refusal inside has
+    // already settled the stream with the reason it refused for, and a chunk
+    // that was accepted needs nothing further; a dispatch that captured no
+    // session did nothing at all. Discarded explicitly rather than bound and
+    // then guarded, because a guard whose only arm is the end of this function
+    // reads as though something follows it.
+    let _ = dispatch.with_captured_session_state(&state.peers, |session, app| {
+        let Some(stream) = app
+            .rpc_mut()
+            .stream_chunk_sender(&chunk.request_id, chunk.seq)
+        else {
+            if let Some(stream) = app.rpc_mut().take_stream_end(&chunk.request_id) {
+                stream.finish(Some("RPC stream sequence violation".to_string()));
+            }
+            return false;
+        };
+        if stream.push(session, chunk.payload) {
+            true
+        } else {
+            if let Some(stream) = app.rpc_mut().take_stream_end(&chunk.request_id) {
+                stream.finish(Some("RPC stream refused by resource owner".to_string()));
+            }
+            false
+        }
+    });
 }
 
 async fn on_rpc_stream_end(
@@ -3151,25 +3235,25 @@ async fn on_rpc_stream_end(
     dispatch: &peer_registry::AdmittedInboundDispatch,
     end: RpcStreamEndMessage,
 ) {
-    let Some(rpc) = state.rpc.read().clone() else {
-        return;
-    };
     // Removes only for the bound device and only a streaming
     // operation, so a foreign peer cannot cut another peer's stream
     // short and a single-response frame cannot close one.
-    let Some(tx) = rpc.take_stream_end(&end.request_id, dispatch.owner().device_id()) else {
+    let Some(stream) = dispatch
+        .with_captured_session_state(&state.peers, |_session, app| {
+            app.rpc_mut().take_stream_end(&end.request_id)
+        })
+        .flatten()
+    else {
         return;
     };
-    if let Some(err) = end.error {
-        let _ = tx.send(Err(err));
-    }
-    // Drop the sender so the receiver's loop exits.
-    drop(tx);
+    stream.finish(end.error);
 }
 
 async fn on_channel_frame(
     state: &Arc<NetworkState>,
     dispatch: &peer_registry::AdmittedInboundDispatch,
+    claim: crate::resource::ResourceClaim,
+    retention: crate::resource::ResourceLease,
     channel: String,
     payload: serde_json::Value,
 ) {
@@ -3181,17 +3265,24 @@ async fn on_channel_frame(
     // replacement takes the same lock, so it lands strictly before or after
     // this send and never in the middle of it.
     //
-    // `dispatch_channel_frame` is a broadcast hand-off: it never blocks on a
+    // Gateway acceptance is a resource-backed fan-out: it never blocks on a
     // subscriber and never re-enters the registry, so it is safe under the
     // mutation lock.
     // Refusal is the intended outcome for a superseded installation: the
     // payload is dropped rather than delivered under an id someone else now
     // holds, and no subscriber is owed a notification of that.
-    let _ = dispatch.with_captured_peer(&state.peers, |_peer| {
+    let _ = dispatch.with_captured_session_state(&state.peers, |session, _record| {
         // An endpoint frame is never interpreted as an ordinary-member routing
         // envelope: the inbound path delivers to subscribers and forwards to
         // nobody.
-        state.dispatch_channel_frame(&channel, dispatch.owner().device_id(), payload);
+        let _ = state.application_gateway.accept_channel(
+            session,
+            claim,
+            retention,
+            &channel,
+            dispatch.owner().device_id(),
+            payload,
+        );
     });
 }
 
@@ -3285,7 +3376,7 @@ pub(crate) async fn send_application_bytes(
                 owner.device_id()
             ))
         })?
-        .send_frame(frame, timeout)
+        .send_frame(&state.peers, frame, timeout)
         .await?;
     state.traffic.record_tx(class, sent);
     Ok(())
@@ -3356,48 +3447,135 @@ async fn send_rpc_request(
     send_to_peer(state, peer, &MeshMessage::RpcRequest(request)).await
 }
 
+/// Tell one exact peer installation what this node offers, if its session is
+/// live at the moment of the send.
+///
+/// The single place a local advertisement leaves this node. Both callers — the
+/// change broadcast and the establishment replay — are the same send with the
+/// same gate, so there is one answer to "when may this node disclose what it
+/// offers", not two that can drift apart.
+///
+/// A live session is what authorizes it, and `PeerStatus` is not that claim.
+/// Status is retained policy history that survives connector replacement, so a
+/// peer can be `Active` with no promoted session, and telling such an endpoint
+/// what this node offers would disclose application metadata across the very
+/// boundary the inbound side refuses at.
+///
+/// The lender is bound and released before the send: it is synchronous and must
+/// not be held across the await, and nothing it lends is needed to build the
+/// frame. That leaves a window in which the session ends before the bytes go
+/// out, which is the same window every application send has and is answered the
+/// same way — the transport refuses a peer that is gone.
+async fn send_capabilities_to_owner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    caps: &CapabilityAdvert,
+) -> bool {
+    if state
+        .peers
+        .with_live_session(
+            owner,
+            state.session_broker.as_ref(),
+            &state.network_id,
+            |_session| (),
+        )
+        .is_none()
+    {
+        return false;
+    }
+    send_to_peer_owner(
+        state,
+        owner,
+        &MeshMessage::CapabilitiesUpdate(CapabilitiesUpdateMessage {
+            capabilities: caps.clone(),
+        }),
+    )
+    .await
+    .is_ok()
+}
+
+/// Tell one exact peer what this node offers, if this session has not been told.
+///
+/// The other half of [`Rpc::advertise`](crate::rpc::Rpc::advertise). That call
+/// reaches the peers holding a session at the moment it runs; this reaches the
+/// session that appears afterwards. Between them there is no window in which a
+/// peer holds a live session and has never been told, and no path that asks the
+/// embedder to advertise a second time to repair one.
+///
+/// The debt is a field of the session's own state, which is what makes both
+/// awkward cases fall out rather than needing rules. A replacement session is a
+/// new record that owes the advert again — and is sent the value current *then*,
+/// not the one its predecessor was sent. A promotion that resource-refuses mints
+/// no record at all, so nothing is consumed and the first later successful
+/// promotion still owes it. Neither depends on this function being reached at
+/// any particular time, which is why no timer is needed to make them true.
+///
+/// Read, send, then clear — deliberately not a consuming take. A take up front
+/// loses the advertisement outright if the send fails, and putting it back means
+/// writing to a session that may already be gone. Here a failed send simply
+/// leaves the debt owed. The cost is that a concurrent pair can both observe the
+/// debt and send: two identical advertisements, which the receiver replaces
+/// wholesale.
+///
+/// The exact owner is what names the session across the send, and it is enough.
+/// A `PeerConnection` promotes one session and cannot replace it in place — its
+/// worker is set at construction, and the handoff and endpoint-auth task each
+/// serve one promotion — so a replaced session is a replaced *installation*, and
+/// that resolves to a different owner token. Re-entering the lender with this
+/// token therefore reaches the same session or none, and a second identity beside
+/// the token would name the same fact twice.
+///
+/// Nothing local is written on any arm. A failure records no belief that the
+/// peer was told, and success records nothing about what the *peer* advertises —
+/// that direction has one path, and it is inbound.
+async fn replay_local_capabilities_to_owner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+) {
+    // No RPC surface installed means no local advertisement exists to replay.
+    // The alternative — sending a default — would manufacture an advertisement
+    // this node never made.
+    let Some(caps) = state.application_gateway.capability_state().current() else {
+        return;
+    };
+    let owed = state.peers.with_live_session_state(
+        owner,
+        state.session_broker.as_ref(),
+        &state.network_id,
+        |_session, session_state| session_state.local_advert_owed(),
+    );
+    if owed != Some(true) {
+        return;
+    }
+    // Cloned out and the guard dropped on this statement: the send awaits, and
+    // the value that goes out is the one current at the moment of the send.
+    if !send_capabilities_to_owner(state, owner, &caps).await {
+        return;
+    }
+    // The refusal needs no handling: a session that ended between the send and
+    // this clear took its debt with it, and a replacement is a different owner
+    // this token cannot reach. Discarded explicitly so that stays a decision.
+    let _ = state.peers.with_live_session_state(
+        owner,
+        state.session_broker.as_ref(),
+        &state.network_id,
+        |_session, session_state| session_state.clear_local_advert_debt(),
+    );
+}
+
 async fn broadcast_capabilities(state: &Arc<NetworkState>, caps: CapabilityAdvert) -> usize {
     // Capability/application metadata is application traffic, so it fans out the
     // same way: per installation, each element authorized by its own session.
+    //
+    // `Active` only selects the candidates. The per-owner send re-proves the
+    // session at the moment of use rather than trusting this snapshot, which was
+    // taken before the loop began and may already be stale.
     let owners = state
         .peers
         .owners_snapshot(|peer| matches!(peer.state.read().status, PeerStatus::Active));
     let mut delivered = 0usize;
     for owner in owners {
-        // `Active` selected the candidates; a live session is what authorizes
-        // each send. The two are not the same claim — `PeerStatus` is retained
-        // policy history that survives connector replacement, so a peer can be
-        // `Active` with no promoted session, and telling such an endpoint what
-        // this node offers would disclose application metadata across the very
-        // boundary the inbound side refuses at. The lender re-proves the
-        // conjunction here rather than trusting the snapshot, which was taken
-        // before this loop began and may already be stale.
-        //
-        // Bound and released before the send: the lender is synchronous and
-        // must not be held across the await, and nothing it lends is needed to
-        // build the frame.
-        if state
-            .peers
-            .with_live_session(
-                &owner,
-                state.session_broker.as_ref(),
-                &state.network_id,
-                |_session| (),
-            )
-            .is_none()
-        {
-            continue;
-        }
-        if send_to_peer_owner(
-            state,
-            &owner,
-            &MeshMessage::CapabilitiesUpdate(CapabilitiesUpdateMessage {
-                capabilities: caps.clone(),
-            }),
-        )
-        .await
-        .is_ok()
-        {
+        if send_capabilities_to_owner(state, &owner, &caps).await {
             delivered += 1;
         }
     }
@@ -3846,11 +4024,23 @@ fn build_test_state_parts_metered(
         .expect("engine fixture has at least one simultaneous connector slot");
     let callback_capacity =
         std::num::NonZeroUsize::new(16).expect("engine fixture callback capacity is nonzero");
+    // This fixture prices its own finite provider from these profiles through
+    // `one_mesh_connector_fixture_grant`, so it states the largest payload it
+    // will fund per callback class. Fixture numbers chosen here, not borrowed
+    // from the protocol or signaling frame limits below: control covers one
+    // gathered ICE candidate's JSON, endpoint data the frames this engine
+    // fixture exchanges.
+    let control_payload_ceiling = std::num::NonZeroUsize::new(4_096)
+        .expect("engine fixture control payload ceiling is nonzero");
+    let endpoint_payload_ceiling = std::num::NonZeroUsize::new(16_384)
+        .expect("engine fixture endpoint payload ceiling is nonzero");
     let webrtc_profile = profile_override.unwrap_or_else(|| {
         let callbacks = crate::runtime::attempt::ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
                 callback_capacity,
                 callback_capacity,
+                control_payload_ceiling,
+                endpoint_payload_ceiling,
             ),
             crate::runtime::attempt::ConnectorCallbackServiceWeights::data_only(
                 callback_capacity,
@@ -3927,10 +4117,40 @@ fn build_test_state_parts_metered(
     let session_grant = crate::runtime::session_broker::session_reservation_charge_for_test()
         .checked_scale(connectors.get())
         .expect("engine fixture session capacity is mechanically representable");
+    // Gateway parsing capacity, which none of the grants above price. They cover
+    // building a connector and moving signaling through it; this covers turning
+    // one inbound frame into a `serde_json::Value` tree, and it is added here at
+    // the full-engine owner rather than inside
+    // `one_mesh_connector_fixture_grant` for exactly that reason — a helper that
+    // prices transport construction has no business naming what the application
+    // gateway may allocate.
+    //
+    // Two simultaneous claims per connector, both with a named holder: the
+    // peer's `Hello` retains its claim for the connection's whole life, and one
+    // further protocol or application frame is being parsed at any moment. One
+    // would fund the retained `Hello` and refuse everything after it, which is
+    // what left every approval latch false with nothing logged above `trace!`.
+    //
+    // The size is this fixture's own number and the claim comes from the gateway
+    // rather than being restated, so grant and admission cannot be derived from
+    // two different formulas. It funds a parse; it gates nothing on the wire.
+    const ENGINE_FIXTURE_JSON_FRAME_BYTES: usize = 8 * 1024;
+    const ENGINE_FIXTURE_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
+    let json_input_grant =
+        crate::application_gateway::json_input_work_claim(ENGINE_FIXTURE_JSON_FRAME_BYTES)
+            .expect("engine fixture JSON input claim is representable")
+            .checked_scale(
+                connectors
+                    .get()
+                    .checked_mul(ENGINE_FIXTURE_JSON_CLAIMS_PER_CONNECTOR)
+                    .expect("engine fixture JSON claim count is representable"),
+            )
+            .expect("engine fixture JSON input capacity is representable");
     let grant = grant
         .checked_add(candidate_grant)
         .and_then(|claim| claim.checked_add(remote_description_grant))
         .and_then(|claim| claim.checked_add(session_grant))
+        .and_then(|claim| claim.checked_add(json_input_grant))
         .expect("engine fixture connector and signaling grant is representable");
     // Everything above is what the fixture needs to exist. `retained` is what a
     // control wants a *promoted session* to be able to hold on top of it, and it
@@ -4139,8 +4359,16 @@ pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> A
     let realtime =
         RealtimeConnectorPolicy::enabled_with_local_ceiling(nonzero(8, "unit limit"), flows)
             .expect("engine real-time fixture policy is structurally valid");
+    // Supplied to the fixture above as a profile override, which prices its own
+    // provider from it, so this states its per-class payload ceilings for the
+    // same reason and on the same terms.
     let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+        ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
+            capacity,
+            capacity,
+            nonzero(4_096, "control payload ceiling"),
+            nonzero(16_384, "endpoint payload ceiling"),
+        ),
         ConnectorCallbackServiceWeights::new(
             nonzero(1, "control weight"),
             nonzero(1, "endpoint-data weight"),
@@ -4199,8 +4427,8 @@ fn realtime_test_name(tag: u8) -> crate::transport::webrtc::RealtimeFlowName {
         .expect("the control flow name fits the one-byte length prefix")
 }
 
-/// Gated for the same reason as [`realtime_test_name`]: its two callers are the
-/// `transport-lab` real-time controls and nothing else.
+/// Gated for the same reason as [`realtime_test_name`]: every caller is a
+/// `transport-lab` real-time control and there are no others.
 #[cfg(all(test, feature = "transport-lab"))]
 fn realtime_test_encoding() -> crate::transport::webrtc::RealtimeEncoding {
     crate::transport::webrtc::RealtimeEncoding::new(
@@ -4910,32 +5138,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frame_cap_rejects_oversize_inbound_frames() {
-        assert!(frame_within_cap(0));
-        assert!(frame_within_cap(MAX_ENDPOINT_FRAME_BYTES));
-        assert!(!frame_within_cap(MAX_ENDPOINT_FRAME_BYTES + 1));
-        // The ceiling is generous (far above any real control frame) but
-        // bounded — a regression that zeroed or ballooned it would trip here.
-        assert!((1 << 20..=1 << 26).contains(&MAX_ENDPOINT_FRAME_BYTES));
-    }
-
-    #[tokio::test]
-    async fn handle_inbound_frame_drops_an_oversize_frame() {
-        // MOM-04: a giant frame short-circuits before the deserializer — no
-        // parse attempt, no panic, and the peer's frame counter doesn't move.
-        let state = build_test_state("oversize-frame");
-        insert_session_less_peer(&state, "flooder", None);
-        let huge = Bytes::from(vec![b' '; MAX_ENDPOINT_FRAME_BYTES + 1]);
-        handle_inbound_frame(&state, "flooder", huge).await;
-        let peer = state.peers.get("flooder").expect("peer present");
-        assert_eq!(
-            peer.state.read().diag.frames_in,
-            0,
-            "an oversize frame must be dropped before it counts as received"
-        );
-    }
-
     // ---- admission gate: pre-authentication application dispatch ----
     //
     // The bug these guard: an endpoint with a live DTLS data channel but an
@@ -5015,6 +5217,65 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_connect_wait_drops_its_exact_installed_registration() {
+        let state = build_test_state("connect-wait-cancellation");
+        let (reply, _receiver) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let id = 41;
+        state.register_connect_waiter(
+            "peer",
+            state::ConnectWaiterRegistration {
+                id,
+                reply,
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        assert_eq!(
+            state.connect_waiter_count_for_test("peer"),
+            1,
+            "non-vacuity: the exact waiter is installed before cancellation"
+        );
+        drop(state::ConnectWaitCancellation {
+            state: &state,
+            device_id: "peer".into(),
+            id,
+            cancelled,
+            armed: true,
+        });
+        assert_eq!(state.connect_waiter_count_for_test("peer"), 0);
+    }
+
+    #[test]
+    fn channel_registration_is_atomic_and_last_subscriber_removal_is_exact() {
+        let state = build_test_state("channel-registration");
+        let channel =
+            crate::channels::Channel::<serde_json::Value>::new("c".into(), Arc::clone(&state));
+        let first = channel.subscribe();
+        let second = channel.subscribe();
+        assert_eq!(
+            state
+                .application_gateway
+                .channel_subscriber_count_for_test("c"),
+            2
+        );
+        drop(first);
+        assert_eq!(
+            state
+                .application_gateway
+                .channel_subscriber_count_for_test("c"),
+            1
+        );
+        drop(second);
+        assert_eq!(
+            state
+                .application_gateway
+                .channel_subscriber_count_for_test("c"),
+            0,
+            "the exact last subscriber removes the channel registration"
+        );
+    }
+
+    #[test]
     fn v4_arc03_relay_selection_is_not_authentication_or_session_admission() {
         let relay_pair = crate::transport::SelectedCandidatePair {
             local: crate::transport::IceCandidateKind::Relay,
@@ -5090,8 +5351,77 @@ mod tests {
     #[cfg(feature = "transport-lab")]
     #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_arc05_adopted_remote_eviction_revokes_before_next_effect() {
+        use crate::network_state::{transition_payload, Transition, TransitionVariant};
+        let state = build_test_state_with_realtime_flows("arc05-adopted-eviction");
+        let authority = crate::identity::Identity::ephemeral();
+        let authority_id = authority.public_id().to_string();
+        let target = "adopted-revoked-peer";
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(&state.network_id, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(authority.signing_key(), &payload)],
+                signers: vec![authority_id.clone()],
+                variant,
+            }
+        };
+        let grant = signed(
+            TransitionVariant::RoleGrant {
+                target: target.into(),
+                role: crate::Role::Member,
+            },
+            1,
+        );
+        state.peers.with_governance_commit(|gov| {
+            gov.kind = crate::NetworkKind::Closed;
+            gov.roles
+                .insert(state.identity.public_id().to_string(), crate::Role::Owner);
+            gov.roles.insert(authority_id.clone(), crate::Role::Owner);
+            gov.roles.insert(target.into(), crate::Role::Member);
+            gov.member_log = vec![grant.clone()];
+        });
+        let fixture = insert_promoted_peer(&state, target).await;
+        let owner = state.peers.owner(target).expect("promoted peer owner");
+        assert!(state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .is_some());
+
+        let evict = signed(
+            TransitionVariant::Evict {
+                target: target.into(),
+            },
+            2,
+        );
+        governance::adopt_transition_log(&state, &authority_id, &[], &[grant, evict]).await;
+
+        assert!(state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .is_none());
+        assert!(
+            !fixture.peer.holds_promoted_session_for_test(),
+            "adoption returns only after revoking the promoted session"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn v4_arc05_revoking_policy_refuses_the_next_operation_and_drops_the_session() {
         let state = build_test_state_with_realtime_flows("arc05-policy-revocation");
+        state.peers.with_governance_commit(|gov| {
+            gov.kind = crate::network_state::NetworkKind::Closed;
+            gov.roles.insert(
+                state.identity.public_id().to_string(),
+                crate::network_state::Role::Owner,
+            );
+            gov.roles.insert(
+                "revoked-peer".to_string(),
+                crate::network_state::Role::Member,
+            );
+        });
         let fixture = insert_promoted_peer(&state, "revoked-peer").await;
         let owner = state
             .peers
@@ -5186,7 +5516,28 @@ mod tests {
             "and its caller is waiting, not already answered"
         );
 
+        // Mint the owned, await-crossing authority before revocation. This is
+        // the delayed-witness case: checking only while minting would let this
+        // value write after the signed policy edge below had already returned.
+        let delayed_send = state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .expect("non-vacuity: policy admits the owned send before revocation");
+        let started_send = state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .expect("non-vacuity: a second owned send is admitted before revocation")
+            .begin_for_test(&state.peers)
+            .expect("the second send crosses its effect-begin point before revocation");
+        fixture.peer.state.write().media_reneg_pending = true;
+        let delayed_renegotiation = state
+            .peers
+            .claim_renegotiation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .expect("non-vacuity: the live session claims renegotiation before revocation");
+        assert!(delayed_renegotiation.is_live());
+
         let before = state.traffic.snapshot();
+        let frames_before_effects = fixture.peer.state.read().diag.frames_out;
 
         // ---- revoke, and nothing else -------------------------------------
         //
@@ -5194,7 +5545,44 @@ mod tests {
         // the same Mesh context and the same runtime. Policy is the only
         // conjunct that moves, so a build with the use-time recheck deleted
         // fails every assertion below.
-        set_admission(&state, "revoked-peer", false, PeerStatus::Offline);
+        state.peers.with_governance_commit(|gov| {
+            gov.roles.remove("revoked-peer");
+        });
+
+        let delayed_error = delayed_send
+            .send_frame(
+                &state.peers,
+                Bytes::from_static(b"must-not-cross-revocation"),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("an already-minted application witness is synchronously revoked");
+        assert!(
+            delayed_error.to_string().contains("was revoked"),
+            "the delayed witness names revocation rather than attempting the wire: {delayed_error}"
+        );
+        assert_eq!(
+            fixture.peer.state.read().diag.frames_out,
+            frames_before_effects,
+            "refusal before effect-begin never reaches the native-send/accounting half",
+        );
+        started_send
+            .send_frame(
+                Bytes::from_static(b"began-before-revocation"),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("a send that crossed first is ordered before the later revocation");
+        assert_eq!(
+            fixture.peer.state.read().diag.frames_out,
+            frames_before_effects + 1,
+            "the already-started arm completes exactly one admitted effect after the later commit",
+        );
+        assert!(
+            !delayed_renegotiation.is_live(),
+            "the same session edge invalidates a claimed renegotiation before it can create an offer"
+        );
+        delayed_renegotiation.complete(&state.peers, Err("session revoked".to_string()));
 
         let error = send_channel_frame(
             &state,
@@ -5265,12 +5653,43 @@ mod tests {
         );
 
         // ---- and the revocation is a teardown, not a pause -----------------
-        set_admission(&state, "revoked-peer", true, PeerStatus::Active);
+        state.peers.with_governance_commit(|gov| {
+            gov.roles.insert(
+                "revoked-peer".to_string(),
+                crate::network_state::Role::Member,
+            );
+        });
         assert!(
             !fence_admits(&state, "revoked-peer"),
             "restoring policy does not restore the session: the channel it was \
              promoted from was consumed by the first promotion"
         );
+
+        // Self-eviction is the same atomic edge with a wider revocation set:
+        // withdrawing the local principal clears every current session before
+        // this commit returns.
+        let self_state = build_test_state_with_realtime_flows("arc05-self-revocation");
+        self_state.peers.with_governance_commit(|gov| {
+            gov.kind = crate::network_state::NetworkKind::Closed;
+            gov.roles.insert(
+                self_state.identity.public_id().to_string(),
+                crate::network_state::Role::Owner,
+            );
+            gov.roles.insert(
+                "self-revoked-peer".to_string(),
+                crate::network_state::Role::Member,
+            );
+        });
+        let self_fixture = insert_promoted_peer(&self_state, "self-revoked-peer").await;
+        assert!(fence_admits(&self_state, "self-revoked-peer"));
+        self_state.peers.with_governance_commit(|gov| {
+            gov.roles.remove(self_state.identity.public_id());
+        });
+        assert!(
+            !self_fixture.peer.holds_promoted_session_for_test(),
+            "self-eviction synchronously clears every promoted session"
+        );
+        assert!(!fence_admits(&self_state, "self-revoked-peer"));
     }
 
     #[tokio::test]
@@ -5631,6 +6050,72 @@ mod tests {
                 .flatten()
         }
 
+        /// Open one flow and answer the handle that names it.
+        ///
+        /// Deliberately **not** `open_realtime_negotiated`: that call brings a
+        /// native transceiver or track up between its fence acquisitions, and
+        /// these controls are about what a handle names rather than about
+        /// negotiation. What has to match is where the handle's identities come
+        /// from, and it does — `flows.identity()` and `flows.flow_identity()`,
+        /// both taken under the same fence acquisition that opened the flow,
+        /// which is exactly the pair phase 1 captures.
+        ///
+        /// Outbound, so the handle can be exercised through the real
+        /// `send_realtime` as well as through the currentness question. An
+        /// outbound flow queues without a native track behind it; the pump is
+        /// what a track is needed for, and no unit here is ever drained.
+        fn open_handle(
+            &self,
+            owner: &peer_registry::PeerOwnerToken,
+            label: u8,
+        ) -> crate::realtime::RealtimeFlowHandle {
+            self.state
+                .peers
+                .with_live_session_flow(
+                    owner,
+                    self.state.session_broker.as_ref(),
+                    &self.state.network_id,
+                    |session, flows, live| {
+                        let name = flows
+                            .open(
+                                session,
+                                Some(live),
+                                crate::transport::webrtc::RealtimeFlowSpec {
+                                    direction:
+                                        crate::transport::webrtc::RealtimeDirection::Outbound,
+                                    encoding: realtime_test_encoding(),
+                                    name: realtime_test_name(label),
+                                },
+                            )
+                            .expect("the fixture opens its outbound flow");
+                        let flow = flows
+                            .flow_identity(&name)
+                            .expect("the record `open` just filed is the one it filed");
+                        crate::realtime::RealtimeFlowHandle::new(
+                            owner.clone(),
+                            flows.identity(),
+                            flow,
+                            name,
+                        )
+                    },
+                )
+                .expect("the fixture peer reaches its session flow set")
+        }
+
+        /// One unit through the production send, addressed by handle.
+        fn send(
+            &self,
+            handle: &crate::realtime::RealtimeFlowHandle,
+        ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+            self.state.send_realtime(
+                handle,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: std::time::Duration::from_millis(20),
+                    data: Bytes::from_static(b"u"),
+                },
+            )
+        }
+
         /// Retire the fixture's connector and its state together.
         async fn shutdown(self, events: crate::transport::webrtc::WebRtcConnectorEventReceiver) {
             let state = Arc::clone(&self.state);
@@ -5970,6 +6455,259 @@ mod tests {
 
         drop(gate);
         state.shutdown().await;
+    }
+
+    /// A flow handle from the superseded installation reaches nothing on the
+    /// replacement, including the replacement's flow of the same name.
+    ///
+    /// This is the review's ABA in the form the runtime can actually produce.
+    /// The old public API took `peer + label` and re-resolved the Device
+    /// selector on every use, so a caller whose session had been replaced had
+    /// its units accepted by the replacement's flow of the same name — silently,
+    /// because nothing on a realtime path is acknowledged per unit. All three
+    /// operations are exercised, because they are three separate entries into
+    /// the fence and a regression could restore selector resolution in any one
+    /// of them.
+    ///
+    /// The replacement deliberately opens the **same label**, so what is proved
+    /// is "the flow is there and this handle cannot reach it" rather than the
+    /// weaker "there was nothing to reach".
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_f6_a_stale_flow_handle_reaches_no_flow_on_the_replacement() {
+        let state = build_test_state_with_realtime_flows("f6-stale-flow-handle");
+        let device_id = "f6-handle-peer".to_string();
+        let (first, _first_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("first connector opens");
+        install_peer(
+            &state.peers,
+            Arc::new(PeerConnection::new(
+                device_id.clone(),
+                Some(Arc::new(first)),
+            )),
+        );
+        let gate = RealtimeGate::over(Arc::clone(&state), device_id.clone());
+        gate.grant_policy();
+        gate.grant_capability();
+        let superseded_owner = gate.owner.clone();
+
+        // Baseline on the installation this handle names, so every refusal
+        // below is the replacement and not a path that never worked.
+        let stale = gate.open_handle(&superseded_owner, 9);
+        assert!(
+            state.realtime_is_current(&stale),
+            "non-vacuity: the handle names a usable flow while its session is current"
+        );
+        assert!(
+            gate.send(&stale).is_ok(),
+            "and the send it authorizes actually lands"
+        );
+
+        // The fixture grant admits two simultaneous connectors, and replacement
+        // is only meaningful with both alive: the first is still open here.
+        let (replacement_worker, _replacement_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("replacement connector opens");
+        install_peer(
+            &state.peers,
+            Arc::new(PeerConnection::new(
+                device_id.clone(),
+                Some(Arc::new(replacement_worker)),
+            )),
+        );
+        gate.grant_policy();
+        gate.grant_capability();
+        let replacement_owner = gate.current_owner();
+        assert!(
+            state.peers.get_if_current(&superseded_owner).is_none(),
+            "the superseded installation is no longer the one this device id resolves to"
+        );
+
+        // The same label, live on the replacement. A selector-resolving
+        // regression lands here, which is precisely the escape under test.
+        let fresh = gate.open_handle(&replacement_owner, 9);
+
+        assert!(
+            !state.realtime_is_current(&stale),
+            "the stale handle names nothing"
+        );
+        assert_eq!(
+            gate.send(&stale).err(),
+            Some(crate::realtime::RealtimeRefusal::SessionNotCurrent),
+            "its units are refused rather than accepted by the replacement's flow"
+        );
+        assert_eq!(
+            state.close_realtime_negotiated(stale).await.err(),
+            Some(crate::realtime::RealtimeRefusal::SessionNotCurrent),
+            "and it cannot close the replacement's flow either — a close that \
+             resolved the selector would tear down a live flow the caller has \
+             no standing over"
+        );
+
+        // Same-fixture positive on the far side, so the three refusals above
+        // are the handle and not a fixture that stopped working.
+        assert!(
+            state.realtime_is_current(&fresh),
+            "the replacement's own handle is usable"
+        );
+        assert!(gate.send(&fresh).is_ok());
+        assert!(state.close_realtime_negotiated(fresh).await.is_ok());
+
+        drop(gate);
+        state.shutdown().await;
+    }
+
+    /// Reopening a label inside one session produces a different flow, and the
+    /// identity says so where nothing coarser can.
+    ///
+    /// The flow-set identity cannot see this: closing a name and claiming it
+    /// again changes neither the installation, nor the session, nor the set —
+    /// only the record. Nor can the bytes, which are identical by construction.
+    /// This is the whole reason a handle carries a third identity, and it is
+    /// what makes a connection-owned table of handles safe on the daemon side,
+    /// where two holders of one coordinate is a shape that does exist.
+    ///
+    /// Stated against the flow set rather than through a stale handle, and that
+    /// is deliberate. Production has no path that closes a flow while leaving a
+    /// live handle to it — `close` consumes the handle, and the only other
+    /// close is the abandonment of an open whose handle was never returned — so
+    /// a control that manufactured that state would be asserting about a
+    /// situation the runtime cannot reach. What is asserted here is the
+    /// property the handle rests on, in the place it actually lives.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_f6_a_reopened_label_is_a_different_flow_record() {
+        let (gate, events) = RealtimeGate::connected("f6-label-reuse").await;
+        gate.grant_policy();
+        gate.grant_capability();
+        let owner = gate.owner.clone();
+
+        let first = gate.open_handle(&owner, 4);
+        let (set_before, refused_before) = gate
+            .state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                gate.state.session_broker.as_ref(),
+                &gate.state.network_id,
+                |session, flows, live| {
+                    // Closed by name, from inside the fence, because the point
+                    // is what the *set* then says about the record that left.
+                    let remains = flows
+                        .close(session, Some(live), &realtime_test_name(4))
+                        .expect("the fixture closes the flow it opened");
+                    drop(remains);
+                    let refused_before = flows.is_same_flow(&realtime_test_name(4), first.flow());
+                    // Same session, same set, same bytes.
+                    flows
+                        .open(
+                            session,
+                            Some(live),
+                            crate::transport::webrtc::RealtimeFlowSpec {
+                                direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                                encoding: realtime_test_encoding(),
+                                name: realtime_test_name(4),
+                            },
+                        )
+                        .expect("the label was released and can be claimed again");
+                    (flows.is_same(first.flow_set()), refused_before)
+                },
+            )
+            .expect("the fixture peer reaches its session flow set");
+
+        assert!(
+            set_before,
+            "non-vacuity: the session and its flow set are unchanged across the \
+             reuse, so nothing coarser than the record could tell these two \
+             flows apart"
+        );
+        assert!(
+            !refused_before,
+            "a closed record is not resolvable even by the exact bytes it was \
+             filed under"
+        );
+        assert!(
+            !gate.state.realtime_is_current(&first),
+            "and the handle that opened the first flow does not name the second"
+        );
+
+        gate.shutdown(events).await;
+    }
+
+    /// Dropping a handle is not a close.
+    ///
+    /// A handle names a flow without owning it, and the two directions of that
+    /// both matter. If dropping one closed the flow, an application that kept a
+    /// handle only long enough to hand a unit over would tear down its own
+    /// media; if holding one funded the flow, a leaked handle would keep a dead
+    /// session's label charged for as long as nobody noticed. This proves the
+    /// first directly, and the second follows from the identities being weak —
+    /// which the reopen control above exercises.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_f6_dropping_a_flow_handle_leaves_the_flow_open() {
+        let (gate, events) = RealtimeGate::connected("f6-handle-drop").await;
+        gate.grant_policy();
+        gate.grant_capability();
+        let owner = gate.owner.clone();
+
+        let handle = gate.open_handle(&owner, 6);
+        assert!(
+            gate.state.realtime_is_current(&handle),
+            "non-vacuity: the flow is open before anything is dropped"
+        );
+        drop(handle);
+
+        // A second handle for the *same* record. It can only exist if that
+        // record is still filed under that name, which is the assertion.
+        let survivor = gate
+            .state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                gate.state.session_broker.as_ref(),
+                &gate.state.network_id,
+                |_session, flows, _live| {
+                    flows.flow_identity(&realtime_test_name(6)).map(|flow| {
+                        crate::realtime::RealtimeFlowHandle::new(
+                            owner.clone(),
+                            flows.identity(),
+                            flow,
+                            realtime_test_name(6),
+                        )
+                    })
+                },
+            )
+            .flatten()
+            .expect("dropping a handle must not have removed the flow it named");
+        assert!(
+            gate.state.realtime_is_current(&survivor),
+            "and the flow is still usable, not merely still listed"
+        );
+        assert!(
+            gate.send(&survivor).is_ok(),
+            "which the send proves rather than assumes"
+        );
+
+        gate.shutdown(events).await;
     }
 
     /// The other replacement ordering: the unit is minted and *delivered
@@ -6402,7 +7140,11 @@ mod tests {
                 &state.network_id,
             )
             .expect("an admitted owner mints a witness")
-            .send_frame(Bytes::from_static(b"arc04c-baseline"), timeout)
+            .send_frame(
+                &state.peers,
+                Bytes::from_static(b"arc04c-baseline"),
+                timeout,
+            )
             .await
             .expect("the captured live session carries the send");
         assert_eq!(
@@ -6473,7 +7215,11 @@ mod tests {
 
         assert!(
             witness
-                .send_frame(Bytes::from_static(b"arc04c-post-mint"), timeout)
+                .send_frame(
+                    &state.peers,
+                    Bytes::from_static(b"arc04c-post-mint"),
+                    timeout,
+                )
                 .await
                 .is_err(),
             "the captured connector was retired by the replacement, so the post-mint send fails there rather than being redirected"
@@ -6601,6 +7347,331 @@ mod tests {
         fn handled_open_expected(self) -> bool {
             self.withhold.is_none()
         }
+    }
+
+    /// A promotion the provider refuses announces nothing, and the first later
+    /// promotion that succeeds announces exactly once.
+    ///
+    /// The half of finding 4 that no amount of care at the Active edge can
+    /// deliver: the review requires that a temporarily resource-refused promotion
+    /// still owes the advertisement, rather than the embedder being asked to
+    /// advertise again. What makes that true is that a refusal mints nothing —
+    /// there is no session, so there is no debt to consume and nothing to
+    /// announce — and the later call that actually promotes is the one that
+    /// announces.
+    ///
+    /// The refusal is the provider's own. `seal_slack_leaving` measures the grant
+    /// against what is in use and holds the remainder, so the pool really is empty
+    /// when B asks; no production grant is changed and no amount is written, which
+    /// is what stops this control from drifting away from what promotion actually
+    /// costs. A control that faked the refusal would prove only that the fake
+    /// suppressed an announcement.
+    ///
+    /// No time passes anywhere in this control. The debt is repaid because a
+    /// promotion succeeded, not because an interval elapsed, which is the
+    /// distinction the directive draws.
+    // `RetainedCapacityMeter`'s impl is `transport-lab` only, and the refusal this
+    // control needs is its measurement rather than a fixture's invention.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_f4_a_refused_promotion_announces_nothing_and_the_later_one_announces_once() {
+        let (state, mut commands, provider, grant) = build_test_state_parts_metered(
+            "f4-capacity-refusal",
+            None,
+            FIXTURE_CONNECTOR_SLOTS,
+            Some(crate::resource::ResourceClaim::ZERO),
+        );
+        let meter = RetainedCapacityMeter { provider, grant };
+
+        // Install both connectors before sealing. The seal must close the
+        // session-promotion headroom, not the connector headroom B still needs
+        // in order to reach that transition.
+        let _peer_a = insert_promoted_peer(&state, "peer-a").await;
+        let owner_a = state.peers.owner("peer-a").expect("peer-a is installed");
+        let peer_b = insert_promoted_peer(&state, "peer-b").await;
+        let owner_b = state.peers.owner("peer-b").expect("peer-b is installed");
+
+        // A is promoted by the seal itself — measuring before promotion would
+        // count the session's own reservation as free capacity.
+        let seal = meter.seal_slack_leaving(&state, &owner_a, crate::resource::ResourceClaim::ZERO);
+        // A's own promotion announced; that is not what this control is about.
+        let _ = collect_replay_commands(&mut commands);
+
+        assert!(
+            !fence_admits(&state, "peer-b"),
+            "non-vacuity: with the pool sealed, B's promotion is refused"
+        );
+        assert!(
+            !peer_b.peer.holds_promoted_session_for_test(),
+            "non-vacuity: the refusal mints nothing, so there is no debt to consume"
+        );
+        assert!(
+            collect_replay_commands(&mut commands).is_empty(),
+            "a refused promotion announces nothing"
+        );
+
+        // The one thing that changes. Nothing else is touched, so what follows is
+        // attributable to capacity alone.
+        drop(seal);
+
+        assert!(
+            fence_admits(&state, "peer-b"),
+            "non-vacuity: the same arrangement promotes once capacity returns"
+        );
+        let replays = collect_replay_commands(&mut commands);
+        assert_eq!(
+            replays.len(),
+            1,
+            "the first successful promotion announces exactly once"
+        );
+        let NetworkCmd::ReplayCapabilities { owner: announced } = &replays[0] else {
+            panic!("collect_replay_commands yields only replay commands");
+        };
+        assert_eq!(
+            announced.device_id(),
+            owner_b.device_id(),
+            "the announcement names the peer whose session was finally minted"
+        );
+
+        // Reuse is not a mint. Without this the control would pass against a
+        // build that announced on every fence entry, which would replay an
+        // advertisement to a session already told.
+        assert!(fence_admits(&state, "peer-b"), "the session is reused");
+        assert!(
+            collect_replay_commands(&mut commands).is_empty(),
+            "reusing a session announces nothing further"
+        );
+    }
+
+    /// An advertisement made before the peer existed reaches that peer's first
+    /// session, as a `CapabilitiesUpdate` carrying exactly what was advertised.
+    ///
+    /// The review's integration control for finding 4. It is end-to-end over a
+    /// real link deliberately: the defect was that `Rpc::advertise` reached only
+    /// the peers active at the moment it ran, and with the Hello snapshot gone a
+    /// peer that appeared afterwards was told nothing. A control that stopped at
+    /// the enqueued command would prove the engine intended to tell the peer, and
+    /// intent is exactly what the defect had.
+    ///
+    /// Every step is the production one. The advertisement goes through the
+    /// public `Rpc::advertise`, before any peer is installed. The session is
+    /// promoted through the registry fence by an ordinary application admission,
+    /// not by a test hook, so the command under test is enqueued by the same
+    /// `promote_and_announce` every fence entry point routes through. The command
+    /// is then run through `handle_command`, which is what the driver does with
+    /// it. What is asserted at the end is the bytes the peer's own connector
+    /// received.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run explicitly in the isolated WSL harness"]
+    async fn v4_f4_a_new_session_receives_the_advert_made_before_the_peer_existed() {
+        let (state, mut commands) = build_test_state_parts("f4-replay-a");
+        let peer_state = build_test_state("f4-replay-b");
+        let device_id = peer_state.identity.public_id().to_string();
+
+        // Advertised before any peer exists — the review's exact scenario. The
+        // fan-out this spawns reaches nobody, which is the point: whatever the
+        // peer is told later cannot have come from it.
+        let advert = CapabilityAdvert {
+            tags: vec!["f4-replay-tag".to_string()],
+            app_version: Some("9.9.9-f4".to_string()),
+            max_connections: Some(7),
+            extra: serde_json::json!({ "f4": "replayed" }),
+        };
+        let rpc = crate::rpc::Rpc::attach(&state);
+        rpc.advertise(advert.clone());
+        assert_eq!(
+            rpc.capabilities(),
+            advert,
+            "non-vacuity: the local advertisement is in place before the peer exists"
+        );
+
+        // Held whole: the fixture owns both connectors' event receivers, and
+        // dropping either stops that connector's pump — so the link the
+        // assertions describe would stop being the link that was up.
+        let mut link =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
+                .await;
+        let open = link.take_open_event();
+        let open = link
+            .left
+            .accept_event(open)
+            .expect("the live connector accepts its own open callback");
+        let (open, _callback_resources) = open.into_parts();
+        assert!(
+            matches!(open, TransportEvent::DataChannelOpen),
+            "non-vacuity: the fixture yields the genuine open callback"
+        );
+        let handoff = match link.left.confirm_data_channel_open() {
+            crate::transport::DataChannelOpenOwnership::Connected(connected) => connected
+                .into_generic()
+                .expect("a connected handoff carries its capability"),
+            _ => panic!("the left connector promotes its exact candidate once"),
+        };
+        link._left_events.commit_data_channel_open();
+
+        let peer = Arc::new(PeerConnection::new(
+            device_id.clone(),
+            Some(Arc::clone(&link.left)),
+        ));
+        {
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        peer.install_authenticated_channel_over_for_test(
+            handoff,
+            &state.network_id,
+            state.identity.public_id(),
+        );
+        install_peer(&state.peers, Arc::clone(&peer));
+        let owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the peer is installed under its own device id");
+
+        // Nothing has promoted yet, so nothing can have been announced. Without
+        // this the command asserted below could be one this fixture had been
+        // carrying since before the peer existed.
+        assert!(
+            !collect_replay_commands(&mut commands).iter().any(|_| true),
+            "non-vacuity: no replay is owed before a session exists"
+        );
+
+        // The promotion is an ordinary application admission through the fence —
+        // the same path an outbound send or a realtime open would take.
+        let witness = state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .expect("an admitted owner with a live connector promotes");
+        drop(witness);
+
+        let replays = collect_replay_commands(&mut commands);
+        assert_eq!(
+            replays.len(),
+            1,
+            "the mint announces exactly once, not per fence entry"
+        );
+        let NetworkCmd::ReplayCapabilities { owner: announced } = &replays[0] else {
+            panic!("collect_replay_commands yields only replay commands");
+        };
+        assert_eq!(
+            announced.device_id(),
+            device_id,
+            "the command names the exact peer whose session was minted"
+        );
+
+        // What the driver does with it, on the driver's own side of the fence.
+        for command in replays {
+            handle_command(&state, command).await;
+        }
+
+        // The peer's own connector, not this node's bookkeeping: the assertion is
+        // the bytes that crossed.
+        let received = receive_capabilities_update(&mut link).await;
+        assert_eq!(
+            received, advert,
+            "the peer receives exactly the advertisement made before it existed"
+        );
+
+        // The other half of the rule, in the same control: none of it rode the
+        // Hello, so the advertisement above cannot be explained by the frame that
+        // used to carry a snapshot.
+        //
+        // Built by the production builder, with `A` already advertised on this
+        // node — not by a literal this control fills in. A hand-built Hello
+        // proves only that this control declined to add capability metadata: it
+        // would still pass if the builder began reading the local advertisement,
+        // and it would still pass against a re-added `Option` that a fresh value
+        // leaves `None` and `skip_serializing_if` omits.
+        //
+        // Asserted against the encoded bytes, and against `A`'s own distinctive
+        // strings rather than only the retired field names. A future field under
+        // any name that carried this advertisement would put "f4-replay-tag" on
+        // the wire, and that is the thing actually being ruled out.
+        let hello = handshake::local_hello(&state, "noncef4".to_string(), "aaa111".to_string());
+        let encoded = serde_json::to_vec(&hello).expect("hello encodes");
+        let encoded = String::from_utf8(encoded).expect("a hello frame is UTF-8 JSON");
+        for absent in [
+            "capabilities",
+            "max_connections",
+            "app_version",
+            "f4-replay-tag",
+            "9.9.9-f4",
+            "replayed",
+        ] {
+            assert!(
+                !encoded.contains(absent),
+                "the hello this node sends carries no capability metadata: {absent} in {encoded}"
+            );
+        }
+        assert!(
+            encoded.contains("noncef4"),
+            "non-vacuity: this is the encoded hello, not an empty frame"
+        );
+    }
+
+    /// Every `ReplayCapabilities` the fence has enqueued since the last call.
+    ///
+    /// Drains the queue and **discards** every other command. A peek would have
+    /// to answer on the *first* queued command, and `Rpc::advertise` queues its
+    /// own fan-out from a spawned task — so that answer would be a statement
+    /// about task scheduling order rather than about promotion.
+    ///
+    /// Discarding is sound only because no control using this asserts on the
+    /// commands it drops, and no driver is running to act on them: these fixtures
+    /// hold the receiver themselves. A control that later needs the fan-out
+    /// command must partition here rather than filter, or it will find the queue
+    /// already empty and conclude the command was never sent.
+    #[cfg(feature = "transport-lab")]
+    fn collect_replay_commands(
+        commands: &mut mpsc::UnboundedReceiver<NetworkCmd>,
+    ) -> Vec<NetworkCmd> {
+        let mut replays = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if matches!(command, NetworkCmd::ReplayCapabilities { .. }) {
+                replays.push(command);
+            }
+        }
+        replays
+    }
+
+    /// The advertisement the peer's connector actually received.
+    ///
+    /// Reads the far side of the live link until a frame arrives, and refuses to
+    /// answer from anything but a decoded `CapabilitiesUpdate` — a control that
+    /// accepted any frame would pass on the acknowledgement of some other send.
+    #[cfg(feature = "transport-lab")]
+    async fn receive_capabilities_update(
+        link: &mut crate::endpoint_auth::native_link::LinkBeforeEngineOpen,
+    ) -> CapabilityAdvert {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let Some(event) =
+                tokio::time::timeout(Duration::from_secs(1), link._right_events.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Some(accepted) = link.right.accept_event(event) else {
+                continue;
+            };
+            let (event, _callback_resources) = accepted.into_parts();
+            let TransportEvent::Message(bytes) = event else {
+                continue;
+            };
+            let message: MeshMessage =
+                serde_json::from_slice(&bytes).expect("the frame that crossed is a mesh frame");
+            match message {
+                MeshMessage::CapabilitiesUpdate(update) => return update.capabilities,
+                other => panic!("the only frame this session sends is the replay, got: {other:?}"),
+            }
+        }
+        panic!("the peer's connector received no frame before the deadline");
     }
 
     /// Drive one real link through the production `DataChannelOpen` arm.
@@ -7109,6 +8180,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_session_application_payload_is_refused_before_full_decode() {
+        let state = build_test_state("pre-session-no-payload-decode");
+        insert_session_less_peer(&state, "attacker", None);
+        set_admission(&state, "attacker", false, PeerStatus::Handshaking);
+
+        // Canonical bounded tag, deliberately invalid application payload. A
+        // full MeshMessage decode would fail before reaching admission; the
+        // stage-one path instead classifies the tag and records the refusal.
+        let encoded =
+            Bytes::from_static(br#"{"kind":"channel","channel":"x","payload":{"nested":[}}"#);
+        handle_inbound_frame(&state, "attacker", encoded).await;
+
+        let peer = state.peers.get("attacker").expect("peer remains installed");
+        let data = peer.state.read();
+        assert_eq!(data.admission_rejected, 1);
+        assert_eq!(data.diag.frames_in, 0);
+        assert!(data.last_recv_at.is_none());
+    }
+
+    #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn admission_gate_admits_application_traffic_from_active_peer() {
         // Report case 9: an admitted peer's application frame flows normally —
@@ -7185,13 +8276,58 @@ mod tests {
         assert_eq!(d.admission_rejected, 1);
     }
 
+    #[cfg(feature = "transport-lab")]
     #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn admission_gate_lets_protocol_frames_through_while_handshaking() {
         // Report case 4: handshake/approval frames pass even while the peer is
         // unauthenticated, so the handshake can actually complete.
+        //
+        // The peer needs a *live connector worker*, which is why this opens a
+        // native object rather than using `insert_session_less_peer`. Without one
+        // the inbound path cannot reserve the frame's parse work and returns
+        // before the admission gate is ever consulted — so `admission_rejected`
+        // stays zero because nothing was decided, not because the frame passed.
+        // That is a control asserting the absence of a rejection it never gave
+        // the gate a chance to make, and it is what this replaces.
+        //
+        // The assertions below are therefore positive production-path
+        // observables rather than the absence of one counter: a frame that is
+        // counted, a latch the handler wrote, and a transition that must not
+        // have happened.
         let state = build_test_state("admit-protocol-pass");
-        insert_session_less_peer(&state, "peer", None);
+        let fixture = insert_promoted_peer(&state, "peer").await;
+        // Back to the state under test, and only partly. `insert_promoted_peer`
+        // leaves an authenticated, Active peer because most callers want one,
+        // and `set_admission` resets exactly two things: the `authenticated`
+        // boolean and the status. The authenticated *channel capability* stays
+        // installed — nothing here removes it, and this control does not need it
+        // gone. No session is promoted, and none is promoted over the course of
+        // this control either: a session is minted lazily by the application
+        // admission fence, and a Protocol frame is precisely the kind that never
+        // reaches that fence. What activation reads is the flags:
+        // `maybe_activate` requires `authenticated && local_approve_sent &&
+        // remote_approve_seen` and a policy that admits, so clearing the boolean
+        // is what makes this peer unauthenticated for the purpose under test.
         set_admission(&state, "peer", false, PeerStatus::Handshaking);
+        // Latch the local half of approval, so that after the inbound `Approve`
+        // lands the *only* activation conjunct still missing is `authenticated`.
+        // Without this the status assertion below would hold even on a build that
+        // had stopped requiring authentication at all — it would simply be
+        // waiting on the local approve — and would prove nothing about the guard
+        // it exists to pin.
+        {
+            let p = state.peers.get("peer").expect("peer present");
+            p.state.write().local_approve_sent = true;
+        }
+        let frames_before = state
+            .peers
+            .get("peer")
+            .expect("peer present")
+            .state
+            .read()
+            .diag
+            .frames_in;
 
         handle_inbound_frame(
             &state,
@@ -7201,11 +8337,34 @@ mod tests {
         .await;
 
         let p = state.peers.get("peer").expect("peer present");
+        let d = p.state.read();
         assert_eq!(
-            p.state.read().admission_rejected,
-            0,
+            d.admission_rejected, 0,
             "a handshake/approval frame must not be gated"
         );
+        assert_eq!(
+            d.diag.frames_in,
+            frames_before + 1,
+            "the frame reached the inbound commit, so it was carried rather than dropped short of \
+             the gate"
+        );
+        assert!(
+            d.remote_approve_seen,
+            "and the approval handler ran on it, which is the whole point of letting it through"
+        );
+        assert_eq!(
+            d.status,
+            PeerStatus::Handshaking,
+            "letting the frame through is not admitting the peer: with both approvals latched and \
+             only authentication missing, the peer stays exactly where it was"
+        );
+
+        drop(d);
+        drop(p);
+        // Held until every assertion is made: dropping the fixture retires the
+        // connector, and the frame above is only meaningful while the worker
+        // that funds its parse is still live.
+        drop(fixture);
     }
 
     #[tokio::test]
@@ -7274,13 +8433,24 @@ mod tests {
         owner: &peer_registry::PeerOwnerToken,
         msg: MeshMessage,
     ) -> Option<peer_registry::AdmittedInboundApplicationOperation> {
+        let encoded = Bytes::from(serde_json::to_vec(&msg).expect("the control frame serializes"));
         state
             .peers
             .with_admitted_current_or_refused(
                 owner,
                 state.session_broker.as_ref(),
                 &state.network_id,
-                |admitted| Some(admitted.inbound_application_operation(msg)),
+                |admitted| {
+                    let decoded = admitted
+                        .with_session_state(|session, _record| {
+                            crate::application_gateway::AdmittedApplicationFrame::admit(
+                                session, encoded,
+                            )
+                            .and_then(|frame| frame.decode())
+                        })
+                        .and_then(std::result::Result::ok)?;
+                    Some(admitted.inbound_application_operation(decoded))
+                },
                 |_| None,
             )
             .flatten()
@@ -7331,7 +8501,7 @@ mod tests {
 
         let operation = admit_inbound_for_test(&state, &owner, shelve_frame())
             .expect("an admitted owner mints an inbound authority");
-        let (msg, dispatch) = operation.into_dispatch();
+        let (msg, _claim, _work, dispatch) = operation.into_dispatch();
         let MeshMessage::Shelve(s) = msg else {
             panic!("the authority carries the frame it admitted");
         };
@@ -7390,7 +8560,7 @@ mod tests {
         let mut events = state.events_tx.subscribe();
 
         // RESUME — dispatch the authority minted for A.
-        let (msg, dispatch) = operation.into_dispatch();
+        let (msg, _claim, _work, dispatch) = operation.into_dispatch();
         let MeshMessage::Shelve(s) = msg else {
             panic!("the authority carries the frame it admitted");
         };
@@ -7436,7 +8606,7 @@ mod tests {
 
         let operation = admit_inbound_for_test(&state, &captured_owner, shelve_frame())
             .expect("A is admitted at mint time");
-        let (_msg, dispatch) = operation.into_dispatch();
+        let (_msg, _claim, _work, dispatch) = operation.into_dispatch();
 
         // Still current: the effect runs and its value comes back.
         assert_eq!(
@@ -7483,7 +8653,8 @@ mod tests {
         let state = build_test_state_with_connector_slots("arc04e1-delivery", 3);
         let captured_fixture = insert_admitted_peer(&state, "peer").await;
         let captured_owner = state.peers.owner("peer").expect("A is installed");
-        let mut frames = state.subscribe_channel("c");
+        let frames = state.application_gateway.subscribe_channel("c");
+        let second_frames = state.application_gateway.subscribe_channel("c");
 
         let channel_frame = || MeshMessage::Channel {
             channel: "c".into(),
@@ -7491,29 +8662,34 @@ mod tests {
         };
 
         // Baseline: still current, so it is delivered.
-        let (msg, dispatch) = admit_inbound_for_test(&state, &captured_owner, channel_frame())
-            .expect("A is admitted")
-            .into_dispatch();
+        let (msg, claim, work, dispatch) =
+            admit_inbound_for_test(&state, &captured_owner, channel_frame())
+                .expect("A is admitted")
+                .into_dispatch();
         let MeshMessage::Channel { channel, payload } = msg else {
             panic!("the authority carries the frame it admitted");
         };
-        on_channel_frame(&state, &dispatch, channel, payload).await;
+        on_channel_frame(&state, &dispatch, claim, work, channel, payload).await;
         assert!(
-            frames.try_recv().is_ok(),
+            frames.try_recv().is_some(),
             "an admitted payload is delivered while its installation is current"
+        );
+        assert!(
+            second_frames.try_recv().is_some(),
+            "each subscriber owns and receives through its distinct mailbox"
         );
 
         // Replaced between mint and dispatch: not delivered at all.
         let operation = admit_inbound_for_test(&state, &captured_owner, channel_frame())
             .expect("A is still admitted at mint time");
         let replacement_fixture = insert_admitted_peer(&state, "peer").await;
-        let (msg, dispatch) = operation.into_dispatch();
+        let (msg, claim, work, dispatch) = operation.into_dispatch();
         let MeshMessage::Channel { channel, payload } = msg else {
             panic!("the authority carries the frame it admitted");
         };
-        on_channel_frame(&state, &dispatch, channel, payload).await;
+        on_channel_frame(&state, &dispatch, claim, work, channel, payload).await;
         assert!(
-            frames.try_recv().is_err(),
+            frames.try_recv().is_none(),
             "a payload admitted for a superseded installation is not delivered under its device id"
         );
         drop((captured_fixture, replacement_fixture));
@@ -7708,10 +8884,22 @@ mod tests {
         // funding this many is funding at least enough — and exactly enough in
         // the residual dimension, which is what refuses.
         let widest = reliable::encoded_frame_for_test(u64::MAX, u64::MAX, "pressure", "u").len();
+        // Room for the retained frames, plus one copy for a write. The flush
+        // borrows the frame into a funded transient buffer, and there is at most
+        // one in flight because the flush sends one frame per fence entry — so
+        // one is the exact number, not a margin. A fixture that funded only
+        // retention would starve the flush instead of pressuring the retention,
+        // and the refusal under test would be the wrong refusal.
         let retained =
             crate::runtime::peer_session::retained_frame_reservation_charge_for_test(widest)
                 .checked_scale(RETAINED)
-                .expect("the control's retained capacity is representable");
+                .expect("the control's retained capacity is representable")
+                .checked_add(
+                    crate::runtime::peer_session::transient_frame_reservation_charge_for_test(
+                        widest,
+                    ),
+                )
+                .expect("the control's retained and transient capacity is representable");
         let (state, meter) =
             build_test_state_with_retained_capacity("macro1-reliable-pressure", retained);
         let fixture = insert_promoted_peer(&state, "peer").await;
@@ -7782,9 +8970,18 @@ mod tests {
 
         // Acknowledge the first frame. Its node, its buffer and its lease are
         // released together, which is what makes room for exactly one more.
+        //
+        // Marked sent first, because an acknowledgement settles only frames that
+        // reached the wire. This fixture has no peer to write to, so nothing here
+        // is sent as a side effect and the mark has to be stated. That is the
+        // rule under test elsewhere doing its job, not a workaround: without it
+        // this acknowledgement would correctly settle nothing.
         let stream = fixture
             .peer
-            .with_live_session_state(|_session, record| record.stream_for_test())
+            .with_live_session_state(|_session, record| {
+                record.mark_sent(1);
+                record.stream_for_test()
+            })
             .expect("the promoted session is current");
         handle_inbound_frame_from(
             &state,
@@ -7815,6 +9012,349 @@ mod tests {
             "the released claim funded exactly one more retention"
         );
         drop((readmitted, funded, fixture));
+    }
+
+    /// Reach one promoted session's application record through the production
+    /// fence, for the state-machine controls below.
+    ///
+    /// They drive the record rather than the wire deliberately: each asserts one
+    /// rule of the acknowledged-delivery state machine, and a control that had
+    /// to arrange a real peer to reach that rule would be asserting the arrangement
+    /// as much as the rule.
+    #[cfg(feature = "transport-lab")]
+    fn with_record<R>(
+        state: &Arc<NetworkState>,
+        owner: &peer_registry::PeerOwnerToken,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::runtime::peer_session::PeerSessionState,
+        ) -> R,
+    ) -> R {
+        state
+            .peers
+            .with_live_session_state(
+                owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                effect,
+            )
+            .expect("the promoted session is current")
+    }
+
+    /// A cumulative acknowledgement settles only the contiguous front prefix
+    /// that actually reached the wire.
+    ///
+    /// The attack this forbids needs nothing but one received frame: that tells
+    /// the peer this session's stream id, after which it can acknowledge
+    /// `u64::MAX`. Without the sent test every frame still queued behind the
+    /// wire would resolve its caller `Ok` for data the peer has never seen.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_macro1_acknowledgement_settles_only_the_sent_contiguous_prefix() {
+        let state = build_test_state("macro1-ack-sent-prefix");
+        let fixture = insert_promoted_peer(&state, "peer").await;
+        set_admission(&state, "peer", true, PeerStatus::Active);
+        let owner = state.peers.owner("peer").expect("peer is installed");
+
+        let mut waits = Vec::new();
+        for _ in 0..3u8 {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            with_record(&state, &owner, |session, record| {
+                record.submit(session, "c", serde_json::json!("u"), reply)
+            });
+            waits.push(rx);
+        }
+        // Exactly one frame reached the wire. The other two are retained and
+        // unsent, which is the state the peer must not be able to settle.
+        let stream = with_record(&state, &owner, |_session, record| {
+            record.mark_sent(1);
+            record.stream_for_test()
+        });
+        assert_eq!(
+            with_record(&state, &owner, |_session, record| record.pending()),
+            3,
+            "non-vacuity: three frames are genuinely retained before the acknowledgement"
+        );
+
+        let settled = with_record(&state, &owner, |_session, record| {
+            record.acknowledge(stream, u64::MAX)
+        });
+        assert_eq!(
+            settled, 1,
+            "an acknowledgement through the ceiling settles the sent prefix and stops \
+             at the first unsent frame"
+        );
+        assert!(
+            waits[0].try_recv().is_ok_and(|outcome| outcome.is_ok()),
+            "the frame that reached the wire is settled"
+        );
+        for wait in waits.iter_mut().skip(1) {
+            assert!(
+                wait.try_recv().is_err(),
+                "a frame that never reached the wire keeps its caller waiting, however \
+                 large an `up_to` the peer claims"
+            );
+        }
+        assert_eq!(
+            with_record(&state, &owner, |_session, record| record.pending()),
+            2,
+            "and stays retained, so it can still be sent"
+        );
+        drop((waits, fixture));
+    }
+
+    /// A sequence gap delivers nothing and advances nothing.
+    ///
+    /// The data channel is ordered, so a gap is a frame that did not arrive
+    /// rather than one that arrived early. Advancing past it would let the
+    /// sender settle every frame it skipped.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_macro1_an_inbound_gap_neither_delivers_nor_advances() {
+        use crate::runtime::peer_session::InboundOutcome;
+        let state = build_test_state("macro1-inbound-gap");
+        let fixture = insert_promoted_peer(&state, "peer").await;
+        set_admission(&state, "peer", true, PeerStatus::Active);
+        let owner = state.peers.owner("peer").expect("peer is installed");
+        let delivered = std::cell::Cell::new(0u32);
+
+        let gap = with_record(&state, &owner, |_session, record| {
+            record.receive(7, 5, serde_json::json!("u"), |_| {
+                delivered.set(delivered.get() + 1)
+            })
+        });
+        assert_eq!(
+            gap,
+            InboundOutcome::Gap(0),
+            "a frame beyond the next sequence is a gap, and answers the mark this side \
+             is actually at"
+        );
+        assert_eq!(delivered.get(), 0, "and hands nothing to the subscribers");
+
+        // The mark did not move, so the frame that was actually next is still
+        // next. Were the gap treated as delivered, this would be a duplicate.
+        let next = with_record(&state, &owner, |_session, record| {
+            record.receive(7, 1, serde_json::json!("u"), |_| {
+                delivered.set(delivered.get() + 1)
+            })
+        });
+        assert_eq!(
+            next,
+            InboundOutcome::Delivered(1),
+            "the sequence the gap skipped is still the one this side is waiting for"
+        );
+        assert_eq!(delivered.get(), 1, "and it is delivered exactly once");
+        drop(fixture);
+    }
+
+    /// A peer cannot reset this session's receive state by naming another
+    /// stream.
+    ///
+    /// The sender mints its stream once per session. If a second stream value
+    /// rebound the receiver, a peer could zero the mark at will and replay every
+    /// sequence it had already spent.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_macro1_a_second_stream_cannot_reset_the_inbound_mark() {
+        use crate::runtime::peer_session::InboundOutcome;
+        let state = build_test_state("macro1-second-stream");
+        let fixture = insert_promoted_peer(&state, "peer").await;
+        set_admission(&state, "peer", true, PeerStatus::Active);
+        let owner = state.peers.owner("peer").expect("peer is installed");
+        let delivered = std::cell::Cell::new(0u32);
+        let bump = |_: serde_json::Value| delivered.set(delivered.get() + 1);
+
+        assert_eq!(
+            with_record(&state, &owner, |_session, record| record.receive(
+                7,
+                1,
+                serde_json::json!("u"),
+                bump
+            )),
+            InboundOutcome::Delivered(1),
+            "non-vacuity: this session is bound to a stream and has a mark to reset"
+        );
+
+        let foreign = with_record(&state, &owner, |_session, record| {
+            record.receive(8, 1, serde_json::json!("u"), bump)
+        });
+        assert_eq!(
+            foreign,
+            InboundOutcome::ForeignStream,
+            "a different stream on the same session is refused outright"
+        );
+        assert!(
+            foreign.acknowledge().is_none(),
+            "and is answered with nothing, because acknowledging would put a mark on \
+             the bound stream in reply to a frame that was never part of it"
+        );
+        assert_eq!(delivered.get(), 1, "nothing was delivered for it");
+
+        assert_eq!(
+            with_record(&state, &owner, |_session, record| record.receive(
+                7,
+                2,
+                serde_json::json!("u"),
+                bump
+            )),
+            InboundOutcome::Delivered(2),
+            "and the bound stream continues from the mark it had, which a reset would \
+             have zeroed"
+        );
+        drop(fixture);
+    }
+
+    /// An exact duplicate is re-acknowledged and delivered no second time.
+    ///
+    /// Re-acknowledging is what stops a sender whose earlier acknowledgement was
+    /// lost; delivering again would hand the application the same payload twice.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_macro1_a_duplicate_is_reacknowledged_without_a_second_delivery() {
+        use crate::runtime::peer_session::InboundOutcome;
+        let state = build_test_state("macro1-inbound-duplicate");
+        let fixture = insert_promoted_peer(&state, "peer").await;
+        set_admission(&state, "peer", true, PeerStatus::Active);
+        let owner = state.peers.owner("peer").expect("peer is installed");
+        let delivered = std::cell::Cell::new(0u32);
+        let bump = |_: serde_json::Value| delivered.set(delivered.get() + 1);
+
+        assert_eq!(
+            with_record(&state, &owner, |_session, record| record.receive(
+                7,
+                1,
+                serde_json::json!("u"),
+                bump
+            )),
+            InboundOutcome::Delivered(1)
+        );
+        assert_eq!(
+            delivered.get(),
+            1,
+            "non-vacuity: the first arrival delivered"
+        );
+
+        let repeat = with_record(&state, &owner, |_session, record| {
+            record.receive(7, 1, serde_json::json!("u"), bump)
+        });
+        assert_eq!(
+            repeat,
+            InboundOutcome::Duplicate(1),
+            "a sequence at or below the mark is a duplicate"
+        );
+        assert_eq!(
+            repeat.acknowledge(),
+            Some(1),
+            "which is still acknowledged, because a duplicate usually means our \
+             acknowledgement was lost and re-answering is what stops the retransmits"
+        );
+        assert_eq!(
+            delivered.get(),
+            1,
+            "and the payload reaches the application exactly once"
+        );
+        drop(fixture);
+    }
+
+    /// A reliable frame the Application Gateway refuses is acknowledged to
+    /// nobody.
+    ///
+    /// An acknowledgement is a statement about delivery. Sending one for a
+    /// payload no subscriber received tells the sender its frame arrived, and
+    /// the sender then releases the only copy — so the frame is lost with both
+    /// sides believing it landed.
+    ///
+    /// `runtime::peer_session::reliable`'s
+    /// `refused_gateway_acceptance_neither_advances_nor_turns_retransmit_into_duplicate`
+    /// is the record half of this and pins the mark. This is the engine half
+    /// and pins the wire, which is the part a record-level control cannot see.
+    ///
+    /// Two arms, and neither means anything alone. The negative alone passes
+    /// against a build where the handler is never reached at all — a refused
+    /// dispatch, an unpromoted session, a mis-keyed owner — because nothing is
+    /// sent in that world either. So the positive runs the *same bytes* through
+    /// the *same owner*, varying only whether the channel has a subscriber. It
+    /// can pass only if the handler runs, which is what makes the negative's
+    /// silence attributable to the gateway's refusal.
+    ///
+    /// Reusing sequence 1 in the positive arm also pins the mark from outside
+    /// the record: had the refusal advanced it, the second arrival would be a
+    /// duplicate — re-acknowledged, deliberately, but never delivered — and the
+    /// subscriber assertion below would fail while the acknowledgement one
+    /// still passed. That is the discrimination the two assertions buy
+    /// together.
+    ///
+    /// The acknowledgement is measured as an *attempt*
+    /// (`NetworkState::channel_ack_attempts`) rather than as a completed write.
+    /// It has to be: this fixture has no remote peer, so no write completes in
+    /// it, and `diag.frames_out` and `traffic.record_tx` both move only after
+    /// one does. Measuring completions here would pass identically against a
+    /// build that acknowledges every refusal — the ack would simply fail to
+    /// reach a peer that is not there — which is the defect this control
+    /// exists to catch. The attempt counter is the semantic answer: the
+    /// handler decided to acknowledge, or it did not.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_f15_a_refused_reliable_delivery_acknowledges_nothing() {
+        let state = build_test_state("f15-refused-delivery-no-ack");
+        let fixture = insert_promoted_peer(&state, "peer").await;
+        set_admission(&state, "peer", true, PeerStatus::Active);
+        let owner = state.peers.owner("peer").expect("peer is installed");
+        // One channel name for both arms: the subscription is the only thing
+        // that differs between them.
+        let channel = "acknowledged-only-on-delivery";
+        let frame = || {
+            frame_bytes(&MeshMessage::ChannelSeq {
+                stream: 7,
+                seq: 1,
+                channel: channel.to_string(),
+                payload: serde_json::json!("u"),
+            })
+        };
+
+        let acks = || {
+            state
+                .channel_ack_attempts
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        // ---- negative: nobody is subscribed, so the gateway refuses --------
+        let rx_before = state.traffic.snapshot().app_rx.frames;
+        let acks_before = acks();
+        handle_inbound_frame_from(&state, &owner, frame()).await;
+        assert_eq!(
+            state.traffic.snapshot().app_rx.frames,
+            rx_before + 1,
+            "non-vacuity: the frame was admitted and reached the dispatch, so the \
+             silence below is the gateway's refusal rather than an earlier drop"
+        );
+        assert_eq!(
+            acks(),
+            acks_before,
+            "a payload no subscriber received is acknowledged to nobody — not \
+             even attempted"
+        );
+
+        // ---- positive: the same frame, now with a subscriber ---------------
+        let received = state.application_gateway.subscribe_channel(channel);
+        handle_inbound_frame_from(&state, &owner, frame()).await;
+        assert_eq!(
+            acks(),
+            acks_before + 1,
+            "an accepted delivery is acknowledged, exactly once, on the same path \
+             the refusal above left silent"
+        );
+        assert!(
+            received.try_recv().is_some(),
+            "and the payload really did reach the subscriber — so the refused \
+             arrival had not advanced the mark past this sequence"
+        );
+        drop(fixture);
     }
 
     /// Capability metadata is application payload: it is not retained before a
@@ -8602,9 +10142,10 @@ mod tests {
             .peers
             .owner(device_id)
             .expect("the peer is installed for this control");
-        admit_inbound_for_test(state, &owner, msg)
+        let (message, _claim, _work, dispatch) = admit_inbound_for_test(state, &owner, msg)
             .expect("an admitted peer mints an inbound authority")
-            .into_dispatch()
+            .into_dispatch();
+        (message, dispatch)
     }
 
     /// Deliver one `rpc_response` frame as `device_id`.
@@ -8689,12 +10230,13 @@ mod tests {
         // The central escape: C answers a request B owns. C is fully
         // authenticated — this is not an admission failure, it is C being
         // admitted for its own traffic and then reaching for B's.
-        let (state, rpc, _b, _c) = two_authenticated_peers("arc04f2-foreign-settle").await;
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f2-foreign-settle").await;
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let request_id = rpc
-            .inner
-            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
-            .expect("the pending call is filed");
+        let request_id = state
+            .application_gateway
+            .register_rpc_request(&state, "device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("the exact promoted session funds the pending call")
+            .request_id;
 
         deliver_rpc_response(&state, "device-c", &request_id, serde_json::json!("stolen")).await;
 
@@ -8722,29 +10264,32 @@ mod tests {
         // Wrong class, right device. A streaming operation is not answered by
         // a single response, and mistaking one for the other would resolve a
         // stream caller with a body it has no way to interpret.
-        let (state, rpc, _b, _c) = two_authenticated_peers("arc04f2-single-onto-stream").await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let request_id = rpc
-            .inner
-            .insert_local_request("device-b", crate::rpc::PendingEntry::Stream(tx))
-            .expect("the pending stream is filed");
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f2-single-onto-stream").await;
+        let inbox = Arc::new(crate::rpc::RpcStreamInbox::new());
+        let request_id = state
+            .application_gateway
+            .register_rpc_request(
+                &state,
+                "device-b",
+                crate::rpc::PendingEntry::Stream(Arc::clone(&inbox)),
+            )
+            .expect("the exact promoted session funds the pending stream")
+            .request_id;
 
         deliver_rpc_response(&state, "device-b", &request_id, serde_json::json!("wrong")).await;
 
         assert!(
-            matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
+            inbox.try_recv().is_none(),
             "no item is routed to the stream, and it is not disconnected"
         );
 
         // Non-destructive: the stream is still open and still B's.
         deliver_rpc_stream_chunk(&state, "device-b", &request_id, serde_json::json!("chunk")).await;
         assert_eq!(
-            rx.try_recv()
+            inbox
+                .try_recv()
                 .expect("the stream survived the wrong-class frame"),
-            Ok(serde_json::json!("chunk")),
+            serde_json::json!("chunk"),
             "and it still delivers B's chunks"
         );
     }
@@ -8755,12 +10300,13 @@ mod tests {
         // The same mismatch the other way. A stream end must not close a
         // single-shot call: doing so drops the oneshot and resolves the caller
         // with NetworkDown for a request that is still legitimately in flight.
-        let (state, rpc, _b, _c) = two_authenticated_peers("arc04f2-end-onto-single").await;
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f2-end-onto-single").await;
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let request_id = rpc
-            .inner
-            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
-            .expect("the pending call is filed");
+        let request_id = state
+            .application_gateway
+            .register_rpc_request(&state, "device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("the exact promoted session funds the pending call")
+            .request_id;
 
         deliver_rpc_stream_end(&state, "device-b", &request_id).await;
 
@@ -8785,12 +10331,17 @@ mod tests {
         // Chunk injection. This is the quietest of the three escapes: the
         // stream stays open, the caller keeps reading, and a foreign peer's
         // item is indistinguishable from the real peer's once delivered.
-        let (state, rpc, _b, _c) = two_authenticated_peers("arc04f2-foreign-chunk").await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let request_id = rpc
-            .inner
-            .insert_local_request("device-b", crate::rpc::PendingEntry::Stream(tx))
-            .expect("the pending stream is filed");
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f2-foreign-chunk").await;
+        let inbox = Arc::new(crate::rpc::RpcStreamInbox::new());
+        let request_id = state
+            .application_gateway
+            .register_rpc_request(
+                &state,
+                "device-b",
+                crate::rpc::PendingEntry::Stream(Arc::clone(&inbox)),
+            )
+            .expect("the exact promoted session funds the pending stream")
+            .request_id;
 
         deliver_rpc_stream_chunk(
             &state,
@@ -8801,47 +10352,35 @@ mod tests {
         .await;
 
         assert!(
-            matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
+            inbox.try_recv().is_none(),
             "C's chunk never reaches B's stream"
         );
 
         deliver_rpc_stream_chunk(&state, "device-b", &request_id, serde_json::json!("real")).await;
         assert_eq!(
-            rx.try_recv().expect("B's own chunk is delivered"),
-            Ok(serde_json::json!("real")),
+            inbox.try_recv().expect("B's own chunk is delivered"),
+            serde_json::json!("real"),
             "and the first item the caller sees is B's, not C's"
         );
 
         // A chunk removes nothing, so the stream is still B's to end.
         deliver_rpc_stream_end(&state, "device-c", &request_id).await;
         assert!(
-            matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
+            inbox.try_recv().is_none(),
             "and C cannot cut B's stream short either — the receiver is still open"
         );
     }
 
     #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
-    async fn v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call() {
-        // The selected rule, stated positively. Binding to the *installation*
-        // here would be wrong: a peer that drops and re-authenticates mid-call
-        // returns on a fresh connector under the same canonical device id, and
-        // the local caller is still waiting for exactly that answer. This is
-        // the one place the response path deliberately diverges from
-        // `on_rpc_request`, which binds to the installation because it
-        // authorizes a handler run rather than completing a pending call.
-        let (state, rpc, _b, _c) = two_authenticated_peers("arc04f2-replacement-connector").await;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let request_id = rpc
-            .inner
-            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
-            .expect("the pending call is filed");
+    async fn v4_arc04f2_same_device_replacement_retires_old_and_fresh_session_settles() {
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f2-replacement-connector").await;
+        let (old_tx, old_rx) = tokio::sync::oneshot::channel();
+        let old_request_id = state
+            .application_gateway
+            .register_rpc_request(&state, "device-b", crate::rpc::PendingEntry::Single(old_tx))
+            .expect("session 1 funds its pending call")
+            .request_id;
 
         let original = state.peers.owner("device-b").expect("B is installed");
         // A genuinely distinct installation under the same device id, on its
@@ -8853,12 +10392,39 @@ mod tests {
             "the original installation really is superseded"
         );
 
-        deliver_rpc_response(&state, "device-b", &request_id, serde_json::json!("after")).await;
+        assert!(
+            old_rx.await.is_err(),
+            "dropping session 1 resolves its pending caller"
+        );
+        deliver_rpc_response(
+            &state,
+            "device-b",
+            &old_request_id,
+            serde_json::json!("stale"),
+        )
+        .await;
+
+        let (fresh_tx, fresh_rx) = tokio::sync::oneshot::channel();
+        let fresh_request_id = state
+            .application_gateway
+            .register_rpc_request(
+                &state,
+                "device-b",
+                crate::rpc::PendingEntry::Single(fresh_tx),
+            )
+            .expect("session 2 independently funds a fresh call")
+            .request_id;
+        deliver_rpc_response(
+            &state,
+            "device-b",
+            &fresh_request_id,
+            serde_json::json!("fresh"),
+        )
+        .await;
 
         assert!(
-            matches!(rx.await, Ok(Ok(response)) if response.body == serde_json::json!("after")),
-            "the same canonical device completes its own pending call across a \
-             freshly authenticated replacement connector"
+            matches!(fresh_rx.await, Ok(Ok(response)) if response.body == serde_json::json!("fresh")),
+            "only session 2's freshly filed operation settles"
         );
     }
 
@@ -8868,12 +10434,13 @@ mod tests {
         // The other half of the selected rule, so the control above cannot be
         // read as "any replacement completes anything". Device identity is the
         // binding; a fresh connector does not launder it.
-        let (state, rpc, _b, _c) = two_authenticated_peers("arc04f2-replacement-foreign").await;
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f2-replacement-foreign").await;
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let request_id = rpc
-            .inner
-            .insert_local_request("device-b", crate::rpc::PendingEntry::Single(tx))
-            .expect("the pending call is filed");
+        let request_id = state
+            .application_gateway
+            .register_rpc_request(&state, "device-b", crate::rpc::PendingEntry::Single(tx))
+            .expect("B's exact promoted session funds the pending call")
+            .request_id;
 
         let _replacement = insert_admitted_peer(&state, "device-c").await;
         deliver_rpc_response(&state, "device-c", &request_id, serde_json::json!("stolen")).await;

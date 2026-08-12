@@ -31,6 +31,8 @@ pub enum ChannelError {
     Serialize(#[from] serde_json::Error),
     #[error("transport: {0}")]
     Transport(String),
+    #[error("application gateway lagged by {0} accepted messages")]
+    Lagged(u64),
 }
 
 /// One inbound message on a channel, paired with the peer that
@@ -38,12 +40,12 @@ pub enum ChannelError {
 pub struct ChannelMessage<T> {
     pub from: DeviceId,
     pub body: T,
+    _gateway_retention: crate::resource::ResourceLease,
 }
 
 /// Typed handle to a named channel. Cheap to clone — multiple
-/// holders can `subscribe` independently; the underlying receive
-/// stream is a `tokio::sync::broadcast` so missed-while-lagging
-/// is observable (matches the broader event stream's policy).
+/// holders can `subscribe` independently; each subscription owns a distinct,
+/// resource-backed Application Gateway mailbox.
 pub struct Channel<T> {
     pub(crate) name: Arc<String>,
     pub(crate) network: Arc<NetworkState>,
@@ -131,24 +133,37 @@ where
             .await)
     }
 
-    /// Subscribe to inbound messages on this channel. The returned
-    /// receiver lives until dropped; missed messages while a
-    /// receiver is lagging are signaled by the underlying
-    /// broadcast channel (matches the event stream's contract).
+    /// Subscribe to inbound messages on this channel. The returned receiver
+    /// owns a distinct resource-backed mailbox; pressure and loss are surfaced
+    /// rather than hidden behind a shared ring.
     pub fn subscribe(&self) -> ChannelSubscription<T> {
-        let rx = self.network.subscribe_channel(&self.name);
+        let subscriber = self
+            .network
+            .application_gateway
+            .subscribe_channel(&self.name);
         ChannelSubscription {
-            rx,
+            subscriber,
+            name: Arc::clone(&self.name),
+            network: Arc::clone(&self.network),
             _phantom: PhantomData,
         }
     }
 }
 
-/// Inbound side of a channel. Wraps a tokio broadcast Receiver
-/// and deserializes each frame into `T` on demand.
+/// Inbound side of one resource-backed Application Gateway mailbox.
 pub struct ChannelSubscription<T> {
-    rx: tokio::sync::broadcast::Receiver<RawChannelFrame>,
+    subscriber: Arc<crate::application_gateway::ChannelSubscriber>,
+    name: Arc<String>,
+    network: Arc<NetworkState>,
     _phantom: PhantomData<T>,
+}
+
+impl<T> Drop for ChannelSubscription<T> {
+    fn drop(&mut self) {
+        self.network
+            .application_gateway
+            .unsubscribe_channel(&self.name, &self.subscriber);
+    }
 }
 
 impl<T> ChannelSubscription<T>
@@ -159,36 +174,23 @@ where
     /// been torn down (network closed). Surfaces deserialization
     /// failures as `Err`.
     pub async fn recv(&mut self) -> Option<Result<ChannelMessage<T>, ChannelError>> {
-        loop {
-            match self.rx.recv().await {
-                Ok(frame) => {
-                    let body = match serde_json::from_value::<T>(frame.payload) {
-                        Ok(v) => v,
-                        Err(e) => return Some(Err(ChannelError::Serialize(e))),
-                    };
-                    return Some(Ok(ChannelMessage {
-                        from: frame.from,
-                        body,
-                    }));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Skip the gap and keep going. Embedders that
-                    // need explicit lag visibility can observe
-                    // `MeshEvent::Diag` for the matching warning.
-                    continue;
-                }
+        let delivery = match self.subscriber.recv().await {
+            Ok(delivery) => delivery,
+            Err(crate::application_gateway::GatewayRefusal::Revoked) => return None,
+            Err(crate::application_gateway::GatewayRefusal::Lag(skipped)) => {
+                return Some(Err(ChannelError::Lagged(skipped)))
             }
-        }
+            Err(other) => return Some(Err(ChannelError::Transport(format!("{other:?}")))),
+        };
+        let (frame, retention) = delivery.into_parts();
+        let body = match serde_json::from_value::<T>(frame.payload) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(ChannelError::Serialize(error))),
+        };
+        Some(Ok(ChannelMessage {
+            from: frame.from,
+            body,
+            _gateway_retention: retention,
+        }))
     }
-}
-
-/// The internal frame the engine's channel router stores in its
-/// per-channel broadcast queue. Public so `NetworkState` can
-/// expose typed accessors that return it; embedders shouldn't
-/// construct these directly.
-#[derive(Clone, Debug)]
-pub struct RawChannelFrame {
-    pub from: DeviceId,
-    pub payload: serde_json::Value,
 }

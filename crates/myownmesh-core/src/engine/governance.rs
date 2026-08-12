@@ -72,6 +72,18 @@ fn pk(device_id: &str) -> String {
     crate::signing::pubkey_part(device_id).to_string()
 }
 
+/// The single temporary live-policy projection used by every session edge.
+pub(super) fn current_policy_admits(
+    gov: &network_state::NetworkState,
+    local_device_id: &str,
+    remote_device_id: &str,
+) -> bool {
+    if gov.kind.is_open_governance() {
+        return true;
+    }
+    gov.roles.contains_key(&pk(local_device_id)) && gov.roles.contains_key(&pk(remote_device_id))
+}
+
 /// Iterate active peers — those whose data channel is ACTIVE +
 /// authenticated. Used to broadcast governance frames.
 fn active_peer_ids(state: &Arc<EngineState>) -> Vec<String> {
@@ -156,7 +168,15 @@ pub async fn propose(
     // NOT yet signed into the log, so granting it Member is meaningful and must
     // proceed (this is exactly how a not-yet-signed member gets admitted).
     if let TransitionVariant::RoleGrant { target, role } = &variant {
-        if state.governance_state.read().roles.get(target).copied() == Some(*role) {
+        let gov = state.governance_state.read();
+        let signed_member = *role != Role::Member
+            || network_state::verify_log(&state.network_id, &gov.transitions)
+                .map(|verified| {
+                    network_state::verify_member_log(&verified, &gov.member_log, &state.network_id)
+                        .contains(target)
+                })
+                .unwrap_or(false);
+        if gov.roles.get(target).copied() == Some(*role) && signed_member {
             return Ok(String::new());
         }
     }
@@ -700,11 +720,112 @@ pub(super) async fn on_state_broadcast(
     // necessarily changing membership, so a membership-only check would miss it.
     let membership_differs =
         crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
-    if membership_differs
-        || msg.transitions_count > local_count
-        || msg.member_log_count > local_member_count
-    {
+    let reply = state_broadcast_reply(local_count, local_member_count, &msg, membership_differs);
+    if reply.pull_roster {
         request_roster(state, owner).await;
+    }
+    if reply.re_advertise {
+        send_state_to_owner(state, owner).await;
+    }
+}
+
+/// What one received `NetworkState` snapshot obliges us to send back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StateBroadcastReply {
+    /// Ask the sender for their roster and signed logs: they hold something we
+    /// do not.
+    pull_roster: bool,
+    /// Send our own snapshot straight back to the sender: we hold something
+    /// they do not, and nothing else is going to tell them.
+    re_advertise: bool,
+}
+
+/// Decide both halves of the reply from four numbers.
+///
+/// Extracted from [`on_state_broadcast`] because the interesting property is
+/// the decision rather than the send, and a decision reachable only through a
+/// transport is one nothing can state exhaustively.
+///
+/// **Why a re-advertise exists at all.** Every pull condition asks "is the
+/// *sender* ahead of me". That converges a peer who hears from someone further
+/// along, and does nothing at all for a peer who is behind and hears from
+/// someone who is not: the peer that holds the newer log sees a stale snapshot,
+/// has no reason to pull, and — before this — said nothing back. Since
+/// [`broadcast_state`] fires only on a local mutation or an activation, and
+/// nothing re-announces on a timer, one broadcast that arrives while a peer is
+/// not yet Active left that peer stale until the next mutation or a reconnect.
+/// In a two-peer mesh that is a hang; in a fleet it is one owner holding a
+/// member the others never see, arriving through timing rather than a fork.
+///
+/// **Why this cannot echo.** A re-advertise is triggered only by a *strict*
+/// inequality on a count. For any one count, at most one of two peers can be
+/// strictly greater, so the peer we answer cannot answer us back on that same
+/// count — it is strictly behind, so it pulls instead. `membership_differs` is
+/// symmetric and deliberately does **not** trigger one; two peers whose roots
+/// disagree would otherwise answer each other forever. Genuine cross-divergence
+/// — each side ahead on a different count — costs exactly one frame each way,
+/// and both sides also pull, so the next exchange has equal counts and both
+/// fall silent. Convergence is the fixed point: nothing is strictly ahead, so
+/// nothing is sent.
+fn state_broadcast_reply(
+    local_transitions: u32,
+    local_members: u32,
+    msg: &NetworkStateBroadcast,
+    membership_differs: bool,
+) -> StateBroadcastReply {
+    StateBroadcastReply {
+        pull_roster: membership_differs
+            || msg.transitions_count > local_transitions
+            || msg.member_log_count > local_members,
+        re_advertise: local_transitions > msg.transitions_count
+            || local_members > msg.member_log_count,
+    }
+}
+
+/// Send our current snapshot to exactly one peer.
+///
+/// Targeted rather than a fleet broadcast, and that is the whole difference
+/// from [`broadcast_state`]: this answers one stale peer, and telling the whole
+/// network because a single member fell behind is precisely the flood the
+/// summary/request/entries shape exists to avoid.
+///
+/// Through the captured owner, so a peer whose installation was replaced while
+/// we were deciding is answered on nothing rather than on a stale link — the
+/// same rule [`on_roster_request`] follows when it hands back the full roster.
+async fn send_state_to_owner(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
+    let msg = MeshMessage::NetworkState(local_state_snapshot(state));
+    if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
+        tracing::debug!(peer = %owner.device_id(), err = %e, "state re-advertise send failed");
+    }
+}
+
+/// Our current governance snapshot, as the wire carries it.
+///
+/// One builder for all three senders — the fleet broadcast, the
+/// activation-bound broadcast, and the targeted re-advertise above — so a
+/// change to what a snapshot states cannot reach two of them and miss the
+/// third.
+///
+/// The membership root is the *membership* root and not the full merkle root,
+/// so peers reconcile on who is in the network rather than on per-node label
+/// and timestamp churn — see [`crate::roster::membership_root`].
+fn local_state_snapshot(state: &Arc<EngineState>) -> NetworkStateBroadcast {
+    let (kind, transitions_count, member_log_count) = {
+        let gov = state.governance_state.read();
+        (
+            gov.kind,
+            gov.transitions.len() as u32,
+            gov.member_log.len() as u32,
+        )
+    };
+    NetworkStateBroadcast {
+        kind,
+        transitions_count,
+        member_log_count,
+        roster_root: crate::roster::membership_root(&state.roster.read()),
     }
 }
 
@@ -1091,7 +1212,7 @@ fn project_roles(
 /// either does we reproject the full role map from both logs, mirror it into
 /// the roster, and re-gossip so it ripples on. We keep our in-flight pending
 /// proposals throughout.
-async fn adopt_transition_log(
+pub(super) async fn adopt_transition_log(
     state: &Arc<EngineState>,
     peer_id: &str,
     incoming_gov: &[Transition],
@@ -1140,8 +1261,7 @@ async fn adopt_transition_log(
     };
 
     // Apply both tiers under the write lock; reproject + mirror if either moved.
-    let (changed, roles, removed, adopted_topology) = {
-        let mut gov = state.governance_state.write();
+    let (changed, roles, removed, adopted_topology) = state.peers.with_governance_commit(|gov| {
         let mut changed = false;
         let mut adopted_topology = None;
 
@@ -1183,7 +1303,7 @@ async fn adopt_transition_log(
             let removed =
                 network_state::member_log_removed(&verified, &gov.member_log, &state.network_id);
             gov.roles = projected.clone();
-            if let Err(e) = network_state::save(&gov) {
+            if let Err(e) = network_state::save(gov) {
                 diag(
                     state,
                     crate::events::DiagLevel::Warn,
@@ -1192,7 +1312,7 @@ async fn adopt_transition_log(
             }
             (true, projected, removed, adopted_topology)
         }
-    };
+    });
 
     if !changed {
         return;
@@ -1432,93 +1552,112 @@ fn same_signer_set(a: &Transition, b: &Transition) -> bool {
 /// denied — fold it into the signed transition log, apply, persist,
 /// and broadcast a fresh state snapshot.
 async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
-    let (transition, applied) = {
-        let mut gov = state.governance_state.write();
-        let Some(idx) = gov.pending.iter().position(|p| p.id == proposal_id) else {
-            return Ok(());
-        };
-        if !gov.pending[idx].deniers.is_empty() {
-            // Denied — drop from pending and bail.
-            gov.pending.remove(idx);
-            network_state::save(&gov)?;
-            return Ok(());
-        }
-        let p = &gov.pending[idx];
-
-        // Fold the (signer, signature) pairs into a canonical order —
-        // proposer first, then the rest sorted by signer pubkey — so that two
-        // peers who collected the same co-signatures in different ack-arrival
-        // orders record the *byte-identical* transition. Without this, the
-        // shared-prefix fork guard in `adopt_transition_log` would see two
-        // orderings of the same multi-signer transition as divergent logs and
-        // refuse to converge. ed25519 signatures are deterministic, so once the
-        // signer order agrees the whole entry agrees. Genesis and splits are
-        // single-signer, so `first()` still resolves to the founder/proposer
-        // (canonicalisation is a no-op there).
-        let (signers, signatures) = canonicalize_signers(&p.proposer, &p.signers, &p.signatures);
-        let candidate = Transition {
-            at: p.created_at,
-            variant: p.variant.clone(),
-            signers,
-            signatures,
-        };
-        if network_state::verify_transition_signatures(&state.network_id, &candidate).is_err() {
-            // Should never happen — we verified each at intake.
-            return Ok(());
-        }
-
-        // Quorum check. Authority is read entirely off the signed state
-        // (`gov.roles`), reconstructed from the log — no external roster is
-        // consulted, so this matches what a converging peer's `verify_log`
-        // will re-derive.
-        if network_state::verify_quorum(&gov, &candidate).is_err() {
-            return Ok(());
-        }
-
-        let transition = candidate;
-        // Route by tier: a member admit/removal rides the union-merged member
-        // log (so two managers' concurrent offline admissions don't fork);
-        // everything else (kind change, owner/manager grant or removal, split)
-        // extends the strict governance log. A removal is member-tier iff its
-        // target is currently a plain member.
-        let member_tier = match &transition.variant {
-            TransitionVariant::RoleGrant {
-                role: Role::Member, ..
-            } => true,
-            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
-                gov.role_of(target) == Role::Member
+    let transition = state
+        .peers
+        .with_governance_commit(|gov| -> Result<Option<Transition>> {
+            let Some(idx) = gov.pending.iter().position(|p| p.id == proposal_id) else {
+                return Ok(None);
+            };
+            if !gov.pending[idx].deniers.is_empty() {
+                // Denied — drop from pending and bail.
+                gov.pending.remove(idx);
+                network_state::save(gov)?;
+                return Ok(None);
             }
-            _ => false,
-        };
-        if member_tier {
-            gov.member_log.push(transition.clone());
-            gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
-        } else {
-            // Apply to the governance log (also advances `gov.roles`).
-            let after = network_state::apply_transition(gov.clone(), &transition);
-            *gov = after;
-            // Evicting a device promoted past plain member (an owner or manager)
-            // still leaves its *original* member-tier admit in the member log.
-            // On its own the governance-log evict removes the role but not that
-            // admit, so any peer that re-derives membership from the signed logs
-            // — the gossip-adoption path a co-owner runs after being offline for
-            // the kick — folds the stale admit back in and resurrects the evicted
-            // device as a plain member: it lingers in the roster, still
-            // authorised, and nobody but the evicting owner sees it gone. Record
-            // the evict in the union-merged member log too, so it tombstones that
-            // admit; the removal then converges network-wide and survives
-            // concurrent authors, exactly like a plain-member evict.
-            if matches!(&transition.variant, TransitionVariant::Evict { .. }) {
+            let p = &gov.pending[idx];
+
+            // Fold the (signer, signature) pairs into a canonical order —
+            // proposer first, then the rest sorted by signer pubkey — so that two
+            // peers who collected the same co-signatures in different ack-arrival
+            // orders record the *byte-identical* transition. Without this, the
+            // shared-prefix fork guard in `adopt_transition_log` would see two
+            // orderings of the same multi-signer transition as divergent logs and
+            // refuse to converge. ed25519 signatures are deterministic, so once the
+            // signer order agrees the whole entry agrees. Genesis and splits are
+            // single-signer, so `first()` still resolves to the founder/proposer
+            // (canonicalisation is a no-op there).
+            let (signers, signatures) =
+                canonicalize_signers(&p.proposer, &p.signers, &p.signatures);
+            let candidate = Transition {
+                at: p.created_at,
+                variant: p.variant.clone(),
+                signers,
+                signatures,
+            };
+            if network_state::verify_transition_signatures(&state.network_id, &candidate).is_err() {
+                // Should never happen — we verified each at intake.
+                return Ok(None);
+            }
+
+            // Quorum check. Authority is read entirely off the signed state
+            // (`gov.roles`), reconstructed from the log — no external roster is
+            // consulted, so this matches what a converging peer's `verify_log`
+            // will re-derive.
+            if network_state::verify_quorum(gov, &candidate).is_err() {
+                return Ok(None);
+            }
+
+            let transition = candidate;
+            // Route by tier: a member admit/removal rides the union-merged member
+            // log (so two managers' concurrent offline admissions don't fork);
+            // everything else (kind change, owner/manager grant or removal, split)
+            // extends the strict governance log. A removal is member-tier iff its
+            // target is currently a plain member.
+            let member_tier = match &transition.variant {
+                TransitionVariant::RoleGrant {
+                    role: Role::Member, ..
+                } => true,
+                TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
+                    gov.role_of(target) == Role::Member
+                }
+                _ => false,
+            };
+            if member_tier {
                 gov.member_log.push(transition.clone());
                 gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
+            } else {
+                // Apply to the governance log. `apply_transition` advances
+                // `gov.roles` **incrementally, from this transition alone** —
+                // the genesis arm inserts the founder and nothing else — so the
+                // reprojection below is what folds the other tier back in. It
+                // is not an optimisation and not defensive: without it the
+                // founder's own close leaves every signed member absent from
+                // `roles`, and `with_governance_commit` then synchronously
+                // revokes the sessions of exactly those members. A node that
+                // adopts a close through `adopt_transition_log` reprojects from
+                // both tiers and keeps them; the node that *authors* one used to
+                // drop them, which is the node guaranteed to hit it.
+                let after = network_state::apply_transition(gov.clone(), &transition);
+                *gov = after;
+                // Evicting a device promoted past plain member (an owner or manager)
+                // still leaves its *original* member-tier admit in the member log.
+                // On its own the governance-log evict removes the role but not that
+                // admit, so any peer that re-derives membership from the signed logs
+                // — the gossip-adoption path a co-owner runs after being offline for
+                // the kick — folds the stale admit back in and resurrects the evicted
+                // device as a plain member: it lingers in the roster, still
+                // authorised, and nobody but the evicting owner sees it gone. Record
+                // the evict in the union-merged member log too, so it tombstones that
+                // admit; the removal then converges network-wide and survives
+                // concurrent authors, exactly like a plain-member evict.
+                if matches!(&transition.variant, TransitionVariant::Evict { .. }) {
+                    gov.member_log.push(transition.clone());
+                }
+                // Both tiers, once, for every governance transition. The evict
+                // above used to carry its own copy of this line, which made the
+                // reprojection look like part of tombstoning rather than what it
+                // is — the projection this branch owes on *any* mutation. Evict
+                // semantics are unchanged: the tombstone is still pushed first,
+                // so `verify_member_log` sees it and the target's latest
+                // member-tier verdict is still removal.
+                gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
             }
-        }
-        gov.pending.retain(|p| p.id != proposal_id);
-        network_state::save(&gov)?;
-        (transition, true)
-    };
+            gov.pending.retain(|p| p.id != proposal_id);
+            network_state::save(gov)?;
+            Ok(Some(transition))
+        })?;
 
-    if applied {
+    if let Some(transition) = transition {
         // Mirror role grants into the on-disk roster's `role`
         // projection so peers' rows render with the new authority
         // without re-reading the state log.
@@ -1620,25 +1759,11 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
 /// after every mutation to keep peers in sync without waiting on
 /// the next ACTIVE transition.
 pub async fn broadcast_state(state: &Arc<EngineState>) {
-    let (kind, transitions_count, member_log_count) = {
-        let gov = state.governance_state.read();
-        (
-            gov.kind,
-            gov.transitions.len() as u32,
-            gov.member_log.len() as u32,
-        )
-    };
-    // Membership root (not the full merkle root) so peers reconcile on
-    // *who is in the network*, not on per-node label / timestamp churn —
-    // see `roster::membership_root`.
-    let roster_root = crate::roster::membership_root(&state.roster.read());
-    let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
-        kind,
-        transitions_count,
-        member_log_count,
-        roster_root,
-    });
-    broadcast(state, msg).await;
+    broadcast(
+        state,
+        MeshMessage::NetworkState(local_state_snapshot(state)),
+    )
+    .await;
 }
 
 /// Activation-triggered state snapshot. Each outbound send retains the exact
@@ -1651,24 +1776,341 @@ pub(super) async fn broadcast_state_for_owner(
     if state.peers.get_if_current(owner).is_none() {
         return false;
     }
-    let (kind, transitions_count, member_log_count) = {
-        let gov = state.governance_state.read();
-        (
-            gov.kind,
-            gov.transitions.len() as u32,
-            gov.member_log.len() as u32,
-        )
-    };
-    let roster_root = crate::roster::membership_root(&state.roster.read());
     broadcast_for_owner(
         state,
         owner,
-        MeshMessage::NetworkState(NetworkStateBroadcast {
-            kind,
-            transitions_count,
-            member_log_count,
-            roster_root,
-        }),
+        MeshMessage::NetworkState(local_state_snapshot(state)),
     )
     .await
+}
+
+/// Controls for [`current_policy_admits`], which is declared near the top of
+/// this file with the rest of the policy projection.
+///
+/// The module sits here rather than beside what it exercises because a test
+/// module is the end of a file by convention, and items following one read as
+/// though they were meant to be inside it.
+#[cfg(test)]
+mod current_policy_controls {
+    use super::*;
+
+    #[test]
+    fn closed_requires_positive_local_and_remote_roles() {
+        let mut gov = network_state::NetworkState::empty_for("closed-policy-control");
+        gov.kind = NetworkKind::Closed;
+        gov.roles.insert("local".into(), Role::Owner);
+        assert!(!current_policy_admits(&gov, "local", "unknown"));
+        gov.roles.insert("remote".into(), Role::Member);
+        assert!(current_policy_admits(&gov, "local", "remote"));
+        gov.roles.remove("local");
+        assert!(!current_policy_admits(&gov, "local", "remote"));
+    }
+
+    #[test]
+    fn open_and_silent_are_only_the_policy_half() {
+        for kind in [NetworkKind::Open, NetworkKind::Silent] {
+            let mut gov = network_state::NetworkState::empty_for("open-policy-control");
+            gov.kind = kind;
+            assert!(current_policy_admits(&gov, "local", "remote"));
+        }
+        // Mutual approval remains a separate conjunct in PeerRegistry's
+        // promotion lender; this predicate deliberately does not manufacture
+        // that legacy admission fact.
+    }
+}
+
+/// Controls for the projection [`try_ratify`] owes on a governance transition.
+#[cfg(test)]
+mod governance_projection_controls {
+    use super::*;
+
+    /// A founder's own close must not evict the members it already signed.
+    ///
+    /// Driven through the real `try_ratify`, not through `project_roles`, and
+    /// that is the whole point: the helper was always correct and the branch
+    /// that had to call it did not. A control over the helper would have passed
+    /// throughout the outage.
+    ///
+    /// The failure it pins is not cosmetic. `apply_transition`'s genesis arm
+    /// inserts the founder alone, so before the reprojection `gov.roles` held
+    /// `{founder}` while `gov.member_log` held a ratified grant for somebody
+    /// else. `with_governance_commit` revokes every session the new projection
+    /// does not admit, so the founder closed the network and synchronously cut
+    /// the link to exactly the member she had just signed in — and on the peer
+    /// side, a node whose own grant was missing failed its *self* admission and
+    /// denied every peer at once, leaving it unable to receive the frame that
+    /// would have named it. Neither node can recover by waiting.
+    ///
+    /// `roles.contains_key` rather than `role_of`: an absent key reads as
+    /// `Member` there, so the obvious assertion is the vacuous one.
+    #[tokio::test]
+    async fn a_locally_ratified_genesis_keeps_the_members_it_already_signed() {
+        let state = crate::engine::build_test_state("genesis-projection-control");
+        let network_id = state.network_id.clone();
+        let founder = state.identity.public_id().to_string();
+        let member = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        // A member-tier grant the founder authored while the network was still
+        // Open — exactly what `cross_approve` seeds before a close.
+        let granted = TransitionVariant::RoleGrant {
+            target: member.clone(),
+            role: Role::Member,
+        };
+        let grant_signature =
+            network_state::sign_transition(&network_id, &granted, state.identity.signing_key());
+        {
+            let mut gov = state.governance_state.write();
+            gov.member_log.push(Transition {
+                at: 1,
+                variant: granted,
+                signers: vec![founder.clone()],
+                signatures: vec![grant_signature],
+            });
+        }
+        // Non-vacuity, before anything is ratified: the seed is really there,
+        // and it is really *not* yet projected — roles are empty on an open
+        // network because its author is not yet an owner. If either half of
+        // this stopped holding, the assertions after the close would be about
+        // a state this control never established.
+        {
+            let gov = state.governance_state.read();
+            assert!(member_tier_grant_present(&gov.member_log, &member));
+            assert!(
+                !gov.roles.contains_key(&member),
+                "an open network projects no roles, so the close is what has to \
+                 carry this membership across"
+            );
+        }
+
+        // The founder authors and locally ratifies the genesis close.
+        let close = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let close_signature =
+            network_state::sign_transition(&network_id, &close, state.identity.signing_key());
+        let proposal_id = "genesis-projection-proposal";
+        {
+            let mut gov = state.governance_state.write();
+            gov.pending.push(Proposal {
+                id: proposal_id.to_string(),
+                created_at: 2,
+                proposer: founder.clone(),
+                variant: close,
+                signers: vec![founder.clone()],
+                signatures: vec![close_signature],
+                deniers: Vec::new(),
+                split_spawned: false,
+            });
+        }
+        try_ratify(&state, proposal_id)
+            .await
+            .expect("a founder's lone signature satisfies the genesis quorum");
+
+        let gov = state.governance_state.read();
+        assert_eq!(gov.kind, NetworkKind::Closed);
+        assert_eq!(
+            gov.roles.get(&founder).copied(),
+            Some(Role::Owner),
+            "the founder is still elected owner — the reprojection must not cost \
+             the thing the genesis arm exists to do"
+        );
+        assert!(
+            gov.roles.contains_key(&member),
+            "and the member the founder signed while open survives the close, \
+             instead of being projected away by a genesis that only knows its \
+             own signer"
+        );
+
+        // The consequence, stated where it actually bites. Both conjuncts:
+        // without the remote half the founder cuts the member's link, and
+        // without the local half a node that ratifies a genesis not naming it
+        // denies every peer it has.
+        assert!(
+            current_policy_admits(&gov, &founder, &member),
+            "so the closed-network policy still admits the link to that member"
+        );
+        assert!(
+            current_policy_admits(&gov, &founder, &founder),
+            "and the node still admits itself, which is what stops one \
+             projection from revoking every session it holds"
+        );
+    }
+
+    /// Whether the member log carries a ratified `Member` grant for `target`.
+    ///
+    /// Local to this control so it states its own premise; the integration
+    /// suite has its own copy for the same reason.
+    fn member_tier_grant_present(log: &[Transition], target: &str) -> bool {
+        log.iter().any(|entry| {
+            matches!(
+                &entry.variant,
+                TransitionVariant::RoleGrant { target: granted, role: Role::Member }
+                    if granted == target
+            )
+        })
+    }
+}
+
+/// Controls for [`state_broadcast_reply`], the anti-entropy decision.
+#[cfg(test)]
+mod state_broadcast_reply_controls {
+    use super::*;
+
+    /// One peer's snapshot as it arrives on the wire. `kind` and the root are
+    /// held constant in every control below that is about the counts, so a
+    /// verdict is attributable to the numbers under test and nothing else.
+    fn snapshot(transitions: u32, members: u32, root: &str) -> NetworkStateBroadcast {
+        NetworkStateBroadcast {
+            kind: NetworkKind::Open,
+            transitions_count: transitions,
+            member_log_count: members,
+            roster_root: root.to_string(),
+        }
+    }
+
+    /// A peer that is **behind** us has to be told, because nothing else will.
+    ///
+    /// The load-bearing control for the whole repair. Every pull condition asks
+    /// whether the *sender* is ahead, so the peer holding the newer log used to
+    /// see a stale snapshot and say nothing: the staleness was visible to
+    /// exactly the one party that had the answer. This fails the moment
+    /// `re_advertise` stops firing on a strictly-ahead local count, in either
+    /// tier independently — the member tier is the one `cross_approve`'s
+    /// open-network grant rides, and the governance tier is the one a founder
+    /// election rides.
+    #[test]
+    fn a_local_count_ahead_of_the_sender_re_advertises() {
+        let behind = snapshot(0, 0, "identical-root");
+
+        let ahead_on_members = state_broadcast_reply(0, 1, &behind, false);
+        assert!(
+            ahead_on_members.re_advertise,
+            "a member log the sender has not got must be advertised back to it"
+        );
+        assert!(
+            !ahead_on_members.pull_roster,
+            "and we ask a peer that is strictly behind us for nothing"
+        );
+
+        let ahead_on_transitions = state_broadcast_reply(1, 0, &behind, false);
+        assert!(
+            ahead_on_transitions.re_advertise,
+            "the governance tier converges the same way — a founder election \
+             bumps only this count"
+        );
+        assert!(!ahead_on_transitions.pull_roster);
+    }
+
+    /// The direction that already worked still works, and does not answer.
+    ///
+    /// Without this half the repair could satisfy the control above by
+    /// re-advertising unconditionally, which would turn every received snapshot
+    /// into a reply and the pair into a pure echo.
+    #[test]
+    fn a_sender_ahead_of_us_still_pulls_and_stays_quiet() {
+        for ahead in [
+            snapshot(0, 1, "identical-root"),
+            snapshot(1, 0, "identical-root"),
+        ] {
+            let reply = state_broadcast_reply(0, 0, &ahead, false);
+            assert!(
+                reply.pull_roster,
+                "a sender holding more than we do is still pulled from"
+            );
+            assert!(
+                !reply.re_advertise,
+                "and we do not answer a peer that already has everything we have"
+            );
+        }
+    }
+
+    /// A differing membership root pulls and must **not** re-advertise.
+    ///
+    /// The echo guard, stated on the one input that is symmetric: two peers
+    /// whose roots disagree both see `membership_differs`, so a re-advertise
+    /// triggered by it would have each answering the other's answer with no
+    /// count ever moving to end it. The roster pull is what resolves a root
+    /// disagreement; the snapshot reply is only ever about counts.
+    #[test]
+    fn a_differing_membership_root_pulls_without_re_advertising() {
+        let reply = state_broadcast_reply(2, 2, &snapshot(2, 2, "their-root"), true);
+        assert!(
+            reply.pull_roster,
+            "a root disagreement is resolved by pulling"
+        );
+        assert!(
+            !reply.re_advertise,
+            "a symmetric condition must never trigger a reply, or two peers \
+             answer each other forever"
+        );
+    }
+
+    /// Exhaustive: no pair of peers can re-advertise at each other forever.
+    ///
+    /// The termination argument as a control rather than as a comment. Over
+    /// every pair of count vectors in a small grid it checks two things: two
+    /// converged peers fall completely silent, which is the fixed point; and
+    /// the only way both peers reply at once is a genuine cross-divergence —
+    /// each strictly ahead in a *different* tier — in which case both also
+    /// pull, so the exchange that follows has equal counts and stops. Any
+    /// implementation that answered on a non-strict comparison, or on the
+    /// symmetric root, fails here rather than in a mesh three months later.
+    #[test]
+    fn no_pair_of_peers_can_re_advertise_at_each_other_forever() {
+        for a_transitions in 0..4u32 {
+            for a_members in 0..4u32 {
+                for b_transitions in 0..4u32 {
+                    for b_members in 0..4u32 {
+                        let a_sees_b = state_broadcast_reply(
+                            a_transitions,
+                            a_members,
+                            &snapshot(b_transitions, b_members, "identical-root"),
+                            false,
+                        );
+                        let b_sees_a = state_broadcast_reply(
+                            b_transitions,
+                            b_members,
+                            &snapshot(a_transitions, a_members, "identical-root"),
+                            false,
+                        );
+
+                        if a_transitions == b_transitions && a_members == b_members {
+                            assert_eq!(
+                                (a_sees_b, b_sees_a),
+                                (
+                                    StateBroadcastReply {
+                                        pull_roster: false,
+                                        re_advertise: false
+                                    },
+                                    StateBroadcastReply {
+                                        pull_roster: false,
+                                        re_advertise: false
+                                    }
+                                ),
+                                "two peers that agree must send nothing at all: \
+                                 convergence is the fixed point"
+                            );
+                            continue;
+                        }
+
+                        if a_sees_b.re_advertise && b_sees_a.re_advertise {
+                            assert!(
+                                (a_transitions > b_transitions && b_members > a_members)
+                                    || (a_members > b_members && b_transitions > a_transitions),
+                                "both sides may only reply when each is ahead in a \
+                                 different tier; anything else is an echo"
+                            );
+                            assert!(
+                                a_sees_b.pull_roster && b_sees_a.pull_roster,
+                                "and a real cross-divergence pulls both ways, so the \
+                                 next exchange has equal counts and falls silent"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

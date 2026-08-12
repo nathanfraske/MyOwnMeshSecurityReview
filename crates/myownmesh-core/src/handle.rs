@@ -50,16 +50,14 @@ struct MeshInner {
     transport: Transport,
     resource_scope: MeshRuntimeResourceScope,
     events_tx: broadcast::Sender<MeshEvent>,
-    networks: Mutex<Vec<NetworkEntry>>,
 }
 
-struct NetworkEntry {
-    config_id: String,
-    network_id: String,
-    #[allow(dead_code)] // Reserved for ctl access; tracked but not read yet.
-    state: Arc<NetworkState>,
-    driver: Option<tokio::task::JoinHandle<()>>,
-    fanout: Option<tokio::task::JoinHandle<()>>,
+struct JoinedNetworkLifecycle {
+    /// The async mutex is intentionally held across the join: concurrent
+    /// shutdown callers then wait for the same exact driver completion instead
+    /// of the second caller observing an empty slot and returning early.
+    driver: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    fanout: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Mesh {
@@ -124,7 +122,6 @@ impl Mesh {
             transport,
             resource_scope,
             events_tx,
-            networks: Mutex::new(Vec::new()),
         });
         info!(
             device_id = %inner.identity.display_id(),
@@ -210,8 +207,7 @@ impl MeshHandle {
             &self.mesh.inner.resource_scope,
         )
         .await?;
-        let rpc = Rpc::new(state.clone());
-        *state.rpc.write() = Some(rpc.inner.clone());
+        let rpc = Rpc::attach(&state);
 
         // Fan-out per-network events into the mesh-wide broadcaster.
         let mesh_events_tx = self.mesh.inner.events_tx.clone();
@@ -228,64 +224,26 @@ impl MeshHandle {
             }
         });
 
-        // Track the entry so leave() can find it.
-        self.mesh.inner.networks.lock().push(NetworkEntry {
-            config_id: config.id.clone(),
-            network_id: config.network_id.clone(),
-            state: state.clone(),
-            driver: Some(driver),
-            fanout: Some(fanout),
-        });
-
         Ok(JoinedNetwork {
-            mesh: self.mesh.clone(),
             state,
             rpc: Arc::new(rpc),
             config_id: config.id,
             label: config.label,
+            lifecycle: Arc::new(JoinedNetworkLifecycle {
+                driver: tokio::sync::Mutex::new(Some(driver)),
+                fanout: Mutex::new(Some(fanout)),
+            }),
         })
     }
-
-    /// Convenience: snapshot all currently-joined networks.
-    pub fn joined_network_ids(&self) -> Vec<String> {
-        self.mesh
-            .inner
-            .networks
-            .lock()
-            .iter()
-            .map(|e| e.network_id.clone())
-            .collect()
-    }
-}
-
-/// Validate an application-supplied flow name at the public boundary.
-///
-/// The name is the application's own opaque bytes and this side never allocates
-/// one, so the only thing to decide here is whether the representation can carry
-/// it — the encoded name is length-prefixed by a single byte, which bounds one
-/// name's width and says nothing about how many may exist.
-///
-/// Refused as [`RealtimeRefusal::ProviderConfigurationInvalid`] for the same
-/// reason an unusable provider configuration is: it is an unusable *request*,
-/// caught before any session is resolved, so it costs no fence acquisition and
-/// tells a caller that has proved nothing only that its own argument was wrong.
-/// It is deliberately not `SessionNotCurrent`, which would be untrue, and not
-/// `FlowRefused`, which would claim the connector saw it.
-fn flow_name(
-    label: &[u8],
-) -> std::result::Result<crate::transport::webrtc::RealtimeFlowName, crate::realtime::RealtimeRefusal>
-{
-    crate::transport::webrtc::RealtimeFlowName::new(label.to_vec())
-        .ok_or(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)
 }
 
 /// One joined network's user-facing handle.
 pub struct JoinedNetwork {
-    mesh: Mesh,
     state: Arc<NetworkState>,
     rpc: Arc<Rpc>,
     config_id: String,
     label: String,
+    lifecycle: Arc<JoinedNetworkLifecycle>,
 }
 
 impl JoinedNetwork {
@@ -401,8 +359,9 @@ impl JoinedNetwork {
         Ok(())
     }
 
-    /// Set the capability advertisement we share with peers via
-    /// hello + capabilities_update frames.
+    /// Set the capability advertisement this node publishes. It crosses only as
+    /// a `capabilities_update` frame, to peers with a live session — see
+    /// [`crate::rpc::Rpc::advertise`] for when each peer is told.
     pub fn advertise(&self, caps: CapabilityAdvert) {
         self.rpc.advertise(caps);
     }
@@ -656,22 +615,20 @@ impl JoinedNetwork {
     /// the driver to exit, and drops the entry. After leave, the
     /// `JoinedNetwork` is no longer usable.
     pub async fn leave(self) -> Result<()> {
+        self.shutdown().await
+    }
+
+    /// Initiate and await shutdown without requiring unique ownership of the
+    /// facade. Idempotent: every concurrent caller observes the same driver
+    /// retirement before it returns.
+    pub async fn shutdown(&self) -> Result<()> {
         let _ = self.state.cmd_tx.send(NetworkCmd::Shutdown);
-        // Take the entry under the lock, drop the lock, then
-        // await the driver outside. Holding parking_lot's
-        // MutexGuard across an await is forbidden.
-        let mut entry = {
-            let mut nets = self.mesh.inner.networks.lock();
-            let idx = nets.iter().position(|e| e.config_id == self.config_id);
-            idx.map(|i| nets.remove(i))
-        };
-        if let Some(entry) = entry.as_mut() {
-            if let Some(driver) = entry.driver.take() {
-                let _ = driver.await;
-            }
-            if let Some(fanout) = entry.fanout.take() {
-                fanout.abort();
-            }
+        let mut driver = self.lifecycle.driver.lock().await;
+        if let Some(driver) = driver.take() {
+            let _ = driver.await;
+        }
+        if let Some(fanout) = self.lifecycle.fanout.lock().take() {
+            fanout.abort();
         }
         Ok(())
     }
@@ -699,12 +656,22 @@ impl JoinedNetwork {
     /// inside the engine at the moment of use and never travels out here.
     ///
     /// `label` is the application's own choice and the application is the sole
-    /// allocator. It comes back unchanged, is scoped to one session, and grants
-    /// nothing on its own: presenting it later still resolves a live session
-    /// first. Core neither allocates a label nor enforces a capacity — the
-    /// bounded namespace refuses a duplicate as
+    /// allocator. It is scoped to one session and **grants nothing** — it is a
+    /// wire coordinate, readable back off the returned handle for the
+    /// application's own control messages, and there is no operation that will
+    /// accept it in place of one. Core neither allocates a label nor enforces a
+    /// capacity: the bounded namespace refuses a duplicate as
     /// [`RealtimeRefusal::LabelInUse`], and the application sizes its own pool
     /// from the profile capacity it supplied at startup.
+    ///
+    /// **Answers a [`RealtimeFlowHandle`](crate::realtime::RealtimeFlowHandle),
+    /// which is the only thing that authorizes operating on this flow.** It
+    /// names the exact session and the exact flow record, is move-only, and is
+    /// not serializable. That replaces a `peer + label` pair whose every use
+    /// re-resolved the Device selector — so a caller whose session had ended
+    /// and been replaced had its units accepted by the replacement's flow of
+    /// the same name, silently, since nothing on a realtime path is
+    /// acknowledged per unit.
     ///
     /// The provider's configuration is validated **here**, before any session
     /// is resolved, so an unusable request is refused as
@@ -726,24 +693,26 @@ impl JoinedNetwork {
         &self,
         peer: &str,
         open: crate::transport::webrtc::WebRtcRealtimeFlowOpen,
-    ) -> std::result::Result<Vec<u8>, crate::realtime::RealtimeRefusal> {
+    ) -> std::result::Result<crate::realtime::RealtimeFlowHandle, crate::realtime::RealtimeRefusal>
+    {
         let spec = crate::transport::webrtc::RealtimeFlowSpec::try_from(open)?;
-        self.state
-            .open_realtime_negotiated(peer, spec)
-            .await
-            .map(|name| name.as_bytes().to_vec())
+        self.state.open_realtime_negotiated(peer, spec).await
     }
 
     /// Hand one unit to an outbound WebRTC flow. Synchronous: it queues and
     /// returns, and the connector drains to the native track on its own task.
+    ///
+    /// **Borrows the handle and resolves nothing.** The unit reaches the flow
+    /// that handle names or it reaches nothing: a session that has been replaced
+    /// since the open, or a label that has been closed and reopened, is refused
+    /// as [`RealtimeRefusal::SessionNotCurrent`] rather than silently accepted
+    /// by whatever holds the name now.
     pub fn send_webrtc_realtime(
         &self,
-        peer: &str,
-        label: &[u8],
+        flow: &crate::realtime::RealtimeFlowHandle,
         unit: crate::transport::webrtc::WebRtcRealtimeOutboundUnit,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
-        self.state
-            .send_realtime(peer, &flow_name(label)?, unit.into())
+        self.state.send_realtime(flow, unit.into())
     }
 
     /// Close one flow and release its label back to that session's namespace.
@@ -759,24 +728,32 @@ impl JoinedNetwork {
     /// Whole-connector retirement is not relied on anywhere in this path: the
     /// same connector may host a replacement session, so a flow's native half
     /// can outlive the flow while the connector stays healthy.
+    ///
+    /// **Consumes the handle**, because a close is the end of the thing the
+    /// handle names. Taking it by value is what makes "closed twice" and "closed
+    /// then sent on" unrepresentable rather than merely refused — the compiler
+    /// rejects them — and it is why closing one flow cannot close the flow that
+    /// immediately reuses its label: the identities travelled with the handle,
+    /// and the reuse is a different record.
     pub async fn close_realtime(
         &self,
-        peer: &str,
-        label: &[u8],
+        flow: crate::realtime::RealtimeFlowHandle,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
-        self.state
-            .close_realtime_negotiated(peer, &flow_name(label)?)
-            .await
+        self.state.close_realtime_negotiated(flow).await
     }
 
-    /// Whether that label still names a usable flow on `peer`'s current session.
+    /// Whether that handle still names a usable flow.
+    ///
+    /// Borrows rather than consumes: asking is not using, and a caller that
+    /// learns `false` still owns its handle and drops it, which costs nothing.
     ///
     /// Answers `false` for every not-usable reason, because the question is only
-    /// ever "may I use this" — including a name the representation cannot carry,
-    /// which cannot name a flow on any session.
-    pub fn realtime_is_current(&self, peer: &str, label: &[u8]) -> bool {
-        crate::transport::webrtc::RealtimeFlowName::new(label.to_vec())
-            .is_some_and(|name| self.state.realtime_is_current(peer, &name))
+    /// ever "may I use this". A caller is not told whether its session was
+    /// replaced or its label was reopened by something else — both mean it has
+    /// no flow, and the difference is about a flow it has no standing to learn
+    /// about.
+    pub fn realtime_is_current(&self, flow: &crate::realtime::RealtimeFlowHandle) -> bool {
+        self.state.realtime_is_current(flow)
     }
 
     /// Claim the inbound stream of `peer`'s current session.
@@ -941,6 +918,5 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, Error::ConnectorPolicyRequired));
-        assert!(mesh.joined_network_ids().is_empty());
     }
 }

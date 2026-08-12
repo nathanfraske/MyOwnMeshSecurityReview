@@ -399,7 +399,24 @@ pub(crate) async fn join_network(
             if drivers.is_none() {
                 warn!(network = %cfg.network_id, "signaling attach returned no handle");
             }
-            registry.insert(joined, drivers);
+            // The `contains` check above is advisory — it is a separate lock
+            // acquisition from the insert, so a join racing a removal or
+            // another join can still arrive at a held id. The registry decides
+            // under its own state lock, and it hands the network back rather
+            // than dropping it, so a refusal is shut down here instead of being
+            // left running with nothing able to name it.
+            if let Some(refused) = registry.insert(joined, drivers).into_refusal() {
+                warn!(
+                    network = %cfg.network_id,
+                    state = ?refused.state,
+                    "join refused: that id is held by a runtime that has not stopped"
+                );
+                drop(refused.drivers);
+                if let Err(e) = refused.joined.shutdown().await {
+                    warn!(network = %cfg.network_id, "refused join failed to shut down: {e:#}");
+                }
+                return;
+            }
             info!(network = %cfg.network_id, "joined network");
         }
         Err(e) => warn!(network = %cfg.network_id, "join failed: {e:#}"),
@@ -427,9 +444,12 @@ async fn leave_all(registry: &NetworkRegistry) {
     // disabling the node leaves us showing online-but-unconnectable on every
     // peer for over a minute.
     registry.announce_all_departures().await;
-    for net in registry.take_all() {
-        if let Err(e) = net.leave().await {
-            warn!("leave failed: {e:#}");
+    // Every distinct network, none skipped. This is the node-disable
+    // transition, so a network the previous drain could not take sole
+    // ownership of stayed running while the node reported itself disabled.
+    for outcome in registry.shutdown_all().await {
+        if let Err(e) = outcome {
+            warn!("network shutdown failed: {e}");
         }
     }
 }

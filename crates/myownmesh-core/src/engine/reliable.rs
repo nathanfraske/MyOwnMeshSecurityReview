@@ -132,14 +132,24 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
                 owner,
                 state.session_broker.as_ref(),
                 &state.network_id,
-                |_session, record| record.next_unsent(),
+                |session, record| record.next_unsent(session),
             )
             .flatten();
-        let Some((seq, frame)) = next else {
+        // `None` is either "nothing owed" or "the provider would not fund the
+        // copy this write needs". Both stop the flush and neither loses
+        // anything: the frame stays retained and unsent, and the next tick asks
+        // again.
+        let Some(unsent) = next else {
             return;
         };
-        if let Err(e) =
-            super::send_application_bytes(state, owner, frame, traffic::FrameClass::App).await
+        let seq = unsent.seq;
+        if let Err(e) = super::send_application_bytes(
+            state,
+            owner,
+            unsent.bytes.clone(),
+            traffic::FrameClass::App,
+        )
+        .await
         {
             trace!(
                 peer = %super::short_peer(owner.device_id()),
@@ -158,46 +168,14 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
             &state.network_id,
             |_session, record| record.mark_sent(seq),
         );
+        // The copy and the lease that funded it die together, here, once the
+        // write that borrowed them has returned.
+        drop(unsent);
     }
 }
 
-/// What the admission fence already settled for one inbound reliable frame.
-///
-/// Carries removed entries, not a verdict: nothing decided under the fence is
-/// re-decided outside it. In particular it carries **no boolean**.
-///
-/// The receive side's own state — the inbound high-water mark — is deliberately
-/// absent from this type. Advancing the mark and delivering the payload have to
-/// be one step, and the payload is only available on the dispatch side, so both
-/// happen together there under
-/// [`AdmittedInboundDispatch::with_captured_session_state`](super::peer_registry::AdmittedInboundDispatch::with_captured_session_state).
-pub(super) enum InboundReliableAdmission {
-    /// Nothing was settled under the fence — either not a reliable-stream frame
-    /// at all, or a `ChannelSeq`, whose mark and delivery move together on the
-    /// dispatch side instead.
-    Nothing,
-    /// A `ChannelAck`. The frames it settles were released under the fence,
-    /// together with their leases; these are the caller waits still to resolve.
-    Ack(Vec<oneshot::Sender<Result<()>>>),
-}
-
-impl InboundReliableAdmission {
-    /// Resolve the caller waits a fenced acknowledgement settled.
-    ///
-    /// Deferred out of the fence deliberately, and safely: these receivers are
-    /// local caller futures, not peer state and not anything a replacement can
-    /// observe.
-    pub(super) fn settle(self) {
-        if let Self::Ack(replies) = self {
-            for reply in replies {
-                let _ = reply.send(Ok(()));
-            }
-        }
-    }
-}
-
-/// Release the frames one inbound acknowledgement settles, **inside the
-/// registry admission fence**.
+/// Settle the frames one inbound acknowledgement covers, **inside the registry
+/// admission fence**.
 ///
 /// Called from the fence rather than after it because an acknowledgement
 /// admitted for installation A and applied after A was replaced would settle
@@ -205,6 +183,14 @@ impl InboundReliableAdmission {
 /// different stream and the record is not shared — but the ordering is what
 /// makes the acknowledgement and the release one act, so no reader observes
 /// frames released for an acknowledgement that was refused.
+///
+/// The caller waits are resolved **here**, inside the fence, rather than carried
+/// out to be answered later. Each is answered while its frame and that frame's
+/// entry lease are still together, so the oneshot the retained claim paid for
+/// never outlives the lease that paid for it. That is safe under the locks the
+/// fence holds for the same reason the abandon-drop is: sending on a oneshot
+/// stores the value and wakes the waiting task, it does not run the caller's
+/// continuation and it re-enters neither the registry nor the session record.
 ///
 /// A `ChannelSeq` is deliberately not handled here. Its receive-side effect is
 /// two things that must be indivisible — advancing the high-water mark and
@@ -214,15 +200,26 @@ impl InboundReliableAdmission {
 pub(super) fn admit_inbound_reliable(
     admitted: &super::peer_registry::AdmittedSessionOperation<'_>,
     msg: &MeshMessage,
-) -> InboundReliableAdmission {
-    match msg {
-        MeshMessage::ChannelAck { stream, up_to } => admitted
-            .with_session_state(|_session, record| {
-                InboundReliableAdmission::Ack(record.take_acknowledged(*stream, *up_to))
-            })
-            .unwrap_or(InboundReliableAdmission::Nothing),
-        _ => InboundReliableAdmission::Nothing,
+) {
+    if let MeshMessage::ChannelAck { stream, up_to } = msg {
+        admitted.with_session_state(|_session, record| {
+            record.acknowledge(*stream, *up_to);
+        });
     }
+}
+
+/// The four fields one decoded `ChannelSeq` carries, kept together.
+///
+/// One value rather than four parameters because they are one frame. The mark
+/// and the delivery below are only truthful about parts that arrived together:
+/// a caller that could pass the sequence of one frame with the payload of
+/// another would be describing a frame no peer sent, and this side would record
+/// having received it.
+pub(super) struct InboundChannelSeq {
+    pub(super) stream: u64,
+    pub(super) seq: u64,
+    pub(super) channel: String,
+    pub(super) payload: serde_json::Value,
 }
 
 /// Receive one inbound `channel_seq`: move the high-water mark, deliver,
@@ -231,7 +228,7 @@ pub(super) fn admit_inbound_reliable(
 /// The first two are one fenced step, and now one *borrow*: the mark lives in
 /// the same record the delivery is authorized by, so they are reached together
 /// or not at all. Combined with
-/// [`PeerSessionState::advance_inbound_and_deliver`](peer_session::PeerSessionState::advance_inbound_and_deliver)'s
+/// [`PeerSessionState::receive`](peer_session::PeerSessionState::receive)'s
 /// own biconditional, this session's mark records a seq exactly when its payload
 /// was handed to the subscribers.
 ///
@@ -247,15 +244,23 @@ pub(super) fn admit_inbound_reliable(
 ///   admitted for.
 ///
 /// A duplicate is re-acknowledged and not re-delivered, which is what stops a
-/// sender whose earlier acknowledgement was lost.
+/// sender whose earlier acknowledgement was lost. A gap is neither delivered nor
+/// advanced, and answers the current contiguous mark, which tells the sender
+/// exactly how far this side actually is. A frame on an unbound stream is
+/// answered with nothing at all.
 pub(super) async fn on_channel_seq_admitted(
     state: &Arc<NetworkState>,
     dispatch: &super::peer_registry::AdmittedInboundDispatch,
-    stream: u64,
-    seq: u64,
-    channel: String,
-    payload: serde_json::Value,
+    claim: crate::resource::ResourceClaim,
+    retention: crate::resource::ResourceLease,
+    frame: InboundChannelSeq,
 ) {
+    let InboundChannelSeq {
+        stream,
+        seq,
+        channel,
+        payload,
+    } = frame;
     let owner = dispatch.owner();
     // Delivery is an application effect whose escape is visible outside the
     // engine: a subscriber reads `from` as a device identity, so a payload
@@ -263,12 +268,22 @@ pub(super) async fn on_channel_seq_admitted(
     // replaced is attributed to whoever holds the id now. Both the attribution
     // and the mark are therefore settled inside the fence.
     //
-    // `dispatch_channel_frame` is a broadcast hand-off: it never blocks on a
+    // Gateway acceptance is a resource-backed fan-out: it never blocks on a
     // subscriber and never re-enters the registry, so it is safe under the
     // mutation lock.
-    let Some(ack_up_to) = dispatch.with_captured_session_state(&state.peers, |_session, record| {
-        record.advance_inbound_and_deliver(stream, seq, payload, |payload| {
-            state.dispatch_channel_frame(&channel, owner.device_id(), payload)
+    let Some(outcome) = dispatch.with_captured_session_state(&state.peers, |session, record| {
+        record.try_receive(stream, seq, payload, |payload| {
+            state
+                .application_gateway
+                .accept_channel(
+                    session,
+                    claim,
+                    retention,
+                    &channel,
+                    owner.device_id(),
+                    payload,
+                )
+                .map(|_accepted| ())
         })
     }) else {
         // Superseded installation, or one holding no live session: the frame
@@ -277,10 +292,35 @@ pub(super) async fn on_channel_seq_admitted(
         // received that no subscriber ever saw.
         return;
     };
+    let Ok(outcome) = outcome else {
+        trace!(
+            peer = %super::short_peer(owner.device_id()),
+            channel,
+            "reliable frame refused by Application Gateway"
+        );
+        return;
+    };
+    let Some(ack_up_to) = outcome.acknowledge() else {
+        // A stream this session is not bound to. Answering would put a mark on
+        // *our* bound stream in reply to a frame that was never part of it,
+        // which is the sender-visible half of letting a peer reset our state.
+        trace!(
+            peer = %super::short_peer(owner.device_id()),
+            "reliable frame on an unbound stream refused"
+        );
+        return;
+    };
     let msg = MeshMessage::ChannelAck {
         stream,
         up_to: ack_up_to,
     };
+    // Test observation only, taken here because this is the point past every
+    // refusal above: reaching it *is* the decision to acknowledge, whatever the
+    // wire then does with it. See `NetworkState::channel_ack_attempts`.
+    #[cfg(test)]
+    state
+        .channel_ack_attempts
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
         trace!(
             peer = %super::short_peer(owner.device_id()),

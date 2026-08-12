@@ -36,6 +36,7 @@ use myownmesh_core::engine::NetworkState;
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
+use myownmesh_core::Channel;
 use myownmesh_core::NetworkKind;
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -308,18 +309,36 @@ async fn run_area(n_spokes: usize) {
     // trip. This is the Phase B acked path end to end: queue → wire →
     // deliver → echo → wire → deliver.
     for spoke in &spokes {
-        let mut rx = spoke.state.subscribe_channel(CHANNEL);
+        // One resource-backed mailbox per member, held by its echo task for the
+        // run. `recv` separates the two endings the old receiver merged: `None`
+        // is the channel going away with the network, `Err` is one frame that
+        // did not decode.
+        let mut rx =
+            Channel::<serde_json::Value>::new(CHANNEL.to_owned(), spoke.state.clone()).subscribe();
         let echo_state = spoke.state.clone();
         let operator_id = operator.id.clone();
+        let member = spoke.id.clone();
         tokio::spawn(async move {
-            while let Ok(frame) = rx.recv().await {
-                let _ = echo_state
-                    .send_channel_frame(&operator_id, CHANNEL, frame.payload)
-                    .await;
+            while let Some(next) = rx.recv().await {
+                match next {
+                    Ok(frame) => {
+                        let _ = echo_state
+                            .send_channel_frame(&operator_id, CHANNEL, frame.body)
+                            .await;
+                    }
+                    // Reported and survivable, which is the truthful shape here.
+                    // A panic would be swallowed by a `JoinHandle` nobody awaits
+                    // and ending the loop would stop every later echo, so both
+                    // would reach the operator as nothing but a timeout. Saying
+                    // it keeps the real fault visible while the run still
+                    // measures the sessions that are working.
+                    Err(e) => eprintln!("member {member} dropped an undecodable probe frame: {e}"),
+                }
             }
         });
     }
-    let mut echo_rx = operator.state.subscribe_channel(CHANNEL);
+    let mut echo_rx =
+        Channel::<serde_json::Value>::new(CHANNEL.to_owned(), operator.state.clone()).subscribe();
     let pings_per_spoke: usize = 10;
     let mut rtt_ms = Vec::with_capacity(n_spokes * pings_per_spoke);
     for (i, spoke) in spokes.iter().enumerate() {
@@ -339,9 +358,15 @@ async fn run_area(n_spokes: usize) {
                     "echo from member-{i} seq {seq} never arrived"
                 );
                 match tokio::time::timeout(remaining, echo_rx.recv()).await {
-                    Ok(Ok(frame)) if frame.payload == payload => break,
-                    Ok(Ok(_)) => {} // stale/other frame — keep draining
-                    Ok(Err(e)) => panic!("operator echo stream closed: {e}"),
+                    Ok(Some(Ok(frame))) if frame.body == payload => break,
+                    Ok(Some(Ok(_))) => {} // stale/other frame — keep draining
+                    // The old receiver reported both of these as "stream
+                    // closed". They are different faults and only one of them
+                    // has an error to name.
+                    Ok(Some(Err(e))) => panic!("operator echo frame did not decode: {e}"),
+                    Ok(None) => panic!(
+                        "operator echo channel closed while member-{i} seq {seq} was outstanding"
+                    ),
                     Err(_) => panic!("echo from member-{i} seq {seq} timed out"),
                 }
             }

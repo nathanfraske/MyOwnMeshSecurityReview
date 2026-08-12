@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::clients::{ClientRegistry, HandlerMode, PendingInbound};
+use super::clients::{ClientRegistry, HandlerMode, PendingInbound, PendingKey};
 use super::wire::ServerOut;
 
 /// Install (or re-install) a synthetic single-shot RPC handler
@@ -59,40 +59,51 @@ pub fn install_single_handler(
                 return Err("handler owner client disconnected".into());
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
-            registry.put_pending_inbound(call.request_id.clone(), PendingInbound::Single(tx));
+            let pending_key = PendingKey {
+                network: key.0.clone(),
+                method: key.1.clone(),
+                remote_peer: call.from.clone(),
+                remote_request_id: call.request_id.clone(),
+                class: HandlerMode::Single,
+            };
+            let ticket = match registry.insert_exact_pending(
+                pending_key,
+                owner_id,
+                PendingInbound::Single(tx),
+            ) {
+                Ok(ticket) => ticket,
+                Err(_) => return Err("duplicate inbound RPC coordinates already pending".into()),
+            };
             client.send(ServerOut::RpcInbound {
                 network: key.0.clone(),
                 from: call.from.clone(),
                 request_id: call.request_id.clone(),
+                operation_id: ticket.operation_id(),
                 method: call.method.clone(),
                 payload: call.payload.clone(),
                 streaming: call.streaming,
             });
-            // Await the client's `RpcRespond`. If the client
-            // disconnects mid-flight, the registry's
-            // `unregister` path doesn't actively cancel inbound
-            // RPCs (deliberate — another client may still
-            // answer for this method on the next claim wave),
-            // so we lean on the peer's own RPC timeout to
-            // unwedge. If the oneshot resolves to a dropped
-            // sender (PendingInbound replaced), return a clear
-            // error so the peer sees a reasonable failure
-            // instead of hanging forever.
-            match rx.await {
+            // Await this owner's `RpcRespond`. Disconnect and displacement
+            // remove this exact operation and settle the oneshot with a
+            // truthful error; a later claimant cannot answer it.
+            let result = match rx.await {
                 Ok(Ok(payload)) => Ok(value_to_response(payload)),
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err("IPC handler dropped without responding".into()),
-            }
+            };
+            drop(ticket);
+            result
         }
     });
 }
 
 /// Install (or re-install) a synthetic streaming RPC handler.
 /// Mirrors [`install_single_handler`] but stashes an
-/// `mpsc::Sender<Value>` in the pending table instead of a
-/// `oneshot`; chunks land via `RpcStreamChunk` and the stream
-/// closes on `RpcStreamEnd` (drop the sender, engine sees
-/// `None`).
+/// `mpsc::Sender<RpcStreamItem>` in the pending table instead
+/// of a `oneshot`; chunks land via `RpcStreamChunk`, and
+/// `RpcStreamEnd` terminates the stream with an explicit
+/// `RpcStreamItem::End` carrying clean completion or the
+/// client's error.
 pub fn install_stream_handler(
     network: &JoinedNetwork,
     network_key: String,
@@ -114,25 +125,62 @@ pub fn install_stream_handler(
             let Some(client) = registry.client(owner_id) else {
                 return Err("handler owner client disconnected".into());
             };
-            // 32-slot buffer matches the rough back-pressure
-            // shape used by the engine's outgoing peer queues;
-            // streaming responses that exceed it block the IPC
-            // client until the engine drains, which is the
-            // right back-pressure direction. The send side is
-            // stashed in `pending_inbound`; chunks land via
-            // `RpcStreamChunk`. Dropping the sender (via
-            // `RpcStreamEnd` removing the pending entry) closes
-            // the receiver and the engine ships
-            // `RpcStreamEndMessage` to the peer.
-            let (tx, rx) = mpsc::channel::<Value>(32);
-            registry.put_pending_inbound(call.request_id.clone(), PendingInbound::Stream(tx));
+            // The capacity is the local Application Gateway owner's selected
+            // policy, read from the registry rather than chosen here. It is not
+            // borrowed from a peer or transport queue — those capacities answer
+            // an unrelated question — and it is deliberately not a constant: a
+            // number written into this line would be a second owner of a
+            // decision that already has one.
+            //
+            // Streaming responses that exceed it block the IPC client until the
+            // engine drains, which is the right back-pressure direction.
+            //
+            // The send side is stashed in `exact_pending_inbound`; chunks land
+            // via `RpcStreamChunk`. The stream ends with an explicit terminal
+            // item: `RpcStreamEnd` sends `RpcStreamItem::End` carrying either
+            // clean completion or the client's own error, so that distinction
+            // survives to the peer instead of being flattened into a silent
+            // close. A sender that disappears without one is a failure rather
+            // than an end, which is what makes the watchdog below necessary.
+            let (tx, rx) = mpsc::channel::<myownmesh_core::rpc::RpcStreamItem>(
+                registry.stream_capacity().get(),
+            );
+            let pending_key = PendingKey {
+                network: key.0.clone(),
+                method: key.1.clone(),
+                remote_peer: call.from.clone(),
+                remote_request_id: call.request_id.clone(),
+                class: HandlerMode::Stream,
+            };
+            let close_probe = tx.clone();
+            let ticket = match registry.insert_exact_pending(
+                pending_key,
+                owner_id,
+                PendingInbound::Stream(tx),
+            ) {
+                Ok(ticket) => ticket,
+                Err(_) => {
+                    return Err(
+                        "duplicate inbound streaming RPC coordinates already pending".into(),
+                    )
+                }
+            };
             client.send(ServerOut::RpcInbound {
                 network: key.0.clone(),
                 from: call.from.clone(),
                 request_id: call.request_id.clone(),
+                operation_id: ticket.operation_id(),
                 method: call.method.clone(),
                 payload: call.payload.clone(),
                 streaming: call.streaming,
+            });
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = close_probe.closed() => {}
+                    () = ticket.cancelled() => {}
+                }
+                drop(close_probe);
+                drop(ticket);
             });
             Ok(rx)
         }
@@ -257,7 +305,7 @@ mod tests {
     //! registry — same path the dispatch layer takes when a
     //! real socket client posts `RpcRespond`.
 
-    use crate::ipc::clients::{ClientRegistry, HandlerMode};
+    use crate::ipc::clients::{ClientRegistry, HandlerMode, PendingKey};
     use crate::ipc::wire::ServerOut;
     use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
     use myownmesh_core::engine::{attach_local, spawn_network};
@@ -275,7 +323,11 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    static BRIDGE_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Serialization lives on `crate::exclusive_connector_fixture`, which every
+    // connector-consuming family in this binary shares. A mutex local to this
+    // module would only stop these three tests racing each other, which was
+    // never the problem: they draw on one process-global connector budget that
+    // `embedded` and `registry` draw on too.
 
     struct BridgeTestDrivers {
         alice: Arc<myownmesh_core::engine::NetworkState>,
@@ -438,7 +490,7 @@ mod tests {
     /// returned payload.
     #[tokio::test]
     async fn single_shot_rpc_round_trip_through_bridge() {
-        let _serial = BRIDGE_TEST_SERIAL.lock().await;
+        let _fixture = crate::exclusive_connector_fixture().await;
         let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id, drivers) =
             two_peer_rpc("ipc-bridge-single").await;
 
@@ -470,23 +522,36 @@ mod tests {
                     .client(owner)
                     .ok_or_else(|| "owner gone".to_string())?;
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                registry.put_pending_inbound(
-                    call.request_id.clone(),
+                let pending_key = PendingKey {
+                    network: key.0.clone(),
+                    method: key.1.clone(),
+                    remote_peer: call.from.clone(),
+                    remote_request_id: call.request_id.clone(),
+                    class: HandlerMode::Single,
+                };
+                let Ok(ticket) = registry.insert_exact_pending(
+                    pending_key,
+                    owner,
                     crate::ipc::clients::PendingInbound::Single(resp_tx),
-                );
+                ) else {
+                    return Err("duplicate".into());
+                };
                 client.send(ServerOut::RpcInbound {
                     network: key.0.clone(),
                     from: call.from.clone(),
                     request_id: call.request_id.clone(),
+                    operation_id: ticket.operation_id(),
                     method: call.method.clone(),
                     payload: call.payload.clone(),
                     streaming: call.streaming,
                 });
-                match resp_rx.await {
+                let result = match resp_rx.await {
                     Ok(Ok(p)) => Ok(myownmesh_core::rpc::RpcResponse::from_value(p)),
                     Ok(Err(e)) => Err(e),
                     Err(_) => Err("handler dropped".into()),
-                }
+                };
+                drop(ticket);
+                result
             }
         });
 
@@ -503,23 +568,37 @@ mod tests {
             .await
             .expect("inbound timeout")
             .expect("inbound recv");
-        let (request_id, payload) = match inbound {
+        let (network, from, request_id, operation_id, method, payload) = match inbound {
             ServerOut::RpcInbound {
+                network,
+                from,
                 request_id,
+                operation_id,
                 payload,
                 method,
                 ..
             } => {
                 assert_eq!(method, "echo");
-                (request_id, payload)
+                (network, from, request_id, operation_id, method, payload)
             }
             other => panic!("expected RpcInbound, got {other:?}"),
         };
         assert_eq!(payload, serde_json::json!({"n": 7}));
 
         // Respond via the registry (same path dispatch takes).
-        let resolved =
-            registry.resolve_inbound_single(&request_id, serde_json::json!({"n_squared": 49}));
+        let pending_key = PendingKey {
+            network,
+            method,
+            remote_peer: from,
+            remote_request_id: request_id,
+            class: HandlerMode::Single,
+        };
+        let resolved = registry.resolve_exact_single(
+            &pending_key,
+            client.id,
+            operation_id,
+            Ok(serde_json::json!({"n_squared": 49})),
+        );
         assert!(resolved);
 
         let bob_response = tokio::time::timeout(Duration::from_secs(5), call_handle)
@@ -532,12 +611,12 @@ mod tests {
     }
 
     /// Streaming RPC: Alice's "client" pushes three chunks
-    /// via `push_inbound_stream_chunk` + closes via
-    /// `close_inbound_stream`; Bob's `call_stream` drains the
+    /// via `push_exact_stream` + closes via
+    /// `close_exact_stream`; Bob's `call_stream` drains the
     /// receiver and sees all three plus the end-of-stream.
     #[tokio::test]
     async fn streaming_rpc_round_trip_through_bridge() {
-        let _serial = BRIDGE_TEST_SERIAL.lock().await;
+        let _fixture = crate::exclusive_connector_fixture().await;
         let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id, drivers) =
             two_peer_rpc("ipc-bridge-stream").await;
 
@@ -562,18 +641,38 @@ mod tests {
                 let client = registry
                     .client(owner)
                     .ok_or_else(|| "owner gone".to_string())?;
-                let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(32);
-                registry.put_pending_inbound(
-                    call.request_id.clone(),
+                let (tx, rx) = tokio::sync::mpsc::channel::<myownmesh_core::rpc::RpcStreamItem>(4);
+                let close_probe = tx.clone();
+                let pending_key = PendingKey {
+                    network: key.0.clone(),
+                    method: key.1.clone(),
+                    remote_peer: call.from.clone(),
+                    remote_request_id: call.request_id.clone(),
+                    class: HandlerMode::Stream,
+                };
+                let Ok(ticket) = registry.insert_exact_pending(
+                    pending_key,
+                    owner,
                     crate::ipc::clients::PendingInbound::Stream(tx),
-                );
+                ) else {
+                    return Err("duplicate".into());
+                };
                 client.send(ServerOut::RpcInbound {
                     network: key.0.clone(),
                     from: call.from.clone(),
                     request_id: call.request_id.clone(),
+                    operation_id: ticket.operation_id(),
                     method: call.method.clone(),
                     payload: call.payload.clone(),
                     streaming: call.streaming,
+                });
+                tokio::spawn(async move {
+                    tokio::select! {
+                        () = close_probe.closed() => {}
+                        () = ticket.cancelled() => {}
+                    }
+                    drop(close_probe);
+                    drop(ticket);
                 });
                 Ok(rx)
             }
@@ -592,21 +691,39 @@ mod tests {
             .await
             .expect("inbound timeout")
             .expect("inbound recv");
-        let request_id = match inbound {
-            ServerOut::RpcInbound { request_id, .. } => request_id,
+        let (network, from, request_id, operation_id, method) = match inbound {
+            ServerOut::RpcInbound {
+                network,
+                from,
+                request_id,
+                operation_id,
+                method,
+                ..
+            } => (network, from, request_id, operation_id, method),
             other => panic!("expected RpcInbound, got {other:?}"),
         };
 
         // Push three chunks then close.
+        let pending_key = PendingKey {
+            network,
+            method,
+            remote_peer: from,
+            remote_request_id: request_id,
+            class: HandlerMode::Stream,
+        };
         for n in 1..=3 {
             assert!(
                 registry
-                    .push_inbound_stream_chunk(&request_id, serde_json::json!(n))
+                    .push_exact_stream(&pending_key, client.id, operation_id, serde_json::json!(n))
                     .await,
                 "chunk {n} push"
             );
         }
-        assert!(registry.close_inbound_stream(&request_id));
+        assert!(
+            registry
+                .close_exact_stream(&pending_key, client.id, operation_id, None)
+                .await
+        );
 
         // Bob drains his receiver — three chunks then close.
         let mut bob_rx = tokio::time::timeout(Duration::from_secs(5), stream_handle)
@@ -636,7 +753,7 @@ mod tests {
     /// correct payload and sender.
     #[tokio::test]
     async fn channel_inbound_round_trip_through_bridge() {
-        let _serial = BRIDGE_TEST_SERIAL.lock().await;
+        let _fixture = crate::exclusive_connector_fixture().await;
         let (alice_state, bob_state, _alice_rpc, _bob_rpc, _alice_id, bob_id, drivers) =
             two_peer_rpc("ipc-bridge-channel").await;
 

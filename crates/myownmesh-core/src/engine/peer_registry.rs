@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::runtime::session_broker::SessionBroker;
@@ -39,9 +40,23 @@ use super::connection::PeerConnection;
 /// replace, remove, or retire peers. Every ownership exit explicitly ends the
 /// connector worker even when another task retains an external
 /// `Arc<PeerConnection>`.
-pub(super) struct PeerRegistry {
+pub(crate) struct PeerRegistry {
     peers: DashMap<String, PeerRegistryEntry>,
     mutation: Mutex<()>,
+    governance: Arc<parking_lot::RwLock<crate::network_state::NetworkState>>,
+    local_device_id: String,
+    /// Where a newly minted session is announced.
+    ///
+    /// The engine's own command queue, so the announcement is handled by the
+    /// driver after every lock here has been released — nothing runs, awaits or
+    /// re-enters under the fence. A `OnceLock` because the queue is created
+    /// alongside this registry and bound once during state construction, and
+    /// because reading it costs no lock on a path that already holds one.
+    ///
+    /// Unbound in a bare registry, which is what the unit fixtures build: those
+    /// promote and exercise the fence without a driver, and an announcement with
+    /// nowhere to go is correctly dropped rather than being an error.
+    promotion_tx: std::sync::OnceLock<mpsc::UnboundedSender<super::state::NetworkCmd>>,
 }
 
 struct PeerRegistryEntry {
@@ -69,21 +84,136 @@ impl PeerOwnerToken {
 
 impl Default for PeerRegistry {
     fn default() -> Self {
-        Self {
-            peers: DashMap::new(),
-            mutation: Mutex::new(()),
-        }
+        Self::new(
+            Arc::new(parking_lot::RwLock::new(
+                crate::network_state::NetworkState::default(),
+            )),
+            String::new(),
+        )
     }
 }
 
 impl PeerRegistry {
+    pub(super) fn new(
+        governance: Arc<parking_lot::RwLock<crate::network_state::NetworkState>>,
+        local_device_id: String,
+    ) -> Self {
+        Self {
+            peers: DashMap::new(),
+            mutation: Mutex::new(()),
+            governance,
+            local_device_id,
+            promotion_tx: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn policy_admits(&self, remote_device_id: &str) -> bool {
+        super::governance::current_policy_admits(
+            &self.governance.read(),
+            &self.local_device_id,
+            remote_device_id,
+        )
+    }
+
+    /// Apply one verified governance mutation and synchronously revoke every
+    /// session the resulting projection no longer admits.
+    ///
+    /// The lock order is the live authority order: registry mutation first,
+    /// governance second. Every application lender uses the same first lock, so
+    /// no effect can occur between publishing the new projection and clearing
+    /// its denied session. The closure is synchronous; callers perform roster
+    /// mirrors, broadcasts and connector cleanup after this returns.
+    pub(super) fn with_governance_commit<R>(
+        &self,
+        commit: impl FnOnce(&mut crate::network_state::NetworkState) -> R,
+    ) -> R {
+        let _mutation = self.mutation.lock();
+        let (result, denied) = {
+            let mut governance = self.governance.write();
+            let result = commit(&mut governance);
+            let local_admitted = super::governance::current_policy_admits(
+                &governance,
+                &self.local_device_id,
+                &self.local_device_id,
+            );
+            let denied = self
+                .peers
+                .iter()
+                .filter(|entry| {
+                    !local_admitted
+                        || !super::governance::current_policy_admits(
+                            &governance,
+                            &self.local_device_id,
+                            &entry.value().peer.device_id,
+                        )
+                })
+                .map(|entry| Arc::clone(&entry.value().peer))
+                .collect::<Vec<_>>();
+            (result, denied)
+        };
+        for peer in denied {
+            peer.revoke_promoted_session();
+        }
+        result
+    }
+
+    /// Bind the queue newly minted sessions are announced on.
+    ///
+    /// Called once, during state construction, by the owner of both this
+    /// registry and the command queue. Later calls are ignored rather than
+    /// panicking: the binding is an identity this registry holds for its whole
+    /// life, so a second one could only be the same queue again or a mistake,
+    /// and neither is worth taking a process down for.
+    pub(super) fn bind_promotion_sink(&self, tx: mpsc::UnboundedSender<super::state::NetworkCmd>) {
+        let _ = self.promotion_tx.set(tx);
+    }
+
+    /// Promote if needed, announcing a session this call minted.
+    ///
+    /// **The one place promotion is reached from the fence**, so no entry point
+    /// can promote without announcing. That is the whole reason it exists: the
+    /// alternative is seven call sites that each have to remember, and the
+    /// failure mode of forgetting one is a peer that never receives what its
+    /// session was owed, silently and only on that path.
+    ///
+    /// The announcement is enqueued **synchronously, before returning**, so it
+    /// cannot be lost to a task that never runs, and it carries the exact owner
+    /// rather than a device id — a replacement resolves to a different token, so
+    /// a command cannot be applied to a session that did not mint it.
+    ///
+    /// Nothing executes under the fence. An unbounded send stores the command
+    /// and wakes the driver; it does not run the handler, and it cannot block. A
+    /// closed queue means the driver is gone, and there is no session service
+    /// left to notify, so the result is deliberately discarded.
+    fn promote_and_announce(
+        &self,
+        peer: &Arc<PeerConnection>,
+        owner: &PeerOwnerToken,
+        broker: &SessionBroker,
+        mesh_context: &str,
+    ) -> bool {
+        let promotion = peer.promote_session_if_needed(
+            broker,
+            mesh_context,
+            peer.state.read().is_admitted() && self.policy_admits(owner.device_id()),
+        );
+        if promotion == super::connection::Promotion::NewlyPromoted {
+            if let Some(tx) = self.promotion_tx.get() {
+                let _ = tx.send(super::state::NetworkCmd::ReplayCapabilities {
+                    owner: owner.clone(),
+                });
+            }
+        }
+        promotion.is_usable()
+    }
+
     pub(super) fn get(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
         self.peers
             .get(device_id)
             .map(|entry| Arc::clone(&entry.value().peer))
     }
 
-    pub(super) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
+    pub(crate) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
         self.peers.get(device_id).map(|entry| PeerOwnerToken {
             peer: Arc::clone(&entry.value().peer),
             installation: Arc::clone(&entry.value().installation),
@@ -148,7 +278,7 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        if !peer.promote_session_if_needed(broker?, mesh_context) {
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
         Some(effect(&AdmittedSessionOperation {
@@ -187,8 +317,8 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        let promoted =
-            broker.is_some_and(|broker| peer.promote_session_if_needed(broker, mesh_context));
+        let promoted = broker
+            .is_some_and(|broker| self.promote_and_announce(peer, owner, broker, mesh_context));
         if !promoted {
             return Some(refused(peer));
         }
@@ -225,13 +355,16 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        if !peer.promote_session_if_needed(broker?, mesh_context) {
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
         let session = peer.session.lock().clone()?;
+        let validity = peer.with_live_session(|session| session.validity_witness())?;
         Some(AdmittedApplicationOperation {
             peer: Arc::clone(peer),
             session,
+            validity,
+            owner: owner.clone(),
         })
     }
 
@@ -271,7 +404,7 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        if !peer.promote_session_if_needed(broker?, mesh_context) {
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
         peer.with_live_session(effect)
@@ -284,7 +417,7 @@ impl PeerRegistry {
     /// is a field of the session it is handed, so the state cannot outlive the
     /// authority that admitted it and a replacement cannot reach its
     /// predecessor's — there is no key by which to name one.
-    pub(super) fn with_live_session_state<R>(
+    pub(crate) fn with_live_session_state<R>(
         &self,
         owner: &PeerOwnerToken,
         broker: Option<&SessionBroker>,
@@ -300,10 +433,28 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        if !peer.promote_session_if_needed(broker?, mesh_context) {
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
         peer.with_live_session_state(effect)
+    }
+
+    /// The installations whose live session still holds frames that have not
+    /// reached the wire.
+    ///
+    /// Owner tokens, not device ids: the flush that follows must reach the exact
+    /// installation whose record was read, and a device id re-resolved after
+    /// this snapshot could name a replacement. Non-promoting, like the backlog
+    /// count below — a tick that promoted sessions in order to decide whether to
+    /// flush them would create the very thing it was checking for.
+    pub(super) fn owners_with_unsent_reliable_frames(&self) -> Vec<PeerOwnerToken> {
+        let _mutation = self.mutation.lock();
+        self.owners_snapshot(|peer| {
+            self.policy_admits(&peer.device_id)
+                && peer
+                    .with_live_session_state(|_session, record| record.has_unsent())
+                    .unwrap_or(false)
+        })
     }
 
     /// Frames retained and unacknowledged across every peer holding a live
@@ -315,25 +466,15 @@ impl PeerRegistry {
     /// reservation on behalf of a caller that asked for a number. A peer with no
     /// live session contributes nothing, which is exact rather than approximate
     /// — with no session there is nothing retained.
-    /// The installations whose live session still holds frames that have not
-    /// reached the wire.
-    ///
-    /// Owner tokens, not device ids: the flush that follows must reach the exact
-    /// installation whose record was read, and a device id re-resolved after
-    /// this snapshot could name a replacement. Non-promoting, like the backlog
-    /// count — a tick that promoted sessions in order to decide whether to flush
-    /// them would create the very thing it was checking for.
-    pub(super) fn owners_with_unsent_reliable_frames(&self) -> Vec<PeerOwnerToken> {
-        self.owners_snapshot(|peer| {
-            peer.with_live_session_state(|_session, record| record.has_unsent())
-                .unwrap_or(false)
-        })
-    }
-
     pub(super) fn reliable_pending_total(&self) -> usize {
-        self.collect_map(|peer| peer.with_live_session_state(|_session, app| app.pending()))
-            .into_iter()
-            .sum()
+        let _mutation = self.mutation.lock();
+        self.collect_map(|peer| {
+            self.policy_admits(&peer.device_id)
+                .then(|| peer.with_live_session_state(|_session, app| app.pending()))
+                .flatten()
+        })
+        .into_iter()
+        .sum()
     }
 
     pub(super) fn with_live_session_flow<R>(
@@ -353,7 +494,7 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        if !peer.promote_session_if_needed(broker?, mesh_context) {
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
         peer.with_live_session_flow(effect)
@@ -383,7 +524,7 @@ impl PeerRegistry {
             return None;
         }
         let peer = &current.value().peer;
-        if !peer.promote_session_if_needed(broker?, mesh_context) {
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
         peer.with_live_session_flow_and_worker(effect)
@@ -426,7 +567,7 @@ impl PeerRegistry {
             owner,
             broker,
             mesh_context,
-            |_session, _flows, _live, worker| {
+            |session, _flows, _live, worker| {
                 let peer = self.peers.get(owner.device_id())?;
                 let mut data = peer.value().peer.state.write();
                 if !data.media_reneg_pending {
@@ -438,6 +579,7 @@ impl PeerRegistry {
                 Some(AdmittedRenegotiation {
                     session: Arc::clone(worker),
                     owner: owner.clone(),
+                    validity: session.validity_witness(),
                 })
             },
         )
@@ -677,10 +819,10 @@ impl AdmittedSessionOperation<'_> {
     /// may since have taken over.
     pub(super) fn inbound_application_operation(
         &self,
-        msg: crate::protocol::MeshMessage,
+        frame: crate::application_gateway::DecodedApplicationFrame,
     ) -> AdmittedInboundApplicationOperation {
         AdmittedInboundApplicationOperation {
-            msg,
+            frame,
             dispatch: AdmittedInboundDispatch {
                 peer: Arc::clone(self.peer),
                 owner: self.owner.clone(),
@@ -706,7 +848,7 @@ impl AdmittedSessionOperation<'_> {
 /// value, so one admission dispatches exactly one frame.
 #[must_use = "an admitted inbound frame authorizes exactly one dispatch and must be consumed"]
 pub(super) struct AdmittedInboundApplicationOperation {
-    msg: crate::protocol::MeshMessage,
+    frame: crate::application_gateway::DecodedApplicationFrame,
     dispatch: AdmittedInboundDispatch,
 }
 
@@ -716,8 +858,16 @@ impl AdmittedInboundApplicationOperation {
     ///
     /// Consuming by value is the single-dispatch rule: the frame cannot be
     /// dispatched twice, and it cannot be paired with a different admission.
-    pub(super) fn into_dispatch(self) -> (crate::protocol::MeshMessage, AdmittedInboundDispatch) {
-        (self.msg, self.dispatch)
+    pub(super) fn into_dispatch(
+        self,
+    ) -> (
+        crate::protocol::MeshMessage,
+        crate::resource::ResourceClaim,
+        crate::resource::ResourceLease,
+        AdmittedInboundDispatch,
+    ) {
+        let (message, claim, work) = self.frame.into_parts();
+        (message, claim, work, self.dispatch)
     }
 }
 
@@ -821,10 +971,12 @@ impl AdmittedInboundDispatch {
 /// replacement installed during the await cannot receive this operation or its
 /// accounting.
 ///
-/// No separate incarnation is stored. `send_owned` enters the worker's own
-/// operation and close fence and races the write against retirement, so the
-/// captured worker *is* the incarnation check; a duplicate field would be state
-/// that never decides anything.
+/// Before the native future is first polled, [`Self::begin`] re-enters the
+/// registry mutation fence and proves both the captured installation and its
+/// session witness are live. Crossing that synchronous point orders the effect
+/// before any later replacement or governance commit. The await then holds no
+/// registry lock and makes no impossible claim that cancellation can retract
+/// bytes already handed to the native sender.
 ///
 /// Deliberately not `Clone`, `Copy`, `Debug`, `Default`, or serializable, and
 /// consumed by value, so one admission authorizes one operation.
@@ -832,6 +984,8 @@ impl AdmittedInboundDispatch {
 pub(super) struct AdmittedApplicationOperation {
     peer: Arc<PeerConnection>,
     session: Arc<crate::transport::WebRtcConnectorWorker>,
+    validity: crate::runtime::session_broker::SessionValidityWitness,
+    owner: PeerOwnerToken,
 }
 
 impl AdmittedApplicationOperation {
@@ -840,6 +994,56 @@ impl AdmittedApplicationOperation {
     ///
     /// Both halves use the captured values, so a send and its accounting can
     /// never land on different installations.
+    pub(super) async fn send_frame(
+        self,
+        peers: &PeerRegistry,
+        bytes: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<usize> {
+        self.begin(peers)?.send_frame(bytes, timeout).await
+    }
+
+    /// Cross the application effect's synchronous linearization point.
+    ///
+    /// Governance revocation takes the same mutation lock before invalidating
+    /// the session. Therefore this either refuses without ever constructing a
+    /// native send future, or returns an operation ordered before any later
+    /// commit. No registry or parking_lot guard escapes this method.
+    fn begin(self, peers: &PeerRegistry) -> Result<StartedApplicationOperation> {
+        let _mutation = peers.mutation.lock();
+        let current = peers
+            .peers
+            .get(self.owner.device_id())
+            .filter(|current| Arc::ptr_eq(&current.value().installation, &self.owner.installation));
+        if current.is_none() || !self.validity.is_live() {
+            return Err(Error::Transport(
+                "the session authorizing this send was revoked".into(),
+            ));
+        }
+        Ok(StartedApplicationOperation {
+            peer: self.peer,
+            session: self.session,
+        })
+    }
+
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn begin_for_test(
+        self,
+        peers: &PeerRegistry,
+    ) -> Result<StartedApplicationOperation> {
+        self.begin(peers)
+    }
+}
+
+/// An application effect that crossed the registry-fenced begin point.
+/// Revocation after this value exists is ordered after the admitted effect and
+/// does not claim to roll back bytes a native sender may already own.
+pub(super) struct StartedApplicationOperation {
+    peer: Arc<PeerConnection>,
+    session: Arc<crate::transport::WebRtcConnectorWorker>,
+}
+
+impl StartedApplicationOperation {
     pub(super) async fn send_frame(
         self,
         bytes: bytes::Bytes,
@@ -871,9 +1075,31 @@ impl AdmittedApplicationOperation {
 pub(super) struct AdmittedRenegotiation {
     session: Arc<crate::transport::WebRtcConnectorWorker>,
     owner: PeerOwnerToken,
+    validity: crate::runtime::session_broker::SessionValidityWitness,
 }
 
 impl AdmittedRenegotiation {
+    pub(super) fn is_live(&self) -> bool {
+        self.validity.is_live()
+    }
+
+    pub(super) async fn revoked(&self) {
+        let validity = self.validity.clone();
+        validity.revoked().await;
+    }
+
+    /// Run the final synchronous effect only while this installation and the
+    /// promoted session that minted the claim are both still live. Governance
+    /// revocation takes the same registry mutation lock while it invalidates
+    /// the session witness, so the check and hand-off order wholly before or
+    /// after that commit rather than leaving a check-then-send window.
+    pub(super) fn with_live<R>(
+        &self,
+        peers: &PeerRegistry,
+        effect: impl FnOnce() -> R,
+    ) -> Option<R> {
+        peers.with_current(&self.owner, |_peer| self.validity.is_live().then(effect))?
+    }
     /// The connector this renegotiation drives. Its own liveness and close
     /// fence stays authoritative for every SDP call.
     pub(super) fn session(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
@@ -883,11 +1109,6 @@ impl AdmittedRenegotiation {
     /// The captured owner's device id, for logging and signaling attribution.
     pub(super) fn device_id(&self) -> &str {
         self.owner.device_id()
-    }
-
-    /// Whether the exact installation this was claimed for is still current.
-    pub(super) fn is_current(&self, peers: &PeerRegistry) -> bool {
-        peers.get_if_current(&self.owner).is_some()
     }
 
     /// Record the outcome against the exact captured installation.

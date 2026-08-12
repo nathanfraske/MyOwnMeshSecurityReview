@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::network_state::Transition;
 
+pub(crate) fn verification_code_has_protocol_shape(code: &str) -> bool {
+    code.len() == 6
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
 /// Sent immediately on channel open by both ends. Carries the
 /// sender's claimed Device ID and this endpoint's per-attempt
 /// contribution. Both sides' hellos are required: each contribution is
@@ -32,9 +39,12 @@ use crate::network_state::Transition;
 /// additionally manufacture an advertisement no peer ever sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloMessage {
-    /// Wire-protocol version. v1 senders MAY omit features the
-    /// receiver doesn't advertise; v1 receivers MUST silently drop
-    /// unknown message kinds.
+    /// Wire-protocol version. A sender omits optional frame kinds the
+    /// receiver does not advertise; a receiver refuses any kind this
+    /// build does not implement, which fails to deserialize and
+    /// reaches no handler. The gating is the sender's half of that
+    /// rule, not a way around a receiver that tolerates the unknown —
+    /// none does.
     pub protocol: u32,
     /// Bare-pubkey Device ID, base32-lowercase. Display suffix
     /// omitted on the wire — the receiver derives it themselves if
@@ -133,4 +143,20 @@ pub struct DenyMessage {
     /// member's `Evict`). Same compat story as `transitions`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_log: Vec<Transition>,
+}
+
+#[cfg(test)]
+mod verification_code_tests {
+    use super::verification_code_has_protocol_shape;
+
+    #[test]
+    fn verification_code_is_exactly_six_lowercase_ascii_alphanumerics() {
+        assert!(verification_code_has_protocol_shape("abc123"));
+        for malformed in ["abc12", "abc1234", "ABC123", "abc-12", "\u{e5}bc123"] {
+            assert!(
+                !verification_code_has_protocol_shape(malformed),
+                "{malformed:?}"
+            );
+        }
+    }
 }

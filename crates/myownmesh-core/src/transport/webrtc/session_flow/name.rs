@@ -125,6 +125,63 @@ impl RealtimeFlowLabel {
     }
 }
 
+impl RealtimeFlowLabel {
+    /// Whether these two labels are copies of the *same* leased record, rather
+    /// than two records that merely spell the same name.
+    ///
+    /// Deliberately not `Eq`, which compares the bytes and must keep doing so:
+    /// a peer citing a name, a map lookup and an ordered key all ask the byte
+    /// question, and that is the right one for them. This asks the identity
+    /// question, and there is exactly one caller — a close, deciding which
+    /// queued arrivals belonged to *this* flow. A name may be released and
+    /// claimed again within one session, so at that moment the bytes cannot
+    /// distinguish the flow that is going from the flow that will take its
+    /// name, and only the record can.
+    pub(super) fn is_same_record(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A non-owning citation of *this* flow's record, for a holder outside the
+    /// session to present later.
+    ///
+    /// The same identity question [`Self::is_same_record`] asks, in the form a
+    /// caller can keep. **Weak on purpose, twice over.** It must not fund the
+    /// record — an application holding a flow handle would otherwise keep a
+    /// closed flow's label charged for as long as it felt like — and a dead
+    /// record must answer *nothing* rather than answering by address, which an
+    /// allocator is free to reuse. `Weak` gives both: the control block outlives
+    /// the record, so a citation of a freed flow is distinguishable from a
+    /// citation of whatever was allocated there next.
+    pub(crate) fn identity(&self) -> RealtimeFlowIdentity {
+        RealtimeFlowIdentity(Arc::downgrade(&self.0))
+    }
+
+    /// Whether this label is the exact record `identity` was taken from.
+    ///
+    /// `false` for a record that has since been dropped, which is the whole
+    /// point: a flow that closed cannot be named again, not even by a caller
+    /// holding the same bytes and asking inside the same session.
+    pub(crate) fn is_identity(&self, identity: &RealtimeFlowIdentity) -> bool {
+        identity
+            .0
+            .upgrade()
+            .is_some_and(|record| Arc::ptr_eq(&self.0, &record))
+    }
+}
+
+/// One flow's exact identity, without owning it.
+///
+/// Carries no name, no session and no authority, and answers exactly one
+/// question: "is this the flow I was given?". It answers against the *record*
+/// rather than the bytes, because a name may be released and claimed again
+/// inside one session and the bytes cannot tell those two flows apart. That is
+/// the ABA the public flow handle exists to close.
+///
+/// Opaque and not constructible from outside this module: the only way to hold
+/// one is to have been handed it by the session that admitted the flow.
+#[derive(Debug)]
+pub(crate) struct RealtimeFlowIdentity(std::sync::Weak<LeasedLabel>);
+
 impl std::borrow::Borrow<[u8]> for RealtimeFlowLabel {
     /// Lets a collection keyed by label be looked up with the raw bytes a peer
     /// sent, without minting a lease merely to ask a question. Consistent with

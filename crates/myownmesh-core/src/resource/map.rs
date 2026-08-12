@@ -44,7 +44,8 @@ use super::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass, Resource
 struct LeasedMapNode<K, V> {
     key: K,
     value: V,
-    /// Covers this node's allocation and whatever the caller retained with it.
+    /// Covers only this map node's allocation. Any off-node retention in
+    /// `key` or `value` owns a separate lease for its full lifetime.
     _entry: ResourceLease,
     /// Heap order. A balancing detail — never compared for identity, never
     /// serialized, never shown to a caller.
@@ -152,20 +153,18 @@ impl<K, V> LeasedMap<K, V> {
         }
     }
 
-    /// Everything one entry costs: this map's node, plus whatever the caller
-    /// retains inside it.
+    /// Everything one entry costs: exactly this map's node.
     ///
     /// The single calibration point. An owner never writes the node's size
-    /// itself — it states only its own retention, and this adds the exact
-    /// representation term for the entry that will hold it. The node's size is
+    /// itself. The node's size is
     /// `size_of` over the concrete node type, so it already includes the key
     /// and value inline, the lease handle, the priority and both links; the
     /// residual is 1 because the entry is exactly one allocation, and unlike a
     /// B-tree slot that residual is released at the moment the entry is.
+    /// Off-node retention owned by `K` or `V` carries its own lease in that
+    /// value, so removal may release this node and safely return both values.
     #[must_use = "the entry claim must be acquired before the entry is inserted"]
-    pub(crate) fn entry_claim(
-        retained: ResourceClaim,
-    ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    pub(crate) fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         let record_bytes =
             u64::try_from(std::mem::size_of::<LeasedMapNode<K, V>>()).map_err(|_| {
                 ResourceClaimArithmeticError::Overflow {
@@ -175,8 +174,7 @@ impl<K, V> LeasedMap<K, V> {
         ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, record_bytes),
             (ResourceClass::OpaqueDependencyResidual, 1),
-        ])?
-        .checked_add(retained)
+        ])
     }
 
     /// How many entries are live.
@@ -193,6 +191,46 @@ impl<K, V> LeasedMap<K, V> {
 }
 
 impl<K: Ord + Hash, V> LeasedMap<K, V> {
+    /// Whether any live value satisfies `predicate`, without allocating an
+    /// iterator stack or exposing the map's representation.
+    pub(crate) fn any_value(&self, mut predicate: impl FnMut(&V) -> bool) -> bool {
+        fn visit<K, V>(
+            node: Option<&LeasedMapNode<K, V>>,
+            predicate: &mut impl FnMut(&V) -> bool,
+        ) -> bool {
+            let Some(node) = node else { return false };
+            predicate(&node.value)
+                || visit(node.left.as_deref(), predicate)
+                || visit(node.right.as_deref(), predicate)
+        }
+        visit(self.root.as_deref(), &mut predicate)
+    }
+
+    /// Borrow one live value satisfying `predicate` mutably.
+    ///
+    /// The walk allocates nothing. It is used for bounded teardown quanta: one
+    /// retained child is removed under the owner lock, then dropped after the
+    /// lock is released.
+    pub(crate) fn find_value_mut(
+        &mut self,
+        mut predicate: impl FnMut(&V) -> bool,
+    ) -> Option<&mut V> {
+        fn visit<'a, K, V>(
+            node: Option<&'a mut LeasedMapNode<K, V>>,
+            predicate: &mut impl FnMut(&V) -> bool,
+        ) -> Option<&'a mut V> {
+            let node = node?;
+            if predicate(&node.value) {
+                return Some(&mut node.value);
+            }
+            if let Some(value) = visit(node.left.as_deref_mut(), predicate) {
+                return Some(value);
+            }
+            visit(node.right.as_deref_mut(), predicate)
+        }
+        visit(self.root.as_deref_mut(), &mut predicate)
+    }
+
     /// Insert one entry, which now owns the lease that funded it.
     ///
     /// A key already present is **refused**, and the candidate comes straight
@@ -386,6 +424,14 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     }
 
     /// Remove one entry, releasing exactly that entry's funding.
+    ///
+    /// Controls only. Production takes entries out through
+    /// [`Self::remove_entry`], because the owners here are keyed by a leased
+    /// label and the key is half of what they need back — dropping it inside
+    /// this call would release a shared record the caller still has ordering
+    /// obligations around. This is the value-only convenience the controls use,
+    /// and gating it keeps the production path a single shape.
+    #[cfg(test)]
     pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
@@ -493,6 +539,7 @@ mod tests {
     struct ControlValue {
         key: u32,
         dropped: DropLog,
+        _retention: ResourceLease,
     }
 
     impl Drop for ControlValue {
@@ -512,7 +559,7 @@ mod tests {
     }
 
     fn control_entry_claim() -> ResourceClaim {
-        LeasedMap::<u32, ControlValue>::entry_claim(control_retention())
+        LeasedMap::<u32, ControlValue>::entry_claim()
             .expect("the control entry claim is representable")
     }
 
@@ -521,11 +568,16 @@ mod tests {
     /// per-reservation and per-scope bookkeeping.
     fn control_grant(entries: u64) -> ResourceClaim {
         let scope_record = FiniteResourceProvider::scope_record_charge_for_test();
-        let per_entry = control_entry_claim()
+        let node = control_entry_claim()
             .checked_add(scope_record)
             .expect("the control entry claim plus its reservation record is representable");
+        let retention = control_retention()
+            .checked_add(scope_record)
+            .expect("the value retention plus its reservation record is representable");
         (0..entries)
-            .try_fold(scope_record, |total, _| total.checked_add(per_entry))
+            .try_fold(scope_record, |total, _| {
+                total.checked_add(node)?.checked_add(retention)
+            })
             .expect("the bounded control grant is representable")
     }
 
@@ -548,6 +600,21 @@ mod tests {
         .expect("the control grant funds this entry")
     }
 
+    fn control_value(
+        key: u32,
+        dropped: &DropLog,
+        port: &ResourceProviderPort,
+        scope: &ResourceScope,
+    ) -> ControlValue {
+        ControlValue {
+            key,
+            dropped: Arc::clone(dropped),
+            _retention: port
+                .acquire(scope, ResourceAuthorityClass::Admitted, control_retention())
+                .expect("the control grant funds this value's retention"),
+        }
+    }
+
     /// Keys are found by order regardless of insertion order, and a key that
     /// was never inserted is not found.
     ///
@@ -564,10 +631,7 @@ mod tests {
             assert!(map
                 .insert(
                     key,
-                    ControlValue {
-                        key,
-                        dropped: Arc::clone(&dropped),
-                    },
+                    control_value(key, &dropped, &port, &scope),
                     control_lease(&port, &scope),
                 )
                 .is_ok());
@@ -592,10 +656,7 @@ mod tests {
         assert!(map
             .insert(
                 7_u32,
-                ControlValue {
-                    key: 7,
-                    dropped: Arc::clone(&dropped),
-                },
+                control_value(7, &dropped, &port, &scope),
                 control_lease(&port, &scope),
             )
             .is_ok());
@@ -603,10 +664,7 @@ mod tests {
 
         let refused = map.insert(
             7_u32,
-            ControlValue {
-                key: 700,
-                dropped: Arc::clone(&dropped),
-            },
+            control_value(700, &dropped, &port, &scope),
             control_lease(&port, &scope),
         );
         assert!(refused.is_err(), "the live entry is not replaced");
@@ -640,10 +698,7 @@ mod tests {
             assert!(map
                 .insert(
                     key,
-                    ControlValue {
-                        key,
-                        dropped: Arc::clone(&dropped),
-                    },
+                    control_value(key, &dropped, &port, &scope),
                     control_lease(&port, &scope),
                 )
                 .is_ok());
@@ -652,12 +707,18 @@ mod tests {
 
         let removed = map.remove(&2).expect("the entry was there");
         assert_eq!(removed.key, 2);
+        let after_node_removal = provider.in_use();
+        assert_eq!(
+            after_node_removal.amount(ResourceClass::QueuedBytes),
+            full.amount(ResourceClass::QueuedBytes),
+            "the returned value keeps its own retention funded"
+        );
         drop(removed);
 
         assert_eq!(
             provider.in_use().amount(ResourceClass::QueuedBytes),
             full.amount(ResourceClass::QueuedBytes)
-                - control_entry_claim().amount(ResourceClass::QueuedBytes),
+                - control_retention().amount(ResourceClass::QueuedBytes),
             "exactly one entry's retention was released — not a share of a \
              shared node, and not nothing"
         );
@@ -670,10 +731,7 @@ mod tests {
         assert!(map
             .insert(
                 4_u32,
-                ControlValue {
-                    key: 4,
-                    dropped: Arc::clone(&dropped),
-                },
+                control_value(4, &dropped, &port, &scope),
                 control_lease(&port, &scope),
             )
             .is_ok());
@@ -689,10 +747,7 @@ mod tests {
             assert!(map
                 .insert(
                     key,
-                    ControlValue {
-                        key,
-                        dropped: Arc::clone(&dropped),
-                    },
+                    control_value(key, &dropped, &port, &scope),
                     control_lease(&port, &scope),
                 )
                 .is_ok());

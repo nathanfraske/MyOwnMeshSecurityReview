@@ -12,13 +12,66 @@ use crate::transport::webrtc::WebRtcConnectorProfile;
 pub struct ConnectorCallbackMailboxCapacities {
     control: NonZeroUsize,
     endpoint_data: NonZeroUsize,
+    local_payload_ceilings: Option<LocalCallbackPayloadCeilings>,
+}
+
+/// The largest single payload an owner will fund, stated once per callback
+/// class.
+///
+/// Per class and not one shared number, because one number multiplied across
+/// both classes is the same cross-funding defect in a softer form: the grant
+/// would carry `max(control, endpoint)` for each, so whichever class the owner
+/// sized generously would silently pay for the other, and neither ceiling would
+/// mean what it says. Both are required together — an owner that has to size a
+/// provider knows both answers or neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalCallbackPayloadCeilings {
+    control: NonZeroUsize,
+    endpoint_data: NonZeroUsize,
 }
 
 impl ConnectorCallbackMailboxCapacities {
+    /// Slot counts only, for an owner whose connector draws on a provider it
+    /// did not mint. Carries no byte ceiling because it needs none: the process
+    /// resource owner already holds the byte capacity, and every callback is
+    /// admitted against it at the payload's actual size.
     pub const fn new(control: NonZeroUsize, endpoint_data: NonZeroUsize) -> Self {
         Self {
             control,
             endpoint_data,
+            local_payload_ceilings: None,
+        }
+    }
+
+    /// Slot counts plus the largest single payload this owner will fund for
+    /// each callback class, for the one caller that has to size a provider
+    /// itself.
+    ///
+    /// Required only by the raw transport-lab path, which mints its own finite
+    /// provider from this policy and therefore has nothing else to derive a byte
+    /// grant from. Stated rather than inferred for the same reason
+    /// [`RealtimeConnectorPolicy::enabled_with_local_ceiling`] is: a ceiling
+    /// picked here by core would be a product limit nobody chose, and a ceiling
+    /// borrowed from another class — an endpoint frame maximum standing in for
+    /// an ICE candidate's bytes — funds one class out of another's budget and
+    /// hides the moment either becomes wrong.
+    ///
+    /// Both bound the *grant*, not the wire: a connector drawing on the process
+    /// provider ignores them entirely, and nothing here gates what the protocol
+    /// will carry.
+    pub const fn with_local_payload_ceilings(
+        control: NonZeroUsize,
+        endpoint_data: NonZeroUsize,
+        control_payload_bytes: NonZeroUsize,
+        endpoint_payload_bytes: NonZeroUsize,
+    ) -> Self {
+        Self {
+            control,
+            endpoint_data,
+            local_payload_ceilings: Some(LocalCallbackPayloadCeilings {
+                control: control_payload_bytes,
+                endpoint_data: endpoint_payload_bytes,
+            }),
         }
     }
 
@@ -28,6 +81,25 @@ impl ConnectorCallbackMailboxCapacities {
 
     pub const fn endpoint_data(self) -> NonZeroUsize {
         self.endpoint_data
+    }
+
+    /// The owner-stated control-callback payload ceiling, when this policy is
+    /// one that has to fund its own provider. `None` for every owner backed by
+    /// the process resource root.
+    pub const fn local_control_payload_bytes(self) -> Option<NonZeroUsize> {
+        match self.local_payload_ceilings {
+            Some(ceilings) => Some(ceilings.control),
+            None => None,
+        }
+    }
+
+    /// The owner-stated endpoint-data payload ceiling, on the same terms as
+    /// [`Self::local_control_payload_bytes`]. Present exactly when that one is.
+    pub const fn local_endpoint_payload_bytes(self) -> Option<NonZeroUsize> {
+        match self.local_payload_ceilings {
+            Some(ceilings) => Some(ceilings.endpoint_data),
+            None => None,
+        }
     }
 }
 
@@ -79,9 +151,23 @@ impl ConnectorCallbackServiceWeights {
 
 /// Owner-selected callback behavior for one connector.
 ///
-/// Endpoint frames retain the protocol's independent frame limit. The
-/// real-time unit and structural queue limits are separate operational inputs
-/// because an encoded access unit is not an endpoint message frame.
+/// No class here carries a byte limit that gates the native callback, and there
+/// is no frame-limit check standing behind one anywhere. Endpoint data is
+/// admitted against the provider at the payload's actual size, and what bounds
+/// the application parsing that follows is the provider structural claim taken
+/// once the callback has been classified — capacity an owner granted, refused
+/// when it is not there. Naming a frame limit here would promise a check that no
+/// longer runs.
+///
+/// The real-time unit ceiling and the structural queue capacities remain
+/// distinct operational inputs, because an encoded access unit is not an
+/// endpoint message frame.
+///
+/// The single exception is a grant, not a gate:
+/// [`ConnectorCallbackMailboxCapacities::with_local_payload_ceilings`] states
+/// how many bytes an owner that mints its own provider is willing to fund per
+/// callback, per class. Those bound what that owner reserved, never what the
+/// connector accepts — admission still measures the payload in front of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCallbackPolicy {
     local_mailboxes: Option<ConnectorCallbackMailboxCapacities>,

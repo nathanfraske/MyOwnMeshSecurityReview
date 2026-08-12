@@ -179,12 +179,18 @@ impl Ticker for MediaRenegotiationTicker {
     }
 }
 
-/// Acked-delivery maintenance — expires lapsed outbox entries (their
-/// callers get an error instead of silence) and re-attempts flushes for
-/// peers holding unsent frames after a transient send failure. The event
-/// paths (enqueue, the ACTIVE transition, inbound acks) drive the common
-/// case; this is the no-event backstop, a cheap no-op when every outbox
-/// is drained.
+/// Acked-delivery maintenance — re-attempts flushes for sessions still holding
+/// frames that have not reached the wire after a transient send failure.
+///
+/// Nothing expires here and nothing is expired anywhere: a retained frame ends
+/// when the peer acknowledges it or when the session retaining it ends, and this
+/// loop is the arbiter of neither. The frames belong to the session, not to a
+/// per-device outbox, so there is no queue here to age out and no caller for this
+/// tick to answer.
+///
+/// The event paths — submission, the ACTIVE transition, inbound acknowledgements
+/// — drive the common case. This is the no-event backstop, and a cheap no-op once
+/// every live session has flushed.
 pub(crate) struct ReliableSendTicker;
 
 #[async_trait]

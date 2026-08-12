@@ -51,6 +51,10 @@ pub struct PeerStateData {
     /// forever for a pre-features build, which is exactly the "assume
     /// nothing optional" senders must gate on.
     pub features: Vec<String>,
+    /// Attempt-owned funding for the peer-supplied Hello representation kept
+    /// here until this connector is retired. This is deliberately not copied
+    /// into snapshots: it is ownership, not diagnostic state.
+    pub(crate) hello_retention: Option<crate::resource::ResourceLease>,
     /// True after the exact current data channel accepts our `Approve` bytes
     /// for transmission. This does not prove remote receipt.
     pub local_approve_sent: bool,
@@ -227,6 +231,7 @@ impl Default for PeerStateData {
             tier: ConnectionTier::Steady,
             authenticated: false,
             features: Vec::new(),
+            hello_retention: None,
             local_approve_sent: false,
             remote_approve_seen: false,
             local_shelved: false,
@@ -255,6 +260,37 @@ impl Default for PeerStateData {
             admission_rejected: 0,
             diag: PeerDiag::default(),
         }
+    }
+}
+
+/// What one call to [`PeerConnection::promote_session_if_needed`] did.
+///
+/// Three answers rather than a boolean, because the caller acts differently on
+/// each and one of them is an event. A session that was *minted* by this call is
+/// the only moment at which anything owed to a new session becomes owed, and it
+/// happens exactly once per session however many operations later reuse it. A
+/// boolean collapses `Current` and `NewlyPromoted` into "usable", which is
+/// enough to proceed but not enough to announce — and an announcement derived
+/// from "usable" would fire on every operation for the life of the session.
+///
+/// `Refused` covers both the terminal refusals and the capacity one. Neither
+/// minted a session, so neither announces; the capacity refusal in particular
+/// leaves the authenticated channel installed, so a later operation promotes and
+/// *that* call is the one that announces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Promotion {
+    /// A session was already installed and every use-time conjunct still holds.
+    Current,
+    /// This call minted the session. Nothing owed to it has been done yet.
+    NewlyPromoted,
+    /// No usable session, and none was minted.
+    Refused,
+}
+
+impl Promotion {
+    /// Whether the caller may proceed against a live session.
+    pub(super) fn is_usable(self) -> bool {
+        matches!(self, Self::Current | Self::NewlyPromoted)
     }
 }
 
@@ -298,6 +334,9 @@ pub struct PeerConnection {
 static DIAGNOSTIC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl PeerConnection {
+    pub(super) fn revoke_promoted_session(&self) {
+        self.promoted_session.clear();
+    }
     pub(super) fn new(device_id: String, session: Option<Arc<WebRtcConnectorWorker>>) -> Self {
         Self {
             device_id,
@@ -544,7 +583,7 @@ impl PeerConnection {
     /// from "the fence refused and left it installed" — which is the whole
     /// difference between a revocation that takes effect and one that merely
     /// declines the next call while the authority stays alive behind it.
-    /// Gated to exactly its caller. The only control that asks this stands on a
+    /// Gated to exactly its callers. Every control that asks this stands on a
     /// live connector with a real promoted session, which only the
     /// `transport-lab` harness builds, so a plain `cargo test` compiles the
     /// tests module without it.
@@ -594,7 +633,8 @@ impl PeerConnection {
         &self,
         broker: &crate::runtime::session_broker::SessionBroker,
         mesh_context: &str,
-    ) -> bool {
+        policy_admits: bool,
+    ) -> Promotion {
         let worker = self.session.lock().clone();
         let live_connector = worker
             .as_ref()
@@ -611,7 +651,7 @@ impl PeerConnection {
         // operation this fence admits would keep running for a peer the mesh has
         // since refused.
         match self.promoted_session.reuse_or_revoke(|session| {
-            self.state.read().is_admitted()
+            policy_admits
                 && live_connector.as_ref().is_some_and(|connector| {
                     session.is_current_for(
                         connector,
@@ -621,20 +661,20 @@ impl PeerConnection {
                     )
                 })
         }) {
-            crate::runtime::peer_session::Reuse::Current => return true,
+            crate::runtime::peer_session::Reuse::Current => return Promotion::Current,
             // Refused outright rather than re-promoted. Promoting again here
             // would take a fresh post-authentication reservation for authority
             // that was just withdrawn, on the same call that observed the
             // withdrawal.
-            crate::runtime::peer_session::Reuse::Revoked => return false,
+            crate::runtime::peer_session::Reuse::Revoked => return Promotion::Refused,
             crate::runtime::peer_session::Reuse::Vacant => {}
         }
 
-        if self.registry_retired() || !self.state.read().is_admitted() {
-            return false;
+        if self.registry_retired() || !policy_admits {
+            return Promotion::Refused;
         }
         let (Some(connector), Some(worker)) = (live_connector, worker) else {
-            return false;
+            return Promotion::Refused;
         };
         // Re-proved under `promoted_session`, because the incarnation was read
         // before that guard was taken. This is the narrow window the lock order
@@ -644,7 +684,7 @@ impl PeerConnection {
         // the adapter's retirement state lives — the incarnation itself is an
         // identity token and answers no liveness question.
         if worker.live_connector_incarnation().is_none() {
-            return false;
+            return Promotion::Refused;
         }
         let policy = crate::runtime::session_broker::CurrentPolicyAdmission::from_admitted_peer(
             mesh_context,
@@ -669,9 +709,13 @@ impl PeerConnection {
                 // the same one by construction rather than by a later check.
                 self.promoted_session
                     .install(session, worker.new_session_flows());
-                true
+                Promotion::NewlyPromoted
             }
-            Err(_) => false,
+            // Includes the capacity refusal, which is not terminal: the exact
+            // authenticated channel is still installed, so the next application
+            // operation retries it and *that* promotion is the newly promoted
+            // one. Nothing is announced for an attempt that minted no session.
+            Err(_) => Promotion::Refused,
         }
     }
 
@@ -797,16 +841,11 @@ impl PeerConnection {
     /// Both use-time conjuncts, evaluated under the session slot's own guard.
     ///
     /// The connector half is identity — a session promoted from a superseded
-    /// connector is not this connector's. The policy half is *retained* state:
-    /// an eviction, a denial or a topology change revokes admission long after
-    /// promotion, and a session promoted while it held would otherwise keep
-    /// authorizing operations for a peer the mesh has since refused.
-    ///
-    /// Reading policy here rather than only on the promotion path is what makes
-    /// every projection agree. Without it, a projection reached directly —
-    /// a diagnostic snapshot, a flush pass — would lend a revoked session until
-    /// some unrelated operation happened to go through the registry wrapper and
-    /// notice, which makes revocation take effect at a time no caller controls.
+    /// connector is not this connector's. `is_admitted` is retained
+    /// handshake/topology state, not a live governance read. Governance changes
+    /// become authoritative at the registry's synchronous commit seam, which
+    /// clears the promoted slot and invalidates effect-begin witnesses before
+    /// later effects can start.
     ///
     /// Lock order is preserved: the slot evaluates this with its own guard held
     /// and `state` is taken inside a single statement, which is the order

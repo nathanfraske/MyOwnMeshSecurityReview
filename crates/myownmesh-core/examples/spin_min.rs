@@ -10,7 +10,19 @@ fn callback_policy() -> myownmesh_core::ConnectorCallbackPolicy {
     )
     .expect("MYOWNMESH_LAB_CALLBACK_CAPACITY must be nonzero");
     myownmesh_core::ConnectorCallbackPolicy::new(
-        myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+        // This probe opens a peer on a transport with no connector resource
+        // policy, so the connector mints its own finite provider from this
+        // policy and needs an explicit per-callback byte ceiling to size the
+        // grant. Stated here rather than inferred; it is a probe input and no
+        // product limit.
+        myownmesh_core::ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
+            capacity,
+            capacity,
+            std::num::NonZeroUsize::new(4_096)
+                .expect("the probe control payload ceiling is nonzero"),
+            std::num::NonZeroUsize::new(4_096)
+                .expect("the probe endpoint payload ceiling is nonzero"),
+        ),
         myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
         myownmesh_core::RealtimeConnectorPolicy::Disabled,
     )

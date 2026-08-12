@@ -487,7 +487,7 @@ impl ConnectorCloseOwner {
                     failure_owner.fail_cleanup(reason);
                 }),
             )
-            .is_err()
+            .was_refused()
         {
             self.fail_cleanup("process cleanup executor refused the close owner".to_string());
         }

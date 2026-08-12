@@ -55,9 +55,15 @@ impl EmbeddedDaemon {
         // Say goodbye before we go: a graceful `leave` per network so peers
         // drop our sessions immediately rather than waiting out a heartbeat.
         self.registry.announce_all_departures().await;
-        for net in self.registry.take_all() {
-            if let Err(e) = net.leave().await {
-                warn!("leave failed: {e:#}");
+        // Every distinct network, through the registry's own teardown. It used
+        // to hand back only the networks it could take sole ownership of, so a
+        // network held by one in-flight request at shutdown was silently left
+        // running and its peers waited out a heartbeat instead of seeing a
+        // leave. Nothing is skipped now, and a failed teardown is reported
+        // rather than assumed clean.
+        for outcome in self.registry.shutdown_all().await {
+            if let Err(e) = outcome {
+                warn!("network shutdown failed: {e}");
             }
         }
     }
@@ -178,10 +184,11 @@ async fn start_with_mesh(
 mod tests {
     use super::*;
 
-    /// `Mesh` is one per process and owns one process identity anchor, so the
-    /// real-daemon startup fixtures must not manufacture a second concurrent
-    /// process incarnation inside the test binary.
-    static CONNECTOR_DAEMON_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // The connector-capable startup fixture below installs a connector policy,
+    // so it spends from the one binary-wide budget `crate::test_resource_provider`
+    // grants. It serializes on `crate::exclusive_connector_fixture` with every
+    // other module that draws on the same pool. The infrastructure-only test
+    // beside it installs no policy and takes no guard.
 
     fn nz(value: usize) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(value).expect("startup fixture is nonzero")
@@ -228,7 +235,7 @@ mod tests {
     /// authority the caller could not otherwise reach.
     #[tokio::test]
     async fn the_connector_capable_daemon_starts_from_the_owner_policy_alone() {
-        let _fixture = CONNECTOR_DAEMON_FIXTURE.lock().await;
+        let _fixture = crate::exclusive_connector_fixture().await;
         let temp = tempfile::tempdir().expect("temporary daemon state");
         let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
         daemon_config.control_socket = Some(temp.path().join("daemon.sock"));

@@ -58,6 +58,8 @@ mdns-sd = "0.20"
 
 # Cross-platform local IPC (control socket)
 interprocess = { version = "2", features = ["tokio"] }
+widestring = "1.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
 
 # Concurrent data structures
 dashmap = "6"

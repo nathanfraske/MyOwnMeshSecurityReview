@@ -5,8 +5,12 @@
 //! The pre-active phases are:
 //!
 //!   1. `hello` — each side announces its claimed Device ID, a random
-//!      nonce, a verification code, and an optional capabilities
-//!      blob. Sent immediately on channel open.
+//!      nonce, a verification code, and its supported feature ids.
+//!      Sent immediately on channel open. It carries no application
+//!      capability advertisement: a Hello is admitted before any
+//!      session exists, so a blob here would be attacker-controlled
+//!      application metadata arriving ahead of the boundary that
+//!      admits application payload. See [`handshake::HelloMessage`].
 //!   2. `auth_response` — each side returns the other's nonce signed
 //!      with its own private key. Receiving a valid signature
 //!      authenticates that the sender owns the keypair matching its
@@ -26,10 +30,13 @@
 //!   - Application data over typed user-defined channels (see
 //!     [`crate::events`])
 //!
-//! Forward compat: a receiver getting an unknown `kind` silently
-//! drops the frame. Peers gate optional traffic per-peer via
-//! [`features`] capability negotiation so older peers aren't bombed
-//! with frames they'll discard.
+//! The frame set is closed. A receiver getting a `kind` this build
+//! does not implement refuses it — the frame fails to deserialize and
+//! reaches no handler — so there is no revision-tolerance to rely on.
+//! Peers still gate optional traffic per-peer via [`features`]
+//! capability negotiation, and that gating is the sender's half of the
+//! same rule: it keeps a peer from being sent frames it would only
+//! refuse.
 
 pub mod features;
 pub mod governance;
@@ -56,11 +63,45 @@ pub use topology::{ShelveMessage, UnshelveMessage};
 
 use serde::{Deserialize, Serialize};
 
+/// First-stage classification obtained from the small leading JSON tag only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameAdmission {
+    Protocol,
+    Application,
+}
+
+/// Parse only the canonical leading `kind` envelope emitted by this protocol.
+///
+/// Mixed-version support is intentionally absent. A peer that reorders the tag
+/// behind attacker-controlled payload is malformed rather than making the
+/// classifier scan or deserialize that payload before admission.
+pub(crate) fn classify_frame(bytes: &[u8]) -> Option<FrameAdmission> {
+    const PREFIX: &[u8] = br#"{"kind":""#;
+    const MAX_KIND_BYTES: usize = 32;
+    let rest = bytes.strip_prefix(PREFIX)?;
+    let end = rest
+        .iter()
+        .take(MAX_KIND_BYTES + 1)
+        .position(|byte| *byte == b'"')?;
+    if end > MAX_KIND_BYTES {
+        return None;
+    }
+    let kind = std::str::from_utf8(&rest[..end]).ok()?;
+    Some(match kind {
+        "hello" | "auth_response" | "approve" | "deny" => FrameAdmission::Protocol,
+        _ => FrameAdmission::Application,
+    })
+}
+
 /// Tagged union of every wire frame the mesh transport carries.
-/// Receivers match on `kind`; unknown kinds are silently dropped on
-/// deserialize via the `Unknown` catch-all variant so we can decode
-/// the rest of an incoming stream even when a sender emits a frame
-/// from a future protocol revision.
+///
+/// The set is closed. There is no catch-all variant and no
+/// `serde(other)`, so a frame whose `kind` is not one of these fails
+/// to deserialize and is refused before any handler sees it. That is
+/// the point rather than an omission: tolerating a kind this build
+/// does not implement is mixed-version operation, which this protocol
+/// no longer offers. Frames are discrete, so refusing one costs
+/// nothing but that frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MeshMessage {
@@ -140,13 +181,6 @@ pub enum MeshMessage {
         stream: u64,
         up_to: u64,
     },
-
-    /// Unknown frame from a future protocol revision. Captured here
-    /// so the receiver's deserializer doesn't fail the whole stream
-    /// — the engine forwards Unknown frames as `Diag` events but
-    /// otherwise ignores them.
-    #[serde(other)]
-    Unknown,
 }
 
 #[cfg(test)]
@@ -154,10 +188,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_kind_decodes_as_unknown_variant() {
+    fn bounded_leading_tag_classifies_without_parsing_application_payload() {
+        assert_eq!(
+            classify_frame(br#"{"kind":"hello","payload":[}}"#),
+            Some(FrameAdmission::Protocol)
+        );
+        assert_eq!(
+            classify_frame(br#"{"kind":"channel","payload":[}}"#),
+            Some(FrameAdmission::Application)
+        );
+        assert_eq!(classify_frame(br#"{"payload":[],"kind":"hello"}"#), None);
+    }
+
+    #[test]
+    fn unknown_kind_is_refused() {
         let raw = r#"{"kind":"definitely_not_a_real_kind","whatever":1}"#;
-        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        assert!(matches!(msg, MeshMessage::Unknown));
+        assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
     }
 
     #[test]
@@ -269,19 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn old_peer_drops_governance_frame_as_unknown() {
-        // A v0 peer (no `network_state_v1` flag) receiving one of
-        // these frames just sees an Unknown variant — its dispatch
-        // loop logs and drops without errors. The sender side gates
-        // emission on the peer's advertised features, but receivers
-        // belt-and-braces handle the case.
+    fn a_governance_kind_this_build_implements_decodes_and_a_future_one_is_refused() {
+        // A supported peer decodes this exact frame.
         let raw = r#"{"kind":"network_state_propose","proposal_id":"x","variant":{"kind":"role_grant","target":"a","role":"member"},"proposer":"b","created_at":0,"signature":"s"}"#;
         let msg: MeshMessage = serde_json::from_str(raw).unwrap();
         assert!(matches!(msg, MeshMessage::NetworkStatePropose(_)));
-        // And the inverse — a future kind a v1 doesn't know about
-        // still hits Unknown.
+        // The inverse fails closed: there is no mixed-version live fallback.
         let raw_future = r#"{"kind":"network_state_some_future_thing","whatever":1}"#;
-        let msg: MeshMessage = serde_json::from_str(raw_future).unwrap();
-        assert!(matches!(msg, MeshMessage::Unknown));
+        assert!(serde_json::from_str::<MeshMessage>(raw_future).is_err());
     }
 }

@@ -25,11 +25,17 @@ use super::*;
 /// `None` is ordinary, not an error: a flow closed before negotiation reached
 /// the native layer has nothing outstanding.
 pub(crate) enum RealtimeFlowRemains {
-    /// The token whose transceiver is still to be stopped. The caller stops it
-    /// through the connector worker, which owns that decision; a token whose
-    /// retirement someone else already claimed is a no-op there, which is what
-    /// makes an explicit close and an implicit drop safe to race.
-    Inbound(Arc<RealtimeTrackIdentity>),
+    /// The retirement owner for a transceiver still to be stopped.
+    ///
+    /// It is an owner rather than a bare token because the two ways a flow ends
+    /// are not the same. An explicit close takes the submission out and awaits
+    /// the receipt through the connector worker, which is what lets a daemon
+    /// acknowledge truthfully. An implicit end — revocation, replacement,
+    /// shutdown, the session simply going — never calls anything, so the
+    /// submission has to be the drop itself. A token whose retirement someone
+    /// else already claimed is a no-op wherever it arrives, which is what makes
+    /// the two safe to race.
+    Inbound(RealtimeInboundRetirement),
     /// A receipt for the outbound pump's own retirement.
     ///
     /// The close that produced it dropped the flow's queue, which is what wakes
@@ -189,9 +195,15 @@ pub(crate) struct RealtimeFlow {
     pub(super) end: RealtimeFlowEnd,
     /// What this flow's close will leave for its caller to finish.
     ///
-    /// Recorded as negotiation reaches the native layer — a token at
+    /// Recorded as negotiation reaches the native layer — a retirement owner at
     /// `bind_inbound`, a completion lease at `attach_outbound` — and taken out
-    /// exactly once, by close. A flow that never got that far leaves `None`.
+    /// by close. A flow that never got that far leaves `None`.
+    ///
+    /// A close is not the only thing that ends it. Both arms retire whatever
+    /// they hold when this flow is simply dropped: the inbound retirement
+    /// submits, and dropping the outbound receipt only stops anyone waiting for
+    /// a retirement the pump performs regardless. A close therefore makes the
+    /// end *awaitable*, not merely certain.
     pub(super) native: RealtimeFlowRemains,
     /// The incarnation the opening session was promoted from. Retained by
     /// value so the gate below compares against the connector this flow was
@@ -308,11 +320,18 @@ impl RealtimeFlow {
 /// Refuses before claiming anything if the session is not current on this
 /// incarnation, so a replaced session cannot consume a label or a flow slot on
 /// its way to being refused.
+///
+/// **The name was checked free by the caller, against the flow map, under the
+/// same borrow that will insert into it.** There is no second table of held
+/// names here and no `release` on the refusal paths below: the label is a leased
+/// record, so a refused open drops the only copy that ever existed and the bytes
+/// go back with it. A name is in use exactly when a flow of this session is
+/// keyed by it, which is one fact in one place rather than two that agree until
+/// they do not.
 pub(super) fn open_session_flow(
     session: &impl RealtimeSessionBinding,
     live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
     registry: &Arc<RealtimeFlowRegistry>,
-    labels: &mut RealtimeFlowLabels,
     spec: RealtimeFlowSpec,
 ) -> FlowResult<(RealtimeFlow, crate::resource::ResourceLease)> {
     // Same acquisition rule as the send-time gate: `live` is the worker's own
@@ -327,10 +346,15 @@ pub(super) fn open_session_flow(
         return Err(RealtimeFlowError::SessionNotCurrent);
     }
     // One allocator, and it is not this one. The application names the label;
-    // this side claims exactly that value or refuses. There is no lowest-free
+    // this side mints exactly that value or refuses. There is no lowest-free
     // path in production: a second allocator over one space would collide on a
     // live flow rather than fail at open.
-    let label = labels.claim_exact(&spec.name, registry)?;
+    //
+    // A label is a leased name, not a permission. Holding one proves only that
+    // this session paid for these bytes; every use of the flow behind it is
+    // re-gated by `port_if_current`, so nothing downstream may treat possession
+    // of a label as authority to move anything.
+    let label = RealtimeFlowLabel::mint(spec.name.clone(), registry)?;
     // The checked forms deliberately, not the `Option` twins: those are
     // `#[cfg(test)]` or discard the reason, and a refused open is worth
     // knowing the cause of even where this layer answers one variant for all
@@ -339,18 +363,13 @@ pub(super) fn open_session_flow(
         RealtimeDirection::Outbound => registry.open_outbound_flow_checked(),
         RealtimeDirection::Inbound => registry.open_inbound_flow_checked(),
     };
-    // The connector refused: its own ceiling, or resources. Hand the label
-    // back before returning, or a refused open would burn a name no flow ever
-    // held. The reason stays inside the connector, which already recorded it
-    // through its own drop accounting; surfacing it here would put a
-    // connector-local vocabulary in this layer's public error.
-    let port = match port {
-        Ok(port) => port,
-        Err(refused) => {
-            labels.release(&label);
-            return Err(realtime_drop_refusal(refused));
-        }
-    };
+    // The connector refused: its own ceiling, or resources. Returning here
+    // drops `label`, which is the whole of handing the name back — there is no
+    // table to remove it from, so a refused open cannot burn a name. The reason
+    // stays inside the connector, which already recorded it through its own drop
+    // accounting; surfacing it here would put a connector-local vocabulary in
+    // this layer's public error.
+    let port = port.map_err(realtime_drop_refusal)?;
     // The node in the session's flow map that this record is about to occupy.
     // Last of the three claims an open takes, and released the same way as the
     // other two if it is refused: the label goes back here, and the port goes
@@ -360,38 +379,22 @@ pub(super) fn open_session_flow(
     // is what will hold the node and the map is what must be given the lease
     // that funded it. A copy kept here as well would be a second charge for one
     // allocation.
-    let map_entry = match registry.acquire_map_entry::<RealtimeFlowLabel, RealtimeFlow>() {
-        Ok(entry) => entry,
-        Err(refused) => {
-            labels.release(&label);
-            return Err(realtime_drop_refusal(refused));
-        }
-    };
+    let map_entry = registry
+        .acquire_map_entry::<RealtimeFlowLabel, RealtimeFlow>()
+        .map_err(realtime_drop_refusal)?;
     // The blocks this flow's own constructors are about to allocate: one wake
     // in either direction, and outbound additionally a queue and the wake that
     // drives its pump. Each is funded before it exists and each carries its own
     // lease, because the three do not share a lifetime — see
     // [`RealtimeFlowRegistry::flow_root_claim`].
     //
-    // A refusal here hands the label back exactly as the two acquisitions above
-    // do. Nothing else needs unwinding: the port goes back by being dropped, and
-    // any block minted before the refusal is dropped with the value that held
-    // it, which is what releases its funding.
-    let end = match RealtimeFlowEnd::mint(registry) {
-        Ok(end) => end,
-        Err(refused) => {
-            labels.release(&label);
-            return Err(refused);
-        }
-    };
+    // A refusal here unwinds by returning, exactly as the two acquisitions above
+    // do. Nothing needs undoing by hand: the label, the port and any block
+    // minted before the refusal are all dropped with this frame, and each of
+    // those drops is what releases its own funding.
+    let end = RealtimeFlowEnd::mint(registry)?;
     let queue = match spec.direction {
-        RealtimeDirection::Outbound => match RealtimeFlowQueue::mint(registry) {
-            Ok(queue) => FlowQueue::Outbound(queue),
-            Err(refused) => {
-                labels.release(&label);
-                return Err(refused);
-            }
-        },
+        RealtimeDirection::Outbound => FlowQueue::Outbound(RealtimeFlowQueue::mint(registry)?),
         RealtimeDirection::Inbound => FlowQueue::Inbound,
     };
     Ok((

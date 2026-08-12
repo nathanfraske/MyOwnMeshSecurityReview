@@ -94,6 +94,21 @@ impl<T> SessionStream<T> {
     fn take(&self) -> Option<T> {
         self.items.lock().pop_front()
     }
+
+    /// Drop every queued item `discard` answers true for, in place.
+    ///
+    /// Order-preserving, and each discarded item is destroyed where it sat: its
+    /// node's record lease and whatever the item itself holds are released at
+    /// the moment it stops being queued, not at some later sweep.
+    ///
+    /// It exists for exactly one caller — a close, which must not leave units
+    /// addressed to a name the session is about to make claimable again. No
+    /// wake is emitted: nothing arrived, and a consumer that was parked has
+    /// strictly less to take than before, so there is nothing to tell it about.
+    pub(super) fn purge(&self, discard: impl FnMut(&T) -> bool) {
+        let mut discard = discard;
+        self.items.lock().retain(|item| !discard(item));
+    }
 }
 
 /// The consumer end of a session stream.

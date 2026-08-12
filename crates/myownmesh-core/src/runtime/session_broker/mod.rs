@@ -8,7 +8,8 @@
 //! - the current policy answer, produced by the narrow temporary adapter in
 //!   [`policy`] over the engine's existing admission state;
 //! - one explicit local process principal;
-//! - one real post-authentication resource reservation.
+//! - exact post-authentication reservations for the promoted record and the
+//!   refcounted validity block its delayed witnesses share.
 //!
 //! Two invalidations are structural rather than checked by a timer or a
 //! generation counter. Connector replacement invalidates because the capability
@@ -23,7 +24,10 @@
 
 pub(crate) mod policy;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::application_gateway::LocalPrincipalCapability;
 use crate::connector::ConnectorIncarnation;
@@ -120,9 +124,95 @@ pub(crate) struct SessionCapability {
     /// so currentness is decided by pointer identity rather than by a device id
     /// a replacement may since have taken over.
     connector: Arc<ConnectorIncarnation>,
+    validity: Arc<SessionValidity>,
+}
+
+/// The purpose-owned allocation shared by one session and its delayed
+/// witnesses. Its lease lives in this allocation, last, so it remains funded
+/// until the final witness drops rather than merely until the session does.
+struct SessionValidity {
+    live: AtomicBool,
+    wake: tokio::sync::Notify,
+    _lease: ResourceLease,
+}
+
+impl SessionValidity {
+    fn claim() -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+        let record = std::mem::size_of::<Self>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            })?;
+        ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                u64::try_from(record).map_err(|_| {
+                    crate::resource::ResourceClaimArithmeticError::Overflow {
+                        dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+                    }
+                })?,
+            ),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+    }
+
+    fn mint(permit: &SessionPermit) -> Result<Arc<Self>, ResourceUnavailable> {
+        let lease = permit.reserve_retained(Self::claim().expect(
+            "the validity record claim is size_of arithmetic over fixed types and cannot overflow",
+        ))?;
+        Ok(Arc::new(Self {
+            live: AtomicBool::new(true),
+            wake: tokio::sync::Notify::new(),
+            _lease: lease,
+        }))
+    }
+
+    fn invalidate(&self) {
+        self.live.store(false, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+}
+
+/// A cloneable, read-only proof that an owned operation still belongs to the
+/// promoted session that minted it.
+#[derive(Clone)]
+pub(crate) struct SessionValidityWitness {
+    validity: Arc<SessionValidity>,
+}
+
+impl SessionValidityWitness {
+    pub(crate) fn is_live(&self) -> bool {
+        self.validity.live.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn revoked(&self) {
+        loop {
+            if !self.is_live() {
+                return;
+            }
+            let notified = self.validity.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_live() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for SessionCapability {
+    fn drop(&mut self) {
+        self.validity.invalidate();
+    }
 }
 
 impl SessionCapability {
+    pub(crate) fn validity_witness(&self) -> SessionValidityWitness {
+        SessionValidityWitness {
+            validity: Arc::clone(&self.validity),
+        }
+    }
     fn runtime(&self) -> &RuntimeIncarnation {
         self.permit.runtime()
     }
@@ -258,6 +348,12 @@ pub(crate) struct SessionBroker {
 }
 
 impl SessionBroker {
+    pub(crate) fn reserve_local_application(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.resources.reserve_application(claim)
+    }
     /// Install the broker for one live Mesh runtime.
     ///
     /// The principal is minted once, here, from the explicit local process
@@ -344,10 +440,12 @@ impl SessionBroker {
             return Err(error);
         }
 
-        // The last fallible step, and the only one that can refuse a channel
-        // which is in every other respect promotable. Until it succeeds the slot
-        // still holds its channel, so `?` here retries cleanly.
+        // The one fallible step that can refuse a channel which is in every
+        // other respect promotable. Until it succeeds the slot still holds its
+        // channel, so `?` here retries cleanly.
         let permit = SessionPermit::reserve(&self.resources, self.runtime.clone())
+            .map_err(|_| SessionPromotionError::ResourcesUnavailable)?;
+        let validity = SessionValidity::mint(&permit)
             .map_err(|_| SessionPromotionError::ResourcesUnavailable)?;
 
         // Infallible from here: the move out of the slot *is* the commit.
@@ -360,6 +458,7 @@ impl SessionBroker {
             local_principal: Arc::clone(&self.principal),
             permit,
             connector: Arc::clone(connector),
+            validity,
         })
     }
 }
@@ -371,12 +470,15 @@ pub(crate) fn session_for_test(runtime: RuntimeIncarnation) -> SessionCapability
     let local_principal = Arc::new(LocalPrincipalCapability::for_test(runtime.clone()));
     let permit = SessionPermit::reserve(&test_resource_scope(), runtime)
         .expect("fixture provider admits one session reservation");
+    let validity = SessionValidity::mint(&permit)
+        .expect("fixture provider admits one session validity allocation");
 
     SessionCapability {
         authenticated_channel,
         local_principal,
         permit,
         connector,
+        validity,
     }
 }
 
@@ -402,21 +504,31 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
 /// session claim alone is short by exactly the record the provider keeps, and is
 /// short *silently* until the grant happens to bind — which is the defect this
 /// exists to make unrepeatable.
-#[cfg(any(test, feature = "transport-lab"))]
 pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
-    crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+    let session = crate::resource::FiniteResourceProvider::reservation_planning_charge(
         crate::runtime::peer_session::PromotedSession::promotion_claim()
             .expect("the promoted record claim is `size_of` arithmetic and cannot overflow"),
     )
-    .expect("one session claim plus the provider's reservation record is representable")
+    .expect("one session claim plus the provider's reservation record is representable");
+    let validity = session_validity_reservation_charge_for_test();
+    session
+        .checked_add(validity)
+        .expect("the session and validity reservations compose")
+}
+
+fn session_validity_reservation_charge_for_test() -> ResourceClaim {
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        SessionValidity::claim().expect("the validity record claim is fixed-size arithmetic"),
+    )
+    .expect("one validity claim plus the provider's reservation record is representable")
 }
 
 /// The exact reservation one promoted session takes out of a fixture's grant.
 ///
 /// Public so an **external** integration-test fixture can leave room for the
-/// sessions it promotes, and unavailable without `transport-lab` so it stays out
-/// of the default public API — the same shape as
-/// [`transport_lab_connector_fixture_grant`](crate::transport_lab_connector_fixture_grant).
+/// sessions it promotes. Promotion is part of the default connector rather
+/// than a transport-lab feature, so this planning claim is always available;
+/// raw lab constructors remain feature-gated separately.
 /// An integration test is a separate crate: it sees only `pub` items and links
 /// the library built *without* `cfg(test)`, so neither the `pub(crate)` helper
 /// above nor the provider's own charge is reachable from one. This is.
@@ -427,8 +539,7 @@ pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
 /// session — and short *silently*, binding or refusing on whatever slack some
 /// unrelated term happened to leave. Deriving it here is what stops a fixture
 /// from restating a number the broker owns.
-#[cfg(feature = "transport-lab")]
-pub fn transport_lab_session_reservation_claim() -> ResourceClaim {
+pub fn session_reservation_planning_claim() -> ResourceClaim {
     session_reservation_charge_for_test()
 }
 
@@ -474,9 +585,95 @@ fn fixture_grant(sessions: u64) -> ResourceClaim {
         .expect("the fixture grant is representable")
 }
 
+/// The largest single stream payload this module's baseline scope funds
+/// retained, and how many of them it funds at once.
+///
+/// Owner-stated numbers, not a figure borrowed from a wire limit. They size a
+/// grant: nothing here is checked against a payload on its way in, so a fixture
+/// that funds too little sees a refusal, never a truncation.
+///
+/// Two items, and both have a named holder: one payload queued in a mailbox,
+/// and one further payload's claim taken while the first is still queued. That
+/// is exactly the shape
+/// `rpc::session_ownership_tests::stream_pressure_refuses_without_queueing`
+/// exercises, and the count is what makes it discriminating — funding one would
+/// refuse its oversized push for want of a slot rather than for its size, which
+/// is the same vacuity as funding none. More would be capacity nothing here
+/// holds. The payload figure is deliberately far below the oversized push that
+/// control makes, for the same reason.
+#[cfg(test)]
+const FIXTURE_STREAM_PAYLOAD_BYTES: usize = 8 * 1024;
+#[cfg(test)]
+const FIXTURE_STREAM_ITEMS: u64 = 2;
+
+/// Room for what a promoted session later retains, over and above its record.
+///
+/// A session record and the work that session goes on to retain are different
+/// quantities, and this is the second one.
+/// [`PromotedSession::promotion_claim`](crate::runtime::peer_session::PromotedSession::promotion_claim)
+/// funds neither queue content nor queue nodes on purpose: at promotion the
+/// session's queue is empty and holds no node, and everything it later retains
+/// is funded at the moment it is retained, through
+/// [`SessionCapability::reserve_retained`]. Pre-paying retention into the record
+/// would restore the fixed ceiling that design exists to remove, so the fixture
+/// leaves room for retention that no record was ever charged for instead.
+///
+/// The claim is taken from the gateway in the same two calls
+/// `RpcStreamInbox::push` makes — one payload's retention plus one mailbox node
+/// — rather than restated here. A fixture that writes out its own formula is
+/// exactly how a grant denominated in records came to meet a claim denominated
+/// in bytes, and be short in a dimension no term in it ever named.
+///
+/// Each of the two is charged as its **own** reservation, and their sum is not
+/// charged once. `push` takes two independent
+/// [`SessionCapability::reserve_retained`] calls and therefore holds two leases,
+/// for which the provider keeps two records. Charging the combined claim would
+/// budget one record per item and leave the second paid for out of whatever
+/// slack some unrelated term happened to leave — which is the same silent
+/// underfunding this whole term exists to close.
+#[cfg(test)]
+fn fixture_stream_retention_claim() -> ResourceClaim {
+    use crate::application_gateway::GatewayMailbox;
+    use crate::resource::FiniteResourceProvider;
+
+    let payload = FiniteResourceProvider::reservation_charge_for_test(
+        GatewayMailbox::<serde_json::Value>::retention_claim(FIXTURE_STREAM_PAYLOAD_BYTES, 1)
+            .expect("one retained stream payload claim is representable"),
+    )
+    .expect("the retained payload claim plus its provider record is representable");
+    let node = FiniteResourceProvider::reservation_charge_for_test(
+        GatewayMailbox::<serde_json::Value>::node_claim()
+            .expect("the mailbox node claim is `size_of` arithmetic and cannot overflow"),
+    )
+    .expect("the mailbox node claim plus its provider record is representable");
+
+    payload
+        .checked_add(node)
+        .expect("one retained item is its payload's reservation plus its node's")
+        .checked_scale(FIXTURE_STREAM_ITEMS)
+        .expect("the fixture retention capacity is representable")
+}
+
+/// The baseline scope every control in this module — and `rpc`'s session
+/// controls — draws on.
+///
+/// Two named terms rather than one, because they fund different things: room to
+/// promote sessions, and room for what a promoted session retains afterwards.
+///
+/// The retention term is added here rather than inside [`fixture_grant`] on
+/// purpose. Retention is not a property of a session record, so scaling it by
+/// the session count would be the pre-payment
+/// [`fixture_stream_retention_claim`] exists to avoid; and the exactness
+/// controls below grant `fixture_grant(1)` and depend on it admitting exactly
+/// one session, which slack in the dimensions retention shares with a record
+/// would quietly undo.
 #[cfg(test)]
 fn test_resource_scope() -> MeshConnectorResourceScope {
-    scope_for_grant(fixture_grant(64))
+    scope_for_grant(
+        fixture_grant(64)
+            .checked_add(fixture_stream_retention_claim())
+            .expect("the fixture session and retention grants compose"),
+    )
 }
 
 /// Stand one isolated provider up over `grant` and issue its Mesh scope.
@@ -531,6 +728,54 @@ mod tests {
         assert!(session.runtime().is_same(&runtime));
         assert!(session.local_principal().runtime().is_same(&runtime));
         assert!(session.authenticated_for("fixture-mesh", "fixture-device-remote"));
+    }
+
+    #[test]
+    fn v4_arc05_validity_allocation_stays_funded_until_the_last_witness_drops() {
+        use crate::resource::{FiniteResourceProvider, ProcessResourceRoot, ResourceProviderPort};
+
+        let grant = fixture_grant(1);
+        let provider = FiniteResourceProvider::new(grant);
+        let port =
+            ResourceProviderPort::new(provider.clone()).expect("the grant funds the process scope");
+        let scope = ProcessResourceRoot::isolated()
+            .install_resource_provider(port)
+            .expect("the isolated root accepts one provider")
+            .issue_mesh_scope()
+            .expect("the provider funds the mesh scope");
+        let runtime = crate::runtime::runtime_for_test();
+        let broker = SessionBroker::new(runtime.clone(), scope);
+        let channel = crate::endpoint_auth::authenticated_for_test(runtime);
+        let connector = Arc::clone(channel.record().connector());
+        let baseline = provider.in_use();
+        let mut slot = Some(channel);
+        let session = broker
+            .promote(
+                &mut slot,
+                &connector,
+                CurrentPolicyAdmission::admitted_for_test(),
+            )
+            .expect("the exact session and validity reservations are available");
+        let witness = session.validity_witness();
+
+        drop(session);
+        assert!(
+            !witness.is_live(),
+            "session drop synchronously invalidates witnesses"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(session_validity_reservation_charge_for_test())
+                .expect("the baseline and validity reservation compose"),
+            "the session reservation returns but the refcounted validity block remains funded",
+        );
+        drop(witness);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the final witness drop releases the validity block and its provider record",
+        );
     }
 
     #[test]

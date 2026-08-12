@@ -35,7 +35,8 @@ use super::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass, Resource
 /// provider believes memory is free while it is still occupied.
 struct LeasedQueueNode<T> {
     value: T,
-    /// Covers this node's allocation and whatever the caller retained with it.
+    /// Covers only this queue node's allocation. Any off-node retention in
+    /// `value` owns a separate lease for its full lifetime.
     _entry: ResourceLease,
     next: Option<Box<LeasedQueueNode<T>>>,
 }
@@ -101,8 +102,7 @@ impl<T> LeasedQueue<T> {
         }
     }
 
-    /// Everything one entry costs: this queue's node, plus whatever the caller
-    /// retains inside it.
+    /// Everything one entry costs: exactly this queue's node.
     ///
     /// The single calibration point. An owner never writes the node's size
     /// itself — it states only its own retention, and this adds the exact
@@ -111,16 +111,13 @@ impl<T> LeasedQueue<T> {
     /// caller's value inline, the lease handle, and the link; the residual is 1
     /// because the entry is exactly one allocation.
     ///
-    /// `retained` is the caller's own claim for that entry and nothing is
-    /// assumed about it: a queue of inline values passes
-    /// [`ResourceClaim::ZERO`], and a queue of entries owning a heap payload
-    /// passes that payload's bytes. Acquiring the resulting claim is the
-    /// caller's, because the scope and the authority class are the owner's
-    /// facts, and a refusal is the owner's error to report.
+    /// Anything `T` retains off-node owns a separate lease inside `T`. That
+    /// separation is load-bearing: [`Self::pop_front`] releases the removed
+    /// node before returning `T`, while the returned value can remain live for
+    /// arbitrarily longer. A combined lease would tell the provider that the
+    /// value's retention had ended while the caller still owned it.
     #[must_use = "the entry claim must be acquired before the entry is pushed"]
-    pub(crate) fn entry_claim(
-        retained: ResourceClaim,
-    ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    pub(crate) fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         let record_bytes =
             u64::try_from(std::mem::size_of::<LeasedQueueNode<T>>()).map_err(|_| {
                 ResourceClaimArithmeticError::Overflow {
@@ -130,8 +127,7 @@ impl<T> LeasedQueue<T> {
         ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, record_bytes),
             (ResourceClass::OpaqueDependencyResidual, 1),
-        ])?
-        .checked_add(retained)
+        ])
     }
 
     /// Append one entry, which now owns the lease that funded it.
@@ -159,12 +155,21 @@ impl<T> LeasedQueue<T> {
     ///
     /// Takes `&mut self` because answering may require moving the push chain
     /// across, which is a change to the representation and not to the contents.
+    ///
+    /// Controls only. An owner that wants the oldest entry takes it —
+    /// [`Self::pop_front`] — because looking first and then taking is two views
+    /// of a queue that can change between them, and the borrow this returns
+    /// would have to be released before the take anyway. What the controls need
+    /// it for is the opposite: asserting *which* entry is at the front without
+    /// consuming it, so the ordering assertion and the release assertion can be
+    /// separate.
+    #[cfg(test)]
     pub(crate) fn front(&mut self) -> Option<&T> {
         self.expose_front();
         self.oldest.as_ref().map(|node| &node.value)
     }
 
-    /// Remove and return the oldest entry, releasing that entry's lease.
+    /// Remove and return the oldest entry, releasing only its node lease.
     pub(crate) fn pop_front(&mut self) -> Option<T> {
         self.expose_front();
         let node = *self.oldest.take()?;
@@ -181,9 +186,31 @@ impl<T> LeasedQueue<T> {
             .len
             .checked_sub(1)
             .expect("an entry was removed, so the count was not zero");
-        // `_entry` is released here, after the value it funded has been handed
-        // back to the caller and is no longer this queue's to account for.
+        // `_entry` funds only the removed node and is released here. Any
+        // off-node retention travels with `value` under a lease owned by T.
         Some(value)
+    }
+
+    /// Remove and return the newest entry, releasing only its node lease.
+    ///
+    /// Used by an owner unwinding an insertion whose subsequent scheduling
+    /// link could not be installed. It preserves every older entry and moves no
+    /// allocation that remains live.
+    pub(crate) fn pop_back(&mut self) -> Option<T> {
+        self.merge();
+        let mut cursor = &mut self.oldest;
+        loop {
+            let is_last = cursor.as_ref()?.next.is_none();
+            if is_last {
+                let node = *cursor.take()?;
+                self.len = self
+                    .len
+                    .checked_sub(1)
+                    .expect("an entry was removed, so the count was not zero");
+                return Some(node.value);
+            }
+            cursor = &mut cursor.as_mut()?.next;
+        }
     }
 
     /// Every entry, oldest first, mutable in place.
@@ -243,11 +270,13 @@ impl<T> LeasedQueue<T> {
         self.len
     }
 
-    /// Controls only. An owner that wants to know whether there is work reaches
-    /// for the entry itself — `front` or `pop_front` — because the answer it
-    /// actually needs is the entry, and asking emptiness first would be a second
-    /// look at a queue that can change between the two.
-    #[cfg(test)]
+    /// Whether this owner currently retains no queue nodes.
+    ///
+    /// A consumer normally reaches for `pop_front` directly. The predicate is
+    /// also valid immediately after a pop while the caller still holds the
+    /// queue's enclosing owner lock: that same-owner observation lets a bounded
+    /// service loop reschedule remaining work without racing a producer or
+    /// taking an unfenced second look.
     pub(crate) const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -362,6 +391,7 @@ mod tests {
     struct ControlEntry {
         order: u64,
         dropped: DropLog,
+        _retention: ResourceLease,
     }
 
     impl Drop for ControlEntry {
@@ -388,12 +418,17 @@ mod tests {
     /// control never states a capacity number of its own.
     fn control_grant(entries: u64) -> ResourceClaim {
         let scope_record = FiniteResourceProvider::scope_record_charge_for_test();
-        let per_entry = LeasedQueue::<ControlEntry>::entry_claim(control_retention())
+        let node = LeasedQueue::<ControlEntry>::entry_claim()
             .expect("the control entry claim is representable")
             .checked_add(scope_record)
             .expect("the control entry claim plus its reservation record is representable");
+        let retention = control_retention()
+            .checked_add(scope_record)
+            .expect("the retention claim plus its reservation record is representable");
         (0..entries)
-            .try_fold(scope_record, |total, _| total.checked_add(per_entry))
+            .try_fold(scope_record, |total, _| {
+                total.checked_add(node)?.checked_add(retention)
+            })
             .expect("the bounded control grant is representable")
     }
 
@@ -414,20 +449,24 @@ mod tests {
         order: u64,
         dropped: &DropLog,
     ) {
-        let entry = port
+        let node = port
             .acquire(
                 scope,
                 ResourceAuthorityClass::Admitted,
-                LeasedQueue::<ControlEntry>::entry_claim(control_retention())
+                LeasedQueue::<ControlEntry>::entry_claim()
                     .expect("the control entry claim is representable"),
             )
             .expect("the control grant funds this entry");
+        let retention = port
+            .acquire(scope, ResourceAuthorityClass::Admitted, control_retention())
+            .expect("the control grant funds this value's retention");
         queue.push(
             ControlEntry {
                 order,
                 dropped: Arc::clone(dropped),
+                _retention: retention,
             },
-            entry,
+            node,
         );
     }
 
@@ -492,12 +531,18 @@ mod tests {
             "three funded entries are holding both the retention and the node terms"
         );
 
-        drop(queue.pop_front());
+        let removed = queue.pop_front().expect("one entry is queued");
         let after_one = provider.in_use();
         assert!(
-            after_one.amount(ResourceClass::QueuedBytes) < full.amount(ResourceClass::QueuedBytes),
-            "taking one entry released that entry's retention"
+            after_one.amount(ResourceClass::QueuedBytes) == full.amount(ResourceClass::QueuedBytes),
+            "taking one entry keeps its off-node retention funded while the value lives"
         );
+        assert!(
+            after_one.amount(ResourceClass::AccountedMemoryBytes)
+                < full.amount(ResourceClass::AccountedMemoryBytes),
+            "taking one entry releases exactly its queue node"
+        );
+        drop(removed);
         assert!(
             after_one.amount(ResourceClass::QueuedBytes) > 0,
             "the entries still queued are still paid for"
@@ -544,18 +589,17 @@ mod tests {
         );
     }
 
-    /// The entry claim states the node and the caller's retention, and neither
-    /// term is the other.
+    /// The entry claim states only the node; value retention is independent.
     #[test]
-    fn v4_arc05_the_entry_claim_charges_the_node_beside_the_callers_retention() {
+    fn v4_arc05_the_entry_claim_charges_only_the_queue_node() {
         let retention = control_retention();
-        let entry = LeasedQueue::<ControlEntry>::entry_claim(retention)
+        let entry = LeasedQueue::<ControlEntry>::entry_claim()
             .expect("the control entry claim is representable");
 
         assert_eq!(
             entry.amount(ResourceClass::QueuedBytes),
-            retention.amount(ResourceClass::QueuedBytes),
-            "the caller's retention is carried through unchanged"
+            0,
+            "the value's off-node retention is not released with the node"
         );
         assert_eq!(
             entry.amount(ResourceClass::AccountedMemoryBytes),

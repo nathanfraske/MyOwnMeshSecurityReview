@@ -175,8 +175,7 @@ pub use runtime::attempt::{
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
     WebRtcConnectorCapablePolicy,
 };
-#[cfg(feature = "transport-lab")]
-pub use runtime::session_broker::transport_lab_session_reservation_claim;
+pub use runtime::session_broker::session_reservation_planning_claim;
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 #[cfg(feature = "transport-lab")]
@@ -211,9 +210,11 @@ pub const SIGN_DOMAIN_TAG: &str = "myownmesh-mesh-auth-v1:";
 /// downstream forks can isolate their fleet.
 pub const TRYSTERO_APP_ID: &str = "myownmesh-cloud-mesh-v1";
 
-/// Wire-protocol version. Stays at 1 across additive changes (new
-/// optional fields, new message kinds); a v1 receiver getting an
-/// unknown message kind silently drops it. Bump only when an existing
-/// message's wire shape changes incompatibly — finer-grained
-/// capability negotiation happens in [`protocol::features`].
+/// Wire-protocol version. Stays at 1 across additive changes — new
+/// optional fields, and new message kinds that senders gate on a
+/// capability the receiver advertises through [`protocol::features`].
+/// "Additive" is a statement about that gating and not about receiver
+/// tolerance: a receiver refuses a kind this build does not
+/// implement, which fails to deserialize and reaches no handler. Bump
+/// only when an existing message's wire shape changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 1;

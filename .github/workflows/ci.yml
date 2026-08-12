@@ -326,9 +326,17 @@ jobs:
             }
           }
 
-          # The three that carry no family prefix.
+          # The ones that carry no family prefix.
           run_exact_control admission_gate_admits_application_traffic_from_active_peer --ignored
           run_exact_control v4_arc03_outbound_application_send_requires_current_session_admission --ignored
+
+          # The admission gate's other half: an unauthenticated peer's handshake
+          # frame is carried rather than gated, so the handshake can complete at
+          # all. It needs a live connector worker to reserve its parse work, so
+          # it opens a native object and is `#[cfg(feature = "transport-lab")]`
+          # and `#[ignore]`d like its neighbours -- which makes this line its
+          # only execution anywhere in CI.
+          run_exact_control admission_gate_lets_protocol_frames_through_while_handshaking --ignored
 
           # Revocation of a *retained* admission. The controls above prove a
           # session is refused when it was never admitted; this one proves an
@@ -340,13 +348,12 @@ jobs:
           run_exact_control v4_arc05_revoking_policy_refuses_the_next_operation_and_drops_the_session --ignored
 
           # Inbound application effects against a replaced installation.
-          run_exact_group v4_arc04e1_ 6 \
+          run_exact_group v4_arc04e1_ 5 \
             v4_arc04e1_admitted_inbound_effect_lands_on_the_captured_installation \
             v4_arc04e1_inbound_application_effect_never_reaches_a_replacement \
             v4_arc04e1_captured_peer_effect_is_refused_after_replacement \
             v4_arc04e1_inbound_delivery_is_never_attributed_to_a_replacement \
-            v4_arc04e1_stale_owner_application_frame_credits_the_replacement_nothing \
-            v4_arc04e1_reliable_stream_state_moves_only_under_the_fence
+            v4_arc04e1_stale_owner_application_frame_credits_the_replacement_nothing
 
           # Who may settle a pending call. The last one is the negative that
           # gives the family its point: a replacement connector for a
@@ -362,7 +369,7 @@ jobs:
             v4_arc04f2_a_single_response_cannot_settle_a_pending_stream \
             v4_arc04f2_a_stream_end_cannot_settle_a_pending_single_call \
             v4_arc04f2_a_stream_chunk_from_a_foreign_device_is_ignored \
-            v4_arc04f2_the_same_device_over_a_replacement_connector_completes_the_call \
+            v4_arc04f2_same_device_replacement_retires_old_and_fresh_session_settles \
             v4_arc04f2_a_replacement_connector_for_a_different_device_still_never_settles
 
           # Session-owned retention: the reliable frames and the capability
@@ -372,19 +379,52 @@ jobs:
           # The `v4_macro1_` prefix is heavily shared -- `transport/webrtc.rs`,
           # `provider.rs` and `session_flow.rs` hold about twenty-five more --
           # but all of those are ordinary tests, so `--ignored` excludes them
-          # and the count is 3. If any of them ever gains `#[ignore]`, this
-          # selects more than 3 and fails here, which is the right way for that
+          # and the count is 7. If any of them ever gains `#[ignore]`, this
+          # selects more than 7 and fails here, which is the right way for that
           # to surface.
           #
           # `v4_macro1_reliable_submission_without_a_session_is_refused_and_retains_nothing`
           # is deliberately absent: it carries no `#[ignore]`, so the suite-wide
           # transport-lab run in `check` already executes it, and naming it here
-          # would make this group select 4 and fail. It is the negative these
-          # three positives are read against.
-          run_exact_group v4_macro1_ 3 \
+          # would make this group select 8 and fail. It is the negative these
+          # seven positives are read against.
+          run_exact_group v4_macro1_ 7 \
             v4_macro1_ending_a_session_releases_its_retained_frames_and_resolves_their_callers \
             v4_macro1_retention_pressure_refuses_the_next_frame_and_releases_exactly_on_ack \
-            v4_macro1_capability_metadata_is_owned_by_the_session_that_receives_it
+            v4_macro1_capability_metadata_is_owned_by_the_session_that_receives_it \
+            v4_macro1_acknowledgement_settles_only_the_sent_contiguous_prefix \
+            v4_macro1_an_inbound_gap_neither_delivers_nor_advances \
+            v4_macro1_a_second_stream_cannot_reset_the_inbound_mark \
+            v4_macro1_a_duplicate_is_reacknowledged_without_a_second_delivery
+
+          # The outbound half of the same boundary: an advertisement made before
+          # the peer existed reaches that peer's first session. Named outside the
+          # `v4_macro1_` family on purpose -- adding it there would make the group
+          # above select 8 and fail -- and run as its own exact control so the
+          # count stays a statement about session-owned retention.
+          run_exact_control v4_f4_a_new_session_receives_the_advert_made_before_the_peer_existed --ignored
+
+          # The deferred half: a promotion the provider refuses announces nothing,
+          # and the first later promotion that succeeds announces exactly once. It
+          # measures the real pool rather than faking the refusal, so it is
+          # `transport-lab` like the group above and runs only from here.
+          run_exact_control v4_f4_a_refused_promotion_announces_nothing_and_the_later_one_announces_once --ignored
+
+          # Exact realtime flow-handle authority. Its own family because it is
+          # about what a *handle* names rather than about session-owned
+          # retention, and because all three are `#[ignore]`d -- folding them
+          # into `v4_macro1_` would make that group select 10 and fail.
+          run_exact_group v4_f6_ 3 \
+            v4_f6_a_stale_flow_handle_reaches_no_flow_on_the_replacement \
+            v4_f6_a_reopened_label_is_a_different_flow_record \
+            v4_f6_dropping_a_flow_handle_leaves_the_flow_open
+
+          # The wire half of the reliable acceptance rule: a delivery the
+          # Application Gateway refuses is acknowledged to nobody. The
+          # `v4_macro1_` group above is about what a session *retains*; this is
+          # about what leaves, so it is named outside that family — and folding
+          # it in would make the group select 8 and fail.
+          run_exact_control v4_f15_a_refused_reliable_delivery_acknowledges_nothing --ignored
 
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |

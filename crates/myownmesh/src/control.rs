@@ -365,13 +365,9 @@ pub enum Request {
     // ---- typed-channel + RPC IPC (post-EventsSubscribe) ----------
     //
     // The variants below require the client to have first sent
-    // `EventsSubscribe` on the same connection — they install
-    // per-client state (handler claims, channel subscriptions,
-    // in-flight outbound stream forwarders) that the daemon
-    // routes back as `ServerOut` event frames. Sending one on a
-    // non-event-subscribed connection returns a `not subscribed`
-    // error so the client gets immediate feedback rather than a
-    // silent black hole.
+    // `EventsSubscribe` first. That connection becomes server-push-only and
+    // returns an unguessable capability; later command connections must present
+    // both it and the numeric routing coordinate.
     /// Claim a method name on a network. Subsequent peer RPC
     /// calls matching the method are forwarded to the client
     /// identified by `client_id` as `RpcInbound` events on its
@@ -382,6 +378,7 @@ pub enum Request {
     /// single-shot (`RpcRespond`).
     RpcRegister {
         client_id: crate::ipc::ClientId,
+        client_capability: String,
         network: String,
         method: String,
         streaming: bool,
@@ -390,15 +387,22 @@ pub enum Request {
     /// this client.
     RpcUnregister {
         client_id: crate::ipc::ClientId,
+        client_capability: String,
         network: String,
         method: String,
     },
-    /// Resolve an in-flight inbound RPC (single-shot). Matches
-    /// by `request_id` regardless of which client originally
-    /// received the `RpcInbound`. Either `ok` or `error` should
-    /// be set; if both, `error` wins.
+    /// Resolve an in-flight inbound RPC (single-shot). The exact remote
+    /// coordinates, response class, local owner capability and private
+    /// operation id must all match. Either `ok` or `error` should be set; if
+    /// both, `error` wins.
     RpcRespond {
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
         request_id: String,
+        operation_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ok: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,7 +410,13 @@ pub enum Request {
     },
     /// Push one chunk to an in-flight streaming inbound RPC.
     RpcStreamChunk {
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
         request_id: String,
+        operation_id: u64,
         payload: serde_json::Value,
     },
     /// Close an in-flight streaming inbound RPC. After this the
@@ -414,7 +424,13 @@ pub enum Request {
     /// silently dropped. Optional `error` propagates to the
     /// peer as the stream-end's failure reason.
     RpcStreamEnd {
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
         request_id: String,
+        operation_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -434,6 +450,7 @@ pub enum Request {
     /// identifies which event socket receives the chunks.
     RpcCallStream {
         client_id: crate::ipc::ClientId,
+        client_capability: String,
         network: String,
         peer: String,
         method: String,
@@ -446,6 +463,7 @@ pub enum Request {
     /// frame.
     ChannelSubscribe {
         client_id: crate::ipc::ClientId,
+        client_capability: String,
         network: String,
         channel: String,
     },
@@ -453,6 +471,7 @@ pub enum Request {
     /// subscribed.
     ChannelUnsubscribe {
         client_id: crate::ipc::ClientId,
+        client_capability: String,
         network: String,
         channel: String,
     },
@@ -548,10 +567,29 @@ pub enum Request {
     /// two clock rates into one. `clock_rate` is additionally what makes an
     /// inbound unit's `rtp_timestamp` interpretable, so it is a field rather
     /// than something folded into `mime` and parsed back out.
+    ///
+    /// **Answers a `flow_capability`, and that is what authorizes everything
+    /// afterwards.** The daemon keeps the move-only core flow handle behind it,
+    /// owned by the authenticated client. `network`, `peer` and `flow_label`
+    /// are what this request *resolves*; none of them is presented again. The
+    /// pair they replace was re-resolvable — a client whose session had been
+    /// replaced kept writing under `peer + flow_label` and its units were taken
+    /// by the successor's flow of the same name, silently, because nothing on a
+    /// realtime path is acknowledged per unit.
+    ///
+    /// `client_id` and `client_capability` are required for the same reason:
+    /// the flow has to be owned by somebody, and the owner must be the same
+    /// client across the several connections it will use — the flow is opened
+    /// here and written on a separate `realtime_pipe`.
     RealtimeFlowOpen {
         network: String,
         peer: String,
         flow_label: String,
+        /// The client's `EventsSubscribe` id — a routing coordinate.
+        client_id: crate::ipc::ClientId,
+        /// Authority minted for that event-stream connection. Possession of
+        /// this, not the id beside it, is what owns the flow.
+        client_capability: String,
         /// Which way this node carries units on this flow. Stated by the caller
         /// rather than inferred: a flow this node sends on and one it receives
         /// on need different transceiver directions, and inferring from later
@@ -588,10 +626,20 @@ pub enum Request {
     /// this ordering removes: the peer cannot tell the new flow from the old one
     /// it has not finished tearing down. On a refusal the label stays reserved
     /// too — a close that did not happen has retired nothing.
+    ///
+    /// Names the flow by the capability `RealtimeFlowOpen` issued, never by
+    /// `peer + flow_label`. The coordinate pair is what made a close as
+    /// dangerous as a send: a client whose session had been replaced would have
+    /// torn down the *successor's* flow of the same name, and the successor
+    /// belongs to somebody else. The capability closes the flow it was issued
+    /// for or nothing at all.
+    ///
+    /// The daemon's stored handle is **consumed**, so a second close with the
+    /// same capability finds nothing rather than reaching core twice.
     RealtimeFlowClose {
-        network: String,
-        peer: String,
-        flow_label: String,
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        flow_capability: String,
     },
     /// Convert this connection into a dedicated **binary realtime pipe**:
     /// after the ack it carries only length-prefixed frames
@@ -603,16 +651,30 @@ pub enum Request {
     /// flow it arrived on — the frame carries the name, so no subscription
     /// selects which flows are delivered.
     ///
-    /// **Both** directions are bound to exactly one session by `network` +
-    /// `peer`. That binding is what makes a unit routable at all: a frame body
-    /// carries a `flow_label` and no peer, and the label is scoped to a
-    /// session, so on a peer-multiplexed pipe peer A's `screen` and peer B's
-    /// `screen` are indistinguishable — a name means whatever its own session
-    /// says it means. Binding the connection supplies the session by
-    /// construction, which keeps the body compact.
+    /// **The two directions are bound differently, and the asymmetry is the
+    /// point.**
     ///
-    /// Inbound is bound for the same reason and not a weaker one: a binary unit
-    /// carries no peer, and it is the units that need routing.
+    /// `Outbound` names its flow by `flow_capability` — the value
+    /// `RealtimeFlowOpen` issued — and nothing else. It carries no `peer`,
+    /// because a peer selector here would be re-resolved for every unit, which
+    /// is precisely the defect: labels are session-scoped and freely reused, so
+    /// a pipe that outlived its session went on writing `screen` into whatever
+    /// the successor called `screen`, with nothing anywhere acknowledging a unit
+    /// and therefore nothing to notice. `network` remains because closing and
+    /// sending happen *through* a joined network, not because it selects
+    /// anything: the capability already names one exact flow on one exact
+    /// session.
+    ///
+    /// The frame body still carries a `flow_label`, and it still grants nothing.
+    /// It is checked against the flow this pipe is bound to and refused if it
+    /// disagrees, so a client that muddles its own names hears about it rather
+    /// than having units silently rerouted.
+    ///
+    /// `Inbound` is bound by `network` + `peer`, and that is a different
+    /// question: it claims one *session's* whole unit stream, not one flow, and
+    /// the stream reader it gets is itself the exact authority — it can only
+    /// ever yield units the claiming session's own flow set put there. There is
+    /// no coordinate to re-resolve after the claim.
     ///
     /// The binding is also a lifetime, and it is observed rather than
     /// signalled. There is no flow or session event on any socket: a separate
@@ -633,19 +695,35 @@ pub enum Request {
     /// re-established per session and never cached per peer.
     ///
     /// Field shapes are validated strictly and a wrong-shaped request is
-    /// refused rather than trimmed: `Outbound` requires `network` + `peer` and
-    /// no `client_id`; `Inbound` requires all three. Silently ignoring a
-    /// supplied `client_id` on an outbound pipe would let a client believe it
-    /// had bound a delivery target that the daemon never recorded.
+    /// refused rather than trimmed. `Outbound` requires `network`, `client_id`,
+    /// `client_capability` and `flow_capability`, and refuses `peer`;
+    /// `Inbound` requires `network`, `peer`, `client_id` and
+    /// `client_capability`, and refuses `flow_capability`. Silently ignoring a
+    /// field would let a client believe it had bound something the daemon never
+    /// recorded — and for `peer` on an outbound pipe that belief is exactly the
+    /// one this finding removes.
     RealtimePipe {
         direction: RealtimePipeDirection,
-        /// The session both directions bind to.
+        /// Which joined network the operations run through. Not a selector for
+        /// `Outbound`: the flow capability already names one exact flow.
         network: String,
-        peer: String,
-        /// Required for `Inbound` — the client's `EventsSubscribe` id and the
-        /// delivery target. Must be absent for `Outbound`.
+        /// Required for `Inbound`, which claims that session's whole unit
+        /// stream. Must be absent for `Outbound`, which names a flow rather
+        /// than a peer.
+        #[serde(default)]
+        peer: Option<String>,
+        /// The client's `EventsSubscribe` id. Required for both directions
+        /// now: outbound needs it to find the client that owns the flow.
         #[serde(default)]
         client_id: Option<crate::ipc::ClientId>,
+        /// Authority minted for the referenced event-stream connection.
+        #[serde(default)]
+        client_capability: Option<String>,
+        /// Required for `Outbound` — the capability `RealtimeFlowOpen` issued
+        /// for the exact flow this pipe writes to. Must be absent for
+        /// `Inbound`, which is bound to a session rather than a flow.
+        #[serde(default)]
+        flow_capability: Option<String>,
     },
 
     // ---- self-update -------------------------------------------------
@@ -825,15 +903,24 @@ pub async fn serve(
     realtime: RealtimeAdvert,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
+    let stream_capacity = std::env::var("MYOWNMESH_IPC_STREAM_CAPACITY")
+        .context(
+            "MYOWNMESH_IPC_STREAM_CAPACITY must explicitly select the local RPC stream capacity",
+        )?
+        .parse::<std::num::NonZeroUsize>()
+        .context("MYOWNMESH_IPC_STREAM_CAPACITY must be a nonzero integer")?;
+    let json_line_bytes = explicit_nonzero_bytes("MYOWNMESH_IPC_JSON_LINE_BYTES")?;
+    let realtime_frame_bytes = explicit_nonzero_bytes("MYOWNMESH_IPC_REALTIME_FRAME_BYTES")?;
     let target = resolve_socket(custom)?;
     let listener = bind_listener(&target)?;
     info!(?target, "control socket listening");
-
     let state = Arc::new(ControlState {
         mesh,
         registry,
         services,
-        clients: crate::ipc::ClientRegistry::new(),
+        clients: crate::ipc::ClientRegistry::with_stream_capacity(stream_capacity),
+        json_line_bytes,
+        realtime_frame_bytes,
         realtime,
     });
 
@@ -861,6 +948,15 @@ pub async fn serve(
         }
     }
 
+    // Every client's flows are closed through their own networks before this
+    // returns. Dropping the handles would release nothing — a flow handle owns
+    // no part of the flow — so a daemon that shut down without this would leave
+    // native transceivers and senders behind for as long as their sessions
+    // lived.
+    for client in state.clients.shutdown() {
+        close_owned_realtime_flows(&state, &client).await;
+    }
+
     Ok(())
 }
 
@@ -868,6 +964,8 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
     use interprocess::local_socket::Name;
     let name: Name = match target {
         SocketTarget::Path(p) => {
+            #[cfg(unix)]
+            prepare_owner_only_socket_parent(p)?;
             // Remove stale socket if present so re-binds succeed.
             #[cfg(unix)]
             {
@@ -882,10 +980,169 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
             .to_ns_name::<GenericNamespaced>()
             .context("control socket name → ns_name")?,
     };
-    ListenerOptions::new()
-        .name(name)
-        .create_tokio()
-        .context("create_tokio")
+    let options = ListenerOptions::new().name(name);
+    #[cfg(unix)]
+    let options = {
+        use interprocess::os::unix::local_socket::ListenerOptionsExt;
+        options.mode(0o600)
+    };
+    #[cfg(windows)]
+    let options = {
+        use interprocess::os::windows::{
+            local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor,
+        };
+        // Protected DACL naming the current token's user SID exactly. Owner
+        // Rights (`OW`) is not equivalent: an elevated token's default owner
+        // may be an administrator group.
+        let sddl = current_user_pipe_sddl()?;
+        let descriptor = SecurityDescriptor::deserialize(&sddl)
+            .context("create current-owner pipe security descriptor")?;
+        options.security_descriptor(descriptor)
+    };
+    let listener = options.create_tokio().context("create_tokio")?;
+    #[cfg(unix)]
+    if let SocketTarget::Path(path) = target {
+        verify_owner_only_socket_path(path)?;
+    }
+    Ok(listener)
+}
+
+#[cfg(windows)]
+fn current_user_pipe_sddl() -> Result<widestring::U16CString> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree, HANDLE},
+        Security::{
+            Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
+        "open current process token: {}",
+        std::io::Error::last_os_error()
+    );
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    let token = Token(token);
+    let mut needed = 0_u32;
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    anyhow::ensure!(needed != 0, "measure current token user SID");
+    let word = std::mem::size_of::<usize>();
+    let mut buffer = vec![0_usize; (needed as usize).div_ceil(word)];
+    anyhow::ensure!(
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } != 0,
+        "read current token user SID: {}",
+        std::io::Error::last_os_error()
+    );
+    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid_text = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_text) } != 0,
+        "format current token user SID: {}",
+        std::io::Error::last_os_error()
+    );
+    struct LocalString(windows_sys::core::PWSTR);
+    impl Drop for LocalString {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+    let sid_text = LocalString(sid_text);
+    let sid = unsafe { widestring::U16CStr::from_ptr_str(sid_text.0) }.to_string_lossy();
+    widestring::U16CString::from_str(format!("D:P(A;;GA;;;{sid})"))
+        .context("encode current-user pipe DACL")
+}
+
+#[cfg(unix)]
+fn prepare_owner_only_socket_parent(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .context("control socket has no parent directory")?;
+    if !parent.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("create owner-only control directory {}", parent.display()))?;
+    }
+    let metadata = std::fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "control socket parent is not a directory"
+    );
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "control socket parent is not owned by the daemon user"
+    );
+    if metadata.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("make control directory owner-only: {}", parent.display()))?;
+    }
+    let metadata = std::fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o077 == 0,
+        "control socket parent must be owner-only"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_owner_only_socket_path(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect control socket {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "control endpoint is not a socket"
+    );
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "control socket is not owned by the daemon user"
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o777 == 0o600,
+        "control socket must have exact owner-only mode 0600"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_local_peer(stream: &LocalSocketStream) -> Result<()> {
+    let credentials = stream
+        .peer_creds()
+        .context("read control peer credentials")?;
+    let peer = credentials
+        .euid()
+        .context("control transport did not provide peer euid")?;
+    anyhow::ensure!(
+        peer == unsafe { libc::geteuid() },
+        "control peer is not the daemon user"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_local_peer(_stream: &LocalSocketStream) -> Result<()> {
+    Ok(())
 }
 
 struct ControlState {
@@ -894,6 +1151,16 @@ struct ControlState {
     services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
     realtime: RealtimeAdvert,
+    json_line_bytes: usize,
+    realtime_frame_bytes: usize,
+}
+
+fn explicit_nonzero_bytes(name: &str) -> Result<usize> {
+    std::env::var(name)
+        .with_context(|| format!("{name} must explicitly select a local IPC byte ceiling"))?
+        .parse::<std::num::NonZeroUsize>()
+        .with_context(|| format!("{name} must be a nonzero integer"))
+        .map(std::num::NonZeroUsize::get)
 }
 
 // The daemon keeps no realtime flow state of its own, and deliberately holds
@@ -903,10 +1170,10 @@ struct ControlState {
 // units routed to a flow that closed.
 
 async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> Result<()> {
+    verify_local_peer(&stream)?;
     let (reader, mut writer) = stream.split();
-    let reader = BufReader::new(reader);
-    let mut lines = reader.lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = BufReader::new(reader);
+    while let Some(line) = read_bounded_json_line(&mut reader, state.json_line_bytes).await? {
         let request: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -931,6 +1198,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             let ack = Response::ok(serde_json::json!({
                 "subscribed": true,
                 "client_id": client_id.to_string(),
+                "client_capability": state.clients.capability(&client),
             }));
             let line = serde_json::to_string(&ack)? + "\n";
             writer.write_all(line.as_bytes()).await?;
@@ -938,6 +1206,12 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             // Clean up the client's claims regardless of how
             // the stream ended.
             state.clients.unregister(client_id);
+            // And its realtime flows, which have to be *closed* rather than
+            // dropped: a flow handle owns nothing, so dropping one leaves the
+            // label claimed and the native half up until the session itself
+            // ends. This is the one place that knows both the flows and the
+            // networks to close them through.
+            close_owned_realtime_flows(&state, &client).await;
             result?;
             break;
         }
@@ -979,13 +1253,20 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             network,
             peer,
             client_id,
+            client_capability,
+            flow_capability,
         } = &request
         {
             // Field shapes are checked before the ack, and extras are refused
             // rather than ignored. A pipe that acked and then behaved as though
             // a field had not been sent would be indistinguishable, from the
             // client's side, from one that honoured it.
-            let bound = match realtime_pipe_binding(*direction, network, peer, *client_id) {
+            let bound = match realtime_pipe_binding(
+                *direction,
+                network,
+                peer.as_deref(),
+                flow_capability.as_deref(),
+            ) {
                 Ok(bound) => bound,
                 Err(message) => {
                     let resp = Response::err(message);
@@ -995,8 +1276,39 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     continue;
                 }
             };
-            let Some(net) = state.registry.get(&bound.network) else {
-                let resp = Response::err(format!("unknown network: {}", bound.network));
+            // Both directions are owned now. Inbound has always needed an owner
+            // to end with; outbound needs one because the flow it writes to
+            // belongs to a client, and the client capability is what proves this
+            // connection is that client.
+            let pipe_owner = {
+                let (Some(client_id), Some(capability)) =
+                    (*client_id, client_capability.as_deref())
+                else {
+                    let resp = Response::err(
+                        "realtime_pipe requires client_id and client_capability: a pipe \
+                         is owned by the client that opened its flow, and possession of \
+                         the capability is what proves this connection is that client",
+                    );
+                    writer
+                        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                        .await?;
+                    continue;
+                };
+                let Some(owner) = state.clients.authenticate(client_id, capability) else {
+                    let resp = Response::err("invalid local client authority");
+                    writer
+                        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                        .await?;
+                    continue;
+                };
+                owner
+            };
+            let bound_network = match &bound {
+                RealtimePipeBinding::Outbound { network, .. }
+                | RealtimePipeBinding::Inbound { network, .. } => network.clone(),
+            };
+            let Some(net) = state.registry.get(&bound_network) else {
+                let resp = Response::err(format!("unknown network: {bound_network}"));
                 writer
                     .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
                     .await?;
@@ -1024,15 +1336,18 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             // A refusal therefore means what it says: the session is gone, or a
             // pipe for it is live right now. Neither is a lingering claim from a
             // pipe that has already died.
-            let inbound_stream = match bound.direction {
-                RealtimePipeDirection::Inbound => match net.realtime_inbound(&bound.peer) {
+            //
+            // An outbound pipe proves its flow before the ack for the mirror
+            // reason: a client that acked and then found every unit refused
+            // would have to discover from silence that its capability was wrong.
+            let inbound_stream = match &bound {
+                RealtimePipeBinding::Inbound { peer, .. } => match net.realtime_inbound(peer) {
                     Some(stream) => Some(stream),
                     None => {
                         let resp = Response::err(format!(
-                            "no inbound realtime stream for {}: the session is not current, \
-                             or a live pipe already holds it — one inbound pipe per session, \
-                             and the lease returns when that pipe ends",
-                            bound.peer
+                            "no inbound realtime stream for {peer}: the session is not \
+                                 current, or a live pipe already holds it — one inbound pipe \
+                                 per session, and the lease returns when that pipe ends"
                         ));
                         writer
                             .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
@@ -1040,7 +1355,25 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                         continue;
                     }
                 },
-                RealtimePipeDirection::Outbound => None,
+                RealtimePipeBinding::Outbound {
+                    network,
+                    flow_capability,
+                } => {
+                    if pipe_owner
+                        .with_realtime_flow(flow_capability, network, |_flow| ())
+                        .is_none()
+                    {
+                        let resp = Response::err(
+                            "unknown flow_capability on this network: it was never issued \
+                             to this client, or the flow it named has already been closed",
+                        );
+                        writer
+                            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                            .await?;
+                        continue;
+                    }
+                    None
+                }
             };
             let ack = Response::ok(serde_json::json!({ "realtime_pipe": true }));
             writer
@@ -1048,12 +1381,46 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 .await?;
             writer.flush().await?;
             // Recover the buffered reader — it may already hold the first frame.
-            let reader = lines.into_inner();
-            let result = match inbound_stream {
-                None => run_realtime_outbound_pipe(&net, &bound.peer, reader).await,
-                Some(stream) => {
-                    run_realtime_inbound_pipe(&net, &bound, &stream, reader, &mut writer).await
+            let pipe = async {
+                match (inbound_stream, &bound) {
+                    (
+                        None,
+                        RealtimePipeBinding::Outbound {
+                            network,
+                            flow_capability,
+                        },
+                    ) => {
+                        run_realtime_outbound_pipe(
+                            &net,
+                            &pipe_owner,
+                            flow_capability,
+                            network,
+                            reader,
+                            state.realtime_frame_bytes,
+                        )
+                        .await
+                    }
+                    (Some(stream), RealtimePipeBinding::Inbound { peer, .. }) => {
+                        run_realtime_inbound_pipe(
+                            &net,
+                            peer,
+                            &stream,
+                            reader,
+                            &mut writer,
+                            state.realtime_frame_bytes,
+                        )
+                        .await
+                    }
+                    // Unreachable by construction — the claim above is taken on
+                    // exactly the inbound arm — and spelled as a refusal rather
+                    // than a panic, because a control connection failing closed
+                    // is always preferable to a daemon that stops.
+                    _ => Ok(()),
                 }
+            };
+            let result = tokio::select! {
+                result = pipe => result,
+                () = pipe_owner.wait_disconnected() => Ok(()),
             };
             result?;
             break;
@@ -1065,78 +1432,152 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
     Ok(())
 }
 
-/// A realtime pipe's validated session binding.
+async fn read_bounded_json_line<R>(reader: &mut R, ceiling: usize) -> Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(bytes)
+                .map(Some)
+                .context("control request is not UTF-8");
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |at| at + 1);
+        anyhow::ensure!(
+            take <= ceiling.saturating_sub(bytes.len()),
+            "control request exceeds owner-selected byte ceiling"
+        );
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return String::from_utf8(bytes)
+                .map(Some)
+                .context("control request is not UTF-8");
+        }
+    }
+}
+
+/// What one realtime pipe is bound to, once its fields have been checked
+/// against its direction.
 ///
-/// `client_id` is required on an inbound pipe and validated, but not carried,
-/// and that is worth stating plainly rather than leaving as an omission.
-/// `recv_webrtc_realtime_any` delivers every flow of the bound session with its
-/// label attached, so no subscription is consulted and nothing here reads the
-/// value. Malformed input is still refused rather than silently accepted;
-/// whether the field should remain on the wire at all is a contract question,
-/// not one this struct should answer by quietly keeping a field nobody uses.
-struct RealtimePipeBinding {
-    direction: RealtimePipeDirection,
-    network: String,
-    peer: String,
+/// The two directions carry different bindings because they are bound to
+/// different things: an outbound pipe to one exact flow, an inbound pipe to one
+/// session's whole unit stream. A single struct with optional fields would make
+/// "which of these is authority here" a question every reader has to re-derive.
+enum RealtimePipeBinding {
+    /// Writes to the one flow `flow_capability` names, on the client that owns
+    /// it. No peer: there is nothing left to resolve.
+    Outbound {
+        network: String,
+        flow_capability: String,
+    },
+    /// Claims the whole inbound unit stream of the session `peer` currently
+    /// resolves to. The claim is the authority and it is taken once.
+    Inbound { network: String, peer: String },
 }
 
 /// Validate a [`Request::RealtimePipe`]'s fields against its direction.
 ///
-/// Both directions are bound to exactly one session, so `network` and `peer`
-/// are required for each. That binding is what makes a unit routable at all: a
-/// frame body carries a `flow_label` and no peer, and a label is scoped to a
-/// session, so on a peer-multiplexed pipe peer A's `screen` and peer B's
-/// `screen` are indistinguishable. Binding the connection supplies the session
-/// by construction and keeps the body compact.
-///
-/// `client_id` is required for `Inbound` and refused for `Outbound` rather than
-/// ignored there. An outbound pipe that accepted and dropped a `client_id`
-/// would read, from the client's side, exactly like one that honoured it.
+/// Every field is required or refused; none is accepted and ignored. A pipe
+/// that took a field and dropped it would read, from the client's side, exactly
+/// like one that honoured it — and for `peer` on an outbound pipe that
+/// misreading is the finding itself, a client believing its units are bound to
+/// a peer when what actually binds them is a flow.
 fn realtime_pipe_binding(
     direction: RealtimePipeDirection,
     network: &str,
-    peer: &str,
-    client_id: Option<crate::ipc::ClientId>,
+    peer: Option<&str>,
+    flow_capability: Option<&str>,
 ) -> std::result::Result<RealtimePipeBinding, String> {
     if network.trim().is_empty() {
         return Err("realtime_pipe requires a network".to_string());
     }
-    if peer.trim().is_empty() {
-        return Err(
-            "realtime_pipe requires a peer: a flow_label is scoped to one \
-                    session, so a pipe that did not name one could not route a unit"
-                .to_string(),
-        );
-    }
-    match (direction, client_id) {
-        (RealtimePipeDirection::Outbound, Some(_)) => Err(
-            "realtime_pipe outbound takes no client_id: it writes to the session it \
-             is bound to, and no client's subscriptions are consulted"
-                .to_string(),
-        ),
-        (RealtimePipeDirection::Inbound, None) => Err(
-            "realtime_pipe inbound requires a client_id: it carries the flows that \
-             client subscribed to"
-                .to_string(),
-        ),
-        _ => Ok(RealtimePipeBinding {
-            direction,
-            network: network.to_string(),
-            peer: peer.to_string(),
-        }),
+    match direction {
+        RealtimePipeDirection::Outbound => {
+            if peer.is_some() {
+                return Err(
+                    "realtime_pipe outbound takes no peer: it writes to the exact flow \
+                     its flow_capability names, and a peer selector here would be \
+                     re-resolved per unit — which is how a pipe outliving its session \
+                     ended up writing into the replacement's flow of the same name"
+                        .to_string(),
+                );
+            }
+            let Some(flow_capability) = flow_capability else {
+                return Err(
+                    "realtime_pipe outbound requires a flow_capability: the value \
+                     realtime_flow_open issued is the only thing that authorizes a write"
+                        .to_string(),
+                );
+            };
+            Ok(RealtimePipeBinding::Outbound {
+                network: network.to_string(),
+                flow_capability: flow_capability.to_string(),
+            })
+        }
+        RealtimePipeDirection::Inbound => {
+            if flow_capability.is_some() {
+                return Err(
+                    "realtime_pipe inbound takes no flow_capability: it claims a \
+                     session's whole unit stream rather than one flow, and every unit \
+                     carries the name of the flow it arrived on"
+                        .to_string(),
+                );
+            }
+            let Some(peer) = peer.filter(|peer| !peer.trim().is_empty()) else {
+                return Err(
+                    "realtime_pipe inbound requires a peer: the stream it claims \
+                     belongs to one session"
+                        .to_string(),
+                );
+            };
+            Ok(RealtimePipeBinding::Inbound {
+                network: network.to_string(),
+                peer: peer.to_string(),
+            })
+        }
     }
 }
 
 /// Read length-prefixed units off an outbound [`Request::RealtimePipe`] and hand
-/// each to its flow on the bound session.
+/// each to the **one flow this pipe is bound to**.
 ///
 /// Sends nothing back per unit: errors are logged rather than answered, which is
 /// the whole latency win — a per-unit acknowledgement would put a round trip on
 /// the media path. Returns when the client disconnects.
+///
+/// **Nothing here resolves a selector, and nothing here re-resolves anything.**
+/// The pipe holds a flow capability, the capability names one move-only handle
+/// the owning client stored at open, and that handle names one exact session and
+/// one exact flow record. This is the correction: the version this replaces kept
+/// `network + peer` and re-resolved them for every unit, so a pipe whose session
+/// had ended went on writing until the peer's next session came up and then
+/// delivered into *that* one, under labels chosen for a session that no longer
+/// existed — with nothing to notice, because nothing on this path is
+/// acknowledged.
+///
+/// The frame's `flow_label` survives as a wire coordinate and is checked, not
+/// obeyed: a unit naming a different flow than this pipe is bound to is dropped
+/// rather than rerouted. A client with two flows open has two pipes.
 async fn run_realtime_outbound_pipe<R>(
     net: &myownmesh_core::JoinedNetwork,
-    peer: &str,
+    owner: &crate::ipc::ClientHandle,
+    flow_capability: &str,
+    network: &str,
     mut reader: R,
+    frame_ceiling: usize,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1152,7 +1593,7 @@ where
             return Ok(());
         }
         let len = u32::from_le_bytes(len_buf) as usize;
-        if len > MAX_REALTIME_FRAME_BYTES {
+        if !realtime_frame_length_admitted(len, frame_ceiling) {
             warn!("realtime frame too large ({len} bytes) — dropping pipe");
             return Ok(());
         }
@@ -1181,39 +1622,90 @@ where
             duration: std::time::Duration::from_micros(u64::from(unit.duration_us)),
             data: unit.payload.into(),
         };
+        // Lent for exactly this unit and never held: the borrow ends with the
+        // closure, so the daemon's stored handle stays the only one and a close
+        // arriving on another connection is not racing a copy.
+        //
         // Synchronous by design: the unit is authorized against the session and
         // enqueued before this returns, so a refusal is attributable to the unit
         // that caused it rather than surfacing later against an unrelated one.
-        if let Err(refusal) = net.send_webrtc_realtime(peer, &label, outbound) {
+        let sent = owner.with_realtime_flow(flow_capability, network, |flow| {
+            // The label is compared, not resolved. It grants nothing — the flow
+            // is already chosen — so a mismatch is a client naming one of its
+            // own flows on the wrong pipe, which is worth telling it about and
+            // is never worth guessing at.
+            if flow.label() != label.as_slice() {
+                return Err(None);
+            }
+            net.send_webrtc_realtime(flow, outbound).map_err(Some)
+        });
+        let Some(sent) = sent else {
+            // The flow was closed while this pipe was running — by this client
+            // on another connection, or by its disconnect drain. There is
+            // nothing left to write to, and the pipe ends rather than idling
+            // against a capability that will never resolve again.
+            debug!(
+                label = %logged,
+                "realtime outbound pipe closing: its flow is no longer held by this client"
+            );
+            return Ok(());
+        };
+        match sent {
+            Ok(()) => {}
+            Err(None) => {
+                debug!(
+                    label = %logged,
+                    "realtime unit names a different flow than this pipe is bound to — dropped"
+                );
+            }
             // `SessionNotCurrent` ENDS THE PIPE. Every other refusal is about
             // one unit and the next one may well succeed, but this one says the
-            // session this pipe was bound to is gone.
-            //
-            // Continuing past it is not merely futile, it is unsafe. Labels are
-            // session-scoped and are reused freely across sessions, so a pipe
-            // that kept writing would sit there until the peer's next session
-            // came up and then start delivering units — with labels it chose
-            // under the old one — into the new one. `screen` meant a screen
-            // share to a session that no longer exists; in the successor it
-            // means whatever that session named. The client is still writing frames
-            // it believes are going one place and they arrive somewhere else,
-            // with nothing anywhere in the path to notice, because nothing is
-            // acknowledged per unit.
+            // session this pipe's flow belonged to is gone — and because the
+            // flow handle is exact, that is now the *only* thing it can mean.
+            // It can no longer be a peer that has been replaced under a name
+            // this pipe kept resolving.
             //
             // Closing hands the failure to the one party that can resolve it:
-            // the client sees its pipe drop, and reopening forces a fresh
-            // binding against whatever session is current now.
-            if matches!(refusal, core_realtime::RealtimeRefusal::SessionNotCurrent) {
-                warn!(
-                    %peer,
-                    label = %logged,
-                    code = refusal.code(),
-                    "realtime outbound pipe closing: its session is no longer current"
-                );
-                return Ok(());
+            // the client sees its pipe drop, and reopening a flow forces a
+            // fresh binding against whatever session is current now.
+            Err(Some(refusal)) => {
+                if matches!(refusal, core_realtime::RealtimeRefusal::SessionNotCurrent) {
+                    warn!(
+                        label = %logged,
+                        code = refusal.code(),
+                        "realtime outbound pipe closing: its session is no longer current"
+                    );
+                    return Ok(());
+                }
+                debug!(label = %logged, code = refusal.code(), "realtime send refused");
             }
-            debug!(%peer, label = %logged, code = refusal.code(), "realtime send refused");
         }
+    }
+}
+
+fn realtime_frame_length_admitted(length: usize, ceiling: usize) -> bool {
+    length <= ceiling
+}
+
+/// Close every realtime flow one client still owns, through the network each
+/// was opened on.
+///
+/// Called when that client's event stream ends, however it ended. Dropping the
+/// handles would be silent and wrong: a handle is non-owning by design, so
+/// dropping one releases neither the label nor the transceiver or sender behind
+/// it, and a client that crashed would leave both held until its session
+/// happened to end.
+///
+/// Each flow is taken out of the client's table before its close runs, so a
+/// close racing this drain reaches core at most once for a given flow.
+/// Refusals are ignored rather than reported: there is nobody left to report to,
+/// and every refusal this can produce means the flow was already gone.
+async fn close_owned_realtime_flows(state: &ControlState, client: &crate::ipc::ClientHandle) {
+    for (network, flow) in client.drain_realtime_flows() {
+        let Some(net) = state.registry.get(&network) else {
+            continue;
+        };
+        let _ = net.close_realtime(flow).await;
     }
 }
 
@@ -1241,10 +1733,11 @@ fn label_for_log(label: &[u8]) -> String {
 /// session that ended has taken every flow with it.
 async fn run_realtime_inbound_pipe<R, W>(
     net: &myownmesh_core::JoinedNetwork,
-    bound: &RealtimePipeBinding,
+    peer: &str,
     inbound: &core_realtime::RealtimeInboundStream,
     mut reader: R,
     writer: &mut W,
+    frame_ceiling: usize,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1264,16 +1757,24 @@ where
             arrival = net.recv_webrtc_realtime_any(inbound) => arrival,
         };
         let Some(arrival) = arrival else {
-            debug!(peer = %bound.peer, "realtime inbound stream ended (session over)");
+            debug!(%peer, "realtime inbound stream ended (session over)");
             return Ok(());
         };
+        let admitted_len = REALTIME_FRAME_HEADER
+            .checked_add(arrival.label.len())
+            .and_then(|length| length.checked_add(arrival.unit.data.len()))
+            .filter(|length| realtime_frame_length_admitted(*length, frame_ceiling));
+        if admitted_len.is_none() {
+            warn!(%peer, bytes = arrival.unit.data.len(), "realtime unit exceeds owner-selected frame ceiling — dropped");
+            continue;
+        }
         let unit = RealtimeRecvUnit {
             flow_label: arrival.label,
             marker: arrival.unit.marker,
             rtp_timestamp: arrival.unit.rtp_timestamp,
             payload: arrival.unit.data.to_vec(),
         };
-        let Some(body) = encode_realtime_recv_unit(&unit) else {
+        let Some(body) = encode_realtime_recv_unit_with_ceiling(&unit, frame_ceiling) else {
             // Larger than the framing can express. Dropped here, and the pipe
             // continues: the alternative is writing a frame whose length prefix
             // or inner length is wrong, which the client cannot interpret and
@@ -1281,7 +1782,7 @@ where
             // becomes every unit after it. One flow's oversized unit is not a
             // reason to take down a session's whole inbound path.
             warn!(
-                peer = %bound.peer,
+                %peer,
                 label = %label_for_log(&unit.flow_label),
                 bytes = unit.payload.len(),
                 "realtime unit too large to frame — dropped"
@@ -1289,7 +1790,7 @@ where
             continue;
         };
         // Cannot truncate: `encode_realtime_recv_unit` returned `Some`, so the
-        // body is within `MAX_REALTIME_FRAME_BYTES`, which is far below u32.
+        // body is within the owner-selected ceiling and the u32 wire length.
         let len = (body.len() as u32).to_le_bytes();
         if writer.write_all(&len).await.is_err()
             || writer.write_all(&body).await.is_err()
@@ -1306,7 +1807,10 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             let status = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "device_id": state.mesh.identity().display_id(),
-                "joined_networks": state.mesh.joined_network_ids(),
+                "joined_networks": state.registry.summaries()
+                    .into_iter()
+                    .map(|summary| summary.network_id)
+                    .collect::<Vec<String>>(),
                 // Always present: `supported: false` is a definite answer, and
                 // an absent object would be indistinguishable from a client
                 // that failed to read it.
@@ -1462,7 +1966,16 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             mime,
             clock_rate,
             channels,
+            client_id,
+            client_capability,
         } => {
+            // Authenticated before anything is opened, because the flow the
+            // open produces has to be *owned*, and a flow opened for nobody
+            // would have to be dropped — which releases nothing — or filed
+            // under a coordinate, which is what this finding removes.
+            let Some(owner) = state.clients.authenticate(client_id, &client_capability) else {
+                return Response::err("invalid local client authority");
+            };
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
@@ -1488,22 +2001,51 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // call and still all-or-nothing from here, so a refusal has released
             // both the label and the native object and leaves nothing behind.
             match net.open_webrtc_realtime(&peer, open).await {
-                // Echoed back, not reassigned — core claims the exact name the
-                // caller chose. Returning it keeps the client's confirmation on
-                // the same path as its request rather than an event. It is the
-                // caller's own string, not a re-decode of what core answered:
-                // core answers with the bytes it now holds, and those are the
-                // bytes of this string, so re-decoding would only introduce a
-                // failure mode where the two could differ.
-                Ok(_claimed) => Response::ok(serde_json::json!({ "flow_label": chosen })),
+                // The handle is stored, never returned. What the client gets is
+                // the capability naming it: unguessable, minted here, and the
+                // only thing that will authorize a write or a close. Core's
+                // handle is move-only and not serializable, so there is nothing
+                // to hand across the socket even if it were wanted.
+                //
+                // `flow_label` is echoed beside it because the client still
+                // needs the name for its own control messages — and because it
+                // is the caller's own string, so echoing cannot disagree with
+                // what core holds. It authorizes nothing.
+                Ok(flow) => match state.clients.install_realtime_flow(&owner, network, flow) {
+                    Ok(capability) => Response::ok(serde_json::json!({
+                        "flow_label": chosen,
+                        "flow_capability": capability.expose(),
+                    })),
+                    Err(flow) => {
+                        // Disconnect won the registry mutation race. This
+                        // completed open was never installed, so this branch is
+                        // its sole close owner.
+                        let _ = net.close_realtime(flow).await;
+                        Response::err("local client disconnected before realtime flow installation")
+                    }
+                },
                 Err(refusal) => realtime_refused(refusal),
             }
         }
         Request::RealtimeFlowClose {
-            network,
-            peer,
-            flow_label,
+            client_id,
+            client_capability,
+            flow_capability,
         } => {
+            let Some(owner) = state.clients.authenticate(client_id, &client_capability) else {
+                return Response::err("invalid local client authority");
+            };
+            // Taken out before the close runs, and taken by value. Two
+            // concurrent closes therefore cannot both reach core with the same
+            // flow — the second finds nothing — and a client cannot send on a
+            // flow it has asked to close, because there is no longer an entry
+            // for its pipe to borrow.
+            let Some((network, flow)) = owner.take_realtime_flow(&flow_capability) else {
+                return Response::err(
+                    "unknown flow_capability: it was never issued to this client, or the \
+                     flow it named has already been closed",
+                );
+            };
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
@@ -1513,7 +2055,14 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // client that closes a label and immediately reopens it can rely on
             // the previous occupant being gone; acking on the release would make
             // that false in precisely the case where it matters.
-            match net.close_realtime(&peer, flow_label.as_bytes()).await {
+            //
+            // The handle is consumed here. A refusal therefore does not hand it
+            // back, and that is right rather than merely convenient: every
+            // refusal this can produce means the flow is already gone — its
+            // session was replaced, or the label was closed with it — so
+            // returning the capability would be re-issuing authority over
+            // nothing.
+            match net.close_realtime(flow).await {
                 Ok(()) => Response::ok(serde_json::json!({ "closed": true })),
                 Err(refusal) => realtime_refused(refusal),
             }
@@ -1746,12 +2295,17 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         // ---- RPC handler claims --------------------------------------
         Request::RpcRegister {
             client_id,
+            client_capability,
             network,
             method,
             streaming,
         } => {
-            if state.clients.client(client_id).is_none() {
-                return Response::err(format!("unknown client_id: {client_id}"));
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
             }
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
@@ -1784,9 +2338,17 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
 
         Request::RpcUnregister {
             client_id,
+            client_capability,
             network,
             method,
         } => {
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
+            }
             let key = (network, method);
             let released = state.clients.release_method(&key, client_id);
             Response::ok(serde_json::json!({ "released": released }))
@@ -1794,17 +2356,35 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
 
         // ---- inbound-RPC responses (from IPC handler back to daemon)
         Request::RpcRespond {
+            client_id,
+            client_capability,
+            network,
+            peer,
+            method,
             request_id,
+            operation_id,
             ok,
             error,
         } => {
-            let resolved = if let Some(err) = error {
-                state.clients.reject_inbound_single(&request_id, err)
-            } else {
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
+            }
+            let key = crate::ipc::clients::PendingKey {
+                network,
+                method,
+                remote_peer: peer,
+                remote_request_id: request_id.clone(),
+                class: crate::ipc::clients::HandlerMode::Single,
+            };
+            let result = error.map_or_else(|| Ok(ok.unwrap_or(serde_json::Value::Null)), Err);
+            let resolved =
                 state
                     .clients
-                    .resolve_inbound_single(&request_id, ok.unwrap_or(serde_json::Value::Null))
-            };
+                    .resolve_exact_single(&key, client_id, operation_id, result);
             if resolved {
                 Response::ok(serde_json::json!({ "resolved": true }))
             } else {
@@ -1813,12 +2393,32 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         }
 
         Request::RpcStreamChunk {
+            client_id,
+            client_capability,
+            network,
+            peer,
+            method,
             request_id,
+            operation_id,
             payload,
         } => {
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
+            }
+            let key = crate::ipc::clients::PendingKey {
+                network,
+                method,
+                remote_peer: peer,
+                remote_request_id: request_id.clone(),
+                class: crate::ipc::clients::HandlerMode::Stream,
+            };
             let accepted = state
                 .clients
-                .push_inbound_stream_chunk(&request_id, payload)
+                .push_exact_stream(&key, client_id, operation_id, payload)
                 .await;
             if accepted {
                 Response::ok(serde_json::json!({ "delivered": true }))
@@ -1828,19 +2428,35 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         }
 
         Request::RpcStreamEnd {
+            client_id,
+            client_capability,
+            network,
+            peer,
+            method,
             request_id,
-            error: _,
+            operation_id,
+            error,
         } => {
-            // Note: webrtc-rs's `Rpc::serve_stream` derives the
-            // stream-end error from the inner future (Err →
-            // `RpcStreamEnd { error }` on the wire). At this
-            // layer dropping the sender is the only signal we
-            // have — the engine emits `error: None`. Surfacing
-            // an explicit error from the IPC client requires
-            // sending it as the final chunk before close. A
-            // follow-up extension can plumb the wire-level
-            // error if needed; for now the close is silent.
-            let closed = state.clients.close_inbound_stream(&request_id);
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
+            }
+            // The typed terminal item preserves clean versus failed closure;
+            // disappearing without either is treated as failure by core.
+            let key = crate::ipc::clients::PendingKey {
+                network,
+                method,
+                remote_peer: peer,
+                remote_request_id: request_id.clone(),
+                class: crate::ipc::clients::HandlerMode::Stream,
+            };
+            let closed = state
+                .clients
+                .close_exact_stream(&key, client_id, operation_id, error)
+                .await;
             Response::ok(serde_json::json!({ "closed": closed }))
         }
 
@@ -1862,13 +2478,14 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
 
         Request::RpcCallStream {
             client_id,
+            client_capability,
             network,
             peer,
             method,
             payload,
         } => {
-            let Some(client) = state.clients.client(client_id) else {
-                return Response::err(format!("unknown client_id: {client_id}"));
+            let Some(client) = state.clients.authenticate(client_id, &client_capability) else {
+                return Response::err("invalid local client authority");
             };
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
@@ -1884,15 +2501,21 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 Err(e) => return Response::err(e.to_string()),
             };
             let writer_tx = client.writer_tx.clone();
+            let stream_owner = client.clone();
             let req_id_for_task = request_id.clone();
             tokio::spawn(async move {
                 let mut rx = rx;
-                while let Some(chunk) = rx.recv().await {
+                loop {
+                    let chunk = tokio::select! {
+                        () = stream_owner.wait_disconnected() => return,
+                        chunk = rx.recv() => chunk,
+                    };
+                    let Some(chunk) = chunk else { break };
                     match chunk {
                         Ok(payload) => {
                             let _ = writer_tx.send(crate::ipc::ServerOut::RpcCallStreamChunk {
                                 request_id: req_id_for_task.clone(),
-                                payload,
+                                payload: payload.into_value(),
                             });
                         }
                         Err(err) => {
@@ -1915,11 +2538,16 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         // ---- typed channels ------------------------------------------
         Request::ChannelSubscribe {
             client_id,
+            client_capability,
             network,
             channel,
         } => {
-            if state.clients.client(client_id).is_none() {
-                return Response::err(format!("unknown client_id: {client_id}"));
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
             }
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
@@ -1939,9 +2567,17 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
 
         Request::ChannelUnsubscribe {
             client_id,
+            client_capability,
             network,
             channel,
         } => {
+            if state
+                .clients
+                .authenticate(client_id, &client_capability)
+                .is_none()
+            {
+                return Response::err("invalid local client authority");
+            }
             let key = (network, channel);
             state.clients.unsubscribe_channel(&key, client_id);
             // We don't actively tear the pump down — it exits
@@ -2063,7 +2699,14 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
     if drivers.is_none() {
         warn!(network = %config.network_id, "signaling attach returned no handle");
     }
-    state.registry.insert(joined, drivers);
+    if let Some(refused) = state.registry.insert(joined, drivers).into_refusal() {
+        let refusal_state = refused.state;
+        drop(refused.drivers);
+        let _ = refused.joined.shutdown().await;
+        return Response::err(format!(
+            "network id is held by a runtime in {refusal_state:?} state"
+        ));
+    }
 
     // Refresh the service-role advert so the new network advertises what
     // this device hosts.
@@ -2082,11 +2725,9 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
     Response::ok(serde_json::json!({ "added": summary }))
 }
 
-/// Leave a live network and remove it from the on-disk config. The
-/// remove call returns ownership of the `JoinedNetwork`; we run its
-/// `leave()` to flush the engine driver cleanly. The signaling
-/// driver dropped inside `registry.remove` tears down its own
-/// tasks.
+/// Leave a live network and remove it from the on-disk config. The registry
+/// owns signaling and engine teardown through completion and reports its exact
+/// outcome.
 /// Drop a network's persisted **governance state + roster** — the on-disk half
 /// of forgetting a network. Best-effort + logged: a leave that can't delete the
 /// files isn't worth failing the request over, but leaving them is precisely
@@ -2102,54 +2743,37 @@ fn purge_network_state(network_id: &str) {
 
 async fn network_remove(state: &Arc<ControlState>, key: &str, purge: bool) -> Response {
     let key_owned = key.to_string();
-    // Tell peers we're leaving *before* the registry drops the signaling
-    // driver — a self-announced `leave` so they tear our session down now
-    // instead of waiting out the ~90 s heartbeat timeout. The reconnect
-    // button is a leave-then-rejoin, and without this the rejoined device
-    // strands peers holding a dead session whose ICE still reports
-    // `Connected`. Scoped so the cloned handle is released before `remove`,
-    // which would otherwise see it borrowed and report StillBorrowed.
-    {
-        if let Some(joined) = state.registry.get(key) {
-            joined.announce_leave().await;
-        }
-    }
-    match state.registry.remove(key) {
-        RemoveResult::Removed(joined) => {
-            let config_id = joined.config_id().to_string();
-            let network_id = joined.network_id().to_string();
+    let ids = if let Some(joined) = state.registry.get(key) {
+        let ids = (
+            joined.config_id().to_string(),
+            joined.network_id().to_string(),
+        );
+        joined.announce_leave().await;
+        Some(ids)
+    } else {
+        None
+    };
+    match state.registry.remove(key).await {
+        RemoveResult::Removed(outcome) => {
+            let (config_id, network_id) =
+                ids.unwrap_or_else(|| (key_owned.clone(), key_owned.clone()));
             state.services.on_network_removed(&config_id).await;
-            if let Err(e) = joined.leave().await {
-                warn!("leave({key_owned}) returned error: {e:#}");
-            }
             if let Err(e) = persist_network_remove(&config_id, &network_id) {
                 return Response::err(format!("network left but config.json save failed: {e}"));
             }
             if purge {
                 purge_network_state(&network_id);
             }
-            Response::ok(serde_json::json!({ "removed": config_id }))
-        }
-        RemoveResult::StillBorrowed => {
-            // Engine driver will exit on command-channel drop; we
-            // still need to update disk so a restart doesn't
-            // re-join. We don't know the network_id since we
-            // couldn't unwrap; persist by the key we were given
-            // and let the persist helper handle either alias.
-            state.services.on_network_removed(&key_owned).await;
-            if let Err(e) = persist_network_remove(&key_owned, &key_owned) {
-                return Response::err(format!("network removed but config.json save failed: {e}"));
+            match outcome {
+                Ok(()) => Response::ok(serde_json::json!({ "removed": config_id })),
+                Err(error) => Response::err(format!(
+                    "network removed but runtime teardown reported failure: {error}"
+                )),
             }
-            if purge {
-                // We couldn't unwrap the JoinedNetwork, so we only have the key
-                // we were given; it doubles as the network id for the alias the
-                // caller used (same basis `persist_network_remove` relies on).
-                purge_network_state(&key_owned);
-            }
-            Response::ok(
-                serde_json::json!({ "removed": key_owned, "warning": "engine teardown deferred — request was in flight" }),
-            )
         }
+        RemoveResult::AlreadyClosing(runtime) => Response::err(format!(
+            "network teardown already in progress ({runtime:?})"
+        )),
         RemoveResult::NotFound => Response::err(format!("unknown network: {key_owned}")),
     }
 }
@@ -2355,8 +2979,7 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     // was rather than leaving the user with nothing — the roster file
     // survives on disk regardless, but a vanished network with no
     // recovery surface is a footgun. Then release our Arc clones so the
-    // registry can reclaim ownership and `leave()` the old driver
-    // cleanly rather than reporting StillBorrowed.
+    // registry can begin its single owned teardown.
     let old_config = net_state.config.read().clone();
     // Same graceful-departure courtesy as network_remove: peers drop our
     // session now rather than waiting out the heartbeat timeout, so the
@@ -2367,21 +2990,22 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     drop(net_state);
     drop(joined);
 
-    match state.registry.remove(&config.id) {
-        RemoveResult::Removed(old) => {
-            if let Err(e) = old.leave().await {
-                warn!("leave during network update returned error: {e:#}");
-            }
+    match state.registry.remove(&config.id).await {
+        RemoveResult::Removed(Ok(())) => {}
+        RemoveResult::Removed(Err(error)) => {
+            return Response::err(format!("old runtime teardown failed: {error}"));
         }
-        RemoveResult::StillBorrowed => {
-            warn!(
-                network = %config.id,
-                "network update: old engine teardown deferred (request in flight)"
-            );
+        RemoveResult::AlreadyClosing(runtime) => {
+            return Response::err(format!(
+                "network update refused while teardown is already in progress ({runtime:?})"
+            ));
         }
         RemoveResult::NotFound => {
-            // Raced with a concurrent remove between our get() and
-            // here; fall through and re-join fresh from the new config.
+            if let Some(runtime) = state.registry.state(&config.id) {
+                return Response::err(format!(
+                    "network update refused while prior runtime is {runtime:?}"
+                ));
+            }
         }
     }
 
@@ -2397,13 +3021,22 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
                         let net_state = restored.state();
                         myownmesh_core::engine::attach_signaling(&net_state)
                     };
-                    state.registry.insert(restored, drivers);
-                    state.services.on_network_added(&config.id).await;
-                    " — restored the previous config"
+                    match state.registry.insert(restored, drivers).into_refusal() {
+                        None => {
+                            state.services.on_network_added(&config.id).await;
+                            " — restored the previous config".to_string()
+                        }
+                        Some(refused) => {
+                            let refusal_state = refused.state;
+                            drop(refused.drivers);
+                            let _ = refused.joined.shutdown().await;
+                            format!(" — rollback join was refused by a {refusal_state:?} runtime")
+                        }
+                    }
                 }
                 Err(re) => {
                     warn!(network = %config.id, "network update rollback failed: {re:#}");
-                    " — AND rollback failed; re-add it from the Networks tab"
+                    " — AND rollback failed; re-add it from the Networks tab".to_string()
                 }
             };
             return Response::err(format!("rejoin with new config: {e}{rollback}"));
@@ -2423,7 +3056,14 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     if drivers.is_none() {
         warn!(network = %config.network_id, "signaling attach returned no handle after update");
     }
-    state.registry.insert(joined, drivers);
+    if let Some(refused) = state.registry.insert(joined, drivers).into_refusal() {
+        let refusal_state = refused.state;
+        drop(refused.drivers);
+        let _ = refused.joined.shutdown().await;
+        return Response::err(format!(
+            "replacement runtime refused while predecessor is {refusal_state:?}"
+        ));
+    }
 
     // The old network was torn down and a fresh one registered under the
     // same id; re-run both hooks so the advert tracks the replacement.
@@ -2681,7 +3321,8 @@ static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(No
 // held to theirs.
 
 /// Defensive cap on one frame body — a corrupt length never allocates more.
-pub const MAX_REALTIME_FRAME_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const TEST_REALTIME_FRAME_CEILING: usize = 64 * 1024 * 1024;
 
 /// Fixed prefix width of a realtime frame body, identical in both directions:
 /// the label's length, a one-byte slot, a four-byte slot, and the payload
@@ -2829,7 +3470,10 @@ pub fn decode_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendUnit> {
 /// bytes a unit is cheap for turning a silent misinterpretation into a refusal.
 ///
 /// See `a_neighbouring_encoders_frame_is_refused_not_reinterpreted`.
-pub fn encode_realtime_recv_unit(unit: &RealtimeRecvUnit) -> Option<Vec<u8>> {
+pub fn encode_realtime_recv_unit_with_ceiling(
+    unit: &RealtimeRecvUnit,
+    frame_ceiling: usize,
+) -> Option<Vec<u8>> {
     // Every check happens before anything is allocated, and every one is
     // checked rather than cast. `payload.len() as u32` would truncate a payload
     // past 4 GiB and produce a body whose inner length disagreed with its own
@@ -2848,7 +3492,7 @@ pub fn encode_realtime_recv_unit(unit: &RealtimeRecvUnit) -> Option<Vec<u8>> {
     let total = REALTIME_FRAME_HEADER
         .checked_add(unit.flow_label.len())?
         .checked_add(unit.payload.len())?;
-    if total > MAX_REALTIME_FRAME_BYTES {
+    if total > frame_ceiling || total > u32::MAX as usize {
         return None;
     }
     let mut out = Vec::with_capacity(total);
@@ -2859,6 +3503,11 @@ pub fn encode_realtime_recv_unit(unit: &RealtimeRecvUnit) -> Option<Vec<u8>> {
     out.extend_from_slice(&unit.flow_label);
     out.extend_from_slice(&unit.payload);
     Some(out)
+}
+
+#[cfg(test)]
+fn encode_realtime_recv_unit(unit: &RealtimeRecvUnit) -> Option<Vec<u8>> {
+    encode_realtime_recv_unit_with_ceiling(unit, TEST_REALTIME_FRAME_CEILING)
 }
 
 #[cfg(test)]
@@ -2898,22 +3547,74 @@ mod realtime_control_tests {
     /// it.
     const LABEL: &[u8] = &[b's', b'c', b'r', 0xff];
 
-    /// Both directions bind to one session, so `network` and `peer` are
-    /// required on each. A pipe that parsed without them would carry frames
-    /// whose `flow_label` names a flow on no particular peer.
+    /// A pipe is refused unless it is bound to the thing its direction is
+    /// actually bound to — a flow outbound, a session inbound.
+    ///
+    /// Parsing and binding are separate steps here, and the assertions follow
+    /// that split rather than blurring it: `network` is the only field the
+    /// request type itself requires, because everything else is
+    /// direction-dependent and a serde-level `Option` cannot express "required
+    /// for one variant of a sibling field". The direction-dependent rules are
+    /// [`realtime_pipe_binding`]'s, and are asserted against it.
+    ///
+    /// The outbound case is the finding: a pipe that accepted a `peer` would be
+    /// carrying a selector it re-resolves per unit, which is how a pipe whose
+    /// session had ended went on writing into the replacement's flow of the
+    /// same name.
     #[test]
     fn a_realtime_pipe_will_not_parse_without_its_session() {
-        let bound = r#"{"op":"realtime_pipe","direction":"outbound",
-            "network":"home","peer":"peerpub"}"#;
-        assert!(matches!(
-            serde_json::from_str::<Request>(bound),
-            Ok(Request::RealtimePipe { .. })
-        ));
-
         let unbound = r#"{"op":"realtime_pipe","direction":"outbound"}"#;
         assert!(
             serde_json::from_str::<Request>(unbound).is_err(),
-            "an unbound pipe cannot route a session-scoped label"
+            "a pipe with no network names nothing to operate through"
+        );
+
+        assert!(
+            realtime_pipe_binding(RealtimePipeDirection::Outbound, "home", None, Some("cap"))
+                .is_ok(),
+            "non-vacuity: an outbound pipe bound to a flow capability is accepted"
+        );
+        assert!(
+            realtime_pipe_binding(
+                RealtimePipeDirection::Outbound,
+                "home",
+                Some("peerpub"),
+                Some("cap"),
+            )
+            .is_err(),
+            "an outbound pipe must not carry a peer: that selector is what gets \
+             re-resolved into a replacement session"
+        );
+        assert!(
+            realtime_pipe_binding(RealtimePipeDirection::Outbound, "home", None, None).is_err(),
+            "and it must carry the capability, which is the only thing that \
+             authorizes a write"
+        );
+
+        assert!(
+            realtime_pipe_binding(
+                RealtimePipeDirection::Inbound,
+                "home",
+                Some("peerpub"),
+                None
+            )
+            .is_ok(),
+            "non-vacuity: an inbound pipe bound to a session is accepted"
+        );
+        assert!(
+            realtime_pipe_binding(RealtimePipeDirection::Inbound, "home", None, None).is_err(),
+            "an inbound pipe claims one session's stream and must name it"
+        );
+        assert!(
+            realtime_pipe_binding(
+                RealtimePipeDirection::Inbound,
+                "home",
+                Some("peerpub"),
+                Some("cap"),
+            )
+            .is_err(),
+            "and it is bound to a session rather than a flow, so a flow \
+             capability here is refused rather than ignored"
         );
     }
 
@@ -3189,7 +3890,7 @@ mod realtime_control_tests {
         // ceiling too, which is why it is subtracted here: a bound that only
         // considered the payload would emit bodies a byte over. Allocated rather
         // than faked, so the bound under test is the real one.
-        let headroom = MAX_REALTIME_FRAME_BYTES - REALTIME_FRAME_HEADER - LABEL.len();
+        let headroom = TEST_REALTIME_FRAME_CEILING - REALTIME_FRAME_HEADER - LABEL.len();
         let oversize = RealtimeRecvUnit {
             flow_label: LABEL.to_vec(),
             marker: false,
@@ -3198,7 +3899,7 @@ mod realtime_control_tests {
         };
         assert!(
             encode_realtime_recv_unit(&oversize).is_none(),
-            "a body over MAX_REALTIME_FRAME_BYTES must not be encoded at all"
+            "a body over the selected frame ceiling must not be encoded at all"
         );
 
         // The largest unit that still fits is accepted — the check is a ceiling,
@@ -3211,7 +3912,7 @@ mod realtime_control_tests {
         };
         assert_eq!(
             encode_realtime_recv_unit(&exact).map(|body| body.len()),
-            Some(MAX_REALTIME_FRAME_BYTES)
+            Some(TEST_REALTIME_FRAME_CEILING)
         );
     }
 
@@ -3354,5 +4055,56 @@ mod realtime_control_tests {
             decoded.duration_us, recv.rtp_timestamp,
             "a 90 kHz timestamp read as a 90-millisecond duration, undetectably"
         );
+    }
+
+    #[tokio::test]
+    async fn json_reader_refuses_before_crossing_selected_ceiling() {
+        let input = b"123456789\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let error = read_bounded_json_line(&mut reader, 8)
+            .await
+            .expect_err("nine bytes exceed eight");
+        assert!(error.to_string().contains("owner-selected byte ceiling"));
+    }
+
+    #[tokio::test]
+    async fn json_reader_accepts_exact_ceiling_without_hidden_slack() {
+        let input = b"12345678\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        assert_eq!(
+            read_bounded_json_line(&mut reader, 9).await.unwrap(),
+            Some("12345678".into())
+        );
+    }
+
+    #[test]
+    fn realtime_length_refusal_is_checked_before_body_allocation() {
+        assert!(realtime_frame_length_admitted(8, 8));
+        assert!(!realtime_frame_length_admitted(9, 8));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_control_endpoint_is_verified_as_exact_owner_only_socket() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let directory = tempfile::tempdir().expect("temporary control directory");
+        let path = directory.path().join("control.sock");
+        let listener = bind_listener(&SocketTarget::Path(path.clone())).expect("bind control");
+        let metadata = std::fs::symlink_metadata(&path).expect("socket metadata");
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        drop(listener);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_dacl_names_current_token_user_not_owner_rights() {
+        let sddl = current_user_pipe_sddl()
+            .expect("current user DACL")
+            .to_string_lossy();
+        assert!(sddl.starts_with("D:P(A;;GA;;;S-1-"));
+        assert!(!sddl.contains(";;;OW)"));
     }
 }
