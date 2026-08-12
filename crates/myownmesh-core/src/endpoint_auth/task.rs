@@ -1119,19 +1119,19 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc04_legacy_handshake_signature_is_not_an_accepted_fallback() {
+    fn v4_arc04_an_alternate_signature_payload_is_not_an_accepted_fallback() {
         // Domain separation, not negotiation: a signature over anything other
         // than this transcript simply fails, and there is no downgrade path.
         let fixture = fixture();
         let peer = peer_draw();
         fixture.task.accept_peer_hello(peer).expect("binds");
-        let legacy = crate::signing::sign_with(&fixture.peer_key, b"myownmesh-handshake-v1:legacy");
+        let alternate = crate::signing::sign_with(&fixture.peer_key, b"alternate-auth-payload");
 
         // Matched rather than compared: the capability is deliberately neither
         // `Debug` nor `PartialEq`, because its private provenance must not be
         // printable or comparable outside its owner.
         assert!(matches!(
-            fixture.task.accept_peer_proof(&legacy),
+            fixture.task.accept_peer_proof(&alternate),
             Err(EndpointAuthError::SignatureInvalid)
         ));
     }

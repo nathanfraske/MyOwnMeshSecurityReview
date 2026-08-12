@@ -73,7 +73,7 @@ struct LeasedMapNode<K, V> {
 /// out would be holding a payload whose lease had already been released with
 /// the node around it, and every caller in the crate wants only the fact of the
 /// refusal.
-pub(crate) struct RefusedEntry<K, V> {
+pub struct LeasedMapInsertRefusal<K, V> {
     /// Never read; it exists to be dropped. Underscored for the same reason a
     /// node's `_entry` is: the whole content of this field is its destructor.
     _node: Box<LeasedMapNode<K, V>>,
@@ -85,9 +85,9 @@ pub(crate) struct RefusedEntry<K, V> {
 /// a derived `Debug` would demand `K: Debug` and `V: Debug` of every map, and
 /// would put a caller's payload and its accounting handle into a panic message.
 /// Which key collided is already known to the caller that supplied it.
-impl<K, V> std::fmt::Debug for RefusedEntry<K, V> {
+impl<K, V> std::fmt::Debug for LeasedMapInsertRefusal<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RefusedEntry")
+        f.write_str("LeasedMapInsertRefusal")
     }
 }
 
@@ -97,7 +97,7 @@ impl<K, V> std::fmt::Debug for RefusedEntry<K, V> {
 /// release on removal, release on drop — is the same fact for a session's held
 /// names and for its live flows, and two copies of it would be two places to
 /// get the drop order wrong.
-pub(crate) struct LeasedMap<K, V> {
+pub struct LeasedMap<K, V> {
     root: Option<Box<LeasedMapNode<K, V>>>,
     len: usize,
     /// Seeds the per-entry priority. Per map and per process, so the tree's
@@ -145,7 +145,7 @@ impl<K, V> Default for LeasedMap<K, V> {
 }
 
 impl<K, V> LeasedMap<K, V> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             root: None,
             len: 0,
@@ -164,7 +164,7 @@ impl<K, V> LeasedMap<K, V> {
     /// Off-node retention owned by `K` or `V` carries its own lease in that
     /// value, so removal may release this node and safely return both values.
     #[must_use = "the entry claim must be acquired before the entry is inserted"]
-    pub(crate) fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    pub fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         let record_bytes =
             u64::try_from(std::mem::size_of::<LeasedMapNode<K, V>>()).map_err(|_| {
                 ResourceClaimArithmeticError::Overflow {
@@ -193,7 +193,7 @@ impl<K, V> LeasedMap<K, V> {
 impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// Whether any live value satisfies `predicate`, without allocating an
     /// iterator stack or exposing the map's representation.
-    pub(crate) fn any_value(&self, mut predicate: impl FnMut(&V) -> bool) -> bool {
+    pub fn any_value(&self, mut predicate: impl FnMut(&V) -> bool) -> bool {
         fn visit<K, V>(
             node: Option<&LeasedMapNode<K, V>>,
             predicate: &mut impl FnMut(&V) -> bool,
@@ -206,15 +206,27 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         visit(self.root.as_deref(), &mut predicate)
     }
 
+    /// Visit every live key and value without exposing or allocating an
+    /// iterator representation.
+    ///
+    /// Callers that need an owned snapshot perform their own allocation while
+    /// this borrowed walk keeps the map's node and lease ownership private.
+    pub fn for_each(&self, mut visit_entry: impl FnMut(&K, &V)) {
+        fn visit<K, V>(node: Option<&LeasedMapNode<K, V>>, visit_entry: &mut impl FnMut(&K, &V)) {
+            let Some(node) = node else { return };
+            visit(node.left.as_deref(), visit_entry);
+            visit_entry(&node.key, &node.value);
+            visit(node.right.as_deref(), visit_entry);
+        }
+        visit(self.root.as_deref(), &mut visit_entry);
+    }
+
     /// Borrow one live value satisfying `predicate` mutably.
     ///
     /// The walk allocates nothing. It is used for bounded teardown quanta: one
     /// retained child is removed under the owner lock, then dropped after the
     /// lock is released.
-    pub(crate) fn find_value_mut(
-        &mut self,
-        mut predicate: impl FnMut(&V) -> bool,
-    ) -> Option<&mut V> {
+    pub fn find_value_mut(&mut self, mut predicate: impl FnMut(&V) -> bool) -> Option<&mut V> {
         fn visit<'a, K, V>(
             node: Option<&'a mut LeasedMapNode<K, V>>,
             predicate: &mut impl FnMut(&V) -> bool,
@@ -245,12 +257,12 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// handing back an unpacked value and lease would widen every one of them
     /// by the size of the caller's payload to describe a case that did not
     /// happen.
-    pub(crate) fn insert(
+    pub fn insert(
         &mut self,
         key: K,
         value: V,
         entry: ResourceLease,
-    ) -> Result<(), RefusedEntry<K, V>> {
+    ) -> Result<(), LeasedMapInsertRefusal<K, V>> {
         let priority = self.priority(&key);
         let node = Box::new(LeasedMapNode {
             key,
@@ -261,7 +273,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             right: None,
         });
         match Self::insert_node(&mut self.root, node) {
-            Some(refused) => Err(RefusedEntry { _node: refused }),
+            Some(refused) => Err(LeasedMapInsertRefusal { _node: refused }),
             None => {
                 // Not saturating: the count and the tree must agree, and a
                 // saturated count would disagree silently. It cannot overflow
@@ -382,7 +394,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// Borrowed lookup, so asking about a name costs nothing the name does not
     /// already own — a caller with raw bytes never has to build a funded key
     /// merely to ask a question.
-    pub(crate) fn get<Q>(&self, key: &Q) -> Option<&V>
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -390,7 +402,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         self.find(key).map(|node| &node.value)
     }
 
-    pub(crate) fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -415,7 +427,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         self.find(key).map(|node| (&node.key, &node.value))
     }
 
-    pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -423,16 +435,12 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         self.find(key).is_some()
     }
 
-    /// Remove one entry, releasing exactly that entry's funding.
+    /// Remove one entry and return its value, releasing the stored key and the
+    /// entry's funding as they drop.
     ///
-    /// Controls only. Production takes entries out through
-    /// [`Self::remove_entry`], because the owners here are keyed by a leased
-    /// label and the key is half of what they need back — dropping it inside
-    /// this call would release a shared record the caller still has ordering
-    /// obligations around. This is the value-only convenience the controls use,
-    /// and gating it keeps the production path a single shape.
-    #[cfg(test)]
-    pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    /// Call [`Self::remove_entry`] instead when the caller must retain the
+    /// map's owned key for a later ordering or delivery step.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -442,7 +450,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
 
     /// Remove one entry and hand back both halves, releasing that entry's
     /// funding as the node drops.
-    pub(crate) fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,

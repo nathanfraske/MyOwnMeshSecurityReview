@@ -25,12 +25,11 @@
 
 use std::sync::Arc;
 
+use crate::error::{Error, Result};
+use crate::resource::ResourceMailboxSender;
+use crate::runtime::session_broker::SessionBroker;
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
-
-use crate::error::{Error, Result};
-use crate::runtime::session_broker::SessionBroker;
 
 use super::connection::PeerConnection;
 
@@ -56,7 +55,7 @@ pub(crate) struct PeerRegistry {
     /// Unbound in a bare registry, which is what the unit fixtures build: those
     /// promote and exercise the fence without a driver, and an announcement with
     /// nowhere to go is correctly dropped rather than being an error.
-    promotion_tx: std::sync::OnceLock<mpsc::UnboundedSender<super::state::NetworkCmd>>,
+    promotion_tx: std::sync::OnceLock<ResourceMailboxSender<super::state::NetworkCmd>>,
 }
 
 struct PeerRegistryEntry {
@@ -164,7 +163,7 @@ impl PeerRegistry {
     /// panicking: the binding is an identity this registry holds for its whole
     /// life, so a second one could only be the same queue again or a mistake,
     /// and neither is worth taking a process down for.
-    pub(super) fn bind_promotion_sink(&self, tx: mpsc::UnboundedSender<super::state::NetworkCmd>) {
+    pub(super) fn bind_promotion_sink(&self, tx: ResourceMailboxSender<super::state::NetworkCmd>) {
         let _ = self.promotion_tx.set(tx);
     }
 
@@ -181,10 +180,12 @@ impl PeerRegistry {
     /// rather than a device id — a replacement resolves to a different token, so
     /// a command cannot be applied to a session that did not mint it.
     ///
-    /// Nothing executes under the fence. An unbounded send stores the command
-    /// and wakes the driver; it does not run the handler, and it cannot block. A
-    /// closed queue means the driver is gone, and there is no session service
-    /// left to notify, so the result is deliberately discarded.
+    /// Nothing executes under the fence. Resource-backed admission stores the
+    /// command and wakes the driver; it does not run the handler or await. If
+    /// the provider refuses that one pending callback, the newly minted session
+    /// is revoked before this fence reports it usable: a session that silently
+    /// skipped its first application replay would not be the session callers
+    /// were promised.
     fn promote_and_announce(
         &self,
         peer: &Arc<PeerConnection>,
@@ -199,9 +200,15 @@ impl PeerRegistry {
         );
         if promotion == super::connection::Promotion::NewlyPromoted {
             if let Some(tx) = self.promotion_tx.get() {
-                let _ = tx.send(super::state::NetworkCmd::ReplayCapabilities {
-                    owner: owner.clone(),
-                });
+                if tx
+                    .send(super::state::NetworkCmd::ReplayCapabilities {
+                        owner: owner.clone(),
+                    })
+                    .is_err()
+                {
+                    peer.revoke_promoted_session();
+                    return false;
+                }
             }
         }
         promotion.is_usable()
@@ -323,6 +330,60 @@ impl PeerRegistry {
             return Some(refused(peer));
         }
         Some(admitted(&AdmittedSessionOperation {
+            peer,
+            owner,
+            _not_send: std::marker::PhantomData,
+        }))
+    }
+
+    /// Re-enter the fence to commit work an earlier acquisition funded, only if
+    /// the exact session that funded it is still this peer's live one.
+    ///
+    /// This is the second half of a deliberately split admission. Work whose
+    /// cost is bounded but whose *duration* is set by peer-supplied input — a
+    /// JSON parse over an admitted frame is the case that motivated this — must
+    /// not run under the registry's single mutation lock, because that lock
+    /// orders every peer's promotion, replacement and dispatch. One peer's
+    /// pathological payload would otherwise stall the whole mesh for as long as
+    /// the parse takes, and the admission that authorized the parse is exactly
+    /// what makes the payload's shape adversary-chosen.
+    ///
+    /// So the first acquisition admits, records, and *funds*; the work happens
+    /// outside every lock; and this commits the result. What that costs is one
+    /// extra check, and it is the check the split makes necessary: the session
+    /// may have been revoked or replaced while the work ran, and work funded by
+    /// a session that is gone authorizes nothing. `witness` is matched by
+    /// identity against the peer's current session rather than merely tested for
+    /// liveness, so a *replacement* that promoted in the interval refuses here
+    /// instead of inheriting the predecessor's admitted frame.
+    ///
+    /// No refusal arm and no counting. A frame that reaches here was already
+    /// admitted and already counted; failing this test means the session went
+    /// away underneath it, which is this side's lifecycle and not the peer's
+    /// misbehaviour. `None` covers all three ways that happens — stale owner,
+    /// no live session, different session — because none of them authorizes the
+    /// commit and telling them apart out here would be a distinction the caller
+    /// could only misuse.
+    pub(super) fn with_same_session<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        witness: &crate::runtime::session_broker::SessionValidityWitness,
+        committed: impl FnOnce(&AdmittedSessionOperation<'_>) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        // Read under the lock, like every other authorizing fact in this file.
+        // Deliberately *not* a promotion: promoting here would mint a fresh
+        // session on demand and then hand it work the previous session paid
+        // for, which is the precise substitution this check exists to refuse.
+        if !peer.with_live_session(|session| witness.witnesses(session))? {
+            return None;
+        }
+        Some(committed(&AdmittedSessionOperation {
             peer,
             owner,
             _not_send: std::marker::PhantomData,
@@ -785,6 +846,21 @@ impl AdmittedSessionOperation<'_> {
     /// Record inbound liveness and traffic on the exact admitted peer.
     pub(super) fn record_inbound(&self, effect: impl FnOnce(&Arc<PeerConnection>)) {
         effect(self.peer);
+    }
+
+    /// A witness for the exact session this fence admitted.
+    ///
+    /// Read-only and carrying no authority of its own: it cannot send, cannot
+    /// retain, and cannot be turned back into a session. Its whole purpose is to
+    /// let work funded here be committed by a *later* acquisition through
+    /// [`PeerRegistry::with_same_session`], which is what allows peer-supplied
+    /// work to run outside the mutation lock without letting a replacement
+    /// inherit the result.
+    pub(super) fn session_witness(
+        &self,
+    ) -> Option<crate::runtime::session_broker::SessionValidityWitness> {
+        self.peer
+            .with_live_session(|session| session.validity_witness())
     }
 
     /// Lend the live session this fence admitted, and the application state it

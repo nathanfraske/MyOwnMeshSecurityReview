@@ -23,7 +23,10 @@ use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, MeshPhase};
 use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
-use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
+use crate::resource::{
+    LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
+    ResourceProviderPort, ResourceReport,
+};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
 use crate::runtime::attempt::{
@@ -49,6 +52,7 @@ struct MeshInner {
     identity: Arc<Identity>,
     transport: Transport,
     resource_scope: MeshRuntimeResourceScope,
+    local_application_resources: LocalApplicationResourceScope,
     events_tx: broadcast::Sender<MeshEvent>,
 }
 
@@ -68,9 +72,12 @@ impl Mesh {
     /// handle cannot join a network or allocate a native peer connector. A
     /// network-capable owner must use [`Self::open_connector_capable`]
     /// and provide the reviewed process policy explicitly.
-    pub async fn open_infrastructure_only(config: MeshConfig) -> Result<MeshHandle> {
+    pub async fn open_infrastructure_only(
+        config: MeshConfig,
+        resources: ResourceProviderPort,
+    ) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
-        Self::open_infrastructure_only_with_identity(config, identity).await
+        Self::open_infrastructure_only_with_identity(config, identity, resources).await
     }
 
     /// Build a `Mesh` whose native connector allocations are admitted by the
@@ -96,7 +103,9 @@ impl Mesh {
     pub async fn open_infrastructure_only_with_identity(
         _config: MeshConfig,
         identity: Arc<Identity>,
+        resources: ResourceProviderPort,
     ) -> Result<MeshHandle> {
+        ProcessResourceRoot::global().install_local_application_provider(resources)?;
         let transport = Transport::new()?;
         Self::open_with_identity_and_transport(identity, transport)
     }
@@ -116,11 +125,14 @@ impl Mesh {
         transport: Transport,
     ) -> Result<MeshHandle> {
         let resource_scope = ProcessResourceRoot::global().mesh_runtime_scope();
+        let local_application_resources =
+            ProcessResourceRoot::global().issue_local_application_scope()?;
         let (events_tx, _) = broadcast::channel(256);
         let inner = Arc::new(MeshInner {
             identity,
             transport,
             resource_scope,
+            local_application_resources,
             events_tx,
         });
         info!(
@@ -182,6 +194,17 @@ impl MeshHandle {
         self.mesh.inner.resource_scope.report()
     }
 
+    /// Issue one child of this Mesh runtime's exact local-application owner.
+    /// Daemon IPC and joined-network application state share the selected
+    /// process provider without borrowing connector authority.
+    pub fn local_application_resource_scope(&self) -> Result<LocalApplicationResourceScope> {
+        self.mesh
+            .inner
+            .local_application_resources
+            .child()
+            .map_err(Error::from)
+    }
+
     /// Join a network. Returns a [`JoinedNetwork`] handle for
     /// channels / RPC / roster. The driver task keeps running
     /// until [`JoinedNetwork::leave`] is called (or the
@@ -205,9 +228,10 @@ impl MeshHandle {
             self.mesh.inner.identity.clone(),
             self.mesh.inner.transport.clone(),
             &self.mesh.inner.resource_scope,
+            &self.mesh.inner.local_application_resources,
         )
         .await?;
-        let rpc = Rpc::attach(&state);
+        let rpc = Rpc::attach(&state)?;
 
         // Fan-out per-network events into the mesh-wide broadcaster.
         let mesh_events_tx = self.mesh.inner.events_tx.clone();
@@ -286,7 +310,7 @@ impl JoinedNetwork {
         self.state
             .cmd_tx
             .send(NetworkCmd::SetTopology(mode))
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         Ok(())
     }
 
@@ -331,7 +355,7 @@ impl JoinedNetwork {
                 label: label.to_string(),
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped approve reply".into()))??;
         // Emit local approve frame after roster persistence.
@@ -349,21 +373,29 @@ impl JoinedNetwork {
                 device_id: device_id.to_string(),
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped reply".into()))??;
-        let _ = self.state.cmd_tx.send(NetworkCmd::DropPeer {
+        if let Err(error) = self.state.cmd_tx.send(NetworkCmd::DropPeer {
             device_id: device_id.to_string(),
             reason: DropReason::Denied,
-        });
+        }) {
+            tracing::warn!(error = %error.into_admission_error(), peer = %device_id, "post-roster peer drop was refused");
+        }
         Ok(())
     }
 
     /// Set the capability advertisement this node publishes. It crosses only as
     /// a `capabilities_update` frame, to peers with a live session — see
     /// [`crate::rpc::Rpc::advertise`] for when each peer is told.
-    pub fn advertise(&self, caps: CapabilityAdvert) {
-        self.rpc.advertise(caps);
+    ///
+    /// Answers whether the value was committed. Discarding this is discarding
+    /// the fact that the node is still advertising its previous capabilities.
+    pub fn advertise(
+        &self,
+        caps: CapabilityAdvert,
+    ) -> std::result::Result<(), crate::rpc::RpcError> {
+        self.rpc.advertise(caps)
     }
 
     // ---- governance (closed networks) ---------------------------------
@@ -381,7 +413,7 @@ impl JoinedNetwork {
         self.state
             .cmd_tx
             .send(NetworkCmd::GovernanceSnapshot { reply })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped snapshot reply".into()))
     }
@@ -406,7 +438,7 @@ impl JoinedNetwork {
                 mfa_code,
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped propose reply".into()))?
     }
@@ -423,7 +455,7 @@ impl JoinedNetwork {
                 mfa_code,
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped sign reply".into()))?
     }
@@ -439,7 +471,7 @@ impl JoinedNetwork {
                 proposal_id: proposal_id.to_string(),
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped deny reply".into()))?
     }
@@ -455,7 +487,7 @@ impl JoinedNetwork {
                 proposal_id: proposal_id.to_string(),
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped withdraw reply".into()))?
     }
@@ -473,7 +505,7 @@ impl JoinedNetwork {
                 proposal_id: proposal_id.to_string(),
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped split reply".into()))?
     }
@@ -539,7 +571,7 @@ impl JoinedNetwork {
                 sticky: false,
                 reply: None,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         Ok(())
     }
 
@@ -590,10 +622,9 @@ impl JoinedNetwork {
     /// the peer's engine has delivered it to the application layer.
     ///
     /// Fail-closed at submission. It errs immediately when the peer has no live
-    /// session, when the peer does not advertise reliable channels — no silent
-    /// downgrade to a best-effort send — and when the resource provider will not
-    /// fund retaining the frame, which is what backpressure is. There is no
-    /// queue-until-later: a frame is retained under a session or not at all.
+    /// session and when the resource provider will not fund retaining the frame,
+    /// which is what backpressure is. There is no queue-until-later: a frame is
+    /// retained under a session or not at all.
     ///
     /// It also errs, rather than retransmitting, if that session ends before the
     /// peer acknowledges — a rebuild, a policy revocation, a peer replacement or
@@ -622,7 +653,7 @@ impl JoinedNetwork {
     /// facade. Idempotent: every concurrent caller observes the same driver
     /// retirement before it returns.
     pub async fn shutdown(&self) -> Result<()> {
-        let _ = self.state.cmd_tx.send(NetworkCmd::Shutdown);
+        self.state.request_shutdown();
         let mut driver = self.lifecycle.driver.lock().await;
         if let Some(driver) = driver.take() {
             let _ = driver.await;
@@ -884,6 +915,23 @@ pub struct PeerInfo {
 mod tests {
     use super::*;
     use crate::identity::Identity;
+    use crate::resource::ResourceClaim;
+
+    fn infrastructure_resources() -> ResourceProviderPort {
+        static PROVIDER: std::sync::OnceLock<ResourceProviderPort> = std::sync::OnceLock::new();
+        PROVIDER
+            .get_or_init(|| {
+                let grant = ResourceClaim::try_from_entries(
+                    crate::resource::ResourceClass::ALL
+                        .into_iter()
+                        .map(|dimension| (dimension, 1_000_000)),
+                )
+                .expect("fixture grant is representable");
+                ResourceProviderPort::new(crate::resource::FiniteResourceProvider::new(grant))
+                    .expect("fixture grant funds its process record")
+            })
+            .clone()
+    }
 
     /// The injection seam adopts the caller's identity rather than the
     /// on-disk anchor: the opened mesh's device id is the injected key's
@@ -895,9 +943,13 @@ mod tests {
         let identity = Arc::new(Identity::ephemeral());
         let want = identity.public_id().to_string();
 
-        let mesh = Mesh::open_infrastructure_only_with_identity(MeshConfig::default(), identity)
-            .await
-            .expect("open_with_identity");
+        let mesh = Mesh::open_infrastructure_only_with_identity(
+            MeshConfig::default(),
+            identity,
+            infrastructure_resources(),
+        )
+        .await
+        .expect("open_with_identity");
 
         // The mesh's wire id derives from the injected key, not a disk anchor.
         assert_eq!(mesh.device_id(), want);
@@ -906,9 +958,13 @@ mod tests {
     #[tokio::test]
     async fn ownerless_mesh_rejects_network_join_with_typed_policy_error() {
         let identity = Arc::new(Identity::ephemeral());
-        let mesh = Mesh::open_infrastructure_only_with_identity(MeshConfig::default(), identity)
-            .await
-            .expect("open infrastructure-only mesh");
+        let mesh = Mesh::open_infrastructure_only_with_identity(
+            MeshConfig::default(),
+            identity,
+            infrastructure_resources(),
+        )
+        .await
+        .expect("open infrastructure-only mesh");
 
         let error = match mesh
             .join(NetworkConfig::from_network_id("ownerless", "ownerless"))

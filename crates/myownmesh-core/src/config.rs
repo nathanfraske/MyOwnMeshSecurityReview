@@ -2,10 +2,8 @@
 //! lives here so any caller (binary, library embedder, tests) shares
 //! the same parse / default behavior.
 //!
-//! Schema versioning: a single `version` field on the root. v1 is
-//! current; additive changes (new optional fields, new networks)
-//! don't bump the version. Field-shape-breaking changes will bump and
-//! ship a migration in this module.
+//! Schema versioning uses one exact hard-alpha `version` field. This build
+//! refuses any other version rather than migrating or guessing compatibility.
 
 use std::path::PathBuf;
 
@@ -235,17 +233,14 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub label: String,
     /// Initial governance kind for this network. Open is the
-    /// default and matches the engine's behaviour through every
-    /// release before `network_state_v1` shipped. Closed sets up
+    /// default. Closed sets up
     /// the per-network signed state log so the founder
     /// self-elects as `Owner` on first attach. Silent is Open
     /// governance plus two connection-behaviour changes — no
     /// auto-dial on presence (co-present peers surface as `Sighted`
     /// without a WebRTC session until an explicit `connect_peer` or
     /// an inbound offer) and no roster gossip — for a shared open
-    /// mesh where every connection is deliberate. Configs written
-    /// by older builds parse via #[serde(default)] without an
-    /// explicit field.
+    /// mesh where every connection is deliberate.
     ///
     /// At runtime, the *authoritative* kind is the one in the
     /// signed [`crate::NetworkState`] log; this field is only the
@@ -589,22 +584,14 @@ impl Default for MeshConfig {
     }
 }
 
-/// Forward-migrate an older on-disk config to the current shape.
-/// v1 → v2: `Ring` becomes [`TopologyMode::FullMesh`]. The v1 "ring"
-/// never shaped connections — it only shelved app frames, so every v1
-/// network genuinely ran a full mesh; from v2, `Ring` names the real
-/// shaped ring, and a network only runs it by choosing it. Idempotent,
-/// and a no-op for configs already at the current version.
-fn migrate(mut cfg: MeshConfig) -> MeshConfig {
-    if cfg.version < 2 {
-        for net in &mut cfg.networks {
-            if matches!(net.topology, TopologyMode::Ring { .. }) {
-                net.topology = TopologyMode::FullMesh;
-            }
-        }
-        cfg.version = 2;
+fn require_current_version(cfg: MeshConfig) -> Result<MeshConfig> {
+    if cfg.version != CONFIG_VERSION {
+        return Err(Error::Config(format!(
+            "config version {} is not the current hard-alpha version {}",
+            cfg.version, CONFIG_VERSION
+        )));
     }
-    cfg
+    Ok(cfg)
 }
 
 impl MeshConfig {
@@ -639,20 +626,11 @@ impl MeshConfig {
                 return Ok(Self::default());
             }
         };
-        if cfg.version > CONFIG_VERSION {
-            return Err(Error::Config(format!(
-                "config version {} is from a newer build (this one expects v{})",
-                cfg.version, CONFIG_VERSION
-            )));
-        }
-        Ok(migrate(cfg))
+        require_current_version(cfg)
     }
 
     /// Persist to the default location. Pretty-printed JSON for
     /// easy hand-editing; the file isn't on a hot path.
-    ///
-    /// (Migrations live in [`migrate`], applied on every load; the
-    /// next save writes the migrated shape at [`CONFIG_VERSION`].)
     pub fn save(&self) -> Result<()> {
         let path = crate::dirs::config_path()?;
         let parent = path.parent().ok_or_else(|| {
@@ -677,7 +655,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_v1_with_defaults() {
+    fn default_is_current_with_defaults() {
         let cfg = MeshConfig::default();
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(cfg.auto_update.enabled);
@@ -698,34 +676,12 @@ mod tests {
     }
 
     #[test]
-    fn v1_config_ring_migrates_to_full_mesh() {
-        let mut cfg = MeshConfig {
+    fn old_hard_alpha_config_is_refused_not_migrated() {
+        let old = MeshConfig {
             version: 1,
             ..Default::default()
         };
-        let mut net = NetworkConfig::from_network_id("n1", "net-one");
-        net.topology = TopologyMode::Ring { n_preferred: None };
-        cfg.networks.push(net);
-        let mut chosen = NetworkConfig::from_network_id("n2", "net-two");
-        chosen.topology = TopologyMode::Star {
-            hub: "hub-id".into(),
-        };
-        cfg.networks.push(chosen);
-
-        let migrated = migrate(cfg);
-        assert_eq!(migrated.version, CONFIG_VERSION);
-        assert_eq!(
-            migrated.networks[0].topology,
-            TopologyMode::FullMesh,
-            "a v1 ring was a full mesh in practice — load it as one"
-        );
-        assert!(
-            matches!(migrated.networks[1].topology, TopologyMode::Star { .. }),
-            "deliberately-chosen modes migrate untouched"
-        );
-        // Idempotent: running the migration again changes nothing.
-        let again = migrate(migrated.clone());
-        assert_eq!(again, migrated);
+        assert!(require_current_version(old).is_err());
     }
 
     #[test]
@@ -859,27 +815,6 @@ mod tests {
         assert!(s.signaling.limits.max_event_rate > 0);
         // TURN bandwidth is unlimited until configured.
         assert_eq!(s.turn.max_bps_per_connection, 0);
-    }
-
-    #[test]
-    fn node_defaults_on_for_old_configs() {
-        // A config written before the `node` toggle existed must still
-        // behave as a node (the field is #[serde(default)] → enabled).
-        let json = r#"{ "version": 1, "services": {}, "networks": [] }"#;
-        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.services.node.enabled);
-    }
-
-    #[test]
-    fn config_without_services_field_parses() {
-        // A config.json written by a build that predates the services
-        // block must still load — the field is #[serde(default)].
-        let json = r#"{
-            "version": 1,
-            "networks": []
-        }"#;
-        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.services, ServicesConfig::default());
     }
 
     #[test]

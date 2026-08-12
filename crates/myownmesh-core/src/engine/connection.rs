@@ -46,10 +46,9 @@ pub struct PeerStateData {
     pub status: PeerStatus,
     pub tier: ConnectionTier,
     pub authenticated: bool,
-    /// Features the peer advertised in its `hello` (see
-    /// `protocol::features`). Empty until the hello lands — and empty
-    /// forever for a pre-features build, which is exactly the "assume
-    /// nothing optional" senders must gate on.
+    /// Profile identifiers the peer advertised in its `hello` (see
+    /// `protocol::features`). Empty until the hello lands. Endpoint
+    /// authentication requires the one exact current profile identifier.
     pub features: Vec<String>,
     /// Attempt-owned funding for the peer-supplied Hello representation kept
     /// here until this connector is retired. This is deliberately not copied
@@ -337,6 +336,31 @@ impl PeerConnection {
     pub(super) fn revoke_promoted_session(&self) {
         self.promoted_session.clear();
     }
+
+    /// Replace this installed peer's connector after its promoted session and
+    /// authenticated channel have both been consumed. Controls only.
+    ///
+    /// Production installs a new [`PeerConnection`] when a connector is
+    /// replaced. The exact-session fence control deliberately keeps this
+    /// installation (and therefore its owner token) fixed so replacement of the
+    /// session cannot be confused with replacement of the peer. This seam makes
+    /// only that normally-atomic fixture step separable; the replacement still
+    /// has to present its own live connector and authenticated handoff before it
+    /// can promote.
+    #[cfg(test)]
+    pub(crate) fn replace_connector_for_session_control(&self, worker: Arc<WebRtcConnectorWorker>) {
+        assert!(
+            !self.promoted_session.is_installed(),
+            "the session control replaces a connector only after revocation"
+        );
+        assert!(
+            self.authenticated_channel.lock().is_none(),
+            "a successfully promoted channel is consumed before replacement"
+        );
+        let replaced = self.session.lock().replace(worker);
+        drop(replaced);
+    }
+
     pub(super) fn new(device_id: String, session: Option<Arc<WebRtcConnectorWorker>>) -> Self {
         Self {
             device_id,

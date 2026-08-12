@@ -29,11 +29,6 @@ pub struct CapabilityAdvert {
     /// "running 0.3.1" beside each peer.
     #[serde(default)]
     pub app_version: Option<String>,
-    /// Hint about how many concurrent connections the peer can
-    /// service. Feeds the topology selector when scaling out — peers
-    /// that can hold more get more preferred slots.
-    #[serde(default)]
-    pub max_connections: Option<u32>,
     /// Embedder-defined structured advertisement. JSON-encoded so
     /// the mesh stays type-agnostic; downstream apps deserialize
     /// into their own type.

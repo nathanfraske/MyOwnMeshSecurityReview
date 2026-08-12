@@ -278,7 +278,6 @@ export function tierName(t: ConnectionTier): string {
 export interface CapabilityAdvert {
   tags: string[];
   app_version: string | null;
-  max_connections: number | null;
   extra: unknown;
 }
 
@@ -419,14 +418,9 @@ export interface AuthorizedPeer {
    *  field exists on every roster entry so the same on-disk shape
    *  works for `open` (everyone is `member`, the field is unused)
    *  and `closed` networks (the field gates roster-edit authority).
-   *
-   *  Optional in the wire shape — entries written before
-   *  `network_state_v1` shipped don't carry the field and the GUI
-   *  treats `undefined` as `"member"`. See
-   *  [`docs/NETWORK-TYPES.md`](../../docs/NETWORK-TYPES.md). On a
-   *  `closed` network the engine enforces this via the signed
+   *  On a `closed` network the engine enforces this via the signed
    *  transition log; on an `open` network it's a cosmetic tag. */
-  role?: Role;
+  role: Role;
 }
 
 // ---- governance (closed networks) ------------------------------------
@@ -562,11 +556,6 @@ export interface NetworkSummary {
   label: string;
   phase: MeshPhase;
   topology: TopologyMode;
-  /** Optional governance kind. Field is intentionally optional so a
-   *  pre-`network_state_v1` daemon can return the same JSON shape
-   *  without emitting the field; the GUI treats `undefined` as
-   *  `"open"`. */
-  kind?: NetworkKind;
 }
 
 /** What to show the human for a network. Mirrors MyOwnLLM's pattern:

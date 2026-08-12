@@ -185,6 +185,22 @@ impl SessionValidityWitness {
         self.validity.live.load(Ordering::Acquire)
     }
 
+    /// Whether this witness was minted by `session` — the very same promoted
+    /// session, not merely one that is also live.
+    ///
+    /// Identity, by pointer, because the question is identity. [`Self::is_live`]
+    /// answers a weaker one that is nearly always sufficient: replacement drops
+    /// the predecessor, and `Drop for SessionCapability` invalidates, so a
+    /// witness for a replaced session reads dead and stays dead. This exists for
+    /// the one caller that should not have to rely on that chain — work funded
+    /// under one session and committed under a later acquisition of the same
+    /// peer, where "the peer has *a* live session" and "the peer still has *the*
+    /// session that paid for this" are different facts and only the second one
+    /// authorizes the commit.
+    pub(crate) fn witnesses(&self, session: &SessionCapability) -> bool {
+        Arc::ptr_eq(&self.validity, &session.validity)
+    }
+
     pub(crate) async fn revoked(&self) {
         loop {
             if !self.is_live() {
@@ -465,10 +481,46 @@ impl SessionBroker {
 
 #[cfg(test)]
 pub(crate) fn session_for_test(runtime: RuntimeIncarnation) -> SessionCapability {
+    session_in_scope_for_test(runtime, test_resource_scope())
+}
+
+/// One session whose scope funds the baseline **plus** `extra`.
+///
+/// [`session_for_test`] is this with nothing extra, and is what nearly every
+/// control wants. This exists for the controls that must fund something the
+/// baseline deliberately does not — a control that retains an admitted JSON
+/// frame needs `ParsingOrCpuWork`, which no session record and no mailbox item
+/// charges, so the baseline grants none of it.
+///
+/// Naming the extra term is the alternative to widening the baseline. Widening
+/// it would hand every other control in the tree capacity it was written
+/// without, and a pressure control that passes because of unrelated headroom is
+/// the failure mode this whole fixture family is arranged to avoid. `extra` is a
+/// bare claim: the reservation record the provider keeps for it is added here,
+/// so a caller states what it retains and not what the accounting costs.
+#[cfg(test)]
+pub(crate) fn session_funding_for_test(
+    runtime: RuntimeIncarnation,
+    extra: ResourceClaim,
+) -> SessionCapability {
+    let extra = crate::resource::FiniteResourceProvider::reservation_charge_for_test(extra)
+        .expect("the extra retention plus its provider record is representable");
+    let grant = fixture_grant(1)
+        .checked_add(fixture_stream_retention_claim())
+        .and_then(|grant| grant.checked_add(extra))
+        .expect("the baseline grant and one control's extra retention compose");
+    session_in_scope_for_test(runtime, scope_for_grant(grant))
+}
+
+#[cfg(test)]
+fn session_in_scope_for_test(
+    runtime: RuntimeIncarnation,
+    scope: MeshConnectorResourceScope,
+) -> SessionCapability {
     let authenticated_channel = crate::endpoint_auth::authenticated_for_test(runtime.clone());
     let connector = Arc::clone(authenticated_channel.record().connector());
     let local_principal = Arc::new(LocalPrincipalCapability::for_test(runtime.clone()));
-    let permit = SessionPermit::reserve(&test_resource_scope(), runtime)
+    let permit = SessionPermit::reserve(&scope, runtime)
         .expect("fixture provider admits one session reservation");
     let validity = SessionValidity::mint(&permit)
         .expect("fixture provider admits one session validity allocation");

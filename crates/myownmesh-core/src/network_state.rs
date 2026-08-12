@@ -29,16 +29,14 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// Domain-separation tag prefixed to every signed state-transition
-/// payload. Distinct from [`crate::SIGN_DOMAIN_TAG`] so a signature
-/// from one protocol step (e.g. the per-peer handshake) cannot be
-/// replayed at another (a network-state transition).
+/// payload. Distinct from the endpoint-auth transcript domain so a signature
+/// from authentication cannot be replayed as a state transition.
 pub const SIGN_DOMAIN_TAG_STATE: &str = "myownmesh-network-state-v1:";
 
 /// File-format schema version for the per-network state log.
 ///
-/// v2 split the single transition log into the governance log (`transitions`)
-/// and the multi-writer `member_log`. A v1 file still loads — [`load`] migrates
-/// it via [`split_member_tier`] — so the bump is a forward, not a break.
+/// Version 2 is the one current hard-alpha shape. Other versions are refused
+/// rather than migrated or guessed.
 pub const NETWORK_STATE_VERSION: u32 = 2;
 
 // ---- kinds + roles --------------------------------------------------
@@ -174,15 +172,6 @@ pub enum TransitionVariant {
     /// transition ratified yet) means the network's shape is whatever
     /// each device's local config says — the pre-governance behaviour.
     TopologyChange { to: crate::config::TopologyMode },
-    /// A transition kind a newer build introduced. Parsing it as
-    /// `Unknown` (instead of failing the enclosing message) keeps
-    /// roster anti-entropy alive across mixed-version fleets: an older
-    /// daemon can still ingest entries and membership, while
-    /// [`verify_log`] refuses to adopt a governance log containing a
-    /// variant it can't verify — it stays behind on governance until
-    /// it updates, rather than breaking the whole sync channel.
-    #[serde(other)]
-    Unknown,
 }
 
 /// Canonical signed-payload bytes for a transition. The signer
@@ -269,10 +258,6 @@ pub fn transition_payload(network_id: &str, variant: &TransitionVariant) -> Vec<
                 }
             }
         }
-        // Never signed by this build — and a foreign signature over a
-        // variant we can't render byte-identically can never verify,
-        // which is exactly the "stay behind until updated" contract.
-        TransitionVariant::Unknown => "unknown".to_string(),
     };
     format!("{SIGN_DOMAIN_TAG_STATE}{network_id}|{variant_str}").into_bytes()
 }
@@ -342,10 +327,7 @@ pub struct NetworkState {
     /// single owner/manager. Multi-writer: union-merged on adoption so
     /// distributed managers can admit concurrently (offline) without forking —
     /// the leaf tier of the cert chain. Projected via [`verify_member_log`];
-    /// merged via [`merge_member_logs`]. `#[serde(default)]` so a pre-split
-    /// (legacy single-log) state still loads, then [`split_member_tier`]
-    /// migrates it.
-    #[serde(default)]
+    /// merged via [`merge_member_logs`].
     pub member_log: Vec<Transition>,
     /// Pending proposals awaiting ratification.
     pub pending: Vec<Proposal>,
@@ -356,9 +338,7 @@ pub struct NetworkState {
     /// [`TransitionVariant::TopologyChange`]. `Some` is authoritative
     /// over the device-local config topology (the same precedence
     /// `kind` has); `None` means no topology transition has ever been
-    /// ratified and the local config rules. `#[serde(default)]` so
-    /// pre-topology state files keep loading.
-    #[serde(default)]
+    /// ratified and the local config rules.
     pub topology: Option<crate::config::TopologyMode>,
 }
 
@@ -474,10 +454,8 @@ pub fn verify_transition_signatures(network_id: &str, transition: &Transition) -
 /// Quorum table — **flat peer authority**: a holder of a tier may grant or
 /// demote at that tier or below, on a single signature, with no consensus
 /// round:
-///   - `KindChange { to: Closed }` — the founder self-elects
-///     (`signers.first()` becomes owner); ≥ 1 signer. Multi-signer capable:
-///     a close may be co-signed (a peer mesh can't assume one always-online
-///     founder), and only the empty signer set is rejected.
+///   - `KindChange { to: Closed }` — exactly one founder self-elects and
+///     becomes owner.
 ///   - `KindChange { to: Open }` — ≥ 1 owner.
 ///   - `RoleGrant { role: Owner }` — ≥ 1 owner (owners make owners).
 ///   - `RoleGrant { role: Controller }` — ≥ 1 controller or owner
@@ -498,11 +476,9 @@ pub fn verify_transition_signatures(network_id: &str, transition: &Transition) -
 /// converging peer reconstructs from the signed log itself
 /// ([`verify_log`]). Genesis is deliberately **single-signer**: the
 /// founder self-elects, and no other check depends on an external
-/// member roster. That matters for convergence — a peer replaying the
-/// log has no way to reconstruct who *else* was in the open network at
-/// close time, so a multi-signer "unanimous member consent" genesis
-/// could never be re-verified downstream. Existing peers become plain
-/// members of the closed network and may leave if they object.
+/// member roster. Every adopter can therefore replay the exact founder
+/// election from the signed log alone. Existing peers become plain members of
+/// the closed network and may leave if they object.
 pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Result<()> {
     use std::collections::BTreeSet;
 
@@ -522,29 +498,18 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
         .collect();
 
     match (&transition.variant, state_before.kind) {
-        // Founder self-election: `open → closed`. `apply_transition` elects
-        // `signers.first()` — the founder — as the sole owner; any peers already
-        // present become plain members (ownership is then distributed via
-        // peer-authority owner grants, so the mesh never depends on the founder
-        // staying online).
-        //
-        // Genesis is **multi-signer capable** — a peer mesh can't assume one
-        // always-online founder, so a close may be co-signed. We accept **≥ 1**
-        // signer and elect the first; the rest gain nothing at genesis. Requiring
-        // exactly one would fail `verify_log` for the whole log on every adopting
-        // peer — silently dropping every member admit on the adopting side while
-        // the authoring owner still holds it locally (its ratify-time roster
-        // mirror runs unconditionally). That is exactly the "one owner sees the
-        // device, the other never does" split.
+        // Founder self-election: `open → closed`. Exactly one signer becomes
+        // the founder-owner. Additional authority is distributed later through
+        // ordinary signed owner grants, whose pre-state the log can replay.
         (
             TransitionVariant::KindChange {
                 to: NetworkKind::Closed,
             },
             NetworkKind::Open,
         ) => {
-            if signers.is_empty() {
+            if transition.signers.len() != 1 {
                 return Err(Error::Protocol(
-                    "founder self-election needs a signer".into(),
+                    "founder self-election needs exactly one signer".into(),
                 ));
             }
         }
@@ -560,10 +525,10 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
                 ));
             }
         }
-        // Same-kind transitions don't make sense.
+        // No other kind transition is part of this hard-alpha profile.
         (TransitionVariant::KindChange { .. }, _) => {
             return Err(Error::Protocol(
-                "KindChange to the current kind is a no-op".into(),
+                "KindChange is accepted only for open -> closed and closed -> open".into(),
             ));
         }
 
@@ -708,16 +673,6 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
                     .into(),
             ));
         }
-
-        (TransitionVariant::Unknown, _) => {
-            // A variant from a newer build. We can't reconstruct its
-            // canonical payload, so we can't verify authority over it —
-            // refuse, which makes `verify_log` hold this node at its
-            // current governance state until it updates.
-            return Err(Error::Protocol(
-                "transition kind from a newer build — update to verify it".into(),
-            ));
-        }
     }
     Ok(())
 }
@@ -733,14 +688,8 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
     match &t.variant {
         TransitionVariant::KindChange { to } => {
             state.kind = *to;
-            // Founder election on `open → closed`: the *proposer*
-            // becomes founder-owner, regardless of how many
-            // co-signers there are. The signer set's first entry
-            // is the proposer by convention (the engine always
-            // self-signs at issue time and appends co-signers
-            // afterward). Co-signers consent to the close + to the
-            // proposer's ownership; they don't acquire ownership
-            // themselves.
+            // Founder election on `open → closed`: quorum verification admits
+            // exactly one signer, and that signer becomes founder-owner.
             if matches!(to, NetworkKind::Closed) {
                 if let Some(founder) = t.signers.first() {
                     state.roles.insert(founder.clone(), Role::Owner);
@@ -773,10 +722,6 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
         TransitionVariant::TopologyChange { to } => {
             state.topology = Some(to.clone());
         }
-        // Unreachable through verified paths (the quorum table refuses
-        // Unknown), but apply stays total: record the entry, mutate
-        // nothing.
-        TransitionVariant::Unknown => {}
     }
     state.transitions.push(t.clone());
     state
@@ -828,22 +773,6 @@ pub fn verify_log(network_id: &str, transitions: &[Transition]) -> Result<Networ
 /// sort tiebreak, so every peer derives the same membership from the same set.
 fn member_entry_key(t: &Transition) -> String {
     serde_json::to_string(t).unwrap_or_default()
-}
-
-/// True if `variant`, applied when the target held `target_role`, is a
-/// member-tier change (admit/remove of a plain member) rather than a
-/// governance-tier one (kind change, owner/manager grant, owner/manager
-/// removal, or split). Drives [`split_member_tier`].
-fn is_member_tier(variant: &TransitionVariant, target_role: Role) -> bool {
-    match variant {
-        TransitionVariant::RoleGrant {
-            role: Role::Member, ..
-        } => true,
-        TransitionVariant::RoleRevoke { .. } | TransitionVariant::Evict { .. } => {
-            target_role == Role::Member
-        }
-        _ => false,
-    }
 }
 
 /// Project the member-tier log against the governance state, returning the set
@@ -914,17 +843,10 @@ fn member_log_verdict(
         .collect();
 
     // Deterministic order: by timestamp, then tombstones *before* grants,
-    // then a stable per-entry key. The middle term is the tie-break that
-    // matters: the fold below is last-writer-wins, so at an equal `at` the
-    // grant is applied after the tombstone and membership survives. Live
-    // authoring stamps member-tier entries strictly past the newest existing
-    // entry, so an evict that *means* to remove a member always lands later
-    // than the grant it removes — an equal-stamp pair only arises from legacy
-    // logs where a re-admit raced its evict inside one wall-clock second (or
-    // the authors' clocks were skewed), and there the re-admit was the later
-    // intent. Letting the tombstone win that tie is what silently stranded
-    // devices out of every fleet roster on upgrade (remote control refused
-    // fleet-wide while video kept streaming).
+    // then a stable per-entry key. The fold below is last-writer-wins, so an
+    // equal-stamp grant survives. Live authoring stamps every member-tier
+    // entry strictly past the newest existing entry; the tie-break is only the
+    // total-order rule for externally supplied logs whose timestamps collide.
     let is_member_grant = |t: &&Transition| {
         matches!(
             t.variant,
@@ -983,64 +905,20 @@ pub fn merge_member_logs(local: &[Transition], incoming: &[Transition]) -> Vec<T
     by_key.into_values().collect()
 }
 
-/// Migrate a legacy single-log state into the two-tier shape: member-tier
-/// admits/removes move out of `transitions` into `member_log`; the governance
-/// log keeps kind changes, owner/manager grants and removals, and splits. The
-/// projected roster is unchanged — a migrated member is still re-derived into
-/// the roles map by [`verify_member_log`]. Idempotent: re-running on an
-/// already-split state is a no-op, because the governance log then holds no
-/// member-tier entry.
-pub fn split_member_tier(state: &mut NetworkState) {
-    // Replay to learn each target's role at the instant a revoke/evict applied,
-    // so removals are classified by the tier they actually touched.
-    let mut roles: std::collections::BTreeMap<String, Role> = std::collections::BTreeMap::new();
-    let mut governance: Vec<Transition> = Vec::new();
-    let mut members: Vec<Transition> = Vec::new();
-    for t in std::mem::take(&mut state.transitions) {
-        let target_role = match &t.variant {
-            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
-                roles.get(target).copied().unwrap_or(Role::Member)
-            }
-            _ => Role::Member,
-        };
-        let member_tier = is_member_tier(&t.variant, target_role);
-        // Advance the replay roles so later transitions classify correctly.
-        match &t.variant {
-            TransitionVariant::RoleGrant { target, role } => {
-                roles.insert(target.clone(), *role);
-            }
-            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
-                roles.remove(target);
-            }
-            TransitionVariant::KindChange { to } => {
-                if matches!(to, NetworkKind::Closed) {
-                    if let Some(founder) = t.signers.first() {
-                        roles.insert(founder.clone(), Role::Owner);
-                    }
-                }
-            }
-            // Neither touches roles, and both are governance-tier —
-            // they fall through to the governance vec below.
-            TransitionVariant::Split { .. }
-            | TransitionVariant::TopologyChange { .. }
-            | TransitionVariant::Unknown => {}
-        }
-        if member_tier {
-            members.push(t);
-        } else {
-            governance.push(t);
-        }
-    }
-    // Preserve anything already in the member log (defensive; empty pre-split).
-    members.append(&mut state.member_log);
-    state.transitions = governance;
-    state.member_log = members;
-}
-
 // ---- on-disk persistence -------------------------------------------
 
 fn state_path(network_id: &str) -> Result<PathBuf> {
     Ok(crate::dirs::states_dir()?.join(format!("{network_id}.json")))
+}
+
+fn require_current_version(state: NetworkState) -> Result<NetworkState> {
+    if state.version != NETWORK_STATE_VERSION {
+        return Err(Error::Other(format!(
+            "network_state version {} unsupported (this build expects v{NETWORK_STATE_VERSION})",
+            state.version
+        )));
+    }
+    Ok(state)
 }
 
 /// Load the network state scoped to the given Network ID. Missing
@@ -1058,7 +936,7 @@ pub fn load(network_id: &str) -> Result<NetworkState> {
     // here failed every subsequent join of the network. Governance
     // state re-converges from the network's signed transition
     // broadcasts, so empty is always recoverable.
-    let mut state: NetworkState = match serde_json::from_str(&raw) {
+    let state: NetworkState = match serde_json::from_str(&raw) {
         Ok(s) => s,
         Err(e) => {
             let kept = crate::persist::quarantine(&path);
@@ -1073,21 +951,7 @@ pub fn load(network_id: &str) -> Result<NetworkState> {
             return Ok(NetworkState::empty_for(network_id));
         }
     };
-    match state.version {
-        // v1 (legacy single log): split the member tier out of `transitions`
-        // into `member_log`, then it is a v2 state. Idempotent and roster-
-        // preserving — a migrated member still re-derives into the roles map.
-        1 => {
-            split_member_tier(&mut state);
-            state.version = NETWORK_STATE_VERSION;
-        }
-        NETWORK_STATE_VERSION => {}
-        other => {
-            return Err(Error::Other(format!(
-                "network_state version {other} unsupported (this build expects v{NETWORK_STATE_VERSION})"
-            )));
-        }
-    }
+    let state = require_current_version(state)?;
     if state.network_id != network_id {
         // Filename is the index of truth; on mismatch, start fresh.
         return Ok(NetworkState::empty_for(network_id));
@@ -1349,12 +1213,8 @@ mod tests {
     }
 
     #[test]
-    fn quorum_open_to_closed_elects_the_first_signer() {
-        // Genesis is a founder self-election: the first signer becomes owner.
-        // New fleets sign it alone, but a multi-signer genesis (from the retired
-        // unanimous-consent model) must still verify so an older fleet converges
-        // on upgrade rather than being stranded — only the empty signer set is
-        // rejected.
+    fn quorum_open_to_closed_requires_exactly_one_founder_signer() {
+        // Genesis has one accepted shape: one founder self-elects as owner.
         let (_, pk_alice) = fixture_key(1);
         let (_, pk_bob) = fixture_key(2);
         let state = NetworkState::empty_for("net-1");
@@ -1370,26 +1230,17 @@ mod tests {
 
         // Lone founder → accept.
         verify_quorum(&state, &close(vec![pk_alice.clone()])).unwrap();
-        // Multi-signer genesis → still accepted (founder = first signer).
-        verify_quorum(&state, &close(vec![pk_alice.clone(), pk_bob])).unwrap();
+        // Alternate two-signer shape → refuse rather than reinterpret.
+        assert!(verify_quorum(&state, &close(vec![pk_alice.clone(), pk_bob])).is_err());
         // No signer at all → reject.
         assert!(verify_quorum(&state, &close(vec![])).is_err());
 
-        // apply_transition elects the *first* signer as the sole owner,
-        // regardless of how many co-signers rode along.
-        let after = apply_transition(state, &close(vec![pk_alice.clone(), "someone".into()]));
+        let after = apply_transition(state, &close(vec![pk_alice.clone()]));
         assert_eq!(after.role_of(&pk_alice), Role::Owner);
-        assert_eq!(after.role_of("someone"), Role::Member);
     }
 
     #[test]
-    fn verify_log_accepts_a_multi_signer_genesis_and_elects_the_founder() {
-        // The heal path: an older fleet's genesis may carry more than one signer
-        // (unanimous-consent era). `verify_log` must accept it — electing the
-        // first signer as owner — so the whole log verifies and members converge,
-        // rather than the log failing wholesale and every admit being dropped on
-        // the adopting side (the "one owner sees the device, the other doesn't"
-        // split).
+    fn verify_log_refuses_an_alternate_multi_signer_genesis() {
         let (alice_sk, alice) = fixture_key(1);
         let (bob_sk, bob) = fixture_key(2);
         let net = "heal-net";
@@ -1406,17 +1257,9 @@ mod tests {
                 crate::signing::sign_with(&bob_sk, &payload),
             ],
         };
-        let state = verify_log(net, std::slice::from_ref(&genesis))
-            .expect("a multi-signer genesis must still verify");
-        assert_eq!(
-            state.role_of(&alice),
-            Role::Owner,
-            "the founder (first signer) is owner"
-        );
-        assert_eq!(
-            state.role_of(&bob),
-            Role::Member,
-            "a genesis co-signer is a plain member, not a second owner"
+        assert!(
+            verify_log(net, std::slice::from_ref(&genesis)).is_err(),
+            "this hard-alpha build accepts only the exact one-founder genesis"
         );
     }
 
@@ -1477,15 +1320,10 @@ mod tests {
     }
 
     #[test]
-    fn equal_stamp_readmit_beats_the_tombstone() {
-        // The legacy re-admit race: before authoring stamped member-tier
-        // entries strictly past the newest existing one, a re-admit could
-        // carry the same wall-clock second as the evict it undoes (same
-        // author, or a skewed second author). The verdict's tie-break must
-        // resolve that pair to *membership* — the re-admit was the later
-        // intent — or the device is stranded evicted, the roster mirror
-        // deletes it on every peer at adoption, and remote control is
-        // refused fleet-wide while video keeps streaming.
+    fn equal_stamp_grant_wins_the_total_order() {
+        // Externally supplied logs can contain equal timestamps. The declared
+        // total order applies the tombstone first and the grant second, so
+        // every peer derives membership from the same pair in the same way.
         let (owner_sk, owner) = fixture_key(1);
         let (_, m) = fixture_key(2);
         let net = "tie-net";
@@ -1913,32 +1751,32 @@ mod tests {
     }
 
     #[test]
-    fn unknown_variant_parses_but_never_verifies() {
-        // A transition kind from a newer build must not break parsing —
-        // roster anti-entropy carries whole logs, and 0.2.35↔0.2.36-style
-        // mixed fleets have to keep converging membership — but it can't
-        // be verified, so log adoption holds this node at its current
-        // governance until it updates.
+    fn current_profile_refuses_unknown_transition_kinds_at_decode() {
         let json = r#"{
             "at": 9,
             "variant": { "kind": "from_the_future", "field": true },
             "signers": ["p1"],
             "signatures": ["s1"]
         }"#;
-        let t: Transition = serde_json::from_str(json).unwrap();
-        assert_eq!(t.variant, TransitionVariant::Unknown);
-        let gov = NetworkState::empty_for("net-x");
-        assert!(verify_quorum(&gov, &t).is_err());
+        assert!(serde_json::from_str::<Transition>(json).is_err());
     }
 
     #[test]
-    fn pre_topology_state_file_loads_with_none() {
-        // State written by a build that predates governed topology.
+    fn old_hard_alpha_state_is_refused_not_migrated() {
+        let mut old = NetworkState::empty_for("old-state");
+        old.version = NETWORK_STATE_VERSION - 1;
+        assert!(require_current_version(old).is_err());
+    }
+
+    #[test]
+    fn current_state_without_a_ratified_topology_loads_with_none() {
+        // Current-version state for a network with no ratified topology transition.
         let json = r#"{
             "version": 2,
             "network_id": "net-a",
             "kind": "closed",
             "roles": {},
+            "member_log": [],
             "transitions": [],
             "pending": [],
             "splits": []
@@ -2075,42 +1913,6 @@ mod tests {
         let m2 = merge_member_logs(&right, &left);
         assert_eq!(m1.len(), 2); // ga deduped + gb
         assert_eq!(m1, m2); // union is order-independent
-    }
-
-    #[test]
-    fn split_member_tier_splits_then_is_idempotent() {
-        let (owner_sk, owner) = fixture_key(1);
-        let (_, a) = fixture_key(3);
-        let net = "fleet-m";
-        // Legacy single log: founder election + a member grant in `transitions`.
-        let v0 = TransitionVariant::KindChange {
-            to: NetworkKind::Closed,
-        };
-        let t0 = Transition {
-            at: 1,
-            signers: vec![owner.clone()],
-            signatures: vec![sign_transition(net, &v0, &owner_sk)],
-            variant: v0,
-        };
-        let mut state = NetworkState::empty_for(net);
-        state.kind = NetworkKind::Closed;
-        state.transitions = vec![t0, member_grant(net, &a, &owner_sk, &owner, 2)];
-        split_member_tier(&mut state);
-        assert_eq!(
-            state.transitions.len(),
-            1,
-            "founder election stays in gov log"
-        );
-        assert_eq!(state.member_log.len(), 1, "the member grant moved out");
-        // The migrated member still re-derives: roles come from the governance
-        // log (founder election → owner), and the owner authored the admit.
-        let gov = verify_log(net, &state.transitions).expect("gov log verifies");
-        assert!(verify_member_log(&gov, &state.member_log, net).contains(&a));
-        // Idempotent.
-        let (gov_before, mem_before) = (state.transitions.clone(), state.member_log.clone());
-        split_member_tier(&mut state);
-        assert_eq!(state.transitions, gov_before);
-        assert_eq!(state.member_log, mem_before);
     }
 
     #[test]

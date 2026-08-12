@@ -33,6 +33,10 @@ pub enum ChannelError {
     Transport(String),
     #[error("application gateway lagged by {0} accepted messages")]
     Lagged(u64),
+    #[error("application gateway resource pressure: {0:?}")]
+    ResourcePressure(crate::resource::ResourceUnavailable),
+    #[error("application command admission: {0}")]
+    Admission(String),
 }
 
 /// One inbound message on a channel, paired with the peer that
@@ -96,6 +100,15 @@ where
                 crate::error::Error::Network(msg) if msg.contains("not found") => {
                     ChannelError::PeerNotFound(peer.to_string())
                 }
+                crate::error::Error::ResourceMailboxAdmission(
+                    crate::resource::ResourceMailboxAdmissionError::Closed,
+                ) => ChannelError::NetworkDown,
+                crate::error::Error::ResourceMailboxAdmission(
+                    crate::resource::ResourceMailboxAdmissionError::Pressure(error),
+                ) => ChannelError::ResourcePressure(error),
+                crate::error::Error::ResourceMailboxAdmission(error) => {
+                    ChannelError::Admission(error.to_string())
+                }
                 crate::error::Error::Transport(msg) => ChannelError::Transport(msg),
                 other => ChannelError::Transport(other.to_string()),
             })
@@ -115,6 +128,15 @@ where
             .send_channel_reliable(peer, &self.name, payload)
             .await
             .map_err(|e| match e {
+                crate::error::Error::ResourceMailboxAdmission(
+                    crate::resource::ResourceMailboxAdmissionError::Closed,
+                ) => ChannelError::NetworkDown,
+                crate::error::Error::ResourceMailboxAdmission(
+                    crate::resource::ResourceMailboxAdmissionError::Pressure(error),
+                ) => ChannelError::ResourcePressure(error),
+                crate::error::Error::ResourceMailboxAdmission(error) => {
+                    ChannelError::Admission(error.to_string())
+                }
                 crate::error::Error::Transport(msg) => ChannelError::Transport(msg),
                 other => ChannelError::Transport(other.to_string()),
             })
@@ -127,26 +149,44 @@ where
     /// the WebRTC stack actually flushing).
     pub async fn broadcast(&self, body: &T) -> Result<usize, ChannelError> {
         let payload = serde_json::to_value(body)?;
-        Ok(self
-            .network
+        self.network
             .broadcast_channel_frame(&self.name, payload)
-            .await)
+            .await
+            .map_err(|error| match error {
+                crate::error::Error::ResourceMailboxAdmission(
+                    crate::resource::ResourceMailboxAdmissionError::Closed,
+                ) => ChannelError::NetworkDown,
+                crate::error::Error::ResourceMailboxAdmission(
+                    crate::resource::ResourceMailboxAdmissionError::Pressure(error),
+                ) => ChannelError::ResourcePressure(error),
+                crate::error::Error::ResourceMailboxAdmission(error) => {
+                    ChannelError::Admission(error.to_string())
+                }
+                other => ChannelError::Transport(other.to_string()),
+            })
     }
 
     /// Subscribe to inbound messages on this channel. The returned receiver
     /// owns a distinct resource-backed mailbox; pressure and loss are surfaced
     /// rather than hidden behind a shared ring.
-    pub fn subscribe(&self) -> ChannelSubscription<T> {
+    pub fn subscribe(&self) -> Result<ChannelSubscription<T>, ChannelError> {
         let subscriber = self
             .network
             .application_gateway
-            .subscribe_channel(&self.name);
-        ChannelSubscription {
+            .subscribe_channel(&self.name)
+            .map_err(|refusal| match refusal {
+                crate::application_gateway::GatewayRefusal::Revoked => ChannelError::NetworkDown,
+                crate::application_gateway::GatewayRefusal::Pressure(error) => {
+                    ChannelError::ResourcePressure(error)
+                }
+                other => ChannelError::Transport(format!("{other:?}")),
+            })?;
+        Ok(ChannelSubscription {
             subscriber,
             name: Arc::clone(&self.name),
             network: Arc::clone(&self.network),
             _phantom: PhantomData,
-        }
+        })
     }
 }
 

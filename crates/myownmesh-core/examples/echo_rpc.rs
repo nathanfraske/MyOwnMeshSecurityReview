@@ -55,13 +55,15 @@ async fn main() {
         .await
         .unwrap();
 
-    let server_rpc = Rpc::attach(&server_net);
-    let client_rpc = Rpc::attach(&client_net);
+    let server_rpc = Rpc::attach(&server_net).expect("server RPC dispatcher");
+    let client_rpc = Rpc::attach(&client_net).expect("client RPC dispatcher");
 
     // Server registers an echo handler.
-    server_rpc.serve("echo", |call| async move {
-        Ok(RpcResponse::from_value(call.payload))
-    });
+    server_rpc
+        .serve("echo", |call| async move {
+            Ok(RpcResponse::from_value(call.payload))
+        })
+        .expect("server handler admission");
 
     let mut server_events = server_net.events_tx.subscribe();
     let mut client_events = client_net.events_tx.subscribe();

@@ -97,13 +97,20 @@ pub async fn start_connector_capable(
 /// The configuration must explicitly disable node participation. This form
 /// installs no connector policy, joins no network, and cannot later enable
 /// node participation through the live service configuration.
+///
+/// It still takes the owner's exact resource port. Installing no connector
+/// policy removes the connector's demands, not the daemon's: this process
+/// still admits IPC payloads, local application state and its own tasks, and
+/// all of that has to be funded from an envelope the owner chose rather than
+/// from one this function invented.
 pub async fn start_infrastructure_only(
     cfg: myownmesh_core::MeshConfig,
+    resources: myownmesh_core::ResourceProviderPort,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     if cfg.services.node.enabled {
         return Err(EmbeddedStartError::InfrastructureOnlyRequiresNodeDisabled);
     }
-    let mesh = myownmesh_core::Mesh::open_infrastructure_only(cfg.clone()).await?;
+    let mesh = myownmesh_core::Mesh::open_infrastructure_only(cfg.clone(), resources).await?;
     // Infrastructure-only installs no connector policy at all, so there is no
     // realtime path to advertise.
     start_with_mesh(cfg, mesh, control::RealtimeAdvert::unsupported()).await
@@ -222,7 +229,13 @@ mod tests {
 
     #[tokio::test]
     async fn infrastructure_start_requires_node_participation_disabled() {
-        let result = start_infrastructure_only(myownmesh_core::MeshConfig::default()).await;
+        // A real port, so the refusal below is the node-participation check and
+        // not a missing grant standing in for it.
+        let result = start_infrastructure_only(
+            myownmesh_core::MeshConfig::default(),
+            crate::test_resource_provider(),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(EmbeddedStartError::InfrastructureOnlyRequiresNodeDisabled)

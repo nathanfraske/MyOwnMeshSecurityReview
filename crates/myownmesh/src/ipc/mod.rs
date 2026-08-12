@@ -42,5 +42,7 @@ pub mod clients;
 pub mod wire;
 
 #[allow(unused_imports)]
-pub use clients::{ClientHandle, ClientId, ClientRegistry, RealtimeFlowCapability};
+pub use clients::{
+    ClientHandle, ClientId, ClientRegistry, RealtimeFlowCapability, UnregisteredClient,
+};
 pub use wire::ServerOut;

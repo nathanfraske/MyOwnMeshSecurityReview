@@ -18,128 +18,227 @@
 //! - `installed_handlers` — which shape of synthetic handler the bridge has
 //!   installed for each claim, so a re-claim can be answered without asking
 //!   the engine what it already holds.
+//!
+//! Every one of them is a [`LeasedMap`], and every entry in every one of them is
+//! funded before it exists. That is what makes each of these tables bounded by
+//! the process owner's grant rather than by how many method names a local client
+//! feels like claiming: an index node is memory the daemon holds on a client's
+//! say-so, and a table that admitted entries for free would be an unmetered way
+//! for one local process to grow the daemon. So each insertion is an admission
+//! and each can be refused, and every removal — including the one that happens
+//! when a table is dropped with entries still in it — releases exactly what that
+//! entry took.
+//!
+//! **One lock over all five.** They sit together in [`RegistryTables`] behind a
+//! single mutex rather than one mutex each, because almost every operation here
+//! touches more than one of them — claiming a method writes three tables, a
+//! disconnect writes four — and five locks would mean five acquisition orders to
+//! keep consistent forever. Nothing under this lock awaits, and a client's own
+//! tables are only ever locked while this one is held, never the reverse.
+//!
+//! **What is here and what is not.** This file declares the state and what it
+//! costs: the tables, the records, the handle, and the exact claims that fund
+//! each of them. What the registry *does* with that state is [`registry`], a
+//! descendant — which is what lets it hold every operation while every field
+//! above stays exactly as private as it was. A sibling module or an outside
+//! caller still reaches none of it.
 
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+
+use myownmesh_core::{
+    LeasedMap, LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError,
+    ResourceClass, ResourceLease, ResourceMailboxAdmissionError, ResourceMailboxSender,
+    ResourceUnavailable,
+};
 
 use super::wire::ServerOut;
 
-/// Process-unique identifier for a connected client.
+/// Encoded width of a minted [`ClientCapability`].
 ///
-/// Just a monotonic counter; the daemon never reuses ids, so a
-/// stale reference in a forwarder task that races with
-/// disconnect resolves to a `None` lookup instead of routing to
-/// a different client.
+/// 32 random bytes in unpadded base64url, which is `ceil(32 * 4 / 3)`. Stated
+/// rather than measured because the claim below is taken before the capability
+/// exists — the record has to be funded before anything is put in it.
+const CLIENT_CAPABILITY_BYTES: usize = 43;
+
+/// Why one thing this registry owns could not be admitted — a client record,
+/// or a task the daemon would have to keep running.
 ///
-/// Wire form is the `Display` shape `c<n>` — clients pass it
-/// back verbatim on subsequent RPC/channel-management requests
-/// to identify which event-subscribed connection a handler
-/// claim belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ClientId(pub u64);
-
-impl std::fmt::Display for ClientId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "c{}", self.0)
-    }
+/// Two arms because they are two different events, exactly as core separates
+/// them for a mailbox: the claim being unrepresentable is a defect in this
+/// crate's arithmetic, while a refusal is the process owner's envelope being
+/// full. Flattening them would report a bug here as ordinary back-pressure.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcAdmissionError {
+    #[error("IPC claim is not representable: {0}")]
+    Claim(ResourceClaimArithmeticError),
+    #[error("IPC admission was refused by the resource provider: {0:?}")]
+    Resources(ResourceUnavailable),
 }
 
-impl std::str::FromStr for ClientId {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let n_str = s
-            .strip_prefix('c')
-            .ok_or_else(|| format!("ClientId must start with 'c', got '{s}'"))?;
-        let n: u64 = n_str.parse().map_err(|e| format!("ClientId parse: {e}"))?;
-        Ok(ClientId(n))
-    }
-}
-
-impl serde::Serialize for ClientId {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ClientId {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-/// Per-network handler-claim key. `network` is the
-/// configuration id (matching the rest of the control surface).
-pub type ClaimKey = (String, String);
-
-/// Unforgeable authority issued to one event-stream connection. `ClientId`
-/// remains a routing coordinate; possession of this value is the authority.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ClientCapability(String);
-
-impl ClientCapability {
-    fn mint() -> Self {
-        let mut bytes = [0_u8; 32];
-        getrandom::getrandom(&mut bytes)
-            .expect("OS randomness is required for local IPC authority");
-        Self(data_encoding::BASE64URL_NOPAD.encode(&bytes))
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    fn matches(&self, presented: &str) -> bool {
-        if self.0.len() != presented.len() {
-            return false;
-        }
-        self.0
-            .bytes()
-            .zip(presented.bytes())
-            .fold(0_u8, |d, (a, b)| d | (a ^ b))
-            == 0
-    }
-}
-
-/// Unforgeable authority naming one realtime flow a client has open.
+/// Why one registration a client asked for could not be installed.
 ///
-/// Minted when the flow is opened, and the daemon keeps the move-only core
-/// handle behind it. A client presents it to write on that flow or to close it;
-/// there is no coordinate that substitutes, which is the whole point — the peer
-/// selector and the flow label it replaces were both re-resolvable, so a client
-/// whose session had been replaced was writing into the successor's flow of the
-/// same name.
-///
-/// Separate from [`ClientCapability`] rather than reusing it, because the two
-/// answer different questions: that one says *who* is asking, this one says
-/// *which of that client's flows*. One value doing both would make a client's
-/// second flow indistinguishable from its first.
-///
-/// Compared by map lookup rather than in constant time, and that is sound here
-/// where it would not be for [`ClientCapability`]: this table is only ever
-/// reached after the client capability has authenticated, and it holds only
-/// that client's own flows. What a timing probe could learn is which of its own
-/// flows it already has.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RealtimeFlowCapability(String);
-
-impl RealtimeFlowCapability {
-    fn mint() -> Self {
-        let mut bytes = [0_u8; 32];
-        getrandom::getrandom(&mut bytes)
-            .expect("OS randomness is required for local IPC authority");
-        Self(data_encoding::BASE64URL_NOPAD.encode(&bytes))
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
+/// The two arms are the two things that can go wrong for a method claim, a
+/// channel subscription or a realtime flow alike, which is why one type serves
+/// all three: either the client stopped being registered while its own request
+/// was in flight, or the entry it needed was refused funding. A caller has to
+/// answer differently — the first is nobody's fault and there is nobody left to
+/// tell, the second is back-pressure the client should see — so they are not
+/// flattened.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationError {
+    #[error("the local client disconnected before its registration was installed")]
+    ClientGone,
+    #[error(transparent)]
+    Admission(#[from] IpcAdmissionError),
 }
+
+/// A completed realtime open that was never installed, handed back with why.
+///
+/// The handle comes back because it is move-only and owns nothing: dropping it
+/// releases neither the label nor the native half behind it. Whoever receives
+/// this is the flow's sole close owner, in both arms of `reason`.
+pub struct RealtimeFlowRejected {
+    pub flow: myownmesh_core::realtime::RealtimeFlowHandle,
+    pub reason: RegistrationError,
+}
+
+/// What a released method claim leaves behind for a caller with networks.
+pub struct MethodRelease {
+    /// `true` only if this caller really owned the claim it released. A client
+    /// releasing a method a later claimant has since taken gets `false` and
+    /// changes nothing.
+    pub released: bool,
+    /// Set when this was the *last* claim on the method, so the synthetic
+    /// handler the bridge installed on the engine now belongs to nobody.
+    ///
+    /// It has to be answered rather than acted on here: forgetting a handler
+    /// needs the `JoinedNetwork` it was installed on, and this module holds
+    /// client state, not networks.
+    pub forget: bool,
+}
+
+/// One removed client, and what removing it left for a caller with networks.
+pub struct UnregisteredClient {
+    pub handle: Arc<ClientHandle>,
+    /// Methods this client was the last claimant of. Each still has a synthetic
+    /// handler installed on its network, which now answers every inbound call
+    /// with "no claim" — true, but a handler retained for nobody. The caller
+    /// forgets them; see [`MethodRelease::forget`] for why not here.
+    pub forget: Vec<ClaimKey>,
+}
+
+/// An inbound call that could not be tracked, handed back with why.
+pub struct PendingRejected {
+    /// The engine-side awaiter, returned so the caller drops it deliberately
+    /// rather than having it disappear inside a refusal.
+    pub effect: PendingInbound,
+    pub reason: PendingRefusal,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PendingRefusal {
+    #[error("duplicate inbound RPC coordinates are already pending")]
+    Duplicate,
+    #[error("the claiming local client disconnected before the call could be tracked")]
+    OwnerGone,
+    #[error("the inbound call could not be accounted: {0}")]
+    Admission(#[from] IpcAdmissionError),
+}
+
+/// Exact claim for one IPC task this daemon keeps alive.
+///
+/// Two dimensions and no byte term. A spawned future's size is not knowable
+/// from here — it is an opaque generated type, and each of the three call sites
+/// has a different one — so a byte figure written here would be a guess wearing
+/// an exact claim's clothes. What *is* exactly true is that the task occupies
+/// one runtime worker obligation and one bookkeeping object, and those are the
+/// two quantities the process owner's envelope actually bounds.
+fn task_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::WorkerOrTask, 1),
+        (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+}
+
+/// Exact claim for one registered client's own record.
+///
+/// Covers what the handle itself retains: its `Arc` allocation and the minted
+/// capability's bytes. The three tables it owns are inline fields, so
+/// `size_of::<ClientHandle>()` already counts them — an empty [`LeasedMap`] is a
+/// null root pointer, a length and a hash seed, and allocates nothing until
+/// something is admitted into it.
+///
+/// It deliberately does *not* cover what those tables later hold. A method
+/// claim, a channel subscription or an open flow is funded by the insertion that
+/// admits it, so a client that registers and does nothing pays for nothing it is
+/// not holding — and, more to the point, a client that claims a thousand methods
+/// pays a thousand times rather than once.
+///
+/// Nor does it cover the registry's own index node for this client. That is not
+/// a gap: [`ClientRegistry::register`] acquires that node's claim from the same
+/// scope in the same admission, and it has to be a separate claim because the
+/// node belongs to the registry's table and is released when the entry is
+/// removed, which is a different moment from when the last reference to the
+/// handle goes.
+fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let overflow = || ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    };
+    let bytes = std::mem::size_of::<ClientHandle>()
+        // The strong and weak counts beside the value in one `Arc` allocation.
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .and_then(|bytes| bytes.checked_add(CLIENT_CAPABILITY_BYTES))
+        .ok_or_else(overflow)?;
+    let bytes = u64::try_from(bytes).map_err(|_| overflow())?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        // The `Arc` allocation and the capability string's own buffer.
+        (ResourceClass::OpaqueDependencyResidual, 2),
+    ])
+}
+
+/// Everything this registry's fixtures acquire, priced from the real APIs.
+///
+/// `clients` funds that many client records; `entries` funds that many entries
+/// *in each* of the registry's tables. Summing the eight node shapes rather than
+/// picking the widest is deliberate over-funding, and it is the right kind: a
+/// fixture grant that is generous fails only by hiding headroom, while one that
+/// is tight fails by refusing a control for reasons the control is not about.
+///
+/// It lives here rather than beside the grant it feeds because the node types
+/// are private to this module. A grant written elsewhere would have to restate
+/// them, and every term below comes out of the same function that will charge
+/// against it — so this figure and the admission it has to satisfy cannot be
+/// derived from two different formulas. That is the failure this shape exists to
+/// prevent, and the daemon's IPC mailbox grant already records one instance of
+/// it having happened.
+#[cfg(test)]
+pub(crate) fn registry_fixture_claim(
+    clients: u64,
+    entries: u64,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let records = client_record_claim()?.checked_scale(clients)?;
+    let entry = LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?
+        .checked_add(LeasedMap::<ClaimKey, ClientId>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, HandlerMode>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, LeasedMap<ClientId, ()>>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClientId, ()>::entry_claim()?)?
+        .checked_add(LeasedMap::<PendingKey, PendingRecord>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, ()>::entry_claim()?)?
+        .checked_add(LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?)?;
+    records.checked_add(entry.checked_scale(entries)?)
+}
+
+/// Who is asking, and which of their things: the client id, the claim key, and
+/// the two unforgeable authorities. Values only — nothing in there holds a
+/// resource or knows this registry exists.
+mod identity;
+
+pub use identity::{ClaimKey, ClientCapability, ClientId, RealtimeFlowCapability};
 
 /// One flow a client owns, and the network it was opened on.
 ///
@@ -151,7 +250,7 @@ struct OwnedRealtimeFlow {
     flow: myownmesh_core::realtime::RealtimeFlowHandle,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PendingKey {
     pub network: String,
     pub method: String,
@@ -178,12 +277,24 @@ impl PendingCancellation {
         self.notify.notify_waiters();
     }
 
+    /// Synchronous read, for callers that no longer suspend.
+    ///
+    /// The stream push used to race this against a bounded channel's
+    /// backpressure. There is no backpressure to race now, so the only question
+    /// left is the one this answers directly: has this operation already been
+    /// cancelled.
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     async fn wait(&self) {
         loop {
             if self.cancelled.load(Ordering::Acquire) {
                 return;
             }
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.cancelled.load(Ordering::Acquire) {
                 return;
             }
@@ -216,17 +327,19 @@ impl Drop for PendingTicket {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        if let Some((_, pending)) =
-            registry
-                .exact_pending_inbound
-                .remove_if(&self.key, |_, pending| {
-                    let matches = pending.operation_id == self.operation_id;
-                    if matches {
-                        pending.cancelled.cancel();
-                    }
-                    matches
-                })
-        {
+        let mut tables = registry.tables.lock();
+        // This exact operation, or nothing. A later operation that reuses every
+        // public coordinate is a different call and not this ticket's to remove.
+        let ours = match tables.exact_pending_inbound.get(&self.key) {
+            Some(pending) => pending.operation_id == self.operation_id,
+            None => false,
+        };
+        if !ours {
+            return;
+        }
+        if let Some(pending) = tables.exact_pending_inbound.remove(&self.key) {
+            pending.cancelled.cancel();
+            drop(tables);
             drop(pending);
         }
     }
@@ -250,7 +363,7 @@ pub enum PendingInbound {
     /// indistinguishable from one that finished.
     ///
     /// [`RpcStreamItem::End`]: myownmesh_core::rpc::RpcStreamItem::End
-    Stream(mpsc::Sender<myownmesh_core::rpc::RpcStreamItem>),
+    Stream(ResourceMailboxSender<myownmesh_core::rpc::RpcStreamItem>),
 }
 
 /// State for a single connected event-subscribed client.
@@ -259,16 +372,32 @@ pub struct ClientHandle {
     capability: ClientCapability,
     connected: AtomicBool,
     disconnected: tokio::sync::Notify,
-    /// Mpsc the read loop and bridge code push outbound frames
-    /// into; a writer task on the same connection drains it.
-    pub writer_tx: mpsc::UnboundedSender<ServerOut>,
-    /// Method claims this client currently holds. Tracked for
-    /// O(1) cleanup on disconnect; the authoritative routing
-    /// table is on the registry.
-    pub method_claims: Arc<DashSet<ClaimKey>>,
+    /// Mailbox the read loop and bridge code push outbound frames into; a
+    /// writer task on the same connection drains it.
+    ///
+    /// Count-unbounded and resource-bounded: no frame count is invented here,
+    /// and every queued frame is funded by the local application scope that
+    /// owns this connection. A client that stops reading therefore stops being
+    /// admitted rather than growing an unbilled queue in the daemon.
+    pub writer_tx: ResourceMailboxSender<ServerOut>,
+    /// Method claims this client currently holds. Tracked so disconnect can
+    /// find them without walking the registry's whole claim table; the
+    /// authoritative routing table is on the registry.
+    ///
+    /// Private, and it was public. Nothing outside this module ever read it, and
+    /// leaving it exposed would have let a caller add a name here that the
+    /// registry's own table did not agree with — a client credited with a claim
+    /// no inbound call would ever route to.
+    method_claims: HeldNames,
     /// Channel subscriptions this client currently holds.
-    /// Same disconnect-cleanup rationale.
-    pub channel_subs: Arc<DashSet<ClaimKey>>,
+    /// Same disconnect-cleanup rationale, and the same reason for being private.
+    channel_subs: HeldNames,
+    /// Funding for this record, held rather than read.
+    ///
+    /// Released when the last reference to this handle goes, which is what
+    /// makes an unregistered client's capacity available to the next one
+    /// without an explicit release step that a disconnect path could miss.
+    _record: ResourceLease,
     /// Realtime flows this client has open, each under the capability issued
     /// for it.
     ///
@@ -282,7 +411,59 @@ pub struct ClientHandle {
     /// Private, because the handles inside are move-only and must stay that
     /// way: an accessor that lent one out by value would let a caller keep a
     /// flow the close path believes it has taken.
-    realtime_flows: Arc<DashMap<String, OwnedRealtimeFlow>>,
+    realtime_flows: Mutex<LeasedMap<String, OwnedRealtimeFlow>>,
+}
+
+/// One client's own set of claimed names, funded one name at a time.
+///
+/// Two fields of a `ClientHandle` are exactly this — held methods and subscribed
+/// channels — and they were two `DashSet`s that admitted names for free. A local
+/// client chooses how many names go in, so free admission made both of them a
+/// way for one process to grow the daemon without the process owner's grant
+/// having anything to say about it.
+///
+/// Every name is now a funded entry. The funding is acquired by the registry,
+/// which is the thing that holds the scope, and handed in — a client handle has
+/// no acquisition authority of its own and should not grow one.
+///
+/// The mutex is never held across an await; nothing on this type suspends. It is
+/// also only ever locked while the registry's own table lock is held, which is
+/// what makes the two orders consistent by construction rather than by
+/// convention.
+#[derive(Default)]
+struct HeldNames(Mutex<LeasedMap<ClaimKey, ()>>);
+
+impl HeldNames {
+    fn holds(&self, key: &ClaimKey) -> bool {
+        self.0.lock().contains_key(key)
+    }
+
+    /// Take a name and the funding that pays for it.
+    ///
+    /// A name already held is refused by the map, and the refusal releases the
+    /// redundant lease as it drops — so a caller that funded speculatively is
+    /// corrected rather than charged twice. Every caller in this module checks
+    /// [`Self::holds`] first under the registry's table lock, so the refusal
+    /// path is a backstop and not the ordinary case.
+    fn hold(&self, key: ClaimKey, entry: ResourceLease) {
+        let _ = self.0.lock().insert(key, (), entry);
+    }
+
+    fn release(&self, key: &ClaimKey) {
+        self.0.lock().remove(key);
+    }
+
+    /// Owned copies of every name held, for a caller that has to release them
+    /// through tables this one does not reach.
+    ///
+    /// Allocates deliberately: the alternative is calling back into the registry
+    /// while this lock is held, which is the one lock order this module does not
+    /// take.
+    fn snapshot(&self) -> Vec<ClaimKey> {
+        let mut names = Vec::new();
+        self.0.lock().for_each(|key, ()| names.push(key.clone()));
+        names
+    }
 }
 
 impl ClientHandle {
@@ -290,16 +471,29 @@ impl ClientHandle {
     ///
     /// The capability is minted here rather than supplied, so a client cannot
     /// choose where its flow is filed or overwrite another of its own.
+    ///
+    /// `entry` funds the table node this flow will occupy, and is acquired by
+    /// the registry before the open is installed. The lease lives in the node,
+    /// so taking the flow out again — by close, by disconnect, or by dropping
+    /// the handle with flows still in it — releases it without a separate step.
     fn register_realtime_flow(
         &self,
         network: String,
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
+        entry: ResourceLease,
     ) -> RealtimeFlowCapability {
         let capability = RealtimeFlowCapability::mint();
-        self.realtime_flows.insert(
-            capability.expose().to_string(),
-            OwnedRealtimeFlow { network, flow },
-        );
+        self.realtime_flows
+            .lock()
+            .insert(
+                capability.expose().to_string(),
+                OwnedRealtimeFlow { network, flow },
+                entry,
+            )
+            // 32 bytes of OS randomness, minted one line above and never
+            // reused. A collision here is not a case to handle; it is evidence
+            // the randomness is not random.
+            .expect("a freshly minted flow capability cannot already name a flow");
         capability
     }
 
@@ -315,15 +509,18 @@ impl ClientHandle {
     /// buys is that the refusal says what happened, instead of surfacing as a
     /// session that is somehow never current.
     ///
-    /// Nothing here awaits, so the map's shard guard is never held across a
-    /// suspension point.
+    /// Nothing here awaits, so the table's guard is never held across a
+    /// suspension point. `effect` is the one thing this cannot see the inside
+    /// of, which is why it takes a borrow of the handle and not the guard: a
+    /// caller can send on the flow, and cannot park on the table while doing it.
     pub fn with_realtime_flow<R>(
         &self,
         capability: &str,
         network: &str,
         effect: impl FnOnce(&myownmesh_core::realtime::RealtimeFlowHandle) -> R,
     ) -> Option<R> {
-        let owned = self.realtime_flows.get(capability)?;
+        let flows = self.realtime_flows.lock();
+        let owned = flows.get(capability)?;
         (owned.network == network).then(|| effect(&owned.flow))
     }
 
@@ -336,7 +533,7 @@ impl ClientHandle {
         &self,
         capability: &str,
     ) -> Option<(String, myownmesh_core::realtime::RealtimeFlowHandle)> {
-        let (_, owned) = self.realtime_flows.remove(capability)?;
+        let owned = self.realtime_flows.lock().remove(capability)?;
         Some((owned.network, owned.flow))
     }
 
@@ -346,23 +543,35 @@ impl ClientHandle {
     /// their networks rather than merely dropped — dropping a handle releases
     /// nothing, by design, so a client that vanished would otherwise leave its
     /// labels claimed and its native halves up until the session itself ended.
+    /// Taken under one acquisition of the table, unlike the two-phase walk this
+    /// replaces: a flow opened between the old snapshot and the old removal
+    /// survived the drain and was never closed.
     pub fn drain_realtime_flows(
         &self,
     ) -> Vec<(String, myownmesh_core::realtime::RealtimeFlowHandle)> {
-        let keys: Vec<String> = self
-            .realtime_flows
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| self.take_realtime_flow(&key))
+        let mut flows = self.realtime_flows.lock();
+        let mut capabilities = Vec::new();
+        flows.for_each(|capability, _| capabilities.push(capability.clone()));
+        capabilities
+            .into_iter()
+            .filter_map(|capability| flows.remove(&capability))
+            .map(|owned| (owned.network, owned.flow))
             .collect()
     }
 
-    pub fn send(&self, frame: ServerOut) {
-        // Best effort: a dropped writer means the connection is
-        // gone; the registry will clean up the handle shortly.
-        let _ = self.writer_tx.send(frame);
+    /// Queue one frame for this client's writer task.
+    ///
+    /// The refusal is returned rather than swallowed because the two ways this
+    /// can fail are not the same event, and they used to be flattened into the
+    /// same discarded `Err`. `Closed` means the connection is gone and the
+    /// registry will drop this handle shortly — nothing was owed to anyone.
+    /// `Pressure` and `Claim` mean the frame was real, the client is still
+    /// connected, and it will never see it. A caller with a peer waiting on the
+    /// other end has to say so rather than leave them to time out.
+    pub fn send(&self, frame: ServerOut) -> Result<(), ResourceMailboxAdmissionError> {
+        self.writer_tx
+            .send(frame)
+            .map_err(|refusal| refusal.into_admission_error())
     }
 
     pub async fn wait_disconnected(&self) {
@@ -371,6 +580,8 @@ impl ClientHandle {
                 return;
             }
             let notified = self.disconnected.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if !self.connected.load(Ordering::Acquire) {
                 return;
             }
@@ -393,1048 +604,87 @@ pub struct ClientRegistry {
 }
 
 struct RegistryInner {
-    mutation: Mutex<()>,
-    stream_capacity: NonZeroUsize,
+    /// Every routing table this registry owns, under one acquisition.
+    ///
+    /// This replaced a bare `Mutex<()>` fence beside five separately-locked
+    /// `DashMap`s. The fence made the multi-table operations atomic with respect
+    /// to each other, but the single-table readers bypassed it, so a reader
+    /// could see a claim installed and the client that owned it already gone.
+    /// There is one acquisition now, and no way to read one table without it.
+    tables: Mutex<RegistryTables>,
+    /// The one acquisition port everything this registry admits is funded
+    /// from. It is supplied rather than reached for: the registry has no
+    /// authority of its own, and a daemon that could mint some here would be
+    /// able to admit clients the process owner never granted capacity for.
+    resources: LocalApplicationResourceScope,
     next_id: AtomicU64,
     next_call_stream_id: AtomicU64,
-    clients: DashMap<ClientId, Arc<ClientHandle>>,
-    handler_claims: DashMap<ClaimKey, ClientId>,
-    channel_subs: DashMap<ClaimKey, Arc<Mutex<Vec<ClientId>>>>,
-    exact_pending_inbound: DashMap<PendingKey, PendingRecord>,
     next_operation_id: AtomicU64,
-    /// Streaming methods that have a synthetic handler
-    /// installed on the engine. `(network, method) → ()` —
-    /// the value side is unused; we only need set semantics.
-    /// Tracked so we can ask the bridge to forget the handler
-    /// on the last unclaim.
-    installed_handlers: DashMap<ClaimKey, HandlerMode>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The registry's five routing tables, which are only ever reached together.
+///
+/// Each is a [`LeasedMap`], so each entry is funded before it exists and
+/// released when it is removed — including when this whole struct is dropped
+/// with entries still in it, which is the daemon-shutdown case.
+struct RegistryTables {
+    clients: LeasedMap<ClientId, Arc<ClientHandle>>,
+    handler_claims: LeasedMap<ClaimKey, ClientId>,
+    /// Subscribers per (network, channel), as a funded set of funded members.
+    ///
+    /// Nested rather than a `Vec`, because both counts are chosen by local
+    /// clients: how many channels get subscribed to, and how many clients
+    /// subscribe to each. A `Vec` would have funded the first and not the
+    /// second. The outer entry appears with its first member and is removed with
+    /// its last, so an unsubscribed channel costs nothing — the previous shape
+    /// left an empty subscriber list behind forever.
+    channel_subs: LeasedMap<ClaimKey, LeasedMap<ClientId, ()>>,
+    exact_pending_inbound: LeasedMap<PendingKey, PendingRecord>,
+    /// Which shape of synthetic handler the bridge has installed on the engine
+    /// for each claim. Kept so a re-claim of the same method does not have to
+    /// ask the engine what it already holds, and so the last unclaim knows there
+    /// is a handler to forget.
+    installed_handlers: LeasedMap<ClaimKey, HandlerMode>,
+}
+
+impl RegistryTables {
+    /// Look one client up while the tables are already held.
+    ///
+    /// Exists because [`ClientRegistry::client`] takes the same lock, and this
+    /// mutex is not reentrant: every method here that both locks and needs a
+    /// client handle calls this instead, which is the whole of the discipline.
+    fn client(&self, id: ClientId) -> Option<Arc<ClientHandle>> {
+        self.clients.get(&id).cloned()
+    }
+}
+
+impl RegistryInner {
+    /// Fund one entry in one of this registry's tables, before it is inserted.
+    ///
+    /// Generic over the table's key and value because the claim is exactly the
+    /// size of that table's node — [`LeasedMap::entry_claim`] is the single
+    /// calibration point, and an owner that wrote a node size itself would be
+    /// stating a number the map is free to change.
+    fn lease_entry<K, V>(&self) -> Result<ResourceLease, IpcAdmissionError> {
+        self.resources
+            .acquire(LeasedMap::<K, V>::entry_claim().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)
+    }
+}
+
+/// Which shape of synthetic handler is installed for a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HandlerMode {
     Single,
     Stream,
 }
 
-impl ClientRegistry {
-    pub fn with_stream_capacity(stream_capacity: NonZeroUsize) -> Self {
-        Self {
-            inner: Arc::new(RegistryInner {
-                stream_capacity,
-                mutation: Mutex::new(()),
-                next_id: AtomicU64::new(0),
-                next_call_stream_id: AtomicU64::new(0),
-                clients: DashMap::new(),
-                handler_claims: DashMap::new(),
-                channel_subs: DashMap::new(),
-                exact_pending_inbound: DashMap::new(),
-                next_operation_id: AtomicU64::new(0),
-                installed_handlers: DashMap::new(),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn new() -> Self {
-        Self::with_stream_capacity(NonZeroUsize::new(4).expect("test policy is nonzero"))
-    }
-
-    pub fn stream_capacity(&self) -> NonZeroUsize {
-        self.inner.stream_capacity
-    }
-
-    /// Allocate a fresh `ClientId` and register the client's
-    /// outbound writer. Returns the handle the read loop should
-    /// keep alongside its socket.
-    pub fn register(&self, writer_tx: mpsc::UnboundedSender<ServerOut>) -> Arc<ClientHandle> {
-        let id = ClientId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let handle = Arc::new(ClientHandle {
-            id,
-            capability: ClientCapability::mint(),
-            connected: AtomicBool::new(true),
-            disconnected: tokio::sync::Notify::new(),
-            writer_tx,
-            method_claims: Arc::new(DashSet::new()),
-            channel_subs: Arc::new(DashSet::new()),
-            realtime_flows: Arc::new(DashMap::new()),
-        });
-        self.inner.clients.insert(id, handle.clone());
-        handle
-    }
-
-    pub fn capability<'a>(&self, client: &'a ClientHandle) -> &'a str {
-        client.capability.expose()
-    }
-
-    pub fn authenticate(&self, id: ClientId, presented: &str) -> Option<Arc<ClientHandle>> {
-        let client = self.client(id)?;
-        client.capability.matches(presented).then_some(client)
-    }
-
-    /// Install a completed realtime open only while its event-stream owner is
-    /// still registered. This shares the registry mutation seam with
-    /// [`Self::unregister`]: install-first means the disconnect drain observes
-    /// and closes the flow; disconnect-first returns the move-only handle to
-    /// the caller, which must close it directly.
-    pub fn install_realtime_flow(
-        &self,
-        owner: &Arc<ClientHandle>,
-        network: String,
-        flow: myownmesh_core::realtime::RealtimeFlowHandle,
-    ) -> Result<RealtimeFlowCapability, myownmesh_core::realtime::RealtimeFlowHandle> {
-        self.install_if_live(owner, flow, |flow| {
-            owner.register_realtime_flow(network, flow)
-        })
-    }
-
-    fn install_if_live<T, R>(
-        &self,
-        owner: &Arc<ClientHandle>,
-        value: T,
-        install: impl FnOnce(T) -> R,
-    ) -> Result<R, T> {
-        let _mutation = self.inner.mutation.lock();
-        let Some(current) = self.inner.clients.get(&owner.id) else {
-            return Err(value);
-        };
-        if !Arc::ptr_eq(current.value(), owner) || !owner.connected.load(Ordering::Acquire) {
-            return Err(value);
-        }
-        Ok(install(value))
-    }
-
-    /// Remove one exact connection owner, all its claims and subscriptions,
-    /// and every pending operation it owns. A stream sender disappearing
-    /// without an explicit terminal item is a peer-visible failure in core.
-    pub fn unregister(&self, id: ClientId) -> Option<Arc<ClientHandle>> {
-        let _mutation = self.inner.mutation.lock();
-        let (_, handle) = self.inner.clients.remove(&id)?;
-        handle.connected.store(false, Ordering::Release);
-        handle.disconnected.notify_waiters();
-        // Drop method claims this client owned. Note: we don't
-        // tear down the synthetic handler on the engine — a
-        // future claimant might re-take the same method
-        // immediately and we'd save the install. The handler
-        // gracefully errors with `no claim` if invoked with no
-        // current owner.
-        for entry in handle.method_claims.iter() {
-            let key = entry.key().clone();
-            // Only drop if we still own it (a displacing client
-            // might have already taken over).
-            self.inner
-                .handler_claims
-                .remove_if(&key, |_, owner| *owner == id);
-        }
-        // Drop channel subscriptions. The fan-out task running
-        // for this (network, channel) will notice the empty
-        // subscriber list and exit on its next iteration.
-        for entry in handle.channel_subs.iter() {
-            let key = entry.key().clone();
-            if let Some(subs) = self.inner.channel_subs.get(&key) {
-                subs.lock().retain(|c| *c != id);
-            }
-        }
-        let keys: Vec<_> = self
-            .inner
-            .exact_pending_inbound
-            .iter()
-            .filter(|entry| entry.value().owner == id)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for key in keys {
-            if let Some((_, pending)) =
-                self.inner
-                    .exact_pending_inbound
-                    .remove_if(&key, |_, pending| {
-                        let matches = pending.owner == id;
-                        if matches {
-                            pending.cancelled.cancel();
-                        }
-                        matches
-                    })
-            {
-                match pending.effect {
-                    PendingInbound::Single(tx) => {
-                        let _ = tx.send(Err("local IPC handler disconnected".into()));
-                    }
-                    PendingInbound::Stream(tx) => drop(tx),
-                }
-            }
-        }
-        Some(handle)
-    }
-
-    pub fn client(&self, id: ClientId) -> Option<Arc<ClientHandle>> {
-        self.inner.clients.get(&id).map(|e| e.value().clone())
-    }
-
-    /// Unregister every client and answer the handles that were removed.
-    ///
-    /// The handles are returned rather than dropped because some of what a
-    /// client owns cannot be released by dropping it — realtime flows in
-    /// particular, whose handles are non-owning and whose closes have to run
-    /// through a joined network and await. This module has neither, so it hands
-    /// the owners back to the caller that does.
-    #[must_use = "a shut-down client's realtime flows still have to be closed through their networks"]
-    pub fn shutdown(&self) -> Vec<Arc<ClientHandle>> {
-        let clients: Vec<_> = self
-            .inner
-            .clients
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
-        let removed: Vec<Arc<ClientHandle>> = clients
-            .into_iter()
-            .filter_map(|client| self.unregister(client))
-            .collect();
-        // Defensive: handler futures can race shutdown after the client
-        // snapshot. Dropping a stream entry without End is explicitly failed
-        // by core; dropping a single sender wakes its waiter with cancellation.
-        let remaining: Vec<_> = self
-            .inner
-            .exact_pending_inbound
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        for key in remaining {
-            if let Some((_, pending)) =
-                self.inner
-                    .exact_pending_inbound
-                    .remove_if(&key, |_, pending| {
-                        pending.cancelled.cancel();
-                        true
-                    })
-            {
-                drop(pending.effect);
-            }
-        }
-        removed
-    }
-
-    /// Claim a method on a network. Returns the previously
-    /// claiming client if any (so the caller can notify them
-    /// with `HandlerDisplaced`).
-    pub fn claim_method(
-        &self,
-        key: ClaimKey,
-        new_owner: ClientId,
-        mode: HandlerMode,
-    ) -> Option<ClientId> {
-        let _mutation = self.inner.mutation.lock();
-        // Update the per-client cache first so on-disconnect
-        // cleanup sees the new claim.
-        let client = self.client(new_owner)?;
-        client.method_claims.insert(key.clone());
-        let prev = self.inner.handler_claims.insert(key.clone(), new_owner);
-        self.inner.installed_handlers.insert(key.clone(), mode);
-        if let Some(prev_owner) = prev {
-            if prev_owner != new_owner {
-                if let Some(prev_client) = self.client(prev_owner) {
-                    prev_client.method_claims.remove(&key);
-                }
-                self.cancel_displaced_claim(&key, prev_owner);
-                return Some(prev_owner);
-            }
-        }
-        None
-    }
-
-    fn cancel_displaced_claim(&self, claim: &ClaimKey, owner: ClientId) {
-        let keys: Vec<_> = self
-            .inner
-            .exact_pending_inbound
-            .iter()
-            .filter(|entry| {
-                entry.value().owner == owner
-                    && entry.key().network == claim.0
-                    && entry.key().method == claim.1
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
-        for key in keys {
-            if let Some((_, pending)) =
-                self.inner
-                    .exact_pending_inbound
-                    .remove_if(&key, |_, pending| {
-                        let matches = pending.owner == owner;
-                        if matches {
-                            pending.cancelled.cancel();
-                        }
-                        matches
-                    })
-            {
-                match pending.effect {
-                    PendingInbound::Single(tx) => {
-                        let _ = tx.send(Err("local IPC handler displaced".into()));
-                    }
-                    PendingInbound::Stream(tx) => drop(tx),
-                }
-            }
-        }
-    }
-
-    /// Release a method claim. Returns the prior owner if the
-    /// caller did own it.
-    pub fn release_method(&self, key: &ClaimKey, owner: ClientId) -> bool {
-        let _mutation = self.inner.mutation.lock();
-        if let Some(client) = self.client(owner) {
-            client.method_claims.remove(key);
-        }
-        self.inner
-            .handler_claims
-            .remove_if(key, |_, current| *current == owner)
-            .is_some()
-    }
-
-    pub fn handler_owner(&self, key: &ClaimKey) -> Option<ClientId> {
-        self.inner.handler_claims.get(key).map(|e| *e.value())
-    }
-
-    #[allow(dead_code)]
-    pub fn handler_mode(&self, key: &ClaimKey) -> Option<HandlerMode> {
-        self.inner.installed_handlers.get(key).map(|e| *e.value())
-    }
-
-    /// Returns `true` on the FIRST subscriber for this
-    /// (network, channel) — caller uses that signal to spawn a
-    /// new pump task.
-    pub fn subscribe_channel(&self, key: ClaimKey, client: ClientId) -> bool {
-        let _mutation = self.inner.mutation.lock();
-        let Some(c) = self.client(client) else {
-            return false;
-        };
-        c.channel_subs.insert(key.clone());
-        let entry = self
-            .inner
-            .channel_subs
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
-        let mut subs = entry.lock();
-        let was_empty = subs.is_empty();
-        if !subs.contains(&client) {
-            subs.push(client);
-        }
-        was_empty
-    }
-
-    /// Release a subscription. Returns `true` if no clients
-    /// remain on this channel — caller uses that signal to tear
-    /// down the pump task.
-    pub fn unsubscribe_channel(&self, key: &ClaimKey, client: ClientId) -> bool {
-        let _mutation = self.inner.mutation.lock();
-        if let Some(c) = self.client(client) {
-            c.channel_subs.remove(key);
-        }
-        let Some(subs) = self.inner.channel_subs.get(key) else {
-            return true;
-        };
-        let mut subs = subs.lock();
-        subs.retain(|c| *c != client);
-        subs.is_empty()
-    }
-
-    /// Snapshot the current set of subscribers — used by the
-    /// channel pump task each iteration.
-    pub fn channel_subscribers(&self, key: &ClaimKey) -> Vec<ClientId> {
-        self.inner
-            .channel_subs
-            .get(key)
-            .map(|subs| subs.lock().clone())
-            .unwrap_or_default()
-    }
-
-    /// Monotonic counter used to tag outbound stream calls.
-    /// The lib's `Rpc::call_stream` allocates its own request
-    /// id internally but doesn't expose it; the IPC layer
-    /// generates its own correlation id so clients can match
-    /// chunks back to their originating call.
-    pub fn next_call_stream_id(&self) -> u64 {
-        self.inner
-            .next_call_stream_id
-            .fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub fn insert_exact_pending(
-        &self,
-        key: PendingKey,
-        owner: ClientId,
-        effect: PendingInbound,
-    ) -> Result<PendingTicket, PendingInbound> {
-        use dashmap::mapref::entry::Entry;
-        let _mutation = self.inner.mutation.lock();
-        if self.client(owner).is_none() {
-            return Err(effect);
-        }
-        let operation_id = self.inner.next_operation_id.fetch_add(1, Ordering::Relaxed);
-        let ticket_key = key.clone();
-        let cancelled = Arc::new(PendingCancellation {
-            cancelled: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-        });
-        match self.inner.exact_pending_inbound.entry(key) {
-            Entry::Vacant(slot) => {
-                slot.insert(PendingRecord {
-                    owner,
-                    operation_id,
-                    effect,
-                    cancelled: cancelled.clone(),
-                });
-                Ok(PendingTicket {
-                    registry: Arc::downgrade(&self.inner),
-                    key: ticket_key,
-                    operation_id,
-                    cancelled,
-                })
-            }
-            Entry::Occupied(_) => Err(effect),
-        }
-    }
-
-    /// Settle one single-shot operation, with success or with the client's
-    /// error. `true` only if that exact operation was pending and this caller
-    /// owned it: the key, the owner and the private operation id must all
-    /// match, and the record must be of the single-shot class.
-    ///
-    /// The class check is what stops a `RpcRespond` from terminating a stream
-    /// that happens to share every public coordinate with it.
-    pub fn resolve_exact_single(
-        &self,
-        key: &PendingKey,
-        owner: ClientId,
-        operation_id: u64,
-        result: Result<serde_json::Value, String>,
-    ) -> bool {
-        let Some((_, pending)) = self
-            .inner
-            .exact_pending_inbound
-            .remove_if(key, |_, pending| {
-                pending.owner == owner
-                    && pending.operation_id == operation_id
-                    && matches!(&pending.effect, PendingInbound::Single(_))
-            })
-        else {
-            return false;
-        };
-        let PendingInbound::Single(tx) = pending.effect else {
-            unreachable!("predicate fixed response class")
-        };
-        pending.cancelled.cancel();
-        let _ = tx.send(result);
-        true
-    }
-
-    /// Push one chunk into an in-flight stream. `true` if it was accepted.
-    ///
-    /// Awaits when the queue is full, which is the back-pressure the capacity
-    /// policy exists to apply. That wait is what makes the cancellation matter:
-    /// the sender and the cancellation are both cloned out here and the map
-    /// guard is dropped before the wait, so a settlement that lands meanwhile
-    /// cannot be seen by looking the record up again — it is *gone* by then.
-    ///
-    /// The select is `biased` on cancellation for that reason. Every terminal
-    /// path — [`Self::close_exact_stream`], [`Self::unregister`], displacement,
-    /// and dropping the [`PendingTicket`] — cancels while holding the map's
-    /// write guard, before its own terminal item goes out. So once a stream has
-    /// been settled, a blocked chunk answers `false` and is never written: it
-    /// cannot appear after the `End` its peer has already been told is final.
-    /// A chunk that wins the race outright still lands, ahead of the terminal
-    /// item, which is ordinary.
-    pub async fn push_exact_stream(
-        &self,
-        key: &PendingKey,
-        owner: ClientId,
-        operation_id: u64,
-        payload: serde_json::Value,
-    ) -> bool {
-        let (tx, cancelled) = match self.inner.exact_pending_inbound.get(key) {
-            Some(entry) if entry.owner == owner && entry.operation_id == operation_id => {
-                match &entry.effect {
-                    PendingInbound::Stream(tx) => (tx.clone(), entry.cancelled.clone()),
-                    _ => return false,
-                }
-            }
-            _ => return false,
-        };
-        tokio::select! {
-            biased;
-            () = cancelled.wait() => false,
-            result = tx.send(myownmesh_core::rpc::RpcStreamItem::Chunk(payload)) => result.is_ok(),
-        }
-    }
-
-    /// Terminate one in-flight stream, cleanly or with the client's error.
-    ///
-    /// The record is removed and its cancellation fired inside one write
-    /// acquisition, before the terminal item is sent, so no chunk still parked
-    /// on a full queue can overtake it.
-    ///
-    /// [`RpcStreamItem::End`] is sent rather than the sender merely dropped:
-    /// the error the client supplied is the point, and a drop would report
-    /// every ending as the same failure.
-    ///
-    /// [`RpcStreamItem::End`]: myownmesh_core::rpc::RpcStreamItem::End
-    pub async fn close_exact_stream(
-        &self,
-        key: &PendingKey,
-        owner: ClientId,
-        operation_id: u64,
-        error: Option<String>,
-    ) -> bool {
-        let Some((_, pending)) = self
-            .inner
-            .exact_pending_inbound
-            .remove_if(key, |_, pending| {
-                let matches = pending.owner == owner
-                    && pending.operation_id == operation_id
-                    && matches!(&pending.effect, PendingInbound::Stream(_));
-                if matches {
-                    pending.cancelled.cancel();
-                }
-                matches
-            })
-        else {
-            return false;
-        };
-        let PendingInbound::Stream(tx) = pending.effect else {
-            unreachable!("predicate fixed response class")
-        };
-        tx.send(myownmesh_core::rpc::RpcStreamItem::End(
-            error.map_or(Ok(()), Err),
-        ))
-        .await
-        .is_ok()
-    }
-}
-
-/// Delegates to [`ClientRegistry::new`], which is itself controls-only.
+/// Every operation this registry performs on the tables declared above.
 ///
-/// Present so the two ways of asking for the same fixture cannot answer
-/// differently, not because a registry has a meaningful default. Production
-/// names its stream capacity through [`ClientRegistry::with_stream_capacity`],
-/// because a stream queue's depth is the local Application Gateway owner's
-/// decision and a default would make it a silent one. Neither this nor `new` is
-/// compiled into the daemon.
-#[cfg(test)]
-impl Default for ClientRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// A descendant, so it reaches every private field here without any of them
+/// being widened for it. What the state *is* stays with the claims that fund
+/// it; what is *done* with it lives there.
+mod registry;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fresh_client(
-        registry: &ClientRegistry,
-    ) -> (Arc<ClientHandle>, mpsc::UnboundedReceiver<ServerOut>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let handle = registry.register(tx);
-        (handle, rx)
-    }
-
-    #[test]
-    fn client_id_roundtrips_through_string() {
-        let id = ClientId(42);
-        assert_eq!(id.to_string(), "c42");
-        let parsed: ClientId = "c42".parse().expect("parse");
-        assert_eq!(parsed, id);
-        assert!("not-an-id".parse::<ClientId>().is_err());
-        assert!("c-99".parse::<ClientId>().is_err());
-    }
-
-    #[test]
-    fn ids_are_monotonic_and_unique() {
-        let reg = ClientRegistry::new();
-        let (a, _ra) = fresh_client(&reg);
-        let (b, _rb) = fresh_client(&reg);
-        let (c, _rc) = fresh_client(&reg);
-        assert_eq!(a.id, ClientId(0));
-        assert_eq!(b.id, ClientId(1));
-        assert_eq!(c.id, ClientId(2));
-        assert!(reg.client(a.id).is_some());
-        assert!(reg.client(ClientId(99)).is_none());
-        assert!(reg.authenticate(a.id, reg.capability(&a)).is_some());
-        assert!(reg.authenticate(b.id, reg.capability(&a)).is_none());
-    }
-
-    #[test]
-    fn disconnect_winner_returns_completed_install_to_its_sole_cleanup_owner() {
-        #[derive(Debug)]
-        struct Completed(Arc<AtomicU64>);
-        impl Drop for Completed {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-
-        let reg = ClientRegistry::new();
-        let (owner, _) = fresh_client(&reg);
-        reg.unregister(owner.id).expect("registered owner");
-        let drops = Arc::new(AtomicU64::new(0));
-        let installed = Arc::new(AtomicBool::new(false));
-        let installed_probe = installed.clone();
-        let returned = reg
-            .install_if_live(&owner, Completed(drops.clone()), move |completed| {
-                installed_probe.store(true, Ordering::Release);
-                completed
-            })
-            .expect_err("disconnect won the shared mutation seam");
-        assert!(!installed.load(Ordering::Acquire));
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        drop(returned);
-        assert_eq!(drops.load(Ordering::Acquire), 1);
-    }
-
-    /// The other side of the seam from
-    /// `disconnect_winner_returns_completed_install_to_its_sole_cleanup_owner`:
-    /// an install that lands while its owner is still registered stays landed,
-    /// and the disconnect path hands back the very handle it landed in — which
-    /// is what lets the caller's drain find it and close it.
-    ///
-    /// Bounded deliberately, and the bound is worth stating. A real
-    /// `RealtimeFlowHandle` is `pub(crate)` to core and cannot be minted from
-    /// this crate, so this drives `install_if_live` generically rather than
-    /// `install_realtime_flow`. The ordering under test lives entirely in that
-    /// seam — the flow table is only what the closure happens to write to — but
-    /// the consequence is that the end-to-end install → disconnect → drain →
-    /// close path is still uncovered here.
-    #[test]
-    fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up() {
-        let reg = ClientRegistry::new();
-        let (owner, _) = fresh_client(&reg);
-        let table: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let landed = table.clone();
-        reg.install_if_live(&owner, 7_u32, move |value| landed.lock().push(value))
-            .expect("a registered, connected owner admits the install");
-        assert_eq!(&*table.lock(), &[7], "the install ran");
-
-        let returned = reg.unregister(owner.id).expect("registered owner");
-        assert!(
-            Arc::ptr_eq(&returned, &owner),
-            "disconnect answers with the same handle the install landed in"
-        );
-        assert_eq!(
-            &*table.lock(),
-            &[7],
-            "unregister does not undo a completed install — the drain that runs \
-             after it is what releases one, and it can only release what is \
-             still there"
-        );
-
-        let refused = table.clone();
-        assert!(
-            reg.install_if_live(&owner, 9_u32, move |value| refused.lock().push(value))
-                .is_err(),
-            "the same owner admits nothing once it has disconnected"
-        );
-        assert_eq!(
-            &*table.lock(),
-            &[7],
-            "and the refused value never reached the table"
-        );
-    }
-
-    #[test]
-    fn claim_method_takes_ownership_and_displaces_prior() {
-        let reg = ClientRegistry::new();
-        let (a, _ra) = fresh_client(&reg);
-        let (b, _rb) = fresh_client(&reg);
-        let key = ("net".to_string(), "infer".to_string());
-
-        let prev = reg.claim_method(key.clone(), a.id, HandlerMode::Single);
-        assert!(prev.is_none());
-        assert_eq!(reg.handler_owner(&key), Some(a.id));
-        assert!(a.method_claims.contains(&key));
-
-        let prev = reg.claim_method(key.clone(), a.id, HandlerMode::Single);
-        assert!(prev.is_none());
-
-        let prev = reg.claim_method(key.clone(), b.id, HandlerMode::Stream);
-        assert_eq!(prev, Some(a.id));
-        assert_eq!(reg.handler_owner(&key), Some(b.id));
-        assert!(b.method_claims.contains(&key));
-        assert!(!a.method_claims.contains(&key));
-    }
-
-    #[test]
-    fn release_method_only_succeeds_for_current_owner() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let (b, _) = fresh_client(&reg);
-        let key = ("net".to_string(), "infer".to_string());
-
-        reg.claim_method(key.clone(), a.id, HandlerMode::Single);
-        assert!(!reg.release_method(&key, b.id));
-        assert_eq!(reg.handler_owner(&key), Some(a.id));
-        assert!(reg.release_method(&key, a.id));
-        assert!(reg.handler_owner(&key).is_none());
-        assert!(!a.method_claims.contains(&key));
-    }
-
-    #[test]
-    fn unregister_drops_claims_and_subscriptions() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let method_key = ("net".to_string(), "infer".to_string());
-        let channel_key = ("net".to_string(), "catalog".to_string());
-
-        reg.claim_method(method_key.clone(), a.id, HandlerMode::Single);
-        reg.subscribe_channel(channel_key.clone(), a.id);
-
-        assert_eq!(reg.handler_owner(&method_key), Some(a.id));
-        assert_eq!(reg.channel_subscribers(&channel_key), vec![a.id]);
-
-        reg.unregister(a.id);
-
-        assert!(reg.handler_owner(&method_key).is_none());
-        assert!(reg.channel_subscribers(&channel_key).is_empty());
-        assert!(reg.client(a.id).is_none());
-    }
-
-    #[test]
-    fn unregister_doesnt_collateral_drop_a_displacing_claim() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let (b, _) = fresh_client(&reg);
-        let key = ("net".to_string(), "infer".to_string());
-
-        reg.claim_method(key.clone(), a.id, HandlerMode::Single);
-        reg.claim_method(key.clone(), b.id, HandlerMode::Single);
-        assert_eq!(reg.handler_owner(&key), Some(b.id));
-
-        reg.unregister(a.id);
-        assert_eq!(reg.handler_owner(&key), Some(b.id));
-    }
-
-    #[test]
-    fn channel_subscribe_first_subscriber_flag() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let (b, _) = fresh_client(&reg);
-        let key = ("net".to_string(), "catalog".to_string());
-
-        assert!(reg.subscribe_channel(key.clone(), a.id), "first sub");
-        assert!(!reg.subscribe_channel(key.clone(), b.id), "second sub");
-
-        assert!(!reg.unsubscribe_channel(&key, b.id));
-        assert!(reg.unsubscribe_channel(&key, a.id));
-    }
-
-    #[tokio::test]
-    async fn exact_owner_coordinates_and_operation_identity_all_match() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let (b, _) = fresh_client(&reg);
-        let key = PendingKey {
-            network: "n".into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "same".into(),
-            class: HandlerMode::Single,
-        };
-        let (tx, rx) = oneshot::channel();
-        let Ok(ticket) = reg.insert_exact_pending(key.clone(), a.id, PendingInbound::Single(tx))
-        else {
-            panic!("first claim must be vacant")
-        };
-        assert!(!reg.resolve_exact_single(
-            &key,
-            b.id,
-            ticket.operation_id(),
-            Ok(serde_json::json!("foreign"))
-        ));
-        assert!(!reg.resolve_exact_single(
-            &key,
-            a.id,
-            ticket.operation_id() + 1,
-            Ok(serde_json::json!("stale"))
-        ));
-        assert!(reg.resolve_exact_single(
-            &key,
-            a.id,
-            ticket.operation_id(),
-            Ok(serde_json::json!("mine"))
-        ));
-        assert_eq!(
-            rx.await.expect("settled").expect("success"),
-            serde_json::json!("mine")
-        );
-    }
-
-    #[test]
-    fn collision_refuses_newcomer_and_disconnect_truthfully_settles_owner() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let key = PendingKey {
-            network: "n".into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "same".into(),
-            class: HandlerMode::Single,
-        };
-        let (first_tx, first_rx) = oneshot::channel();
-        let Ok(_ticket) =
-            reg.insert_exact_pending(key.clone(), a.id, PendingInbound::Single(first_tx))
-        else {
-            panic!("incumbent must be vacant")
-        };
-        let (new_tx, _new_rx) = oneshot::channel();
-        assert!(reg
-            .insert_exact_pending(key, a.id, PendingInbound::Single(new_tx))
-            .is_err());
-        reg.unregister(a.id);
-        assert!(
-            matches!(first_rx.blocking_recv(), Ok(Err(message)) if message.contains("disconnected"))
-        );
-    }
-
-    #[test]
-    fn identical_remote_id_in_distinct_scopes_does_not_displace() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let key = |network: &str| PendingKey {
-            network: network.into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "same".into(),
-            class: HandlerMode::Single,
-        };
-        let (tx_a, _) = oneshot::channel();
-        let (tx_b, _) = oneshot::channel();
-        assert!(reg
-            .insert_exact_pending(key("a"), a.id, PendingInbound::Single(tx_a))
-            .is_ok());
-        assert!(reg
-            .insert_exact_pending(key("b"), a.id, PendingInbound::Single(tx_b))
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn handler_displacement_settles_only_that_exact_claim() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let (b, _) = fresh_client(&reg);
-        reg.claim_method(("n".into(), "m".into()), a.id, HandlerMode::Single);
-        reg.claim_method(("n".into(), "other".into()), a.id, HandlerMode::Single);
-        let key = |method: &str| PendingKey {
-            network: "n".into(),
-            method: method.into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "same".into(),
-            class: HandlerMode::Single,
-        };
-        let (m_tx, m_rx) = oneshot::channel();
-        let (other_tx, other_rx) = oneshot::channel();
-        let Ok(_m) = reg.insert_exact_pending(key("m"), a.id, PendingInbound::Single(m_tx)) else {
-            panic!("m")
-        };
-        let Ok(other) =
-            reg.insert_exact_pending(key("other"), a.id, PendingInbound::Single(other_tx))
-        else {
-            panic!("other")
-        };
-        assert_eq!(
-            reg.claim_method(("n".into(), "m".into()), b.id, HandlerMode::Single),
-            Some(a.id)
-        );
-        assert!(matches!(m_rx.await, Ok(Err(message)) if message.contains("displaced")));
-        assert!(reg.resolve_exact_single(
-            &key("other"),
-            a.id,
-            other.operation_id(),
-            Ok(serde_json::json!("still-owned"))
-        ));
-        assert!(
-            matches!(other_rx.await, Ok(Ok(value)) if value == serde_json::json!("still-owned"))
-        );
-    }
-
-    #[tokio::test]
-    async fn selected_stream_capacity_applies_backpressure_and_releases() {
-        let reg = ClientRegistry::with_stream_capacity(NonZeroUsize::new(1).unwrap());
-        let (a, _) = fresh_client(&reg);
-        let key = PendingKey {
-            network: "n".into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "stream".into(),
-            class: HandlerMode::Stream,
-        };
-        let (tx, mut rx) = mpsc::channel(reg.stream_capacity().get());
-        let Ok(ticket) = reg.insert_exact_pending(key.clone(), a.id, PendingInbound::Stream(tx))
-        else {
-            panic!("stream claim")
-        };
-        assert!(
-            reg.push_exact_stream(&key, a.id, ticket.operation_id(), serde_json::json!(1))
-                .await
-        );
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(1),
-            reg.push_exact_stream(&key, a.id, ticket.operation_id(), serde_json::json!(2))
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-                serde_json::json!(1)
-            ))
-        );
-        assert!(
-            reg.push_exact_stream(&key, a.id, ticket.operation_id(), serde_json::json!(2))
-                .await
-        );
-        let closing = tokio::spawn({
-            let reg = reg.clone();
-            let key = key.clone();
-            let operation_id = ticket.operation_id();
-            async move { reg.close_exact_stream(&key, a.id, operation_id, None).await }
-        });
-        // This control uses Tokio's default current-thread test runtime. After
-        // this yield the spawned closer has been polled and can only still be
-        // pending because the resident chunk owns the queue's sole permit.
-        tokio::task::yield_now().await;
-        assert!(
-            !closing.is_finished(),
-            "the terminal item waits behind the resident chunk instead of overtaking it"
-        );
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-                serde_json::json!(2)
-            ))
-        );
-        assert!(closing.await.expect("the closer does not panic"));
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
-        );
-    }
-
-    #[tokio::test]
-    async fn capacity_blocked_chunk_cannot_cross_terminal_settlement() {
-        let reg = ClientRegistry::with_stream_capacity(NonZeroUsize::new(1).unwrap());
-        let (owner, _) = fresh_client(&reg);
-        let owner_id = owner.id;
-        let key = PendingKey {
-            network: "n".into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "ordered".into(),
-            class: HandlerMode::Stream,
-        };
-        let (tx, mut rx) = mpsc::channel(1);
-        let Ok(ticket) =
-            reg.insert_exact_pending(key.clone(), owner_id, PendingInbound::Stream(tx))
-        else {
-            panic!("vacant stream")
-        };
-        let operation_id = ticket.operation_id();
-        assert!(
-            reg.push_exact_stream(&key, owner_id, operation_id, serde_json::json!(1))
-                .await
-        );
-
-        let blocked_registry = reg.clone();
-        let blocked_key = key.clone();
-        let blocked = tokio::spawn(async move {
-            blocked_registry
-                .push_exact_stream(&blocked_key, owner_id, operation_id, serde_json::json!(2))
-                .await
-        });
-        tokio::task::yield_now().await;
-        let closer = {
-            let registry = reg.clone();
-            let key = key.clone();
-            tokio::spawn(async move {
-                registry
-                    .close_exact_stream(&key, owner_id, operation_id, None)
-                    .await
-            })
-        };
-
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-                serde_json::json!(1)
-            ))
-        );
-        assert!(!blocked.await.expect("blocked sender joins"));
-        assert!(closer.await.expect("closer joins"));
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
-        );
-        assert_eq!(rx.recv().await, None);
-    }
-
-    #[tokio::test]
-    async fn stream_terminal_error_is_preserved_exactly() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let key = PendingKey {
-            network: "n".into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "err".into(),
-            class: HandlerMode::Stream,
-        };
-        let (tx, mut rx) = mpsc::channel(reg.stream_capacity().get());
-        let Ok(ticket) = reg.insert_exact_pending(key.clone(), a.id, PendingInbound::Stream(tx))
-        else {
-            panic!("stream claim")
-        };
-        assert!(
-            reg.close_exact_stream(&key, a.id, ticket.operation_id(), Some("denied".into()))
-                .await
-        );
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::End(
-                Err("denied".into())
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn wrong_response_class_retains_same_operation_identity() {
-        let reg = ClientRegistry::new();
-        let (a, _) = fresh_client(&reg);
-        let key = PendingKey {
-            network: "n".into(),
-            method: "m".into(),
-            remote_peer: "peer".into(),
-            remote_request_id: "typed".into(),
-            class: HandlerMode::Stream,
-        };
-        let (tx, mut rx) = mpsc::channel(reg.stream_capacity().get());
-        let Ok(ticket) = reg.insert_exact_pending(key.clone(), a.id, PendingInbound::Stream(tx))
-        else {
-            panic!("stream")
-        };
-        assert!(!reg.resolve_exact_single(
-            &key,
-            a.id,
-            ticket.operation_id(),
-            Ok(serde_json::json!("wrong"))
-        ));
-        assert!(
-            reg.push_exact_stream(
-                &key,
-                a.id,
-                ticket.operation_id(),
-                serde_json::json!("same-op")
-            )
-            .await
-        );
-        assert_eq!(
-            rx.recv().await,
-            Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-                serde_json::json!("same-op")
-            ))
-        );
-    }
-}
+mod tests;

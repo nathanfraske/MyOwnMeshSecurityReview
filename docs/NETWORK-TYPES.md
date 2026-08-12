@@ -1,4 +1,4 @@
-# Legacy network types: open, closed, and silent
+# Network types: open, closed, and silent
 
 **Status: historical pre-V4 implementation record.** This document describes
 legacy source behavior that remains during migration. It is not the V4 product
@@ -225,7 +225,7 @@ signed state-update appended to the per-network state log.
 
 | From | To | Authority |
 |---|---|---|
-| `open`   | `closed` | founder self-election — `signers.first()` becomes owner (≥ 1 signer; co-signing allowed) |
+| `open`   | `closed` | founder self-election — exactly one signer becomes owner |
 | `closed` | `open`   | ≥ 1 owner |
 
 Founding a closed network is a **founder self-election**: `signers.first()`
@@ -235,13 +235,11 @@ peer-authority owner grants, so the network never depends on the founder
 staying online). It is *not* a consent vote — the founder needs no one
 else's signature.
 
-Genesis is **multi-signer capable**: because a peer mesh can't assume a
-single always-online founder, a close may be co-signed, and `verify_log`
-accepts any non-empty signer set (electing the first). What it does *not*
-do is try to prove "unanimous consent" — a converging peer replays from an
-empty member set and can't reconstruct who else was present, so genesis
-authority rests on the elected founder alone, not on a headcount. This is
-what keeps the whole log verifiable by anyone who later pulls it.
+Genesis accepts **exactly one signer**. The sole signer is the elected founder;
+an empty signer set is unauthorised, while a multi-signer close is refused
+rather than silently treating the first signer as more authoritative than the
+rest. A converging peer can therefore reconstruct the same unique founder from
+the signed log without consulting an external headcount.
 
 Each transition appends to `network_state.json`'s transition log:
 
@@ -282,8 +280,8 @@ signed by the right authorities at each step.
 Because founding needs no co-signers, a close never stalls. The founder
 publishes `network_state_propose { transition: { to: "closed" } }`,
 self-signs, and it ratifies **at once** on the founder and converges to
-every other peer via gossip — each adopts the genesis (electing
-`signers.first()`) without being asked to co-sign. A closed network's
+every other peer via gossip — each adopts the genesis by electing its sole
+signer without being asked to co-sign. A closed network's
 identity is its
 `network_id` (at the app layer, derived from a shared key) plus the
 members on its signed roster — never its display label. Two unrelated
@@ -416,9 +414,9 @@ That's not a fork; that's just a bad frame.
 
 ## Wire protocol
 
-Net-new message kinds, all gated by the `network_state_v1` feature
-flag so old peers (and bare-MyOwnLLM peers on the pre-closed-network
-build) silently ignore them.
+Net-new message kinds. The frame set is closed: a receiver refuses any
+`kind` this build does not implement, so these messages are not optional
+and are not negotiated.
 
 | Kind | Direction | Purpose |
 |---|---|---|
@@ -448,10 +446,10 @@ The four foundational choices, settled:
    `signers.first()` signs `to: "closed"` and becomes owner; peers
    already present become plain members, and ownership spreads from
    there via peer-authority grants so the mesh never leans on the
-   founder being online. Genesis is multi-signer capable (a close may
-   be co-signed), but authority rests on the elected founder, not on a
-   consent headcount — so a close never stalls and needs no consent
-   round. *(Superseded design: founding once required
+   founder being online. Genesis requires exactly that founder's one
+   signature; multi-signer genesis is refused rather than assigning hidden
+   precedence to the first signer. No consent round is involved.
+   *(Superseded design: founding once required
    unanimous member consent with a would-be-owner-initiated
    **split** fallback after `STATE_PROPOSAL_TIMEOUT_S` when
    signatures stalled. That stall can't happen under single-signer
@@ -490,13 +488,12 @@ The four foundational choices, settled:
 
 ## Implementation map
 
-The legacy implementation uses these source touch points:
+The implementation uses these source touch points:
 
 - `crates/myownmesh-core/src/roster.rs` — add a `role` field to
-  `AuthorizedPeer` (default `Member` for backward-compat), the
-  Merkle-root helper, and tombstone handling.
+  `AuthorizedPeer`, the Merkle-root helper, and tombstone handling.
 - `crates/myownmesh-core/src/protocol/` — net-new message kinds
-  above, gated by `features::network_state_v1`.
+  above.
 - `crates/myownmesh-core/src/` (new) `network_state.rs` — the
   `NetworkState` struct, transition log, signature verification,
   and the `derive_split_network_id()` helper.

@@ -187,6 +187,8 @@ impl Lifecycle {
                 return RuntimeState::Stopped;
             }
             let notified = self.stopped.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.state() == RuntimeState::Stopped {
                 return RuntimeState::Stopped;
             }

@@ -56,7 +56,7 @@
 //! - [`protocol`] — wire format: `hello` / `auth_response` / `approve`
 //!   / `deny` / `ping` / `pong` / `shelve` / `unshelve` /
 //!   `capabilities_update` / generic RPC frames. See `docs/PROTOCOL.md`.
-//! - [`topology`] selectors — Ring (default), Star, FullMesh.
+//! - [`topology`] selectors — FullMesh (default), Ring, Star.
 //! - [`transport`] — webrtc-rs wrapper; one [`PeerSession`](transport::PeerSession)
 //!   per peer with an event mpsc the engine drains.
 //! - [`engine`] — connection engine: hello state machine, heartbeat,
@@ -93,9 +93,8 @@
 //! already-issued capability is prevented by connector-incarnation
 //! ownership — not by the fingerprints.
 //!
-//! This is a hard cutover. The legacy `SIGN_DOMAIN_TAG` handshake
-//! payload is neither produced nor accepted on the live path, and there
-//! is no feature-negotiated fallback: an older peer fails authentication
+//! This is a hard cutover. Endpoint authentication has one transcript and no
+//! feature-negotiated fallback: a mismatched profile fails authentication
 //! rather than negotiating down, so a downgrade is not attacker-selectable.
 //!
 //! A user-visible 6-char verification code lets a human
@@ -158,9 +157,14 @@ pub use network_state::{
 };
 pub use protocol::CapabilityAdvert;
 pub use resource::{
-    FiniteResourceProvider, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
-    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourcePressure,
-    ResourceProvider, ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
+    resource_mailbox, serialized_mailbox_item_claim, FiniteResourceProvider, LeasedMap,
+    LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
+    ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
+    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
+    ResourceMailboxItemError, ResourceMailboxPlanningError, ResourceMailboxReceiver,
+    ResourceMailboxSendError, ResourceMailboxSender, ResourcePressure, ResourceProvider,
+    ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
     ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
     RESOURCE_CLASS_COUNT,
 };
@@ -197,12 +201,6 @@ pub use transport::{
     WebRtcRealtimeProfile, WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };
 
-/// Domain-separation tag prefixed to every signed handshake payload.
-/// A signature obtained for one protocol step cannot be replayed in
-/// another (e.g. a different version of MyOwnMesh, or any other product
-/// that signs ed25519 challenges).
-pub const SIGN_DOMAIN_TAG: &str = "myownmesh-mesh-auth-v1:";
-
 /// App-id used to derive the Trystero room handle. Two MyOwnMesh peers
 /// with the same `network_id` and the same app-id meet in the same
 /// signaling room; peers with mismatching app-ids never see each
@@ -210,11 +208,7 @@ pub const SIGN_DOMAIN_TAG: &str = "myownmesh-mesh-auth-v1:";
 /// downstream forks can isolate their fleet.
 pub const TRYSTERO_APP_ID: &str = "myownmesh-cloud-mesh-v1";
 
-/// Wire-protocol version. Stays at 1 across additive changes — new
-/// optional fields, and new message kinds that senders gate on a
-/// capability the receiver advertises through [`protocol::features`].
-/// "Additive" is a statement about that gating and not about receiver
-/// tolerance: a receiver refuses a kind this build does not
-/// implement, which fails to deserialize and reaches no handler. Bump
-/// only when an existing message's wire shape changes incompatibly.
+/// Wire-protocol version for the one current alpha profile. A receiver refuses
+/// any kind this build does not implement; there is no feature-negotiated or
+/// mixed-version fallback. Bump when the closed profile's wire shape changes.
 pub const PROTOCOL_VERSION: u32 = 1;

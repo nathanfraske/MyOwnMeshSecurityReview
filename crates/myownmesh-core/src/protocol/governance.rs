@@ -24,9 +24,8 @@
 //!      this shape and can ship in a later release without changing
 //!      the message kind.
 //!
-//! All variants are gated by the `network_state_v1` feature flag;
-//! older peers won't advertise it and senders skip these kinds
-//! against them.
+//! These variants belong to the one current wire profile. The alpha has no
+//! optional governance-feature gate or mixed-version fallback.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,9 +53,6 @@ pub struct NetworkStateBroadcast {
     /// Sender's **member**-log length. The member tier is union-merged, not
     /// strict-prefix, so its length alone isn't a total order — but a receiver
     /// whose own member log is shorter knows it's missing entries and pulls.
-    /// `#[serde(default)]` so an older peer (which omits it, → 0) never makes us
-    /// think we're behind on a tier it doesn't track.
-    #[serde(default)]
     pub member_log_count: u32,
     /// Base32-lowercase Merkle root over the sender's current
     /// roster. Receivers compare to their own; equal roots = caught
@@ -186,17 +182,13 @@ pub struct RosterEntriesMessage {
     /// from genesis ([`crate::network_state::verify_log`]), rather than trusting
     /// a gossiped role tag. The receiver only adopts a log that extends its own,
     /// so a peer can't rewrite a genesis. Empty on an open network (no signed
-    /// log) and, via `#[serde(default)]`, absent from an older peer's reply —
-    /// which then behaves exactly as before (membership-only gossip).
-    #[serde(default)]
+    /// log).
     pub transitions: Vec<Transition>,
     /// The network's signed **member** log — per-member admit/remove entries,
     /// each authored by one owner/manager. Carried alongside the governance log
     /// so membership converges by **union-merge** ([`crate::network_state::merge_member_logs`]):
     /// two managers' concurrent (offline) admissions both survive, where the
-    /// strict-prefix governance log would fork. `#[serde(default)]`, so an older
-    /// peer that doesn't send it just contributes no member entries.
-    #[serde(default)]
+    /// strict-prefix governance log would fork.
     pub member_log: Vec<Transition>,
 }
 

@@ -178,6 +178,15 @@ pub struct RealtimeFlowHandle {
     /// The application's own coordinate, kept so operations can name the flow to
     /// the session that owns it. It proves nothing; the two identities above do.
     name: crate::transport::webrtc::RealtimeFlowName,
+    /// Where an abandoned flow goes to be closed.
+    ///
+    /// **Weak, and that is the whole of "holding one keeps no session alive".**
+    /// It funds nothing and keeps nothing open; if the engine has gone, so has
+    /// every flow it owned, and there is nothing left to close.
+    ///
+    /// `None` once [`Self::disarm`] has taken it, which is what makes an
+    /// explicit close the single closer on its own path.
+    closer: Option<std::sync::Weak<crate::engine::state::NetworkState>>,
 }
 
 impl RealtimeFlowHandle {
@@ -186,13 +195,35 @@ impl RealtimeFlowHandle {
         flow_set: crate::transport::webrtc::RealtimeFlowSetIdentity,
         flow: crate::transport::webrtc::RealtimeFlowIdentity,
         name: crate::transport::webrtc::RealtimeFlowName,
+        closer: std::sync::Weak<crate::engine::state::NetworkState>,
     ) -> Self {
         Self {
             owner,
             flow_set,
             flow,
             name,
+            closer: Some(closer),
         }
+    }
+
+    /// Give up the drop-close, for a caller that is closing this flow itself.
+    ///
+    /// Disarming rather than racing: an explicit close awaits the native
+    /// retirement so it can acknowledge truthfully, and a drop that also closed
+    /// behind it would be a second close of a record the first one removed.
+    pub(crate) fn disarm(&mut self) {
+        self.closer = None;
+    }
+
+    /// Whether dropping this handle would still close the flow.
+    ///
+    /// The observable half of the exactly-once property, on the same pattern as
+    /// `RealtimeInboundRetirement::submits_on_drop`: a control can tell "the
+    /// explicit close disarmed the drop" from "the drop ran and happened to find
+    /// nothing".
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn closes_on_drop(&self) -> bool {
+        self.closer.is_some()
     }
 
     /// The label this flow was opened under.
@@ -217,6 +248,45 @@ impl RealtimeFlowHandle {
 
     pub(crate) fn name(&self) -> &crate::transport::webrtc::RealtimeFlowName {
         &self.name
+    }
+}
+
+impl Drop for RealtimeFlowHandle {
+    /// A flow whose handle is gone is a flow nobody can operate on, so it is
+    /// closed here.
+    ///
+    /// The handle is the only thing that authorizes sending on this flow and it
+    /// is move-only, so losing it is not a state anyone recovers from — the
+    /// label cannot be re-resolved into the record, by design. Without this, an
+    /// abandoned handle left the flow, its label, its m-line and its bandwidth
+    /// held until the whole session ended, and the application had no way to ask
+    /// for them back.
+    ///
+    /// Caller `Drop` is the whole signal. Nothing here is timed, counted, or
+    /// polled, and nothing above has to remember to close.
+    ///
+    /// **Phase 1 only, and that is sufficient.** Removing the flow from its set
+    /// is synchronous; the native half comes back as `RealtimeFlowRemains`,
+    /// which retires what it holds when it is dropped in both directions. What
+    /// an explicit close still buys is the *acknowledgement* — it awaits the
+    /// retirement, so a caller can say the flow is down and be telling the
+    /// truth. A drop has nobody to tell.
+    ///
+    /// Every refusal is silent on purpose. A stale owner, a replaced session and
+    /// a reopened label all mean this flow is already gone, and there is no
+    /// caller left to report that to.
+    fn drop(&mut self) {
+        let Some(state) = self
+            .closer
+            .take()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            // Either an explicit close took it, or the engine that owned the
+            // flow is gone and took the flow with it.
+            return;
+        };
+        state.abandon_realtime_flow(self);
     }
 }
 

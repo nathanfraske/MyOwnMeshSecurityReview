@@ -65,6 +65,18 @@ pub enum Error {
         #[from] crate::runtime::attempt::MeshConnectorResourceScopeIssueError,
     ),
 
+    #[error("local application resource scope: {0}")]
+    LocalApplicationResourceScope(#[from] crate::resource::LocalApplicationResourceScopeIssueError),
+
+    #[error("resource mailbox: {0}")]
+    ResourceMailbox(#[from] crate::resource::ResourceMailboxCreateError),
+
+    #[error("resource mailbox admission: {0}")]
+    ResourceMailboxAdmission(#[from] crate::resource::ResourceMailboxAdmissionError),
+
+    #[error("application gateway: {0}")]
+    ApplicationGateway(#[from] crate::application_gateway::GatewayRefusal),
+
     #[error("network: {0}")]
     Network(String),
 

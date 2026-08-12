@@ -14,10 +14,14 @@
 //! The contract that follows:
 //!
 //! * **Submission acquires the current session first.** A caller whose peer has
-//!   no live session, or whose peer does not speak the acknowledged contract, or
-//!   whose frame the provider will not fund retaining, is refused with that
-//!   reason. A frame is retained under a session or not at all.
-//! * **A frame ends on acknowledgement or with its session.** Session end
+//!   no live session, or whose frame the provider will not fund retaining, is
+//!   refused with that reason. A frame is retained under a session or not at
+//!   all.
+//! * **A frame ends on acknowledgement, with its caller, or with its session.**
+//!   A caller that stops waiting takes its frame with it wherever dropping the
+//!   frame leaves the wire contiguous — the session record's own
+//!   `release_abandoned` decides where that is, because it is the only thing
+//!   that knows what the peer has already been shown. Session end
 //!   resolves the caller with the truth and the application decides whether the
 //!   payload still means anything — which it is in a position to know and this
 //!   layer is not.
@@ -31,9 +35,20 @@
 //! session be recognised and discarded rather than applied to the replacement's
 //! frames.
 //!
-//! Everything here runs on the engine driver task (via the command queue and the
-//! state-watch tick), so the record is mutated serially; the fence it is reached
-//! through orders it against replacement.
+//! **This module is not the record's only writer, and nothing here may assume
+//! it is.** Submission and flushing run on the engine driver task, through the
+//! command queue and the state-watch tick. Inbound frames do not: each peer's
+//! connector events are pumped by their own spawned task, which reaches
+//! [`super::handle_inbound_frame_from`] and from there this session's
+//! acknowledgement path. The two are concurrent.
+//!
+//! What orders them is the registry fence, per entry — and only per entry.
+//! [`flush_owner`] deliberately releases it for the write, so the record can be
+//! entered and mutated by the inbound task while a frame of this one's is on
+//! the wire. That interval is real and is the reason `sent` is not a safe proxy
+//! for "the peer has not seen this": it is set on a later acquisition than the
+//! write it describes. An earlier version of the retention sweep read it that
+//! way and could roll back a sequence the peer already held.
 
 use std::sync::Arc;
 
@@ -41,7 +56,7 @@ use tokio::sync::oneshot;
 use tracing::trace;
 
 use crate::error::Result;
-use crate::protocol::{features, MeshMessage};
+use crate::protocol::MeshMessage;
 use crate::runtime::peer_session;
 
 use super::peer_registry::PeerOwnerToken;
@@ -56,11 +71,11 @@ use super::traffic;
 /// directly, so there is no arm on which a caller is answered twice or not at
 /// all.
 ///
-/// The feature read is deliberately outside the fence and deliberately allowed
-/// to be one instant stale. It decides whether this peer speaks the
-/// acknowledged contract at all — a property of the peer's build, not of its
-/// admission — and nothing is written on the strength of it. Every fact that
-/// authorizes the retention is read inside the fence, at the moment of use.
+/// Nothing here asks whether the peer speaks the acknowledged contract. It is
+/// current-profile behaviour of every build that can promote a session, so there
+/// is no negotiated fact to read and no advertisement to be stale, wrong, or
+/// withheld. Every fact that authorizes the retention is read inside the fence,
+/// at the moment of use.
 pub(crate) async fn submit(
     state: &Arc<NetworkState>,
     peer: &str,
@@ -72,21 +87,6 @@ pub(crate) async fn submit(
         let _ = reply.send(Err(peer_session::no_session_error(peer)));
         return;
     };
-    let acked_contract = state
-        .peers
-        .get_if_current(&owner)
-        .map(|entry| {
-            let data = entry.state.read();
-            features::peer_supports(&data.features, features::Feature::RELIABLE_CHANNELS)
-        })
-        .unwrap_or(false);
-    if !acked_contract {
-        // Refused, not downgraded: local send success is an answer about this
-        // process's socket, and this caller asked about the peer's application
-        // layer.
-        let _ = reply.send(Err(peer_session::unsupported_error(peer)));
-        return;
-    }
     // Both the payload and the caller's wait are lent to the closure through
     // `Option`s rather than moved into it. A fence that refuses never runs the
     // closure, and a `oneshot::Sender` that is merely dropped resolves its

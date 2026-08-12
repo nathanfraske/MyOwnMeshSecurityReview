@@ -12,11 +12,21 @@
 //! so an owner using one can charge per entry or release per entry, but not
 //! both truthfully.
 
-pub(crate) mod map;
+mod mailbox;
+mod map;
 pub mod provider;
 pub(crate) mod queue;
 
-pub(crate) use map::LeasedMap;
+pub(crate) use mailbox::{
+    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
+};
+pub use mailbox::{
+    resource_mailbox, serialized_mailbox_item_claim, ResourceMailboxAdmissionError,
+    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
+    ResourceMailboxItemError, ResourceMailboxPlanningError, ResourceMailboxReceiver,
+    ResourceMailboxSendError, ResourceMailboxSender,
+};
+pub use map::{LeasedMap, LeasedMapInsertRefusal};
 pub(crate) use queue::LeasedQueue;
 
 pub use provider::{
@@ -314,6 +324,7 @@ pub fn process_resource_report() -> ResourceReport {
 #[derive(Clone)]
 pub struct ProcessResourceRoot {
     accountant: ResourceAccountant,
+    provider: Arc<OnceLock<ResourceProviderPort>>,
     connector_owner: Arc<OnceLock<crate::runtime::attempt::ConnectorResourceOwnerPort>>,
 }
 
@@ -324,7 +335,7 @@ impl std::fmt::Debug for ProcessResourceRoot {
             .field("accountant", &self.accountant)
             .field(
                 "resource_provider_installed",
-                &self.connector_owner.get().is_some(),
+                &self.provider.get().is_some(),
             )
             .finish()
     }
@@ -336,6 +347,7 @@ impl ProcessResourceRoot {
         PROCESS_RESOURCE_ROOT
             .get_or_init(|| Self {
                 accountant: ResourceAccountant::observation_only(),
+                provider: Arc::new(OnceLock::new()),
                 connector_owner: Arc::new(OnceLock::new()),
             })
             .clone()
@@ -353,14 +365,46 @@ impl ProcessResourceRoot {
         crate::runtime::attempt::ConnectorResourceOwnerPort,
         ResourceProviderConflict,
     > {
+        let installed_provider = self.install_local_application_provider(provider)?;
         let installed = self.connector_owner.get_or_init(|| {
-            crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider.clone())
+            crate::runtime::attempt::ConnectorResourceOwnerPort::new(installed_provider.clone())
         });
+        if installed.same_provider(&installed_provider) {
+            Ok(installed.clone())
+        } else {
+            Err(ResourceProviderConflict)
+        }
+    }
+
+    /// Install or reuse the one owner-selected provider without installing
+    /// connector authority. Infrastructure-only runtimes use this boundary.
+    pub fn install_local_application_provider(
+        &self,
+        provider: ResourceProviderPort,
+    ) -> Result<ResourceProviderPort, ResourceProviderConflict> {
+        let installed = self.provider.get_or_init(|| provider.clone());
         if installed.same_provider(&provider) {
             Ok(installed.clone())
         } else {
             Err(ResourceProviderConflict)
         }
+    }
+
+    /// Issue one local-application scope from the exact process provider.
+    /// This does not install connector authority and is available to an
+    /// infrastructure-only runtime whose owner supplied the provider directly.
+    pub fn issue_local_application_scope(
+        &self,
+    ) -> Result<LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError> {
+        let provider = self
+            .provider
+            .get()
+            .ok_or(LocalApplicationResourceScopeIssueError::ResourceProviderMissing)?
+            .clone();
+        let scope = provider
+            .create_scope(&provider.process_scope())
+            .map_err(LocalApplicationResourceScopeIssueError::ResourcesUnavailable)?;
+        Ok(LocalApplicationResourceScope { provider, scope })
     }
 
     /// Return the installed process connector owner, if the process owner has
@@ -403,8 +447,40 @@ impl ProcessResourceRoot {
     pub(crate) fn isolated() -> Self {
         Self {
             accountant: ResourceAccountant::observation_only(),
+            provider: Arc::new(OnceLock::new()),
             connector_owner: Arc::new(OnceLock::new()),
         }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LocalApplicationResourceScopeIssueError {
+    #[error("the process resource provider is not installed")]
+    ResourceProviderMissing,
+    #[error("the process resource provider refused the local application scope: {0:?}")]
+    ResourcesUnavailable(ResourceUnavailable),
+}
+
+/// Acquisition port for daemon and local-application state that is not owned
+/// by any connector or remote session.
+#[derive(Clone)]
+pub struct LocalApplicationResourceScope {
+    provider: ResourceProviderPort,
+    scope: ResourceScope,
+}
+
+impl LocalApplicationResourceScope {
+    pub fn child(&self) -> Result<Self, ResourceUnavailable> {
+        let scope = self.provider.create_scope(&self.scope)?;
+        Ok(Self {
+            provider: self.provider.clone(),
+            scope,
+        })
+    }
+
+    pub fn acquire(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
+        self.provider
+            .acquire(&self.scope, ResourceAuthorityClass::Admitted, claim)
     }
 }
 

@@ -67,6 +67,58 @@ const TEST_JSON_FRAME_BYTES: usize = 8 * 1024;
 #[cfg(test)]
 const TEST_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
 
+/// Event-subscribed IPC clients whose outbound mailboxes this binary's
+/// fixtures fund at once.
+///
+/// Peak *concurrent* across the whole test binary, not per test: the provider
+/// is a `OnceLock`, so its grant belongs to the binary, and the default harness
+/// runs tests on as many threads as the machine has cores. Several client
+/// fixtures per test, times those threads, is the figure this has to cover — a
+/// per-test number would be right for one test and wrong for the suite.
+#[cfg(test)]
+const TEST_IPC_CLIENT_MAILBOXES: u64 = 64;
+
+/// Outbound frames one fixture client may hold queued at once.
+///
+/// The mailbox is count-unbounded by design — nothing in the daemon names a
+/// frame count — so this is a *funding* decision here and not a ceiling
+/// anywhere. A fixture that queues more than this sees a truthful `Pressure`
+/// refusal, which is the correct failure for a test binary that under-funded
+/// itself, and not a dropped or truncated frame.
+#[cfg(test)]
+const TEST_IPC_FRAMES_IN_FLIGHT: u64 = 8;
+
+/// The largest outbound IPC frame this binary's fixtures fund the retention of.
+///
+/// Its own number rather than a share of [`TEST_JSON_FRAME_BYTES`]: that one
+/// bounds what the gateway allocates decoding an *inbound* frame, and this
+/// bounds what the daemon retains holding an *outbound* one until its client
+/// reads it. Same units, different holder, different lifetime.
+#[cfg(test)]
+const TEST_IPC_FRAME_BYTES: usize = 4 * 1024;
+
+/// Entries this binary's fixtures hold in each of the IPC registry's tables at
+/// once.
+///
+/// Every registry index node is separately funded now — a client record, a
+/// method claim, a channel subscriber, a pending inbound call, an open flow —
+/// so a fixture that registers clients and claims methods is making real
+/// admissions and can be refused. Peak *concurrent* across the whole binary, on
+/// the same reasoning as [`TEST_IPC_CLIENT_MAILBOXES`]: the provider is a
+/// `OnceLock`, so its grant belongs to the binary rather than to a test.
+#[cfg(test)]
+const TEST_IPC_REGISTRY_ENTRIES: u64 = 512;
+
+/// Inbound control frames this binary's fixtures buffer at once.
+///
+/// The control reader funds every byte it buffers, which is what lets the
+/// `MYOWNMESH_IPC_*` byte ceilings be optional: absence means the grant decides
+/// at measured size rather than that nothing decides. Priced at
+/// [`TEST_JSON_FRAME_BYTES`] a frame — the same bound the gateway's own input
+/// work is priced at, because it is the same frame.
+#[cfg(test)]
+const TEST_CONTROL_INBOUND_FRAMES: u64 = 16;
+
 /// One explicitly finite provider shared by daemon-library tests.
 ///
 /// These are fixture resources, not production defaults. The callback and
@@ -145,9 +197,60 @@ pub(crate) fn test_resource_provider() -> myownmesh_core::ResourceProviderPort {
                             .expect("daemon test JSON claim count is representable"),
                     )
                     .expect("daemon test JSON input grant is representable");
+            // Outbound IPC frame queues, priced from the mailbox's own API
+            // rather than from a formula restated here. Every term below comes
+            // out of the same functions that will charge against it —
+            // `root_claim`, `node_claim`, and the frame's own
+            // `retained_claim` — so this grant and the admission it has to
+            // satisfy cannot be derived from two different formulas. That is
+            // the failure mode the JSON term above already records.
+            let ipc_frame = crate::ipc::ServerOut::ChannelInbound {
+                network: String::new(),
+                from: String::new(),
+                channel: String::new(),
+                // Priced at the bound, not at a typical frame. Every term of
+                // `retained_claim` grows with the encoded length, so funding
+                // the largest frame this binary's fixtures may hold funds every
+                // smaller one — no fixture has to be audited against it.
+                payload: serde_json::Value::String("x".repeat(TEST_IPC_FRAME_BYTES)),
+            };
+            let ipc_entry =
+                myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::
+                    accepted_item_planning_charge(&ipc_frame)
+                    .expect("daemon test IPC mailbox entry charge is representable");
+            let ipc_mailboxes =
+                myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::root_claim()
+                    .expect("daemon test IPC mailbox root claim is representable")
+                    .checked_add(
+                        ipc_entry
+                            .checked_scale(TEST_IPC_FRAMES_IN_FLIGHT)
+                            .expect("daemon test IPC in-flight grant is representable"),
+                    )
+                    .and_then(|per_client| per_client.checked_scale(TEST_IPC_CLIENT_MAILBOXES))
+                    .expect("daemon test IPC mailbox grant is representable");
+            // The IPC registry's own admissions: client records, and one entry
+            // in each of its tables per [`TEST_IPC_REGISTRY_ENTRIES`]. Priced by
+            // the module that owns those node types, for the same reason the
+            // mailbox term above is priced by the mailbox.
+            let ipc_registry = crate::ipc::clients::registry_fixture_claim(
+                TEST_IPC_CLIENT_MAILBOXES,
+                TEST_IPC_REGISTRY_ENTRIES,
+            )
+            .expect("daemon test IPC registry grant is representable");
+            // Inbound control frames, buffered and funded as they are read.
+            let control_inbound = myownmesh_core::ResourceClaim::try_from_entries([(
+                myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                TEST_CONTROL_INBOUND_FRAMES
+                    .checked_mul(TEST_JSON_FRAME_BYTES as u64)
+                    .expect("daemon test control inbound grant is representable"),
+            )])
+            .expect("daemon test control inbound claim is representable");
             let claim = structural
                 .checked_add(workload)
                 .and_then(|claim| claim.checked_add(json_input_work))
+                .and_then(|claim| claim.checked_add(ipc_mailboxes))
+                .and_then(|claim| claim.checked_add(ipc_registry))
+                .and_then(|claim| claim.checked_add(control_inbound))
                 .expect("daemon test resource grant is representable");
             myownmesh_core::ResourceProviderPort::new(myownmesh_core::FiniteResourceProvider::new(
                 claim,
@@ -155,6 +258,26 @@ pub(crate) fn test_resource_provider() -> myownmesh_core::ResourceProviderPort {
             .expect("daemon test resource provider admits its process scope")
         })
         .clone()
+}
+
+/// One local-application acquisition scope over the same binary-wide grant.
+///
+/// Daemon-library tests that build an IPC writer mailbox need the acquisition
+/// port a live daemon gets from its `MeshHandle`, and a unit test has no mesh
+/// to ask. This reaches the same place the daemon does — the process resource
+/// root — rather than inventing a second provider beside
+/// [`test_resource_provider`]: two grants over one process is exactly the split
+/// `install_local_application_provider` exists to refuse.
+///
+/// Installation is idempotent by identity, so every caller in the binary shares
+/// one provider and each gets its own child scope off the process scope.
+#[cfg(test)]
+pub(crate) fn test_application_scope() -> myownmesh_core::LocalApplicationResourceScope {
+    let root = myownmesh_core::ProcessResourceRoot::global();
+    root.install_local_application_provider(test_resource_provider())
+        .expect("the daemon test binary installs exactly one provider identity");
+    root.issue_local_application_scope()
+        .expect("the installed daemon test provider issues a local application scope")
 }
 
 /// Exclusive use of the connector budget above, for the whole lifetime of one
@@ -200,33 +323,21 @@ pub(crate) async fn exclusive_connector_fixture() -> tokio::sync::MutexGuard<'st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myownmesh_core::ResourceClass;
 
-    /// The provider this binary actually hands out funds two simultaneous JSON
-    /// inputs per connector, and exactly two.
+    /// The aggregate provider this binary actually hands out admits two
+    /// simultaneous JSON inputs per connector.
     ///
-    /// Behavioural rather than arithmetic on purpose. Restating the formula and
-    /// asserting it equals itself would pass against a provider that dropped the
-    /// term, mis-scaled it, or merged it into the record residual — the three
-    /// ways this has actually gone wrong. So this acquires real leases from
-    /// [`test_resource_provider`] on its own process scope and holds every one of
-    /// them live to the end.
-    ///
-    /// The end-to-end bridge and silent-area round trips cannot stand in for it
-    /// either: real handshake frames are far under the stated fixture frame size,
-    /// so a grant of one claim per connector still carries them, and those tests
-    /// would pass against a provider that refuses the second frame on any larger
-    /// input.
-    ///
-    /// The refusal is asserted on `OpaqueDependencyResidual` specifically. That
-    /// is the dimension the JSON term is denominated in and the one the record
-    /// residual could never have covered; a refusal on any other dimension would
-    /// mean this control passed for a reason unrelated to the defect.
+    /// This is deliberately an aggregate-capacity control, not evidence that
+    /// the separately named JSON term is a partitioned allowance. IPC mailboxes,
+    /// control input and connector work share dimensions with JSON parsing, and
+    /// the finite provider is intentionally work-conserving across that whole
+    /// grant. The control therefore proves only the production-relevant fact it
+    /// can observe: all stated inputs can be admitted and held together.
     ///
     /// Takes the connector fixture guard because it spends from the one binary
     /// budget every connector-consuming fixture draws on.
     #[tokio::test]
-    async fn v4_f8_the_daemon_provider_funds_exactly_two_json_inputs_per_connector() {
+    async fn v4_f8_the_daemon_aggregate_admits_two_json_inputs_per_connector() {
         let _fixture = exclusive_connector_fixture().await;
         let provider = test_resource_provider();
         let scope = provider.process_scope();
@@ -253,26 +364,8 @@ mod tests {
             leases.push(lease);
         }
 
-        let refused = provider.acquire(
-            &scope,
-            myownmesh_core::ResourceAuthorityClass::Admitted,
-            one,
-        );
-        let Err(unavailable) = refused else {
-            panic!(
-                "the provider funded a {}th simultaneous JSON input, so the two-per-connector term \
-                 is not what bounds it",
-                funded + 1
-            )
-        };
-        assert_eq!(
-            unavailable.dimension(),
-            Some(ResourceClass::OpaqueDependencyResidual),
-            "the bound must be the JSON term's own dimension"
-        );
-
-        // Held to the end. Releasing any earlier would let the refusal above
-        // pass against capacity an earlier acquisition had already returned.
+        // Held to the end so the control proves simultaneous capacity rather
+        // than repeatedly reacquiring one returned slot.
         drop(leases);
     }
 }

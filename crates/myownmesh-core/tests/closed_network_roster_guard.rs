@@ -67,7 +67,7 @@ fn vouch(id: &str, label: &str) -> RosterEntriesMessage {
             granted_by: String::new(),
         }],
         // No governance log on this gossip — exercises the membership-only path
-        // (and the `#[serde(default)]` skew an older peer's reply would take).
+        // without relying on a missing-field compatibility default.
         transitions: Vec::new(),
         // No signed member log either — the closed-net guard must still refuse.
         member_log: Vec::new(),

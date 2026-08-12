@@ -204,14 +204,3 @@ pub(crate) fn no_session_error(peer: &str) -> Error {
         "no live promoted session to carry a reliable send to {peer}"
     ))
 }
-
-/// Why a reliable submission was refused for a peer that has a session.
-///
-/// The peer's build does not speak the acknowledged contract. Refused rather
-/// than downgraded: a local send succeeding is an answer about this process's
-/// socket, and this caller asked about the peer's application layer.
-pub(crate) fn unsupported_error(peer: &str) -> Error {
-    Error::Transport(format!(
-        "peer {peer} does not support acknowledged channel delivery"
-    ))
-}

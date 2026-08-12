@@ -38,6 +38,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
 
+use crate::resource::{ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender};
 use crate::transport::LocalIceCandidate;
 
 use super::state::{NetworkState, SignalingInbound, SignalingOutbound};
@@ -67,7 +68,8 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
         let _ = out_tx.send(LocalOutbound::Announce {
             device_id: device_id_for_out.clone(),
         });
-        while let Some(outbound) = outbound_rx.recv().await {
+        while let Some(delivery) = outbound_rx.recv().await {
+            let (outbound, _mailbox_entry) = delivery.into_parts();
             let msg = match outbound {
                 SignalingOutbound::Announce => LocalOutbound::Announce {
                     device_id: device_id_for_out.clone(),
@@ -154,7 +156,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     },
                 },
             };
-            if inbound_tx.send(translated).is_err() {
+            if !deliver_inbound_lossy(&inbound_tx, translated) {
                 break;
             }
         }
@@ -190,12 +192,12 @@ const GATE_SEEN_CAPACITY: usize = 2048;
 /// duplicate, and applying it twice via `set_remote_description`
 /// wedges WebRTC permanently.
 struct InboundGate {
-    tx: mpsc::UnboundedSender<SignalingInbound>,
+    tx: ResourceMailboxSender<SignalingInbound>,
     seen: Mutex<VecDeque<u64>>,
 }
 
 impl InboundGate {
-    fn new(tx: mpsc::UnboundedSender<SignalingInbound>) -> Arc<Self> {
+    fn new(tx: ResourceMailboxSender<SignalingInbound>) -> Arc<Self> {
         Arc::new(Self {
             tx,
             seen: Mutex::new(VecDeque::with_capacity(GATE_SEEN_CAPACITY)),
@@ -205,18 +207,64 @@ impl InboundGate {
     /// Deliver to the engine unless it's a cross-driver duplicate.
     /// Returns `false` once the engine side is gone (pump exits).
     fn deliver(&self, msg: SignalingInbound) -> bool {
+        let kind = msg.kind_name();
         if let Some(key) = dedup_key(&msg) {
             let mut seen = self.seen.lock();
             if seen.contains(&key) {
                 trace!(kind = msg.kind_name(), "cross-driver duplicate dropped");
                 return true;
             }
-            if seen.len() >= GATE_SEEN_CAPACITY {
-                seen.pop_front();
-            }
-            seen.push_back(key);
+            return match self.tx.send(msg) {
+                Ok(()) => {
+                    if seen.len() >= GATE_SEEN_CAPACITY {
+                        seen.pop_front();
+                    }
+                    seen.push_back(key);
+                    true
+                }
+                Err(ResourceMailboxSendError::Closed(_)) => false,
+                Err(ResourceMailboxSendError::Pressure { error, .. }) => {
+                    warn!(
+                        kind,
+                        ?error,
+                        "inbound signaling dropped under declared resource pressure"
+                    );
+                    true
+                }
+                Err(ResourceMailboxSendError::Claim { error, .. }) => {
+                    warn!(kind, %error, "unrepresentable inbound signaling dropped");
+                    true
+                }
+            };
         }
-        self.tx.send(msg).is_ok()
+        deliver_inbound_lossy(&self.tx, msg)
+    }
+}
+
+/// Signaling ingress is explicitly lossy under local resource pressure. A
+/// closed mailbox stops its pump; a measured-but-unfunded or unrepresentable
+/// value is dropped and the driver continues so a later bounded event can
+/// recover the connection.
+fn deliver_inbound_lossy(
+    tx: &ResourceMailboxSender<SignalingInbound>,
+    msg: SignalingInbound,
+) -> bool {
+    let kind = msg.kind_name();
+    match tx.send(msg) {
+        Ok(()) => true,
+        Err(ResourceMailboxSendError::Closed(_)) => false,
+        Err(ResourceMailboxSendError::Pressure { error, .. }) => {
+            warn!(
+                kind,
+                ?error,
+                "inbound signaling dropped under declared resource pressure"
+            );
+            true
+        }
+        Err(ResourceMailboxSendError::Claim { error, .. }) => {
+            warn!(kind, %error, "unrepresentable inbound signaling dropped");
+            true
+        }
     }
 }
 
@@ -300,7 +348,7 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
 /// from the one engine receiver.
 fn attach_nostr_with(
     state: &Arc<NetworkState>,
-    mut outbound_rx: mpsc::UnboundedReceiver<SignalingOutbound>,
+    mut outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     gate: Arc<InboundGate>,
 ) -> NostrDriverHandle {
     let cfg = state.config.read();
@@ -345,7 +393,8 @@ fn attach_nostr_with(
         // would just publish a duplicate event (different timestamp
         // → distinct sha256 id, so receiver-side dedup wouldn't
         // collapse it) — wasted relay bandwidth for no benefit.
-        while let Some(outbound) = outbound_rx.recv().await {
+        while let Some(delivery) = outbound_rx.recv().await {
+            let (outbound, _mailbox_entry) = delivery.into_parts();
             let translated = match outbound {
                 SignalingOutbound::Announce => NostrOutbound::Announce,
                 SignalingOutbound::Leave => NostrOutbound::Leave,
@@ -439,7 +488,7 @@ pub fn attach_mdns(state: &Arc<NetworkState>) -> Option<MdnsDriverHandle> {
 /// a warning names the network.
 fn attach_mdns_with(
     state: &Arc<NetworkState>,
-    mut outbound_rx: mpsc::UnboundedReceiver<SignalingOutbound>,
+    mut outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     gate: Arc<InboundGate>,
 ) -> Option<MdnsDriverHandle> {
     let mdns_cfg = MdnsDriverConfig {
@@ -475,7 +524,8 @@ fn attach_mdns_with(
     // driver's registration doubles as the announce, so Announce is
     // a cheap idempotent nudge.
     tokio::spawn(async move {
-        while let Some(outbound) = outbound_rx.recv().await {
+        while let Some(delivery) = outbound_rx.recv().await {
+            let (outbound, _mailbox_entry) = delivery.into_parts();
             let translated = match outbound {
                 SignalingOutbound::Announce => MdnsOutbound::Announce,
                 SignalingOutbound::Leave => MdnsOutbound::Leave,
@@ -586,7 +636,7 @@ impl Drop for SignalingDrivers {
 /// config in a multicast-less environment) still drains the engine's
 /// outbound queue so it can't grow unboundedly — the network is
 /// simply unreachable, and warnings say so.
-pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
+pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<SignalingDrivers>> {
     let (strategy, mdns_on) = {
         let cfg = state.config.read();
         (cfg.signaling.strategy.clone(), cfg.signaling.mdns)
@@ -605,13 +655,17 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
         }
     };
 
-    let outbound_rx = state.take_signaling_outbound_rx()?;
+    let Some(outbound_rx) = state.take_signaling_outbound_rx() else {
+        return Ok(None);
+    };
     let gate = InboundGate::new(state.signaling_inbound_tx.clone());
 
     let drivers = match (want_nostr, mdns_on) {
         (true, true) => {
-            let (nostr_tx, nostr_rx) = mpsc::unbounded_channel::<SignalingOutbound>();
-            let (mdns_tx, mdns_rx) = mpsc::unbounded_channel::<SignalingOutbound>();
+            let (nostr_tx, nostr_rx) =
+                crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
+            let (mdns_tx, mdns_rx) =
+                crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let fanout = spawn_fanout(state.clone(), outbound_rx, vec![nostr_tx, mdns_tx]);
             let nostr = attach_nostr_with(state, nostr_rx, gate.clone());
             let mdns = attach_mdns_with(state, mdns_rx, gate);
@@ -656,7 +710,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
             }
         }
     };
-    Some(drivers)
+    Ok(Some(drivers))
 }
 
 /// Clone every engine emission to each driver's queue. A closed
@@ -667,8 +721,8 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
 /// event, not per driver copy.
 fn spawn_fanout(
     state: Arc<NetworkState>,
-    mut outbound_rx: mpsc::UnboundedReceiver<SignalingOutbound>,
-    driver_txs: Vec<mpsc::UnboundedSender<SignalingOutbound>>,
+    mut outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
+    driver_txs: Vec<ResourceMailboxSender<SignalingOutbound>>,
 ) -> tokio::task::JoinHandle<()> {
     // While stood-down (signed-evicted), announces are suppressed — but
     // not forever silenced: one probe per this interval still goes out, so
@@ -679,7 +733,8 @@ fn spawn_fanout(
     const EVICTED_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
     let mut last_evicted_probe: Option<std::time::Instant> = None;
     tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
+        while let Some(delivery) = outbound_rx.recv().await {
+            let (msg, _mailbox_entry) = delivery.into_parts();
             // A stood-down engine stops advertising itself: an announce is
             // an invitation to dial us, and every member would answer it
             // with a denial. Directed signaling (offers/answers already in
@@ -700,7 +755,26 @@ fn spawn_fanout(
                 .traffic
                 .record_signaling_tx(matches!(msg, SignalingOutbound::Announce));
             for tx in &driver_txs {
-                let _ = tx.send(msg.clone());
+                let kind = match &msg {
+                    SignalingOutbound::Announce => "announce",
+                    SignalingOutbound::Leave => "leave",
+                    SignalingOutbound::Offer { .. } => "offer",
+                    SignalingOutbound::Answer { .. } => "answer",
+                    SignalingOutbound::Candidate { .. } => "candidate",
+                };
+                match tx.send(msg.clone()) {
+                    Ok(()) | Err(ResourceMailboxSendError::Closed(_)) => {}
+                    Err(ResourceMailboxSendError::Pressure { error, .. }) => {
+                        warn!(
+                            kind,
+                            ?error,
+                            "signaling driver copy dropped under declared resource pressure"
+                        );
+                    }
+                    Err(ResourceMailboxSendError::Claim { error, .. }) => {
+                        warn!(kind, %error, "unrepresentable signaling driver copy dropped");
+                    }
+                }
             }
         }
         trace!("signaling fan-out exiting");
@@ -711,8 +785,26 @@ fn spawn_fanout(
 mod tests {
     use super::*;
 
-    fn gate_with_rx() -> (Arc<InboundGate>, mpsc::UnboundedReceiver<SignalingInbound>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn gate_with_rx() -> (
+        Arc<InboundGate>,
+        crate::resource::ResourceMailboxReceiver<SignalingInbound>,
+    ) {
+        let grant = crate::resource::ResourceClaim::try_from_entries(
+            crate::resource::ResourceClass::ALL.map(|dimension| (dimension, 1_000_000)),
+        )
+        .expect("test grant is representable");
+        let provider = crate::resource::ResourceProviderPort::new(
+            crate::resource::FiniteResourceProvider::new(grant),
+        )
+        .expect("test grant funds process bookkeeping");
+        let root = crate::resource::ProcessResourceRoot::isolated();
+        root.install_local_application_provider(provider)
+            .expect("isolated root accepts its provider");
+        let (tx, rx) = crate::resource::resource_mailbox(
+            root.issue_local_application_scope()
+                .expect("test local-application scope"),
+        )
+        .expect("test mailbox");
         (InboundGate::new(tx), rx)
     }
 
@@ -731,8 +823,8 @@ mod tests {
         let (gate, mut rx) = gate_with_rx();
         assert!(gate.deliver(offer("peer-a", "sdp-1")));
         assert!(gate.deliver(offer("peer-a", "sdp-1"))); // via the other driver
-        assert!(rx.try_recv().is_ok(), "first delivery lands");
-        assert!(rx.try_recv().is_err(), "duplicate swallowed");
+        assert!(rx.try_recv().is_some(), "first delivery lands");
+        assert!(rx.try_recv().is_none(), "duplicate swallowed");
     }
 
     /// Distinct negotiations (different SDP — every ICE restart or
@@ -782,18 +874,20 @@ mod tests {
         assert!(gate.deliver(cand(Some("0"))));
         assert!(gate.deliver(cand(Some("0")))); // exact duplicate — dropped
         assert!(gate.deliver(cand(Some("1")))); // differing mid — passes
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err());
+        assert!(rx.try_recv().is_some());
+        assert!(rx.try_recv().is_some());
+        assert!(rx.try_recv().is_none());
     }
 
     /// The seen-ring is bounded; ancient entries roll off and may
     /// legitimately re-deliver.
     #[test]
     fn gate_ring_is_bounded() {
-        let (gate, _rx) = gate_with_rx();
+        let (gate, mut rx) = gate_with_rx();
         for i in 0..(GATE_SEEN_CAPACITY + 10) {
-            gate.deliver(offer("peer-a", &format!("sdp-{i}")));
+            assert!(gate.deliver(offer("peer-a", &format!("sdp-{i}"))));
+            rx.try_recv()
+                .expect("each distinct offer reaches the engine mailbox");
         }
         assert_eq!(gate.seen.lock().len(), GATE_SEEN_CAPACITY);
     }

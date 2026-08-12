@@ -5,23 +5,36 @@
 //! shape.
 //!
 //! Backward compat: `Event` / `Lagged` were the only `kind`s
-//! the original event stream emitted, and the existing
-//! MyOwnMesh GUI client already ignores unknown kinds via its
-//! `match _ => {}` default in
-//! `gui/src-tauri/src/main.rs::run_event_pump`. New variants
-//! land additively without breaking it.
+//! the original event stream emitted, and new variants land
+//! additively without breaking the existing MyOwnMesh GUI
+//! client. That tolerance is real, but it is not where this
+//! comment used to say it was — there is no `kind` match in
+//! `gui/src-tauri/src/main.rs::run_event_pump` to have a
+//! default arm. That pump never inspects a frame at all: it
+//! relays each line to the frontend verbatim as a
+//! `mesh://event`. The dispatch lives one layer further out,
+//! in `gui/src/mesh-client.svelte.ts`, which branches on the
+//! `kind` it recognises and renders anything else generically.
+//! A client that must act on a new variant still has to learn
+//! it; what is guaranteed is that not knowing one is not an
+//! error.
 
 use serde::Serialize;
 use serde_json::Value;
 
 use myownmesh_core::events::MeshEvent;
+use myownmesh_core::{ResourceClaim, ResourceMailboxItemError};
 
 /// Server → client wire frame on a duplex event socket.
 ///
-/// Pre-`EventsSubscribe`, the daemon emits the legacy
-/// [`crate::control::Response`] shape (no `kind` tag) so the
-/// existing one-shot request/response clients keep working.
-/// After `EventsSubscribe`, every server-initiated line is a
+/// Pre-`EventsSubscribe`, the daemon emits the untagged
+/// [`crate::control::Response`] shape so the one-shot
+/// request/response clients keep working. Untagged rather than
+/// legacy: it carries no `kind` because it does not need one —
+/// a response is the answer to the request on the same
+/// connection, and there is nothing to discriminate. After
+/// `EventsSubscribe` the connection stops being
+/// request/response, so every server-initiated line is a tagged
 /// `ServerOut` JSON object.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -83,4 +96,24 @@ pub enum ServerOut {
         /// daemon does not surface socket addresses.
         by: String,
     },
+}
+
+/// Off-node retention owned by one queued outbound frame.
+///
+/// Every variant is pure serializable data — no oneshot, sender, or socket
+/// handle rides in one — so one measurement over the whole frame is exact where
+/// a per-variant match would only restate it, and core's shared costing for a
+/// serializable value answers it completely. That is not true of every mailbox
+/// item: `NetworkCmd` carries reply handles serialization cannot see, which is
+/// why its implementation enumerates variants and adds a `SocketOrHandle` term.
+/// There is nothing here for such a term to count.
+///
+/// Delegated rather than derived. This used to restate core's JSON-tree
+/// costing, which meant one question — what does a JSON-shaped value retain —
+/// had two answers in two crates that could drift apart independently. There is
+/// one answer now, and it lives with the trait it serves.
+impl myownmesh_core::ResourceMailboxItem for ServerOut {
+    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+        myownmesh_core::serialized_mailbox_item_claim(self)
+    }
 }

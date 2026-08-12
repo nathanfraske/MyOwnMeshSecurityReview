@@ -34,16 +34,15 @@
 //!     it against the transcript it already built. A one-directional
 //!     proof is not accepted as mutual.
 //!   - On success: install the `AuthenticatedChannelCapability` on the
-//!     peer *before* any legacy admission state, emit `PeerAuthenticated`,
+//!     peer before any diagnostic admission state, emit `PeerAuthenticated`,
 //!     decide approval (roster auto-approve or wait for user), send
 //!     `approve` when cleared.
 //!   - Duplicates are idempotent for a channel this exact current task
 //!     already promoted; anything else fails closed.
 //!
-//! The legacy `SIGN_DOMAIN_TAG` payload is no longer produced or accepted
-//! on this path — only the frame envelope is retained, so an old peer
-//! fails to verify rather than selecting a weaker format. The fingerprint
-//! pair is not a session-unique exporter; see `endpoint_auth/BOUNDARY.md`.
+//! No alternate signature payload is produced or accepted on this path. The
+//! fingerprint pair is not a session-unique exporter; see
+//! `endpoint_auth/BOUNDARY.md`.
 //!
 //! On inbound approve:
 //!   - If we've also sent ours, transition to `Active` and emit
@@ -273,8 +272,8 @@ pub(super) async fn on_hello_with_retention(
     // sends can be verified and nothing we send it can be verified either.
     // Refusing here means no contribution is bound, no transcript is built and
     // no signature is computed for an unauthenticatable peer. There is no
-    // fallback: an older peer fails closed rather than being offered anything
-    // weaker, which is the whole point of advertising the profile at all.
+    // fallback: a mismatched profile fails closed rather than being offered
+    // anything weaker, which is the whole point of advertising the profile.
     if let Err(error) = crate::endpoint_auth::negotiate_profile(&hello.features) {
         state.log_diag_with(
             crate::events::DiagLevel::Error,
@@ -309,10 +308,9 @@ pub(super) async fn on_hello_with_retention(
     // Hand the typed contribution to the exact current task *before* recording
     // anything from this frame. The channel binding, the transcript, the role
     // ordering, the profile, and the signature all belong to the task — this
-    // path translates wire values and nothing else. The legacy
-    // `SIGN_DOMAIN_TAG` payload is deliberately never sent: domain separation
-    // means a peer that still speaks the old format simply fails to verify,
-    // rather than being offered a weaker format it could select.
+    // path translates wire values and nothing else. Domain separation means
+    // any other signature payload fails to verify; there is no selectable
+    // weaker format.
     let Some(task) = state
         .peers
         .get_if_current(owner)
@@ -442,8 +440,8 @@ pub async fn on_auth_response(
     // length-prefixed mesh context, profile, signer role, both Device IDs,
     // both contributions and both certificate fingerprints, ordered by role
     // rather than by which side is local — so both endpoints derive identical
-    // bytes. Domain separation from the legacy `SIGN_DOMAIN_TAG` payload means
-    // an Arc 03 signature simply fails here; it is not an accepted fallback.
+    // bytes. Domain separation makes any signature over a different payload
+    // fail here; no alternate format is an accepted fallback.
     // Neither contribution is held in per-peer state. Both belong to the task,
     // which keeps its own draw and its bound peer value for its whole life,
     // including after promotion — so a retransmitted or delayed Hello still
@@ -1067,8 +1065,9 @@ mod tests {
             label: "unadvertised".to_string(),
             nonce: contribution.to_string(),
             verification_code: "zzz999".to_string(),
-            // An older peer: it speaks other features, just not this profile.
-            features: vec![crate::protocol::features::Feature::TYPED_CHANNELS.to_string()],
+            // An unrelated string is not a compatibility fallback for the one
+            // required profile.
+            features: vec!["unrelated_profile".to_string()],
         }
     }
 
@@ -1082,13 +1081,13 @@ mod tests {
         assert_eq!(
             crate::endpoint_auth::negotiate_profile(&[
                 Feature::ENDPOINT_AUTH_V1.to_string(),
-                Feature::TYPED_CHANNELS.to_string(),
+                "unrelated_profile".to_string(),
             ]),
             Ok(crate::endpoint_auth::EndpointAuthProfile::V1Ed25519Dtls),
             "a peer advertising the profile resolves to the one closed profile"
         );
         assert_eq!(
-            crate::endpoint_auth::negotiate_profile(&[Feature::TYPED_CHANNELS.to_string()]),
+            crate::endpoint_auth::negotiate_profile(&["unrelated_profile".to_string()]),
             Err(crate::endpoint_auth::EndpointAuthSetupError::IncompatibleProfile),
             "a peer that speaks other features but not this profile is refused"
         );
@@ -1618,33 +1617,18 @@ mod tests {
         state.shutdown().await;
     }
 
-    /// A Hello cannot carry application capability metadata, and a peer that
-    /// sends one anyway changes nothing.
+    /// A Hello cannot carry application capability metadata.
     ///
     /// This is the pre-promotion half of the capability boundary, and it is a
     /// wire claim rather than a type claim: deleting the field from
     /// `HelloMessage` stops *this* build from producing one, but says nothing
     /// about what a peer may put on the wire. A sender that still emits the old
-    /// frame — or an attacker that emits it deliberately — must be unable to
-    /// place application metadata into this node before a session owns it.
-    ///
-    /// Three things are asserted, and each fails differently:
-    ///
-    /// 1. the frame still parses, so the removal is a hard cutover of *meaning*
-    ///    and not an accidental denial of service against every older peer;
-    /// 2. the parsed value has nowhere to put it — there is no field on
-    ///    `HelloMessage` that a `capabilities` key can land in, which is what
-    ///    makes step 3 structural rather than a matter of the handler
-    ///    remembering to ignore it;
-    /// 3. re-encoding what was parsed does not carry the key forward, so the
-    ///    metadata cannot be relayed onward either.
-    ///
-    /// The complementary post-promotion half — that `CapabilitiesUpdate` is
-    /// refused before a live session — is enforced by the admission gate in
-    /// `engine::mod` and by the live-session lender `on_capabilities_update`
-    /// runs under; a peer without a promoted session reaches neither.
+    /// frame — or an attacker that emits it deliberately — must be refused
+    /// before it can place application metadata into this node. The retired
+    /// shape is not accepted and silently stripped, so a caller cannot mistake
+    /// a mixed-profile Hello for a current one.
     #[test]
-    fn a_hello_advertising_capabilities_is_parsed_without_them() {
+    fn a_hello_carrying_retired_application_metadata_is_refused() {
         use crate::protocol::features::Feature;
 
         let with_advert = serde_json::json!({
@@ -1654,24 +1638,12 @@ mod tests {
             "nonce": "noncexyz",
             "verification_code": "aaa111",
             "features": [Feature::ENDPOINT_AUTH_V1.to_string()],
-            // The retired fields, exactly as an older peer would send them.
+            // Retired pre-session application metadata.
             "capabilities": { "tags": ["transcribe"], "app_version": "9.9.9" },
             "max_connections": 8,
             "app_version": "9.9.9",
         });
 
-        let hello: HelloMessage =
-            serde_json::from_value(with_advert).expect("an older peer's hello still parses");
-        assert_eq!(hello.device_id, "peer");
-        assert_eq!(hello.features, vec![Feature::ENDPOINT_AUTH_V1.to_string()]);
-
-        let reencoded = serde_json::to_value(&hello).expect("hello re-encodes");
-        let object = reencoded.as_object().expect("hello is a JSON object");
-        for retired in ["capabilities", "max_connections", "app_version"] {
-            assert!(
-                !object.contains_key(retired),
-                "a retired hello field must not survive a parse: {reencoded}"
-            );
-        }
+        assert!(serde_json::from_value::<HelloMessage>(with_advert).is_err());
     }
 }

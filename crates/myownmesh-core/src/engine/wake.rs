@@ -188,7 +188,10 @@ mod tests {
             .expect("outbound signaling rx should be available");
         on_wake(&state).await;
         assert!(
-            matches!(rx.try_recv(), Ok(SignalingOutbound::Announce)),
+            matches!(
+                rx.try_recv().map(|delivery| delivery.into_parts().0),
+                Some(SignalingOutbound::Announce)
+            ),
             "on_wake must emit a fresh announce"
         );
     }

@@ -6,11 +6,9 @@
 //! deny is the user-facing trust gate that fires once mutual auth is
 //! verified.
 //!
-//! These structs are the wire envelope only. The bytes actually signed
-//! are the Arc 04 endpoint-auth transcript built by
-//! [`crate::endpoint_auth`]; the legacy
-//! [`crate::signing::handshake_payload`] helper is retained but is no
-//! longer produced or accepted on the live path.
+//! These structs are the wire envelope only. The bytes actually signed are the
+//! endpoint-auth transcript built by [`crate::endpoint_auth`]; there is no
+//! alternate handshake-signature payload in this hard-alpha profile.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,13 +36,11 @@ pub(crate) fn verification_code_has_protocol_shape(code: &str) -> bool {
 /// application-payload boundary — and an "absent means default" rule would
 /// additionally manufacture an advertisement no peer ever sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HelloMessage {
-    /// Wire-protocol version. A sender omits optional frame kinds the
-    /// receiver does not advertise; a receiver refuses any kind this
-    /// build does not implement, which fails to deserialize and
-    /// reaches no handler. The gating is the sender's half of that
-    /// rule, not a way around a receiver that tolerates the unknown —
-    /// none does.
+    /// Wire-protocol version. The frame set is closed: a receiver refuses any
+    /// kind this build does not implement, which fails to deserialize and
+    /// reaches no handler. This alpha has no optional-frame negotiation.
     pub protocol: u32,
     /// Bare-pubkey Device ID, base32-lowercase. Display suffix
     /// omitted on the wire — the receiver derives it themselves if
@@ -72,9 +68,8 @@ pub struct HelloMessage {
     /// Protocol-feature list — see [`super::features`]. Read before a session
     /// exists because that is what it is for: `endpoint_auth_v1` is how a peer
     /// states it speaks the one closed authentication profile, and its absence
-    /// is a fail-closed refusal. It gates which frame kinds the sender may
-    /// later emit; it advertises no application capability and names no
-    /// application semantics.
+    /// is a fail-closed refusal. It advertises no application capability and
+    /// names no application semantics.
     ///
     /// `#[serde(default)]` here is not an older-peer accommodation: an empty
     /// list is the honest reading of a peer that advertised nothing, and it
@@ -92,10 +87,9 @@ pub struct AuthResponseMessage {
     /// Base32-lowercase signature over the Arc 04 endpoint-auth
     /// transcript, under `ENDPOINT_AUTH_DOMAIN_TAG`.
     ///
-    /// This is a hard cutover, not a negotiation: a signature over the
-    /// legacy `SIGN_DOMAIN_TAG` payload is rejected by domain separation
-    /// rather than accepted as a fallback, so there is nothing for an
-    /// attacker to select down to. An older peer fails authentication.
+    /// This is a hard cutover, not a negotiation: a signature over any other
+    /// payload is rejected by domain separation rather than accepted as a
+    /// fallback. Anything outside the current profile fails authentication.
     pub signature: String,
 }
 
@@ -133,14 +127,12 @@ pub struct DenyMessage {
     #[serde(default)]
     pub reason: Option<String>,
     /// The network's signed governance log (proof for an eviction
-    /// denial). Empty on ordinary denies; absent from older peers'
-    /// frames via `#[serde(default)]`, which also means an older
-    /// receiver simply ignores the extra fields — it is denied
-    /// exactly as before, just without the ability to self-verify.
+    /// denial). Empty on ordinary denies, where the current wire shape omits
+    /// the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transitions: Vec<Transition>,
     /// The signed member-tier log (the half that actually carries a
-    /// member's `Evict`). Same compat story as `transitions`.
+    /// member's `Evict`). Empty on an ordinary denial.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_log: Vec<Transition>,
 }

@@ -7,7 +7,7 @@
 //!
 //! Companion to `two_peer_handshake.rs` which covers the open-
 //! network roster-approve flow; this one drives the
-//! `network_state_v1` engine half from
+//! current signed-governance engine path from
 //! [`docs/NETWORK-TYPES.md`](../../../docs/NETWORK-TYPES.md) end
 //! to end.
 
@@ -163,9 +163,9 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
     // open network is already populated when Alice founds. This is the exact
     // condition that used to strand a fleet: the old quorum demanded unanimous
     // consent from every rostered peer, so a lone founder could never close a
-    // populated open network. Founding now stands on the founder's own signature
-    // (the founder is `signers.first()`) regardless of who else is present — a
-    // co-signed genesis is fine too, but no co-signer is *required*.
+    // populated open network. Founding now stands on exactly the founder's one
+    // signature regardless of who else is present; a second genesis signer is
+    // refused instead of being treated as an unordered co-founder.
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
     // Sanity: both sides remain `Open` with no governance transitions logged;
@@ -243,9 +243,9 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
         bob_view.pending
     );
 
-    // Byte-identical genesis on both peers. A lone founder signs this one (a
-    // co-signed genesis is also valid — `verify_log` elects `signers.first()`
-    // either way); here we assert the single-signer shape the engine authors.
+    // Byte-identical genesis on both peers. Exactly the lone founder signs it;
+    // `verify_log` refuses a second genesis signer rather than choosing one by
+    // list position. Here we also pin the single-signer shape the engine authors.
     assert_eq!(
         alice_view.transitions[0].variant,
         bob_view.transitions[0].variant
@@ -1395,12 +1395,15 @@ async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
 
     // Backstop: a manual local SetTopology on a governed network is
     // ignored — one device can't fork itself off the owner's shape.
-    bob_state
-        .cmd_tx
-        .send(myownmesh_core::engine::NetworkCmd::SetTopology(
-            TopologyMode::FullMesh,
-        ))
-        .expect("send local set");
+    assert!(
+        bob_state
+            .cmd_tx
+            .send(myownmesh_core::engine::NetworkCmd::SetTopology(
+                TopologyMode::FullMesh,
+            ))
+            .is_ok(),
+        "send local set"
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         *bob_state.topology.read(),

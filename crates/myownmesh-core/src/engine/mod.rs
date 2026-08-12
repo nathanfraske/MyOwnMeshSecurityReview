@@ -61,7 +61,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -79,7 +78,9 @@ use crate::protocol::{
     topology::ShelveMessage,
     CapabilityAdvert, MeshMessage,
 };
-use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot};
+use crate::resource::{
+    LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
+};
 use crate::transport::{
     DataChannelOpenOwnership, RemoteCandidateDisposition, Role, Transport, TransportEvent,
     WebRtcConnectorEvent,
@@ -98,7 +99,8 @@ pub async fn spawn_network(
     transport: Transport,
 ) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
     let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-    spawn_network_in_mesh_scope(config, identity, transport, &mesh_scope).await
+    let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
+    spawn_network_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources).await
 }
 
 pub(crate) async fn spawn_network_in_mesh_scope(
@@ -106,9 +108,10 @@ pub(crate) async fn spawn_network_in_mesh_scope(
     identity: Arc<Identity>,
     transport: Transport,
     mesh_scope: &MeshRuntimeResourceScope,
+    local_resources: &LocalApplicationResourceScope,
 ) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
     let (state, signaling_inbound_rx, cmd_rx) =
-        NetworkState::new_in_mesh_scope(config, identity, transport, mesh_scope)?;
+        NetworkState::new_in_mesh_scope(config, identity, transport, mesh_scope, local_resources)?;
     let driver_state = state.clone();
     let handle = tokio::spawn(async move {
         run_driver(driver_state, signaling_inbound_rx, cmd_rx).await;
@@ -121,8 +124,8 @@ pub(crate) async fn spawn_network_in_mesh_scope(
 /// command events.
 pub async fn run_driver(
     state: Arc<NetworkState>,
-    mut signaling_inbound: mpsc::UnboundedReceiver<SignalingInbound>,
-    mut cmd_rx: mpsc::UnboundedReceiver<NetworkCmd>,
+    mut signaling_inbound: crate::resource::ResourceMailboxReceiver<SignalingInbound>,
+    mut cmd_rx: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
 ) {
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
     // Settle the signed-eviction verdict from the persisted governance
@@ -204,11 +207,14 @@ pub async fn run_driver(
     // relay/signaling feed dying.
     let stop_reason: &str = loop {
         tokio::select! {
+            _ = state.wait_for_shutdown() => {
+                break "shutdown requested";
+            }
+
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break "command channel closed" };
-                if !handle_command(&state, cmd).await {
-                    break "shutdown command";
-                }
+                let (cmd, _entry_resources) = cmd.into_parts();
+                handle_command(&state, cmd).await;
             }
 
             sig = signaling_inbound.recv() => {
@@ -216,6 +222,7 @@ pub async fn run_driver(
                     warn!(network = %state.network_id, "signaling channel closed");
                     break "signaling channel closed";
                 };
+                let (sig, _entry_resources) = sig.into_parts();
                 handle_signaling_inbound(&state, sig).await;
             }
 
@@ -254,9 +261,8 @@ pub async fn run_driver(
     state.shutdown().await;
 }
 
-async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
+async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
     match cmd {
-        NetworkCmd::Shutdown => return false,
         NetworkCmd::SetTopology(mode) => {
             // Backstop for the control-path check: once a ratified
             // TopologyChange owns the shape, a local set must not
@@ -381,7 +387,6 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             let _ = reply.send(governance::snapshot(state));
         }
     }
-    true
 }
 
 /// The role a peer's **live connection** was opened with, read from that
@@ -2658,14 +2663,20 @@ async fn handle_inbound_frame_from(
     // escape here was an `Option<bool>`, after which every arm below
     // re-resolved the peer by device id and a replacement answered.
     //
-    // The reliable *outbox* is the one effect that cannot wait for the
-    // dispatch: it is keyed by device id and shared across installations, so an
-    // ack applied after replacement would drain entries the next installation
-    // owns. It is drained inside the fence, atomically with the admission that
-    // authorized it; only the caller waits it owes travel out. The receive-side
-    // high-water mark is *not* settled here — it moves together with the
-    // delivery, under the dispatch's own fence, in `on_channel_seq_admitted`.
-    let admitted = state
+    // Three phases, and the middle one is the point: **admit and fund** under
+    // the fence, **decode** under nothing, **commit** under the same session
+    // that funded it. The registry has one mutation lock and it orders every
+    // peer's promotion, replacement and dispatch, so any work held under it is
+    // held against the whole mesh. A JSON parse is work whose duration the
+    // sender chooses — admission is what makes the payload adversary-chosen in
+    // the first place — so it is the one step that must not run there.
+    //
+    // What escapes the first fence is a funded, *undecoded* frame and a
+    // read-only witness. Neither can send, retain further, or be turned back
+    // into a session; the frame's own lease is what keeps the parse it pays for
+    // honest, and the witness is what stops a replacement inheriting the
+    // result.
+    let funded = state
         .peers
         .with_admitted_current_or_refused(
             owner,
@@ -2673,17 +2684,23 @@ async fn handle_inbound_frame_from(
             &state.network_id,
             |admitted| {
                 admitted.record_inbound(commit);
-                let decoded = admitted
+                // Admitted and *funded* here, decoded below. `admit` measures
+                // the encoded length and reserves against it; it does not look
+                // at the bytes. That is the whole reason the split is possible:
+                // the expensive half of this work is the parse, and the parse is
+                // not needed to decide whether the parse may happen.
+                let frame = admitted
                     .with_session_state(|session, _record| {
                         crate::application_gateway::AdmittedApplicationFrame::admit(
                             session,
                             bytes.clone(),
                         )
-                        .and_then(|frame| frame.decode())
                     })
                     .and_then(std::result::Result::ok)?;
-                reliable::admit_inbound_reliable(admitted, decoded.message());
-                Some(admitted.inbound_application_operation(decoded))
+                // Taken while the session is proved current, because that is the
+                // only moment it is worth taking. It authorizes nothing on its
+                // own; it is how the commit below refuses a replacement.
+                Some((frame, admitted.session_witness()?))
             },
             |peer| {
                 // Counted under the same acquisition that refused it, so the
@@ -2710,7 +2727,41 @@ async fn handle_inbound_frame_from(
         // answer that could be told apart out here would be exactly the
         // transient boolean this replaces.
         .flatten();
+    let Some((frame, witness)) = funded else {
+        return;
+    };
+
+    // **Outside every lock.** This is the peer's payload deciding how long the
+    // work takes, so it runs where a slow one costs this peer's frame and
+    // nothing else. Under the fence above it would have held the registry's one
+    // mutation lock — which orders promotion, replacement and dispatch for
+    // *every* peer — for as long as an admitted sender cared to make a parse
+    // last.
+    let Ok(decoded) = frame.decode() else {
+        trace!(peer = %device_id, "discarding undecodable admitted application frame");
+        return;
+    };
+
+    // Committed under the exact session that funded the parse. A revocation or
+    // replacement that landed while the parse ran refuses here: the work was
+    // paid for by a session that no longer speaks for this peer, so it
+    // authorizes nothing and the lease releases with `decoded`.
+    //
+    // The reliable *outbox* drain stays inside this fence, unchanged and for the
+    // unchanged reason: it is keyed by device id and shared across
+    // installations, so an ack applied outside would drain entries the next
+    // installation owns. The receive-side high-water mark is still not settled
+    // here — it moves with the delivery, under the dispatch's own fence, in
+    // `on_channel_seq_admitted`.
+    let admitted = state.peers.with_same_session(owner, &witness, |admitted| {
+        reliable::admit_inbound_reliable(admitted, decoded.message());
+        admitted.inbound_application_operation(decoded)
+    });
     let Some(operation) = admitted else {
+        trace!(
+            peer = %device_id,
+            "discarding an admitted frame whose session was replaced while it decoded"
+        );
         return;
     };
     let (msg, application_claim, application_work, dispatch) = operation.into_dispatch();
@@ -2919,10 +2970,158 @@ async fn on_capabilities_update(
 }
 
 /// One RPC handler lifted out of the map, so the registry fence is never taken
-/// while a DashMap shard guard is held.
+/// while the handler-registry mutex is held.
 enum PreparedRpcHandler {
     Single(crate::rpc::RpcHandler),
     Stream(crate::rpc::RpcStreamHandler),
+}
+
+impl PreparedRpcHandler {
+    fn accepts(&self, streaming: bool) -> bool {
+        matches!(
+            (self, streaming),
+            (Self::Single(_), false) | (Self::Stream(_), true)
+        )
+    }
+}
+
+fn validate_rpc_handler_class(
+    handler: PreparedRpcHandler,
+    method: &str,
+    streaming: bool,
+) -> std::result::Result<PreparedRpcHandler, String> {
+    if handler.accepts(streaming) {
+        Ok(handler)
+    } else {
+        Err(format!(
+            "handler class for '{method}' does not match the requested response class"
+        ))
+    }
+}
+
+fn reserve_rpc_handler_task(
+    session: &crate::runtime::session_broker::SessionCapability,
+    claim: crate::resource::ResourceClaim,
+) -> std::result::Result<crate::resource::ResourceLease, crate::resource::ResourceUnavailable> {
+    session.reserve_retained(claim)
+}
+
+fn rpc_refusal_frame(request_id: String, streaming: bool, error: String) -> MeshMessage {
+    if streaming {
+        MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+            request_id,
+            error: Some(error),
+        })
+    } else {
+        MeshMessage::RpcResponse(RpcResponseMessage {
+            request_id,
+            ok: None,
+            error: Some(error),
+        })
+    }
+}
+
+async fn refuse_rpc_request(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    request_id: String,
+    streaming: bool,
+    error: String,
+) {
+    let frame = rpc_refusal_frame(request_id, streaming, error);
+    let _ = send_to_peer_owner(state, owner, &frame).await;
+}
+
+#[cfg(test)]
+mod inbound_rpc_refusal_controls {
+    use super::*;
+
+    #[test]
+    fn refusal_frame_uses_the_response_class_the_caller_requested() {
+        let MeshMessage::RpcResponse(single) =
+            rpc_refusal_frame("single".into(), false, "refused".into())
+        else {
+            panic!("a unary request is terminated by rpc_response");
+        };
+        assert_eq!(single.request_id, "single");
+        assert_eq!(single.error.as_deref(), Some("refused"));
+
+        let MeshMessage::RpcStreamEnd(stream) =
+            rpc_refusal_frame("stream".into(), true, "refused".into())
+        else {
+            panic!("a streaming request is terminated by rpc_stream_end");
+        };
+        assert_eq!(stream.request_id, "stream");
+        assert_eq!(stream.error.as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn handler_class_mismatch_is_rejected_before_user_code_can_run() {
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let single_invocations = Arc::clone(&invocations);
+        let single_handler: crate::rpc::RpcHandler = Arc::new(move |_| {
+            single_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err("the mismatch must not invoke this handler".into()) })
+        });
+        let stream_invocations = Arc::clone(&invocations);
+        let stream_handler: crate::rpc::RpcStreamHandler = Arc::new(move |_| {
+            stream_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err("the mismatch must not invoke this handler".into()) })
+        });
+
+        assert!(validate_rpc_handler_class(
+            PreparedRpcHandler::Single(Arc::clone(&single_handler)),
+            "single",
+            false,
+        )
+        .is_ok());
+        assert!(validate_rpc_handler_class(
+            PreparedRpcHandler::Stream(Arc::clone(&stream_handler)),
+            "stream",
+            true,
+        )
+        .is_ok());
+        let single = PreparedRpcHandler::Single(single_handler);
+        let stream = PreparedRpcHandler::Stream(stream_handler);
+        assert!(validate_rpc_handler_class(single, "single", true).is_err());
+        assert!(validate_rpc_handler_class(stream, "stream", false).is_err());
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "class validation never calls user code"
+        );
+    }
+
+    #[test]
+    fn handler_task_pressure_is_an_exact_production_admission_refusal() {
+        let session =
+            crate::runtime::session_broker::session_for_test(crate::runtime::runtime_for_test());
+        let small = crate::rpc::RpcCall {
+            from: "peer".into(),
+            request_id: "small".into(),
+            method: "work".into(),
+            payload: serde_json::json!("small"),
+            streaming: false,
+        };
+        let small_claim = crate::rpc::handler_task_claim(&small)
+            .expect("the small handler task is representable");
+        drop(
+            reserve_rpc_handler_task(&session, small_claim)
+                .expect("the fixture funds an ordinary handler task"),
+        );
+
+        let oversized = crate::rpc::RpcCall {
+            request_id: "oversized".into(),
+            payload: serde_json::Value::String("x".repeat(16 * 1024 * 1024)),
+            ..small
+        };
+        let oversized_claim = crate::rpc::handler_task_claim(&oversized)
+            .expect("the oversized handler task is representable but unfunded");
+        assert!(
+            reserve_rpc_handler_task(&session, oversized_claim).is_err(),
+            "the same session that funds ordinary work refuses the oversized task"
+        );
+    }
 }
 
 /// Move-only authority to run exactly one RPC handler on behalf of one exact
@@ -2964,16 +3163,13 @@ async fn on_rpc_request(
     let owner = dispatch.owner();
     let device_id = owner.device_id();
     let Some(rpc) = state.application_gateway.rpc() else {
-        // No RPC bound yet — send a transient error so the peer
-        // doesn't hang on the oneshot.
-        let _ = send_to_peer_owner(
+        // No RPC bound yet — send the exact terminal class the caller filed.
+        refuse_rpc_request(
             state,
             owner,
-            &MeshMessage::RpcResponse(RpcResponseMessage {
-                request_id: req.request_id,
-                ok: None,
-                error: Some("rpc not bound".into()),
-            }),
+            req.request_id,
+            req.streaming,
+            "rpc not bound".into(),
         )
         .await;
         return;
@@ -2985,19 +3181,38 @@ async fn on_rpc_request(
         payload: req.payload.clone(),
         streaming: req.streaming,
     };
-    let handler = rpc.handlers.get(&req.method);
-    let Some(handler) = handler else {
-        let _ = send_to_peer_owner(
+    // Clone only the callable out of the leased registry. Its entry keeps the
+    // registration funded, while this clone is the prepared application effect
+    // authorized below. The registry lock is gone before either the peer fence
+    // or user code is reached.
+    let prepared = {
+        let handlers = rpc.handlers.lock();
+        handlers.get(&req.method).map(|handler| match handler {
+            crate::rpc::HandlerEntry::Single { handler, .. } => {
+                PreparedRpcHandler::Single(handler.clone())
+            }
+            crate::rpc::HandlerEntry::Stream { handler, .. } => {
+                PreparedRpcHandler::Stream(handler.clone())
+            }
+        })
+    };
+    let Some(prepared) = prepared else {
+        refuse_rpc_request(
             state,
             owner,
-            &MeshMessage::RpcResponse(RpcResponseMessage {
-                request_id: req.request_id,
-                ok: None,
-                error: Some(format!("no handler for '{}'", req.method)),
-            }),
+            req.request_id,
+            req.streaming,
+            format!("no handler for '{}'", req.method),
         )
         .await;
         return;
+    };
+    let prepared = match validate_rpc_handler_class(prepared, &req.method, req.streaming) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            refuse_rpc_request(state, owner, req.request_id, req.streaming, error).await;
+            return;
+        }
     };
     // A user handler is an application effect, and the heaviest one here: it
     // runs embedder code and can do anything. Invoking it is therefore claimed
@@ -3013,28 +3228,32 @@ async fn on_rpc_request(
     //
     // The two replacement cases differ, and the difference is deliberate. A
     // replacement *before* the mint refuses the authority and the handler never
-    // runs — that is the request lost to a fast reconnect, covered by the
-    // caller's own timeout. A replacement *after* the mint does not cancel
-    // anything: the handler was already authorized and runs to completion. It
-    // stays harmless because its replies are owner-bound, so they fail closed
-    // against the superseded installation instead of being delivered to
-    // whoever holds the device id by then.
+    // runs; this node still attempts an owner-bound terminal, which reaches the
+    // caller only if the captured installation remains current. A replacement
+    // *after* the mint does not cancel anything: the handler was already
+    // authorized and runs to completion. It stays harmless because its replies
+    // are owner-bound, so they fail closed against the superseded installation
+    // instead of being delivered to whoever holds the device id by then.
     //
-    // The handler is cloned out of the RPC map and the map guard dropped before
-    // the fence, so the registry lock is never taken while holding a DashMap
-    // shard guard.
-    let prepared = match &*handler {
-        crate::rpc::HandlerEntry::Single(h) => PreparedRpcHandler::Single(h.clone()),
-        crate::rpc::HandlerEntry::Stream(h) => PreparedRpcHandler::Stream(h.clone()),
-    };
-    drop(handler);
+    // The handler was cloned out of the leased map above, so the registry lock
+    // is never taken while holding the handler-registry lock.
     let task_claim = match crate::rpc::handler_task_claim(&call) {
         Ok(claim) => claim,
-        Err(_) => return,
+        Err(error) => {
+            refuse_rpc_request(
+                state,
+                owner,
+                req.request_id,
+                req.streaming,
+                format!("RPC handler task is not representable: {error}"),
+            )
+            .await;
+            return;
+        }
     };
     let Some(admitted) = dispatch
         .with_captured_session_state(&state.peers, move |session, _app| {
-            let task_lease = session.reserve_retained(task_claim).ok()?;
+            let task_lease = reserve_rpc_handler_task(session, task_claim).ok()?;
             Some(AdmittedRpcCall {
                 handler: prepared,
                 call,
@@ -3044,6 +3263,14 @@ async fn on_rpc_request(
         })
         .flatten()
     else {
+        refuse_rpc_request(
+            state,
+            owner,
+            req.request_id,
+            req.streaming,
+            "RPC handler task was refused by the current session".into(),
+        )
+        .await;
         return;
     };
     // Lock released. Consume the authority exactly once.
@@ -3096,7 +3323,8 @@ async fn on_rpc_request(
                     }
                 };
                 let mut seq = 0u64;
-                while let Some(item) = rx.recv().await {
+                while let Some(delivery) = rx.recv().await {
+                    let (item, _retention) = delivery.into_parts();
                     let payload = match item {
                         crate::rpc::RpcStreamItem::Chunk(payload) => payload,
                         crate::rpc::RpcStreamItem::End(result) => {
@@ -3165,8 +3393,8 @@ async fn on_rpc_request(
 /// handler run; a replacement here must be allowed, because the
 /// local caller is still waiting for exactly this answer.
 ///
-/// Each arm holds no DashMap guard across its send: the bound
-/// operation decides and extracts under the shard lock, hands the
+/// Each arm holds no pending-map guard across its send: the bound
+/// operation decides and extracts under the session-state fence, hands the
 /// sender back, and the send happens here with no guard live.
 async fn on_rpc_response(
     state: &Arc<NetworkState>,
@@ -3219,14 +3447,23 @@ async fn on_rpc_stream_chunk(
             }
             return false;
         };
-        if stream.push(session, chunk.payload) {
-            true
-        } else {
-            if let Some(stream) = app.rpc_mut().take_stream_end(&chunk.request_id) {
-                stream.finish(Some("RPC stream refused by resource owner".to_string()));
+        // Settled with the reason the admission actually gave. A single
+        // sentence for both arms used to say "refused by resource owner" for a
+        // chunk the resource owner never saw — the application was told its
+        // provider was short when what had happened was that a peer sent an
+        // item this side could not admit. The two want different responses from
+        // whoever reads them, so they are told apart here.
+        let refusal = match stream.push(session, chunk.payload) {
+            Ok(()) => return true,
+            Err(crate::application_gateway::GatewayRefusal::Malformed) => {
+                "RPC stream item could not be admitted".to_string()
             }
-            false
+            Err(e) => format!("RPC stream refused by resource owner: {e:?}"),
+        };
+        if let Some(stream) = app.rpc_mut().take_stream_end(&chunk.request_id) {
+            stream.finish(Some(refusal));
         }
+        false
     });
 }
 
@@ -3933,7 +4170,8 @@ fn remove_peer(
 /// their on-disk roster / state files don't collide.
 #[cfg(test)]
 pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
-    let (state, _cmd_rx) = build_test_state_parts(network_id_suffix);
+    let (state, cmd_rx) = build_test_state_parts(network_id_suffix);
+    state.park_command_receiver_for_test(cmd_rx);
     state
 }
 
@@ -3945,7 +4183,10 @@ const FIXTURE_CONNECTOR_SLOTS: usize = 2;
 #[cfg(test)]
 fn build_test_state_parts(
     network_id_suffix: &str,
-) -> (Arc<NetworkState>, mpsc::UnboundedReceiver<NetworkCmd>) {
+) -> (
+    Arc<NetworkState>,
+    crate::resource::ResourceMailboxReceiver<NetworkCmd>,
+) {
     build_test_state_parts_with(network_id_suffix, None, FIXTURE_CONNECTOR_SLOTS, None)
 }
 
@@ -3960,8 +4201,9 @@ pub(crate) fn build_test_state_with_connector_slots(
     network_id_suffix: &str,
     connector_slots: usize,
 ) -> Arc<NetworkState> {
-    let (state, _cmd_rx) =
+    let (state, cmd_rx) =
         build_test_state_parts_with(network_id_suffix, None, connector_slots, None);
+    state.park_command_receiver_for_test(cmd_rx);
     state
 }
 
@@ -3975,7 +4217,10 @@ fn build_test_state_parts_with(
     profile_override: Option<crate::WebRtcConnectorProfile>,
     connector_slots: usize,
     retained: Option<crate::resource::ResourceClaim>,
-) -> (Arc<NetworkState>, mpsc::UnboundedReceiver<NetworkCmd>) {
+) -> (
+    Arc<NetworkState>,
+    crate::resource::ResourceMailboxReceiver<NetworkCmd>,
+) {
     let (state, cmd_rx, _provider, _grant) = build_test_state_parts_metered(
         network_id_suffix,
         profile_override,
@@ -3993,7 +4238,7 @@ fn build_test_state_parts_metered(
     retained: Option<crate::resource::ResourceClaim>,
 ) -> (
     Arc<NetworkState>,
-    mpsc::UnboundedReceiver<NetworkCmd>,
+    crate::resource::ResourceMailboxReceiver<NetworkCmd>,
     crate::resource::FiniteResourceProvider,
     crate::resource::ResourceClaim,
 ) {
@@ -4146,11 +4391,128 @@ fn build_test_state_parts_metered(
                     .expect("engine fixture JSON claim count is representable"),
             )
             .expect("engine fixture JSON input capacity is representable");
+    // The engine owns one local-application scope below the process and one
+    // network-local child below it. Its three mailboxes each own another child
+    // scope plus an exact root reservation. Price those from the real types;
+    // otherwise they silently consume the connector callback envelope and make
+    // pressure controls depend on unrelated transport slack.
+    let local_application_scopes =
+        crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
+            .checked_scale(2)
+            .expect("engine fixture local-application scopes are representable");
+    let mailbox_roots = [
+        crate::resource::ResourceMailboxSender::<SignalingOutbound>::root_claim()
+            .expect("outbound signaling mailbox root is representable"),
+        crate::resource::ResourceMailboxSender::<NetworkCmd>::root_claim()
+            .expect("engine command mailbox root is representable"),
+        crate::resource::ResourceMailboxSender::<SignalingInbound>::root_claim()
+            .expect("inbound signaling mailbox root is representable"),
+    ]
+    .into_iter()
+    .try_fold(crate::resource::ResourceClaim::ZERO, |total, root| {
+        total.checked_add(
+            crate::resource::FiniteResourceProvider::child_scope_with_reservation_charge_for_test(
+                root,
+            )
+            .expect("engine fixture mailbox root charge is representable"),
+        )
+    })
+    .expect("engine fixture mailbox roots are representable together");
+    // Root capacity alone would let the mailboxes exist but force every queued
+    // item to consume unrelated connector slack. Name the fixture's actual
+    // in-flight work: one inbound and one outbound signaling frame per
+    // connector, one promotion announcement per connector, and one caller
+    // command. Each charge is derived from a concrete value through the same
+    // mailbox measurement and two-reservation path production uses.
+    const ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES: usize = 8 * 1024;
+    const ENGINE_FIXTURE_QUEUED_SIGNALING_PER_CONNECTOR: u64 = 1;
+    const ENGINE_FIXTURE_PROMOTION_COMMANDS_PER_CONNECTOR: u64 = 1;
+    const ENGINE_FIXTURE_QUEUED_CALLER_COMMANDS: u64 = 1;
+
+    let inbound_signaling = SignalingInbound::Offer {
+        device_id: "fixture-signaling-peer".into(),
+        sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
+    };
+    let inbound_signaling =
+        crate::resource::ResourceMailboxSender::<SignalingInbound>::accepted_item_charge_for_test(
+            &inbound_signaling,
+        )
+        .checked_scale(
+            connectors
+                .get()
+                .checked_mul(ENGINE_FIXTURE_QUEUED_SIGNALING_PER_CONNECTOR)
+                .expect("engine fixture inbound signaling count is representable"),
+        )
+        .expect("engine fixture inbound signaling capacity is representable");
+    let outbound_signaling = SignalingOutbound::Offer {
+        device_id: "fixture-signaling-peer".into(),
+        sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
+    };
+    let outbound_signaling =
+        crate::resource::ResourceMailboxSender::<SignalingOutbound>::accepted_item_charge_for_test(
+            &outbound_signaling,
+        )
+        .checked_scale(
+            connectors
+                .get()
+                .checked_mul(ENGINE_FIXTURE_QUEUED_SIGNALING_PER_CONNECTOR)
+                .expect("engine fixture outbound signaling count is representable"),
+        )
+        .expect("engine fixture outbound signaling capacity is representable");
+
+    // `GovernanceSnapshot` conservatively stands in for the smaller
+    // `ReplayCapabilities`: both retain the fixed command value, while the
+    // snapshot also owns a reply effect. The caller-shaped frame exercises the
+    // fixture's named JSON payload allowance.
+    let (promotion_reply, _promotion_reply_rx) = tokio::sync::oneshot::channel();
+    let promotion_command = NetworkCmd::GovernanceSnapshot {
+        reply: promotion_reply,
+    };
+    let promotion_commands =
+        crate::resource::ResourceMailboxSender::<NetworkCmd>::accepted_item_charge_for_test(
+            &promotion_command,
+        )
+        .checked_scale(
+            connectors
+                .get()
+                .checked_mul(ENGINE_FIXTURE_PROMOTION_COMMANDS_PER_CONNECTOR)
+                .expect("engine fixture promotion command count is representable"),
+        )
+        .expect("engine fixture promotion command capacity is representable");
+    let (caller_reply, _caller_reply_rx) = tokio::sync::oneshot::channel();
+    let caller_command = NetworkCmd::SendChannelFrame {
+        peer: "fixture-command-peer".into(),
+        channel: "fixture-command-channel".into(),
+        payload: serde_json::Value::String("p".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES)),
+        reply: caller_reply,
+    };
+    let caller_commands =
+        crate::resource::ResourceMailboxSender::<NetworkCmd>::accepted_item_charge_for_test(
+            &caller_command,
+        )
+        .checked_scale(ENGINE_FIXTURE_QUEUED_CALLER_COMMANDS)
+        .expect("engine fixture caller command capacity is representable");
+    let mailbox_entries = [
+        inbound_signaling,
+        outbound_signaling,
+        promotion_commands,
+        caller_commands,
+    ]
+    .into_iter()
+    .try_fold(crate::resource::ResourceClaim::ZERO, |total, item| {
+        total.checked_add(item)
+    })
+    .expect("engine fixture mailbox item capacity is representable together");
+    let local_application_grant = local_application_scopes
+        .checked_add(mailbox_roots)
+        .and_then(|claim| claim.checked_add(mailbox_entries))
+        .expect("engine fixture local-application grant is representable");
     let grant = grant
         .checked_add(candidate_grant)
         .and_then(|claim| claim.checked_add(remote_description_grant))
         .and_then(|claim| claim.checked_add(session_grant))
         .and_then(|claim| claim.checked_add(json_input_grant))
+        .and_then(|claim| claim.checked_add(local_application_grant))
         .expect("engine fixture connector and signaling grant is representable");
     // Everything above is what the fixture needs to exist. `retained` is what a
     // control wants a *promoted session* to be able to hold on top of it, and it
@@ -4173,15 +4535,23 @@ fn build_test_state_parts_metered(
     let metered = finite.clone();
     let provider = crate::resource::ResourceProviderPort::new(finite)
         .expect("engine fixture provider admits its process scope");
-    let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider);
+    let process = crate::resource::ProcessResourceRoot::isolated();
+    let owner = process
+        .install_resource_provider(provider)
+        .expect("engine fixture installs one exact process provider");
     let scope = owner
         .issue_mesh_scope()
         .expect("engine fixture process owner issues one explicit Mesh scope");
     let transport = crate::transport::Transport::new()
         .expect("transport")
         .with_connector_resource_scope(scope, webrtc_profile);
+    let mesh_scope = process.mesh_runtime_scope();
+    let local_resources = process
+        .issue_local_application_scope()
+        .expect("engine fixture issues local application authority");
     let (state, _signaling_in_rx, cmd_rx) =
-        NetworkState::new(config, identity, transport).expect("network state");
+        NetworkState::new_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources)
+            .expect("network state");
     (state, cmd_rx, metered, grant)
 }
 
@@ -4309,12 +4679,13 @@ pub(crate) fn build_test_state_with_retained_capacity(
     network_id_suffix: &str,
     retained: crate::resource::ResourceClaim,
 ) -> (Arc<NetworkState>, RetainedCapacityMeter) {
-    let (state, _cmd_rx, provider, grant) = build_test_state_parts_metered(
+    let (state, cmd_rx, provider, grant) = build_test_state_parts_metered(
         network_id_suffix,
         None,
         FIXTURE_CONNECTOR_SLOTS,
         Some(retained),
     );
+    state.park_command_receiver_for_test(cmd_rx);
     (state, RetainedCapacityMeter { provider, grant })
 }
 
@@ -4406,12 +4777,13 @@ pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> A
     )
     .with_realtime_profile(realtime_profile)
     .expect("the engine real-time fixture enables real-time, so a profile is accepted");
-    let (state, _cmd_rx) = build_test_state_parts_with(
+    let (state, cmd_rx) = build_test_state_parts_with(
         network_id_suffix,
         Some(profile),
         FIXTURE_CONNECTOR_SLOTS,
         None,
     );
+    state.park_command_receiver_for_test(cmd_rx);
     state
 }
 
@@ -4462,9 +4834,8 @@ pub(crate) fn build_test_state_with_command_driver(
     let command_state = Arc::clone(&state);
     let command_driver = tokio::spawn(async move {
         while let Some(command) = cmd_rx.recv().await {
-            if !handle_command(&command_state, command).await {
-                break;
-            }
+            let (command, _entry_resources) = command.into_parts();
+            handle_command(&command_state, command).await;
         }
     });
     (state, command_driver)
@@ -4746,6 +5117,52 @@ mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn v4_f3_stale_channel_and_rpc_handles_cannot_repopulate_a_closed_gateway() {
+        let state = build_test_state("gateway-close-latch");
+        let channel =
+            crate::Channel::<serde_json::Value>::new("stale-channel".into(), Arc::clone(&state));
+        let rpc = crate::rpc::Rpc::attach(&state).expect("the live gateway admits its RPC owner");
+        rpc.serve("installed-before-close", |_call| async {
+            Ok(crate::rpc::RpcResponse::from_value(serde_json::json!({
+                "live": true
+            })))
+        })
+        .expect("the live gateway admits a handler");
+
+        state.shutdown().await;
+
+        assert!(matches!(
+            channel.subscribe(),
+            Err(crate::ChannelError::NetworkDown)
+        ));
+        assert!(matches!(
+            rpc.serve("must-not-reappear", |_call| async {
+                Ok(crate::rpc::RpcResponse::from_value(serde_json::Value::Null))
+            }),
+            Err(crate::application_gateway::GatewayRefusal::Revoked)
+        ));
+        assert!(
+            !rpc.registered_methods()
+                .iter()
+                .any(|method| method == "must-not-reappear"),
+            "the refused stale handle installs no new handler"
+        );
+        assert!(matches!(
+            rpc.advertise(crate::protocol::CapabilityAdvert {
+                tags: vec!["must-not-reappear".to_string()],
+                app_version: None,
+                extra: serde_json::Value::Null,
+            }),
+            Err(crate::rpc::RpcError::NetworkDown)
+        ));
+        assert_eq!(
+            rpc.capabilities(),
+            crate::protocol::CapabilityAdvert::default(),
+            "the refused stale handle retains no new capability advertisement"
+        );
+    }
 
     /// The throttle window, one millisecond short of due.
     fn just_short_of_due(now: Instant) -> Instant {
@@ -5383,8 +5800,8 @@ mod tests {
         let state = build_test_state("channel-registration");
         let channel =
             crate::channels::Channel::<serde_json::Value>::new("c".into(), Arc::clone(&state));
-        let first = channel.subscribe();
-        let second = channel.subscribe();
+        let first = channel.subscribe().expect("first subscription admitted");
+        let second = channel.subscribe().expect("second subscription admitted");
         assert_eq!(
             state
                 .application_gateway
@@ -5763,7 +6180,6 @@ mod tests {
         {
             let mut data = fixture.peer.state.write();
             data.data_channel_open = true;
-            data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
         }
         let (reply, mut retained_caller) = tokio::sync::oneshot::channel();
         reliable::submit(
@@ -6061,28 +6477,18 @@ mod tests {
         set_admission(&state, "pending-peer", true, PeerStatus::PendingApproval);
         {
             // Transport readiness is made explicit, so the refusal below cannot
-            // be explained by a link that was never up: the data channel is
-            // open and the peer advertises the acked contract.
+            // be explained by a link that was never up. Reliable delivery is
+            // part of the fixed current profile, not a negotiated feature.
             let mut data = fixture.peer.state.write();
             data.data_channel_open = true;
-            data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
         }
         {
-            // Read back rather than assumed. Both facts are asserted here so the
-            // refusal below is attributable to admission alone — a control that
-            // set them and did not check them would still pass against a fixture
-            // that silently dropped one.
+            // Read back rather than assumed so the refusal below is attributable
+            // to admission alone.
             let data = fixture.peer.state.read();
             assert!(
                 data.data_channel_open,
                 "non-vacuity: the transport link is up"
-            );
-            assert!(
-                crate::protocol::features::peer_supports(
-                    &data.features,
-                    crate::protocol::features::Feature::RELIABLE_CHANNELS,
-                ),
-                "non-vacuity: and the peer speaks the acknowledged contract"
             );
         }
 
@@ -6448,6 +6854,12 @@ mod tests {
                             flows.identity(),
                             flow,
                             name,
+                            // The same closer production hands out, so a fixture
+                            // handle that goes out of scope closes its flow the
+                            // way a real one does. A fixture that minted a
+                            // disarmed handle would quietly stop covering the
+                            // drop path every control below leans on.
+                            Arc::downgrade(&self.state),
                         )
                     },
                 )
@@ -7003,20 +7415,31 @@ mod tests {
         gate.shutdown(events).await;
     }
 
-    /// Dropping a handle is not a close.
+    /// Dropping a handle closes the flow it named.
     ///
-    /// A handle names a flow without owning it, and the two directions of that
-    /// both matter. If dropping one closed the flow, an application that kept a
-    /// handle only long enough to hand a unit over would tear down its own
-    /// media; if holding one funded the flow, a leaked handle would keep a dead
-    /// session's label charged for as long as nobody noticed. This proves the
-    /// first directly, and the second follows from the identities being weak —
-    /// which the reopen control above exercises.
+    /// **This control used to assert the opposite**, on the reasoning that a
+    /// handle names a flow without owning it and that an application which kept
+    /// one only long enough to hand a unit over should not tear down its own
+    /// media. The first half is still true and is still what makes the
+    /// identities weak. The second half describes a caller that cannot exist:
+    /// `send_realtime` takes the handle by reference, the handle is move-only
+    /// and not `Clone`, and a label cannot be re-resolved into a record by
+    /// design — so a caller that has dropped its handle can never send on that
+    /// flow again, and nobody else can either.
+    ///
+    /// What "leave it open" actually bought, then, was a flow no one could
+    /// operate on holding its label, its m-line and its bandwidth until the
+    /// whole session ended, with no way for the application to ask for them
+    /// back. Caller `Drop` is the fact, here as on every other abandoned
+    /// resource in this crate.
+    ///
+    /// The half that has not changed — holding a handle funds nothing — is
+    /// still carried by the weak identities and by the reopen control above.
     #[cfg(feature = "transport-lab")]
     #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
-    async fn v4_f6_dropping_a_flow_handle_leaves_the_flow_open() {
-        let (gate, events) = RealtimeGate::connected("f6-handle-drop").await;
+    async fn v4_f8_dropping_a_flow_handle_closes_the_flow() {
+        let (gate, events) = RealtimeGate::connected("f8-handle-drop").await;
         gate.grant_policy();
         gate.grant_capability();
         let owner = gate.owner.clone();
@@ -7026,38 +7449,41 @@ mod tests {
             gate.state.realtime_is_current(&handle),
             "non-vacuity: the flow is open before anything is dropped"
         );
+        assert!(
+            handle.closes_on_drop(),
+            "non-vacuity: and this handle is armed, so the drop below is the \
+             subject rather than a handle that never had a closer"
+        );
         drop(handle);
 
-        // A second handle for the *same* record. It can only exist if that
-        // record is still filed under that name, which is the assertion.
-        let survivor = gate
+        // Asked through the flow set, not through a handle: the authority that
+        // could ask died with the handle, which is precisely why the flow had to
+        // go with it.
+        let still_filed = gate
             .state
             .peers
             .with_live_session_flow(
                 &owner,
                 gate.state.session_broker.as_ref(),
                 &gate.state.network_id,
-                |_session, flows, _live| {
-                    flows.flow_identity(&realtime_test_name(6)).map(|flow| {
-                        crate::realtime::RealtimeFlowHandle::new(
-                            owner.clone(),
-                            flows.identity(),
-                            flow,
-                            realtime_test_name(6),
-                        )
-                    })
-                },
+                |_session, flows, _live| flows.flow_identity(&realtime_test_name(6)).is_some(),
             )
-            .flatten()
-            .expect("dropping a handle must not have removed the flow it named");
+            .expect("the fence still answers for this owner after the handle drops");
         assert!(
-            gate.state.realtime_is_current(&survivor),
-            "and the flow is still usable, not merely still listed"
+            !still_filed,
+            "the record is gone: a flow nobody can operate on does not keep its \
+             label until the session ends"
         );
+
+        // And the close completed rather than merely unfiling something. The
+        // label is claimable again, and the flow it names is usable — which the
+        // send proves rather than assumes.
+        let reopened = gate.open_handle(&owner, 6);
         assert!(
-            gate.send(&survivor).is_ok(),
-            "which the send proves rather than assumes"
+            gate.state.realtime_is_current(&reopened),
+            "the name the dropped flow held is free again"
         );
+        assert!(gate.send(&reopened).is_ok());
 
         gate.shutdown(events).await;
     }
@@ -7828,11 +8254,12 @@ mod tests {
         let advert = CapabilityAdvert {
             tags: vec!["f4-replay-tag".to_string()],
             app_version: Some("9.9.9-f4".to_string()),
-            max_connections: Some(7),
             extra: serde_json::json!({ "f4": "replayed" }),
         };
-        let rpc = crate::rpc::Rpc::attach(&state);
-        rpc.advertise(advert.clone());
+        let rpc =
+            crate::rpc::Rpc::attach(&state).expect("the fixture owner funds one RPC dispatcher");
+        rpc.advertise(advert.clone())
+            .expect("the fixture owner funds one advertisement");
         assert_eq!(
             rpc.capabilities(),
             advert,
@@ -7995,18 +8422,19 @@ mod tests {
                 "the hello this node sends carries no capability metadata: {absent} in {encoded}"
             );
         }
-        assert!(
-            object
-                .get("features")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|features| {
-                    features.iter().any(|feature| {
-                        feature.as_str()
-                            == Some(crate::protocol::features::Feature::CAPABILITIES_UPDATE)
-                    })
-                }),
-            "the production hello still advertises the exact capabilities-update feature: \
-             {encoded}"
+        let features = object
+            .get("features")
+            .and_then(serde_json::Value::as_array)
+            .expect("the encoded hello carries its profile list");
+        assert_eq!(
+            features.len(),
+            1,
+            "the production hello advertises only the current endpoint-auth profile: {encoded}"
+        );
+        assert_eq!(
+            features[0].as_str(),
+            Some(crate::protocol::features::Feature::ENDPOINT_AUTH_V1),
+            "the production hello advertises the exact endpoint-auth profile: {encoded}"
         );
         assert!(
             encoded.contains("noncef4"),
@@ -8028,10 +8456,11 @@ mod tests {
     /// already empty and conclude the command was never sent.
     #[cfg(feature = "transport-lab")]
     fn collect_replay_commands(
-        commands: &mut mpsc::UnboundedReceiver<NetworkCmd>,
+        commands: &mut crate::resource::ResourceMailboxReceiver<NetworkCmd>,
     ) -> Vec<NetworkCmd> {
         let mut replays = Vec::new();
-        while let Ok(command) = commands.try_recv() {
+        while let Some(delivery) = commands.try_recv() {
+            let (command, _retention) = delivery.into_parts();
             if matches!(command, NetworkCmd::ReplayCapabilities { .. }) {
                 replays.push(command);
             }
@@ -8829,32 +9258,169 @@ mod tests {
 
     /// Mint the exact inbound authority `handle_inbound_frame_from` mints, so a
     /// control can hold it across a replacement.
+    ///
+    /// The same three phases production takes, in the same order and through the
+    /// same functions: admit and fund under the fence, decode outside it, commit
+    /// under the session that funded the decode. Collapsing them back into one
+    /// acquisition here would leave every control below exercising a shape
+    /// production no longer has — and would quietly stop covering the commit
+    /// check, which is the one step the split adds.
     fn admit_inbound_for_test(
         state: &Arc<NetworkState>,
         owner: &peer_registry::PeerOwnerToken,
         msg: MeshMessage,
     ) -> Option<peer_registry::AdmittedInboundApplicationOperation> {
         let encoded = Bytes::from(serde_json::to_vec(&msg).expect("the control frame serializes"));
-        state
+        let (frame, witness) = state
             .peers
             .with_admitted_current_or_refused(
                 owner,
                 state.session_broker.as_ref(),
                 &state.network_id,
                 |admitted| {
-                    let decoded = admitted
+                    let frame = admitted
                         .with_session_state(|session, _record| {
                             crate::application_gateway::AdmittedApplicationFrame::admit(
                                 session, encoded,
                             )
-                            .and_then(|frame| frame.decode())
                         })
                         .and_then(std::result::Result::ok)?;
-                    Some(admitted.inbound_application_operation(decoded))
+                    Some((frame, admitted.session_witness()?))
+                },
+                |_| None,
+            )
+            .flatten()?;
+        let decoded = frame.decode().ok()?;
+        state.peers.with_same_session(owner, &witness, |admitted| {
+            admitted.inbound_application_operation(decoded)
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_arc06f5_a_frame_the_replaced_session_funded_commits_nothing() {
+        // The only new risk the decode split carries: between funding and
+        // commit, this side's session can go away. The frame was paid for by a
+        // session that no longer speaks for the peer, so it must authorize
+        // nothing.
+        //
+        // The *installation* is deliberately left alone. Replacing the peer
+        // would refuse at the owner-token check the existing E1 controls
+        // already cover, and this control would then pass without ever
+        // exercising the session-identity test it exists for. So the session is
+        // revoked in place and a fresh one promoted over the same installation:
+        // same owner, live session, different session.
+        let (state, mut commands) =
+            build_test_state_parts("arc06f5-session-replaced-during-decode");
+        let fixture = insert_admitted_peer(&state, "peer").await;
+        let owner = state.peers.owner("peer").expect("the peer is installed");
+        let encoded =
+            Bytes::from(serde_json::to_vec(&shelve_frame()).expect("the control frame serializes"));
+
+        let (frame, witness) = state
+            .peers
+            .with_admitted_current_or_refused(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |admitted| {
+                    let frame = admitted
+                        .with_session_state(|session, _record| {
+                            crate::application_gateway::AdmittedApplicationFrame::admit(
+                                session, encoded,
+                            )
+                        })
+                        .and_then(std::result::Result::ok)?;
+                    Some((frame, admitted.session_witness()?))
                 },
                 |_| None,
             )
             .flatten()
+            .expect("non-vacuity: the live session admits and funds the frame");
+        assert!(
+            witness.is_live(),
+            "non-vacuity: the witness names a session that is live at funding time"
+        );
+
+        let promotion = commands
+            .try_recv()
+            .expect("the first promotion announces the session it minted");
+        assert!(
+            matches!(
+                promotion.into_parts().0,
+                NetworkCmd::ReplayCapabilities { .. }
+            ),
+            "the drained command is the first session's promotion announcement"
+        );
+
+        fixture.peer.revoke_promoted_session();
+        assert!(
+            !witness.is_live(),
+            "non-vacuity: revocation really did invalidate the funding session"
+        );
+
+        // One authenticated channel yields exactly one session, so revocation
+        // cannot re-promote from the channel the first session consumed. Give
+        // this same installation a genuinely distinct live connector and its
+        // own handoff. The owner token remains unchanged; only the session
+        // identity the commit fence will compare is replaced.
+        let (replacement_worker, _replacement_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the fixture grant admits the replacement connector");
+        let replacement_worker = Arc::new(replacement_worker);
+        let replacement_handoff = match replacement_worker.confirm_data_channel_open() {
+            DataChannelOpenOwnership::Connected(handoff) => handoff,
+            _ => panic!("the replacement connector yields exactly one connected handoff"),
+        };
+        fixture
+            .peer
+            .replace_connector_for_session_control(Arc::clone(&replacement_worker));
+        fixture.peer.install_authenticated_channel_over_for_test(
+            replacement_handoff
+                .into_generic()
+                .expect("a fresh replacement handoff carries its capability"),
+            &state.network_id,
+            state.identity.public_id(),
+        );
+        assert!(
+            fence_admits(&state, "peer"),
+            "non-vacuity: and the peer promotes again, so a *live* session exists \
+             at commit time and the refusal below is not merely 'no session'"
+        );
+        let promotion = commands
+            .try_recv()
+            .expect("the replacement session announces its own promotion");
+        assert!(
+            matches!(
+                promotion.into_parts().0,
+                NetworkCmd::ReplayCapabilities { .. }
+            ),
+            "the second promotion is committed far enough to announce itself"
+        );
+        assert!(
+            state.peers.get_if_current(&owner).is_some(),
+            "non-vacuity: over the same installation, so the owner-token check \
+             cannot be what refuses"
+        );
+
+        let decoded = frame.decode().expect("the control frame is well formed");
+        assert!(
+            state
+                .peers
+                .with_same_session(&owner, &witness, |admitted| {
+                    admitted.inbound_application_operation(decoded)
+                })
+                .is_none(),
+            "a frame the replaced session funded commits nothing"
+        );
+        drop(fixture);
     }
 
     /// An installed peer that passes the application-admission fence.
@@ -9054,8 +9620,14 @@ mod tests {
         let state = build_test_state_with_connector_slots("arc04e1-delivery", 3);
         let captured_fixture = insert_admitted_peer(&state, "peer").await;
         let captured_owner = state.peers.owner("peer").expect("A is installed");
-        let frames = state.application_gateway.subscribe_channel("c");
-        let second_frames = state.application_gateway.subscribe_channel("c");
+        let frames = state
+            .application_gateway
+            .subscribe_channel("c")
+            .expect("first subscriber admitted");
+        let second_frames = state
+            .application_gateway
+            .subscribe_channel("c")
+            .expect("second subscriber admitted");
 
         let channel_frame = || MeshMessage::Channel {
             channel: "c".into(),
@@ -9133,11 +9705,9 @@ mod tests {
     /// exist — and, the half that matters for accounting, nothing is held on
     /// their behalf while they wait, because they do not wait.
     ///
-    /// Both non-vacuity conjuncts are arranged *positively* so the refusal is
-    /// attributable to the missing session alone: the link reads as up and the
-    /// peer advertises the acknowledged contract, which are the two other things
-    /// that can refuse a submission. Without them this control would pass
-    /// against a build that refused for either of those reasons instead.
+    /// Transport readiness is arranged positively so the refusal is attributable
+    /// to the missing session alone. Reliable delivery belongs to the fixed
+    /// current profile; there is no negotiated feature gate.
     #[tokio::test]
     async fn v4_macro1_reliable_submission_without_a_session_is_refused_and_retains_nothing() {
         let state = build_test_state("macro1-reliable-no-session");
@@ -9148,7 +9718,6 @@ mod tests {
             data.authenticated = true;
             data.status = PeerStatus::Active;
             data.data_channel_open = true;
-            data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
         }
         assert!(
             state
@@ -9209,7 +9778,6 @@ mod tests {
         {
             let mut data = fixture.peer.state.write();
             data.data_channel_open = true;
-            data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
         }
 
         let (reply, mut receiver) = tokio::sync::oneshot::channel();
@@ -9371,7 +9939,6 @@ mod tests {
         {
             let mut data = fixture.peer.state.write();
             data.data_channel_open = true;
-            data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
         }
         // Seal the base grant's unused worst-case envelopes, leaving room for
         // `RETAINED` frames and one acknowledgement's admission and nothing
@@ -9845,7 +10412,10 @@ mod tests {
         );
 
         // ---- positive: the same frame, now with a subscriber ---------------
-        let received = state.application_gateway.subscribe_channel(channel);
+        let received = state
+            .application_gateway
+            .subscribe_channel(channel)
+            .expect("subscriber admitted");
         handle_inbound_frame_from(&state, &owner, frame()).await;
         assert_eq!(
             acks(),
@@ -10793,7 +11363,8 @@ mod tests {
         let state = build_test_state_with_connector_slots(suffix, 3);
         let b = insert_admitted_peer(&state, "device-b").await;
         let c = insert_admitted_peer(&state, "device-c").await;
-        let rpc = crate::rpc::Rpc::attach(&state);
+        let rpc =
+            crate::rpc::Rpc::attach(&state).expect("the fixture owner funds one RPC dispatcher");
         (state, rpc, b, c)
     }
 

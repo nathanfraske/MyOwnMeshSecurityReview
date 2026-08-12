@@ -272,7 +272,20 @@ impl ServiceManager {
         let advert = build_capability_advert(&g.config);
         for summary in self.registry.summaries() {
             if let Some(joined) = self.registry.get(&summary.config_id) {
-                joined.advertise(advert.clone());
+                // Reported per network and never aborts the sweep: the refusals
+                // are per-network, so one network that would not take the new
+                // advert must not stop the rest from getting it. A network that
+                // refuses keeps publishing its previous roles, which is a
+                // divergence between what this device hosts and what its peers
+                // believe — worth a warning even though there is no caller here
+                // to return it to.
+                if let Err(error) = joined.advertise(advert.clone()) {
+                    warn!(
+                        network = %summary.config_id,
+                        "service-role advert was refused; this network still \
+                         publishes its previous roles: {error}"
+                    );
+                }
             }
         }
         // Touch `mesh` so the field is considered used even on builds
@@ -375,7 +388,6 @@ fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
     CapabilityAdvert {
         tags,
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        max_connections: None,
         extra,
     }
 }
@@ -395,9 +407,37 @@ pub(crate) async fn join_network(
     }
     match mesh.join(cfg.clone()).await {
         Ok(joined) => {
-            let drivers = myownmesh_core::engine::attach_signaling(&joined.state());
+            // Attach is now fallible, and a refusal is not the same event as
+            // the receiver having been taken. A network that joined but could
+            // not attach is unreachable, so it is taken back down rather than
+            // registered — the same disposal the id-refusal path below performs
+            // — instead of being left running as a network nothing can signal
+            // through. This stays best-effort per this function's contract:
+            // neither caller (daemon startup, the node-enable transition) has
+            // anywhere to return a per-network failure to.
+            let attached = {
+                let net_state = joined.state();
+                myownmesh_core::engine::attach_signaling(&net_state)
+            };
+            let drivers = match attached {
+                Ok(drivers) => drivers,
+                Err(error) => {
+                    warn!(network = %cfg.network_id, "signaling attach failed: {error}");
+                    if let Err(e) = joined.shutdown().await {
+                        warn!(
+                            network = %cfg.network_id,
+                            "network with no signaling failed to shut down: {e:#}"
+                        );
+                    }
+                    return;
+                }
+            };
             if drivers.is_none() {
-                warn!(network = %cfg.network_id, "signaling attach returned no handle");
+                warn!(
+                    network = %cfg.network_id,
+                    "signaling outbound receiver was already taken — \
+                     this network keeps no driver handle"
+                );
             }
             // The `contains` check above is advisory — it is a separate lock
             // acquisition from the insert, so a join racing a removal or
@@ -540,6 +580,7 @@ mod tests {
         let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
             MeshConfig::default(),
             identity,
+            crate::test_resource_provider(),
         )
         .await
         .expect("open infrastructure-only mesh");
@@ -578,6 +619,7 @@ mod tests {
         let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
             MeshConfig::default(),
             identity,
+            crate::test_resource_provider(),
         )
         .await
         .expect("open infrastructure-only mesh");

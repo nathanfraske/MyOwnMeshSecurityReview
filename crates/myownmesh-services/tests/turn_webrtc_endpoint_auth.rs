@@ -8,7 +8,7 @@ use myownmesh_core::config::{
     TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
+use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
@@ -344,8 +344,10 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
 
     let alice_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&alice));
     let bob_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&bob));
-    let mut alice_receive = alice_channel.subscribe();
-    let mut bob_receive = bob_channel.subscribe();
+    let mut alice_receive = alice_channel
+        .subscribe()
+        .expect("alice subscription admitted");
+    let mut bob_receive = bob_channel.subscribe().expect("bob subscription admitted");
 
     alice_channel
         .send_to(bob_id.public_id(), &"alice-over-turn".to_string())
@@ -369,13 +371,8 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     );
 
     let positive_close_at = std::time::Instant::now();
-    alice
-        .cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Alice shutdown reaches its driver");
-    bob.cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Bob shutdown reaches its driver");
+    alice.request_shutdown();
+    bob.request_shutdown();
     alice_driver.await.expect("Alice driver shuts down cleanly");
     bob_driver.await.expect("Bob driver shuts down cleanly");
     if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
@@ -441,13 +438,8 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         .await
         .expect_err("relay selection cannot bypass session admission");
 
-    carol
-        .cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Carol shutdown reaches its driver");
-    dave.cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Dave shutdown reaches its driver");
+    carol.request_shutdown();
+    dave.request_shutdown();
     carol_driver.await.expect("Carol driver shuts down cleanly");
     dave_driver.await.expect("Dave driver shuts down cleanly");
     drop((carol, dave));

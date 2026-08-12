@@ -1362,7 +1362,6 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
- "dashmap",
  "data-encoding",
  "dirs",
  "getrandom 0.2.17",

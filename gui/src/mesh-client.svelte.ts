@@ -180,9 +180,9 @@ function createMeshClient() {
     await Promise.all([refreshPeers(network), refreshRoster(network)]);
   }
 
-  async function rosterList(network: string) {
+  async function rosterList(network: string): Promise<AuthorizedPeer[]> {
     const resp = (await invoke("mesh_roster_list", { network })) as {
-      roster: Array<{ device_id: string; label: string; approved_at: number }>;
+      roster: AuthorizedPeer[];
     };
     return resp.roster ?? [];
   }

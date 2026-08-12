@@ -17,7 +17,7 @@ catalogue and the path to crates.io.
 - **Identity:** long-lived ed25519 keypair, base32-lowercase device id.
 - **Roster:** per-network approved-peers file (0600 on Unix).
 - **Wire protocol:** `MeshMessage` variants and capability matrix.
-- **Topology:** Ring (default), Star, and FullMesh selectors. Pure functions that are symmetric across peers.
+- **Topology:** FullMesh (default), Ring, and Star selectors. Pure functions that are symmetric across peers.
 - **Transport:** webrtc-rs wrapper. One `PeerSession` per peer, with event queues drained by the engine.
 - **Engine:** `hello` → `auth_response` handshake, ping/pong heartbeat, recovery driven by reliable transport signals, and topology shelving. Recovery uses in-place ICE restart confirmed by inbound traffic, then a clean rebuild on failure.
 - **Channels:** typed pub/sub via `Channel<T>`.
@@ -42,7 +42,7 @@ Full surface: `Mesh`, `MeshHandle`, `JoinedNetwork`, `MeshConfig`,
 `DiagEntry`, `CapabilityAdvert`, `ConnectionTier`, `Channel`,
 `ChannelMessage`, `ChannelError`, `Rpc`, `RpcCall`, `RpcResponse`,
 `RpcError`. Helpers: `generate_network_id`, `normalize_network_id`.
-Constants: `SIGN_DOMAIN_TAG`, `TRYSTERO_APP_ID`, `PROTOCOL_VERSION`.
+Constants: `TRYSTERO_APP_ID`, `PROTOCOL_VERSION`.
 
 See [`../../docs/QUICKSTART.md`](../../docs/QUICKSTART.md) for the
 narrative walkthrough of identity, channels, RPC, roster,

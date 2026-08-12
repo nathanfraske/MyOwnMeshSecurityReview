@@ -74,7 +74,7 @@ async fn two_peers_handshake_and_exchange_channel_message() {
     // Type-safe channel send.
     let alice_chan: Channel<String> = Channel::new("greetings".into(), alice_state.clone());
     let bob_chan: Channel<String> = Channel::new("greetings".into(), bob_state.clone());
-    let mut bob_sub = bob_chan.subscribe();
+    let mut bob_sub = bob_chan.subscribe().expect("bob subscription admitted");
 
     alice_chan
         .send_to(bob_id.public_id(), &"hello from alice".to_string())
@@ -96,7 +96,7 @@ async fn two_peers_handshake_and_exchange_channel_message() {
     assert_eq!(msg.body, "hello from alice");
 
     // Reverse direction.
-    let mut alice_sub = alice_chan.subscribe();
+    let mut alice_sub = alice_chan.subscribe().expect("alice subscription admitted");
     bob_chan
         .send_to(alice_id.public_id(), &"hi back".to_string())
         .await

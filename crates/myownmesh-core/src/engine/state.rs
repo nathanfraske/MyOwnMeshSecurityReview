@@ -11,7 +11,11 @@ use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, Phas
 use crate::identity::Identity;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::resource::{
-    MeshRuntimeResourceScope, NetworkInstanceResourceScope, ProcessResourceRoot, ResourceReport,
+    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
+    LocalApplicationResourceScope, MeshRuntimeResourceScope, NetworkInstanceResourceScope,
+    ProcessResourceRoot, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxReceiver, ResourceMailboxSender,
+    ResourceReport,
 };
 use crate::roster::Roster;
 use crate::runtime::session_broker::SessionBroker;
@@ -23,7 +27,7 @@ use crate::transport::webrtc::{
 };
 use crate::transport::{LocalIceCandidate, Transport};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 
@@ -136,8 +140,6 @@ pub enum NetworkCmd {
     ReplayCapabilities {
         owner: super::peer_registry::PeerOwnerToken,
     },
-    /// Stop the engine and tear down all peer sessions.
-    Shutdown,
     /// Switch the topology selector at runtime.
     SetTopology(TopologyMode),
     /// Approve a peer into the roster (and emit the approve frame).
@@ -190,9 +192,8 @@ pub enum NetworkCmd {
     /// current session (see [`super::reliable`]), resolved on the peer's
     /// cumulative acknowledgement.
     ///
-    /// Refused outright, with the reason, when the peer has no live session,
-    /// does not advertise the acknowledged contract, or when the provider will
-    /// not fund retaining the frame. There is no deadline to expire against and
+    /// Refused outright, with the reason, when the peer has no live session or
+    /// when the provider will not fund retaining the frame. There is no deadline to expire against and
     /// no ceiling to be backpressured by: an entry ends when it is acknowledged
     /// or when its session does, and both are events, not guesses.
     SendChannelReliable {
@@ -231,7 +232,7 @@ pub enum NetworkCmd {
     /// local identity, persists the proposal to the governance
     /// state's pending list, and broadcasts a
     /// `NetworkStatePropose` to every active peer that supports
-    /// `network_state_v1`. Reply carries the new proposal id so
+    /// the current closed governance profile. Reply carries the new proposal id so
     /// the caller can correlate acks.
     ProposeTransition {
         variant: crate::network_state::TransitionVariant,
@@ -279,6 +280,104 @@ pub enum NetworkCmd {
     GovernanceSnapshot {
         reply: oneshot::Sender<crate::network_state::NetworkState>,
     },
+}
+
+impl ResourceMailboxItem for NetworkCmd {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = match self {
+            Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
+            Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
+            Self::ApproveRoster {
+                device_id, label, ..
+            } => strings_measure([device_id.as_str(), label.as_str()])?,
+            Self::RemoveRoster { device_id, .. } | Self::ConnectPeer { device_id, .. } => {
+                strings_measure([device_id.as_str()])?
+            }
+            Self::DropPeer { device_id, reason } => {
+                let reason = match reason {
+                    DropReason::TransportError { message } => Some(message.as_str()),
+                    DropReason::Denied
+                    | DropReason::IceFailed
+                    | DropReason::AuthFailed
+                    | DropReason::UserLeft
+                    | DropReason::TopologyPruned
+                    | DropReason::HeartbeatTimeout => None,
+                };
+                strings_measure([Some(device_id.as_str()), reason].into_iter().flatten())?
+            }
+            Self::Reconnect { peer } => strings_measure(peer.iter().map(String::as_str))?,
+            Self::SendChannelReliable {
+                peer,
+                channel,
+                payload,
+                ..
+            }
+            | Self::SendChannelFrame {
+                peer,
+                channel,
+                payload,
+                ..
+            } => checked_measure_add(
+                strings_measure([peer.as_str(), channel.as_str()])?,
+                mailbox_measure_serialized(payload)?,
+            )?,
+            Self::BroadcastChannelFrame {
+                channel, payload, ..
+            } => checked_measure_add(
+                strings_measure([channel.as_str()])?,
+                mailbox_measure_serialized(payload)?,
+            )?,
+            Self::SendRpcRequest { peer, request, .. } => checked_measure_add(
+                strings_measure([peer.as_str()])?,
+                mailbox_measure_serialized(request)?,
+            )?,
+            Self::BroadcastCapabilities { caps, .. } => mailbox_measure_serialized(caps)?,
+            Self::ProposeTransition {
+                variant, mfa_code, ..
+            } => checked_measure_add(
+                mailbox_measure_serialized(variant)?,
+                strings_measure(mfa_code.iter().map(String::as_str))?,
+            )?,
+            Self::SignProposal {
+                proposal_id,
+                mfa_code,
+                ..
+            } => checked_measure_add(
+                strings_measure([proposal_id.as_str()])?,
+                strings_measure(mfa_code.iter().map(String::as_str))?,
+            )?,
+            Self::DenyProposal { proposal_id, .. }
+            | Self::WithdrawProposal { proposal_id, .. }
+            | Self::SpawnSplit { proposal_id, .. } => strings_measure([proposal_id.as_str()])?,
+        };
+        // Channel/Arc-backed effects are opaque dependency allocations, not OS
+        // sockets or handles. The payload walk above counts its own allocations;
+        // this adds only allocations retained by reply/cancellation effects.
+        let effect_allocations = match self {
+            Self::ReplayCapabilities { .. } => 0,
+            Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
+            Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
+            Self::ApproveRoster { .. }
+            | Self::RemoveRoster { .. }
+            | Self::SendChannelReliable { .. }
+            | Self::SendChannelFrame { .. }
+            | Self::BroadcastChannelFrame { .. }
+            | Self::SendRpcRequest { .. }
+            | Self::BroadcastCapabilities { .. }
+            | Self::ProposeTransition { .. }
+            | Self::SignProposal { .. }
+            | Self::DenyProposal { .. }
+            | Self::WithdrawProposal { .. }
+            | Self::SpawnSplit { .. }
+            | Self::GovernanceSnapshot { .. } => 1,
+        };
+        let allocations = measure.2.checked_add(effect_allocations).ok_or(
+            ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::OpaqueDependencyResidual,
+            },
+        )?;
+        mailbox_retained_claim::<Self>(measure.0, measure.1, allocations)
+    }
 }
 
 pub struct ConnectWaiterRegistration {
@@ -341,6 +440,33 @@ impl SignalingInbound {
     }
 }
 
+impl ResourceMailboxItem for SignalingInbound {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = match self {
+            Self::PeerAnnounced { device_id } | Self::PeerLeft { device_id } => {
+                strings_measure([device_id.as_str()])?
+            }
+            Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
+                strings_measure([device_id.as_str(), sdp.as_str()])?
+            }
+            Self::Candidate {
+                device_id,
+                candidate,
+            } => strings_measure(
+                [
+                    Some(device_id.as_str()),
+                    Some(candidate.candidate.as_str()),
+                    candidate.sdp_mid.as_deref(),
+                    candidate.username_fragment.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            )?,
+        };
+        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+    }
+}
+
 /// Outbound signaling messages from the engine to the signaling task.
 /// `Clone` so the bridge's fan-out can hand one engine emission to
 /// several concurrently-attached drivers (Nostr + mDNS).
@@ -370,6 +496,31 @@ pub enum SignalingOutbound {
     },
 }
 
+impl ResourceMailboxItem for SignalingOutbound {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = match self {
+            Self::Announce | Self::Leave => (0, 0, 0),
+            Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
+                strings_measure([device_id.as_str(), sdp.as_str()])?
+            }
+            Self::Candidate {
+                device_id,
+                candidate,
+            } => strings_measure(
+                [
+                    Some(device_id.as_str()),
+                    Some(candidate.candidate.as_str()),
+                    candidate.sdp_mid.as_deref(),
+                    candidate.username_fragment.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            )?,
+        };
+        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+    }
+}
+
 /// The shared state for a single joined network. Every long-lived
 /// subsystem (driver loop, channels, rpc, handle) holds an
 /// `Arc<NetworkState>`. Independent ownership domains use their own narrow
@@ -379,6 +530,7 @@ pub struct NetworkState {
     pub identity: Arc<Identity>,
     pub transport: Transport,
     resource_scope: NetworkInstanceResourceScope,
+    local_resources: LocalApplicationResourceScope,
     /// The one owner of session promotion for this network instance.
     ///
     /// `None` when the process owner installed no resource provider. That is
@@ -415,14 +567,22 @@ pub struct NetworkState {
     pub events_tx: broadcast::Sender<MeshEvent>,
     pub(crate) application_gateway: crate::application_gateway::ApplicationGateway,
 
-    pub signaling_tx: mpsc::UnboundedSender<SignalingOutbound>,
-    pub signaling_inbound_tx: mpsc::UnboundedSender<SignalingInbound>,
-    pub cmd_tx: mpsc::UnboundedSender<NetworkCmd>,
+    pub signaling_tx: ResourceMailboxSender<SignalingOutbound>,
+    pub signaling_inbound_tx: ResourceMailboxSender<SignalingInbound>,
+    pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
 
     /// Receiving end of `signaling_tx` — held here so callers can
     /// drain it via [`Self::take_signaling_outbound_rx`] when they
     /// bring up their signaling task.
-    signaling_outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<SignalingOutbound>>>,
+    signaling_outbound_rx: Mutex<Option<ResourceMailboxReceiver<SignalingOutbound>>>,
+    /// Controls that do not run an engine driver still need the command
+    /// mailbox to be live: session promotion announces on it, and a closed
+    /// receiver truthfully means the driver is gone. Parking the receiver in
+    /// the state models an unread queue without turning it into a dead queue.
+    #[cfg(test)]
+    parked_command_receiver: Mutex<Option<ResourceMailboxReceiver<NetworkCmd>>>,
+    shutdown_requested: std::sync::atomic::AtomicBool,
+    shutdown_ready: tokio::sync::Notify,
 
     /// Offerer-side reconnect intents (see [`ReconnectIntent`]). Keyed by
     /// device id; an entry lives from the moment we drop a peer we owe an
@@ -557,11 +717,12 @@ impl NetworkState {
         transport: Transport,
     ) -> Result<(
         Arc<Self>,
-        mpsc::UnboundedReceiver<SignalingInbound>,
-        mpsc::UnboundedReceiver<NetworkCmd>,
+        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<NetworkCmd>,
     )> {
         let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope)
+        let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
+        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources)
     }
 
     /// Construct state below an existing Mesh runtime observation scope.
@@ -571,16 +732,18 @@ impl NetworkState {
         identity: Arc<Identity>,
         transport: Transport,
         mesh_scope: &MeshRuntimeResourceScope,
+        local_resources: &LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        mpsc::UnboundedReceiver<SignalingInbound>,
-        mpsc::UnboundedReceiver<NetworkCmd>,
+        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<NetworkCmd>,
     )> {
         Self::new_in_resource_scope(
             config,
             identity,
             transport,
             mesh_scope.network_instance_scope(),
+            local_resources.child()?,
         )
     }
 
@@ -590,10 +753,11 @@ impl NetworkState {
         identity: Arc<Identity>,
         transport: Transport,
         resource_scope: NetworkInstanceResourceScope,
+        local_resources: LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        mpsc::UnboundedReceiver<SignalingInbound>,
-        mpsc::UnboundedReceiver<NetworkCmd>,
+        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<NetworkCmd>,
     )> {
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
@@ -616,10 +780,8 @@ impl NetworkState {
                 if s.kind == crate::network_state::NetworkKind::Closed
                     || config.kind == crate::network_state::NetworkKind::Closed
                 {
-                    // Heal the legacy empty-Closed representation as well as a
-                    // brand-new Closed config. The signed log replays from Open,
-                    // so genesis must be expressed as that transition rather
-                    // than as a pre-mutated kind field.
+                    // The signed log replays from Open, so genesis is expressed
+                    // as a transition rather than as a pre-mutated kind field.
                     s.kind = crate::network_state::NetworkKind::Open;
                     let variant = crate::network_state::TransitionVariant::KindChange {
                         to: crate::network_state::NetworkKind::Closed,
@@ -662,9 +824,11 @@ impl NetworkState {
         let conn_trace_force_on = std::env::var("MYOWNMESH_CONN_TRACE")
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false);
-        let (signaling_tx, signaling_outbound_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (signaling_inbound_tx, signaling_inbound_rx) = mpsc::unbounded_channel();
+        let (signaling_tx, signaling_outbound_rx) =
+            crate::resource::resource_mailbox(local_resources.child()?)?;
+        let (cmd_tx, cmd_rx) = crate::resource::resource_mailbox(local_resources.child()?)?;
+        let (signaling_inbound_tx, signaling_inbound_rx) =
+            crate::resource::resource_mailbox(local_resources.child()?)?;
         let session_broker = transport.session_broker();
         let governance_state = Arc::new(RwLock::new(governance_state));
         let local_device_id = identity.public_id().to_string();
@@ -682,11 +846,18 @@ impl NetworkState {
             governance_state,
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
-            application_gateway: crate::application_gateway::ApplicationGateway::new(),
+            application_gateway: crate::application_gateway::ApplicationGateway::new(
+                local_resources.clone(),
+            ),
+            local_resources,
             signaling_tx,
             signaling_inbound_tx,
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
+            #[cfg(test)]
+            parked_command_receiver: Mutex::new(None),
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             sticky_peers: Mutex::new(pinned),
             self_evicted: std::sync::atomic::AtomicBool::new(false),
@@ -719,6 +890,10 @@ impl NetworkState {
         self.resource_scope.peer_connection_scope()
     }
 
+    pub(crate) fn local_application_resource_scope(&self) -> Result<LocalApplicationResourceScope> {
+        Ok(self.local_resources.child()?)
+    }
+
     /// Read observations for this live joined network instance.
     pub fn resource_report(&self) -> ResourceReport {
         self.resource_scope.report()
@@ -729,8 +904,45 @@ impl NetworkState {
     /// calls return `None`.
     pub fn take_signaling_outbound_rx(
         self: &Arc<Self>,
-    ) -> Option<mpsc::UnboundedReceiver<SignalingOutbound>> {
+    ) -> Option<ResourceMailboxReceiver<SignalingOutbound>> {
         self.signaling_outbound_rx.lock().take()
+    }
+
+    /// Keep an otherwise undriven fixture's command receiver alive until the
+    /// fixture state drops. A production driver always owns this receiver.
+    #[cfg(test)]
+    pub(crate) fn park_command_receiver_for_test(
+        &self,
+        receiver: ResourceMailboxReceiver<NetworkCmd>,
+    ) {
+        let replaced = self.parked_command_receiver.lock().replace(receiver);
+        assert!(
+            replaced.is_none(),
+            "a fixture parks its command receiver once"
+        );
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown_ready.notify_waiters();
+        self.cmd_tx.close();
+        self.signaling_inbound_tx.close();
+    }
+
+    pub(crate) async fn wait_for_shutdown(&self) {
+        loop {
+            let notified = self.shutdown_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Remember that we owe `device_id` a fresh offer after a recoverable
@@ -1038,8 +1250,12 @@ impl NetworkState {
     /// Every refusal releases both halves: the flow and its label through the
     /// fence, the native object through the connector. Nothing is retried and
     /// nothing is timed.
+    /// Takes `&Arc<Self>` rather than `&self` for one reason: the handle this
+    /// mints closes its flow when it is dropped, and the only honest way to
+    /// reach this engine from a `Drop` that owns nothing is a weak reference to
+    /// it. Downgrading requires the `Arc`, and every caller already has one.
     pub(crate) async fn open_realtime_negotiated(
-        &self,
+        self: &Arc<Self>,
         peer: &str,
         spec: RealtimeFlowSpec,
     ) -> std::result::Result<crate::realtime::RealtimeFlowHandle, crate::realtime::RealtimeRefusal>
@@ -1175,7 +1391,11 @@ impl NetworkState {
             // answered, and the record `open` filed. None of the three is
             // re-derivable from the selector this call was given.
             Ok(()) => Ok(crate::realtime::RealtimeFlowHandle::new(
-                owner, flow_set, flow, name,
+                owner,
+                flow_set,
+                flow,
+                name,
+                Arc::downgrade(self),
             )),
             Err(error) => {
                 // Ordered so the caller does not return before the transceiver
@@ -1250,8 +1470,14 @@ impl NetworkState {
     /// identities travelled with the handle, and B's flow is a different record.
     pub(crate) async fn close_realtime_negotiated(
         &self,
-        handle: crate::realtime::RealtimeFlowHandle,
+        mut handle: crate::realtime::RealtimeFlowHandle,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        // Before anything, and unconditionally. This call is the close, so the
+        // handle's own drop-close must not run behind it — on the success path
+        // it would be a second close of a record this one removed, and on the
+        // refusal path there is nothing to close: every way this refuses is a
+        // way the flow was already not ours.
+        handle.disarm();
         let (worker, remains) = self.with_owned_realtime_flows_and_worker(
             handle.owner(),
             |session, flows, live, worker| {
@@ -1262,6 +1488,30 @@ impl NetworkState {
         )?;
         retire_realtime_remains(&worker, remains).await;
         Ok(())
+    }
+
+    /// Close the flow an abandoned handle named, telling nobody.
+    ///
+    /// The drop half of [`Self::close_realtime_negotiated`], and deliberately
+    /// only its phase 1. Phase 2 is an await this cannot perform and does not
+    /// need to: `close` hands back a [`RealtimeFlowRemains`], and both of its
+    /// arms retire what they hold when they are dropped — which is what happens
+    /// to the value below. The difference between this and an explicit close is
+    /// therefore the acknowledgement, not the retirement.
+    ///
+    /// Every refusal is discarded, because each one means the flow is already
+    /// gone: a stale owner, a session that has been replaced, a label closed and
+    /// reopened. There is no caller left to tell, and nothing here to undo.
+    pub(crate) fn abandon_realtime_flow(&self, handle: &crate::realtime::RealtimeFlowHandle) {
+        // Dropped, not ignored: this value *is* the retirement, and naming it
+        // is how that reads as the retirement happening rather than as a result
+        // being thrown away.
+        drop(
+            self.with_owned_realtime_flows(handle.owner(), |session, flows, live| {
+                Self::handle_names_live_flow(flows, handle)?;
+                flows.close(session, Some(live), handle.name())
+            }),
+        );
     }
 
     /// Whether that handle still names a usable flow.
@@ -1545,7 +1795,7 @@ impl NetworkState {
                 payload,
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped reply".into()))?
     }
@@ -1556,20 +1806,17 @@ impl NetworkState {
         &self,
         channel: &str,
         payload: serde_json::Value,
-    ) -> usize {
+    ) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
+        self.cmd_tx
             .send(NetworkCmd::BroadcastChannelFrame {
                 channel: channel.to_string(),
                 payload,
                 reply,
             })
-            .is_err()
-        {
-            return 0;
-        }
-        rx.await.unwrap_or(0)
+            .map_err(|error| error.into_admission_error())?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped broadcast reply".into()))
     }
 
     /// Persist `device_id` into the per-network roster. Does NOT
@@ -1583,8 +1830,8 @@ impl NetworkState {
 
     /// Synchronous roster commit used by an already-serialized runtime owner.
     ///
-    /// The public compatibility operation remains async, but the underlying
-    /// roster mutation and file replacement contain no await point. Arc 03
+    /// The public facade remains async, but the underlying roster mutation and
+    /// file replacement contain no await point. The admitted handshake path
     /// uses this form while holding the exact peer-installation fence so a
     /// replacement cannot land between owner validation and persistence.
     pub(super) fn approve_roster_now(&self, device_id: &str, label: &str) -> Result<()> {
@@ -1748,7 +1995,9 @@ impl NetworkState {
     /// emit this *before* dropping the signaling driver and give it a brief
     /// moment to reach the relays.
     pub fn announce_departure(&self) {
-        let _ = self.signaling_tx.send(SignalingOutbound::Leave);
+        if let Err(error) = self.signaling_tx.send(SignalingOutbound::Leave) {
+            tracing::warn!(error = %error.into_admission_error(), "departure announcement was refused");
+        }
     }
 
     /// Queue an in-place reconnect on the engine driver — redial signaling and
@@ -1760,7 +2009,9 @@ impl NetworkState {
     /// [`NetworkCmd::Reconnect`] so it's serialized with every other per-peer
     /// mutation. See [`super::network_watch::reconnect_all_in_place`].
     pub fn reconnect(&self, peer: Option<String>) {
-        let _ = self.cmd_tx.send(NetworkCmd::Reconnect { peer });
+        if let Err(error) = self.cmd_tx.send(NetworkCmd::Reconnect { peer }) {
+            tracing::warn!(error = %error.into_admission_error(), "reconnect command was refused");
+        }
     }
 
     /// Queue a deliberate offerer-side dial of exactly one peer on the engine
@@ -1770,11 +2021,13 @@ impl NetworkState {
     /// like [`Self::reconnect`]; the work runs on the driver via
     /// [`NetworkCmd::ConnectPeer`]. Backs [`crate::JoinedNetwork::connect_peer`].
     pub fn connect_peer(&self, device_id: &str) {
-        let _ = self.cmd_tx.send(NetworkCmd::ConnectPeer {
+        if let Err(error) = self.cmd_tx.send(NetworkCmd::ConnectPeer {
             device_id: device_id.to_string(),
             sticky: false,
             reply: None,
-        });
+        }) {
+            tracing::warn!(error = %error.into_admission_error(), peer = %device_id, "connect command was refused");
+        }
     }
 
     /// Deliberately dial one peer and resolve when the link reaches
@@ -1799,7 +2052,7 @@ impl NetworkState {
                     cancelled: Arc::clone(&cancelled),
                 }),
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         let mut cancellation = ConnectWaitCancellation {
             state: self,
             device_id: device_id.to_string(),
@@ -1832,7 +2085,7 @@ impl NetworkState {
                 payload,
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped the reliable send".into()))?
     }

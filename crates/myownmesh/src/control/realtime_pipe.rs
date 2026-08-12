@@ -1,0 +1,387 @@
+//! The binary `realtime_pipe` connections: what one is bound to, and the two
+//! pumps that move units across it.
+//!
+//! Frame-shaped work only. Admission is settled before either pump starts —
+//! the binding is resolved and checked against its direction first — and every
+//! refusal these can meet is core's, forwarded rather than interpreted. The
+//! frame layout itself is not defined here; these read and write it.
+
+use anyhow::Result;
+use tokio::io::AsyncWriteExt;
+use tracing::{debug, warn};
+
+use myownmesh_core::realtime as core_realtime;
+use myownmesh_core::transport as core_webrtc;
+
+use super::{
+    decode_realtime_send_unit, encode_realtime_recv_unit_with_ceiling, ControlState,
+    FrameAdmission, RealtimePipeDirection, RealtimeRecvUnit, REALTIME_FRAME_HEADER,
+};
+
+/// What one realtime pipe is bound to, once its fields have been checked
+/// against its direction.
+///
+/// The two directions carry different bindings because they are bound to
+/// different things: an outbound pipe to one exact flow, an inbound pipe to one
+/// session's whole unit stream. A single struct with optional fields would make
+/// "which of these is authority here" a question every reader has to re-derive.
+pub(super) enum RealtimePipeBinding {
+    /// Writes to the one flow `flow_capability` names, on the client that owns
+    /// it. No peer: there is nothing left to resolve.
+    Outbound {
+        network: String,
+        flow_capability: String,
+    },
+    /// Claims the whole inbound unit stream of the session `peer` currently
+    /// resolves to. The claim is the authority and it is taken once.
+    Inbound { network: String, peer: String },
+}
+
+/// Validate a [`Request::RealtimePipe`]'s fields against its direction.
+///
+/// Every field is required or refused; none is accepted and ignored. A pipe
+/// that took a field and dropped it would read, from the client's side, exactly
+/// like one that honoured it — and for `peer` on an outbound pipe that
+/// misreading is the finding itself, a client believing its units are bound to
+/// a peer when what actually binds them is a flow.
+pub(super) fn realtime_pipe_binding(
+    direction: RealtimePipeDirection,
+    network: &str,
+    peer: Option<&str>,
+    flow_capability: Option<&str>,
+) -> std::result::Result<RealtimePipeBinding, String> {
+    if network.trim().is_empty() {
+        return Err("realtime_pipe requires a network".to_string());
+    }
+    match direction {
+        RealtimePipeDirection::Outbound => {
+            if peer.is_some() {
+                return Err(
+                    "realtime_pipe outbound takes no peer: it writes to the exact flow \
+                     its flow_capability names, and a peer selector here would be \
+                     re-resolved per unit — which is how a pipe outliving its session \
+                     ended up writing into the replacement's flow of the same name"
+                        .to_string(),
+                );
+            }
+            let Some(flow_capability) = flow_capability else {
+                return Err(
+                    "realtime_pipe outbound requires a flow_capability: the value \
+                     realtime_flow_open issued is the only thing that authorizes a write"
+                        .to_string(),
+                );
+            };
+            Ok(RealtimePipeBinding::Outbound {
+                network: network.to_string(),
+                flow_capability: flow_capability.to_string(),
+            })
+        }
+        RealtimePipeDirection::Inbound => {
+            if flow_capability.is_some() {
+                return Err(
+                    "realtime_pipe inbound takes no flow_capability: it claims a \
+                     session's whole unit stream rather than one flow, and every unit \
+                     carries the name of the flow it arrived on"
+                        .to_string(),
+                );
+            }
+            let Some(peer) = peer.filter(|peer| !peer.trim().is_empty()) else {
+                return Err(
+                    "realtime_pipe inbound requires a peer: the stream it claims \
+                     belongs to one session"
+                        .to_string(),
+                );
+            };
+            Ok(RealtimePipeBinding::Inbound {
+                network: network.to_string(),
+                peer: peer.to_string(),
+            })
+        }
+    }
+}
+
+/// Read length-prefixed units off an outbound [`Request::RealtimePipe`] and hand
+/// each to the **one flow this pipe is bound to**.
+///
+/// Sends nothing back per unit: errors are logged rather than answered, which is
+/// the whole latency win — a per-unit acknowledgement would put a round trip on
+/// the media path. Returns when the client disconnects.
+///
+/// **Nothing here resolves a selector, and nothing here re-resolves anything.**
+/// The pipe holds a flow capability, the capability names one move-only handle
+/// the owning client stored at open, and that handle names one exact session and
+/// one exact flow record. This is the correction: the version this replaces kept
+/// `network + peer` and re-resolved them for every unit, so a pipe whose session
+/// had ended went on writing until the peer's next session came up and then
+/// delivered into *that* one, under labels chosen for a session that no longer
+/// existed — with nothing to notice, because nothing on this path is
+/// acknowledged.
+///
+/// The frame's `flow_label` survives as a wire coordinate and is checked, not
+/// obeyed: a unit naming a different flow than this pipe is bound to is dropped
+/// rather than rerouted. A client with two flows open has two pipes.
+pub(super) async fn run_realtime_outbound_pipe<R>(
+    net: &myownmesh_core::JoinedNetwork,
+    owner: &crate::ipc::ClientHandle,
+    flow_capability: &str,
+    network: &str,
+    mut reader: R,
+    admission: &FrameAdmission,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        // A clean EOF (the client closed the pipe) ends the loop; a short read
+        // is a torn frame and ends it too — the stream is no longer framed, so
+        // nothing after this point can be trusted to be a unit boundary.
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            return Ok(());
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        // Admitted before a single byte of it is allocated, which is what makes
+        // the length prefix safe to believe: a client that announces a frame
+        // this daemon was not granted the memory for gets no allocation at all.
+        // The lease is held for this iteration, which spans the body, the
+        // decoded unit and the send — everything the frame's bytes live in — and
+        // is released when the iteration ends, by any exit.
+        let _frame = match admission.admit(len) {
+            Ok(frame) => frame,
+            Err(refusal) => {
+                warn!("realtime frame of {len} bytes not admitted: {refusal} — dropping pipe");
+                return Ok(());
+            }
+        };
+        let mut body = vec![0u8; len];
+        if reader.read_exact(&mut body).await.is_err() {
+            return Ok(());
+        }
+        let Some(unit) = decode_realtime_send_unit(&body) else {
+            warn!("malformed realtime send unit ({len} bytes) — skipped");
+            continue;
+        };
+        // Two forms of the same name, and only one of them is authority: the
+        // bytes go to core, and the lossy rendering exists solely so a refusal
+        // can name the flow in a log line. A label is opaque application bytes,
+        // so it has no guaranteed text form and none is invented for the wire.
+        let logged = label_for_log(&unit.flow_label);
+        let label = unit.flow_label;
+        // No marker: an outbound unit does not carry one, at any layer. The
+        // marker bit states something about packetization that the flow's
+        // framing policy decides and the packetizer alone is positioned to get
+        // right, so a value supplied from here could only contradict it. The
+        // wire byte that would have held it is reserved zero and refused
+        // otherwise, which is what stops a client from believing it still has a
+        // say.
+        let outbound = core_webrtc::WebRtcRealtimeOutboundUnit {
+            duration: std::time::Duration::from_micros(u64::from(unit.duration_us)),
+            data: unit.payload.into(),
+        };
+        // Lent for exactly this unit and never held: the borrow ends with the
+        // closure, so the daemon's stored handle stays the only one and a close
+        // arriving on another connection is not racing a copy.
+        //
+        // Synchronous by design: the unit is authorized against the session and
+        // enqueued before this returns, so a refusal is attributable to the unit
+        // that caused it rather than surfacing later against an unrelated one.
+        let sent = owner.with_realtime_flow(flow_capability, network, |flow| {
+            // The label is compared, not resolved. It grants nothing — the flow
+            // is already chosen — so a mismatch is a client naming one of its
+            // own flows on the wrong pipe, which is worth telling it about and
+            // is never worth guessing at.
+            if flow.label() != label.as_slice() {
+                return Err(None);
+            }
+            net.send_webrtc_realtime(flow, outbound).map_err(Some)
+        });
+        let Some(sent) = sent else {
+            // The flow was closed while this pipe was running — by this client
+            // on another connection, or by its disconnect drain. There is
+            // nothing left to write to, and the pipe ends rather than idling
+            // against a capability that will never resolve again.
+            debug!(
+                label = %logged,
+                "realtime outbound pipe closing: its flow is no longer held by this client"
+            );
+            return Ok(());
+        };
+        match sent {
+            Ok(()) => {}
+            Err(None) => {
+                debug!(
+                    label = %logged,
+                    "realtime unit names a different flow than this pipe is bound to — dropped"
+                );
+            }
+            // `SessionNotCurrent` ENDS THE PIPE. Every other refusal is about
+            // one unit and the next one may well succeed, but this one says the
+            // session this pipe's flow belonged to is gone — and because the
+            // flow handle is exact, that is now the *only* thing it can mean.
+            // It can no longer be a peer that has been replaced under a name
+            // this pipe kept resolving.
+            //
+            // Closing hands the failure to the one party that can resolve it:
+            // the client sees its pipe drop, and reopening a flow forces a
+            // fresh binding against whatever session is current now.
+            Err(Some(refusal)) => {
+                if matches!(refusal, core_realtime::RealtimeRefusal::SessionNotCurrent) {
+                    warn!(
+                        label = %logged,
+                        code = refusal.code(),
+                        "realtime outbound pipe closing: its session is no longer current"
+                    );
+                    return Ok(());
+                }
+                debug!(label = %logged, code = refusal.code(), "realtime send refused");
+            }
+        }
+    }
+}
+
+/// Release everything a removed client still holds in its networks: every
+/// realtime flow it had open, and every synthetic handler it was the last
+/// claimant of.
+///
+/// Called when that client's event stream ends, however it ended. Both halves
+/// are here because both have the same shape — the registry can say *what* is
+/// outstanding but not release it, since releasing needs a `JoinedNetwork` and
+/// an await, and the registry holds neither.
+///
+/// Dropping a flow handle would be silent and wrong: a handle is non-owning by
+/// design, so dropping one releases neither the label nor the transceiver or
+/// sender behind it, and a client that crashed would leave both held until its
+/// session happened to end. Each flow is taken out of the client's table before
+/// its close runs, so a close racing this drain reaches core at most once for a
+/// given flow.
+///
+/// A handler left installed is the quieter version of the same leak: it holds
+/// the retention the engine funded for it and answers "no claim" to every
+/// caller. `forget` names only the claims nothing else took over, so a method a
+/// displacing client now owns is not removed from under it.
+///
+/// Refusals are ignored rather than reported: there is nobody left to report to,
+/// and every refusal this can produce means the thing was already gone.
+pub(super) async fn release_owned_registrations(
+    state: &ControlState,
+    removed: &crate::ipc::UnregisteredClient,
+) {
+    for (network, flow) in removed.handle.drain_realtime_flows() {
+        let Some(net) = state.registry.get(&network) else {
+            continue;
+        };
+        let _ = net.close_realtime(flow).await;
+    }
+    for (network, method) in &removed.forget {
+        let Some(net) = state.registry.get(network) else {
+            continue;
+        };
+        crate::ipc::bridge::forget_handler(&net, method);
+    }
+}
+
+/// Render a flow label for a log line, and for nothing else.
+///
+/// A label is opaque application bytes with no guaranteed text form, so this is
+/// lossy by construction and its output must never reach the wire, a response,
+/// or a lookup: two distinct labels can render identically, which is harmless in
+/// a diagnostic and would be a routing bug anywhere else.
+fn label_for_log(label: &[u8]) -> String {
+    String::from_utf8_lossy(label).into_owned()
+}
+
+/// Push units for the bound session's inbound flows to a client's binary pipe.
+///
+/// One-way (daemon → client) apart from EOF, which ends the loop. Each unit goes
+/// out as `[u32 len][body]`, and the body's `flow_label` — delivered alongside
+/// the unit rather than looked up — names which flow it belongs to. The session
+/// is already fixed by the pipe's binding, which is what lets the body stay
+/// this small.
+///
+/// The two exits are the only two things that can happen: the client leaves, or
+/// the session ends. `None` from the stream is terminal and means the latter;
+/// there is no retirement flag to check and nothing to distinguish, because a
+/// session that ended has taken every flow with it.
+pub(super) async fn run_realtime_inbound_pipe<R, W>(
+    net: &myownmesh_core::JoinedNetwork,
+    peer: &str,
+    inbound: &core_realtime::RealtimeInboundStream,
+    mut reader: R,
+    writer: &mut W,
+    admission: &FrameAdmission,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut probe = [0u8; 1];
+    loop {
+        let arrival = tokio::select! {
+            biased;
+            // The client never writes on an inbound pipe, so any completed read
+            // — a stray byte, or normally EOF — means it is gone. Biased first
+            // so a departure is noticed on the same poll rather than waiting out
+            // an idle session that may never produce another unit.
+            _ = reader.read(&mut probe) => return Ok(()),
+            arrival = net.recv_webrtc_realtime_any(inbound) => arrival,
+        };
+        let Some(arrival) = arrival else {
+            debug!(%peer, "realtime inbound stream ended (session over)");
+            return Ok(());
+        };
+        let framed_len = REALTIME_FRAME_HEADER
+            .checked_add(arrival.label.len())
+            .and_then(|length| length.checked_add(arrival.unit.data.len()));
+        let Some(framed_len) = framed_len else {
+            warn!(%peer, bytes = arrival.unit.data.len(), "realtime unit cannot be framed — dropped");
+            continue;
+        };
+        // Funded for this iteration, which covers the copy into `unit` and the
+        // encoded body written from it. Inbound units are core's to produce and
+        // this daemon's to hold on their way out, so they are accounted here
+        // even though no local client chose their size — a session sending
+        // faster than a client reads is exactly when this has to hold.
+        let _frame = match admission.admit(framed_len) {
+            Ok(frame) => frame,
+            Err(refusal) => {
+                warn!(%peer, bytes = arrival.unit.data.len(), "realtime unit not admitted: {refusal} — dropped");
+                continue;
+            }
+        };
+        let unit = RealtimeRecvUnit {
+            flow_label: arrival.label,
+            marker: arrival.unit.marker,
+            rtp_timestamp: arrival.unit.rtp_timestamp,
+            payload: arrival.unit.data.to_vec(),
+        };
+        let Some(body) = encode_realtime_recv_unit_with_ceiling(&unit, admission.framing_ceiling())
+        else {
+            // Larger than the framing can express. Dropped here, and the pipe
+            // continues: the alternative is writing a frame whose length prefix
+            // or inner length is wrong, which the client cannot interpret and
+            // cannot resynchronise from — one unit it could not have used
+            // becomes every unit after it. One flow's oversized unit is not a
+            // reason to take down a session's whole inbound path.
+            warn!(
+                %peer,
+                label = %label_for_log(&unit.flow_label),
+                bytes = unit.payload.len(),
+                "realtime unit too large to frame — dropped"
+            );
+            continue;
+        };
+        // Cannot truncate: `encode_realtime_recv_unit` returned `Some`, so the
+        // body is within the owner-selected ceiling and the u32 wire length.
+        let len = (body.len() as u32).to_le_bytes();
+        if writer.write_all(&len).await.is_err()
+            || writer.write_all(&body).await.is_err()
+            || writer.flush().await.is_err()
+        {
+            return Ok(());
+        }
+    }
+}

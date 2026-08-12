@@ -7,42 +7,83 @@
 //! Lifetime model:
 //!
 //! - **Handlers** are installed lazily on first claim of a
-//!   `(network, method)` pair and left in place forever. After
-//!   the last claim is released the synthetic handler still
-//!   sits in the engine's `Rpc` dispatch table; if invoked
-//!   with no current owner it answers with a "no handler"
-//!   error to the peer rather than panicking. This avoids the
-//!   complexity of safely tearing handlers down across
-//!   re-claims and matches how the library-level `Rpc::serve`
-//!   semantics work (overwrite on re-register).
+//!   `(network, method)` pair and forgotten on the last unclaim —
+//!   whether that unclaim is an explicit `RpcUnregister` or the
+//!   disconnect of the client that held it. Installing is an
+//!   admission the engine can refuse, and the refusal is answered
+//!   to the claiming client rather than swallowed: a claim whose
+//!   handler was never installed would route nothing.
+//!
+//!   They used to be left in place forever, on the reasoning that a
+//!   re-claim would save the install. That was a real saving and it
+//!   was paid for in the wrong currency: each installed handler
+//!   holds its own retention in the network's gateway scope, and a
+//!   local client that claimed many methods and left could strand
+//!   all of it indefinitely. A handler still answers "no claim"
+//!   truthfully if invoked between the last unclaim and its
+//!   removal, so nothing depends on the two being simultaneous.
 //!
 //! - **Channel pumps** are scoped to subscribers: the first
 //!   subscribe spawns a forwarder task, the last unsubscribe
 //!   drops the receiver and the task exits on its next loop
-//!   iteration. Each task holds an
-//!   `mpsc::Receiver<broadcast::Receiver<...>>`-shaped weak
-//!   reference so a swept-away registry doesn't keep tasks
-//!   alive.
+//!   iteration. Each task holds a weak reference to the registry rather than
+//!   a strong one, so a swept-away registry doesn't keep tasks alive.
 
-use myownmesh_core::JoinedNetwork;
+use myownmesh_core::application_gateway::GatewayRefusal;
+use myownmesh_core::{JoinedNetwork, ResourceMailboxAdmissionError};
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::clients::{ClientRegistry, HandlerMode, PendingInbound, PendingKey};
+use super::clients::{ClientRegistry, HandlerMode, IpcAdmissionError, PendingInbound, PendingKey};
 use super::wire::ServerOut;
+
+/// Drop the synthetic handler for one method from a network's dispatcher.
+///
+/// Called on the last unclaim — an explicit `RpcUnregister`, or the disconnect
+/// of the client that held the claim. Idempotent in the engine, so a caller that
+/// cannot tell whether it was the last claimant is free to ask anyway; the
+/// registry answers that question exactly, and both of its answers are honoured
+/// here without a second check.
+///
+/// Lives beside the installs rather than at the call sites so that what is
+/// installed and what is removed stay one decision. The engine's own `forget`
+/// takes only the method name because a dispatcher belongs to one network
+/// already — the `(network, method)` pair is this crate's key, not core's.
+pub fn forget_handler(network: &JoinedNetwork, method: &str) {
+    network.rpc().forget(method);
+}
+
+/// Why one channel pump could not be started.
+///
+/// Kept as two arms because the caller's remedy is the same but the operator's
+/// reading of them is not: a refused subscription means the gateway is closed
+/// or under pressure for that channel, while a refused task means this daemon
+/// is at its accounted concurrency. Collapsing them into one string would make
+/// a capacity problem look like a channel problem.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelPumpError {
+    #[error("channel subscription was refused: {0}")]
+    Subscribe(myownmesh_core::ChannelError),
+    #[error("channel pump task could not be accounted: {0}")]
+    Task(IpcAdmissionError),
+}
 
 /// Install (or re-install) a synthetic single-shot RPC handler
 /// for `(network_id, method)` on this network's `Rpc`
 /// dispatcher. The handler emits `RpcInbound` to whichever
 /// client currently owns the claim and awaits an `RpcRespond`
 /// to resolve.
+///
+/// Installing is an admission: the engine funds the handler's retention out of
+/// the network's gateway scope and can refuse. The refusal is returned rather
+/// than discarded, because a claim recorded against a handler that was never
+/// installed is a client told it is serving a method that will never reach it.
 pub fn install_single_handler(
     network: &JoinedNetwork,
     network_key: String,
     method: String,
     registry: ClientRegistry,
-) {
+) -> Result<(), GatewayRefusal> {
     let rpc = network.rpc();
     let key = (network_key.clone(), method.clone());
     rpc.serve(&method, move |call| {
@@ -72,9 +113,19 @@ pub fn install_single_handler(
                 PendingInbound::Single(tx),
             ) {
                 Ok(ticket) => ticket,
-                Err(_) => return Err("duplicate inbound RPC coordinates already pending".into()),
+                // The reason reaches the peer. Colliding coordinates, an owner
+                // that left, and a daemon out of capacity are three different
+                // things to be told, and this used to report all three as the
+                // first — sending a peer to fix coordinates that were fine.
+                Err(rejected) => return Err(rejected.reason.to_string()),
             };
-            client.send(ServerOut::RpcInbound {
+            // A frame the owner's mailbox will not admit is reported to the
+            // peer here rather than dropped. Dropping it would leave the
+            // pending entry installed and the caller waiting on a request no
+            // client was ever told about, which resolves only as a timeout —
+            // an outcome indistinguishable from a peer that went away.
+            // Returning drops the ticket, which removes the pending entry.
+            if let Err(refusal) = client.send(ServerOut::RpcInbound {
                 network: key.0.clone(),
                 from: call.from.clone(),
                 request_id: call.request_id.clone(),
@@ -82,7 +133,11 @@ pub fn install_single_handler(
                 method: call.method.clone(),
                 payload: call.payload.clone(),
                 streaming: call.streaming,
-            });
+            }) {
+                return Err(format!(
+                    "IPC handler owner could not be given the inbound call: {refusal}"
+                ));
+            }
             // Await this owner's `RpcRespond`. Disconnect and displacement
             // remove this exact operation and settle the oneshot with a
             // truthful error; a later claimant cannot answer it.
@@ -94,22 +149,24 @@ pub fn install_single_handler(
             drop(ticket);
             result
         }
-    });
+    })
 }
 
 /// Install (or re-install) a synthetic streaming RPC handler.
-/// Mirrors [`install_single_handler`] but stashes an
-/// `mpsc::Sender<RpcStreamItem>` in the pending table instead
+/// Mirrors [`install_single_handler`] but stashes a resource-funded
+/// `ResourceMailboxSender<RpcStreamItem>` in the pending table instead
 /// of a `oneshot`; chunks land via `RpcStreamChunk`, and
 /// `RpcStreamEnd` terminates the stream with an explicit
 /// `RpcStreamItem::End` carrying clean completion or the
 /// client's error.
+///
+/// Fallible for the same reason [`install_single_handler`] is.
 pub fn install_stream_handler(
     network: &JoinedNetwork,
     network_key: String,
     method: String,
     registry: ClientRegistry,
-) {
+) -> Result<(), GatewayRefusal> {
     let rpc = network.rpc();
     let key = (network_key.clone(), method.clone());
     rpc.serve_stream(&method, move |call| {
@@ -125,15 +182,15 @@ pub fn install_stream_handler(
             let Some(client) = registry.client(owner_id) else {
                 return Err("handler owner client disconnected".into());
             };
-            // The capacity is the local Application Gateway owner's selected
-            // policy, read from the registry rather than chosen here. It is not
-            // borrowed from a peer or transport queue — those capacities answer
-            // an unrelated question — and it is deliberately not a constant: a
-            // number written into this line would be a second owner of a
-            // decision that already has one.
+            // No item count. This queue is bounded by what the process owner
+            // funded, measured per chunk, rather than by a number of chunks —
+            // which is the only bound that is true of a stream whose items have
+            // no fixed size. A capacity of N said nothing about how much memory
+            // N chunks would hold.
             //
-            // Streaming responses that exceed it block the IPC client until the
-            // engine drains, which is the right back-pressure direction.
+            // Its own subtree, so everything one stream retains is released as
+            // a unit when the stream ends rather than lingering in the
+            // registry's scope for the daemon's lifetime.
             //
             // The send side is stashed in `exact_pending_inbound`; chunks land
             // via `RpcStreamChunk`. The stream ends with an explicit terminal
@@ -142,9 +199,25 @@ pub fn install_stream_handler(
             // survives to the peer instead of being flattened into a silent
             // close. A sender that disappears without one is a failure rather
             // than an end, which is what makes the watchdog below necessary.
-            let (tx, rx) = mpsc::channel::<myownmesh_core::rpc::RpcStreamItem>(
-                registry.stream_capacity().get(),
-            );
+            let resources = match registry.child_resources() {
+                Ok(resources) => resources,
+                Err(refusal) => {
+                    return Err(format!(
+                        "inbound streaming RPC queue could not be scoped: {refusal}"
+                    ))
+                }
+            };
+            let (tx, rx) = match myownmesh_core::resource_mailbox::<
+                myownmesh_core::rpc::RpcStreamItem,
+            >(resources)
+            {
+                Ok(mailbox) => mailbox,
+                Err(refusal) => {
+                    return Err(format!(
+                        "inbound streaming RPC queue could not be funded: {refusal}"
+                    ))
+                }
+            };
             let pending_key = PendingKey {
                 network: key.0.clone(),
                 method: key.1.clone(),
@@ -159,13 +232,16 @@ pub fn install_stream_handler(
                 PendingInbound::Stream(tx),
             ) {
                 Ok(ticket) => ticket,
-                Err(_) => {
-                    return Err(
-                        "duplicate inbound streaming RPC coordinates already pending".into(),
-                    )
-                }
+                // Same three outcomes as the single-shot handler, reported
+                // apart for the same reason.
+                Err(rejected) => return Err(rejected.reason.to_string()),
             };
-            client.send(ServerOut::RpcInbound {
+            // Same reasoning as the single-shot handler: a frame the owner's
+            // mailbox refuses is reported to the peer rather than dropped.
+            // Returning here drops `ticket` and `close_probe` before the
+            // watchdog below is spawned, so the pending entry leaves with them
+            // and no stream is left waiting for chunks nothing will send.
+            if let Err(refusal) = client.send(ServerOut::RpcInbound {
                 network: key.0.clone(),
                 from: call.from.clone(),
                 request_id: call.request_id.clone(),
@@ -173,8 +249,29 @@ pub fn install_stream_handler(
                 method: call.method.clone(),
                 payload: call.payload.clone(),
                 streaming: call.streaming,
-            });
+            }) {
+                return Err(format!(
+                    "IPC handler owner could not be given the inbound streaming call: {refusal}"
+                ));
+            }
+            // The watchdog is what eventually drops the ticket and its pending
+            // entry, so it is funded before it is spawned and the refusal is
+            // reported to the peer. An unfunded watchdog would mean either no
+            // watchdog — leaving the pending entry installed with nothing left
+            // to remove it — or one running unaccounted. Returning here drops
+            // `ticket` and `close_probe` together, which removes the entry and
+            // settles the stream, so the refusal path needs no separate
+            // cleanup.
+            let task = match registry.lease_task() {
+                Ok(task) => task,
+                Err(refusal) => {
+                    return Err(format!(
+                        "inbound streaming RPC could not be accounted: {refusal}"
+                    ))
+                }
+            };
             tokio::spawn(async move {
+                let _task = task;
                 tokio::select! {
                     () = close_probe.closed() => {}
                     () = ticket.cancelled() => {}
@@ -184,7 +281,7 @@ pub fn install_stream_handler(
             });
             Ok(rx)
         }
-    });
+    })
 }
 
 /// Spawn the per-channel fan-out task for an IPC subscription
@@ -199,16 +296,27 @@ pub fn install_stream_handler(
 /// The task lives by polling the channel's broadcast receiver.
 /// If the network is torn down (`recv` returns `Closed`) or
 /// the subscriber set becomes empty between frames, it exits.
+/// Subscription is a resource admission and can be refused, so this reports
+/// rather than starts a pump that would never receive anything. The caller
+/// answers the requesting client with the refusal instead of recording a
+/// subscription the daemon does not actually hold.
 pub fn spawn_channel_pump(
     network: &JoinedNetwork,
     network_key: String,
     channel_name: String,
     registry: ClientRegistry,
-) {
+) -> std::result::Result<(), ChannelPumpError> {
     let channel = network.channel::<Value>(&channel_name);
-    let mut sub = channel.subscribe();
+    let mut sub = channel.subscribe().map_err(ChannelPumpError::Subscribe)?;
+    // Funded before the pump exists, and for the same reason the subscription
+    // is checked first: this reports rather than starting a pump the daemon
+    // cannot account for. Both refusals reach the caller before any subscriber
+    // state is recorded, so there is nothing to unwind here — the caller undoes
+    // its own registry entry and tells the client.
+    let task = registry.lease_task().map_err(ChannelPumpError::Task)?;
     let key = (network_key.clone(), channel_name.clone());
     tokio::spawn(async move {
+        let _task = task;
         loop {
             // Exit early if no subscribers remain.
             let subscribers = registry.channel_subscribers(&key);
@@ -238,7 +346,29 @@ pub fn spawn_channel_pump(
                     };
                     for client_id in subscribers {
                         if let Some(client) = registry.client(client_id) {
-                            client.send(frame.clone());
+                            // Fan-out has nobody to answer: the frame came off
+                            // a broadcast and no peer is waiting on this
+                            // subscriber in particular. A refusal is therefore
+                            // logged rather than propagated — but it is logged,
+                            // because a subscriber silently missing a channel
+                            // message is the failure this pump exists to make
+                            // visible. `Closed` is the ordinary disconnect race
+                            // and stays at debug.
+                            match client.send(frame.clone()) {
+                                Ok(()) => {}
+                                Err(ResourceMailboxAdmissionError::Closed) => debug!(
+                                    network = %key.0,
+                                    channel = %key.1,
+                                    client = %client_id,
+                                    "channel frame dropped: subscriber disconnected"
+                                ),
+                                Err(refusal) => warn!(
+                                    network = %key.0,
+                                    channel = %key.1,
+                                    client = %client_id,
+                                    "channel frame refused for a connected subscriber: {refusal}"
+                                ),
+                            }
                         }
                     }
                 }
@@ -252,6 +382,7 @@ pub fn spawn_channel_pump(
             }
         }
     });
+    Ok(())
 }
 
 /// `myownmesh-core`'s `Rpc::serve` wants an
@@ -271,11 +402,31 @@ pub fn notify_displaced(
     method: String,
 ) {
     if let Some(client) = registry.client(prev_owner) {
-        client.send(ServerOut::HandlerDisplaced {
+        // The displacement has already happened in the registry; this frame
+        // only tells the loser about it. There is no caller to refuse and no
+        // way to undo the claim transfer, so a refusal is recorded and the
+        // displaced client is left to notice through its own failing calls.
+        let network_id = network.clone();
+        let displaced_method = method.clone();
+        match client.send(ServerOut::HandlerDisplaced {
             network,
             method,
             by: by.to_string(),
-        });
+        }) {
+            Ok(()) => {}
+            Err(ResourceMailboxAdmissionError::Closed) => debug!(
+                network = %network_id,
+                method = %displaced_method,
+                client = %prev_owner,
+                "displacement notice dropped: displaced client had already disconnected"
+            ),
+            Err(refusal) => warn!(
+                network = %network_id,
+                method = %displaced_method,
+                client = %prev_owner,
+                "connected client was displaced but could not be told: {refusal}"
+            ),
+        }
     }
 }
 
@@ -289,7 +440,7 @@ pub fn install_handler_for_mode(
     method: String,
     mode: HandlerMode,
     registry: ClientRegistry,
-) {
+) -> Result<(), GatewayRefusal> {
     match mode {
         HandlerMode::Single => install_single_handler(network, network_key, method, registry),
         HandlerMode::Stream => install_stream_handler(network, network_key, method, registry),
@@ -337,14 +488,12 @@ mod tests {
 
     impl BridgeTestDrivers {
         async fn shutdown(mut self) {
-            let _ = self
-                .alice
-                .cmd_tx
-                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
-            let _ = self
-                .bob
-                .cmd_tx
-                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
+            // The owner-held coalesced signal, not a queued command: it sets the
+            // flag, wakes the waiters and closes both queues itself, so it
+            // cannot be dropped or outranked by payload traffic the way a
+            // command competing in the same mailbox could be.
+            self.alice.request_shutdown();
+            self.bob.request_shutdown();
             while let Some(driver) = self.drivers.pop() {
                 let _ = driver.await;
             }
@@ -353,14 +502,11 @@ mod tests {
 
     impl Drop for BridgeTestDrivers {
         fn drop(&mut self) {
-            let _ = self
-                .alice
-                .cmd_tx
-                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
-            let _ = self
-                .bob
-                .cmd_tx
-                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
+            // Idempotent by construction, so the explicit `shutdown` above and
+            // this backstop can both run: the flag is a store and the queue
+            // closes are already-closed no-ops on the second call.
+            self.alice.request_shutdown();
+            self.bob.request_shutdown();
         }
     }
 
@@ -455,8 +601,14 @@ mod tests {
         let (bob_state, bob_driver) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
-        let alice_rpc = Arc::new(myownmesh_core::rpc::Rpc::attach(&alice_state));
-        let bob_rpc = Arc::new(myownmesh_core::rpc::Rpc::attach(&bob_state));
+        let alice_rpc = Arc::new(
+            myownmesh_core::rpc::Rpc::attach(&alice_state)
+                .expect("Alice's live gateway admits its RPC owner"),
+        );
+        let bob_rpc = Arc::new(
+            myownmesh_core::rpc::Rpc::attach(&bob_state)
+                .expect("Bob's live gateway admits its RPC owner"),
+        );
 
         let mut alice_events = alice_state.events_tx.subscribe();
         let mut bob_events = bob_state.events_tx.subscribe();
@@ -495,13 +647,19 @@ mod tests {
             two_peer_rpc("ipc-bridge-single").await;
 
         // Simulate an IPC client on Alice's side.
-        let registry = ClientRegistry::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerOut>();
-        let client = registry.register(tx);
+        let registry = ClientRegistry::default();
+        let (tx, mut rx) =
+            myownmesh_core::resource_mailbox::<ServerOut>(crate::test_application_scope())
+                .expect("the daemon test grant funds this fixture client's writer mailbox");
+        let client = registry
+            .register(tx)
+            .expect("the daemon test grant funds this fixture client record");
         let net_key = "alice".to_string();
         let method = "echo".to_string();
         let key = (net_key.clone(), method.clone());
-        registry.claim_method(key.clone(), client.id, HandlerMode::Single);
+        registry
+            .claim_method(key.clone(), client.id, HandlerMode::Single)
+            .expect("the daemon test grant funds this fixture's method claim");
 
         // The bridge needs a `JoinedNetwork` — but we have the
         // state directly. The synthetic handler only needs to
@@ -509,51 +667,64 @@ mod tests {
         // do via the lower-level `attach` path mirroring what
         // `install_single_handler` does, but inlined here so
         // we don't need a `JoinedNetwork` facade.
+        //
+        // Both admissions are asserted rather than discarded. This fixture is
+        // pointless if the handler is not actually installed, and a discarded
+        // refusal would have turned that into a mysteriously silent peer.
         let registry_for_handler = registry.clone();
         let key_for_handler = key.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state).serve("echo", move |call| {
-            let registry = registry_for_handler.clone();
-            let key = key_for_handler.clone();
-            async move {
-                let owner = registry
-                    .handler_owner(&key)
-                    .ok_or_else(|| "no claim".to_string())?;
-                let client = registry
-                    .client(owner)
-                    .ok_or_else(|| "owner gone".to_string())?;
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                let pending_key = PendingKey {
-                    network: key.0.clone(),
-                    method: key.1.clone(),
-                    remote_peer: call.from.clone(),
-                    remote_request_id: call.request_id.clone(),
-                    class: HandlerMode::Single,
-                };
-                let Ok(ticket) = registry.insert_exact_pending(
-                    pending_key,
-                    owner,
-                    crate::ipc::clients::PendingInbound::Single(resp_tx),
-                ) else {
-                    return Err("duplicate".into());
-                };
-                client.send(ServerOut::RpcInbound {
-                    network: key.0.clone(),
-                    from: call.from.clone(),
-                    request_id: call.request_id.clone(),
-                    operation_id: ticket.operation_id(),
-                    method: call.method.clone(),
-                    payload: call.payload.clone(),
-                    streaming: call.streaming,
-                });
-                let result = match resp_rx.await {
-                    Ok(Ok(p)) => Ok(myownmesh_core::rpc::RpcResponse::from_value(p)),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err("handler dropped".into()),
-                };
-                drop(ticket);
-                result
-            }
-        });
+        myownmesh_core::rpc::Rpc::attach(&alice_state)
+            .expect("the fixture network's application gateway admits an Rpc")
+            .serve("echo", move |call| {
+                let registry = registry_for_handler.clone();
+                let key = key_for_handler.clone();
+                async move {
+                    let owner = registry
+                        .handler_owner(&key)
+                        .ok_or_else(|| "no claim".to_string())?;
+                    let client = registry
+                        .client(owner)
+                        .ok_or_else(|| "owner gone".to_string())?;
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    let pending_key = PendingKey {
+                        network: key.0.clone(),
+                        method: key.1.clone(),
+                        remote_peer: call.from.clone(),
+                        remote_request_id: call.request_id.clone(),
+                        class: HandlerMode::Single,
+                    };
+                    let Ok(ticket) = registry.insert_exact_pending(
+                        pending_key,
+                        owner,
+                        crate::ipc::clients::PendingInbound::Single(resp_tx),
+                    ) else {
+                        return Err("duplicate".into());
+                    };
+                    // Reported rather than asserted: this runs inside the engine's
+                    // handler task, where a panic would surface as a caller that
+                    // never settles. An error reaches the assertion in the test
+                    // body carrying its own reason.
+                    if let Err(refusal) = client.send(ServerOut::RpcInbound {
+                        network: key.0.clone(),
+                        from: call.from.clone(),
+                        request_id: call.request_id.clone(),
+                        operation_id: ticket.operation_id(),
+                        method: call.method.clone(),
+                        payload: call.payload.clone(),
+                        streaming: call.streaming,
+                    }) {
+                        return Err(format!("fixture client mailbox refused inbound: {refusal}"));
+                    }
+                    let result = match resp_rx.await {
+                        Ok(Ok(p)) => Ok(myownmesh_core::rpc::RpcResponse::from_value(p)),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err("handler dropped".into()),
+                    };
+                    drop(ticket);
+                    result
+                }
+            })
+            .expect("the fixture network admits one single-shot handler");
 
         // Bob calls the method.
         let alice_did = alice_id.public_id().to_string();
@@ -563,11 +734,13 @@ mod tests {
                 .await
         });
 
-        // Pull the RpcInbound off the simulated client mpsc.
+        // Pull the RpcInbound off the simulated client's writer mailbox.
         let inbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("inbound timeout")
-            .expect("inbound recv");
+            .expect("inbound recv")
+            .into_parts()
+            .0;
         let (network, from, request_id, operation_id, method, payload) = match inbound {
             ServerOut::RpcInbound {
                 network,
@@ -620,63 +793,83 @@ mod tests {
         let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id, drivers) =
             two_peer_rpc("ipc-bridge-stream").await;
 
-        let registry = ClientRegistry::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerOut>();
-        let client = registry.register(tx);
+        let registry = ClientRegistry::default();
+        let (tx, mut rx) =
+            myownmesh_core::resource_mailbox::<ServerOut>(crate::test_application_scope())
+                .expect("the daemon test grant funds this fixture client's writer mailbox");
+        let client = registry
+            .register(tx)
+            .expect("the daemon test grant funds this fixture client record");
         let key = ("alice".to_string(), "stream_echo".to_string());
-        registry.claim_method(key.clone(), client.id, HandlerMode::Stream);
+        registry
+            .claim_method(key.clone(), client.id, HandlerMode::Stream)
+            .expect("the daemon test grant funds this fixture's method claim");
 
         // Wire the synthetic stream handler. Identical to the
         // single-shot test but uses `serve_stream` + the
-        // `PendingInbound::Stream` arm.
+        // `PendingInbound::Stream` arm — including asserting both
+        // admissions rather than discarding them.
         let registry_for_handler = registry.clone();
         let key_for_handler = key.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state).serve_stream("stream_echo", move |call| {
-            let registry = registry_for_handler.clone();
-            let key = key_for_handler.clone();
-            async move {
-                let owner = registry
-                    .handler_owner(&key)
-                    .ok_or_else(|| "no claim".to_string())?;
-                let client = registry
-                    .client(owner)
-                    .ok_or_else(|| "owner gone".to_string())?;
-                let (tx, rx) = tokio::sync::mpsc::channel::<myownmesh_core::rpc::RpcStreamItem>(4);
-                let close_probe = tx.clone();
-                let pending_key = PendingKey {
-                    network: key.0.clone(),
-                    method: key.1.clone(),
-                    remote_peer: call.from.clone(),
-                    remote_request_id: call.request_id.clone(),
-                    class: HandlerMode::Stream,
-                };
-                let Ok(ticket) = registry.insert_exact_pending(
-                    pending_key,
-                    owner,
-                    crate::ipc::clients::PendingInbound::Stream(tx),
-                ) else {
-                    return Err("duplicate".into());
-                };
-                client.send(ServerOut::RpcInbound {
-                    network: key.0.clone(),
-                    from: call.from.clone(),
-                    request_id: call.request_id.clone(),
-                    operation_id: ticket.operation_id(),
-                    method: call.method.clone(),
-                    payload: call.payload.clone(),
-                    streaming: call.streaming,
-                });
-                tokio::spawn(async move {
-                    tokio::select! {
-                        () = close_probe.closed() => {}
-                        () = ticket.cancelled() => {}
+        myownmesh_core::rpc::Rpc::attach(&alice_state)
+            .expect("the fixture network's application gateway admits an Rpc")
+            .serve_stream("stream_echo", move |call| {
+                let registry = registry_for_handler.clone();
+                let key = key_for_handler.clone();
+                async move {
+                    let owner = registry
+                        .handler_owner(&key)
+                        .ok_or_else(|| "no claim".to_string())?;
+                    let client = registry
+                        .client(owner)
+                        .ok_or_else(|| "owner gone".to_string())?;
+                    let (tx, rx) =
+                        myownmesh_core::resource_mailbox::<myownmesh_core::rpc::RpcStreamItem>(
+                            registry
+                                .child_resources()
+                                .expect("the daemon test grant scopes one stream queue"),
+                        )
+                        .expect("the daemon test grant funds one stream queue");
+                    let close_probe = tx.clone();
+                    let pending_key = PendingKey {
+                        network: key.0.clone(),
+                        method: key.1.clone(),
+                        remote_peer: call.from.clone(),
+                        remote_request_id: call.request_id.clone(),
+                        class: HandlerMode::Stream,
+                    };
+                    let Ok(ticket) = registry.insert_exact_pending(
+                        pending_key,
+                        owner,
+                        crate::ipc::clients::PendingInbound::Stream(tx),
+                    ) else {
+                        return Err("duplicate".into());
+                    };
+                    // Same reason as the single-shot fixture above: reported, not
+                    // asserted, so the failure arrives at the caller's assertion.
+                    if let Err(refusal) = client.send(ServerOut::RpcInbound {
+                        network: key.0.clone(),
+                        from: call.from.clone(),
+                        request_id: call.request_id.clone(),
+                        operation_id: ticket.operation_id(),
+                        method: call.method.clone(),
+                        payload: call.payload.clone(),
+                        streaming: call.streaming,
+                    }) {
+                        return Err(format!("fixture client mailbox refused inbound: {refusal}"));
                     }
-                    drop(close_probe);
-                    drop(ticket);
-                });
-                Ok(rx)
-            }
-        });
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            () = close_probe.closed() => {}
+                            () = ticket.cancelled() => {}
+                        }
+                        drop(close_probe);
+                        drop(ticket);
+                    });
+                    Ok(rx)
+                }
+            })
+            .expect("the fixture network admits one streaming handler");
 
         let alice_did = alice_id.public_id().to_string();
         let bob_rpc_clone = bob_rpc.clone();
@@ -690,7 +883,9 @@ mod tests {
         let inbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("inbound timeout")
-            .expect("inbound recv");
+            .expect("inbound recv")
+            .into_parts()
+            .0;
         let (network, from, request_id, operation_id, method) = match inbound {
             ServerOut::RpcInbound {
                 network,
@@ -713,17 +908,16 @@ mod tests {
         };
         for n in 1..=3 {
             assert!(
-                registry
-                    .push_exact_stream(&pending_key, client.id, operation_id, serde_json::json!(n))
-                    .await,
+                registry.push_exact_stream(
+                    &pending_key,
+                    client.id,
+                    operation_id,
+                    serde_json::json!(n)
+                ),
                 "chunk {n} push"
             );
         }
-        assert!(
-            registry
-                .close_exact_stream(&pending_key, client.id, operation_id, None)
-                .await
-        );
+        assert!(registry.close_exact_stream(&pending_key, client.id, operation_id, None));
 
         // Bob drains his receiver — three chunks then close.
         let mut bob_rx = tokio::time::timeout(Duration::from_secs(5), stream_handle)
@@ -757,9 +951,13 @@ mod tests {
         let (alice_state, bob_state, _alice_rpc, _bob_rpc, _alice_id, bob_id, drivers) =
             two_peer_rpc("ipc-bridge-channel").await;
 
-        let registry = ClientRegistry::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerOut>();
-        let client = registry.register(tx);
+        let registry = ClientRegistry::default();
+        let (tx, mut rx) =
+            myownmesh_core::resource_mailbox::<ServerOut>(crate::test_application_scope())
+                .expect("the daemon test grant funds this fixture client's writer mailbox");
+        let client = registry
+            .register(tx)
+            .expect("the daemon test grant funds this fixture client record");
         let net_key = "alice".to_string();
         let chan_key = "catalog".to_string();
         let key = (net_key.clone(), chan_key.clone());
@@ -769,14 +967,16 @@ mod tests {
         // bypass the JoinedNetwork facade here for the same
         // reason the bridge module itself takes
         // `&JoinedNetwork` in production.
-        let was_first = registry.subscribe_channel(key.clone(), client.id);
+        let was_first = registry
+            .subscribe_channel(key.clone(), client.id)
+            .expect("the daemon test grant funds this fixture's subscription");
         assert!(was_first);
 
         // Spawn a pump that mirrors `bridge::spawn_channel_pump`
         // but uses the engine state directly.
         let chan: myownmesh_core::Channel<serde_json::Value> =
             myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
-        let mut sub = chan.subscribe();
+        let mut sub = chan.subscribe().expect("subscription admitted");
         let registry_for_pump = registry.clone();
         let key_for_pump = key.clone();
         tokio::spawn(async move {
@@ -799,7 +999,11 @@ mod tests {
                 };
                 for cid in subscribers {
                     if let Some(c) = registry_for_pump.client(cid) {
-                        c.send(frame.clone());
+                        // The assertion this fixture exists for is on the
+                        // frame arriving, so a refusal here is left to fail as
+                        // the receive timeout it causes rather than being
+                        // reported twice.
+                        let _ = c.send(frame.clone());
                     }
                 }
             }
@@ -819,7 +1023,9 @@ mod tests {
         let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("inbound timeout")
-            .expect("inbound recv");
+            .expect("inbound recv")
+            .into_parts()
+            .0;
         match frame {
             ServerOut::ChannelInbound {
                 network,

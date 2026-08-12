@@ -44,7 +44,6 @@ getrandom = { workspace = true }
 
 interprocess = { workspace = true }
 parking_lot = { workspace = true }
-dashmap = { workspace = true }
 dirs = { workspace = true }
 
 # `service --system` needs an effective-uid check to fail fast without

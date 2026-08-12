@@ -122,7 +122,6 @@ mod tests {
         for role in ServiceRole::all() {
             assert_eq!(ServiceRole::from_tag(role.tag()), Some(role));
         }
-        assert_eq!(ServiceRole::from_tag("ring_topology"), None);
         assert_eq!(ServiceRole::from_tag("service:nope"), None);
     }
 

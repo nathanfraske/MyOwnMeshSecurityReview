@@ -6,14 +6,13 @@ for these types is `crates/myownmesh-core/src/protocol/`.
 
 ```
 PROTOCOL_VERSION  = 1
-SIGN_DOMAIN_TAG   = "myownmesh-mesh-auth-v1:"
 TRYSTERO_APP_ID   = "myownmesh-cloud-mesh-v1"
 ```
 
-A receiver that sees an unknown `kind` silently drops the frame. New
-optional message kinds are gated per-peer via the `features` matrix
-on the `hello` frame so a sender doesn't waste cycles on a peer that
-doesn't speak them.
+This hard-alpha protocol has a closed frame set. An unknown `kind` is
+refused during decoding and reaches no protocol state. The `features`
+list on `hello` carries only the required endpoint-authentication profile;
+it is a compatibility precondition, not optional-frame negotiation.
 
 ## Frame envelope
 
@@ -49,12 +48,13 @@ into the receiver ahead of the application-payload boundary; a receiver that
 treated absence as a default would additionally manufacture an advertisement no
 peer ever sent. What a node offers is exchanged after promotion, on
 [`capabilities_update`](#capabilities_update), under a live session. A `hello`
-that still carries `capabilities`, `max_connections` or `app_version` parses —
-the unknown keys are ignored — and none of them reach any state.
+that still carries `capabilities`, `max_connections` or `app_version` is
+refused during decoding because the frame denies unknown fields; none of them
+reach any state.
 
-`features` is read pre-session because that is what it is for: it gates which
-frame kinds the sender may later emit, and its absence refuses rather than
-enabling. It advertises no application capability.
+`features` is read pre-session only to prove that the peer implements this
+build's required endpoint-authentication profile. It does not authorize later
+frame kinds and advertises no application capability.
 
 **The endpoint-authentication profile is advertised, and it is a hard
 precondition rather than an optional-frame gate.** A `hello` whose
@@ -87,7 +87,7 @@ exact endpoint-auth transcript for this attempt — not over a bare nonce.
 
 | Field | Type | Notes |
 |---|---|---|
-| `signature` | string | Base32-lowercase ed25519 signature over the Arc 04 endpoint-auth transcript (`ENDPOINT_AUTH_DOMAIN_TAG`, length-prefixed, role-canonical — see [Handshake signature](#handshake-signature)). Not the legacy `SIGN_DOMAIN_TAG` payload. |
+| `signature` | string | Base32-lowercase ed25519 signature over the endpoint-auth transcript (`ENDPOINT_AUTH_DOMAIN_TAG`, length-prefixed, role-canonical — see [Handshake signature](#handshake-signature)). |
 
 A peer's contribution binds an attempt exactly once, and an
 `auth_response` that arrives before anything is bound is terminal rather
@@ -167,7 +167,6 @@ the authority that accepted it.
 |---|---|---|
 | `tags` | string[] | Embedder-defined capability tags. |
 | `app_version` | string? | |
-| `max_connections` | u32? | |
 | `extra` | json | Embedder-defined structured advertisement. |
 
 ---
@@ -268,13 +267,11 @@ Device IDs are the canonical base32-lowercase pubkey portion (display
 suffixes stripped). Each side verifies its own half as well as the
 peer's, so a proof is mutual rather than one-directional.
 
-This is a hard cutover. The legacy
-`SIGN_DOMAIN_TAG + nonce + "|" + my_device_id + "|" + their_device_id`
-payload (`crate::signing::handshake_payload`) is retained as a helper
-for other callers but is neither produced nor accepted on the live
-`hello`/`auth_response` path, and there is no feature-negotiated
-fallback: domain separation means an older peer fails authentication
-rather than negotiating down, so a downgrade is not attacker-selectable.
+This is a hard cutover. The endpoint-auth transcript above is the only
+handshake signature payload the crate produces or accepts; no alternate
+payload helper or feature-negotiated fallback remains. Domain separation
+therefore makes a peer using another format fail authentication rather than
+negotiating down, so a downgrade is not attacker-selectable.
 
 The cutover is also *diagnosable* rather than silent. Because the
 profile is advertised on `hello` (see [`hello`](#hello)), a peer running
@@ -480,34 +477,28 @@ reply no inbound frame could reach.
 
 ---
 
-## Forward-compatibility rules
+## Compatibility rules
 
-1. **Unknown `kind`**: receiver silently drops the frame. New
-   message kinds added in future revisions don't break older peers.
+1. **Unknown `kind` is refused.** The hard-alpha frame set is closed; a
+   frame that this build cannot classify never reaches protocol state.
 
-2. **Unknown fields**: serde deserialization ignores extra fields by
-   default. Embedders can add fields to `CapabilityAdvert.extra` without
-   protocol-level coordination.
+2. **Handshake fields are exact.** `hello` denies unknown fields, so a
+   misspelled or retired pre-session field is a decode failure. Application
+   capability extensions belong only in the explicit
+   `CapabilityAdvert.extra` map sent after promotion.
 
-3. **Optional fields with sensible defaults**: a v1 receiver missing
-   an optional field treats it as the default (`None`, empty list,
-   etc.).
+3. **Defaults are schema-defined.** An absent field receives a default only
+   where its concrete message type declares one; there is no protocol-wide
+   rule that manufactures missing values.
 
-4. **`features` gate optional message kinds**: senders consult the
-   peer's advertised `features` list before sending an optional frame.
-   Older peers that don't advertise a feature don't receive it.
+4. **`features` contains the required endpoint-auth profile.** A peer that
+   does not advertise the exact `endpoint_auth_v1` id is refused before proof
+   work. The list does not negotiate optional frames or provide a route around
+   a compatibility break.
 
-   **`endpoint_auth_v1` is the one exception and is not
-   forward-compatible by design.** It is a required precondition, not an
-   optional-frame gate: a peer that does not advertise it is refused,
-   not merely sent less. Absence fails closed with a typed refusal
-   before any proof work rather than degrading to anything weaker, which
-   is exactly what makes the Arc 04 cutover hard. Treat it as a
-   compatibility break against pre-Arc-04 peers, and never as a feature
-   a sender can route around.
-
-5. **Bump `PROTOCOL_VERSION` only when an existing message's shape
-   changes incompatibly.** Additive changes don't bump.
+5. **Bump `PROTOCOL_VERSION` for an incompatible wire change.** Adding a new
+   frame kind is also a compatibility break until all participating builds
+   implement that closed variant.
 
 ---
 

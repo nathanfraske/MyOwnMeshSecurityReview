@@ -33,10 +33,9 @@
 //! The frame set is closed. A receiver getting a `kind` this build
 //! does not implement refuses it — the frame fails to deserialize and
 //! reaches no handler — so there is no revision-tolerance to rely on.
-//! Peers still gate optional traffic per-peer via [`features`]
-//! capability negotiation, and that gating is the sender's half of the
-//! same rule: it keeps a peer from being sent frames it would only
-//! refuse.
+//! There is no optional feature negotiation or mixed-version mode in this
+//! alpha. `hello.features` carries only the closed endpoint-authentication
+//! profile required before any post-active frame is admitted.
 
 pub mod features;
 pub mod governance;
@@ -119,7 +118,7 @@ pub enum MeshMessage {
     RpcStreamChunk(RpcStreamChunkMessage),
     RpcStreamEnd(RpcStreamEndMessage),
 
-    // -- closed-network governance (gated by `network_state_v1`) --
+    // -- closed-network governance --
     /// Sender's snapshot of the network's governance state.
     /// Broadcast on ACTIVE; receivers compare against their own to
     /// detect drift.
@@ -134,7 +133,7 @@ pub enum MeshMessage {
     /// containing the signers the proposer had so far.
     NetworkStateSplit(NetworkStateSplitMessage),
 
-    // -- roster gossip (gated by `network_state_v1`) --
+    // -- roster gossip --
     /// Merkle-root summary of the sender's roster. Triggers a
     /// `RosterRequest` from receivers whose root disagrees.
     RosterSummary(RosterSummaryMessage),
@@ -158,7 +157,7 @@ pub enum MeshMessage {
         payload: serde_json::Value,
     },
 
-    // -- reliable channel delivery (gated by `reliable_channels_v1`) --
+    // -- reliable channel delivery --
     /// A channel frame under the acknowledged-delivery contract: one
     /// entry of the sender's per-session reliable stream. `stream` is
     /// minted once per promoted session (a fresh session = a fresh
@@ -214,7 +213,7 @@ mod tests {
             label: "Laptop".into(),
             nonce: "noncexyz".into(),
             verification_code: "abc123".into(),
-            features: vec!["ring_topology".into()],
+            features: vec![Feature::ENDPOINT_AUTH_V1.into()],
         });
         let s = serde_json::to_string(&msg).unwrap();
         let back: MeshMessage = serde_json::from_str(&s).unwrap();

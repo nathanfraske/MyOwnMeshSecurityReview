@@ -39,20 +39,6 @@ pub enum ConnectionTier {
         #[serde(skip, default = "now")]
         started: std::time::Instant,
     },
-    /// Retained for wire / GUI compatibility — the engine no longer
-    /// drives a re-handshake loop (silence rebuilds instead), so this is
-    /// never produced.
-    Rehandshake {
-        attempt: u32,
-        #[serde(skip, default = "now")]
-        next_at: std::time::Instant,
-    },
-    /// Retained for wire / GUI compatibility — see [`Self::Rehandshake`].
-    RoomRejoin {
-        attempt: u32,
-        #[serde(skip, default = "now")]
-        next_at: std::time::Instant,
-    },
     /// Tier 6 — signaling / STUN / TURN config edit forced
     /// stop+start.
     StopStart,

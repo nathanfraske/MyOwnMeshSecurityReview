@@ -24,7 +24,11 @@ pub async fn run() -> Result<()> {
             connector_policy_from_lookup(|name| std::env::var(name).ok())?;
         myownmesh::embedded::start_connector_capable(cfg, policy, realtime).await?
     } else {
-        myownmesh::embedded::start_infrastructure_only(cfg).await?
+        // Same parse, same variables, same refusals as the connector-capable
+        // branch above — the mode selects what is installed on top of the
+        // grant, never whether the owner had to choose one.
+        let resources = owner_selected_resource_port(|name| std::env::var(name).ok())?;
+        myownmesh::embedded::start_infrastructure_only(cfg, resources).await?
     };
 
     // Wait for SIGINT (Ctrl-C) or SIGTERM.
@@ -289,26 +293,25 @@ struct ConnectorStartup {
     realtime: myownmesh::control::RealtimeAdvert,
 }
 
-fn connector_policy_from_lookup(
+/// The one owner-selected process resource grant, parsed identically for every
+/// serve mode.
+///
+/// This is the process resource grant, not a local policy ceiling. It is the
+/// envelope every byte, handle and task this daemon owns is funded from, so
+/// there is deliberately no default and nothing derived from the machine: an
+/// owner who has not selected one has not said how much of their system this
+/// daemon may take, and starting anyway would answer that on their behalf.
+///
+/// Both serve modes call this. Infrastructure-only is not a lesser case that
+/// may guess — it still admits IPC payloads, local application state and its
+/// own tasks — so the two modes cannot drift into reading different variables,
+/// or into accepting a value for one that the other would reject.
+fn owner_selected_resource_port(
     mut lookup: impl FnMut(&str) -> Option<String>,
-) -> Result<ConnectorStartup> {
-    fn nonzero(
-        lookup: &mut impl FnMut(&str) -> Option<String>,
-        name: &'static str,
-    ) -> Result<NonZeroUsize> {
-        let raw = lookup(name).ok_or_else(|| {
-            anyhow!("connector-capable serve requires owner-selected environment value {name}")
-        })?;
-        raw.parse::<usize>()
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .ok_or_else(|| anyhow!("{name} must be a nonzero integer"))
-    }
-
+) -> Result<myownmesh_core::ResourceProviderPort> {
     fn finite(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Result<u64> {
-        let raw = lookup(name).ok_or_else(|| {
-            anyhow!("connector-capable serve requires owner-selected environment value {name}")
-        })?;
+        let raw = lookup(name)
+            .ok_or_else(|| anyhow!("serve requires owner-selected environment value {name}"))?;
         raw.parse::<u64>()
             .map_err(|_| anyhow!("{name} must be a finite nonnegative integer"))
     }
@@ -365,6 +368,25 @@ fn connector_policy_from_lookup(
     let resources = myownmesh_core::ResourceProviderPort::new(
         myownmesh_core::FiniteResourceProvider::new(provider_grant),
     )?;
+    Ok(resources)
+}
+
+fn connector_policy_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<ConnectorStartup> {
+    fn nonzero(
+        lookup: &mut impl FnMut(&str) -> Option<String>,
+        name: &'static str,
+    ) -> Result<NonZeroUsize> {
+        let raw = lookup(name).ok_or_else(|| {
+            anyhow!("connector-capable serve requires owner-selected environment value {name}")
+        })?;
+        raw.parse::<usize>()
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| anyhow!("{name} must be a nonzero integer"))
+    }
+    let resources = owner_selected_resource_port(&mut lookup)?;
     let local_ceiling_mode = lookup("MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY").ok_or_else(|| {
         anyhow!(
             "connector-capable serve requires MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=none or enabled"

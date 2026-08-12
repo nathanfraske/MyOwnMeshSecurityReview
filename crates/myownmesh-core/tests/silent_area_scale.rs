@@ -313,8 +313,9 @@ async fn run_area(n_spokes: usize) {
         // run. `recv` separates the two endings the old receiver merged: `None`
         // is the channel going away with the network, `Err` is one frame that
         // did not decode.
-        let mut rx =
-            Channel::<serde_json::Value>::new(CHANNEL.to_owned(), spoke.state.clone()).subscribe();
+        let mut rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), spoke.state.clone())
+            .subscribe()
+            .expect("member subscription admitted");
         let echo_state = spoke.state.clone();
         let operator_id = operator.id.clone();
         let member = spoke.id.clone();
@@ -337,8 +338,9 @@ async fn run_area(n_spokes: usize) {
             }
         });
     }
-    let mut echo_rx =
-        Channel::<serde_json::Value>::new(CHANNEL.to_owned(), operator.state.clone()).subscribe();
+    let mut echo_rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), operator.state.clone())
+        .subscribe()
+        .expect("operator subscription admitted");
     let pings_per_spoke: usize = 10;
     let mut rtt_ms = Vec::with_capacity(n_spokes * pings_per_spoke);
     for (i, spoke) in spokes.iter().enumerate() {

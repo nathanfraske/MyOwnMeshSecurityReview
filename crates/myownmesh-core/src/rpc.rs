@@ -25,18 +25,21 @@
 //! which a recycled id could reproduce exactly. Nothing inbound is
 //! ever matched against it.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::engine::state::NetworkState;
 use crate::identity::DeviceId;
 use crate::protocol::CapabilityAdvert;
+use crate::resource::{
+    mailbox_measure_serialized, mailbox_retained_claim, strings_measure, LeasedMap,
+    LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceLease, ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxReceiver,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RpcError {
@@ -69,6 +72,41 @@ pub enum RpcError {
     /// that fails explicitly already is.
     #[error("no unused request id available")]
     RequestIdUnavailable,
+    /// The peer had no live promoted session when the call was filed.
+    ///
+    /// Split out from [`Self::RequestIdUnavailable`], which used to answer for
+    /// it. The two want opposite responses: this one is ordinary and worth
+    /// retrying once a session establishes, and the other is a local draw
+    /// colliding and says nothing about the peer at all.
+    #[error("no live session for peer {0}")]
+    SessionNotCurrent(String),
+    /// The session's resource owner would not fund one more pending operation.
+    ///
+    /// Also split out of [`Self::RequestIdUnavailable`]. Pointing an operator at
+    /// a request-id draw when the actual remedy is a larger grant is worse than
+    /// saying nothing, because it is specific and wrong.
+    #[error("rpc call refused: {0}")]
+    ResourceUnavailable(String),
+}
+
+impl RpcRegistrationRefusal {
+    /// The caller-facing error for one refusal, naming the peer it was about.
+    ///
+    /// One place, so the three facts cannot be mapped one way on the unary path
+    /// and another on the streaming one — which is how they came to be mapped
+    /// to a single wrong answer on both.
+    pub(crate) fn into_rpc_error(self, peer: &str) -> RpcError {
+        match self {
+            Self::SessionNotCurrent => RpcError::SessionNotCurrent(peer.to_string()),
+            Self::RequestIdCollision => RpcError::RequestIdUnavailable,
+            Self::ResourceUnavailable(e) => {
+                RpcError::ResourceUnavailable(format!("no capacity to file the call: {e:?}"))
+            }
+            Self::Unrepresentable => {
+                RpcError::ResourceUnavailable("the call is not representable as a claim".into())
+            }
+        }
+    }
 }
 
 /// A single inbound RPC the local handler receives.
@@ -115,8 +153,24 @@ pub enum RpcStreamItem {
     End(Result<(), String>),
 }
 
-pub type RpcStreamHandlerFuture =
-    Pin<Box<dyn Future<Output = Result<mpsc::Receiver<RpcStreamItem>, String>> + Send + 'static>>;
+impl ResourceMailboxItem for RpcStreamItem {
+    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+        let (retained, queued, allocations) = match self {
+            Self::Chunk(payload) => mailbox_measure_serialized(payload)?,
+            Self::End(Ok(())) => (0, 0, 0),
+            Self::End(Err(error)) => strings_measure([error.as_str()])?,
+        };
+        mailbox_retained_claim::<Self>(retained, queued, allocations)
+    }
+}
+
+pub type RpcStreamHandlerFuture = Pin<
+    Box<
+        dyn Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
+    >,
+>;
 
 pub type RpcStreamHandler = Arc<dyn Fn(RpcCall) -> RpcStreamHandlerFuture + Send + Sync + 'static>;
 
@@ -134,7 +188,9 @@ pub struct RpcInner {
     /// dispatcher; retaining it here would close a permanent strong cycle and
     /// keep handlers and pending effects alive after network retirement.
     pub(crate) network: Weak<NetworkState>,
-    pub(crate) handlers: DashMap<String, HandlerEntry>,
+    pub(crate) handlers: Mutex<LeasedMap<String, HandlerEntry>>,
+    handler_resources: LocalApplicationResourceScope,
+    _allocation: ResourceLease,
 }
 
 /// Locally-originated operations owned by one exact promoted session.
@@ -143,27 +199,49 @@ pub struct RpcInner {
 /// `PeerSessionState`, so replacement, revocation and retirement destroy the
 /// only map capable of settling the old session's calls.
 pub(crate) struct SessionRpcState {
-    pending: HashMap<String, PendingOp>,
+    /// Leased, so every pending operation this session files is funded by that
+    /// session and released with it.
+    ///
+    /// This was a `HashMap`, whose nodes the session paid for through a residual
+    /// term inside [`pending_operation_claim`] — a number this module had to
+    /// keep in agreement with a representation it does not own. A `LeasedMap`
+    /// charges its own node from its own `size_of`, so the two halves are read
+    /// where each is knowable and cannot drift apart.
+    pending: crate::resource::LeasedMap<String, PendingOp>,
 }
 
 impl SessionRpcState {
     pub(crate) fn new() -> Self {
         Self {
-            pending: HashMap::new(),
+            pending: crate::resource::LeasedMap::new(),
         }
     }
 }
 
 impl Drop for SessionRpcState {
     fn drop(&mut self) {
-        for op in self.pending.values() {
+        // Every value, through the predicate walk, which allocates nothing —
+        // this runs while a session is being torn down and a teardown that has
+        // to allocate to report a teardown is one that can fail at the worst
+        // moment. Answering `false` throughout is what makes it a visit rather
+        // than a search.
+        self.pending.any_value(|op| {
             if let PendingEntry::Stream(stream) = &op.effect {
                 stream.finish(Some("RPC session retired".to_string()));
             }
-        }
+            false
+        });
     }
 }
 
+/// What one pending operation retains, off the map node.
+///
+/// The node is **not** here: [`crate::resource::LeasedMap::entry_claim`] adds
+/// it, from a `size_of` only the map can take. This used to carry a residual of
+/// 2 — "hash-map node plus the channel allocation retained by its sender" — and
+/// the first of those two was an inference about someone else's representation.
+/// One term is left, and it is the one this module can actually see: the oneshot
+/// or inbox allocation the effect holds.
 fn pending_operation_claim(
     request_id_bytes: usize,
 ) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
@@ -180,9 +258,33 @@ fn pending_operation_claim(
                 dimension: ResourceClass::AccountedMemoryBytes,
             })?,
         ),
-        // Hash-map node plus the channel allocation retained by its sender.
-        (ResourceClass::OpaqueDependencyResidual, 2),
+        // The channel allocation retained by the effect's sender.
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
+}
+
+/// Why one locally-originated RPC operation was not filed.
+///
+/// Three facts, kept apart because a caller acts differently on each and
+/// because two of them were previously reported as the third. Everything below
+/// used to answer `Option`, which `call` and `call_stream` turned into
+/// [`RpcError::RequestIdUnavailable`] — so a peer with no live session, and a
+/// resource owner that would not fund one more pending entry, were both
+/// reported as "no unused request id available". That sentence is false about
+/// both of them, and it points a reader at a 96-bit draw when the actual remedy
+/// is to wait for a session or to raise a grant.
+#[derive(Debug)]
+pub(crate) enum RpcRegistrationRefusal {
+    /// No live promoted session for this peer at the moment of filing. Nothing
+    /// was written and nothing is pending.
+    SessionNotCurrent,
+    /// The one drawn id was already owned. The incumbent is untouched — see
+    /// [`SessionRpcState::claim_request_id`].
+    RequestIdCollision,
+    /// The session's resource owner would not fund the entry.
+    ResourceUnavailable(crate::resource::ResourceUnavailable),
+    /// The entry is not representable as a claim at all.
+    Unrepresentable,
 }
 
 pub(crate) fn handler_task_claim(
@@ -219,8 +321,47 @@ pub(crate) fn handler_task_claim(
 
 #[allow(clippy::large_enum_variant)]
 pub enum HandlerEntry {
-    Single(RpcHandler),
-    Stream(RpcStreamHandler),
+    Single {
+        handler: RpcHandler,
+        _retention: ResourceLease,
+    },
+    Stream {
+        handler: RpcStreamHandler,
+        _retention: ResourceLease,
+    },
+}
+
+fn rpc_inner_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let bytes = std::mem::size_of::<RpcInner>()
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+}
+
+fn handler_retention_claim<F>(method: &str) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let bytes = method
+        .len()
+        .checked_add(std::mem::size_of::<F>())
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    let allocations = u64::from(!method.is_empty()).checked_add(1).ok_or(
+        ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::OpaqueDependencyResidual,
+        },
+    )?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::OpaqueDependencyResidual, allocations),
+    ])
 }
 
 /// The response class a pending operation will accept.
@@ -262,37 +403,50 @@ impl RpcStreamInbox {
         }
     }
 
+    /// Admit one stream item, or say exactly why not.
+    ///
+    /// The refusal is typed because the two ways this fails are different facts
+    /// with different remedies, and the caller settles a waiting application
+    /// with one of them. `Pressure` means the provider would not fund this item:
+    /// the stream is well formed and the owner is out of capacity, which is a
+    /// sizing answer. `Malformed` means the item could not be represented at all
+    /// — it did not encode, or its size is not expressible as a claim — which is
+    /// a statement about the frame and not about the resource owner.
+    ///
+    /// This used to answer `bool`, and the caller turned every `false` into "RPC
+    /// stream refused by resource owner". That sentence is true of one arm and
+    /// false of the other, and the arm it is false about is the one that means a
+    /// peer sent something this side could not admit. An untyped refusal does
+    /// not merely lose detail here; it reports a resource owner that refused
+    /// nothing.
     pub(crate) fn push(
         &self,
         session: &crate::runtime::session_broker::SessionCapability,
         payload: serde_json::Value,
-    ) -> bool {
-        let encoded_len = match serde_json::to_vec(&payload) {
-            Ok(encoded) => encoded.len(),
-            Err(_) => return false,
-        };
-        let retention =
-            match crate::application_gateway::GatewayMailbox::<serde_json::Value>::retention_claim(
-                encoded_len,
-                1,
+    ) -> Result<(), crate::application_gateway::GatewayRefusal> {
+        use crate::application_gateway::{GatewayMailbox, GatewayRefusal};
+
+        let encoded_len = serde_json::to_vec(&payload)
+            .map_err(|_| GatewayRefusal::Malformed)?
+            .len();
+        // Measured, then funded, then retained — the order every admission in
+        // this crate takes, so nothing is held that the provider never got to
+        // refuse.
+        let retention = session
+            .reserve_retained(
+                GatewayMailbox::<serde_json::Value>::retention_claim(encoded_len, 1)
+                    .map_err(|_| GatewayRefusal::Malformed)?,
             )
-            .ok()
-            .and_then(|claim| session.reserve_retained(claim).ok())
-            {
-                Some(lease) => lease,
-                None => return false,
-            };
-        let node =
-            match crate::application_gateway::GatewayMailbox::<serde_json::Value>::node_claim()
-                .ok()
-                .and_then(|claim| session.reserve_retained(claim).ok())
-            {
-                Some(lease) => lease,
-                None => return false,
-            };
+            .map_err(GatewayRefusal::Pressure)?;
+        let node = session
+            .reserve_retained(
+                GatewayMailbox::<serde_json::Value>::node_claim()
+                    .map_err(|_| GatewayRefusal::Malformed)?,
+            )
+            .map_err(GatewayRefusal::Pressure)?;
         self.mailbox.lock().accept(payload, retention, node);
         self.ready.notify_one();
-        true
+        Ok(())
     }
 
     pub(crate) fn finish(&self, error: Option<String>) {
@@ -306,8 +460,17 @@ impl RpcStreamInbox {
     }
 
     async fn recv(&self) -> Option<Result<RpcStreamChunk, String>> {
+        self.recv_with_before_wait(|| {}).await
+    }
+
+    async fn recv_with_before_wait(
+        &self,
+        mut before_wait: impl FnMut(),
+    ) -> Option<Result<RpcStreamChunk, String>> {
         loop {
             let notified = self.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(delivery) = self.mailbox.lock().pop() {
                 let (value, retention) = delivery.into_parts();
                 return Some(Ok(RpcStreamChunk {
@@ -321,6 +484,7 @@ impl RpcStreamInbox {
             if self.finished.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
             }
+            before_wait();
             notified.await;
         }
     }
@@ -547,15 +711,16 @@ impl RpcStream {
 /// *authenticated* as, taken by the caller from the admitted
 /// dispatch's owner token.
 ///
-/// **Guard discipline.** Each operation decides and extracts under
-/// one DashMap shard guard and then returns the sender to its
-/// caller. None of them sends, awaits, or invokes a callback while
+/// **Guard discipline.** The containing session record gives each operation
+/// exclusive access to the leased map. It decides and extracts there, then
+/// returns the sender to its caller. None of them sends, awaits, or invokes a
+/// callback while
 /// a guard is live — the engine performs the send after the
 /// operation has returned and the guard is gone.
 ///
 /// **Non-destructive refusal.** A wrong source or a wrong class is
 /// not a settle attempt that fails; it is not a settle at all. The
-/// predicate and the removal are the same shard-locked step, so a
+/// predicate and the removal are the same exclusive step, so a
 /// refused frame performs zero action, zero removal and zero
 /// mutation, and the rightful owner's operation is left exactly as
 /// it was.
@@ -579,33 +744,53 @@ impl SessionRpcState {
         request_id: String,
         session: &crate::runtime::session_broker::SessionCapability,
         effect: PendingEntry,
-    ) -> Result<LocalRequest, PendingEntry> {
-        match self.pending.entry(request_id) {
-            // Occupied: another operation owns this id. Hand the
-            // effect back rather than overwrite — displacing the
-            // owner would strand its caller on a oneshot that can
-            // never be resolved.
-            std::collections::hash_map::Entry::Occupied(_) => Err(effect),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let request_id = slot.key().clone();
-                let op_id = PendingOpId::fresh();
-                let claim = match pending_operation_claim(request_id.len()) {
-                    Ok(claim) => claim,
-                    Err(_) => return Err(effect),
-                };
-                let lease = match session.reserve_retained(claim) {
-                    Ok(lease) => lease,
-                    Err(_) => return Err(effect),
-                };
-                slot.insert(PendingOp {
+    ) -> Result<LocalRequest, (PendingEntry, RpcRegistrationRefusal)> {
+        // Occupancy first, and the effect never enters the map on this arm.
+        // Displacing the owner would strand its caller on a oneshot nothing can
+        // resolve. This is a plain read rather than an entry API because
+        // `&mut self` is the exclusion: nothing else can touch this map between
+        // the question and the insert, so there is no window to close.
+        if self.pending.contains_key(request_id.as_str()) {
+            return Err((effect, RpcRegistrationRefusal::RequestIdCollision));
+        }
+        let op_id = PendingOpId::fresh();
+        // Measured, then funded, then filed. Two reservations because two things
+        // are retained and each is released by its own owner: the value's, held
+        // by the `PendingOp`, and the node's, held by the map entry.
+        let Ok(claim) = pending_operation_claim(request_id.len()) else {
+            return Err((effect, RpcRegistrationRefusal::Unrepresentable));
+        };
+        let lease = match session.reserve_retained(claim) {
+            Ok(lease) => lease,
+            Err(e) => return Err((effect, RpcRegistrationRefusal::ResourceUnavailable(e))),
+        };
+        let Ok(node_claim) = crate::resource::LeasedMap::<String, PendingOp>::entry_claim() else {
+            return Err((effect, RpcRegistrationRefusal::Unrepresentable));
+        };
+        let node = match session.reserve_retained(node_claim) {
+            Ok(node) => node,
+            Err(e) => return Err((effect, RpcRegistrationRefusal::ResourceUnavailable(e))),
+        };
+        self.pending
+            .insert(
+                request_id.clone(),
+                PendingOp {
                     id: op_id.clone(),
                     effect,
                     next_stream_seq: 1,
                     _lease: lease,
-                });
-                Ok(LocalRequest { request_id, op_id })
-            }
-        }
+                },
+                node,
+            )
+            // The map refuses a key it already holds, and the occupancy test
+            // above ran under this same `&mut self` — nothing can have inserted
+            // between them, because nothing else can hold this map at all. So
+            // this arm is a violation of the map's own contract rather than a
+            // state a caller can reach, and it is deliberately not given a
+            // refusal variant: inventing one would mean fabricating an effect
+            // to hand back, since the refusal has already taken the candidate.
+            .expect("the id was vacant under this same exclusive borrow");
+        Ok(LocalRequest { request_id, op_id })
     }
 
     /// Register one locally-originated pending operation under a
@@ -623,13 +808,19 @@ impl SessionRpcState {
     /// "never displace" is total either way — while reading as a
     /// policy that will eventually secure an id, when the honest
     /// answer is that one collision fails the call.
+    /// The refusal is typed and the effect is dropped here, deliberately in
+    /// that order. Dropping the effect resolves the caller's own channel with a
+    /// receive error, which says nothing; the returned reason is what the caller
+    /// reports instead, and it is returned rather than logged because only the
+    /// caller knows whether "no session yet" is worth retrying and "out of
+    /// capacity" is not.
     pub(crate) fn register_local_request(
         &mut self,
         session: &crate::runtime::session_broker::SessionCapability,
         effect: PendingEntry,
-    ) -> Option<LocalRequest> {
+    ) -> Result<LocalRequest, RpcRegistrationRefusal> {
         self.claim_request_id(new_request_id(), session, effect)
-            .ok()
+            .map_err(|(_effect, reason)| reason)
     }
 
     /// Drop a local operation the caller is abandoning, but only if
@@ -741,6 +932,37 @@ impl SessionRpcState {
     }
 }
 
+impl RpcInner {
+    fn install_handler(
+        &self,
+        method: &str,
+        entry: HandlerEntry,
+    ) -> Result<(), crate::application_gateway::GatewayRefusal> {
+        let network = self
+            .network
+            .upgrade()
+            .ok_or(crate::application_gateway::GatewayRefusal::Revoked)?;
+        if network.application_gateway.is_closed() {
+            return Err(crate::application_gateway::GatewayRefusal::Revoked);
+        }
+        let node = self
+            .handler_resources
+            .acquire(
+                LeasedMap::<String, HandlerEntry>::entry_claim()
+                    .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
+            )
+            .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
+        let mut handlers = self.handlers.lock();
+        if network.application_gateway.is_closed() {
+            return Err(crate::application_gateway::GatewayRefusal::Revoked);
+        }
+        handlers.remove(method);
+        handlers
+            .insert(method.to_string(), entry, node)
+            .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)
+    }
+}
+
 impl Rpc {
     /// Attach (or look up) the RPC dispatcher for a network. Use
     /// this when you've spun up the engine directly via
@@ -752,52 +974,118 @@ impl Rpc {
     /// Idempotent: subsequent calls return a fresh `Rpc` handle
     /// over the same underlying state, so previously-registered
     /// handlers remain in effect.
-    pub fn attach(network: &Arc<NetworkState>) -> Self {
-        let inner = network.application_gateway.install_rpc(|| {
-            Arc::new(RpcInner {
-                network: Arc::downgrade(network),
-                handlers: DashMap::new(),
-            })
+    pub fn attach(
+        network: &Arc<NetworkState>,
+    ) -> Result<Self, crate::application_gateway::GatewayRefusal> {
+        if let Some(inner) = network.application_gateway.rpc() {
+            if network.application_gateway.is_closed() {
+                return Err(crate::application_gateway::GatewayRefusal::Revoked);
+            }
+            return Ok(Self { inner });
+        }
+        let handler_resources = network.application_gateway.rpc_resource_scope()?;
+        let allocation = handler_resources
+            .acquire(
+                rpc_inner_claim()
+                    .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
+            )
+            .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
+        let candidate = Arc::new(RpcInner {
+            network: Arc::downgrade(network),
+            handlers: Mutex::new(LeasedMap::new()),
+            handler_resources,
+            _allocation: allocation,
         });
-        Self { inner }
+        let inner = network.application_gateway.install_rpc(candidate)?;
+        Ok(Self { inner })
     }
 
     /// Register a single-shot handler under `method`. Replaces any
     /// previous handler for the same name.
-    pub fn serve<F, Fut>(&self, method: &str, handler: F)
+    pub fn serve<F, Fut>(
+        &self,
+        method: &str,
+        handler: F,
+    ) -> Result<(), crate::application_gateway::GatewayRefusal>
     where
         F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
     {
+        let network = self
+            .inner
+            .network
+            .upgrade()
+            .ok_or(crate::application_gateway::GatewayRefusal::Revoked)?;
+        if network.application_gateway.is_closed() {
+            return Err(crate::application_gateway::GatewayRefusal::Revoked);
+        }
+        let retention = self
+            .inner
+            .handler_resources
+            .acquire(
+                handler_retention_claim::<F>(method)
+                    .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
+            )
+            .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
         let h: RpcHandler = Arc::new(move |call| {
             let fut = handler(call);
             Box::pin(fut)
         });
-        self.inner
-            .handlers
-            .insert(method.to_string(), HandlerEntry::Single(h));
+        self.inner.install_handler(
+            method,
+            HandlerEntry::Single {
+                handler: h,
+                _retention: retention,
+            },
+        )
     }
 
     /// Register a streaming handler under `method`. Chunks map to wire chunks;
     /// `End` maps exactly to the terminal frame. Bare receiver closure is error.
-    pub fn serve_stream<F, Fut>(&self, method: &str, handler: F)
+    pub fn serve_stream<F, Fut>(
+        &self,
+        method: &str,
+        handler: F,
+    ) -> Result<(), crate::application_gateway::GatewayRefusal>
     where
         F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<mpsc::Receiver<RpcStreamItem>, String>> + Send + 'static,
+        Fut: Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
     {
+        let network = self
+            .inner
+            .network
+            .upgrade()
+            .ok_or(crate::application_gateway::GatewayRefusal::Revoked)?;
+        if network.application_gateway.is_closed() {
+            return Err(crate::application_gateway::GatewayRefusal::Revoked);
+        }
+        let retention = self
+            .inner
+            .handler_resources
+            .acquire(
+                handler_retention_claim::<F>(method)
+                    .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
+            )
+            .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
         let h: RpcStreamHandler = Arc::new(move |call| {
             let fut = handler(call);
             Box::pin(fut)
         });
-        self.inner
-            .handlers
-            .insert(method.to_string(), HandlerEntry::Stream(h));
+        self.inner.install_handler(
+            method,
+            HandlerEntry::Stream {
+                handler: h,
+                _retention: retention,
+            },
+        )
     }
 
     /// Drop the handler registered under `method`. Idempotent —
     /// no-op if nothing was registered.
     pub fn forget(&self, method: &str) {
-        self.inner.handlers.remove(method);
+        self.inner.handlers.lock().remove(method);
     }
 
     /// Single-shot RPC call.
@@ -820,7 +1108,7 @@ impl Rpc {
         let filed = network
             .application_gateway
             .register_rpc_request(&network, peer, PendingEntry::Single(tx))
-            .ok_or(RpcError::RequestIdUnavailable)?;
+            .map_err(|refusal| refusal.into_rpc_error(peer))?;
         let cancellation = PendingCancellation::new(&network, peer, filed);
         let frame = crate::protocol::RpcRequestMessage {
             request_id: cancellation.request_id().to_string(),
@@ -857,7 +1145,7 @@ impl Rpc {
         let filed = network
             .application_gateway
             .register_rpc_request(&network, peer, PendingEntry::Stream(Arc::clone(&inbox)))
-            .ok_or(RpcError::RequestIdUnavailable)?;
+            .map_err(|refusal| refusal.into_rpc_error(peer))?;
         let cancellation = PendingCancellation::new(&network, peer, filed);
         let frame = crate::protocol::RpcRequestMessage {
             request_id: cancellation.request_id().to_string(),
@@ -888,29 +1176,48 @@ impl Rpc {
     /// establishment — so advertising before any peer exists is not a lost
     /// advertisement, and the embedder is never expected to call this again to
     /// repair one.
-    pub fn advertise(&self, caps: CapabilityAdvert) {
+    /// **Answers whether the advertisement was committed**, which it did not
+    /// used to. Both ways this can fail were silent returns: a network already
+    /// down, and a resource owner that would not fund retaining the encoded
+    /// advert. The second is the one that mattered — the embedder was told
+    /// nothing, `capabilities()` kept answering the *previous* value, and every
+    /// session established afterwards was sent that stale value indefinitely.
+    /// An advertisement that did not take is not a slow advertisement.
+    ///
+    /// `Ok` means the value is stored and is what a later session will be sent.
+    /// The fan-out to peers already holding one is still a spawn, still
+    /// discarded, and still not part of this answer: it reports how many peers
+    /// were reached, which is a fact about the mesh at one instant rather than
+    /// about whether this call did its job.
+    pub fn advertise(&self, caps: CapabilityAdvert) -> Result<(), RpcError> {
         let Some(net) = self.inner.network.upgrade() else {
-            return;
+            return Err(RpcError::NetworkDown);
         };
-        if net
-            .application_gateway
-            .capability_state()
-            .replace(net.session_broker.as_ref(), &caps)
-            .is_err()
-        {
-            return;
-        }
+        net.application_gateway
+            .replace_capabilities(net.session_broker.as_ref(), &caps)
+            .map_err(|refusal| match refusal {
+                crate::application_gateway::CapabilityReplaceRefusal::Revoked => {
+                    RpcError::NetworkDown
+                }
+                crate::application_gateway::CapabilityReplaceRefusal::Unavailable(reason) => {
+                    RpcError::ResourceUnavailable(reason)
+                }
+            })?;
         // The stored value is what a session established later is sent, and it
         // is in place before this returns. The fan-out to peers already holding
         // one is a command the driver runs on its next turn; the spawn is only
         // what keeps this call from waiting on it, and the discarded result is
         // the number of peers reached.
         tokio::spawn(async move {
-            let _ = net
+            if let Err(error) = net
                 .application_gateway
                 .broadcast_capabilities(&net, caps)
-                .await;
+                .await
+            {
+                tracing::warn!(%error, "capability fan-out was refused after local commit");
+            }
         });
+        Ok(())
     }
 
     /// Snapshot of the currently-advertised capabilities.
@@ -922,11 +1229,6 @@ impl Rpc {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn handler_entries(&self) -> &DashMap<String, HandlerEntry> {
-        &self.inner.handlers
-    }
-
     // There is deliberately no `take_pending(request_id)` here.
     // One existed, unused and `#[allow(dead_code)]`, and it was the
     // unbound settle in its purest form: a request id in, someone's
@@ -935,15 +1237,14 @@ impl Rpc {
     // operation now requires naming the authenticated device too,
     // which that signature had no way to express.
 
-    /// Track which handlers are currently registered. Used by the
-    /// engine to surface "this peer doesn't speak method X" without
-    /// shipping a full advertisement on every call.
-    pub fn registered_methods(&self) -> Vec<String> {
-        self.inner
-            .handlers
-            .iter()
-            .map(|e| e.key().clone())
-            .collect()
+    /// Snapshot registered methods for lifecycle controls. Production lookup
+    /// is borrowed and performs no unfunded allocation.
+    #[cfg(test)]
+    pub(crate) fn registered_methods(&self) -> Vec<String> {
+        let handlers = self.inner.handlers.lock();
+        let mut methods = Vec::new();
+        handlers.for_each(|method, _entry| methods.push(method.clone()));
+        methods
     }
 }
 
@@ -958,6 +1259,15 @@ fn map_engine_err(e: crate::error::Error) -> RpcError {
     use crate::error::Error as E;
     match e {
         E::Network(msg) if msg.contains("not found") => RpcError::PeerNotFound(msg),
+        E::ResourceMailboxAdmission(crate::resource::ResourceMailboxAdmissionError::Closed) => {
+            RpcError::NetworkDown
+        }
+        E::ResourceMailboxAdmission(crate::resource::ResourceMailboxAdmissionError::Pressure(
+            error,
+        )) => RpcError::ResourceUnavailable(format!("command admission refused: {error:?}")),
+        E::ResourceMailboxAdmission(error) => {
+            RpcError::ResourceUnavailable(format!("command is not representable: {error}"))
+        }
         E::Transport(msg) => RpcError::Transport(msg),
         other => RpcError::Transport(other.to_string()),
     }
@@ -1011,9 +1321,15 @@ mod tests {
             )
             .expect_err("an already-owned request id is never claimed twice");
         assert!(
-            matches!(returned, PendingEntry::Stream(_)),
+            matches!(returned.0, PendingEntry::Stream(_)),
             "the colliding call gets its own effect back unconsumed, so the retry \
              loop can re-file it under a fresh id"
+        );
+        assert!(
+            matches!(returned.1, RpcRegistrationRefusal::RequestIdCollision),
+            "and it is told the id collided — not that the session was gone or \
+             that the owner was short, which are the two facts this refusal used \
+             to be reported as"
         );
 
         // The incumbent still owns the id, under its original
@@ -1059,6 +1375,44 @@ mod tests {
         assert!(
             pending.take_single_response(&request_id).is_some(),
             "the incumbent entry and class survive the collision"
+        );
+    }
+
+    /// Each refusal reaches the caller as its own error.
+    ///
+    /// The mapping *is* the finding. Registration always knew which of these
+    /// had happened; `call` and `call_stream` threw that away and reported
+    /// [`RpcError::RequestIdUnavailable`] for all of them. So an embedder whose
+    /// peer had no session yet, and one whose resource owner was full, were
+    /// both told to worry about a 96-bit request-id draw — specific, actionable
+    /// and wrong in both cases.
+    ///
+    /// Asserted as three distinct discriminants rather than three exact
+    /// strings: what must hold is that a caller can tell them apart, not how
+    /// they are worded.
+    #[test]
+    fn each_registration_refusal_reaches_the_caller_as_its_own_error() {
+        let session_gone = RpcRegistrationRefusal::SessionNotCurrent.into_rpc_error("peer-a");
+        let collided = RpcRegistrationRefusal::RequestIdCollision.into_rpc_error("peer-a");
+        // `Unrepresentable` rather than `ResourceUnavailable(_)`, which would
+        // need a provider refusal constructed by hand. They share an arm, so
+        // this covers the same discriminant without a fabricated refusal.
+        let unfunded = RpcRegistrationRefusal::Unrepresentable.into_rpc_error("peer-a");
+
+        assert!(matches!(session_gone, RpcError::SessionNotCurrent(ref p) if p == "peer-a"));
+        assert!(matches!(collided, RpcError::RequestIdUnavailable));
+        assert!(matches!(unfunded, RpcError::ResourceUnavailable(_)));
+
+        // And the one that used to answer for all three still answers for
+        // exactly one. Without this the control would pass against a mapping
+        // that had merely renamed the single answer.
+        assert_eq!(
+            [&session_gone, &collided, &unfunded]
+                .into_iter()
+                .filter(|e| matches!(e, RpcError::RequestIdUnavailable))
+                .count(),
+            1,
+            "only the collision is a request-id problem"
         );
     }
 
@@ -1233,7 +1587,7 @@ mod session_ownership_tests {
         let first = pending
             .stream_chunk_sender(&filed.request_id, 1)
             .expect("sequence one is accepted");
-        assert!(first.push(&session, serde_json::json!("one")));
+        assert!(first.push(&session, serde_json::json!("one")).is_ok());
         assert!(
             pending.stream_chunk_sender(&filed.request_id, 3).is_none(),
             "a gap is not delivered as ordinary data"
@@ -1241,6 +1595,24 @@ mod session_ownership_tests {
         let delivery = inbox.recv().await.expect("one item").expect("chunk");
         assert_eq!(delivery, serde_json::json!("one"));
         drop(delivery);
+    }
+
+    #[tokio::test]
+    async fn stream_finish_in_the_check_to_wait_window_cannot_be_lost() {
+        let inbox = RpcStreamInbox::new();
+        let finisher = &inbox;
+        let terminal = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            inbox.recv_with_before_wait(move || {
+                finisher.finish(Some("terminal in the wait window".to_string()));
+            }),
+        )
+        .await
+        .expect("the registered stream waiter observes terminal state");
+        assert!(matches!(
+            terminal,
+            Some(Err(error)) if error == "terminal in the wait window"
+        ));
     }
 
     /// An oversized payload is refused, and refused **for its size**.
@@ -1259,24 +1631,38 @@ mod session_ownership_tests {
     /// consumed — the only two ways this refusal could be about something other
     /// than the payload's size. The fixture funds exactly two retained items
     /// (`FIXTURE_STREAM_ITEMS`), which is what leaves the second push room.
+    ///
+    /// The refusal is asserted **by kind**, not merely as a failure. `push`
+    /// answers `Pressure` and `Malformed` separately, and only `Pressure` says
+    /// what this control is named for; asserting the negation alone would keep
+    /// passing if an oversized payload started being reported as unrepresentable
+    /// instead of unfunded.
     #[test]
     fn stream_pressure_refuses_without_queueing() {
+        use crate::application_gateway::GatewayRefusal;
+
         let session = session();
         let inbox = RpcStreamInbox::new();
 
         assert!(
-            inbox.push(&session, serde_json::json!("small")),
+            inbox.push(&session, serde_json::json!("small")).is_ok(),
             "a payload inside the fixture's stated retention capacity is queued"
         );
 
         let oversized = serde_json::Value::String("x".repeat(16 * 1024 * 1024));
         assert!(
-            !inbox.push(&session, oversized),
-            "a payload far past that capacity is refused"
+            matches!(
+                inbox.push(&session, oversized),
+                Err(GatewayRefusal::Pressure(_))
+            ),
+            "a payload far past that capacity is refused, and refused as \
+             pressure: the provider saw it and would not fund it"
         );
 
         assert!(
-            inbox.push(&session, serde_json::json!("also small")),
+            inbox
+                .push(&session, serde_json::json!("also small"))
+                .is_ok(),
             "and the refusal was about the payload's size, not a slot: the \
              session still admits another small payload afterwards"
         );
@@ -1310,8 +1696,8 @@ mod session_ownership_tests {
     fn attach_elects_one_owner_and_rpc_does_not_keep_network_alive() {
         let state = crate::engine::build_test_state("rpc-weak-owner");
         let weak = Arc::downgrade(&state);
-        let first = Rpc::attach(&state);
-        let second = Rpc::attach(&state);
+        let first = Rpc::attach(&state).expect("the fixture funds one dispatcher");
+        let second = Rpc::attach(&state).expect("attach reuses the funded dispatcher");
         assert!(Arc::ptr_eq(&first.inner, &second.inner));
         drop(state);
         assert!(weak.upgrade().is_none());

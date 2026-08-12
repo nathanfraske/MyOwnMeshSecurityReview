@@ -81,8 +81,12 @@ async fn main() {
 
     let alice_chan: Channel<ChatLine> = Channel::new("chat".into(), alice_net.clone());
     let bob_chan: Channel<ChatLine> = Channel::new("chat".into(), bob_net.clone());
-    let mut bob_sub = bob_chan.subscribe();
-    let mut alice_sub = alice_chan.subscribe();
+    let mut bob_sub = bob_chan
+        .subscribe()
+        .expect("Bob's live channel admits its subscription");
+    let mut alice_sub = alice_chan
+        .subscribe()
+        .expect("Alice's live channel admits its subscription");
 
     // Alice sends to Bob.
     alice_chan
