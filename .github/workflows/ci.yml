@@ -288,13 +288,19 @@ jobs:
 
           # ---- Promoted-session controls, executed as groups -----------------
           #
-          # Fourteen controls, four cargo invocations. Naming each one
-          # separately would be fourteen compiles-and-links of the same test
-          # binary for no extra guarantee, and the controlling review asked
-          # specifically not to grow dozens of one-test invocations. Two of
-          # them share no prefix with anything and stay singletons; the other
-          # twelve fall into two families that can be selected by prefix and
+          # Four families, four cargo invocations. Naming each control
+          # separately would be one compile-and-link of the same test binary
+          # per control for no extra guarantee, and the controlling review
+          # asked specifically not to grow dozens of one-test invocations. The
+          # controls that share no family prefix stay singletons below; the
+          # rest fall into four families that can be selected by prefix and
           # then checked name by name.
+          #
+          # No grand total is stated here, on purpose. The per-family counts
+          # below are asserted by `run_exact_group`, so one that drifts fails
+          # this step and is corrected by the same failure; a total in a
+          # comment is checked by nothing, which is how the previous one came
+          # to be wrong.
           #
           # The group assertion is the same claim as the singleton one, made
           # once per family: the run selected exactly the expected number of
@@ -412,12 +418,25 @@ jobs:
 
           # Exact realtime flow-handle authority. Its own family because it is
           # about what a *handle* names rather than about session-owned
-          # retention, and because all three are `#[ignore]`d -- folding them
-          # into `v4_macro1_` would make that group select 10 and fail.
-          run_exact_group v4_f6_ 3 \
+          # retention, and because both are `#[ignore]`d -- folding them into
+          # `v4_macro1_` would make that group select 9 and fail.
+          run_exact_group v4_f6_ 2 \
             v4_f6_a_stale_flow_handle_reaches_no_flow_on_the_replacement \
-            v4_f6_a_reopened_label_is_a_different_flow_record \
-            v4_f6_dropping_a_flow_handle_leaves_the_flow_open
+            v4_f6_a_reopened_label_is_a_different_flow_record
+
+          # The drop-close control, which used to be the third member of that
+          # family as `v4_f6_dropping_a_flow_handle_leaves_the_flow_open`. It
+          # now asserts the opposite -- dropping a handle *closes* the flow --
+          # and was renamed into the `f8` series along with the behaviour, so
+          # the family above selects two.
+          #
+          # Run as an exact control rather than as a `v4_f8_` group because that
+          # prefix is not unique: `transport/webrtc.rs` holds four more
+          # `v4_f8_` callback-ceiling controls. None of them carries
+          # `#[ignore]`, so `--ignored` would exclude them and a prefix group
+          # would select 1 today -- but naming the full control is exact
+          # whether or not one of them ever gains one.
+          run_exact_control v4_f8_dropping_a_flow_handle_closes_the_flow --ignored
 
           # The wire half of the reliable acceptance rule: a delivery the
           # Application Gateway refuses is acknowledged to nobody. The

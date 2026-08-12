@@ -303,14 +303,48 @@ mod tests {
     /// has no runtime, so that construction panics with "there is no reactor
     /// running" before any assertion is reached. The runtime is also what makes
     /// the trailing `drop` well-defined, since it is a Tokio resource too.
+    ///
+    /// **The socket goes in a child directory that does not yet exist**, which
+    /// is the branch `prepare_owner_only_socket_parent` creates at mode 0700.
+    /// Binding straight into `tempfile::tempdir()` made this control depend on
+    /// whatever mode the host's temporary directory happens to carry: on hosted
+    /// Linux and macOS runners that directory is accessible to group or other,
+    /// so production refused it — correctly — as an unrelated pre-existing
+    /// directory it will not silently chmod, and the control failed for its
+    /// fixture's arrangement rather than for its subject. "A path whose parent
+    /// does not yet exist" is one of the three remedies that refusal names, and
+    /// it is the one this control wants: the directory under test is then the
+    /// one the daemon itself made, on any host.
+    ///
+    /// That also makes this the only control over the *create* half of the
+    /// rule. `unix_control_refuses_an_accessible_unrelated_parent_without_chmod`
+    /// below covers the refuse half.
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_control_endpoint_is_verified_as_exact_owner_only_socket() {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-        let directory = tempfile::tempdir().expect("temporary control directory");
-        let path = directory.path().join("control.sock");
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let parent = directory.path().join("private");
+        let path = parent.join("control.sock");
+        assert!(
+            !parent.exists(),
+            "non-vacuity: the parent must be absent, so the directory asserted \
+             on below is one the daemon created rather than one the host handed us"
+        );
+
         let listener = bind_listener(&SocketTarget::Path(path.clone())).expect("bind control");
+
+        // Exactly 0700 rather than the production predicate `mode & 0o077 == 0`:
+        // `mkdir` applies `mode & !umask` and a umask can only clear bits, so a
+        // directory created at 0700 keeps its owner bits under every ordinary
+        // umask. Asserting the exact value is what makes a regression to 0755
+        // fail here instead of passing a weaker "no group or other bit" check.
+        let parent_metadata = std::fs::symlink_metadata(&parent).expect("created parent metadata");
+        assert!(parent_metadata.file_type().is_dir());
+        assert_eq!(parent_metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(parent_metadata.mode() & 0o777, 0o700);
+
         let metadata = std::fs::symlink_metadata(&path).expect("socket metadata");
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
