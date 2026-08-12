@@ -237,6 +237,16 @@ pub(crate) struct LinkBeforeEngineOpen {
     left_open_event: Option<WebRtcConnectorEvent>,
 }
 
+/// The open-path fixture with its far side proved ready to receive frames.
+///
+/// The right handoff is retained only as the exact ownership witness produced
+/// by that connector's genuine open callback. The left callback remains inside
+/// `link`, unconsumed, for the production engine arm to promote.
+pub(crate) struct ReceiveReadyLinkBeforeEngineOpen {
+    pub(crate) link: LinkBeforeEngineOpen,
+    _right_handoff: crate::connector::ConnectedChannelHandoff,
+}
+
 impl LinkBeforeEngineOpen {
     /// Take the genuine native open callback. Exactly once per fixture.
     pub(crate) fn take_open_event(&mut self) -> WebRtcConnectorEvent {
@@ -274,6 +284,36 @@ pub(crate) async fn connect_before_engine_open(
     left_state: &Arc<NetworkState>,
     right_state: &Arc<NetworkState>,
 ) -> LinkBeforeEngineOpen {
+    connect_before_engine_open_inner(left_state, right_state, false)
+        .await
+        .0
+}
+
+/// Open the same real pair while also proving the right connector is ready to
+/// receive a frame. This is narrower than [`connect_before_engine_open`]: only
+/// the controls that assert on bytes reaching the far side need the far-side
+/// connected ownership, while the open-path controls deliberately stop without
+/// promoting it.
+pub(crate) async fn connect_before_engine_open_receive_ready(
+    left_state: &Arc<NetworkState>,
+    right_state: &Arc<NetworkState>,
+) -> ReceiveReadyLinkBeforeEngineOpen {
+    let (link, right_handoff) =
+        connect_before_engine_open_inner(left_state, right_state, true).await;
+    ReceiveReadyLinkBeforeEngineOpen {
+        link,
+        _right_handoff: right_handoff.expect("receive-ready construction yields a right handoff"),
+    }
+}
+
+async fn connect_before_engine_open_inner(
+    left_state: &Arc<NetworkState>,
+    right_state: &Arc<NetworkState>,
+    require_right_ready: bool,
+) -> (
+    LinkBeforeEngineOpen,
+    Option<crate::connector::ConnectedChannelHandoff>,
+) {
     let (left, mut left_events) = left_state
         .transport
         .open_connector_peer(
@@ -310,7 +350,10 @@ pub(crate) async fn connect_before_engine_open(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut left_open_event = None;
-    while left_open_event.is_none() && tokio::time::Instant::now() < deadline {
+    let mut right_handoff = None;
+    while (left_open_event.is_none() || (require_right_ready && right_handoff.is_none()))
+        && tokio::time::Instant::now() < deadline
+    {
         tokio::select! {
             event = left_events.recv() => {
                 let event = event.expect("left connector remains live");
@@ -332,11 +375,28 @@ pub(crate) async fn connect_before_engine_open(
                 let event = event.expect("right connector remains live");
                 if let Some(event) = right.accept_event(event) {
                     let (event, _callback_resources) = event.into_parts();
-                    // The right half is a live DTLS peer and nothing more. Its
-                    // own open callback is deliberately ignored: promoting it
-                    // would take a connected claim no control here asks for.
-                    if let TransportEvent::LocalIceCandidate(Some(candidate)) = event {
-                        left.add_remote_candidate(candidate).await.expect("left accepts candidate");
+                    match event {
+                        TransportEvent::LocalIceCandidate(Some(candidate)) => {
+                            left.add_remote_candidate(candidate).await.expect("left accepts candidate");
+                        }
+                        TransportEvent::DataChannelOpen
+                            if require_right_ready && right_handoff.is_none() =>
+                        {
+                            let connected = match right.confirm_data_channel_open() {
+                                DataChannelOpenOwnership::Connected(connected) => connected,
+                                _ => panic!("right exact candidate promotes once"),
+                            };
+                            right_handoff = Some(
+                                connected
+                                    .into_generic()
+                                    .expect("a connected right handoff carries its capability"),
+                            );
+                            right_events.commit_data_channel_open();
+                        }
+                        // The ordinary fixture needs a live DTLS peer and
+                        // nothing more. Its right open remains deliberately
+                        // unpromoted because those controls ask for no claim.
+                        _ => {}
                     }
                 }
             }
@@ -344,13 +404,16 @@ pub(crate) async fn connect_before_engine_open(
         }
     }
 
-    LinkBeforeEngineOpen {
-        left,
-        _left_events: left_events,
-        right,
-        _right_events: right_events,
-        left_open_event: Some(left_open_event.expect("left data channel opens")),
-    }
+    (
+        LinkBeforeEngineOpen {
+            left,
+            _left_events: left_events,
+            right,
+            _right_events: right_events,
+            left_open_event: Some(left_open_event.expect("left data channel opens")),
+        },
+        right_handoff,
+    )
 }
 
 /// Everything one twin needs to play the peer against a live left-side task.

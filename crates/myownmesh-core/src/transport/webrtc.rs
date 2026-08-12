@@ -4434,6 +4434,54 @@ struct ConnectorOwnedOperationPermit {
     _resources: crate::resource::ResourceLease,
 }
 
+/// Connector send authority taken at one instant and spent at a later one.
+///
+/// A caller that must decide "may this send happen?" under a lock it cannot
+/// hold across an await takes this value there, and awaits the send afterwards.
+/// The permit inside is the whole authority: it is acquired before the decision
+/// and held until the send resolves, so the connector cannot close in between.
+///
+/// This is deliberately *not* `send_owned` with a later await. `send_owned`
+/// enters the fence at await time, which is too late for such a caller — the
+/// close may already have committed — and it also cancels on retirement.
+/// Retirement is not close: `WebRtcConnectorIncarnation::retire` only flips the
+/// active flag and the retirement watch, and cleanup runs it *before* draining
+/// the operation fence (`cleanup::run`), so a send that watched retirement
+/// would abort in exactly the window this permit exists to protect. The native
+/// session is untouched until `native.close()`, which the drain orders after
+/// this permit drops.
+pub(crate) struct StartedConnectorSend {
+    session: Arc<PeerSession>,
+    /// The authority itself. Dropping this value — including by dropping the
+    /// send future before it resolves — releases the connector to close, which
+    /// is the cancellation contract every other permit holder here has.
+    ///
+    /// Named without an underscore because `send` really does read it: the
+    /// permit's drop point is the invariant, so it is spelled out rather than
+    /// left to whatever the enclosing value's capture happens to imply.
+    permit: ConnectorOwnedOperationPermit,
+}
+
+impl StartedConnectorSend {
+    /// Spend the authority taken at `begin_send`.
+    ///
+    /// No fence re-entry and no retirement watch: re-entering could fail after
+    /// a close began, which would discard an authority already granted, and
+    /// watching retirement would cancel a send the fence has promised to wait
+    /// for.
+    ///
+    /// The permit is bound and dropped explicitly around the await. Moving
+    /// `self` into the future would already keep it alive, but that is an
+    /// inference about capture; the whole close-drain invariant rests on this
+    /// one lifetime, so it is written where a reader checks it.
+    pub(crate) async fn send(self, data: Bytes) -> Result<usize> {
+        let Self { session, permit } = self;
+        let sent = session.send(data).await;
+        drop(permit);
+        sent
+    }
+}
+
 fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeasurement {
     let (logical_bytes, _) = measured_sum([
         candidate.candidate.len(),
@@ -5521,6 +5569,18 @@ impl WebRtcConnectorWorker {
         observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::Task, 1, 1)
     }
 
+    /// Take send authority now for a send awaited later.
+    ///
+    /// Synchronous on purpose: the caller is under a lock, or about to take
+    /// one, and needs the connector's answer before it decides. Acquiring here
+    /// rather than at await time is the whole point — see `StartedConnectorSend`.
+    pub(crate) fn begin_send(&self) -> Result<StartedConnectorSend> {
+        Ok(StartedConnectorSend {
+            session: Arc::clone(&self.session),
+            permit: self.ownership.enter_operation()?,
+        })
+    }
+
     pub(crate) async fn send_owned(&self, data: Bytes) -> Result<usize> {
         let _operation = self.ownership.enter_operation()?;
         await_until_connector_retirement(
@@ -5771,6 +5831,20 @@ impl WebRtcConnectorWorker {
     #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) fn install_native_close_gate_for_test(&self) -> NativeCloseGateHandle {
         self.close_owner.install_native_close_gate_for_test()
+    }
+
+    /// Commit this connector's operation close fence, and nothing else.
+    /// **Controls only.**
+    ///
+    /// Deliberately narrower than every production path that closes a fence:
+    /// it does not retire the incarnation, does not start the close owner, and
+    /// touches no session, promotion, or governance state. That is the whole
+    /// point — it isolates "this connector will accept no further operations"
+    /// from "this peer lost its authority", which production always causes
+    /// together and which a caller must never confuse.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn begin_close_for_test(&self) {
+        self.ownership.begin_close();
     }
 
     /// How many connected claims this connector's close owner is holding in

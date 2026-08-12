@@ -45,8 +45,8 @@ pub use webrtc::{
 #[cfg(all(test, feature = "transport-lab"))]
 pub(crate) use webrtc::WithheldBindingComponent;
 pub(crate) use webrtc::{
-    DataChannelOpenOwnership, RemoteCandidateDisposition, WebRtcConnectorEvent,
-    WebRtcConnectorWorker,
+    DataChannelOpenOwnership, RemoteCandidateDisposition, StartedConnectorSend,
+    WebRtcConnectorEvent, WebRtcConnectorWorker,
 };
 /// The realtime names are all `WebRtc`-qualified, and there is no unqualified
 /// spelling of any of them.

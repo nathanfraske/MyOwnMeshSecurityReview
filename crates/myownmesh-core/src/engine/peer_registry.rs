@@ -971,12 +971,15 @@ impl AdmittedInboundDispatch {
 /// replacement installed during the await cannot receive this operation or its
 /// accounting.
 ///
-/// Before the native future is first polled, [`Self::begin`] re-enters the
-/// registry mutation fence and proves both the captured installation and its
-/// session witness are live. Crossing that synchronous point orders the effect
-/// before any later replacement or governance commit. The await then holds no
-/// registry lock and makes no impossible claim that cancellation can retract
-/// bytes already handed to the native sender.
+/// Before the native future is first polled, [`Self::begin`] takes the
+/// connector's own send authority and then re-enters the registry mutation
+/// fence to prove both the captured installation and its session witness are
+/// live. Crossing that synchronous point orders the effect before any later
+/// replacement or governance commit, and the held connector authority makes
+/// that ordering effective rather than merely recorded: revocation may retire
+/// and close the connector immediately afterwards, and the send still lands.
+/// The await then holds no registry lock and makes no impossible claim that
+/// cancellation can retract bytes already handed to the native sender.
 ///
 /// Deliberately not `Clone`, `Copy`, `Debug`, `Default`, or serializable, and
 /// consumed by value, so one admission authorizes one operation.
@@ -1010,20 +1013,108 @@ impl AdmittedApplicationOperation {
     /// native send future, or returns an operation ordered before any later
     /// commit. No registry or parking_lot guard escapes this method.
     fn begin(self, peers: &PeerRegistry) -> Result<StartedApplicationOperation> {
+        self.begin_after(peers, || {})
+    }
+
+    /// [`Self::begin`], with one observable instant inside it.
+    ///
+    /// `after_precheck` runs between the early validity precheck and the
+    /// connector acquisition, which is the one window a caller cannot otherwise
+    /// reach: everything before it is a single atomic read and everything after
+    /// it is this method's own. A control that must revoke *there* — after the
+    /// precheck has already passed, before the connector is asked — has no
+    /// other way to say so, and that interleaving is exactly what the refusal
+    /// translation below exists to answer correctly.
+    ///
+    /// Production passes an empty closure, so this costs a call to a closure
+    /// that does nothing and compiles away. The hook is deliberately given no
+    /// arguments and no return: it can observe and act on the wider system, but
+    /// it cannot inspect or influence this operation's own decision.
+    fn begin_after(
+        self,
+        peers: &PeerRegistry,
+        after_precheck: impl FnOnce(),
+    ) -> Result<StartedApplicationOperation> {
+        // Policy before resources. A witness already known dead takes nothing
+        // and is refused for the reason it is actually dead.
+        //
+        // This is not the linearization point — the authoritative check is the
+        // one under the mutation lock below, and this one cannot replace it
+        // because it reads no registry state. It exists for two production
+        // reasons. A revoked session must not acquire a connector operation
+        // permit: that permit joins the connector's active-operation count and
+        // holds up the close drain, so a peer that has just lost its authority
+        // could still delay teardown. And the refusal must name revocation
+        // rather than whatever the transport happened to fail first — a caller
+        // that cannot tell a policy refusal from a broken connector has lost
+        // the distinction this whole gate exists to draw.
+        if !self.validity.is_live() {
+            return Err(Self::revoked());
+        }
+        after_precheck();
+        // Connector authority next, and outside the registry lock.
+        //
+        // First, because the send is awaited long after this method returns: a
+        // connector permit taken at await time can find a close already
+        // committed, which is a refusal of an effect this fence has already
+        // ordered as permitted. Held from here, the connector cannot close
+        // until the send resolves or the value is dropped.
+        //
+        // Outside, because acquiring it touches a resource provider and the
+        // connector's own fence, and neither belongs inside the registry-wide
+        // critical section that every peer mutation contends on. Ordering is
+        // unaffected: revocation commits under the mutation lock below, so a
+        // validation that passes proves no revocation had committed while this
+        // permit was already held.
+        let send = match self.session.begin_send() {
+            Ok(send) => send,
+            // The connector refused. Which answer is truthful depends on
+            // whether this witness survived, because revocation closes this
+            // connector too: a caller told only "the close fence has
+            // committed" would be told about the symptom while the cause —
+            // that it no longer has authority to send at all — went unnamed.
+            //
+            // Re-reading validity here is sound in one direction, which is the
+            // direction used. The flag is monotonic — set true once at
+            // construction and false once in `SessionValidity::invalidate`,
+            // with no path back — so a `false` now proves revocation happened
+            // at or before this refusal and cannot be a value about to change
+            // its mind. A `true` proves only that no revocation had been
+            // observed by this load; one may begin immediately after it. That
+            // is enough, because it leaves the connector's own error as the
+            // only cause established at the moment of answering, and the
+            // authoritative check under the mutation lock is not reached on
+            // this path at all.
+            Err(native) => {
+                return Err(if self.validity.is_live() {
+                    native
+                } else {
+                    Self::revoked()
+                })
+            }
+        };
         let _mutation = peers.mutation.lock();
         let current = peers
             .peers
             .get(self.owner.device_id())
             .filter(|current| Arc::ptr_eq(&current.value().installation, &self.owner.installation));
         if current.is_none() || !self.validity.is_live() {
-            return Err(Error::Transport(
-                "the session authorizing this send was revoked".into(),
-            ));
+            return Err(Self::revoked());
         }
         Ok(StartedApplicationOperation {
             peer: self.peer,
-            session: self.session,
+            send,
         })
+    }
+
+    /// The one refusal a revoked application send gives, from either check.
+    ///
+    /// Built in one place so the two cannot drift apart: a caller is entitled
+    /// to the same answer whether the witness was already dead on entry or was
+    /// revoked while this operation was being admitted, and a divergence would
+    /// leak which of the two happened.
+    fn revoked() -> Error {
+        Error::Transport("the session authorizing this send was revoked".into())
     }
 
     #[cfg(all(test, feature = "transport-lab"))]
@@ -1033,6 +1124,21 @@ impl AdmittedApplicationOperation {
     ) -> Result<StartedApplicationOperation> {
         self.begin(peers)
     }
+
+    /// Begin, with `revoke` run at the one instant the precheck cannot cover.
+    ///
+    /// The production entry point is [`Self::begin`] and its closure is empty;
+    /// this exists only so a control can be the concurrency rather than race
+    /// against it. Nothing here is reachable from production, and the closure
+    /// still cannot reach this operation's own state.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn begin_racing_revocation_for_test(
+        self,
+        peers: &PeerRegistry,
+        revoke: impl FnOnce(),
+    ) -> Result<StartedApplicationOperation> {
+        self.begin_after(peers, revoke)
+    }
 }
 
 /// An application effect that crossed the registry-fenced begin point.
@@ -1040,7 +1146,14 @@ impl AdmittedApplicationOperation {
 /// does not claim to roll back bytes a native sender may already own.
 pub(super) struct StartedApplicationOperation {
     peer: Arc<PeerConnection>,
-    session: Arc<crate::transport::WebRtcConnectorWorker>,
+    /// Connector authority already taken, not a worker to ask again later.
+    ///
+    /// Holding the started send rather than the worker is what makes this type
+    /// honest: its documented claim is that the effect is ordered before any
+    /// later revocation, and that is only true if the connector cannot close
+    /// underneath the await. Dropping this value before the send resolves
+    /// releases the connector, which is the cancellation this type does allow.
+    send: crate::transport::StartedConnectorSend,
 }
 
 impl StartedApplicationOperation {
@@ -1049,7 +1162,7 @@ impl StartedApplicationOperation {
         bytes: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> Result<usize> {
-        let sent = tokio::time::timeout(timeout, self.session.send_owned(bytes))
+        let sent = tokio::time::timeout(timeout, self.send.send(bytes))
             .await
             .map_err(|_| Error::Transport("peer send timed out".into()))??;
         let mut data = self.peer.state.write();

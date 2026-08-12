@@ -4560,6 +4560,127 @@ async fn insert_promoted_peer(state: &Arc<NetworkState>, device_id: &str) -> Pro
     }
 }
 
+/// The same promoted peer as [`insert_promoted_peer`], over a **genuinely
+/// linked** connector pair.
+///
+/// `insert_promoted_peer` opens one connector as an answerer and confirms its
+/// own open, which is enough for every control that only needs admission to
+/// have something real to admit. It has no remote, so nothing ever installs
+/// `PeerSession.data_channel`: the offerer branch that calls
+/// `create_data_channel` is not taken, and the `on_data_channel` callback that
+/// would fill it on this side never fires. A send that reaches the native
+/// sender there can only fail, so a control that must prove bytes crossed
+/// cannot use it.
+///
+/// This one completes a real offer, answer, ICE, DTLS and SCTP exchange, and
+/// both halves are held: the far handoff and both event receivers stay alive
+/// for the fixture's lifetime, because dropping either receiver stops that
+/// connector's pump and the link the control asserts on would stop being the
+/// link that was up.
+#[cfg(all(test, feature = "transport-lab"))]
+struct LinkedPromotedPeer {
+    peer: Arc<PeerConnection>,
+    receive_ready: crate::endpoint_auth::native_link::ReceiveReadyLinkBeforeEngineOpen,
+}
+
+/// Install `device_id` as a promoted peer over a live link to `peer_state`.
+///
+/// The left connector's own native open callback is consumed here, exactly as
+/// the production `DataChannelOpen` arm consumes it — accept, confirm, take the
+/// generic handoff, then commit — and that exact worker and handoff become the
+/// peer's authenticated channel. So the installed peer is the same shape
+/// `insert_promoted_peer` produces, differing only in having a far side.
+#[cfg(all(test, feature = "transport-lab"))]
+async fn insert_promoted_peer_over_real_link(
+    state: &Arc<NetworkState>,
+    peer_state: &Arc<NetworkState>,
+    device_id: &str,
+) -> LinkedPromotedPeer {
+    let mut receive_ready =
+        crate::endpoint_auth::native_link::connect_before_engine_open_receive_ready(
+            state, peer_state,
+        )
+        .await;
+    let open = receive_ready.link.take_open_event();
+    let open = receive_ready
+        .link
+        .left
+        .accept_event(open)
+        .expect("the live connector accepts its own open callback");
+    let (open, _callback_resources) = open.into_parts();
+    assert!(
+        matches!(open, TransportEvent::DataChannelOpen),
+        "non-vacuity: the fixture yields the genuine open callback"
+    );
+    let handoff = match receive_ready.link.left.confirm_data_channel_open() {
+        crate::transport::DataChannelOpenOwnership::Connected(connected) => connected
+            .into_generic()
+            .expect("a connected handoff carries its capability"),
+        _ => panic!("the left connector promotes its exact candidate once"),
+    };
+    receive_ready.link._left_events.commit_data_channel_open();
+
+    let peer = Arc::new(PeerConnection::new(
+        device_id.to_string(),
+        Some(Arc::clone(&receive_ready.link.left)),
+    ));
+    {
+        let mut data = peer.state.write();
+        data.authenticated = true;
+        data.status = PeerStatus::Active;
+        data.data_channel_open = true;
+    }
+    peer.install_authenticated_channel_over_for_test(
+        handoff,
+        &state.network_id,
+        state.identity.public_id(),
+    );
+    install_peer(&state.peers, Arc::clone(&peer));
+    LinkedPromotedPeer {
+        peer,
+        receive_ready,
+    }
+}
+
+/// Wait until the far connector receives exactly `expected`, or panic.
+///
+/// Scans rather than reading one frame, because the same link legitimately
+/// carries other sends — the retained reliable frame, for one — and an earlier
+/// unrelated frame is not evidence about this one. Only an exact byte match
+/// ends the wait: a different frame is skipped, never accepted, so this cannot
+/// report success on somebody else's send. Reaching the deadline without the
+/// exact bytes is a failure, which is what makes it a proof that they crossed.
+#[cfg(all(test, feature = "transport-lab"))]
+async fn expect_native_frame(
+    link: &mut crate::endpoint_auth::native_link::LinkBeforeEngineOpen,
+    expected: &[u8],
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(1), link._right_events.recv())
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(accepted) = link.right.accept_event(event) else {
+            continue;
+        };
+        let (event, _callback_resources) = accepted.into_parts();
+        let TransportEvent::Message(bytes) = event else {
+            continue;
+        };
+        if bytes.as_ref() == expected {
+            return;
+        }
+    }
+    panic!(
+        "the peer's own connector never received the exact frame {:?} before the deadline",
+        Bytes::copy_from_slice(expected)
+    );
+}
+
 /// Test-only: an installed peer with a live connector and endpoint-auth task,
 /// approved by legacy policy but holding **no** authenticated channel.
 ///
@@ -5422,6 +5543,133 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn v4_arc05_revoking_policy_refuses_the_next_operation_and_drops_the_session() {
+        // ---- a closed connector is not a revoked session -------------------
+        //
+        // `AdmittedApplicationOperation::begin` answers a connector refusal
+        // with the revocation error when the witness is dead. This arm is the
+        // other side of that branch, and the reason it is a branch rather than
+        // a translation: with the session, the owner and the promotion all
+        // still live, the connector's own account must reach the caller
+        // unchanged. A build that answered *every* connector refusal with "was
+        // revoked" would leave every other assertion in this test green,
+        // because the witness is dead in all of them.
+        //
+        // Its own NetworkState, peer and connector, in a block that ends before
+        // the revocation fixture is built. Committing a close fence on *that*
+        // connector would hand every arm below a second possible cause for a
+        // refusal it attributes to policy. The isolation is the scope, not a
+        // separate test: `ci.yml:348` runs this function by exact name and is
+        // that line's only execution anywhere in CI, so a sibling test would
+        // never run at all.
+        {
+            let closed_state = build_test_state_with_realtime_flows("arc05-connector-close");
+            closed_state.peers.with_governance_commit(|gov| {
+                gov.kind = crate::network_state::NetworkKind::Closed;
+                gov.roles.insert(
+                    closed_state.identity.public_id().to_string(),
+                    crate::network_state::Role::Owner,
+                );
+                gov.roles.insert(
+                    "closing-peer".to_string(),
+                    crate::network_state::Role::Member,
+                );
+            });
+            let closed_fixture = insert_promoted_peer(&closed_state, "closing-peer").await;
+            let closed_owner = closed_state
+                .peers
+                .owner("closing-peer")
+                .expect("the fixture peer is installed");
+
+            // Minted while every conjunct holds, so nothing below can be
+            // attributed to admission having refused.
+            let pending = closed_state
+                .peers
+                .admit_application_operation(
+                    &closed_owner,
+                    closed_state.session_broker.as_ref(),
+                    &closed_state.network_id,
+                )
+                .expect("non-vacuity: policy admits the owned send while everything is live");
+
+            let traffic_before = closed_state.traffic.snapshot();
+            let frames_before = closed_fixture.peer.state.read().diag.frames_out;
+            let bytes_before = closed_fixture.peer.state.read().diag.bytes_out;
+
+            // The connector alone. No governance commit, no eviction, no
+            // retirement, no close owner: this peer keeps every scrap of
+            // authority it had and merely loses the transport it would have
+            // used. That separation is the whole arm — production always causes
+            // both at once, which is precisely why the two must not be
+            // conflated.
+            //
+            // Reached through a renegotiation claim because that is the one
+            // production handle naming a peer's exact connector; the claim is
+            // resolved immediately so it cannot interact with the send below.
+            closed_fixture.peer.state.write().media_reneg_pending = true;
+            let renegotiation = closed_state
+                .peers
+                .claim_renegotiation(
+                    &closed_owner,
+                    closed_state.session_broker.as_ref(),
+                    &closed_state.network_id,
+                )
+                .expect("non-vacuity: the live session claims renegotiation on its own connector");
+            renegotiation.session().begin_close_for_test();
+            renegotiation.complete(&closed_state.peers, Err("connector closed".to_string()));
+
+            let error = pending
+                .send_frame(
+                    &closed_state.peers,
+                    Bytes::from_static(b"connector-closed-not-revoked"),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .expect_err("a connector that accepts no further operations cannot start a send");
+            assert!(
+                error.to_string().contains("close fence has committed"),
+                "the connector's own account of the failure reaches the caller: {error}"
+            );
+            assert!(
+                !error.to_string().contains("revoked"),
+                "and is not restated as a loss of authority this peer never suffered: {error}"
+            );
+
+            // Named individually, because an answer of "revoked" would be a
+            // claim about a state that none of the three agree with.
+            assert!(
+                closed_fixture.peer.holds_promoted_session_for_test(),
+                "the promoted session outlives its connector's close fence"
+            );
+            assert!(
+                closed_state
+                    .peers
+                    .admit_application_operation(
+                        &closed_owner,
+                        closed_state.session_broker.as_ref(),
+                        &closed_state.network_id
+                    )
+                    .is_some(),
+                "and the current owner and its session validity still admit the next operation"
+            );
+
+            // ---- and the refusal had no effect ----------------------------
+            assert_eq!(
+                closed_fixture.peer.state.read().diag.frames_out,
+                frames_before,
+                "a send refused before its connector authority never reaches the accounting half"
+            );
+            assert_eq!(
+                closed_fixture.peer.state.read().diag.bytes_out,
+                bytes_before,
+                "and records no bytes against a peer it never wrote to"
+            );
+            assert_eq!(
+                closed_state.traffic.snapshot(),
+                traffic_before,
+                "and moves no traffic counter in any lane"
+            );
+        }
+
         let state = build_test_state_with_realtime_flows("arc05-policy-revocation");
         state.peers.with_governance_commit(|gov| {
             gov.kind = crate::network_state::NetworkKind::Closed;
@@ -5434,7 +5682,15 @@ mod tests {
                 crate::network_state::Role::Member,
             );
         });
-        let fixture = insert_promoted_peer(&state, "revoked-peer").await;
+        // Over a real link, because the started arm below must prove bytes
+        // crossed and not merely that a send was authorized. `peer_state` is
+        // the native far half only — the connector, its resource scope and its
+        // event pump. Every policy identity in this control remains exactly
+        // "revoked-peer", which is what the governance roles above name and
+        // what every later assertion resolves through.
+        let peer_state = build_test_state("arc05-policy-revocation-far");
+        let mut fixture =
+            insert_promoted_peer_over_real_link(&state, &peer_state, "revoked-peer").await;
         let owner = state
             .peers
             .owner("revoked-peer")
@@ -5535,6 +5791,10 @@ mod tests {
             .peers
             .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
             .expect("non-vacuity: policy admits the owned send before revocation");
+        let racing_send = state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .expect("non-vacuity: a third owned send is admitted before revocation");
         let started_send = state
             .peers
             .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
@@ -5557,9 +5817,42 @@ mod tests {
         // the same Mesh context and the same runtime. Policy is the only
         // conjunct that moves, so a build with the use-time recheck deleted
         // fails every assertion below.
-        state.peers.with_governance_commit(|gov| {
-            gov.roles.remove("revoked-peer");
-        });
+        //
+        // Performed *inside* a third witness's begin, at the one instant its
+        // early precheck has already passed and its connector has not yet been
+        // asked. That interleaving is the only one a precheck cannot cover, and
+        // here it is driven rather than raced: single-threaded, no timing, no
+        // second task. Every later arm sees the same committed revocation it
+        // saw when this was a standalone call.
+        let racing_error = match racing_send.begin_racing_revocation_for_test(&state.peers, || {
+            state.peers.with_governance_commit(|gov| {
+                gov.roles.remove("revoked-peer");
+            });
+            // Non-vacuity for this arm alone: the commit has already closed the
+            // connector, so the acquisition this closure returns into cannot
+            // succeed, and the refusal below can only be a translation of that
+            // failure. Without this the arm would pass just as well with the
+            // connector still open and the mutation-locked recheck answering —
+            // a different gate, giving the same words. Which refusal the
+            // connector gives is pinned below rather than here.
+            assert!(
+                delayed_renegotiation.session().begin_send().is_err(),
+                "non-vacuity: revocation closed this connector before it is asked to send"
+            );
+        }) {
+            Ok(_unexpected) => panic!("a witness revoked mid-begin does not start its send"),
+            Err(error) => error,
+        };
+        assert!(
+            racing_error.to_string().contains("was revoked"),
+            "a revocation landing mid-begin is named as revocation, not as the close it \
+             caused: {racing_error}"
+        );
+        assert!(
+            !racing_error.to_string().contains("close fence"),
+            "so the connector's own message is what gets translated, not what surfaces: \
+             {racing_error}"
+        );
 
         let delayed_error = delayed_send
             .send_frame(
@@ -5573,10 +5866,46 @@ mod tests {
             delayed_error.to_string().contains("was revoked"),
             "the delayed witness names revocation rather than attempting the wire: {delayed_error}"
         );
+        // Refused *by policy*, and not by the transport getting there first.
+        //
+        // Revocation also closes this connector, so the fence would refuse this
+        // send too — for a reason that says nothing about authority. Were that
+        // the answer, a build with the use-time policy recheck deleted would
+        // still fail this send, and the arm above would stop discriminating.
+        assert!(
+            !delayed_error.to_string().contains("close fence"),
+            "and refused for the policy reason, not the transport one: {delayed_error}"
+        );
         assert_eq!(
             fixture.peer.state.read().diag.frames_out,
             frames_before_effects,
             "refusal before effect-begin never reaches the native-send/accounting half",
+        );
+        // Non-vacuity for the arm below: the connector's close fence really has
+        // committed by now, so the started arm cannot be passing merely because
+        // nothing closed. Asked for fresh authority at this instant, the exact
+        // same connector refuses.
+        //
+        // This also carries the message the racing arm's closure deliberately
+        // left unpinned. The two are complementary rather than repeated: that
+        // one establishes *when* the fence closed, this one establishes *what*
+        // it says when it refuses.
+        //
+        // The renegotiation claim is the handle: it captured this connector
+        // before revocation and, unlike every admission path, it still names it
+        // afterwards. Its own liveness is separately asserted below, so reading
+        // the connector through it does not weaken that assertion.
+        let refused_now = match delayed_renegotiation.session().begin_send() {
+            Ok(_unexpected) => {
+                panic!("non-vacuity: fresh connector authority is refused after revocation")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            refused_now
+                .to_string()
+                .contains("close fence has committed"),
+            "and refused by the close fence specifically, got: {refused_now}"
         );
         started_send
             .send_frame(
@@ -5584,12 +5913,23 @@ mod tests {
                 std::time::Duration::from_secs(1),
             )
             .await
-            .expect("a send that crossed first is ordered before the later revocation");
+            .expect(
+                "a send that crossed first carries its connector authority through the close it \
+                 preceded",
+            );
         assert_eq!(
             fixture.peer.state.read().diag.frames_out,
             frames_before_effects + 1,
             "the already-started arm completes exactly one admitted effect after the later commit",
         );
+        // The bytes themselves, on the peer's own connector.
+        //
+        // Everything above this line is the sender's account of its own send.
+        // This is the far side's, and it is the difference between "the effect
+        // was authorized and accounted" and "the effect happened": a build that
+        // ordered the authority correctly and then dropped the frame would
+        // satisfy every assertion before this one.
+        expect_native_frame(&mut fixture.receive_ready.link, b"began-before-revocation").await;
         assert!(
             !delayed_renegotiation.is_live(),
             "the same session edge invalidates a claimed renegotiation before it can create an offer"
@@ -7502,9 +7842,13 @@ mod tests {
         // Held whole: the fixture owns both connectors' event receivers, and
         // dropping either stops that connector's pump — so the link the
         // assertions describe would stop being the link that was up.
-        let mut link =
-            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
-                .await;
+        let mut receive_ready =
+            crate::endpoint_auth::native_link::connect_before_engine_open_receive_ready(
+                &state,
+                &peer_state,
+            )
+            .await;
+        let link = &mut receive_ready.link;
         let open = link.take_open_event();
         let open = link
             .left
@@ -7576,13 +7920,40 @@ mod tests {
         );
 
         // What the driver does with it, on the driver's own side of the fence.
+        // These two counters and the session's debt localize success to the left
+        // send before the far-side wire assertion below. Without them a timeout
+        // could mean either that replay never crossed its application-send
+        // boundary or that a successfully written frame was not observed by the
+        // receive fixture.
+        let frames_out_before = peer.state.read().diag.frames_out;
+        let control_tx_before = state.traffic.snapshot().control_tx.frames;
         for command in replays {
             handle_command(&state, command).await;
         }
+        assert_eq!(
+            peer.state.read().diag.frames_out,
+            frames_out_before + 1,
+            "the replay writes exactly one frame through the captured peer"
+        );
+        assert_eq!(
+            state.traffic.snapshot().control_tx.frames,
+            control_tx_before + 1,
+            "the replay accounts exactly one capability control frame"
+        );
+        assert_eq!(
+            state.peers.with_live_session_state(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |_session, session_state| session_state.local_advert_owed(),
+            ),
+            Some(false),
+            "the exact promoted session clears its advert debt only after the send succeeds"
+        );
 
         // The peer's own connector, not this node's bookkeeping: the assertion is
         // the bytes that crossed.
-        let received = receive_capabilities_update(&mut link).await;
+        let received = receive_capabilities_update(link).await;
         assert_eq!(
             received, advert,
             "the peer receives exactly the advertisement made before it existed"
@@ -7605,20 +7976,38 @@ mod tests {
         // the wire, and that is the thing actually being ruled out.
         let hello = handshake::local_hello(&state, "noncef4".to_string(), "aaa111".to_string());
         let encoded = serde_json::to_vec(&hello).expect("hello encodes");
+        let object = serde_json::from_slice::<serde_json::Value>(&encoded)
+            .expect("the encoded hello is JSON")
+            .as_object()
+            .expect("the encoded hello is an object")
+            .clone();
         let encoded = String::from_utf8(encoded).expect("a hello frame is UTF-8 JSON");
-        for absent in [
-            "capabilities",
-            "max_connections",
-            "app_version",
-            "f4-replay-tag",
-            "9.9.9-f4",
-            "replayed",
-        ] {
+        for absent_key in ["capabilities", "max_connections", "app_version"] {
+            assert!(
+                !object.contains_key(absent_key),
+                "the hello this node sends has no capability-metadata key: \
+                 {absent_key} in {encoded}"
+            );
+        }
+        for absent in ["f4-replay-tag", "9.9.9-f4", "replayed"] {
             assert!(
                 !encoded.contains(absent),
                 "the hello this node sends carries no capability metadata: {absent} in {encoded}"
             );
         }
+        assert!(
+            object
+                .get("features")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|features| {
+                    features.iter().any(|feature| {
+                        feature.as_str()
+                            == Some(crate::protocol::features::Feature::CAPABILITIES_UPDATE)
+                    })
+                }),
+            "the production hello still advertises the exact capabilities-update feature: \
+             {encoded}"
+        );
         assert!(
             encoded.contains("noncef4"),
             "non-vacuity: this is the encoded hello, not an empty frame"
