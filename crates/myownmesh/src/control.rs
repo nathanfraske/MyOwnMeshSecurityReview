@@ -981,7 +981,16 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
             .context("control socket name → ns_name")?,
     };
     let options = ListenerOptions::new().name(name);
-    #[cfg(unix)]
+    // `ListenerOptionsExt::mode` is an `fchmod` on the socket fd performed
+    // *before* `bind`, which is exactly what makes it race-free: the socket is
+    // never visible under any other mode, not even briefly. interprocess 2.4.2
+    // documents support for Linux, FreeBSD 14.3+ and OpenBSD, and converts an
+    // `EINVAL` from that `fchmod` into `ErrorKind::Unsupported` — which is what
+    // macOS returns for an unbound `AF_UNIX` descriptor. So on macOS this is
+    // not a weaker option, it is a failing one: passing it there aborts the
+    // bind rather than degrading, and the crate removed its racy fallback in
+    // 2.3.0 rather than paper over it.
+    #[cfg(all(unix, not(target_os = "macos")))]
     let options = {
         use interprocess::os::unix::local_socket::ListenerOptionsExt;
         options.mode(0o600)
@@ -1000,6 +1009,27 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
         options.security_descriptor(descriptor)
     };
     let listener = options.create_tokio().context("create_tokio")?;
+    // macOS only: set explicitly what the builder is not permitted to set.
+    //
+    // This does reintroduce a bind-then-chmod interval that the
+    // `fchmod`-before-`bind` path does not have. That interval is not reachable
+    // by another user, and the parent directory is the whole reason why:
+    // `prepare_owner_only_socket_parent` has already proved — forcing it if
+    // necessary, and re-reading to confirm — that the socket's parent is owned
+    // by this euid and carries no group or other bits. A directory that grants
+    // no `x` to others cannot be traversed by them, so a socket inside it
+    // cannot be opened during the interval whatever its own mode says at that
+    // instant. The window is closed by the containing directory, not by luck.
+    //
+    // The mode is stated exactly rather than left to the process umask, which
+    // is neither read nor modified here or anywhere else in this path, and the
+    // result is verified below on the same terms as every other platform.
+    #[cfg(target_os = "macos")]
+    if let SocketTarget::Path(path) = target {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set owner-only mode on control socket {}", path.display()))?;
+    }
     #[cfg(unix)]
     if let SocketTarget::Path(path) = target {
         verify_owner_only_socket_path(path)?;
@@ -4083,9 +4113,14 @@ mod realtime_control_tests {
         assert!(!realtime_frame_length_admitted(9, 8));
     }
 
+    /// `bind_listener` ends in `create_tokio`, which registers the listener's
+    /// descriptor with the Tokio reactor as it is constructed. A plain `#[test]`
+    /// has no runtime, so that construction panics with "there is no reactor
+    /// running" before any assertion is reached. The runtime is also what makes
+    /// the trailing `drop` well-defined, since it is a Tokio resource too.
     #[cfg(unix)]
-    #[test]
-    fn unix_control_endpoint_is_verified_as_exact_owner_only_socket() {
+    #[tokio::test]
+    async fn unix_control_endpoint_is_verified_as_exact_owner_only_socket() {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
         let directory = tempfile::tempdir().expect("temporary control directory");

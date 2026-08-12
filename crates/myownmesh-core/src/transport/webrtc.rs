@@ -16780,6 +16780,41 @@ mod tests {
         // The connector is fine; its process's cleanup executor is not.
         mesh.fail_cleanup_executor_for_test();
 
+        // Settle before measuring anything. `fail_cleanup_executor_for_test`
+        // terminates the executor thread, and that thread is what owns the
+        // executor's infrastructure reservation: the lease is released as it
+        // unwinds, asynchronously with respect to this one. A baseline taken
+        // before that release counts a charge the final snapshot will not, and
+        // the exact vector relation at the end of this control would then fail
+        // on a dimension nothing here is about.
+        //
+        // `SocketOrHandle` is the exact predicate because that infrastructure
+        // claim is the only Socket holder in this scope. Its reaching zero is
+        // precisely "the executor's own lease is gone" and nothing else, so it
+        // puts the baseline and the final snapshot on the same side of the
+        // release rather than merely allowing time to pass.
+        //
+        // Bounded and yielded rather than slept: a correct teardown is past
+        // this within the first few yields, and the deadline is here to fail an
+        // executor that never releases at all, not to wait out a slow one.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if provider
+                .in_use()
+                .amount(crate::resource::ResourceClass::SocketOrHandle)
+                == 0
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed cleanup executor never released its infrastructure \
+                 reservation, so no baseline taken here could be compared with a \
+                 total taken after the drop"
+            );
+            tokio::task::yield_now().await;
+        }
+
         // Read before the drop, because a refusal does two different things to
         // two different charges — one retained, one returned — and stating
         // either against a total taken afterwards would let them stand in for
@@ -16857,6 +16892,45 @@ mod tests {
              refused reservation's own record, and did neither of those things \
              to the transceiver's raw claim, which stayed exactly where it was"
         );
+
+        // A second returned charge, sealed the same way the queue slot is.
+        //
+        // Terminating the executor releases the infrastructure lease its thread
+        // owned, and that capacity comes back to the one grant every
+        // acquisition here draws on. It covers a whole transceiver claim on
+        // every dimension a transceiver claim uses — CallbackOrScheduledWork
+        // 1 >= 1, OpaqueDependencyResidual 4 >= 4, and a tokio runtime plus
+        // three handles against one native port — so left standing it, and not
+        // the retention under test, is what the probes below would be
+        // measuring.
+        //
+        // This value is a control-owned pressure seal shaped like that
+        // infrastructure claim. It is not a live executor, and holding it
+        // asserts nothing about ownership: no thread, runtime or queue exists
+        // behind it. Its only job is to occupy the capacity a terminated
+        // executor handed back, so the refusals below are about the
+        // transceiver's retained claim and nothing else.
+        //
+        // Placed *after* the ledger assertion above, deliberately. Taken any
+        // earlier it would be inside the totals that assertion compares, and
+        // could then stand in for retention or for a returned record — the two
+        // things that assertion exists to tell apart. After it, the exact
+        // vector relation is already proved and this cannot participate in it.
+        //
+        // The `expect` is the discriminator rather than a formality: an
+        // executor that leaked its infrastructure on termination leaves this
+        // capacity unavailable and fails here by name, instead of quietly
+        // satisfying the probes below.
+        let infrastructure_seal = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                crate::runtime::attempt::cleanup_executor_infrastructure_claim()
+                    .expect("the executor infrastructure claim is representable"),
+            )
+            .expect(
+                "a terminated cleanup executor released the exact infrastructure \
+                 capacity its thread was holding",
+            );
         assert!(
             scope
                 .acquire(
@@ -16906,10 +16980,15 @@ mod tests {
             "and the accounting is unchanged by that visit — a loser retains \
              nothing, because it was never holding the charge"
         );
-        // Held all the way to here on purpose: released any earlier and every
-        // refusal above would have had returned slot capacity standing behind
+        // Both held all the way to here on purpose: released any earlier and
+        // every refusal above would have had returned capacity standing behind
+        // it — the queue slot the refusal gave back, and the infrastructure the
+        // terminated executor gave back. The terminal visit above is inside
+        // that span for the same reason, so it observes the same exhausted
+        // grant the probes did rather than one that quietly refilled underneath
         // it.
         drop(returned_slot);
+        drop(infrastructure_seal);
     }
 
     /// An FU-B start fragment is not an anchor, because this side cannot frame
