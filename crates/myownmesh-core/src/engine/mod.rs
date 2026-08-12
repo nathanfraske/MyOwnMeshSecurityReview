@@ -4188,18 +4188,30 @@ fn build_test_state_parts_metered(
 /// The grant a fixture was built with, and a reader for what it has actually
 /// consumed, so a pressure control can make the provider's refusal exact.
 ///
-/// This exists because adding an exact `retained` term to the grant does **not**
-/// make it a ceiling. Every scope draws from one shared pool, and the base grant
-/// is built from worst-case envelopes — connector, remote-candidate,
-/// remote-description and session terms sized for every slot the fixture could
-/// use, against a peer count and a candidate volume no pressure control comes
-/// near. What is left unused after one peer is promoted is real, large, and
-/// spread across the very dimensions a retained frame charges, including the
-/// residual one. So the N+1st acquisition gets funded by that leftover instead
-/// of being refused, and a control written against the addend alone passes
-/// vacuously or hangs.
+/// This exists because adding an exact term to the grant does **not** make it a
+/// ceiling. Every scope draws from one shared pool, and the base grant is built
+/// from worst-case envelopes — connector, remote-candidate, remote-description
+/// and session terms sized for every slot the fixture could use, against a peer
+/// count and a candidate volume no pressure control comes near. What is left
+/// unused after one peer is promoted is real, large, and spread across the very
+/// dimensions a retained frame charges, including the residual one. So the
+/// N+1st acquisition gets funded by that leftover instead of being refused, and
+/// a control written against the addend alone passes vacuously or hangs.
 ///
 /// Sealing closes that gap by measurement instead of by a chosen number.
+///
+/// **What the claim passed to both halves means: headroom, not retention.** It
+/// is everything the control needs to be able to hold *at one instant* after the
+/// seal, which is not always long-lived. An inbound application frame is
+/// admitted against its own parse claim before it is deserialized, and that
+/// lease is held across the whole dispatch — so a control that drives a frame
+/// through the production inbound path has to leave that charge standing
+/// alongside whatever the frame goes on to retain, or the seal takes the
+/// in-flight budget the grant deliberately provided and the frame is refused
+/// before any handler sees it. Independent acquisitions must be charged
+/// independently, each wrapped in the provider's own reservation record: a
+/// headroom that adds the bare claims is short by exactly one record per
+/// acquisition, and short silently.
 #[cfg(all(test, feature = "transport-lab"))]
 pub(crate) struct RetainedCapacityMeter {
     provider: crate::resource::FiniteResourceProvider,
@@ -8871,6 +8883,27 @@ mod tests {
     /// below is therefore in the dimension the fixture controls precisely, and
     /// no byte slack can make it admit one frame more.
     ///
+    /// That last sentence is about what a submission can *reach*, not about what
+    /// the seal contains. The seal also funds one inbound acknowledgement's
+    /// admission, because admitting an application frame is itself a retention
+    /// against this same session pool — so the acknowledgement below could not
+    /// arrive at all without it. What keeps that budget from cross-funding a
+    /// retention is that this control **holds** it: reserved before the first
+    /// submission, released only to let the real acknowledgement through, and
+    /// re-taken before the retry.
+    ///
+    /// Holding rather than merely funding is the whole technique, and it is not
+    /// bookkeeping fussiness. Unheld capacity is not a margin — it is capacity
+    /// the next submission spends. An envelope sized for a whole frame carries
+    /// residuals as well as bytes, so it funds *both* reservations of one more
+    /// buffer and moves the refusal onto the queue node's fixed byte claim: a
+    /// true refusal of a different statement, which passes a control that only
+    /// asks whether something was refused. The acknowledgement's own budget is
+    /// larger still — `structural_json_claim` is denominated per input byte — so
+    /// leaving it loose at the retry would let the retry bind on parse slack
+    /// rather than on the one retained-frame charge the acknowledgement returned,
+    /// and the closing assertion would read as proved while proving nothing.
+    ///
     /// Nothing here writes a resource amount, and nothing iterates until the
     /// provider happens to refuse.
     #[cfg(feature = "transport-lab")]
@@ -8884,24 +8917,66 @@ mod tests {
         // funding this many is funding at least enough — and exactly enough in
         // the residual dimension, which is what refuses.
         let widest = reliable::encoded_frame_for_test(u64::MAX, u64::MAX, "pressure", "u").len();
-        // Room for the retained frames, plus one copy for a write. The flush
-        // borrows the frame into a funded transient buffer, and there is at most
-        // one in flight because the flush sends one frame per fence entry — so
-        // one is the exact number, not a margin. A fixture that funded only
-        // retention would starve the flush instead of pressuring the retention,
-        // and the refusal under test would be the wrong refusal.
+        // Room for the retained frames and the acknowledgement below, and
+        // nothing else — in particular the sealed pool budgets no transient
+        // write copy of its own. This used to fund one, on the reasoning that a
+        // starved flush would produce the wrong refusal.
+        //
+        // Budgeting none is not the same as the copy never being funded, and
+        // the difference is worth stating exactly. `submit` does enter
+        // `flush_owner` every time. At the first submission the capacity the
+        // second frame will need is still free, and a whole retained envelope
+        // is strictly more than one copy costs — the copy carries the same byte
+        // term with its own allocations and no queue node — so `next_unsent`
+        // reserves its copy out of that headroom, holds the lease across the
+        // write, and releases it when the failed flush returns. All of it
+        // happens inside the awaited `submit`: the borrow is real, but it is
+        // synchronous and over before anything is asserted. Once both retained
+        // envelopes are occupied no later flush can fund a copy at all, and the
+        // frame past the grant is refused at the retained value's own
+        // reservation — which is the refusal this control is about.
+        //
+        // No assertion here reads a flushed frame: this control watches
+        // retention, the refusal, and the acknowledgement's release, not the
+        // wire. There is no remote to complete a write, which is exactly why
+        // the acknowledgement below has to mark the frame sent by hand.
+        //
+        // What that envelope did do is fund the submission past the grant.
+        // Nothing held it, and unheld capacity is not a margin — it is capacity
+        // the next submission spends. Sized for a whole widest frame it covered
+        // both of that frame's reservations, admitting the buffer and leaving
+        // only the queue node to refuse, on bytes.
         let retained =
             crate::runtime::peer_session::retained_frame_reservation_charge_for_test(widest)
                 .checked_scale(RETAINED)
-                .expect("the control's retained capacity is representable")
-                .checked_add(
-                    crate::runtime::peer_session::transient_frame_reservation_charge_for_test(
-                        widest,
-                    ),
-                )
-                .expect("the control's retained and transient capacity is representable");
+                .expect("the control's retained capacity is representable");
+        // The widest acknowledgement this control could receive, derived exactly
+        // as the frame above is: the maximum stream and sequence a session could
+        // mint. The real one below is narrower, so this covers it — and because
+        // the re-take at the end asks for this same width, the difference is
+        // re-held too rather than left loose.
+        let widest_ack = frame_bytes(&MeshMessage::ChannelAck {
+            stream: u64::MAX,
+            up_to: u64::MAX,
+        })
+        .len();
+        // Admitting an inbound application frame is a retention against this
+        // same session pool: `AdmittedApplicationFrame::admit` reserves
+        // `structural_json_claim(len)` there before it will decode anything. So
+        // an acknowledgement is not free, and the fixture has to name its budget
+        // rather than leave it to whatever slack happens to be lying around —
+        // which is exactly how the frame past the grant came to be funded once
+        // already.
+        let ack_claim = crate::application_gateway::AdmittedApplicationFrame::claim(widest_ack)
+            .expect("the widest acknowledgement's admission claim is representable");
+        let ack_charge =
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(ack_claim)
+                .expect("the acknowledgement's admission charge plus its record is representable");
+        let funded_total = retained
+            .checked_add(ack_charge)
+            .expect("the control's retention and acknowledgement capacity is representable");
         let (state, meter) =
-            build_test_state_with_retained_capacity("macro1-reliable-pressure", retained);
+            build_test_state_with_retained_capacity("macro1-reliable-pressure", funded_total);
         let fixture = insert_promoted_peer(&state, "peer").await;
         set_admission(&state, "peer", true, PeerStatus::Active);
         {
@@ -8910,10 +8985,22 @@ mod tests {
             data.features = vec![crate::protocol::features::Feature::RELIABLE_CHANNELS.to_string()];
         }
         // Seal the base grant's unused worst-case envelopes, leaving room for
-        // `RETAINED` frames and nothing else. Without this the frame past the
-        // grant is funded by that slack and this control proves nothing.
+        // `RETAINED` frames and one acknowledgement's admission and nothing
+        // else. Without this the frame past the grant is funded by that slack
+        // and this control proves nothing.
         let owner = state.peers.owner("peer").expect("peer is installed");
-        let _seal = meter.seal_slack_leaving(&state, &owner, retained);
+        let _seal = meter.seal_slack_leaving(&state, &owner, funded_total);
+
+        // Take the acknowledgement's budget out of reach before the first
+        // submission, and keep it there through the refusal. Funding it and
+        // leaving it loose would hand the frame past the grant a whole
+        // byte-denominated envelope to bind on, which is the defect this control
+        // exists to catch wearing a different hat.
+        let ack_budget = fixture
+            .peer
+            .with_live_session_state(|session, _record| session.reserve_retained(ack_claim).ok())
+            .flatten()
+            .expect("the sealed grant funds one inbound acknowledgement's admission");
 
         // Bound once and reused at every submission below, so that "the identical
         // submission" is a property of this control rather than a claim about
@@ -8983,6 +9070,11 @@ mod tests {
                 record.stream_for_test()
             })
             .expect("the promoted session is current");
+        // Only now does the acknowledgement's budget go back to the pool, and it
+        // is released for exactly one inbound frame: the admission below is a
+        // retention like any other, so without this the frame is refused at
+        // `AdmittedApplicationFrame::admit`, never decodes, and settles nothing.
+        drop(ack_budget);
         handle_inbound_frame_from(
             &state,
             &state.peers.owner("peer").expect("peer is installed"),
@@ -9002,6 +9094,29 @@ mod tests {
             "one frame released, exactly one"
         );
 
+        // Take the acknowledgement's budget back out of reach before the retry,
+        // and that is what makes the next assertion mean what it says. The
+        // dispatch above released the admission claim when its decoded frame
+        // dropped, so at this instant *two* things are free: the one retained
+        // frame the acknowledgement settled, and a whole byte-denominated parse
+        // envelope. `structural_json_claim` is per input byte, so that envelope
+        // is worth many frames' residuals — the retry would bind on it and the
+        // closing assertion would read as proved while proving nothing about the
+        // release.
+        //
+        // The re-take is also the only witness that the admission claim came
+        // back at all. It is asked for at the same widest width as the original
+        // hold, so the slack between the widest acknowledgement and the real one
+        // is re-held too rather than left behind.
+        let ack_budget = fixture
+            .peer
+            .with_live_session_state(|session, _record| session.reserve_retained(ack_claim).ok())
+            .flatten()
+            .expect(
+                "the settled acknowledgement returned its own admission budget, so re-taking it \
+                 leaves the retry nothing but the retained-frame charge that was released",
+            );
+
         // The identical submission that was refused a moment ago now binds, on
         // the capacity the acknowledgement returned and nothing else.
         let (reply, readmitted) = tokio::sync::oneshot::channel();
@@ -9011,7 +9126,7 @@ mod tests {
             RETAINED as usize,
             "the released claim funded exactly one more retention"
         );
-        drop((readmitted, funded, fixture));
+        drop((readmitted, funded, ack_budget, fixture));
     }
 
     /// Reach one promoted session's application record through the production
@@ -9396,14 +9511,49 @@ mod tests {
             "a capability advertisement is application payload, not admission traffic"
         );
 
-        // Exactly one retained advertisement is funded, which arm (d) needs and
-        // the earlier arms are unaffected by: A is the first and fits.
+        // Two independent charges, and keeping them apart is what makes the arms
+        // below mean anything.
+        //
+        // **Retention** is the long-lived one: the advertisement a session holds
+        // until it is replaced. Exactly one is funded, which is the whole of arm
+        // (d) — A is the first and fits.
+        //
+        // **Parse work** is the transient one. Every inbound application frame is
+        // admitted against `AdmittedApplicationFrame::claim` *before* it is
+        // deserialized, and that lease is held across the whole dispatch, so it
+        // and the retention it leads to are alive at the same instant. Charging
+        // one figure for both would let either pay for the other. It is wrapped
+        // in the provider's own reservation record because it is a separate
+        // acquisition, not a bigger one — a headroom that budgeted the claim
+        // alone is short by exactly one record, and short silently.
+        //
+        // Sizing this from the frame the control actually sends, rather than from
+        // the fixture's worst-case JSON envelope, is deliberate: an 8 KiB
+        // envelope left standing here would comfortably fund arm (d)'s second
+        // retention out of parse capacity, and the refusal that arm exists to
+        // prove would never happen.
         let a = advert("a");
         let retained = crate::runtime::peer_session::retained_advert_reservation_charge_for_test(
             crate::runtime::peer_session::encoded_advert_len_for_test(&a),
         );
+        // One frame value, built once and sent by both post-seal arms. Two
+        // separately constructed frames could differ in length, and the headroom
+        // is derived from this one's exact bytes.
+        let advert_frame = frame_bytes(&MeshMessage::CapabilitiesUpdate(
+            crate::protocol::rpc::CapabilitiesUpdateMessage {
+                capabilities: a.clone(),
+            },
+        ));
+        let parse_work = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+            crate::application_gateway::AdmittedApplicationFrame::claim(advert_frame.len())
+                .expect("one advertisement frame's parse claim is representable"),
+        )
+        .expect("the parse claim plus the provider's record is representable");
+        let headroom = retained
+            .checked_add(parse_work)
+            .expect("one retention and one in-flight frame compose");
         let (state, meter) =
-            build_test_state_with_retained_capacity("macro1-capability-session", retained);
+            build_test_state_with_retained_capacity("macro1-capability-session", headroom);
         let fixture = insert_promoted_peer(&state, "peer").await;
         let owner = state.peers.owner("peer").expect("peer is installed");
         let mut events = state.events_tx.subscribe();
@@ -9480,20 +9630,20 @@ mod tests {
         // ---- (c) under a live session: retained, and announced ---------------
         set_admission(&state, "peer", true, PeerStatus::Active);
         // The peer can promote now, so seal everything the base grant left unused
-        // except one advertisement's charge. Arm (d) rests on this: those unused
-        // worst-case envelopes would otherwise fund the second retention, and the
-        // refusal it is about would simply never happen.
-        let _seal = meter.seal_slack_leaving(&state, &owner, retained);
-        handle_inbound_frame_from(
-            &state,
-            &owner,
-            frame_bytes(&MeshMessage::CapabilitiesUpdate(
-                crate::protocol::rpc::CapabilitiesUpdateMessage {
-                    capabilities: a.clone(),
-                },
-            )),
-        )
-        .await;
+        // except one advertisement's retention and one frame's parse work. Arm
+        // (d) rests on this: those unused worst-case envelopes would otherwise
+        // fund the second retention, and the refusal it is about would simply
+        // never happen.
+        //
+        // The parse half has to be left standing or nothing gets that far. The
+        // grant budgets in-flight frame work, but at this moment no frame is in
+        // flight, so a seal that took every unused byte would take exactly that
+        // budget — and the next frame would be refused at
+        // `AdmittedApplicationFrame::admit`, before any handler saw it. The
+        // assertions below would then read as a session that failed to retain,
+        // when in fact the advertisement never arrived.
+        let _seal = meter.seal_slack_leaving(&state, &owner, headroom);
+        handle_inbound_frame_from(&state, &owner, advert_frame.clone()).await;
         assert_eq!(
             fixture
                 .peer
@@ -9511,22 +9661,56 @@ mod tests {
 
         // ---- (d) refused retention: nothing moves, nothing announces --------
         //
-        // The same advertisement again. Replacement is atomic — the installed
-        // one stays while the new one is encoded and funded — so the second
-        // retention needs its own capacity on top of the first, and the grant
-        // funds exactly one. That overlap is not a flaw being exploited here: it
-        // is what lets a refusal leave the previous value untouched, which is
-        // the property this arm exists to prove.
-        handle_inbound_frame_from(
-            &state,
-            &owner,
-            frame_bytes(&MeshMessage::CapabilitiesUpdate(
-                crate::protocol::rpc::CapabilitiesUpdateMessage {
-                    capabilities: a.clone(),
-                },
-            )),
-        )
-        .await;
+        // The same advertisement again, byte for byte — the same frame value, so
+        // its parse work costs exactly what the headroom left standing and this
+        // frame reaches the handler just as (c)'s did. What it cannot do is
+        // retain. Replacement is atomic — the installed advertisement stays while
+        // the new one is encoded and funded — so the second retention needs its
+        // own capacity on top of the first, and the grant funds exactly one. That
+        // overlap is not a flaw being exploited here: it is what lets a refusal
+        // leave the previous value untouched, which is the property this arm
+        // exists to prove.
+        //
+        // The refusal is therefore attributable to retention and to nothing else.
+        // The parse lease is still held when the retention is attempted, so at
+        // that instant the provider has nothing free at all — and if the frame
+        // had instead been refused at admission, arm (c) would have failed first,
+        // because it sends the identical bytes through the identical headroom.
+        //
+        // That last sentence is an argument, and the counter below is the
+        // measurement. `record_rx` runs only after the fence has admitted the
+        // frame and its operation has been decoded, so this count advances for a
+        // frame that reached dispatch and for no other. Without it the two
+        // assertions after it — A still held, nothing announced — are equally
+        // satisfied by a frame refused at `AdmittedApplicationFrame::admit`,
+        // which is exactly how this control failed once already: the
+        // advertisement never arrived and the result read as a session that
+        // declined to retain it.
+        //
+        // **The lane is `control_rx`, not `app_rx`, and the two classifications
+        // are genuinely different questions.** `message_admission` answers who
+        // may send this frame and calls it `Application` — arm (a) pins that.
+        // `traffic::class_of` answers which lane accounts for it and calls it
+        // `FrameClass::Control`. A capability advertisement is both: application
+        // payload by admission, control traffic by accounting. Reading `app_rx`
+        // here counts a lane this frame never touches and is deterministically
+        // zero.
+        //
+        // An exact `+1` is sound because of what this fixture does *not* have,
+        // which is narrower than "no transport" — it does stand up a real
+        // connector. It has no remote peer writing to it, and nothing else
+        // feeding the inbound path: no reader task, no signaling, no retry. The
+        // awaited call on the next line is the only inbound call in the sampled
+        // interval, so the only frame that can move any lane is that one.
+        let control_rx_before = state.traffic.snapshot().control_rx.frames;
+        handle_inbound_frame_from(&state, &owner, advert_frame).await;
+        assert_eq!(
+            state.traffic.snapshot().control_rx.frames,
+            control_rx_before + 1,
+            "non-vacuity: the second advertisement was admitted and reached the \
+             dispatch, so what follows is the retention being refused rather than \
+             the frame never getting that far"
+        );
         assert_eq!(
             fixture
                 .peer

@@ -568,19 +568,6 @@ pub(crate) fn retained_frame_reservation_charge_for_test(encoded: usize) -> Reso
         .expect("the two independent reliable reservations are representable together")
 }
 
-/// The full provider charge for the copy one write borrows, for fixtures that
-/// must leave room for a flush as well as for the retention it drains.
-///
-/// A control that funds only retention starves the flush: `next_unsent` refuses,
-/// nothing reaches the wire, and nothing becomes eligible for acknowledgement.
-#[cfg(all(test, feature = "transport-lab"))]
-pub(crate) fn transient_frame_reservation_charge_for_test(encoded: usize) -> ResourceClaim {
-    let claim = transient_frame_claim(encoded)
-        .expect("the transient frame claim is arithmetic over a bounded length");
-    crate::resource::FiniteResourceProvider::reservation_charge_for_test(claim)
-        .expect("one transient frame claim plus the provider's reservation record is representable")
-}
-
 #[cfg(test)]
 mod gateway_controls {
     use super::*;

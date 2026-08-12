@@ -58,9 +58,7 @@ pub(crate) use capabilities::{
     encoded_advert_len_for_test, retained_advert_reservation_charge_for_test,
 };
 #[cfg(all(test, feature = "transport-lab"))]
-pub(crate) use reliable::{
-    retained_frame_reservation_charge_for_test, transient_frame_reservation_charge_for_test,
-};
+pub(crate) use reliable::retained_frame_reservation_charge_for_test;
 
 /// The application state one promoted session owns.
 ///
