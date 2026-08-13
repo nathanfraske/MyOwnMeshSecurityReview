@@ -443,18 +443,18 @@ impl<R: tokio::io::AsyncRead> AdmittedReader<R> {
 /// the other way round.
 pub(super) struct AdmittedLine {
     line: String,
-    _held: Vec<myownmesh_core::ResourceLease>,
+    _held: crate::ipc::LeasedList<myownmesh_core::ResourceLease>,
     /// The allocator residual for the buffers the line was assembled in, held
     /// until the line itself goes. Separate from `_held` because it is not a
-    /// growth step: it was taken before either buffer existed and covers both
-    /// for their whole lives. Declared last so it is released last.
+    /// growth step: it was taken before the byte buffer existed and covers it
+    /// for its whole life. Each list node has its own separate node lease.
+    /// Declared last so it is released last.
     _residual: myownmesh_core::ResourceLease,
 }
 
-/// The live allocations one line read holds: the byte buffer and the vector of
-/// leases beside it. Two, named rather than spelled `2` at the call site, so the
-/// number and the thing it counts stay together.
-const LINE_READ_ALLOCATIONS: u64 = 2;
+/// The one shared allocation a line read holds: its byte buffer. The growth
+/// leases sit in independently funded list nodes rather than a shared vector.
+const LINE_READ_ALLOCATIONS: u64 = 1;
 
 impl AdmittedLine {
     /// The bytes this line admitted, as text.
@@ -519,8 +519,7 @@ impl AdmittedLine {
     pub(super) fn decode_request(
         &self,
         admission: &FrameAdmission,
-    ) -> std::result::Result<(myownmesh_core::ResourceLease, super::wire::Request), DecodeRefusal>
-    {
+    ) -> std::result::Result<super::AdmittedRequest, DecodeRefusal> {
         let whole = myownmesh_core::application_gateway::json_input_work_claim(self.line.len())
             .map_err(|error| DecodeRefusal::Admission(FrameRefusal::Claim(error)))?;
         let work = myownmesh_core::ResourceClaim::single(
@@ -543,7 +542,7 @@ impl AdmittedLine {
         // The parse is over. Anything still held for it from here would be
         // capacity this daemon reports as spent on work that has finished.
         drop(work);
-        Ok((retained, value))
+        Ok(super::AdmittedRequest::new(value, retained))
     }
 }
 
@@ -593,6 +592,9 @@ pub(super) enum ControlOut<'a> {
     /// The trace stream's lag marker, which is a bare JSON object rather than
     /// one of the protocol's own shapes.
     Marker(&'a serde_json::Value),
+    /// A response whose typed representation was admitted before any owned
+    /// field was constructed.
+    Prepared(&'a PreparedReply),
 }
 
 impl serde::Serialize for ControlOut<'_> {
@@ -605,8 +607,547 @@ impl serde::Serialize for ControlOut<'_> {
             Self::Frame(value) => value.serialize(serializer),
             Self::Trace(value) => value.serialize(serializer),
             Self::Marker(value) => value.serialize(serializer),
+            Self::Prepared(value) => value.serialize(serializer),
         }
     }
+}
+
+/// The allocation-free and exactly funded response shapes migrated to the
+/// prepared boundary. New variants must remain closed and must serialize
+/// without constructing a `Value`, `String`, or collection.
+pub(super) enum PreparedReply {
+    StaticError(&'static str),
+    Error(PreparedText),
+    Bool {
+        key: &'static str,
+        value: bool,
+    },
+    Usize {
+        key: &'static str,
+        value: usize,
+    },
+    Text {
+        key: &'static str,
+        value: PreparedText,
+    },
+    TraceSubscribed {
+        network: PreparedText,
+    },
+    EventsSubscribed(myownmesh_core::FundedArc<crate::ipc::ClientHandle>),
+    ServicesStatus(crate::services::FundedServicesStatus),
+    Config(myownmesh_core::config::FundedMeshConfig),
+    NetworkId(myownmesh_core::identity::FundedNetworkId),
+    Status(crate::registry::FundedStatus),
+    Networks(crate::registry::FundedNetworksList),
+}
+
+/// One owned response string and the funding that outlives its buffer.
+pub(super) struct PreparedText {
+    value: String,
+    _retention: myownmesh_core::ResourceLease,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PreparedTextRefusal {
+    #[error(transparent)]
+    Admission(#[from] FrameRefusal),
+    #[error("prepared response text could not be formatted")]
+    Format,
+    #[error("prepared response text changed length between measurement and construction")]
+    Unstable,
+}
+
+impl PreparedText {
+    pub(super) fn copying(
+        value: &str,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        Self::building(value.len(), admission, || value.to_owned())
+    }
+
+    fn surrounded(
+        prefix: &'static str,
+        value: &str,
+        suffix: &'static str,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        let bytes = prefix
+            .len()
+            .checked_add(value.len())
+            .and_then(|bytes| bytes.checked_add(suffix.len()))
+            .ok_or(PreparedTextRefusal::Format)?;
+        Self::building(bytes, admission, || {
+            let mut text = String::with_capacity(bytes);
+            text.push_str(prefix);
+            text.push_str(value);
+            text.push_str(suffix);
+            text
+        })
+    }
+
+    /// Acquire the exact typed-string claim before invoking its sole builder.
+    pub(super) fn building<B>(
+        bytes: usize,
+        admission: &FrameAdmission,
+        build: B,
+    ) -> std::result::Result<Self, PreparedTextRefusal>
+    where
+        B: FnOnce() -> String,
+    {
+        let claim = match myownmesh_core::mailbox_retained_claim::<String>(bytes, 0, 1) {
+            Ok(claim) => claim,
+            Err(myownmesh_core::ResourceMailboxItemError::Claim(error)) => {
+                return Err(FrameRefusal::Claim(error).into())
+            }
+            Err(myownmesh_core::ResourceMailboxItemError::Measurement(_)) => {
+                unreachable!("a claim built from scalar counts performs no measurement")
+            }
+        };
+        let retention = admission.acquire_claim(claim)?;
+        let value = build();
+        if value.len() != bytes {
+            return Err(PreparedTextRefusal::Unstable);
+        }
+        Ok(Self {
+            value,
+            _retention: retention,
+        })
+    }
+
+    /// Format the one closed error source currently admitted at this boundary.
+    pub(super) fn core_error(
+        value: &myownmesh_core::Error,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        use std::fmt::Write as _;
+
+        struct Count(usize);
+        impl std::fmt::Write for Count {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+
+        let mut count = Count(0);
+        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
+        let claim = match myownmesh_core::mailbox_retained_claim::<String>(count.0, 0, 1) {
+            Ok(claim) => claim,
+            Err(myownmesh_core::ResourceMailboxItemError::Claim(error)) => {
+                return Err(FrameRefusal::Claim(error).into())
+            }
+            Err(myownmesh_core::ResourceMailboxItemError::Measurement(_)) => {
+                unreachable!("a claim built from scalar counts performs no measurement")
+            }
+        };
+        let retention = admission.acquire_claim(claim)?;
+        let mut text = String::with_capacity(count.0);
+        write!(&mut text, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
+        if text.len() != count.0 {
+            return Err(PreparedTextRefusal::Unstable);
+        }
+        Ok(Self {
+            value: text,
+            _retention: retention,
+        })
+    }
+
+    /// The exact daemon-owned lookup refusal; no generic formatter crosses the
+    /// prepared boundary.
+    pub(super) fn unknown_network(
+        network: &str,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        const PREFIX: &str = "unknown network: ";
+        let bytes = PREFIX
+            .len()
+            .checked_add(network.len())
+            .ok_or(PreparedTextRefusal::Format)?;
+        Self::building(bytes, admission, || {
+            let mut text = String::with_capacity(bytes);
+            text.push_str(PREFIX);
+            text.push_str(network);
+            text
+        })
+    }
+
+    pub(super) fn no_inflight_rpc(
+        request_id: &str,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        Self::surrounded("no in-flight inbound RPC for '", request_id, "'", admission)
+    }
+
+    pub(super) fn no_inflight_stream(
+        request_id: &str,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        Self::surrounded(
+            "no in-flight inbound stream for '",
+            request_id,
+            "'",
+            admission,
+        )
+    }
+
+    pub(super) fn rpc_advertise_error(
+        value: &myownmesh_core::rpc::RpcError,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        use std::fmt::Write as _;
+        const PREFIX: &str =
+            "capabilities were not advertised; the node is still publishing its previous ones: ";
+        let mut count = DisplayCount(PREFIX.len());
+        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
+        let bytes = count.0;
+        Self::building(bytes, admission, || {
+            let mut text = String::with_capacity(bytes);
+            text.push_str(PREFIX);
+            write!(&mut text, "{value}").expect("formatting an error into String cannot fail");
+            text
+        })
+    }
+
+    pub(super) fn channel_error(
+        value: &myownmesh_core::ChannelError,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        use std::fmt::Write as _;
+        let mut count = DisplayCount(0);
+        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
+        Self::building(count.0, admission, || value.to_string())
+    }
+
+    pub(super) fn decode_admission_error(
+        value: &DecodeRefusal,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        use std::fmt::Write as _;
+        let mut count = DisplayCount(0);
+        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
+        Self::building(count.0, admission, || value.to_string())
+    }
+
+    pub(super) fn no_inbound_realtime_stream(
+        peer: &str,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, PreparedTextRefusal> {
+        Self::surrounded(
+            "no inbound realtime stream for ",
+            peer,
+            ": the session is not current, or a live pipe already holds it — one inbound pipe per session, and the lease returns when that pipe ends",
+            admission,
+        )
+    }
+}
+
+struct DisplayCount(usize);
+
+impl std::fmt::Write for DisplayCount {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+macro_rules! closed_prefixed_error {
+    ($name:ident, $ty:ty, $prefix:literal) => {
+        impl PreparedText {
+            pub(super) fn $name(
+                value: &$ty,
+                admission: &FrameAdmission,
+            ) -> std::result::Result<Self, PreparedTextRefusal> {
+                use std::fmt::Write as _;
+                let mut count = DisplayCount($prefix.len());
+                write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
+                let bytes = count.0;
+                Self::building(bytes, admission, || {
+                    let mut text = String::with_capacity(bytes);
+                    text.push_str($prefix);
+                    write!(&mut text, "{value}")
+                        .expect("formatting a concrete error into String cannot fail");
+                    text
+                })
+            }
+        }
+    };
+}
+
+closed_prefixed_error!(
+    rpc_registration_error,
+    crate::ipc::clients::RegistrationError,
+    "rpc register refused: "
+);
+closed_prefixed_error!(json_parse_error, serde_json::Error, "parse: ");
+closed_prefixed_error!(
+    network_id_error,
+    myownmesh_core::identity::NetworkIdRefusal,
+    ""
+);
+closed_prefixed_error!(
+    events_registration_error,
+    crate::ipc::clients::IpcAdmissionError,
+    "events subscribe refused: "
+);
+closed_prefixed_error!(
+    rpc_gateway_error,
+    myownmesh_core::application_gateway::GatewayRefusal,
+    "rpc register refused: "
+);
+closed_prefixed_error!(
+    channel_registration_error,
+    crate::ipc::clients::RegistrationError,
+    "channel subscribe refused: "
+);
+closed_prefixed_error!(
+    channel_pump_error,
+    crate::ipc::bridge::ChannelPumpError,
+    "channel subscribe refused: "
+);
+
+impl serde::Serialize for PreparedReply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        struct Field<'a, T: ?Sized> {
+            key: &'static str,
+            value: &'a T,
+        }
+        impl<T: serde::Serialize + ?Sized> serde::Serialize for Field<'_, T> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut data = serializer.serialize_struct("ResponseData", 1)?;
+                data.serialize_field(self.key, self.value)?;
+                data.end()
+            }
+        }
+
+        match self {
+            Self::StaticError(message) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &false)?;
+                response.serialize_field("error", message)?;
+                response.end()
+            }
+            Self::Error(message) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &false)?;
+                response.serialize_field("error", &message.value)?;
+                response.end()
+            }
+            Self::Bool { key, value } => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field("data", &Field { key, value })?;
+                response.end()
+            }
+            Self::Usize { key, value } => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field("data", &Field { key, value })?;
+                response.end()
+            }
+            Self::Text { key, value } => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key,
+                        value: &value.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::TraceSubscribed { network } => {
+                #[derive(serde::Serialize)]
+                struct TraceData<'a> {
+                    subscribed: bool,
+                    stream: &'static str,
+                    network: &'a str,
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &TraceData {
+                        subscribed: true,
+                        stream: "conn_trace",
+                        network: &network.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::EventsSubscribed(client) => {
+                #[derive(serde::Serialize)]
+                struct EventsData<'a> {
+                    subscribed: bool,
+                    client_id: crate::ipc::ClientId,
+                    client_capability: &'a str,
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &EventsData {
+                        subscribed: true,
+                        client_id: client.id,
+                        client_capability: client.capability(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::ServicesStatus(status) => {
+                #[derive(serde::Serialize)]
+                struct ServicesData<'a> {
+                    status: &'a crate::services::ServicesReport,
+                    config: &'a myownmesh_core::ServicesConfig,
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &ServicesData {
+                        status: status.report(),
+                        config: status.config(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::Config(config) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "config",
+                        value: config.get(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::NetworkId(network_id) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "network_id",
+                        value: network_id.get(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::Status(status) => {
+                #[derive(serde::Serialize)]
+                struct StatusData<'a> {
+                    version: &'static str,
+                    device_id: &'a str,
+                    joined_networks: &'a [String],
+                    realtime: &'a crate::control::RealtimeAdvert,
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &StatusData {
+                        version: status.version(),
+                        device_id: status.device_id(),
+                        joined_networks: status.joined_networks(),
+                        realtime: status.realtime(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::Networks(networks) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field("data", networks)?;
+                response.end()
+            }
+        }
+    }
+}
+
+const NETWORK_ID_REPLY_PREFIX: &str = "{\"ok\":true,\"data\":{\"network_id\":";
+const NETWORK_ID_REPLY_SUFFIX: &str = "}}\n";
+
+pub(super) fn network_id_reply_line_ceiling(
+    encoded_network_id: usize,
+) -> std::result::Result<usize, FrameRefusal> {
+    NETWORK_ID_REPLY_PREFIX
+        .len()
+        .checked_add(encoded_network_id)
+        .and_then(|bytes| bytes.checked_add(NETWORK_ID_REPLY_SUFFIX.len()))
+        .ok_or(FrameRefusal::Claim(
+            myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            },
+        ))
+}
+
+/// Maximum encoded EventsSubscribe success line, derived by running the real
+/// closed serializer over the widest id and then adding the capability's fixed
+/// encoded width. No client or response value is constructed to answer it.
+pub(super) fn events_subscribed_line_ceiling() -> std::result::Result<usize, FrameRefusal> {
+    #[derive(serde::Serialize)]
+    struct EventsData<'a> {
+        subscribed: bool,
+        client_id: crate::ipc::ClientId,
+        client_capability: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        ok: bool,
+        data: EventsData<'a>,
+    }
+
+    let mut counted = CountingSink::default();
+    serde_json::to_writer(
+        &mut counted,
+        &Envelope {
+            ok: true,
+            data: EventsData {
+                subscribed: true,
+                client_id: crate::ipc::ClientId(u64::MAX),
+                client_capability: "",
+            },
+        },
+    )
+    .map_err(|_| {
+        FrameRefusal::Claim(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        })
+    })?;
+    counted
+        .bytes
+        .checked_add(crate::ipc::ClientHandle::capability_encoded_len())
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(FrameRefusal::Claim(
+            myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            },
+        ))
+}
+
+/// Bytes surrounding the compact config encoding in a successful response.
+///
+/// Named from the exact wire shape serialized by `PreparedReply::Config`, so
+/// the core ceiling is extended only by bytes this layer itself adds.
+const CONFIG_REPLY_PREFIX: &str = "{\"ok\":true,\"data\":{\"config\":";
+const CONFIG_REPLY_SUFFIX: &str = "}}\n";
+
+pub(super) fn config_reply_line_ceiling(
+    config_encoding_ceiling: usize,
+) -> std::result::Result<usize, FrameRefusal> {
+    CONFIG_REPLY_PREFIX
+        .len()
+        .checked_add(config_encoding_ceiling)
+        .and_then(|bytes| bytes.checked_add(CONFIG_REPLY_SUFFIX.len()))
+        .ok_or(FrameRefusal::Claim(
+            myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            },
+        ))
 }
 
 /// One outbound control line, funded before it is encoded.
@@ -630,8 +1171,44 @@ impl serde::Serialize for ControlOut<'_> {
 /// paid for it.
 pub(super) struct AdmittedLineOut {
     line: Vec<u8>,
+    // A raw peers array is copied into `line`, not re-serialized.  Keep its
+    // exact core lease alive until the copied line has finished writing.
+    _peer_snapshot: Option<myownmesh_core::FundedPeerSnapshot>,
     _bytes: myownmesh_core::ResourceLease,
     _allocation: myownmesh_core::ResourceLease,
+}
+
+/// Encoded-line capacity acquired before a source commit may allocate.
+pub(super) struct PreparedLineCapacity {
+    capacity: usize,
+    _bytes: myownmesh_core::ResourceLease,
+    _allocation: myownmesh_core::ResourceLease,
+}
+
+pub(super) fn prepare_typed_and_line_building<T, E, B>(
+    typed_claim: myownmesh_core::ResourceClaim,
+    line_capacity: usize,
+    admission: &FrameAdmission,
+    build: B,
+) -> std::result::Result<(Result<T, E>, PreparedLineCapacity), FrameRefusal>
+where
+    B: FnOnce(myownmesh_core::ResourceLease) -> Result<T, E>,
+{
+    let typed = admission.acquire_claim(typed_claim)?;
+    let output = AdmittedLineOut::prepare_capacity(line_capacity, admission)?;
+    Ok((build(typed), output))
+}
+
+pub(super) fn prepare_reply_then<R, B>(
+    reply: &PreparedReply,
+    admission: &FrameAdmission,
+    build: B,
+) -> std::result::Result<(R, PreparedLineCapacity), EncodeRefusal>
+where
+    B: FnOnce() -> R,
+{
+    let output = AdmittedLineOut::prepare(&ControlOut::Prepared(reply), admission)?;
+    Ok((build(), output))
 }
 
 /// The live allocations one outbound line holds: its single byte buffer.
@@ -694,6 +1271,125 @@ pub(super) enum EncodeRefusal {
 }
 
 impl AdmittedLineOut {
+    const PEERS_PREFIX: &'static [u8] = b"{\"ok\":true,\"data\":{\"peers\":";
+    const PEERS_SUFFIX: &'static [u8] = b"}}\n";
+
+    pub(super) fn peers_capacity(array_ceiling: usize) -> std::result::Result<usize, FrameRefusal> {
+        Self::PEERS_PREFIX
+            .len()
+            .checked_add(array_ceiling)
+            .and_then(|bytes| bytes.checked_add(Self::PEERS_SUFFIX.len()))
+            .ok_or(FrameRefusal::Claim(
+                myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                    dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                },
+            ))
+    }
+
+    /// Copy core's already-validated raw JSON array into its admitted daemon
+    /// envelope.  The capacity lease was acquired at the array ceiling before
+    /// core committed; narrow it to the exact wrapper width before allocating.
+    pub(super) fn encode_peers(
+        snapshot: myownmesh_core::FundedPeerSnapshot,
+        prepared: PreparedLineCapacity,
+    ) -> std::result::Result<Self, EncodeRefusal> {
+        let PreparedLineCapacity {
+            capacity,
+            mut _bytes,
+            _allocation,
+        } = prepared;
+        let exact =
+            Self::peers_capacity(snapshot.encoded_len()).map_err(EncodeRefusal::Admission)?;
+        if exact > capacity {
+            return Err(EncodeRefusal::Unstable {
+                funded: capacity,
+                encoded: exact,
+            });
+        }
+        let exact_claim = myownmesh_core::ResourceClaim::try_from_entries([(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(exact).map_err(|_| {
+                EncodeRefusal::Admission(FrameRefusal::Claim(
+                    myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                        dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                    },
+                ))
+            })?,
+        )])
+        .map_err(|error| EncodeRefusal::Admission(FrameRefusal::Claim(error)))?;
+        _bytes
+            .transition(exact_claim)
+            .map_err(|error| EncodeRefusal::Admission(FrameRefusal::Resources(error)))?;
+
+        let mut line = Vec::with_capacity(exact);
+        line.extend_from_slice(Self::PEERS_PREFIX);
+        line.extend_from_slice(snapshot.bytes());
+        line.extend_from_slice(Self::PEERS_SUFFIX);
+        debug_assert_eq!(line.len(), exact);
+        Ok(Self {
+            line,
+            _peer_snapshot: Some(snapshot),
+            _bytes,
+            _allocation,
+        })
+    }
+
+    /// Measure and fund an encoded line without constructing its byte buffer.
+    pub(super) fn prepare(
+        value: &ControlOut<'_>,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<PreparedLineCapacity, EncodeRefusal> {
+        let mut counted = CountingSink::default();
+        serde_json::to_writer(&mut counted, &value).map_err(EncodeRefusal::Malformed)?;
+        let capacity = counted.bytes.checked_add(1).ok_or({
+            EncodeRefusal::Admission(FrameRefusal::Claim(
+                myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                    dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                },
+            ))
+        })?;
+        Self::prepare_capacity(capacity, admission).map_err(EncodeRefusal::Admission)
+    }
+
+    pub(super) fn prepare_capacity(
+        capacity: usize,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<PreparedLineCapacity, FrameRefusal> {
+        let bytes = admission.admit_allocation(capacity)?;
+        let allocation = admission.admit_allocator_residual(LINE_WRITE_ALLOCATIONS)?;
+        Ok(PreparedLineCapacity {
+            capacity,
+            _bytes: bytes,
+            _allocation: allocation,
+        })
+    }
+
+    pub(super) fn encode_prepared(
+        value: ControlOut<'_>,
+        prepared: PreparedLineCapacity,
+    ) -> std::result::Result<Self, EncodeRefusal> {
+        let PreparedLineCapacity {
+            capacity,
+            _bytes,
+            _allocation,
+        } = prepared;
+        let mut line = Vec::with_capacity(capacity);
+        serde_json::to_writer(&mut line, &value).map_err(EncodeRefusal::Malformed)?;
+        line.push(NEWLINE);
+        if line.len() > capacity {
+            return Err(EncodeRefusal::Unstable {
+                funded: capacity,
+                encoded: line.len(),
+            });
+        }
+        Ok(Self {
+            line,
+            _peer_snapshot: None,
+            _bytes,
+            _allocation,
+        })
+    }
+
     /// Measure, fund, then encode — in that order and no other.
     pub(super) fn encode(
         value: ControlOut<'_>,
@@ -718,21 +1414,12 @@ impl AdmittedLineOut {
     where
         B: FnOnce(usize) -> Vec<u8>,
     {
-        let mut counted = CountingSink::default();
-        serde_json::to_writer(&mut counted, &value).map_err(EncodeRefusal::Malformed)?;
-        // The terminating newline is part of what this connection will hold.
-        let capacity = counted.bytes.checked_add(1).ok_or({
-            EncodeRefusal::Admission(FrameRefusal::Claim(
-                myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                    dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                },
-            ))
-        })?;
-        // No ceiling. The owner's frame ceiling bounds what a *client* may send;
-        // applying it to the daemon's own answer would let a small ceiling make
-        // an operation unanswerable rather than refused.
-        let bytes = admission.admit_allocation(capacity)?;
-        let allocation = admission.admit_allocator_residual(LINE_WRITE_ALLOCATIONS)?;
+        let prepared = Self::prepare(&value, admission)?;
+        let PreparedLineCapacity {
+            capacity,
+            _bytes,
+            _allocation,
+        } = prepared;
         let mut line = build(capacity);
         serde_json::to_writer(&mut line, &value).map_err(EncodeRefusal::Malformed)?;
         line.push(NEWLINE);
@@ -749,8 +1436,9 @@ impl AdmittedLineOut {
         }
         Ok(Self {
             line,
-            _bytes: bytes,
-            _allocation: allocation,
+            _peer_snapshot: None,
+            _bytes,
+            _allocation,
         })
     }
 
@@ -795,8 +1483,8 @@ pub(super) async fn read_bounded_json_line<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    // One opaque dependency per live `Vec` below, taken before either of them
-    // has allocated anything and held for as long as both do.
+    // One opaque dependency for the live byte Vec below, taken before it has
+    // allocated anything and held for its whole life.
     //
     // This is the honest name for what a `Vec` costs beyond its contents. The
     // capacity each growth step *requests* is funded as bytes, before the
@@ -804,8 +1492,8 @@ where
     // allocator actually reserves is not a number this code can state. Charging
     // a byte count for it would be inventing a measurement, and re-measuring
     // after the growth would be funding storage that already exists. An opaque
-    // residual says what is true: there are two allocations here whose exact
-    // size is the allocator's to choose.
+    // residual says what is true: this allocation's exact excess is the
+    // allocator's to choose. List nodes are admitted independently below.
     let residual = admission
         .admit_allocator_residual(LINE_READ_ALLOCATIONS)
         .context("control request buffer allocations were not admitted")?;
@@ -814,11 +1502,10 @@ where
     // it is dropped here instead, together with the buffer it paid for — a line
     // that never became one funds nothing.
     //
-    // This vector's own capacity is funded too, one slot per growth step,
-    // because its length is chosen by the sender: a client that trickles a line
-    // one byte per write makes one lease per byte, and a lease vector charged to
-    // nobody is the same unaccounted growth as an unfunded line.
-    let mut held: Vec<myownmesh_core::ResourceLease> = Vec::new();
+    // Each list node is funded before it exists. A client can choose one growth
+    // step per byte, so even the storage holding the growth leases must be
+    // resource-backed rather than hidden in an expanding Vec.
+    let mut held = crate::ipc::LeasedList::<myownmesh_core::ResourceLease>::new();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -837,18 +1524,13 @@ where
             .checked_add(take)
             .context("control request length overflowed")?;
         let byte_capacity = frame.saturating_sub(bytes.capacity());
-        let lease_capacity = held
-            .len()
-            .checked_add(1)
-            .context("control request lease count overflowed")?
-            .saturating_sub(held.capacity())
-            .checked_mul(std::mem::size_of::<myownmesh_core::ResourceLease>())
-            .context("control request lease capacity overflowed")?;
-        let growth = byte_capacity
-            .checked_add(lease_capacity)
-            .context("control request buffer growth overflowed")?;
+        let node_claim = crate::ipc::LeasedList::<myownmesh_core::ResourceLease>::node_claim()
+            .context("control request lease-node claim is not representable")?;
+        let node = admission
+            .acquire_claim(node_claim)
+            .context("control request lease-node was not admitted")?;
         let lease = admission
-            .admit_buffer_growth(frame, growth)
+            .admit_buffer_growth(frame, byte_capacity)
             .context("control request was not admitted")?;
         // Past every refusal, so the capacity is funded before it is requested.
         // `reserve_exact` guarantees *at least* what is asked for, so what these
@@ -858,8 +1540,7 @@ where
         // claim taken after growth would be funding an allocation that already
         // exists, which is the whole defect this function was rewritten for.
         bytes.reserve_exact(take);
-        held.reserve_exact(1);
-        held.push(lease);
+        held.push(lease, node);
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if bytes.last() == Some(&b'\n') {
@@ -882,7 +1563,7 @@ where
 /// one would fail on bytes it already had.
 fn admitted_line(
     bytes: Vec<u8>,
-    held: Vec<myownmesh_core::ResourceLease>,
+    held: crate::ipc::LeasedList<myownmesh_core::ResourceLease>,
     residual: myownmesh_core::ResourceLease,
 ) -> Result<AdmittedLine> {
     let line = String::from_utf8(bytes).context("control request is not UTF-8")?;
@@ -961,6 +1642,33 @@ pub struct RealtimeSendUnit {
     pub payload: Vec<u8>,
 }
 
+pub(super) struct RealtimeSendView {
+    pub(super) flow_label: std::ops::Range<usize>,
+    pub(super) duration_us: u32,
+    pub(super) payload: std::ops::Range<usize>,
+}
+
+/// Inspect one body without copying either byte run. Production converts the
+/// body allocation into the connector payload owner after comparing the label.
+pub(super) fn inspect_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendView> {
+    let header = body.get(..REALTIME_FRAME_HEADER)?;
+    let label_len = header[0] as usize;
+    if label_len == 0 || header[1] != 0 {
+        return None;
+    }
+    let payload_len = u32::from_le_bytes(header[6..10].try_into().ok()?) as usize;
+    let payload_start = REALTIME_FRAME_HEADER.checked_add(label_len)?;
+    let end = payload_start.checked_add(payload_len)?;
+    if end != body.len() {
+        return None;
+    }
+    Some(RealtimeSendView {
+        flow_label: REALTIME_FRAME_HEADER..payload_start,
+        duration_us: u32::from_le_bytes(header[2..6].try_into().ok()?),
+        payload: payload_start..end,
+    })
+}
+
 // There is no `marker` on an outbound unit, and the byte that would hold it is
 // reserved zero on the wire.
 //
@@ -1002,15 +1710,16 @@ pub struct RealtimeRecvUnit {
 /// the frame — a malformed frame is dropped, never panics, and never trusts a
 /// length it did not check against the bytes actually present.
 pub fn decode_realtime_send_unit(body: &[u8]) -> Option<RealtimeSendUnit> {
+    let view = inspect_realtime_send_unit(body)?;
     let header = body.get(..REALTIME_FRAME_HEADER)?;
-    let label_len = header[0] as usize;
+    let label_len = view.flow_label.len();
     // Zero is refused rather than read as "no label". A flow is always named,
     // and a body that named nothing could only be resolved by guessing which
     // flow it meant.
     if label_len == 0 {
         return None;
     }
-    let payload_len = u32::from_le_bytes(header[6..10].try_into().ok()?) as usize;
+    let payload_len = view.payload.len();
     // Byte 1 is reserved and must be zero. Every other value is refused, which
     // is the strongest check available at this offset: the encoders
     // neighbouring this one put a stream index, a payload type or a keyframe
@@ -1061,6 +1770,43 @@ pub fn encode_realtime_recv_unit_with_ceiling(
     unit: &RealtimeRecvUnit,
     frame_ceiling: usize,
 ) -> Option<Vec<u8>> {
+    encode_realtime_recv_fields_with_ceiling(
+        &unit.flow_label,
+        unit.marker,
+        unit.rtp_timestamp,
+        &unit.payload,
+        frame_ceiling,
+    )
+}
+
+pub(super) fn encode_realtime_recv_fields_with_ceiling(
+    flow_label: &[u8],
+    marker: bool,
+    rtp_timestamp: u32,
+    payload: &[u8],
+    frame_ceiling: usize,
+) -> Option<Vec<u8>> {
+    encode_realtime_recv_fields_building(
+        flow_label,
+        marker,
+        rtp_timestamp,
+        payload,
+        frame_ceiling,
+        Vec::with_capacity,
+    )
+}
+
+fn encode_realtime_recv_fields_building<B>(
+    flow_label: &[u8],
+    marker: bool,
+    rtp_timestamp: u32,
+    payload: &[u8],
+    frame_ceiling: usize,
+    build: B,
+) -> Option<Vec<u8>>
+where
+    B: FnOnce(usize) -> Vec<u8>,
+{
     // Every check happens before anything is allocated, and every one is
     // checked rather than cast. `payload.len() as u32` would truncate a payload
     // past 4 GiB and produce a body whose inner length disagreed with its own
@@ -1071,24 +1817,24 @@ pub fn encode_realtime_recv_unit_with_ceiling(
     // The label bound is the same rule the decoder enforces, applied here so a
     // name that could not be framed is never half-written: empty is refused,
     // and so is anything the one-byte length prefix could not count.
-    if unit.flow_label.is_empty() || unit.flow_label.len() > MAX_REALTIME_FLOW_LABEL_BYTES {
+    if flow_label.is_empty() || flow_label.len() > MAX_REALTIME_FLOW_LABEL_BYTES {
         return None;
     }
-    let label_len = u8::try_from(unit.flow_label.len()).ok()?;
-    let payload_len = u32::try_from(unit.payload.len()).ok()?;
+    let label_len = u8::try_from(flow_label.len()).ok()?;
+    let payload_len = u32::try_from(payload.len()).ok()?;
     let total = REALTIME_FRAME_HEADER
-        .checked_add(unit.flow_label.len())?
-        .checked_add(unit.payload.len())?;
+        .checked_add(flow_label.len())?
+        .checked_add(payload.len())?;
     if total > frame_ceiling || total > u32::MAX as usize {
         return None;
     }
-    let mut out = Vec::with_capacity(total);
+    let mut out = build(total);
     out.push(label_len);
-    out.push(unit.marker as u8);
-    out.extend_from_slice(&unit.rtp_timestamp.to_le_bytes());
+    out.push(marker as u8);
+    out.extend_from_slice(&rtp_timestamp.to_le_bytes());
     out.extend_from_slice(&payload_len.to_le_bytes());
-    out.extend_from_slice(&unit.flow_label);
-    out.extend_from_slice(&unit.payload);
+    out.extend_from_slice(flow_label);
+    out.extend_from_slice(payload);
     Some(out)
 }
 
@@ -1651,6 +2397,43 @@ mod tests {
         assert!(admission.admit(9).is_err());
     }
 
+    #[test]
+    fn inbound_realtime_encoding_constructs_exactly_one_output_buffer() {
+        let mut constructions = 0;
+        let body = encode_realtime_recv_fields_building(
+            b"flow",
+            true,
+            7,
+            b"payload",
+            usize::MAX,
+            |capacity| {
+                constructions += 1;
+                Vec::with_capacity(capacity)
+            },
+        )
+        .expect("an ordinary borrowed arrival is encodable");
+        assert_eq!(constructions, 1);
+        assert_eq!(body.len(), REALTIME_FRAME_HEADER + 4 + 7);
+
+        let mut refused_constructions = 0;
+        assert!(encode_realtime_recv_fields_building(
+            b"flow",
+            false,
+            0,
+            b"payload",
+            body.len() - 1,
+            |_| {
+                refused_constructions += 1;
+                Vec::new()
+            },
+        )
+        .is_none());
+        assert_eq!(
+            refused_constructions, 0,
+            "the structural ceiling refuses before buffer construction"
+        );
+    }
+
     /// The growth claim names the allocation, not the bytes that will sit in it.
     ///
     /// Load-bearing and easy to lose: `admit_growth` charges the logical length,
@@ -1715,6 +2498,23 @@ mod tests {
             ),
         ])
         .expect("the control grant is representable");
+        FrameAdmission::over_grant_probed(grant, None)
+    }
+
+    /// A provider granting exactly the process-scope record and the requested
+    /// reservation sequence, including the provider's own record per lease.
+    fn probed_admission_for_reservations(
+        claims: impl IntoIterator<Item = myownmesh_core::ResourceClaim>,
+    ) -> (FrameAdmission, myownmesh_core::FiniteResourceProvider) {
+        let mut grant = myownmesh_core::FiniteResourceProvider::scope_planning_charge();
+        for claim in claims {
+            grant = grant
+                .checked_add(
+                    myownmesh_core::FiniteResourceProvider::reservation_planning_charge(claim)
+                        .expect("the control reservation is representable"),
+                )
+                .expect("the exact control grant is representable");
+        }
         FrameAdmission::over_grant_probed(grant, None)
     }
 
@@ -1783,14 +2583,14 @@ mod tests {
             .await
             .expect("the padded line is funded")
             .expect("a complete line");
-        let (retained, request) = line
+        let admitted = line
             .decode_request(&admission)
             .expect("this grant funds the padded line's decode");
         // The raw line goes exactly where `handle_client` drops it. Past here,
         // what is held is what a live subscription holds.
         drop(line);
         assert!(
-            matches!(request, Request::EventsSubscribe),
+            matches!(admitted.request, Request::EventsSubscribe),
             "and it decoded to the small variant the padding was hiding"
         );
 
@@ -1806,7 +2606,7 @@ mod tests {
              what came back was the work and not the retention"
         );
 
-        drop((retained, request));
+        drop(admitted);
         assert_eq!(
             held_bytes(&provider),
             baseline_bytes,
@@ -1899,6 +2699,774 @@ mod tests {
         );
         drop(line);
         assert_eq!(provider.in_use(), baseline, "and returned with it");
+    }
+
+    /// Typed reply ownership is admitted before the first owned field exists.
+    #[test]
+    fn v4_r2_daemon_prepared_reply_pressure_invokes_no_typed_builder() {
+        let (typed_starved, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let typed_claim = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            1,
+        );
+        let refusal =
+            match prepare_typed_and_line_building(typed_claim, 64, &typed_starved, |typed| {
+                commits += 1;
+                drop(typed);
+                Ok::<_, ()>(())
+            }) {
+                Ok(_) => panic!("the typed claim must refuse before output preparation"),
+                Err(refusal) => refusal,
+            };
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(commits, 0, "typed pressure invokes no source commit");
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "typed refusal prepares no output and restores the exact ledger"
+        );
+
+        let (starved_commit, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let refusal = match prepare_typed_and_line_building(
+            myownmesh_core::ResourceClaim::ZERO,
+            64,
+            &starved_commit,
+            |typed| {
+                commits += 1;
+                drop(typed);
+                Ok::<_, ()>(())
+            },
+        ) {
+            Ok(_) => panic!("an unfunded response line must refuse before source commit"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(commits, 0, "output pressure wins before source commit");
+        assert_eq!(provider.in_use(), baseline);
+
+        let (funded_commit, provider) = probed_admission_granting_bytes(1 << 16);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let (built, output) = prepare_typed_and_line_building(
+            myownmesh_core::ResourceClaim::ZERO,
+            64,
+            &funded_commit,
+            |typed| {
+                commits += 1;
+                drop(typed);
+                Ok::<_, ()>(7_u8)
+            },
+        )
+        .expect("the positive grant funds typed and line preparation");
+        assert_eq!(built, Ok(7));
+        assert_eq!(
+            commits, 1,
+            "the source commits exactly once after both claims"
+        );
+        drop(output);
+        assert_eq!(provider.in_use(), baseline);
+
+        let scalar = PreparedReply::Bool {
+            key: "completed",
+            value: true,
+        };
+        let (starved_scalar, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut output_builds = 0usize;
+        let refusal = match AdmittedLineOut::encode_building(
+            ControlOut::Prepared(&scalar),
+            &starved_scalar,
+            |capacity| {
+                output_builds += 1;
+                Vec::with_capacity(capacity)
+            },
+        ) {
+            Ok(_) => panic!("a zero-byte grant refuses the scalar line"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(
+            refusal,
+            EncodeRefusal::Admission(FrameRefusal::Resources(_))
+        ));
+        assert_eq!(
+            output_builds, 0,
+            "scalar output is not built before admission"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "scalar refusal retains nothing"
+        );
+
+        let mut scalar_commits = 0usize;
+        let refusal = match prepare_reply_then(&scalar, &starved_scalar, || scalar_commits += 1) {
+            Ok(_) => panic!("a zero-byte grant refuses before the scalar operation"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(
+            refusal,
+            EncodeRefusal::Admission(FrameRefusal::Resources(_))
+        ));
+        assert_eq!(
+            scalar_commits, 0,
+            "the operation is not invoked until its result line is admitted"
+        );
+
+        let text = "a response field chosen outside the daemon";
+        let (starved, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut builds = 0usize;
+        let refusal = match PreparedText::building(text.len(), &starved, || {
+            builds += 1;
+            text.to_string()
+        }) {
+            Ok(_) => panic!("a zero-byte grant cannot fund an owned response string"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(
+            refusal,
+            PreparedTextRefusal::Admission(FrameRefusal::Resources(_))
+        ));
+        assert_eq!(builds, 0, "pressure wins before typed construction");
+        assert_eq!(provider.in_use(), baseline, "refusal retains no claim");
+
+        let (funded, provider) = probed_admission_granting_bytes(1 << 16);
+        let baseline = provider.in_use();
+        let mut builds = 0usize;
+        let value = PreparedText::building(text.len(), &funded, || {
+            builds += 1;
+            text.to_string()
+        })
+        .expect("the positive grant funds the typed field");
+        assert_eq!(
+            builds, 1,
+            "the sole builder runs exactly once after admission"
+        );
+        let reply = PreparedReply::Text {
+            key: "value",
+            value,
+        };
+        let line = AdmittedLineOut::encode(ControlOut::Prepared(&reply), &funded)
+            .expect("the same grant funds encoded output beside the typed field");
+        assert!(line
+            .bytes()
+            .windows(text.len())
+            .any(|bytes| bytes == text.as_bytes()));
+        drop((line, reply));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "both typed and encoded claims return"
+        );
+
+        let baseline = provider.in_use();
+        let refusal = match PreparedText::building(1, &funded, || "longer".to_string()) {
+            Ok(_) => panic!("a builder may not exceed its admitted typed length"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(refusal, PreparedTextRefusal::Unstable));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "typed funding returns when a builder drifts"
+        );
+    }
+
+    #[test]
+    fn network_id_pressure_precedes_generation_and_the_exact_line_build() {
+        let plan = myownmesh_core::identity::prepare_generated_network_id()
+            .expect("network-id generation can be planned without drawing randomness");
+        let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())
+            .expect("the closed wrapper is representable");
+        let (starved, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let refusal = match prepare_typed_and_line_building(
+            plan.typed_retention_claim(),
+            line_ceiling,
+            &starved,
+            |typed| {
+                commits += 1;
+                plan.commit(typed)
+            },
+        ) {
+            Ok(_) => panic!("a zero-byte grant cannot fund a generated network id"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(
+            commits, 0,
+            "pressure reaches no randomness or string builder"
+        );
+        assert_eq!(provider.in_use(), baseline, "refusal retains nothing");
+
+        let plan = myownmesh_core::identity::prepare_generated_network_id()
+            .expect("the positive generation plan is representable");
+        let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())
+            .expect("the positive wrapper is representable");
+        let (funded, provider) = probed_admission_granting_bytes(1 << 16);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let (network_id, output) = prepare_typed_and_line_building(
+            plan.typed_retention_claim(),
+            line_ceiling,
+            &funded,
+            |typed| {
+                commits += 1;
+                plan.commit(typed)
+            },
+        )
+        .expect("the positive grant funds the id and its line");
+        let reply = PreparedReply::NetworkId(network_id.expect("the admitted plan commits"));
+        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+            .expect("the exact ceiling carries the generated response");
+        assert_eq!(
+            commits, 1,
+            "the sole builder runs exactly once after admission"
+        );
+        assert_eq!(line.bytes().len(), line_ceiling);
+        drop((line, reply));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "both funded owners release exactly"
+        );
+    }
+
+    #[test]
+    fn status_pressure_invokes_no_snapshot_builder_and_the_full_grant_builds_once() {
+        let registry = crate::registry::NetworkRegistry::new();
+        let identity = myownmesh_core::Identity::ephemeral();
+        let realtime = crate::control::RealtimeAdvert {
+            supported: false,
+            encodings: Vec::new(),
+            flow_ceiling: None,
+        };
+        let source = registry.status_source(&identity, &realtime);
+        let typed_claim = source.typed_claim().expect("status is representable");
+        let line_ceiling = source.line_ceiling().expect("status line is representable");
+        let (starved, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let refusal =
+            match prepare_typed_and_line_building(typed_claim, line_ceiling, &starved, |typed| {
+                commits += 1;
+                source.commit(typed)
+            }) {
+                Ok(_) => panic!("a zero-byte grant cannot fund Status"),
+                Err(refusal) => refusal,
+            };
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(commits, 0, "pressure constructs no status snapshot");
+        assert_eq!(provider.in_use(), baseline, "refusal retains nothing");
+
+        let source = registry.status_source(&identity, &realtime);
+        let typed_claim = source.typed_claim().expect("status remains representable");
+        let line_ceiling = source
+            .line_ceiling()
+            .expect("status line remains representable");
+        let (funded, provider) = probed_admission_granting_bytes(1 << 16);
+        let baseline = provider.in_use();
+        let mut commits = 0usize;
+        let (status, output) =
+            prepare_typed_and_line_building(typed_claim, line_ceiling, &funded, |typed| {
+                commits += 1;
+                source.commit(typed)
+            })
+            .expect("the full grant funds Status");
+        let reply = PreparedReply::Status(status.expect("the exact claim commits"));
+        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+            .expect("the measured ceiling carries Status");
+        assert_eq!(commits, 1, "the snapshot is built exactly once");
+        assert_eq!(line.bytes().len(), line_ceiling);
+        drop((line, reply));
+        assert_eq!(provider.in_use(), baseline, "all Status funding returns");
+    }
+
+    #[test]
+    fn v4_r3_daemon_networks_pressure_precedes_snapshot_build_and_exact_line() {
+        let registry = crate::registry::NetworkRegistry::new();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("an empty registry has a representable NetworksList plan");
+        let (typed_starved, provider) = probed_admission_for_reservations([]);
+        let baseline = provider.in_use();
+        let refusal = match typed_starved.acquire_claim(plan.typed_claim()) {
+            Ok(_typed) => panic!("a scope-only grant cannot fund typed NetworksList retention"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(registry.networks_line_measurements_for_test(), 0);
+        assert_eq!(registry.networks_commits_for_test(), 0);
+        assert_eq!(provider.in_use(), baseline, "typed refusal retains nothing");
+
+        let registry = crate::registry::NetworkRegistry::new();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("the work-pressure plan is representable");
+        let typed_claim = plan.typed_claim();
+        let (work_starved, provider) = probed_admission_for_reservations([typed_claim]);
+        let baseline = provider.in_use();
+        let typed = work_starved
+            .acquire_claim(typed_claim)
+            .expect("the exact typed reservation is available");
+        let refusal = match work_starved.acquire_claim(plan.work_claim()) {
+            Ok(_work) => panic!("a typed-only grant cannot fund NetworksList work"),
+            Err(refusal) => refusal,
+        };
+        drop((typed, plan));
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(registry.networks_line_measurements_for_test(), 0);
+        assert_eq!(registry.networks_commits_for_test(), 0);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "work refusal returns typed funding"
+        );
+
+        let registry = crate::registry::NetworkRegistry::new();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("the line-pressure plan is representable");
+        let typed_claim = plan.typed_claim();
+        let work_claim = plan.work_claim();
+        let (line_bytes_starved, provider) =
+            probed_admission_for_reservations([typed_claim, work_claim]);
+        let baseline = provider.in_use();
+        let typed = line_bytes_starved
+            .acquire_claim(typed_claim)
+            .expect("typed retention is funded before line pressure");
+        let work = line_bytes_starved
+            .acquire_claim(work_claim)
+            .expect("work is funded before line pressure");
+        let plan = plan
+            .measure_line_ceiling(&work)
+            .expect("the funded empty line is measurable");
+        let empty_line_ceiling = plan.line_ceiling();
+        let refusal =
+            match AdmittedLineOut::prepare_capacity(empty_line_ceiling, &line_bytes_starved) {
+                Ok(_output) => panic!("typed and work reservations cannot also fund line bytes"),
+                Err(refusal) => refusal,
+            };
+        drop((plan, work, typed));
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(registry.networks_line_measurements_for_test(), 1);
+        assert_eq!(registry.networks_commits_for_test(), 0);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "line refusal returns earlier leases"
+        );
+
+        let line_bytes_claim = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(empty_line_ceiling).expect("the line fits the resource model"),
+        );
+        let line_allocation_claim = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            1,
+        );
+        let registry = crate::registry::NetworkRegistry::new();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("the allocation-pressure plan is representable");
+        let typed_claim = plan.typed_claim();
+        let work_claim = plan.work_claim();
+        let (line_allocation_starved, provider) =
+            probed_admission_for_reservations([typed_claim, work_claim, line_bytes_claim]);
+        let baseline = provider.in_use();
+        let typed = line_allocation_starved
+            .acquire_claim(typed_claim)
+            .expect("typed retention is funded");
+        let work = line_allocation_starved
+            .acquire_claim(work_claim)
+            .expect("work is funded");
+        let plan = plan
+            .measure_line_ceiling(&work)
+            .expect("line measurement is funded");
+        assert_eq!(plan.line_ceiling(), empty_line_ceiling);
+        let refusal = match AdmittedLineOut::prepare_capacity(
+            plan.line_ceiling(),
+            &line_allocation_starved,
+        ) {
+            Ok(_output) => panic!("the byte-only line grant cannot fund its allocation"),
+            Err(refusal) => refusal,
+        };
+        drop((plan, work, typed));
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(registry.networks_line_measurements_for_test(), 1);
+        assert_eq!(registry.networks_commits_for_test(), 0);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the admitted line bytes return when allocation pressure refuses"
+        );
+
+        let registry = crate::registry::NetworkRegistry::new();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("the funded NetworksList plan is representable");
+        let typed_claim = plan.typed_claim();
+        let work_claim = plan.work_claim();
+        let (funded, provider) = probed_admission_for_reservations([
+            typed_claim,
+            work_claim,
+            line_bytes_claim,
+            line_allocation_claim,
+        ]);
+        let baseline = provider.in_use();
+        let baseline_work = parse_work(&provider);
+        let typed = funded
+            .acquire_claim(typed_claim)
+            .expect("the exact typed claim is funded");
+        let work = funded
+            .acquire_claim(work_claim)
+            .expect("the exact work ceiling is funded");
+        assert!(
+            parse_work(&provider) > baseline_work,
+            "the work lease is genuinely held before measurement"
+        );
+        let plan = plan
+            .measure_line_ceiling(&work)
+            .expect("the admitted work funds exact line measurement");
+        assert_eq!(plan.line_ceiling(), empty_line_ceiling);
+        let output = AdmittedLineOut::prepare_capacity(plan.line_ceiling(), &funded)
+            .expect("the exact line claims are funded");
+        let networks = match plan.commit(typed, work) {
+            Ok(networks) => networks,
+            Err((_typed, _work)) => panic!("the unchanged authoritative snapshot commits"),
+        };
+        assert_eq!(registry.networks_line_measurements_for_test(), 1);
+        assert_eq!(registry.networks_commits_for_test(), 1);
+        let reply = PreparedReply::Networks(networks);
+        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+            .expect("the exact empty NetworksList ceiling carries the line");
+        assert_eq!(line.bytes().len(), empty_line_ceiling);
+        drop((line, reply));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "typed, work, line bytes, and line allocation all return"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_r3_daemon_peers_pressure_precedes_commit_and_exact_wrapper_copy() {
+        use std::num::NonZeroUsize;
+        use std::sync::Arc;
+
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let capacity = NonZeroUsize::new(4).expect("fixture capacity is nonzero");
+        let connector_policy = || {
+            let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
+                myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+                myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
+                myownmesh_core::RealtimeConnectorPolicy::Disabled,
+            )
+            .expect("fixture callback policy is consistent");
+            myownmesh_core::WebRtcConnectorCapablePolicy::new(
+                crate::test_resource_provider(),
+                myownmesh_core::WebRtcConnectorProfile::new(
+                    callbacks,
+                    myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
+                ),
+            )
+        };
+        let near_mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
+            myownmesh_core::MeshConfig::default(),
+            Arc::new(myownmesh_core::Identity::ephemeral()),
+            connector_policy(),
+        )
+        .await
+        .expect("near peer fixture opens");
+        let far_mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
+            myownmesh_core::MeshConfig::default(),
+            Arc::new(myownmesh_core::Identity::ephemeral()),
+            connector_policy(),
+        )
+        .await
+        .expect("far peer fixture opens");
+        let network = |id: &str| myownmesh_core::NetworkConfig {
+            id: id.to_string(),
+            network_id: "peers-pressure-mesh".to_string(),
+            label: id.to_string(),
+            kind: Default::default(),
+            topology: myownmesh_core::TopologyMode::FullMesh,
+            signaling: myownmesh_core::config::SignalingConfig::default(),
+            stun_servers: Vec::new(),
+            turn_servers: Vec::new(),
+            roster_path: None,
+            pinned_peers: Vec::new(),
+            auto_approve: true,
+        };
+        let near = near_mesh
+            .join(network("peers-near"))
+            .await
+            .expect("near network joins");
+        let far = far_mesh
+            .join(network("peers-far"))
+            .await
+            .expect("far network joins");
+        let link = near.install_promoted_peer_over_real_link(&far).await;
+        assert_eq!(
+            near.plan_peers().counted(),
+            1,
+            "the core gates are non-vacuous"
+        );
+
+        let membership_claim = near
+            .plan_peers()
+            .membership_claim()
+            .expect("membership is representable");
+        let (starved, provider) = probed_admission_for_reservations([]);
+        let baseline = provider.in_use();
+        assert!(matches!(
+            starved.acquire_claim(membership_claim),
+            Err(FrameRefusal::Resources(_))
+        ));
+        assert_eq!(provider.in_use(), baseline);
+
+        let claims = {
+            let (admission, _provider) = probed_admission_for_reservations([membership_claim]);
+            let membership = admission
+                .acquire_claim(membership_claim)
+                .expect("membership is funded for claim discovery");
+            let plan = near
+                .plan_peers()
+                .stage(membership)
+                .expect("membership stages");
+            (
+                plan.work_claim(),
+                plan.typed_retention_claim(),
+                plan.output_retention_claim(),
+                plan.line_claim(),
+                plan.encoded_line_ceiling(),
+            )
+        };
+        let (work_claim, typed_claim, peer_output_claim, peer_line_claim, array_ceiling) = claims;
+        let wrapper_ceiling = AdmittedLineOut::peers_capacity(array_ceiling)
+            .expect("the daemon wrapper is representable");
+        let wrapper_bytes = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(wrapper_ceiling).expect("the wrapper fits u64"),
+        );
+        let wrapper_allocation = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            1,
+        );
+
+        let prefixes = [
+            vec![membership_claim],
+            vec![membership_claim, work_claim],
+            vec![membership_claim, work_claim, typed_claim],
+            vec![membership_claim, work_claim, typed_claim, peer_output_claim],
+        ];
+        for (index, funded_claims) in prefixes.into_iter().enumerate() {
+            let (admission, provider) = probed_admission_for_reservations(funded_claims.clone());
+            let baseline = provider.in_use();
+            let membership = admission
+                .acquire_claim(membership_claim)
+                .expect("membership gate is funded");
+            let plan = near
+                .plan_peers()
+                .stage(membership)
+                .expect("membership stages");
+            let next = [work_claim, typed_claim, peer_output_claim, peer_line_claim][index];
+            let mut held = Vec::new();
+            for claim in funded_claims.into_iter().skip(1) {
+                held.push(
+                    admission
+                        .acquire_claim(claim)
+                        .expect("earlier gate is funded"),
+                );
+            }
+            assert!(matches!(
+                admission.acquire_claim(next),
+                Err(FrameRefusal::Resources(_))
+            ));
+            drop((plan, held));
+            assert_eq!(provider.in_use(), baseline, "gate {index} releases exactly");
+        }
+
+        let core_claims = [
+            membership_claim,
+            work_claim,
+            typed_claim,
+            peer_output_claim,
+            peer_line_claim,
+        ];
+        let (wrapper_starved, provider) = probed_admission_for_reservations(core_claims);
+        let baseline = provider.in_use();
+        let membership = wrapper_starved
+            .acquire_claim(membership_claim)
+            .expect("membership");
+        let plan = near
+            .plan_peers()
+            .stage(membership)
+            .expect("membership stages");
+        let work = wrapper_starved.acquire_claim(work_claim).expect("work");
+        let typed = wrapper_starved.acquire_claim(typed_claim).expect("typed");
+        let peer_output = wrapper_starved
+            .acquire_claim(peer_output_claim)
+            .expect("peer output");
+        let peer_line = wrapper_starved
+            .acquire_claim(peer_line_claim)
+            .expect("peer line");
+        assert!(matches!(
+            AdmittedLineOut::prepare_capacity(wrapper_ceiling, &wrapper_starved),
+            Err(FrameRefusal::Resources(_))
+        ));
+        drop((plan, work, typed, peer_output, peer_line));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "wrapper pressure commits nothing"
+        );
+
+        let (wrapper_allocation_starved, provider) = probed_admission_for_reservations([
+            membership_claim,
+            work_claim,
+            typed_claim,
+            peer_output_claim,
+            peer_line_claim,
+            wrapper_bytes,
+        ]);
+        let baseline = provider.in_use();
+        let membership = wrapper_allocation_starved
+            .acquire_claim(membership_claim)
+            .expect("membership");
+        let plan = near
+            .plan_peers()
+            .stage(membership)
+            .expect("membership stages");
+        let work = wrapper_allocation_starved
+            .acquire_claim(work_claim)
+            .expect("work");
+        let typed = wrapper_allocation_starved
+            .acquire_claim(typed_claim)
+            .expect("typed");
+        let peer_output = wrapper_allocation_starved
+            .acquire_claim(peer_output_claim)
+            .expect("peer output");
+        let peer_line = wrapper_allocation_starved
+            .acquire_claim(peer_line_claim)
+            .expect("peer line");
+        assert!(matches!(
+            AdmittedLineOut::prepare_capacity(wrapper_ceiling, &wrapper_allocation_starved),
+            Err(FrameRefusal::Resources(refusal))
+                if refusal.dimension()
+                    == Some(myownmesh_core::ResourceClass::OpaqueDependencyResidual)
+        ));
+        drop((plan, work, typed, peer_output, peer_line));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "wrapper allocation refusal returns its byte lease and every core lease"
+        );
+
+        let (funded, provider) = probed_admission_for_reservations([
+            membership_claim,
+            work_claim,
+            typed_claim,
+            peer_output_claim,
+            peer_line_claim,
+            wrapper_bytes,
+            wrapper_allocation,
+        ]);
+        let baseline = provider.in_use();
+        let membership = funded.acquire_claim(membership_claim).expect("membership");
+        let plan = near
+            .plan_peers()
+            .stage(membership)
+            .expect("membership stages");
+        let work = funded.acquire_claim(work_claim).expect("work");
+        let typed = funded.acquire_claim(typed_claim).expect("typed");
+        let peer_output = funded
+            .acquire_claim(peer_output_claim)
+            .expect("peer output");
+        let peer_line = funded.acquire_claim(peer_line_claim).expect("peer line");
+        let output = AdmittedLineOut::prepare_capacity(wrapper_ceiling, &funded)
+            .expect("wrapper is pre-admitted");
+        let peers = plan
+            .commit(work, typed, peer_output, peer_line)
+            .expect("an unchanged peer commits once");
+        let array_len = peers.encoded_len();
+        let exact_wrapper = AdmittedLineOut::peers_capacity(array_len)
+            .expect("the exact daemon wrapper is representable");
+        assert!(
+            wrapper_ceiling > exact_wrapper,
+            "the promoted peer makes the core array ceiling genuinely wider than its encoding"
+        );
+        let after_core_commit = provider.in_use();
+        assert_eq!(
+            after_core_commit.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
+                - baseline.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes),
+            u64::try_from(array_len + wrapper_ceiling)
+                .expect("the two live buffers fit the ledger"),
+            "before wrapping, the exact core array and daemon ceiling are both live"
+        );
+        let expected = [
+            AdmittedLineOut::PEERS_PREFIX,
+            peers.bytes(),
+            AdmittedLineOut::PEERS_SUFFIX,
+        ]
+        .concat();
+        let line = AdmittedLineOut::encode_peers(peers, output).expect("raw array is wrapped");
+        assert_eq!(line.bytes(), expected);
+        let while_line_is_live = provider.in_use();
+        assert_eq!(
+            while_line_is_live.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
+                - baseline.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes),
+            u64::try_from(array_len + line.bytes().len())
+                .expect("the exact core array and wrapper fit the ledger"),
+            "the wrapper lease narrows to its exact width while the core array remains funded"
+        );
+        let exact_core_line = myownmesh_core::ResourceClaim::try_from_entries([
+            (
+                myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                u64::try_from(array_len).expect("the exact array fits the resource model"),
+            ),
+            (myownmesh_core::ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .expect("the exact core array claim is representable");
+        let exact_wrapper_bytes = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(line.bytes().len()).expect("the exact wrapper fits the resource model"),
+        );
+        let surviving_claims = [exact_core_line, exact_wrapper_bytes, wrapper_allocation];
+        let actual_allocation_residuals = surviving_claims
+            .iter()
+            .map(|claim| claim.amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual))
+            .sum::<u64>();
+        assert_eq!(
+            actual_allocation_residuals, 2,
+            "the core array and daemon wrapper each retain one actual allocation residual"
+        );
+        let provider_record_residuals = surviving_claims
+            .iter()
+            .map(|claim| {
+                myownmesh_core::FiniteResourceProvider::reservation_planning_charge(*claim)
+                    .expect("each surviving reservation record is representable")
+                    .checked_sub(*claim)
+                    .expect("a reservation planning charge contains its original claim")
+                    .amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual)
+            })
+            .sum::<u64>();
+        assert_eq!(
+            while_line_is_live.amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual)
+                - baseline.amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual),
+            actual_allocation_residuals + provider_record_residuals,
+            "both actual allocations and all three surviving lease records are accounted"
+        );
+        drop(line);
+        assert_eq!(provider.in_use(), baseline, "every exact lease returns");
+
+        let _ = link.retire().await;
+        drop(far);
     }
 
     /// A reader that counts the times anything polled it.
@@ -2076,23 +3644,24 @@ mod tests {
             .await
             .expect("the line is funded")
             .expect("a complete line");
-        let (lease, request) = line
+        let admitted = line
             .decode_request(&admission)
             .expect("the structural claim fits this grant");
-        assert!(matches!(request, Request::Status));
+        assert!(matches!(admitted.request, Request::Status));
 
         // A second decode of the same line, against a provider whose accounted
         // memory is now too small to carry another decoded tree. `json_input_work_claim`
         // charges several bytes per input byte, so a grant this tight refuses.
         let tight = admission_granting_bytes(8);
-        let refusal = line
-            .decode_request(&tight)
-            .expect_err("eight bytes cannot fund a decoded request");
+        let refusal = match line.decode_request(&tight) {
+            Ok(_) => panic!("eight bytes cannot fund a decoded request"),
+            Err(refusal) => refusal,
+        };
         assert!(
             matches!(refusal, DecodeRefusal::Admission(_)),
             "refused before the parse, not reported as malformed"
         );
-        drop((lease, request, line));
+        drop((admitted, line));
     }
 
     /// Refusal happens before the line buffer grows.
@@ -2143,15 +3712,17 @@ mod tests {
             .await
             .unwrap()
             .expect("a complete line");
-        let refusal = line
-            .decode_request(&granted_admission())
-            .expect_err("the line is not a request");
+        let refusal = match line.decode_request(&granted_admission()) {
+            Ok(_) => panic!("the line is not a request"),
+            Err(refusal) => refusal,
+        };
         assert!(matches!(refusal, DecodeRefusal::Malformed(_)));
 
         let starved = admission_granting_bytes(8);
-        let refusal = line
-            .decode_request(&starved)
-            .expect_err("eight bytes cannot fund a decode");
+        let refusal = match line.decode_request(&starved) {
+            Ok(_) => panic!("eight bytes cannot fund a decode"),
+            Err(refusal) => refusal,
+        };
         assert!(
             matches!(refusal, DecodeRefusal::Admission(_)),
             "funding is taken before the parse, so pressure answers first"
@@ -2164,14 +3735,14 @@ mod tests {
     /// The raw line is dropped here exactly as `handle_client` drops it, while
     /// the structural lease and the decoded value stay live — which is the
     /// transfer the review found missing. The drop order is the other half and
-    /// is compile-visible rather than asserted: `(lease, request)` come from one
-    /// pattern, and bindings from one pattern drop in reverse, so the request is
-    /// destroyed before the lease that accounts for it.
+    /// is compile-visible rather than asserted: `AdmittedRequest` declares the
+    /// request before its retention, so the request is destroyed before the
+    /// lease that accounts for it.
     #[tokio::test]
     async fn the_decoded_request_carries_its_own_funding_past_the_line() {
         let input = b"{\"op\":\"status\"}\n";
         let admission = granted_admission();
-        let (_decoded, request) = {
+        let admitted = {
             let mut reader = tokio::io::BufReader::new(&input[..]);
             let line = read_bounded_json_line(&mut reader, &admission)
                 .await
@@ -2181,6 +3752,6 @@ mod tests {
             drop(line);
             decoded
         };
-        assert!(matches!(request, Request::Status));
+        assert!(matches!(admitted.request, Request::Status));
     }
 }

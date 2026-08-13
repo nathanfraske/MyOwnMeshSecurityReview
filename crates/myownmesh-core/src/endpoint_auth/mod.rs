@@ -24,19 +24,28 @@
 mod capability;
 mod context;
 mod contribution;
-/// Live two-connector controls over the production `on_auth_response` handler.
+/// Live two-connector controls over the production `on_auth_response` handler,
+/// and the real-link fixture they share.
 ///
 /// Basal V4 behaviour, so it is gated on `transport-lab` alone — these are the
 /// only controls that prove the production handler refuses a substituted
 /// channel binding.
-#[cfg(all(test, feature = "transport-lab"))]
+///
+/// The gate is the feature alone rather than `all(test, …)` because the link
+/// half is also what the crate's `transport-lab` promoted-peer fixture is built
+/// from, and that fixture is constructed from another crate's tests, where this
+/// crate's `cfg(test)` is not set. Everything only the in-crate controls use
+/// stays behind `cfg(test)` inside the module.
+#[cfg(feature = "transport-lab")]
 pub(crate) mod native_link;
 mod task;
 mod transcript;
 
-pub use capability::AuthenticatedChannelCapability;
 #[cfg(test)]
-pub(crate) use capability::{authenticated_for_test, authenticated_over_for_test};
+pub(crate) use capability::authenticated_for_test;
+#[cfg(any(test, feature = "transport-lab"))]
+pub(crate) use capability::authenticated_over_for_test;
+pub use capability::AuthenticatedChannelCapability;
 pub(crate) use context::EndpointAuthContext;
 // The peer's canonical value is parsed on the production inbound path, so it
 // stays a current re-export. The local draw is *not* exported for production

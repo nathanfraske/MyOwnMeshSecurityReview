@@ -706,6 +706,39 @@ pub struct NetworkState {
     #[cfg(test)]
     pub(crate) rpc_send_boundary: RpcSendBoundary,
 
+    /// The instant between a handler run's fenced start and the embedder's
+    /// closure being entered.
+    ///
+    /// The other half of the same problem `rpc_send_boundary` solves, at the
+    /// other end of the run. A control asserting that a *started* run cannot be
+    /// un-started has to deliver revocation after the start commits and before
+    /// the closure is called, and that window is otherwise two adjacent
+    /// statements with nothing between them.
+    ///
+    /// The same type, because it is the same mechanism and a second one could
+    /// drift from it. Test observation and staging only; it does not exist in a
+    /// production build.
+    #[cfg(test)]
+    pub(crate) rpc_handler_start_boundary: RpcSendBoundary,
+
+    /// One action to run inside a handler run's start, between its early
+    /// validity read and the fenced commit.
+    ///
+    /// A staged **synchronous** action rather than a park, because that instant
+    /// is inside a synchronous decision: the run is not a future there, it is a
+    /// function that has not returned yet, and there is nothing for an async
+    /// boundary to hold. What a control needs to do there is act — revoke — and
+    /// acting is exactly what a `FnOnce` can do.
+    ///
+    /// It is reached through the production call path rather than by a control
+    /// calling the fenced begin itself. That distinction is the whole point: a
+    /// control that called `begin` directly could observe the refusal and prove
+    /// nothing about whether `on_rpc_request`'s spawned arm honours it.
+    ///
+    /// Test staging only, and it does not exist in a production build.
+    #[cfg(test)]
+    pub(crate) rpc_handler_precommit_action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+
     /// Force-reconnect handle for the signaling driver, stashed by
     /// [`crate::engine::signaling_bridge::attach_nostr`] once the
     /// Nostr driver is up. Bumping the generation makes every relay
@@ -924,6 +957,10 @@ impl NetworkState {
             exact_retirement_barrier: Mutex::new(None),
             #[cfg(test)]
             rpc_send_boundary: RpcSendBoundary::default(),
+            #[cfg(test)]
+            rpc_handler_start_boundary: RpcSendBoundary::default(),
+            #[cfg(test)]
+            rpc_handler_precommit_action: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
@@ -1008,6 +1045,71 @@ impl NetworkState {
         #[cfg(test)]
         self.rpc_send_boundary.reach().await;
     }
+
+    /// The point in an RPC handler run at which the start has committed under
+    /// the registry fence and the embedder's closure has not yet been called.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist. Under test, and only while a control has armed it, a run that
+    /// reaches here parks until that control releases it — which is what lets a
+    /// control revoke the authority in the one instant the contract is about:
+    /// after the start is committed, before the closure is entered.
+    ///
+    /// What must be observed there is that the closure is entered anyway,
+    /// exactly once, because the start was already ordered before that
+    /// revocation. Everything the run does *afterwards* is still cancelled by
+    /// the witness, which is the other half of the same assertion.
+    pub(crate) async fn reach_rpc_handler_start_boundary(&self) {
+        #[cfg(test)]
+        self.rpc_handler_start_boundary.reach().await;
+    }
+
+    /// The point inside a handler run's start, after its early validity read and
+    /// before the fenced commit.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist, called with nothing staged, and it compiles away. Under test
+    /// it runs whatever a control staged, exactly once — which is how a control
+    /// revokes *in that instant* rather than before or after it.
+    ///
+    /// Taken rather than borrowed, so one staging fires once. A second run
+    /// reaching the same point finds nothing and proceeds, which is what makes
+    /// "the action was consumed" a usable non-vacuity check for the control that
+    /// staged it.
+    pub(crate) fn reach_rpc_handler_precommit_point(&self) {
+        #[cfg(test)]
+        if let Some(staged) = self.rpc_handler_precommit_action.lock().take() {
+            staged();
+        }
+    }
+
+    /// Stage the action the next handler run will perform at its pre-commit
+    /// point.
+    #[cfg(test)]
+    pub(crate) fn stage_rpc_handler_precommit_action(
+        &self,
+        staged: impl FnOnce() + Send + 'static,
+    ) {
+        let displaced = self
+            .rpc_handler_precommit_action
+            .lock()
+            .replace(Box::new(staged));
+        assert!(
+            displaced.is_none(),
+            "a control staged a second handler pre-commit action over one that never fired"
+        );
+    }
+
+    /// Whether the staged action is still waiting — i.e. no handler run has
+    /// reached its pre-commit point since it was staged.
+    ///
+    /// The non-vacuity half. A control asserting "the closure was never entered"
+    /// has to know the run got as far as the point that refused it; without
+    /// this, the same assertion passes for a run that never started.
+    #[cfg(test)]
+    pub(crate) fn rpc_handler_precommit_action_pending(&self) -> bool {
+        self.rpc_handler_precommit_action.lock().is_some()
+    }
 }
 
 /// A control-armed park at the RPC send boundary, and the record of what
@@ -1084,6 +1186,21 @@ impl RpcSendBoundary {
     /// Park every run that reaches the boundary from here on.
     pub(crate) fn arm(&self) {
         self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Let every currently parked run continue past the boundary.
+    ///
+    /// The other exit, and the one a control needs when the point of the
+    /// control is what happens *after* the boundary rather than instead of it:
+    /// revoke while the run is parked, then release, and observe what the run
+    /// does with an authority that ended while it was standing still.
+    ///
+    /// `notify_waiters` rather than `notify_one`, and it wakes only runs already
+    /// parked — a run that arrives later parks as usual, because arming is not
+    /// undone by releasing. That is what keeps one release from silently
+    /// disarming the boundary for every run after it.
+    pub(crate) fn release(&self) {
+        self.release.notify_waiters();
     }
 
     /// A future that resolves when a run arrives at the boundary.
@@ -2167,63 +2284,74 @@ impl NetworkState {
     /// should treat the snapshot as instantaneous and re-fetch
     /// for fresh data.
     pub fn peer_snapshot(&self) -> Vec<crate::handle::PeerInfo> {
-        self.peers.collect_map(|peer| {
-            let device_id = peer.device_id.clone();
-            let data = peer.snapshot();
-            let pubkey = crate::signing::pubkey_part(&device_id);
-            let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
-            Some(crate::handle::PeerInfo {
-                device_id: device_id.clone(),
-                status: data.status,
-                tier: data.tier,
-                rtt_ms: data.rtt_ms,
-                clock_skew_ms: data.clock_skew_ms,
-                label: data.label,
-                capabilities: data.capabilities,
-                local_shelved: data.local_shelved,
-                remote_shelved: data.remote_shelved,
-                authenticated: data.authenticated,
-                device_suffix,
-                verification_code_received: data.verification_code_received,
-                verification_code_sent: data.verification_code_sent,
-                local_approve_sent: data.local_approve_sent,
-                remote_approve_seen: data.remote_approve_seen,
-                needs_turn: data.needs_turn,
-                local_candidates: data.diag.local_candidates,
-                remote_candidates: data.diag.remote_candidates,
-                selected_pair: data.selected_pair,
-            })
-        })
+        self.peers
+            .collect_map(|peer| Some(peer.with_peer_view(Self::peer_info_from_view)))
+    }
+
+    /// Build one [`crate::handle::PeerInfo`] from a single coherent observation.
+    ///
+    /// Both public snapshot paths go through here, so they cannot drift and
+    /// neither can pair a stale advert with fresh state — the view's session and
+    /// data halves were read together.
+    ///
+    /// Reads exactly the fields `PeerInfo` publishes. The shape this replaces
+    /// went through `PeerStateSnapshot`, which cloned the whole `PeerDiag` so
+    /// that two of its counters could be projected and the rest discarded; the
+    /// wire result is identical and the clone is gone.
+    fn peer_info_from_view(view: super::connection::PeerView<'_>) -> crate::handle::PeerInfo {
+        let data = view.data;
+        let pubkey = crate::signing::pubkey_part(view.device_id);
+        crate::handle::PeerInfo {
+            device_id: view.device_id.to_string(),
+            status: data.status,
+            tier: data.tier,
+            rtt_ms: data.rtt_ms,
+            clock_skew_ms: data.clock_skew_ms,
+            label: data.label.clone(),
+            capabilities: view.session.and_then(|app| app.capabilities()),
+            local_shelved: data.local_shelved,
+            remote_shelved: data.remote_shelved,
+            authenticated: data.authenticated,
+            device_suffix: crate::identity::display_suffix(pubkey.as_bytes()),
+            verification_code_received: data.verification_code_received.clone(),
+            verification_code_sent: data.verification_code_sent.clone(),
+            local_approve_sent: data.local_approve_sent,
+            remote_approve_seen: data.remote_approve_seen,
+            needs_turn: data.no_turn_diag_emitted,
+            // Cloned because `IceCandidateStats` is not `Copy`. It is five
+            // `u32`s with no heap under them, so the clone is the copy the
+            // compiler would have made — and still strictly less than the shape
+            // this replaced, which cloned the whole `PeerDiag` to project two
+            // of its fields.
+            local_candidates: data.diag.local_candidates.clone(),
+            remote_candidates: data.diag.remote_candidates.clone(),
+            selected_pair: data.selected_pair,
+        }
+    }
+
+    /// Plan a funded peers snapshot.
+    ///
+    /// The counting step of the shape [`peer_snapshot`](Self::peer_snapshot)
+    /// skips: it allocates nothing, so a caller serving somebody else's request
+    /// can learn what the answer would cost and refuse it before any of it
+    /// exists. See [`super::peer_snapshot`] for what the four acquisitions are
+    /// and why they are four.
+    ///
+    /// `peer_snapshot` remains the right call for a library caller that owns
+    /// the process and is not deciding on anybody's behalf whether a roster is
+    /// affordable.
+    pub fn plan_peer_snapshot(&self) -> super::peer_snapshot::PeerSnapshotStaging<'_> {
+        super::peer_snapshot::PeerSnapshotStaging::new(&self.peers)
     }
 
     /// Per-peer detail. Returns `None` if the peer is not in the
     /// engine's map.
     pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {
-        let peer = self.peers.get(device_id)?;
-        let data = peer.snapshot();
-        let pubkey = crate::signing::pubkey_part(device_id);
-        let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
-        Some(crate::handle::PeerInfo {
-            device_id: device_id.to_string(),
-            status: data.status,
-            tier: data.tier,
-            rtt_ms: data.rtt_ms,
-            clock_skew_ms: data.clock_skew_ms,
-            label: data.label,
-            capabilities: data.capabilities,
-            local_shelved: data.local_shelved,
-            remote_shelved: data.remote_shelved,
-            authenticated: data.authenticated,
-            device_suffix,
-            verification_code_received: data.verification_code_received,
-            verification_code_sent: data.verification_code_sent,
-            local_approve_sent: data.local_approve_sent,
-            remote_approve_seen: data.remote_approve_seen,
-            needs_turn: data.needs_turn,
-            local_candidates: data.diag.local_candidates,
-            remote_candidates: data.diag.remote_candidates,
-            selected_pair: data.selected_pair,
-        })
+        Some(
+            self.peers
+                .get(device_id)?
+                .with_peer_view(Self::peer_info_from_view),
+        )
     }
 
     /// Tear down every active peer session. Called from the

@@ -79,7 +79,11 @@ bytes = "1"
 
 # Serde
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` is required by the funded peers snapshot: it retains each peer's
+# already-canonical encoded advertisement and serializes those exact bytes,
+# rather than decoding a `CapabilityAdvert` whose nested `serde_json::Value`
+# has no exactly measurable retention. See `PreparedPeerSnapshot`.
+serde_json = { version = "1", features = ["raw_value"] }
 
 # Errors + logging
 thiserror = "1"

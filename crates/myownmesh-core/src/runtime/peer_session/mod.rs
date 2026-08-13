@@ -99,6 +99,14 @@ impl PeerSessionState {
         self.peer_advert.decoded()
     }
 
+    /// The same advertisement as canonical encoded bytes, borrowed.
+    ///
+    /// The measurable form. See [`crate::runtime::peer_session::capabilities::RetainedAdvert::encoded`]
+    /// for why a funded path measures and copies these rather than decoding.
+    pub(crate) fn capabilities_encoded(&self) -> Option<&[u8]> {
+        self.peer_advert.encoded()
+    }
+
     /// Record what the peer advertised over this session, replacing any earlier
     /// advertisement it made over the same one.
     ///

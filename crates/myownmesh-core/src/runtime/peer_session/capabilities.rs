@@ -60,6 +60,28 @@ impl RetainedAdvert {
         serde_json::from_slice(&retained.encoded).ok()
     }
 
+    /// The retained bytes themselves, borrowed.
+    ///
+    /// For a caller that must **measure** this advertisement without paying for
+    /// it, and then copy exactly what it measured. [`Self::decoded`] cannot
+    /// serve that: it allocates a `CapabilityAdvert` whose nested
+    /// `serde_json::Value` has no exactly derivable retention — the map, vector
+    /// and string capacities behind it are serde_json's and std's business, not
+    /// a function of these bytes — so a plan that measured through it would be
+    /// quoting a number it could not stand behind.
+    ///
+    /// These bytes are canonical: [`Self::replace`] produced them with
+    /// `encode_exact` at a counted length, so they are compact, escape-correct
+    /// and byte-for-byte what the decoded value would re-encode to. A caller may
+    /// therefore copy them verbatim into a response instead of round-tripping
+    /// through the typed form, and the wire result is identical.
+    ///
+    /// Borrowed, never handed out owned: the lease that paid for them belongs to
+    /// the session, and the borrow ends with the session record's own lender.
+    pub(crate) fn encoded(&self) -> Option<&[u8]> {
+        Some(&self.held.as_ref()?.encoded)
+    }
+
     /// Record what the peer advertised over this session, replacing any earlier
     /// advertisement it made over the same one.
     ///
@@ -67,13 +89,15 @@ impl RetainedAdvert {
     /// advertisement is peer-controlled data of peer-chosen size, so retaining
     /// it is a resource acquisition like any other: the encoded form is measured
     /// exactly, funded through the session that will own it, and only then
-    /// installed.
+    /// built and installed.
     ///
-    /// **On refusal nothing changes.** The previous advertisement — including
-    /// none — stays exactly as it was, the transient encoding is dropped, and
-    /// the caller must not announce a change, because none happened. The
-    /// ordering is what guarantees it: the replacement is the last step and
-    /// nothing after it can fail.
+    /// **On refusal nothing changes, and nothing was built.** The previous
+    /// advertisement — including none — stays exactly as it was, no buffer was
+    /// ever allocated for the rejected one, and the caller must not announce a
+    /// change, because none happened. The ordering is what guarantees it: the
+    /// size is counted without encoding, the encode happens only once the claim
+    /// is funded, and the replacement is the last step with nothing after it
+    /// that can fail.
     ///
     /// `session` is the funding authority and the proof that a current session
     /// authorized this. Taking it makes both unforgeable rather than
@@ -83,10 +107,15 @@ impl RetainedAdvert {
         session: &SessionCapability,
         advert: &CapabilityAdvert,
     ) -> Result<()> {
-        let encoded = serde_json::to_vec(advert)
-            .map_err(Error::Serde)?
-            .into_boxed_slice();
-        let claim = retained_advert_claim(encoded.len()).map_err(|e| {
+        // Counted, not built. The peer chooses this size, so the refusal paths
+        // below are the ones that matter most: a session with no capacity for
+        // the advertisement must not pay for encoding it first.
+        let encoded_len = advert.encoded_len().ok_or_else(|| {
+            Error::Transport(
+                "capability advertisement does not encode to a measurable size".to_string(),
+            )
+        })?;
+        let claim = retained_advert_claim(encoded_len).map_err(|e| {
             Error::Transport(format!(
                 "capability advertisement is not representable as a resource claim: {e:?}"
             ))
@@ -96,10 +125,18 @@ impl RetainedAdvert {
                 "capability advertisement refused: no capacity to retain it for this session: {e:?}"
             ))
         })?;
-        // The old advertisement stays installed while the new one is serialized
-        // and funded — that overlap is what lets a refusal above leave the
-        // previous value untouched. This assignment is the only state change,
-        // and it releases the old bytes and the old lease together.
+        // The old advertisement stays installed while the new one is measured,
+        // funded and encoded — that overlap is what lets a refusal above leave
+        // the previous value untouched. The encode is last because it is the
+        // allocation the lease was taken for: nothing before this point has
+        // built a buffer, so every refusal above is free.
+        let encoded = advert.encode_exact(encoded_len).ok_or_else(|| {
+            Error::Transport(
+                "capability advertisement did not encode to its counted size".to_string(),
+            )
+        })?;
+        // This assignment is the only state change, and it releases the old
+        // bytes and the old lease together.
         self.held = Some(LeasedCapabilityAdvert {
             encoded,
             _lease: lease,
@@ -204,11 +241,13 @@ pub(crate) fn retained_advert_reservation_charge_for_test(encoded: usize) -> Res
 /// The encoded size the advert path will charge for `advert`, so a fixture can
 /// fund exactly one of *this* advertisement rather than a guess at its size.
 ///
-/// Encoded by the same call the update path uses, so the number is the one that
-/// will actually be asked for and not an estimate of it.
+/// Counted by the same call the update path uses, so the number is the one that
+/// will actually be asked for and not an estimate of it. It counts rather than
+/// encodes for the same reason the update path does — and because a fixture that
+/// encoded here would be measuring a different call from the one under test.
 #[cfg(all(test, feature = "transport-lab"))]
 pub(crate) fn encoded_advert_len_for_test(advert: &CapabilityAdvert) -> usize {
-    serde_json::to_vec(advert)
+    advert
+        .encoded_len()
         .expect("a control advertisement serializes")
-        .len()
 }

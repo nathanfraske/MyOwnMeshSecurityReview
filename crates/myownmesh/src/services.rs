@@ -22,7 +22,7 @@ use myownmesh_core::{CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, Se
 use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
 use myownmesh_signaling::server::{RelayStatsSnapshot, SignalingServer, SignalingServerHandle};
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
 
 use crate::registry::NetworkRegistry;
@@ -84,6 +84,77 @@ pub struct EndpointReport {
     /// Lets an operator see at a glance whether peers are reaching it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<RelayStatsSnapshot>,
+}
+
+/// One coherently observed services-status source. It owns the sole manager
+/// guard, measures only borrowed/Copy fields, and can be committed exactly once
+/// after the caller has acquired its returned claim.
+pub(crate) struct ServicesStatusSource<'a> {
+    state: MutexGuard<'a, ManagerState>,
+    captured: CapturedServicesReport,
+}
+
+struct CapturedServicesReport {
+    node_enabled: bool,
+    joined: usize,
+    signaling: CapturedEndpoint,
+    stun: CapturedEndpoint,
+    turn: CapturedEndpoint,
+}
+
+struct CapturedEndpoint {
+    enabled: bool,
+    running: bool,
+    listen: Option<std::net::SocketAddr>,
+    activity: Option<RelayStatsSnapshot>,
+}
+
+pub(crate) struct FundedServicesStatus {
+    report: ServicesReport,
+    config: ServicesConfig,
+    _retention: myownmesh_core::ResourceLease,
+}
+
+impl FundedServicesStatus {
+    pub(crate) fn report(&self) -> &ServicesReport {
+        &self.report
+    }
+
+    pub(crate) fn config(&self) -> &ServicesConfig {
+        &self.config
+    }
+}
+
+#[derive(Serialize)]
+struct ServicesStatusView<'a> {
+    status: ServicesReportView,
+    config: &'a ServicesConfig,
+}
+
+#[derive(Serialize)]
+struct ServicesReportView {
+    node: NodeReport,
+    signaling: EndpointReportView,
+    stun: EndpointReportView,
+    turn: EndpointReportView,
+}
+
+#[derive(Serialize)]
+struct EndpointReportView {
+    enabled: bool,
+    running: bool,
+    listen: Option<SocketDisplay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity: Option<RelayStatsSnapshot>,
+}
+
+#[derive(Clone, Copy)]
+struct SocketDisplay(std::net::SocketAddr);
+
+impl Serialize for SocketDisplay {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
 }
 
 // There is no member-payload-relay report.
@@ -210,7 +281,7 @@ impl ServiceManager {
 
         g.config = desired;
         self.refresh_adverts_locked(&g);
-        let joined = self.registry.summaries().len();
+        let joined = self.registry.joined_count();
         info!(
             node = g.config.node.enabled,
             joined,
@@ -224,13 +295,19 @@ impl ServiceManager {
 
     /// Snapshot the current service status without changing anything.
     pub async fn status(&self) -> ServicesReport {
-        let joined = self.registry.summaries().len();
-        self.state.lock().await.report(joined)
+        self.status_source().await.build_report()
     }
 
     /// The currently-applied config (for persistence round-trips).
     pub async fn current_config(&self) -> ServicesConfig {
         self.state.lock().await.config.clone()
+    }
+
+    pub(crate) async fn status_source(&self) -> ServicesStatusSource<'_> {
+        let joined = self.registry.joined_count();
+        let state = self.state.lock().await;
+        let captured = state.capture(joined);
+        ServicesStatusSource { state, captured }
     }
 
     /// Hook for when a network joins after services were applied: push the
@@ -297,45 +374,147 @@ impl ServiceManager {
 
 impl ManagerState {
     fn report(&self, joined_networks: usize) -> ServicesReport {
-        ServicesReport {
-            node: NodeReport {
-                enabled: self.config.node.enabled,
-                joined: joined_networks,
-            },
-            signaling: EndpointReport {
+        self.capture(joined_networks).build()
+    }
+
+    fn capture(&self, joined: usize) -> CapturedServicesReport {
+        let folded = self.config.stun.enabled && self.config.turn.enabled && self.stun.is_none();
+        let turn_addr = self.turn.as_ref().map(|handle| handle.local_addr());
+        CapturedServicesReport {
+            node_enabled: self.config.node.enabled,
+            joined,
+            signaling: CapturedEndpoint {
                 enabled: self.config.signaling.enabled,
                 running: self.signaling.is_some(),
-                listen: self.signaling.as_ref().map(|h| h.local_addr().to_string()),
-                activity: self.signaling.as_ref().map(|h| h.stats()),
+                listen: self.signaling.as_ref().map(|handle| handle.local_addr()),
+                activity: self.signaling.as_ref().map(|handle| handle.stats()),
             },
-            stun: {
-                // When STUN is folded into TURN (both enabled, no
-                // standalone listener) report it as running at TURN's
-                // address — STUN Binding genuinely is served there, so an
-                // operator shouldn't see it as "enabled but not running".
-                let folded =
-                    self.config.stun.enabled && self.config.turn.enabled && self.stun.is_none();
-                EndpointReport {
-                    enabled: self.config.stun.enabled,
-                    running: self.stun.is_some() || (folded && self.turn.is_some()),
-                    listen: self
-                        .stun
-                        .as_ref()
-                        .map(|h| h.local_addr().to_string())
-                        .or_else(|| {
-                            folded
-                                .then(|| self.turn.as_ref().map(|h| h.local_addr().to_string()))
-                                .flatten()
-                        }),
-                    activity: None,
-                }
-            },
-            turn: EndpointReport {
-                enabled: self.config.turn.enabled,
-                running: self.turn.is_some(),
-                listen: self.turn.as_ref().map(|h| h.local_addr().to_string()),
+            stun: CapturedEndpoint {
+                enabled: self.config.stun.enabled,
+                running: self.stun.is_some() || (folded && self.turn.is_some()),
+                listen: self
+                    .stun
+                    .as_ref()
+                    .map(|handle| handle.local_addr())
+                    .or_else(|| folded.then_some(turn_addr).flatten()),
                 activity: None,
             },
+            turn: CapturedEndpoint {
+                enabled: self.config.turn.enabled,
+                running: self.turn.is_some(),
+                listen: turn_addr,
+                activity: None,
+            },
+        }
+    }
+}
+
+impl ServicesStatusSource<'_> {
+    fn view(&self) -> ServicesStatusView<'_> {
+        self.captured.view(&self.state.config)
+    }
+}
+
+impl CapturedServicesReport {
+    fn view<'a>(&self, config: &'a ServicesConfig) -> ServicesStatusView<'a> {
+        ServicesStatusView {
+            status: ServicesReportView {
+                node: NodeReport {
+                    enabled: self.node_enabled,
+                    joined: self.joined,
+                },
+                signaling: EndpointReportView {
+                    enabled: self.signaling.enabled,
+                    running: self.signaling.running,
+                    listen: self.signaling.listen.map(SocketDisplay),
+                    activity: self.signaling.activity,
+                },
+                stun: EndpointReportView {
+                    enabled: self.stun.enabled,
+                    running: self.stun.running,
+                    listen: self.stun.listen.map(SocketDisplay),
+                    activity: self.stun.activity,
+                },
+                turn: EndpointReportView {
+                    enabled: self.turn.enabled,
+                    running: self.turn.running,
+                    listen: self.turn.listen.map(SocketDisplay),
+                    activity: self.turn.activity,
+                },
+            },
+            config,
+        }
+    }
+}
+
+impl ServicesStatusSource<'_> {
+    pub(crate) fn typed_claim(
+        &self,
+    ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+        myownmesh_core::serialized_mailbox_item_claim_as::<(ServicesReport, ServicesConfig)>(
+            &self.view(),
+        )
+    }
+
+    pub(crate) fn line_ceiling(&self) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
+        services_status_line_ceiling(&self.view())
+    }
+
+    fn build_report(&self) -> ServicesReport {
+        self.captured.build()
+    }
+
+    pub(crate) fn commit(
+        self,
+        retention: myownmesh_core::ResourceLease,
+    ) -> Result<FundedServicesStatus, myownmesh_core::ResourceLease> {
+        if retention.claim()
+            != self
+                .typed_claim()
+                .expect("a previously measured source remains representable")
+        {
+            return Err(retention);
+        }
+        let report = self.captured.build();
+        let config = self.state.config.clone();
+        Ok(FundedServicesStatus {
+            report,
+            config,
+            _retention: retention,
+        })
+    }
+}
+
+fn services_status_line_ceiling(
+    view: &ServicesStatusView<'_>,
+) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
+    let (_, encoded, _) = myownmesh_core::mailbox_measure_serialized(view)?;
+    encoded
+        .checked_add("{\"ok\":true,\"data\":".len())
+        .and_then(|bytes| bytes.checked_add("}\n".len()))
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "services status line length overflowed",
+        ))
+}
+
+impl CapturedServicesReport {
+    fn build(&self) -> ServicesReport {
+        fn endpoint(value: &CapturedEndpoint) -> EndpointReport {
+            EndpointReport {
+                enabled: value.enabled,
+                running: value.running,
+                listen: value.listen.map(|address| address.to_string()),
+                activity: value.activity,
+            }
+        }
+        ServicesReport {
+            node: NodeReport {
+                enabled: self.node_enabled,
+                joined: self.joined,
+            },
+            signaling: endpoint(&self.signaling),
+            stun: endpoint(&self.stun),
+            turn: endpoint(&self.turn),
         }
     }
 }
@@ -640,6 +819,152 @@ mod tests {
         assert!(
             !status.contains("relay"),
             "a running daemon publishes no relay state: {status}"
+        );
+    }
+
+    #[test]
+    fn services_status_measurement_matches_built_multidigit_folded_projection() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let turn = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3478);
+        let captured = CapturedServicesReport {
+            node_enabled: false,
+            joined: 2,
+            signaling: CapturedEndpoint {
+                enabled: true,
+                running: true,
+                listen: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7447)),
+                activity: Some(RelayStatsSnapshot {
+                    connections: 12,
+                    connections_total: 345,
+                    rooms: 67,
+                    events_relayed: 8901,
+                }),
+            },
+            stun: CapturedEndpoint {
+                enabled: true,
+                running: true,
+                listen: Some(turn),
+                activity: None,
+            },
+            turn: CapturedEndpoint {
+                enabled: true,
+                running: true,
+                listen: Some(turn),
+                activity: None,
+            },
+        };
+        let mut config = ServicesConfig::default();
+        config.node.enabled = false;
+        config.signaling.enabled = true;
+        config.stun.enabled = true;
+        config.turn.enabled = true;
+
+        let measured = serde_json::to_vec(&captured.view(&config)).expect("borrowed view encodes");
+        let report = captured.build();
+        #[derive(Serialize)]
+        struct Data<'a> {
+            status: &'a ServicesReport,
+            config: &'a ServicesConfig,
+        }
+        #[derive(Serialize)]
+        struct Envelope<'a> {
+            ok: bool,
+            data: Data<'a>,
+        }
+        let built = serde_json::to_vec(&Data {
+            status: &report,
+            config: &config,
+        })
+        .expect("built status data encodes");
+        let mut full_line = serde_json::to_vec(&Envelope {
+            ok: true,
+            data: Data {
+                status: &report,
+                config: &config,
+            },
+        })
+        .expect("full prepared response encodes");
+        full_line.push(b'\n');
+        let ceiling = services_status_line_ceiling(&captured.view(&config))
+            .expect("the full response ceiling is representable");
+        assert_eq!(
+            ceiling,
+            full_line.len(),
+            "the planned ceiling is the exact compact response wrapper plus newline"
+        );
+        assert_eq!(
+            measured, built,
+            "measurement and one built snapshot are identical"
+        );
+        assert!(
+            std::str::from_utf8(&measured)
+                .expect("JSON is UTF-8")
+                .contains("\"events_relayed\":8901"),
+            "non-vacuity: multi-digit activity participates in the measurement"
+        );
+        assert_eq!(
+            report.stun.listen, report.turn.listen,
+            "non-vacuity: folded STUN reports the captured TURN endpoint"
+        );
+
+        let absent = CapturedServicesReport {
+            node_enabled: true,
+            joined: 0,
+            signaling: CapturedEndpoint {
+                enabled: true,
+                running: false,
+                listen: None,
+                activity: None,
+            },
+            stun: CapturedEndpoint {
+                enabled: true,
+                running: false,
+                listen: None,
+                activity: None,
+            },
+            turn: CapturedEndpoint {
+                enabled: true,
+                running: false,
+                listen: None,
+                activity: None,
+            },
+        };
+        let absent_measured =
+            serde_json::to_vec(&absent.view(&config)).expect("borrowed null-listen view encodes");
+        let absent_report = absent.build();
+        let absent_built = serde_json::to_vec(&Data {
+            status: &absent_report,
+            config: &config,
+        })
+        .expect("built null-listen status data encodes");
+        let mut absent_full_line = serde_json::to_vec(&Envelope {
+            ok: true,
+            data: Data {
+                status: &absent_report,
+                config: &config,
+            },
+        })
+        .expect("full null-listen prepared response encodes");
+        absent_full_line.push(b'\n');
+        let absent_ceiling = services_status_line_ceiling(&absent.view(&config))
+            .expect("the null-listen response ceiling is representable");
+        assert_eq!(
+            absent_ceiling,
+            absent_full_line.len(),
+            "the null-listen plan covers the exact compact wrapper plus newline"
+        );
+        assert_eq!(
+            absent_measured, absent_built,
+            "the borrowed and built projections both retain explicit null listeners"
+        );
+        assert_eq!(
+            std::str::from_utf8(&absent_measured)
+                .expect("JSON is UTF-8")
+                .matches("\"listen\":null")
+                .count(),
+            3,
+            "all three absent endpoints preserve the public listen:null contract"
         );
     }
 }

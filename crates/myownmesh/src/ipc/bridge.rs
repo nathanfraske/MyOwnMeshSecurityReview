@@ -34,11 +34,9 @@
 //!   exactly the case where it was useless — and `serve`, which waits on every
 //!   accepted task, would have waited for it forever.
 
-use std::sync::Arc;
-
 use myownmesh_core::application_gateway::GatewayRefusal;
 use myownmesh_core::channels::ChannelSubscription;
-use myownmesh_core::{JoinedNetwork, ResourceLease, ResourceMailboxAdmissionError};
+use myownmesh_core::{JoinedNetwork, ResourceMailboxAdmissionError};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -82,18 +80,15 @@ use myownmesh_core::{ResourceClaim, ResourceClass};
 pub(crate) struct HandlerContext {
     key: ClaimKey,
     generation: HandlerGeneration,
-    /// This allocation and the two name buffers inside it, acquired before any
-    /// of them existed. Held, never read.
-    _retained: ResourceLease,
 }
 
 impl HandlerContext {
     /// Fund the allocation, then build it.
     fn admit(
-        key: ClaimKey,
+        key: &ClaimKey,
         generation: HandlerGeneration,
         registry: &ClientRegistry,
-    ) -> Result<Arc<Self>, GatewayRefusal> {
+    ) -> Result<myownmesh_core::FundedArc<Self>, GatewayRefusal> {
         // The `Arc` pointee: this struct, the strong and weak counts beside it,
         // and the two name buffers it owns. Three allocations named as
         // residuals -- the `Arc` itself and one per string -- because a `String`
@@ -117,11 +112,14 @@ impl HandlerContext {
             }
             Err(_) => return Err(GatewayRefusal::Malformed),
         };
-        Ok(Arc::new(Self {
-            key,
-            generation,
-            _retained: retained,
-        }))
+        Ok(myownmesh_core::FundedArc::new(
+            Self {
+                key: key.clone(),
+                generation,
+            },
+            retained,
+        )
+        .unwrap_or_else(|_| unreachable!("an admitted handler lease may be shared")))
     }
 }
 
@@ -220,7 +218,7 @@ impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for RpcInboundBuilder
 /// installed is a client told it is serving a method that will never reach it.
 pub fn prepare_single_handler(
     rpc: &myownmesh_core::rpc::Rpc,
-    key: ClaimKey,
+    key: &ClaimKey,
     generation: HandlerGeneration,
     registry: &ClientRegistry,
 ) -> Result<PreparedRegistration, GatewayRefusal> {
@@ -230,7 +228,7 @@ pub fn prepare_single_handler(
     // and funds the copy it keeps, so a `String` clone made here would be a
     // third buffer that neither side's admission covers -- small, but sized by a
     // name a client chose, and made before either party had agreed to it.
-    let closure_context = Arc::clone(&context);
+    let closure_context = context.clone();
     // Weak, always. See [`WeakClientRegistry`]: a network owns its handler
     // entries and an entry owns this closure, so a strong clone here would make
     // the network an owner of the daemon's whole client registry.
@@ -239,7 +237,7 @@ pub fn prepare_single_handler(
     // retains beyond its own callable is one pointer, into an allocation this
     // daemon has funded for a life that outlasts the entry.
     rpc.prepare_serve_with_retention_claim(&context.key.1, ResourceClaim::ZERO, move |call| {
-        single_handler_call(registry.clone(), Arc::clone(&closure_context), call)
+        single_handler_call(registry.clone(), closure_context.clone(), call)
     })
 }
 
@@ -254,7 +252,7 @@ pub fn prepare_single_handler(
 /// and runs the same code core would.
 async fn single_handler_call(
     registry: WeakClientRegistry,
-    context: Arc<HandlerContext>,
+    context: myownmesh_core::FundedArc<HandlerContext>,
     call: myownmesh_core::rpc::RpcCall,
 ) -> Result<myownmesh_core::rpc::RpcResponse, String> {
     let Some(registry) = registry.upgrade() else {
@@ -345,20 +343,20 @@ async fn single_handler_call(
 /// Fallible for the same reason [`prepare_single_handler`] is.
 pub fn prepare_stream_handler(
     rpc: &myownmesh_core::rpc::Rpc,
-    key: ClaimKey,
+    key: &ClaimKey,
     generation: HandlerGeneration,
     registry: &ClientRegistry,
 ) -> Result<PreparedRegistration, GatewayRefusal> {
     let context = HandlerContext::admit(key, generation, registry)?;
     // Borrowed into core, cloned only as a pointer for the closure — see
     // [`prepare_single_handler`].
-    let closure_context = Arc::clone(&context);
+    let closure_context = context.clone();
     let registry = registry.downgrade();
     // Zero for the same reason [`prepare_single_handler`] gives.
     rpc.prepare_serve_stream_with_retention_claim(
         &context.key.1,
         ResourceClaim::ZERO,
-        move |call| stream_handler_call(registry.clone(), Arc::clone(&closure_context), call),
+        move |call| stream_handler_call(registry.clone(), closure_context.clone(), call),
     )
 }
 
@@ -366,7 +364,7 @@ pub fn prepare_stream_handler(
 /// same reason [`single_handler_call`] is.
 async fn stream_handler_call(
     registry: WeakClientRegistry,
-    context: Arc<HandlerContext>,
+    context: myownmesh_core::FundedArc<HandlerContext>,
     call: myownmesh_core::rpc::RpcCall,
 ) -> Result<myownmesh_core::ResourceMailboxReceiver<myownmesh_core::rpc::RpcStreamItem>, String> {
     let Some(registry) = registry.upgrade() else {
@@ -524,17 +522,16 @@ async fn stream_handler_call(
 /// subscription the daemon does not actually hold.
 pub(crate) fn spawn_channel_pump(
     network: &JoinedNetwork,
-    network_key: String,
-    channel_name: String,
+    key: &ClaimKey,
     registry: ClientRegistry,
 ) -> std::result::Result<
     (
-        Arc<crate::ipc::RouteCancellation>,
+        myownmesh_core::FundedArc<crate::ipc::RouteCancellation>,
         tokio::task::JoinHandle<()>,
     ),
     ChannelPumpError,
 > {
-    let channel = network.channel::<Value>(&channel_name);
+    let channel = network.channel::<Value>(&key.1);
     let sub = channel.subscribe().map_err(ChannelPumpError::Subscribe)?;
     // Funded before the pump exists, and for the same reason the subscription
     // is checked first: this reports rather than starting a pump the daemon
@@ -555,19 +552,19 @@ pub(crate) fn spawn_channel_pump(
     // `lease_task` prices one worker obligation and one bookkeeping object and
     // would call two client-chosen strings free. Checked before the clones
     // exist, on the same pattern as `RpcCallStream`'s request id.
-    let captured =
-        network_key
-            .len()
-            .checked_add(channel_name.len())
-            .ok_or(ChannelPumpError::Task(IpcAdmissionError::Claim(
-                myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                    dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                },
-            )))?;
+    let captured = key
+        .0
+        .len()
+        .checked_add(key.1.len())
+        .ok_or(ChannelPumpError::Task(IpcAdmissionError::Claim(
+            myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            },
+        )))?;
     let task = registry
         .lease_task_retaining(captured)
         .map_err(ChannelPumpError::Task)?;
-    let key = (network_key.clone(), channel_name.clone());
+    let key = key.clone();
     // Handed back to the route, which is the only thing entitled to stop this
     // task. Retiring the route cancels and *joins* through these two, so the
     // pump's end is observed rather than assumed — the previous shape had no
@@ -576,7 +573,7 @@ pub(crate) fn spawn_channel_pump(
     let cancel = registry
         .route_cancellation()
         .map_err(ChannelPumpError::Task)?;
-    let cancelled = Arc::clone(&cancel);
+    let cancelled = cancel.clone();
     let join = tokio::spawn(run_channel_pump(sub, key, registry, cancelled, task));
     Ok((cancel, join))
 }
@@ -595,7 +592,7 @@ async fn run_channel_pump(
     mut sub: ChannelSubscription<Value>,
     key: ClaimKey,
     registry: ClientRegistry,
-    cancelled: Arc<crate::ipc::RouteCancellation>,
+    cancelled: myownmesh_core::FundedArc<crate::ipc::RouteCancellation>,
     task: crate::ipc::TaskAdmission,
 ) {
     let _task = task;
@@ -731,6 +728,36 @@ pub fn value_to_response(v: Value) -> myownmesh_core::rpc::RpcResponse {
     myownmesh_core::rpc::RpcResponse::from_value(v)
 }
 
+struct HandlerDisplacedBuilder {
+    network: String,
+    method: String,
+    by: super::clients::ClientId,
+}
+
+impl HandlerDisplacedBuilder {
+    fn view(&self) -> crate::ipc::wire::ServerOutView<'_> {
+        crate::ipc::wire::ServerOutView::HandlerDisplaced {
+            network: &self.network,
+            method: &self.method,
+            by: self.by,
+        }
+    }
+}
+
+impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for HandlerDisplacedBuilder {
+    fn retained_claim(&self) -> Result<ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+        myownmesh_core::serialized_mailbox_item_claim_as::<ServerOut>(&self.view())
+    }
+
+    fn build(self) -> ServerOut {
+        ServerOut::HandlerDisplaced {
+            network: self.network,
+            method: self.method,
+            by: self.by.to_string(),
+        }
+    }
+}
+
 /// Helper used by `dispatch` when an IPC client releases or
 /// has been disconnected: notify the now-displaced client.
 pub fn notify_displaced(
@@ -745,26 +772,16 @@ pub fn notify_displaced(
         // only tells the loser about it. There is no caller to refuse and no
         // way to undo the claim transfer, so a refusal is recorded and the
         // displaced client is left to notice through its own failing calls.
-        let network_id = network.clone();
-        let displaced_method = method.clone();
-        match client.send(ServerOut::HandlerDisplaced {
+        match client.send_building(HandlerDisplacedBuilder {
             network,
             method,
-            by: by.to_string(),
+            by,
         }) {
             Ok(()) => {}
-            Err(ResourceMailboxAdmissionError::Closed) => debug!(
-                network = %network_id,
-                method = %displaced_method,
-                client = %prev_owner,
-                "displacement notice dropped: displaced client had already disconnected"
-            ),
-            Err(refusal) => warn!(
-                network = %network_id,
-                method = %displaced_method,
-                client = %prev_owner,
-                "connected client was displaced but could not be told: {refusal}"
-            ),
+            Err(ResourceMailboxAdmissionError::Closed) => debug!(client = %prev_owner,
+                "displacement notice dropped: displaced client had already disconnected"),
+            Err(refusal) => warn!(client = %prev_owner, %refusal,
+                "connected client was displaced but could not be told"),
         }
     }
 }
@@ -786,7 +803,7 @@ pub fn notify_displaced(
 /// join path to observe a transaction that has nothing to do with peers.
 pub fn prepare_handler_for_mode(
     rpc: &myownmesh_core::rpc::Rpc,
-    key: ClaimKey,
+    key: &ClaimKey,
     generation: HandlerGeneration,
     mode: HandlerMode,
     registry: &ClientRegistry,
@@ -811,7 +828,7 @@ mod tests {
     // handler body core runs, not a copy of it.
     use super::{
         prepare_handler_for_mode, run_channel_pump, single_handler_call, stream_handler_call,
-        HandlerContext, RpcInboundBuilder,
+        HandlerContext, HandlerDisplacedBuilder, RpcInboundBuilder,
     };
     use crate::ipc::clients::{ClientRegistry, HandlerMode, PendingKey, RegistrationError};
     use crate::ipc::wire::ServerOut;
@@ -1007,9 +1024,8 @@ mod tests {
         let first = registry
             .next_handler_generation()
             .expect("a fresh daemon has generations left");
-        let prepared =
-            prepare_handler_for_mode(&rpc, key.clone(), first, HandlerMode::Single, &registry)
-                .expect("the live gateway funds one synthetic handler");
+        let prepared = prepare_handler_for_mode(&rpc, &key, first, HandlerMode::Single, &registry)
+            .expect("the live gateway funds one synthetic handler");
         let displaced = registry
             .claim_method_committing(key.clone(), a.id, HandlerMode::Single, first, prepared)
             .expect("the claim and the handler publish together");
@@ -1022,7 +1038,7 @@ mod tests {
             .next_handler_generation()
             .expect("a fresh daemon has generations left");
         let prepared =
-            prepare_handler_for_mode(&rpc, key.clone(), refused, HandlerMode::Stream, &registry)
+            prepare_handler_for_mode(&rpc, &key, refused, HandlerMode::Stream, &registry)
                 .expect("funding a registration is not publishing it");
         let refusal = registry.claim_method_committing(
             key.clone(),
@@ -1075,9 +1091,8 @@ mod tests {
         let second = registry
             .next_handler_generation()
             .expect("a fresh daemon has generations left");
-        let prepared =
-            prepare_handler_for_mode(&rpc, key.clone(), second, HandlerMode::Stream, &registry)
-                .expect("the live gateway funds the displacing handler");
+        let prepared = prepare_handler_for_mode(&rpc, &key, second, HandlerMode::Stream, &registry)
+            .expect("the live gateway funds the displacing handler");
         let displaced = registry
             .claim_method_committing(key.clone(), b.id, HandlerMode::Stream, second, prepared)
             .expect("the displacing claim and its handler publish together");
@@ -1153,8 +1168,8 @@ mod tests {
         key: crate::ipc::clients::ClaimKey,
         generation: crate::ipc::HandlerGeneration,
         registry: &ClientRegistry,
-    ) -> Arc<HandlerContext> {
-        HandlerContext::admit(key, generation, registry)
+    ) -> myownmesh_core::FundedArc<HandlerContext> {
+        HandlerContext::admit(&key, generation, registry)
             .expect("the daemon test grant funds one handler context")
     }
 
@@ -1233,6 +1248,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v4_r2_daemon_a_displacement_frame_is_measured_before_its_id_string_exists() {
+        use myownmesh_core::{ResourceMailboxItem, ResourceMailboxItemBuilder};
+
+        let builder = HandlerDisplacedBuilder {
+            network: "network-with-owned-coordinate".to_string(),
+            method: "handler.with.owned.coordinate".to_string(),
+            by: crate::ipc::clients::ClientId(42),
+        };
+        let measured_bytes = serde_json::to_vec(&builder.view()).expect("the mirror encodes");
+        let measured_claim = builder.retained_claim().expect("the mirror is measurable");
+        let built = builder.build();
+        let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
+        let built_claim = built.retained_claim().expect("the frame is measurable");
+
+        assert_eq!(
+            measured_bytes, built_bytes,
+            "the borrowed ClientId display and the constructed String have the same wire form"
+        );
+        assert_eq!(
+            measured_claim, built_claim,
+            "the admitted claim is the finished frame's exact claim"
+        );
+    }
+
     /// One inbound call, as a peer would have made it.
     fn fixture_call(from: &str, request_id: &str, streaming: bool) -> myownmesh_core::rpc::RpcCall {
         myownmesh_core::rpc::RpcCall {
@@ -1248,7 +1288,7 @@ mod tests {
     fn fresh_ipc_client(
         registry: &ClientRegistry,
     ) -> (
-        Arc<crate::ipc::ClientHandle>,
+        myownmesh_core::FundedArc<crate::ipc::ClientHandle>,
         myownmesh_core::ResourceMailboxReceiver<ServerOut>,
     ) {
         let (tx, rx) = myownmesh_core::resource_mailbox(crate::test_application_scope())
@@ -1813,7 +1853,7 @@ mod tests {
             sub,
             key.clone(),
             registry.clone(),
-            Arc::clone(&cancel),
+            cancel.clone(),
             task,
         ));
         assert!(

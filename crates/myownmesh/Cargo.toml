@@ -39,6 +39,7 @@ tracing-subscriber = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+bytes = { workspace = true }
 data-encoding = { workspace = true }
 getrandom = { workspace = true }
 
@@ -57,5 +58,6 @@ widestring = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+myownmesh-core = { workspace = true, features = ["transport-lab"] }
 myownmesh-signaling = { workspace = true }
 tempfile = { workspace = true }

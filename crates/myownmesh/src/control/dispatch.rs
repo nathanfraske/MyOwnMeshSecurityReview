@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use myownmesh_core::transport as core_webrtc;
-use myownmesh_core::MeshConfig;
 use tracing::info;
 
 mod network;
@@ -20,24 +19,16 @@ use network::{
 };
 use services::services_set;
 
-use super::{realtime_refused, ControlState, Request, Response};
+use super::{realtime_refused, ConnectionCancel, ControlState, Request, Response};
 
-pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
+pub(super) async fn dispatch(
+    state: &Arc<ControlState>,
+    cancel: &ConnectionCancel,
+    req: Request,
+) -> Response {
     match req {
         Request::Status => {
-            let status = serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "device_id": state.mesh.identity().display_id(),
-                "joined_networks": state.registry.summaries()
-                    .into_iter()
-                    .map(|summary| summary.network_id)
-                    .collect::<Vec<String>>(),
-                // Always present: `supported: false` is a definite answer, and
-                // an absent object would be indistinguishable from a client
-                // that failed to read it.
-                "realtime": state.realtime,
-            });
-            Response::ok(status)
+            unreachable!("Status commits and encodes at the prepared reply boundary")
         }
         Request::IdentityShow => Response::ok(serde_json::json!({
             "device_id": state.mesh.identity().display_id(),
@@ -59,16 +50,11 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             }))
         }
         Request::NetworksList => {
-            // Enriched payload: each network includes its phase,
-            // topology, and labelling info. The CLI prints whatever
-            // it gets; the GUI binds rich fields directly.
-            let summaries = state.registry.summaries();
-            Response::ok(serde_json::json!({ "networks": summaries }))
+            unreachable!("NetworksList commits and encodes at the prepared reply boundary")
         }
-        Request::PeersList { network } => match state.registry.get(&network) {
-            Some(net) => Response::ok(serde_json::json!({ "peers": net.peers() })),
-            None => Response::err(format!("unknown network: {network}")),
-        },
+        Request::PeersList { .. } => {
+            unreachable!("PeersList commits and encodes at the prepared reply boundary")
+        }
         Request::RosterList { network } => match state.registry.get(&network) {
             Some(net) => match net.roster_list().await {
                 Ok(list) => Response::ok(serde_json::json!({ "roster": list })),
@@ -130,19 +116,12 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
                 None => Response::err(format!("unknown network: {network}")),
             }
         }
-        Request::NetworkIdGenerate => Response::ok(serde_json::json!({
-            "network_id": myownmesh_core::identity::generate_network_id(),
-        })),
-        Request::NetworkIdNormalize { input } => {
-            match myownmesh_core::identity::normalize_network_id(&input) {
-                Ok(n) => Response::ok(serde_json::json!({ "network_id": n })),
-                Err(e) => Response::err(e.to_string()),
-            }
+        Request::NetworkIdGenerate | Request::NetworkIdNormalize { .. } => {
+            unreachable!("network ids commit and encode at the prepared reply boundary")
         }
-        Request::ConfigShow => match MeshConfig::load() {
-            Ok(cfg) => Response::ok(serde_json::json!({ "config": cfg })),
-            Err(e) => Response::err(e.to_string()),
-        },
+        Request::ConfigShow => {
+            unreachable!("ConfigShow loads and encodes at the prepared reply boundary")
+        }
         Request::NetworkAdd { config } => {
             info!(network = %config.network_id, config_id = %config.id, "control: network_add");
             network_add(state, config).await
@@ -174,7 +153,11 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             wait_ms,
         } => {
             info!(%network, %peer, pin, wait_ms, "control: network_connect_peer");
-            network_connect_peer(state, &network, &peer, pin, wait_ms).await
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Response::err("control connection closing"),
+                response = network_connect_peer(state, &network, &peer, pin, wait_ms) => response,
+            }
         }
 
         // ---- realtime flows ----
@@ -271,15 +254,14 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             // below, which is read past the lookup, past the await, and into
             // the response — so it has to outlive all of them and is dropped at
             // the end of this arm with the string it funds.
-            let Some((network, flow, _flow_funding)) = owner.take_realtime_flow(&flow_capability)
-            else {
+            let Some(flow) = owner.take_realtime_flow(&flow_capability) else {
                 return Response::err(
                     "unknown flow_capability: it was never issued to this client, or the \
                      flow it named has already been closed",
                 );
             };
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
+            let Some(net) = state.registry.get(flow.network()) else {
+                return Response::err(format!("unknown network: {}", flow.network()));
             };
             // Awaits, and the wait is the guarantee. Closing retires the flow's
             // native half — a transceiver inbound, a sender outbound — and the
@@ -294,7 +276,7 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             // session was replaced, or the label was closed with it — so
             // returning the capability would be re-issuing authority over
             // nothing.
-            match net.close_realtime(flow).await {
+            match flow.close_through(&net).await {
                 Ok(()) => Response::ok(serde_json::json!({ "closed": true })),
                 Err(refusal) => realtime_refused(refusal),
             }
@@ -325,20 +307,14 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             }
         }
         Request::ServicesStatus => {
-            let status = state.services.status().await;
-            let config = state.services.current_config().await;
-            Response::ok(serde_json::json!({ "status": status, "config": config }))
+            unreachable!("ServicesStatus commits and encodes at the prepared reply boundary")
         }
         Request::ServicesSet { services } => services_set(state, services).await,
         Request::EventsSubscribe => {
-            // Handled by `handle_client` before reaching dispatch.
-            // If we somehow get here, surface the bug.
-            Response::err("events_subscribe must be handled upstream")
+            unreachable!("EventsSubscribe switches modes before dispatch")
         }
         Request::TraceSubscribe { .. } => {
-            // Handled by `handle_client` before reaching dispatch, like
-            // events_subscribe.
-            Response::err("trace_subscribe must be handled upstream")
+            unreachable!("TraceSubscribe switches modes before dispatch")
         }
 
         // ---- governance ----
@@ -514,221 +490,33 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
                 Err(e) => Response::err(e.to_string()),
             }
         }
-        Request::GovernanceMfaStatus { network } => Response::ok(serde_json::json!({
-            "enrolled": myownmesh_core::custody::is_enrolled(&network),
-        })),
-        Request::GovernanceMfaDisable { network, code } => {
-            match myownmesh_core::custody::disable(&network, &code) {
-                Ok(()) => Response::ok(serde_json::json!({ "disabled": true })),
-                Err(e) => Response::err(e.to_string()),
-            }
+        Request::GovernanceMfaStatus { .. } => {
+            unreachable!("GovernanceMfaStatus is encoded from scalar state before dispatch")
+        }
+        Request::GovernanceMfaDisable { .. } => {
+            unreachable!("GovernanceMfaDisable is completed at the prepared reply boundary")
         }
 
         // ---- RPC handler claims --------------------------------------
-        Request::RpcRegister {
-            client_id,
-            client_capability,
-            network,
-            method,
-            streaming,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let mode = if streaming {
-                crate::ipc::clients::HandlerMode::Stream
-            } else {
-                crate::ipc::clients::HandlerMode::Single
-            };
-            let key = (network.clone(), method.clone());
-            // One transaction, not two steps. The generation is minted first
-            // because the handler closure captures it; the closure is then
-            // funded without being published; and the daemon's claim runs inside
-            // core's commit, under core's handlers lock, so the handler and the
-            // claim appear together or neither does.
-            //
-            // Neither ordering of two separate steps is correct, which is why
-            // this is not one. Installing first and claiming second leaves a
-            // handler owned by nobody when the claim is refused; claiming first
-            // and installing second leaves a client told it serves a method no
-            // handler can reach. Both were observable, and both took the
-            // incumbent's method away to get there.
-            let generation = match state.clients.next_handler_generation() {
-                Ok(generation) => generation,
-                Err(refusal) => return Response::err(format!("rpc register refused: {refusal}")),
-            };
-            let prepared = match crate::ipc::bridge::prepare_handler_for_mode(
-                &net.rpc(),
-                key.clone(),
-                generation,
-                mode,
-                &state.clients,
-            ) {
-                Ok(prepared) => prepared,
-                Err(refusal) => return Response::err(format!("rpc register refused: {refusal}")),
-            };
-            let prev = match state.clients.claim_method_committing(
-                key.clone(),
-                client_id,
-                mode,
-                generation,
-                prepared,
-            ) {
-                Ok(prev) => prev,
-                Err(refusal) => return Response::err(format!("rpc register refused: {refusal}")),
-            };
-            if let Some(prev_owner) = prev {
-                crate::ipc::bridge::notify_displaced(
-                    &state.clients,
-                    prev_owner,
-                    client_id,
-                    network,
-                    method,
-                );
-            }
-            Response::ok(serde_json::json!({ "registered": true }))
+        Request::RpcRegister { .. } => {
+            unreachable!("RpcRegister commits and encodes at the prepared reply boundary")
         }
 
-        Request::RpcUnregister {
-            client_id,
-            client_capability,
-            network,
-            method,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            let key = (network, method);
-            let release = state.clients.release_method(&key, client_id);
-            let released = release.released;
-            // Dropping the release is what forgets the handler: it carries the
-            // core registration out of the registry, and releasing that removes
-            // exactly the handler this claim installed -- not a successor's that
-            // happens to answer to the same name. Explicit rather than implicit
-            // because it is the operation, not a side effect of the value going
-            // out of scope, and because it must happen here, where no registry
-            // lock is held.
-            //
-            // No network lookup: the registration knows its own dispatcher, so
-            // a release no longer depends on this daemon still having the
-            // network in its map.
-            drop(release);
-            Response::ok(serde_json::json!({ "released": released }))
+        Request::RpcUnregister { .. } => {
+            unreachable!("RpcUnregister commits and encodes at the prepared reply boundary")
         }
 
         // ---- inbound-RPC responses (from IPC handler back to daemon)
-        Request::RpcRespond {
-            client_id,
-            client_capability,
-            network,
-            peer,
-            method,
-            request_id,
-            operation_id,
-            ok,
-            error,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            let key = crate::ipc::clients::PendingKey {
-                network,
-                method,
-                remote_peer: peer,
-                remote_request_id: request_id.clone(),
-                class: crate::ipc::clients::HandlerMode::Single,
-            };
-            let result = error.map_or_else(|| Ok(ok.unwrap_or(serde_json::Value::Null)), Err);
-            let resolved =
-                state
-                    .clients
-                    .resolve_exact_single(&key, client_id, operation_id, result);
-            if resolved {
-                Response::ok(serde_json::json!({ "resolved": true }))
-            } else {
-                Response::err(format!("no in-flight inbound RPC for '{request_id}'"))
-            }
+        Request::RpcRespond { .. } => {
+            unreachable!("RpcRespond commits and encodes at the prepared reply boundary")
         }
 
-        Request::RpcStreamChunk {
-            client_id,
-            client_capability,
-            network,
-            peer,
-            method,
-            request_id,
-            operation_id,
-            payload,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            let key = crate::ipc::clients::PendingKey {
-                network,
-                method,
-                remote_peer: peer,
-                remote_request_id: request_id.clone(),
-                class: crate::ipc::clients::HandlerMode::Stream,
-            };
-            let accepted = state
-                .clients
-                .push_exact_stream(&key, client_id, operation_id, payload);
-            if accepted {
-                Response::ok(serde_json::json!({ "delivered": true }))
-            } else {
-                Response::err(format!("no in-flight inbound stream for '{request_id}'"))
-            }
+        Request::RpcStreamChunk { .. } => {
+            unreachable!("RpcStreamChunk commits and encodes at the prepared reply boundary")
         }
 
-        Request::RpcStreamEnd {
-            client_id,
-            client_capability,
-            network,
-            peer,
-            method,
-            request_id,
-            operation_id,
-            error,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            // The typed terminal item preserves clean versus failed closure;
-            // disappearing without either is treated as failure by core.
-            let key = crate::ipc::clients::PendingKey {
-                network,
-                method,
-                remote_peer: peer,
-                remote_request_id: request_id.clone(),
-                class: crate::ipc::clients::HandlerMode::Stream,
-            };
-            let closed = state
-                .clients
-                .close_exact_stream(&key, client_id, operation_id, error);
-            Response::ok(serde_json::json!({ "closed": closed }))
+        Request::RpcStreamEnd { .. } => {
+            unreachable!("RpcStreamEnd commits and encodes at the prepared reply boundary")
         }
 
         // ---- outbound RPC --------------------------------------------
@@ -741,7 +529,13 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             let Some(net) = state.registry.get(&network) else {
                 return Response::err(format!("unknown network: {network}"));
             };
-            match net.rpc().call(&peer, &method, payload).await {
+            let rpc = net.rpc();
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Response::err("control connection closing"),
+                result = rpc.call(&peer, &method, payload) => result,
+            };
+            match result {
                 Ok(resp) => Response::ok(serde_json::json!({ "response": resp.body })),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -766,7 +560,12 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             // shape and tag chunks on the wire with a fresh
             // daemon-side id so the IPC client can correlate
             // its in-flight calls.
-            let request_id = format!("ipc-stream-{}", state.clients.next_call_stream_id());
+            let request_id = match state.clients.next_call_stream_id() {
+                Ok(id) => format!("ipc-stream-{id}"),
+                Err(refusal) => {
+                    return Response::err(format!("rpc call stream refused: {refusal}"))
+                }
+            };
             // Funded before the call is placed, not after. The forwarding task
             // is the only thing that will ever drain the receiver this call
             // returns, so a refusal discovered afterwards would leave a stream
@@ -787,7 +586,13 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
                     return Response::err(format!("rpc call stream refused: {refusal}"))
                 }
             };
-            let rx = match net.rpc().call_stream(&peer, &method, payload).await {
+            let rpc = net.rpc();
+            let call = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Response::err("control connection closing"),
+                result = rpc.call_stream(&peer, &method, payload) => result,
+            };
+            let rx = match call {
                 Ok(rx) => rx,
                 Err(e) => return Response::err(e.to_string()),
             };
@@ -851,188 +656,34 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
         }
 
         // ---- typed channels ------------------------------------------
-        Request::ChannelSubscribe {
-            client_id,
-            client_capability,
-            network,
-            channel,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let key = (network.clone(), channel.clone());
-            // Recording the subscription is itself an admission now: it funds
-            // the channel's subscriber set, this client's place in it, and this
-            // client's own record of holding it. A refusal is answered here
-            // rather than absorbed, because a client told it is subscribed when
-            // nothing was recorded waits for frames that will never come.
-            // Membership is recorded first and the role comes back with it, so
-            // this client is a member of the route whatever happens next. What
-            // it must not do is *tell its client* it is subscribed before the
-            // route can deliver.
-            let join = match state.clients.subscribe_channel(key.clone(), client_id) {
-                Ok(join) => join,
-                Err(refusal) => {
-                    return Response::err(format!("channel subscribe refused: {refusal}"))
-                }
-            };
-            match join {
-                crate::ipc::ChannelJoin::Install(ready) => {
-                    // The gateway subscription behind this pump is a resource
-                    // admission and may be refused, or the network may already
-                    // be closed. Either way there is no pump, and the route --
-                    // including every follower that joined while this ran -- is
-                    // torn down by `finish_channel_install` rather than only
-                    // this client's own membership. Answering the refusal to
-                    // the followers is `finish_channel_install`'s job; this
-                    // caller answers its own.
-                    let pump = crate::ipc::bridge::spawn_channel_pump(
-                        &net,
-                        network,
-                        channel,
-                        state.clients.clone(),
-                    );
-                    // `ready` and not just `key`: the route this installer was
-                    // handed can be removed and recreated under the same name
-                    // while the spawn above runs, and only the readiness
-                    // identifies which generation this result belongs to. A
-                    // finish that lands on a successor hands back whatever it
-                    // built, and that has to be retired here rather than
-                    // dropped -- dropping a `JoinHandle` detaches the task.
-                    let orphan = match pump {
-                        Ok(pump) => state
-                            .clients
-                            .finish_channel_install(&key, &ready, Some(pump)),
-                        Err(error) => {
-                            if let Some(orphan) =
-                                state.clients.finish_channel_install(&key, &ready, None)
-                            {
-                                orphan.retire().await;
-                            }
-                            return Response::err(format!("channel subscribe refused: {error}"));
-                        }
-                    };
-                    if let Some(orphan) = orphan {
-                        orphan.retire().await;
-                    }
-                }
-                crate::ipc::ChannelJoin::Pending(ready) => {
-                    // Someone else is installing. Waiting here is the point:
-                    // reporting success now is what left a follower subscribed
-                    // to a route that never became deliverable.
-                    if !ready.wait().await {
-                        return Response::err(
-                            "channel subscribe refused: the route this subscription joined could not be installed",
-                        );
-                    }
-                }
-                crate::ipc::ChannelJoin::Live => {}
-            }
-            Response::ok(serde_json::json!({ "subscribed": true }))
+        Request::ChannelSubscribe { .. } => {
+            unreachable!("ChannelSubscribe commits and encodes at the prepared reply boundary")
         }
 
-        Request::ChannelUnsubscribe {
-            client_id,
-            client_capability,
-            network,
-            channel,
-        } => {
-            if state
-                .clients
-                .authenticate(client_id, &client_capability)
-                .is_none()
-            {
-                return Response::err("invalid local client authority");
-            }
-            let key = (network, channel);
-            // The last unsubscribe removes the route and hands back what it
-            // still owes. Retired here, so this response means the pump has
-            // actually stopped rather than that it will notice eventually --
-            // which on a quiet channel it never would, because its only other
-            // wake is a frame nobody is sending.
-            if let Some(route) = state.clients.unsubscribe_channel(&key, client_id) {
-                route.retire().await;
-            }
-            Response::ok(serde_json::json!({ "unsubscribed": true }))
+        Request::ChannelUnsubscribe { .. } => {
+            unreachable!("ChannelUnsubscribe commits and encodes at the prepared reply boundary")
         }
 
-        Request::ChannelSendTo {
-            network,
-            channel,
-            peer,
-            payload,
-        } => {
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let chan = net.channel::<serde_json::Value>(&channel);
-            match chan.send_to(&peer, &payload).await {
-                Ok(()) => Response::ok(serde_json::json!({ "sent": true })),
-                Err(e) => Response::err(e.to_string()),
-            }
+        Request::ChannelSendTo { .. } => {
+            unreachable!("ChannelSendTo sends and encodes at the prepared reply boundary")
         }
 
-        Request::ChannelSendReliable {
-            network,
-            channel,
-            peer,
-            payload,
-        } => {
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            match net.send_reliable(&peer, &channel, payload).await {
-                Ok(()) => Response::ok(serde_json::json!({ "delivered": true })),
-                Err(e) => Response::err(e.to_string()),
-            }
+        Request::ChannelSendReliable { .. } => {
+            unreachable!("ChannelSendReliable waits and encodes at the prepared reply boundary")
         }
 
-        Request::ChannelSendAll {
-            network,
-            channel,
-            payload,
-        } => {
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            let chan = net.channel::<serde_json::Value>(&channel);
-            match chan.broadcast(&payload).await {
-                Ok(count) => Response::ok(serde_json::json!({ "dispatched_to": count })),
-                Err(e) => Response::err(e.to_string()),
-            }
+        Request::ChannelSendAll { .. } => {
+            unreachable!("ChannelSendAll sends and encodes at the prepared reply boundary")
         }
 
-        Request::CapabilitiesSet {
-            network,
-            capabilities,
-        } => {
-            let Some(net) = state.registry.get(&network) else {
-                return Response::err(format!("unknown network: {network}"));
-            };
-            // `advertise` answers whether the value was committed, and the
-            // answer is the whole point of this request. Reporting
-            // `advertised: true` over a refusal would tell the client its new
-            // capabilities are live while the node keeps publishing the
-            // previous ones — the one outcome a caller of this op cannot
-            // afford to be wrong about.
-            match net.advertise(capabilities) {
-                Ok(()) => Response::ok(serde_json::json!({ "advertised": true })),
-                Err(error) => Response::err(format!(
-                    "capabilities were not advertised; the node is still \
-                     publishing its previous ones: {error}"
-                )),
-            }
+        Request::CapabilitiesSet { .. } => {
+            unreachable!("CapabilitiesSet commits and encodes at the prepared reply boundary")
         }
 
         // Handled in `handle_client` (it converts the whole connection); never
         // reaches the per-request dispatcher.
-        Request::RealtimePipe { .. } => Response::err("realtime_pipe must open its own connection"),
+        Request::RealtimePipe { .. } => {
+            unreachable!("RealtimePipe switches framing modes before dispatch")
+        }
     }
 }

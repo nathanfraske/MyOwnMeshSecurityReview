@@ -154,6 +154,27 @@ pub struct PeerStateData {
     pub diag: PeerDiag,
 }
 
+/// One peer's session record and state data, borrowed together.
+///
+/// The whole value of this type is that its three fields were read under **one**
+/// observation — see [`PeerConnection::with_peer_view`], which is the only way
+/// to obtain it. Nothing here is owned, so a caller can measure it without
+/// allocating, and nothing can outlive the guards it was read from.
+///
+/// `session` is `None` for a peer with no current promoted session. That is a
+/// fact about the peer, not a failure to read it: its state is still present and
+/// still borrowed from the same instant.
+///
+/// `Copy`, because it is three shared references: a caller that measures the
+/// view and then builds from it is reading the same borrows twice, not
+/// observing the peer twice.
+#[derive(Clone, Copy)]
+pub(super) struct PeerView<'a> {
+    pub(super) device_id: &'a str,
+    pub(super) data: &'a PeerStateData,
+    pub(super) session: Option<&'a crate::runtime::peer_session::PeerSessionState>,
+}
+
 /// Clonable point-in-time view for diagnostics and compatibility callers.
 ///
 /// This deliberately omits mutable ownership such as the pending candidate
@@ -384,10 +405,62 @@ impl PeerConnection {
     /// which is the truthful answer — nothing has been advertised over a session
     /// that does not exist.
     pub fn snapshot(&self) -> PeerStateSnapshot {
-        let capabilities = self
-            .with_live_session_state(|_session, app| app.capabilities())
-            .flatten();
-        self.state.read().snapshot(capabilities)
+        self.with_peer_view(|view| {
+            let capabilities = view.session.and_then(|app| app.capabilities());
+            view.data.snapshot(capabilities)
+        })
+    }
+
+    /// Lend this peer's session record and state data as **one** observation.
+    ///
+    /// This is the fence the snapshot paths were missing. The shape it replaces
+    /// read the advertisement through the session lender, released that guard,
+    /// and *then* took `state` — two observations stitched together, so a
+    /// snapshot could pair one session's advert with state written after that
+    /// session had already been replaced.
+    ///
+    /// Here the state guard is taken **inside** the session lender, so both are
+    /// held together for the closure's whole life. That is the documented order
+    /// and not a new one: the lender's own liveness predicate already takes
+    /// `state.read()` while holding `promoted_session` (see
+    /// [`Self::session_is_current`]), and no writer in this crate takes
+    /// `state.write()` while holding the slot. Reversing it — state first, then
+    /// the session — is the direction that closes a cycle, and it is what
+    /// [`Self::with_live_session`]'s warning forbids.
+    ///
+    /// A peer with no current session yields `None` for the session half rather
+    /// than being skipped. That is the truthful answer and it is why this cannot
+    /// be written as a plain `Option` chain: an unpromoted peer still has state
+    /// worth reporting, and it must be reported from the same read.
+    ///
+    /// **The closure must not re-enter the registry, the session lender, or the
+    /// provider.** Two locks are held for its duration, and provider
+    /// acquisition under them is exactly the reentrancy the resource discipline
+    /// forbids. Callers measure and copy here; they acquire elsewhere.
+    pub(super) fn with_peer_view<R>(&self, view: impl FnOnce(PeerView<'_>) -> R) -> R {
+        // Moved through an `Option` because it is `FnOnce` and there are two
+        // exits — a live session and none — and a closure cannot be called on
+        // both paths.
+        let mut view = Some(view);
+        let seen = self.with_live_session_state(|_session, app| {
+            let data = self.state.read();
+            (view.take().expect("the peer view runs exactly once"))(PeerView {
+                device_id: &self.device_id,
+                data: &data,
+                session: Some(app),
+            })
+        });
+        match seen {
+            Some(result) => result,
+            None => {
+                let data = self.state.read();
+                (view.take().expect("the peer view runs exactly once"))(PeerView {
+                    device_id: &self.device_id,
+                    data: &data,
+                    session: None,
+                })
+            }
+        }
     }
 
     /// Retire the exact connector worker owned by this registry entry.
@@ -583,7 +656,7 @@ impl PeerConnection {
     /// obligation, so a capability built from it and then dropped returns that
     /// claim through the connector's own close owner rather than releasing it
     /// early.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn install_authenticated_channel_over_for_test(
         &self,
         handoff: crate::connector::ConnectedChannelHandoff,

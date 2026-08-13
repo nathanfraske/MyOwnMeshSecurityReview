@@ -36,10 +36,15 @@ impl LocalCapabilityState {
         if closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(CapabilityReplaceRefusal::Revoked);
         }
-        let encoded = serde_json::to_vec(advert)
-            .expect("CapabilityAdvert serialization is infallible")
-            .into_boxed_slice();
-        let bytes = u64::try_from(encoded.len()).map_err(|_| {
+        // Counted before anything is built, so a refusal below costs no buffer.
+        // Under pressure, or against a gateway that closed, this path allocates
+        // nothing at all.
+        let encoded_len = advert.encoded_len().ok_or_else(|| {
+            CapabilityReplaceRefusal::Unavailable(
+                "local capability advertisement is too large to account".to_string(),
+            )
+        })?;
+        let bytes = u64::try_from(encoded_len).map_err(|_| {
             CapabilityReplaceRefusal::Unavailable(
                 "local capability advertisement is too large to account".to_string(),
             )
@@ -69,6 +74,14 @@ impl LocalCapabilityState {
         if closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(CapabilityReplaceRefusal::Revoked);
         }
+        // The only encode, after the only acquisition, and inside the fence that
+        // decides whether it will be installed. A closed gateway refuses above
+        // with nothing built and the lease released on the way out.
+        let encoded = advert.encode_exact(encoded_len).ok_or_else(|| {
+            CapabilityReplaceRefusal::Unavailable(
+                "local capability advertisement did not encode to its counted size".to_string(),
+            )
+        })?;
         *held = Some(LeasedLocalCapabilityAdvert {
             encoded,
             _lease: lease,

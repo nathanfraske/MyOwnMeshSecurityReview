@@ -147,8 +147,18 @@ pub use config::{
 };
 pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;
+/// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
+/// it answers the same question under a different contract: measured before it
+/// is built, and refusable at four separate points.
+pub use engine::peer_snapshot::{
+    FundedPeerSnapshot, PeerSnapshotRefusal, PeerSnapshotStaging, PreparedPeerSnapshot,
+};
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
+/// The real-link fixture owner, exported at the root for the same reason the
+/// fixture exists: the controls that need it live in another crate.
+#[cfg(feature = "transport-lab")]
+pub use handle::TransportLabPromotedPeer;
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
 pub use network_state::{
@@ -157,9 +167,10 @@ pub use network_state::{
 };
 pub use protocol::CapabilityAdvert;
 pub use resource::{
+    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim,
     prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
-    serialized_mailbox_item_claim_as, FiniteResourceProvider, LeasedMap, LeasedMapInsertRefusal,
-    LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
+    serialized_mailbox_item_claim_as, FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap,
+    LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
     PreparedResourceMailbox, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
     ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease,
     ResourceMailboxAdmissionError, ResourceMailboxCreateError, ResourceMailboxDelivery,

@@ -68,6 +68,7 @@ use std::time::Duration;
 use myownmesh_core::engine::SignalingDrivers;
 use myownmesh_core::JoinedNetwork;
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 
 /// How long [`NetworkRegistry::announce_all_departures`] waits after queuing
 /// the per-network `leave` broadcasts before returning, so they reach the
@@ -223,6 +224,794 @@ pub struct NetworkRegistry {
     state: Mutex<RegistryState>,
     #[cfg(test)]
     claim_pause: Mutex<Option<Arc<ClaimPause>>>,
+    #[cfg(test)]
+    networks_line_measurements: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    networks_commits: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    networks_rows_built: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) struct StatusSource<'a> {
+    state: MutexGuard<'a, RegistryState>,
+    identity: &'a myownmesh_core::Identity,
+    realtime: &'a crate::control::RealtimeAdvert,
+}
+
+/// A capacity-only description of the next NetworksList snapshot.
+///
+/// No entry, id, state value, or authority crosses the provider acquisition:
+/// pass zero contributes numbers only. [`Self::measure_line_ceiling`] measures
+/// after work admission, and the resulting [`MeasuredNetworksList`] reacquires
+/// the daemon registry for its authoritative snapshot.
+#[must_use = "a NetworksList plan has not yet funded or built its snapshot"]
+pub(crate) struct PreparedNetworksList<'a> {
+    registry: &'a NetworkRegistry,
+    typed_claim: myownmesh_core::ResourceClaim,
+    work_claim: myownmesh_core::ResourceClaim,
+}
+
+/// A NetworksList plan whose exact current line length was measured while its
+/// transient traversal work was already funded.
+#[must_use = "a measured NetworksList plan has not yet committed its funded rows"]
+pub(crate) struct MeasuredNetworksList<'a> {
+    registry: &'a NetworkRegistry,
+    typed_claim: myownmesh_core::ResourceClaim,
+    work_claim: myownmesh_core::ResourceClaim,
+    line_ceiling: usize,
+}
+
+/// One prepared NetworksList value and the retention that outlives its rows.
+#[must_use = "dropping a funded NetworksList releases the snapshot it owns"]
+pub(crate) struct FundedNetworksList {
+    rows: Box<[PreparedSlot<PreparedNetworkSummary>]>,
+    _retention: myownmesh_core::ResourceLease,
+    _work: myownmesh_core::ResourceLease,
+}
+
+impl serde::Serialize for FundedNetworksList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(
+            &PreparedNetworksData {
+                networks: &self.rows,
+            },
+            serializer,
+        )
+    }
+}
+
+/// The exact internal wire shape of one prepared topology.
+///
+/// Dynamic hub storage uses fixed boxes so its requested bytes and allocation
+/// count are derivable from the borrowed core view before it is copied.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum PreparedTopology {
+    Ring {
+        n_preferred: Option<u32>,
+    },
+    Star {
+        hub: Box<str>,
+    },
+    Hubs {
+        hubs: Box<[PreparedSlot<Box<str>>]>,
+        spoke_redundancy: Option<u32>,
+    },
+    FullMesh,
+}
+
+/// The exact owned row serialized by [`FundedNetworksList`].
+#[derive(serde::Serialize)]
+struct PreparedNetworkSummary {
+    config_id: Box<str>,
+    network_id: Box<str>,
+    label: Box<str>,
+    phase: myownmesh_core::MeshPhase,
+    topology: PreparedTopology,
+    traffic: myownmesh_core::engine::traffic::TrafficSnapshot,
+}
+
+/// One exact slot in the final fixed row box.
+///
+/// Slots start empty and are filled in canonical order. A funded owner is
+/// published only after every slot is present, so serialization never emits an
+/// option wrapper or a `null` in place of a row.
+struct PreparedSlot<T>(Option<T>);
+
+impl<T: serde::Serialize> serde::Serialize for PreparedSlot<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        serde::Serialize::serialize(
+            self.0
+                .as_ref()
+                .ok_or_else(|| S::Error::custom("an admitted NetworksList row was not built"))?,
+            serializer,
+        )
+    }
+}
+
+/// Allocate one exact fixed slot box and initialize every slot to empty.
+///
+/// `Vec` is deliberately absent: its spare-capacity policy is not a stable
+/// resource shape. The only unsafe step changes initialized
+/// `MaybeUninit<PreparedSlot<T>>` elements into their ordinary representation
+/// after this function has written every one of them.
+fn empty_prepared_slots<T>(count: usize) -> Box<[PreparedSlot<T>]> {
+    let mut slots = Box::<[PreparedSlot<T>]>::new_uninit_slice(count);
+    for slot in &mut slots {
+        slot.write(PreparedSlot(None));
+    }
+    // SAFETY: every slot in the allocated slice was initialized by the loop;
+    // the zero-length case is initialized vacuously.
+    unsafe { slots.assume_init() }
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedNetworkSummary<'a> {
+    config_id: &'a str,
+    network_id: &'a str,
+    label: &'a str,
+    phase: myownmesh_core::MeshPhase,
+    topology: &'a myownmesh_core::TopologyMode,
+    traffic: myownmesh_core::engine::traffic::TrafficSnapshot,
+}
+
+struct NetworksView<'a>(&'a RegistryState);
+
+impl serde::Serialize for NetworksView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let count = self
+            .0
+            .aliases
+            .iter()
+            .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
+            .count();
+        let mut sequence = serializer.serialize_seq(Some(count))?;
+        let mut error = None;
+        self.0.for_each_canonical_in_config_order(|entry| {
+            if error.is_some() {
+                return;
+            }
+            entry.joined.with_network_summary_view(
+                |config_id, network_id, label, phase, topology, traffic| {
+                    error = sequence
+                        .serialize_element(&BorrowedNetworkSummary {
+                            config_id,
+                            network_id,
+                            label,
+                            phase,
+                            topology,
+                            traffic,
+                        })
+                        .err();
+                },
+            );
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        sequence.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedNetworksData<'a> {
+    networks: NetworksView<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct PreparedNetworksData<'a> {
+    networks: &'a [PreparedSlot<PreparedNetworkSummary>],
+}
+
+/// The exact owned projection serialized by the prepared Status reply.
+///
+/// Kept separate from [`FundedStatus`] so
+/// `serialized_mailbox_item_claim_as` receives the value whose inline shape
+/// and wire shape it actually prices. The lease is the funding for this value;
+/// including that handle in the priced type would make its own claim circular.
+#[derive(serde::Serialize)]
+struct OwnedStatusData {
+    version: &'static str,
+    device_id: String,
+    joined_networks: Vec<String>,
+    realtime: crate::control::RealtimeAdvert,
+}
+
+/// One Status projection and the retention that outlives every owned field.
+pub(crate) struct FundedStatus {
+    data: OwnedStatusData,
+    _retention: myownmesh_core::ResourceLease,
+}
+
+impl FundedStatus {
+    pub(crate) fn version(&self) -> &'static str {
+        self.data.version
+    }
+
+    pub(crate) fn device_id(&self) -> &str {
+        &self.data.device_id
+    }
+
+    pub(crate) fn joined_networks(&self) -> &[String] {
+        &self.data.joined_networks
+    }
+
+    pub(crate) fn realtime(&self) -> &crate::control::RealtimeAdvert {
+        &self.data.realtime
+    }
+}
+
+struct DisplayIdWidth(usize);
+
+impl std::fmt::Display for DisplayIdWidth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for _ in 0..self.0 {
+            formatter.write_str("a")?;
+        }
+        Ok(())
+    }
+}
+
+impl serde::Serialize for DisplayIdWidth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+struct VisibleNetworkIds<'a>(&'a RegistryState);
+
+impl RegistryState {
+    /// Visit canonical entries in the legacy `summaries()` order without a
+    /// staging allocation. Each step scans for the least config id greater
+    /// than the previous one, so this is O(N²) comparisons and O(1) auxiliary
+    /// space. Config ids are bounded control coordinates and the registry lock
+    /// keeps the observation coherent; the final owned output is still built
+    /// only after its retention has been admitted.
+    fn for_each_canonical_in_config_order(&self, mut visit: impl FnMut(&Arc<Entry>)) {
+        let mut after: Option<&str> = None;
+        loop {
+            let next = self
+                .aliases
+                .iter()
+                .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
+                .filter(|(key, _)| after.map_or(true, |after| key.as_str() > after))
+                .min_by(|(left, _), (right, _)| left.cmp(right));
+            let Some((key, entry)) = next else { break };
+            visit(entry);
+            after = Some(key.as_str());
+        }
+    }
+
+    fn canonical_count(&self) -> usize {
+        self.aliases
+            .iter()
+            .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
+            .count()
+    }
+}
+
+fn checked_network_bytes_add(
+    total: &mut usize,
+    more: usize,
+) -> Result<(), myownmesh_core::ResourceMailboxItemError> {
+    *total =
+        total
+            .checked_add(more)
+            .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                "NetworksList retention length overflowed",
+            ))?;
+    Ok(())
+}
+
+fn checked_network_allocations_add(
+    total: &mut usize,
+    more: usize,
+) -> Result<(), myownmesh_core::ResourceMailboxItemError> {
+    *total =
+        total
+            .checked_add(more)
+            .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                "NetworksList allocation count overflowed",
+            ))?;
+    Ok(())
+}
+
+fn measure_network_text(
+    value: &str,
+    bytes: &mut usize,
+    allocations: &mut usize,
+) -> Result<(), myownmesh_core::ResourceMailboxItemError> {
+    checked_network_bytes_add(bytes, value.len())?;
+    if !value.is_empty() {
+        checked_network_allocations_add(allocations, 1)?;
+    }
+    Ok(())
+}
+
+fn measure_network_row(
+    config_id: &str,
+    network_id: &str,
+    label: &str,
+    topology: &myownmesh_core::TopologyMode,
+) -> Result<(usize, usize), myownmesh_core::ResourceMailboxItemError> {
+    let mut bytes = 0usize;
+    let mut allocations = 0usize;
+    measure_network_text(config_id, &mut bytes, &mut allocations)?;
+    measure_network_text(network_id, &mut bytes, &mut allocations)?;
+    measure_network_text(label, &mut bytes, &mut allocations)?;
+    match topology {
+        myownmesh_core::TopologyMode::Ring { .. } | myownmesh_core::TopologyMode::FullMesh => {}
+        myownmesh_core::TopologyMode::Star { hub } => {
+            measure_network_text(hub, &mut bytes, &mut allocations)?;
+        }
+        myownmesh_core::TopologyMode::Hubs { hubs, .. } => {
+            checked_network_bytes_add(
+                &mut bytes,
+                hubs.len()
+                    .checked_mul(std::mem::size_of::<PreparedSlot<Box<str>>>())
+                    .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                        "NetworksList hubs storage overflowed",
+                    ))?,
+            )?;
+            if !hubs.is_empty() {
+                checked_network_allocations_add(&mut allocations, 1)?;
+            }
+            for hub in hubs {
+                measure_network_text(hub, &mut bytes, &mut allocations)?;
+            }
+        }
+    }
+    Ok((bytes, allocations))
+}
+
+fn add_network_dynamic_fitting(
+    actual: &mut myownmesh_core::ResourceClaim,
+    admitted: myownmesh_core::ResourceClaim,
+    bytes: usize,
+    allocations: usize,
+) -> Result<bool, myownmesh_core::ResourceMailboxItemError> {
+    let next = actual.checked_add(networks_dynamic_claim(bytes, allocations)?)?;
+    if !claim_fits(next, admitted) {
+        return Ok(false);
+    }
+    *actual = next;
+    Ok(true)
+}
+
+/// Add one current row's dynamic retention, stopping before the first term
+/// whose traversal or construction would exceed the admitted typed capacity.
+///
+/// In particular the fixed hub-slot box is checked from `hubs.len()` before any
+/// hub string is visited. A topology that grew far beyond pass zero therefore
+/// refuses in O(1), rather than spending unadmitted work walking the new list.
+fn add_network_row_fitting(
+    actual: &mut myownmesh_core::ResourceClaim,
+    admitted: myownmesh_core::ResourceClaim,
+    config_id: &str,
+    network_id: &str,
+    label: &str,
+    topology: &myownmesh_core::TopologyMode,
+) -> Result<bool, myownmesh_core::ResourceMailboxItemError> {
+    for value in [config_id, network_id, label] {
+        if !add_network_dynamic_fitting(
+            actual,
+            admitted,
+            value.len(),
+            usize::from(!value.is_empty()),
+        )? {
+            return Ok(false);
+        }
+    }
+    match topology {
+        myownmesh_core::TopologyMode::Ring { .. } | myownmesh_core::TopologyMode::FullMesh => {}
+        myownmesh_core::TopologyMode::Star { hub } => {
+            if !add_network_dynamic_fitting(
+                actual,
+                admitted,
+                hub.len(),
+                usize::from(!hub.is_empty()),
+            )? {
+                return Ok(false);
+            }
+        }
+        myownmesh_core::TopologyMode::Hubs { hubs, .. } => {
+            let slots = hubs
+                .len()
+                .checked_mul(std::mem::size_of::<PreparedSlot<Box<str>>>())
+                .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                    "NetworksList hubs storage overflowed",
+                ))?;
+            if !add_network_dynamic_fitting(actual, admitted, slots, usize::from(!hubs.is_empty()))?
+            {
+                return Ok(false);
+            }
+            for hub in hubs {
+                if !add_network_dynamic_fitting(
+                    actual,
+                    admitted,
+                    hub.len(),
+                    usize::from(!hub.is_empty()),
+                )? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Re-measure the current authoritative registry without allocating. Returns
+/// `None` on any drift that does not fit the pass-zero typed lease.
+fn current_networks_claim_fitting(
+    state: &RegistryState,
+    admitted: myownmesh_core::ResourceClaim,
+) -> Result<Option<myownmesh_core::ResourceClaim>, myownmesh_core::ResourceMailboxItemError> {
+    let typed_bytes = admitted.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes);
+    let aliases = u64::try_from(state.aliases.len()).map_err(|_| {
+        myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList alias count does not fit the resource model",
+        )
+    })?;
+    // Bound even the first canonical-count traversal. Every admitted row owns a
+    // nonzero fixed slot, so an alias table larger than the admitted byte count
+    // cannot possibly fit and is refused without scanning it.
+    if aliases > typed_bytes {
+        return Ok(None);
+    }
+    let count = state.canonical_count();
+    let mut actual = match networks_claim(count, 0, 0) {
+        Ok(claim) if claim_fits(claim, admitted) => claim,
+        _ => return Ok(None),
+    };
+    let mut fits = true;
+    let mut measurement_error = None;
+    state.for_each_canonical_in_config_order(|entry| {
+        if !fits || measurement_error.is_some() {
+            return;
+        }
+        entry.joined.with_network_summary_view(
+            |config_id, network_id, label, _phase, topology, _traffic| {
+                match add_network_row_fitting(
+                    &mut actual,
+                    admitted,
+                    config_id,
+                    network_id,
+                    label,
+                    topology,
+                ) {
+                    Ok(current_fits) => fits = current_fits,
+                    Err(error) => measurement_error = Some(error),
+                }
+            },
+        );
+    });
+    if let Some(error) = measurement_error {
+        return Err(error);
+    }
+    Ok(fits.then_some(actual))
+}
+
+fn networks_claim(
+    count: usize,
+    row_bytes: usize,
+    row_allocations: usize,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    let rows = count
+        .checked_mul(std::mem::size_of::<PreparedSlot<PreparedNetworkSummary>>())
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList row storage overflowed",
+        ))?;
+    let bytes = std::mem::size_of::<Box<[PreparedSlot<PreparedNetworkSummary>]>>()
+        .checked_add(rows)
+        .and_then(|bytes| bytes.checked_add(row_bytes))
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList typed retention overflowed",
+        ))?;
+    let allocations = row_allocations.checked_add(usize::from(count != 0)).ok_or(
+        myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList typed allocation count overflowed",
+        ),
+    )?;
+    Ok(myownmesh_core::ResourceClaim::try_from_entries([
+        (
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(bytes).map_err(|_| {
+                myownmesh_core::ResourceMailboxItemError::Measurement(
+                    "NetworksList typed bytes do not fit the resource model",
+                )
+            })?,
+        ),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            u64::try_from(allocations).map_err(|_| {
+                myownmesh_core::ResourceMailboxItemError::Measurement(
+                    "NetworksList allocation count does not fit the resource model",
+                )
+            })?,
+        ),
+    ])?)
+}
+
+fn networks_dynamic_claim(
+    bytes: usize,
+    allocations: usize,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    Ok(myownmesh_core::ResourceClaim::try_from_entries([
+        (
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(bytes).map_err(|_| {
+                myownmesh_core::ResourceMailboxItemError::Measurement(
+                    "NetworksList dynamic bytes do not fit the resource model",
+                )
+            })?,
+        ),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            u64::try_from(allocations).map_err(|_| {
+                myownmesh_core::ResourceMailboxItemError::Measurement(
+                    "NetworksList dynamic allocation count does not fit the resource model",
+                )
+            })?,
+        ),
+    ])?)
+}
+
+/// Maximum decimal widths of the integer fields in a network row.
+const U32_DECIMAL_DIGITS: u64 = 10;
+const U64_DECIMAL_DIGITS: u64 = 20;
+
+/// One JSON source byte can become at most `\u00XX`.
+const JSON_STRING_ESCAPE_BYTES_PER_SOURCE_BYTE: u64 = 6;
+
+/// Post-admission serialization walks: borrowed line measurement, built-row
+/// equality measurement, and the final output encoding.
+const NETWORKS_SERIALIZATION_PASSES: u64 = 3;
+
+/// Typed-source walks after admission: the fit check before line measurement,
+/// the authoritative fit check during commit, and construction's exact copy.
+const NETWORKS_TYPED_SOURCE_PASSES: u64 = 3;
+
+/// Canonical-order scans after admission: the fit check before line
+/// measurement, borrowed line measurement itself, and the authoritative
+/// build. `for_each_canonical_in_config_order` is deliberately allocation-free
+/// and therefore quadratic; the work ceiling prices that choice instead of
+/// pretending it is a linear traversal.
+const NETWORKS_ORDERING_PASSES: u64 = 3;
+
+const NETWORK_LANE_NAMES: [&str; 10] = [
+    "keepalive_tx",
+    "keepalive_rx",
+    "control_tx",
+    "control_rx",
+    "gossip_tx",
+    "gossip_rx",
+    "app_tx",
+    "app_rx",
+    "other_tx",
+    "other_rx",
+];
+
+const NETWORK_TRAFFIC_SCALAR_NAMES: [&str; 5] = [
+    "announces_rx",
+    "announces_tx",
+    "negotiation_rx",
+    "negotiation_tx",
+    "reliable_pending",
+];
+
+const fn json_key_prefix_len(key: &str) -> u64 {
+    // Opening quote, key bytes, closing quote, colon.
+    key.len() as u64 + 3
+}
+
+/// Exact encoded width of the widest fixed-value `TrafficSnapshot`.
+const fn widest_traffic_json_len() -> u64 {
+    let mut bytes = 2; // braces
+    let mut fields = 0usize;
+    let mut lane = 0usize;
+    while lane < NETWORK_LANE_NAMES.len() {
+        if fields != 0 {
+            bytes += 1; // comma
+        }
+        bytes += json_key_prefix_len(NETWORK_LANE_NAMES[lane]);
+        bytes += 2; // lane braces
+        bytes += json_key_prefix_len("frames") + U64_DECIMAL_DIGITS;
+        bytes += 1; // comma
+        bytes += json_key_prefix_len("bytes") + U64_DECIMAL_DIGITS;
+        fields += 1;
+        lane += 1;
+    }
+    let mut scalar = 0usize;
+    while scalar < NETWORK_TRAFFIC_SCALAR_NAMES.len() {
+        bytes += 1; // comma; every scalar follows the lanes
+        bytes += json_key_prefix_len(NETWORK_TRAFFIC_SCALAR_NAMES[scalar]);
+        bytes += U64_DECIMAL_DIGITS;
+        scalar += 1;
+    }
+    bytes
+}
+
+/// Fixed JSON bytes in the widest row after every variable string is replaced
+/// by its empty form. `Hubs` is the widest topology tag once the hub elements
+/// themselves are excluded; each actual element is added separately below.
+const WIDEST_FIXED_TOPOLOGY_JSON_BYTES: u64 =
+    "{\"kind\":\"hubs\",\"hubs\":[],\"spoke_redundancy\":".len() as u64 + U32_DECIMAL_DIGITS + 1; // closing brace
+const WIDEST_FIXED_NETWORK_ROW_JSON_BYTES: u64 =
+    "{\"config_id\":\"\",\"network_id\":\"\",\"label\":\"\",\"phase\":\"discovering\",\"topology\":"
+        .len() as u64
+        + WIDEST_FIXED_TOPOLOGY_JSON_BYTES
+        + ",\"traffic\":".len() as u64
+        + widest_traffic_json_len()
+        + 1; // closing row brace
+
+const NETWORKS_LINE_WRAPPER_BYTES: u64 =
+    "{\"ok\":true,\"data\":{\"networks\":[".len() as u64 + "]}}\n".len() as u64;
+
+/// Derive a mechanical ceiling for every post-admission traversal from the
+/// exact typed capacity already quoted by pass zero.
+///
+/// Variable string bytes get their six-byte JSON escape maximum. Row and hub
+/// counts are bounded by the fixed slots that the same typed claim must fund,
+/// so all field names, punctuation and maximum-width integers are added from
+/// constants tied to the actual serialized shape. Three full JSON walks and
+/// the two fit scans plus retained-byte copy are then charged explicitly; no
+/// unexplained multiplier remains.
+fn networks_work_claim(
+    typed: myownmesh_core::ResourceClaim,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    let typed_bytes = typed.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes);
+    let row_slot = u64::try_from(std::mem::size_of::<PreparedSlot<PreparedNetworkSummary>>())
+        .map_err(|_| {
+            myownmesh_core::ResourceMailboxItemError::Measurement(
+                "NetworksList row slot does not fit the work model",
+            )
+        })?;
+    let hub_slot = u64::try_from(std::mem::size_of::<PreparedSlot<Box<str>>>()).map_err(|_| {
+        myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList hub slot does not fit the work model",
+        )
+    })?;
+    let max_rows = typed_bytes / row_slot.max(1);
+    let max_hubs = typed_bytes / hub_slot.max(1);
+    let dynamic_json = typed_bytes
+        .checked_mul(JSON_STRING_ESCAPE_BYTES_PER_SOURCE_BYTE)
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList escaped work ceiling overflowed",
+        ))?;
+    let fixed_rows = max_rows
+        .checked_mul(WIDEST_FIXED_NETWORK_ROW_JSON_BYTES + 1) // one separator per row
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList fixed-row work ceiling overflowed",
+        ))?;
+    let hub_elements = max_hubs
+        .checked_mul(3) // quotes plus a conservative comma for every element
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList hub work ceiling overflowed",
+        ))?;
+    let encoded_ceiling = NETWORKS_LINE_WRAPPER_BYTES
+        .checked_add(dynamic_json)
+        .and_then(|bytes| bytes.checked_add(fixed_rows))
+        .and_then(|bytes| bytes.checked_add(hub_elements))
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList encoded work ceiling overflowed",
+        ))?;
+    let work = encoded_ceiling
+        .checked_mul(NETWORKS_SERIALIZATION_PASSES)
+        .and_then(|work| {
+            typed_bytes
+                .checked_mul(NETWORKS_TYPED_SOURCE_PASSES)
+                .and_then(|source| work.checked_add(source))
+        })
+        .and_then(|work| {
+            max_rows
+                .checked_mul(max_rows)
+                // Each comparison may inspect a retained coordinate all the
+                // way to its end; `typed_bytes` is a ceiling for those bytes.
+                .and_then(|comparisons| comparisons.checked_mul(typed_bytes))
+                .and_then(|comparisons| comparisons.checked_mul(NETWORKS_ORDERING_PASSES))
+                .and_then(|ordering| work.checked_add(ordering))
+        })
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList snapshot work overflowed",
+        ))?;
+    Ok(myownmesh_core::ResourceClaim::single(
+        myownmesh_core::ResourceClass::ParsingOrCpuWork,
+        work,
+    ))
+}
+
+fn claim_fits(
+    actual: myownmesh_core::ResourceClaim,
+    admitted: myownmesh_core::ResourceClaim,
+) -> bool {
+    admitted.checked_sub(actual).is_ok()
+}
+
+fn networks_line_ceiling(
+    data: &impl serde::Serialize,
+) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
+    let (_, encoded, _) = myownmesh_core::mailbox_measure_serialized(data)?;
+    encoded
+        .checked_add("{\"ok\":true,\"data\":".len())
+        .and_then(|bytes| bytes.checked_add("}\n".len()))
+        .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+            "NetworksList line length overflowed",
+        ))
+}
+
+impl PreparedNetworkSummary {
+    fn from_view(
+        config_id: &str,
+        network_id: &str,
+        label: &str,
+        phase: myownmesh_core::MeshPhase,
+        topology: &myownmesh_core::TopologyMode,
+        traffic: myownmesh_core::engine::traffic::TrafficSnapshot,
+    ) -> Self {
+        let topology = match topology {
+            myownmesh_core::TopologyMode::Ring { n_preferred } => PreparedTopology::Ring {
+                n_preferred: *n_preferred,
+            },
+            myownmesh_core::TopologyMode::Star { hub } => PreparedTopology::Star {
+                hub: hub.as_str().into(),
+            },
+            myownmesh_core::TopologyMode::Hubs {
+                hubs,
+                spoke_redundancy,
+            } => {
+                let mut prepared = empty_prepared_slots(hubs.len());
+                for (slot, hub) in prepared.iter_mut().zip(hubs) {
+                    slot.0 = Some(Box::<str>::from(hub.as_str()));
+                }
+                PreparedTopology::Hubs {
+                    hubs: prepared,
+                    spoke_redundancy: *spoke_redundancy,
+                }
+            }
+            myownmesh_core::TopologyMode::FullMesh => PreparedTopology::FullMesh,
+        };
+        Self {
+            config_id: config_id.into(),
+            network_id: network_id.into(),
+            label: label.into(),
+            phase,
+            topology,
+            traffic,
+        }
+    }
+}
+
+impl serde::Serialize for VisibleNetworkIds<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let count = self
+            .0
+            .aliases
+            .iter()
+            .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
+            .count();
+        let mut sequence = serializer.serialize_seq(Some(count))?;
+        let mut error = None;
+        self.0.for_each_canonical_in_config_order(|entry| {
+            if error.is_none() {
+                error = sequence.serialize_element(entry.joined.network_id()).err();
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        sequence.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StatusView<'a> {
+    version: &'static str,
+    device_id: DisplayIdWidth,
+    joined_networks: VisibleNetworkIds<'a>,
+    realtime: &'a crate::control::RealtimeAdvert,
 }
 
 #[cfg(test)]
@@ -323,6 +1112,81 @@ impl RegistryState {
 }
 
 impl NetworkRegistry {
+    pub(crate) fn status_source<'a>(
+        &'a self,
+        identity: &'a myownmesh_core::Identity,
+        realtime: &'a crate::control::RealtimeAdvert,
+    ) -> StatusSource<'a> {
+        StatusSource {
+            state: self.state.lock(),
+            identity,
+            realtime,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn networks_line_measurements_for_test(&self) -> usize {
+        self.networks_line_measurements
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn networks_commits_for_test(&self) -> usize {
+        self.networks_commits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn networks_rows_built_for_test(&self) -> usize {
+        self.networks_rows_built
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn prepare_networks_list(
+        &self,
+    ) -> Result<PreparedNetworksList<'_>, myownmesh_core::ResourceMailboxItemError> {
+        let state = self.state.lock();
+        let count = state.canonical_count();
+        let mut row_bytes = 0usize;
+        let mut row_allocations = 0usize;
+        let mut measurement_error = None;
+        state.for_each_canonical_in_config_order(|entry| {
+            if measurement_error.is_some() {
+                return;
+            }
+            entry.joined.with_network_summary_view(
+                |config_id, network_id, label, _phase, topology, _traffic| {
+                    match measure_network_row(config_id, network_id, label, topology) {
+                        Ok((bytes, allocations)) => {
+                            if let Err(error) = checked_network_bytes_add(&mut row_bytes, bytes)
+                                .and_then(|()| {
+                                    checked_network_allocations_add(
+                                        &mut row_allocations,
+                                        allocations,
+                                    )
+                                })
+                            {
+                                measurement_error = Some(error);
+                            }
+                        }
+                        Err(error) => measurement_error = Some(error),
+                    }
+                },
+            );
+        });
+        if let Some(error) = measurement_error {
+            return Err(error);
+        }
+        let typed_claim = networks_claim(count, row_bytes, row_allocations)?;
+        let work_claim = networks_work_claim(typed_claim)?;
+        drop(state);
+        Ok(PreparedNetworksList {
+            registry: self,
+            typed_claim,
+            work_claim,
+        })
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -441,6 +1305,22 @@ impl NetworkRegistry {
         // Stable order across calls: alphabetical by config id.
         out.sort_by(|a, b| a.config_id.cmp(&b.config_id));
         out
+    }
+
+    /// Number of visible joined runtimes, without constructing summaries.
+    ///
+    /// Every entry is stored under its config id and may also be stored under a
+    /// distinct wire id. Counting only the canonical config-id alias therefore
+    /// visits each entry exactly once without a deduplication buffer or cloned
+    /// coordinate. Closing runtimes have already lost every alias and are not
+    /// visible joined networks.
+    pub fn joined_count(&self) -> usize {
+        self.state
+            .lock()
+            .aliases
+            .iter()
+            .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
+            .count()
     }
 
     /// Tear one network down: mark it `Closing`, unlink every alias, drop the
@@ -621,6 +1501,201 @@ impl NetworkRegistry {
     }
 }
 
+impl StatusSource<'_> {
+    fn view(&self) -> StatusView<'_> {
+        StatusView {
+            version: env!("CARGO_PKG_VERSION"),
+            device_id: DisplayIdWidth(self.identity.display_id_len()),
+            joined_networks: VisibleNetworkIds(&self.state),
+            realtime: self.realtime,
+        }
+    }
+
+    pub(crate) fn typed_claim(
+        &self,
+    ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+        myownmesh_core::serialized_mailbox_item_claim_as::<OwnedStatusData>(&self.view())
+    }
+
+    pub(crate) fn line_ceiling(&self) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
+        let (_, encoded, _) = myownmesh_core::mailbox_measure_serialized(&self.view())?;
+        encoded
+            .checked_add("{\"ok\":true,\"data\":".len())
+            .and_then(|bytes| bytes.checked_add("}\n".len()))
+            .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                "status line length overflowed",
+            ))
+    }
+
+    pub(crate) fn commit(
+        self,
+        retention: myownmesh_core::ResourceLease,
+    ) -> Result<FundedStatus, myownmesh_core::ResourceLease> {
+        if retention.claim()
+            != self
+                .typed_claim()
+                .expect("a locked status source remains representable")
+        {
+            return Err(retention);
+        }
+        let count = self
+            .state
+            .aliases
+            .iter()
+            .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
+            .count();
+        let mut joined_networks = Vec::with_capacity(count);
+        self.state.for_each_canonical_in_config_order(|entry| {
+            joined_networks.push(entry.joined.network_id().to_string());
+        });
+        Ok(FundedStatus {
+            data: OwnedStatusData {
+                version: env!("CARGO_PKG_VERSION"),
+                device_id: self.identity.display_id(),
+                joined_networks,
+                realtime: self.realtime.clone(),
+            },
+            _retention: retention,
+        })
+    }
+}
+
+impl<'a> PreparedNetworksList<'a> {
+    pub(crate) fn typed_claim(&self) -> myownmesh_core::ResourceClaim {
+        self.typed_claim
+    }
+
+    pub(crate) fn work_claim(&self) -> myownmesh_core::ResourceClaim {
+        self.work_claim
+    }
+
+    pub(crate) fn measure_line_ceiling(
+        self,
+        work: &myownmesh_core::ResourceLease,
+    ) -> Result<MeasuredNetworksList<'a>, myownmesh_core::ResourceMailboxItemError> {
+        if work.claim() != self.work_claim {
+            return Err(myownmesh_core::ResourceMailboxItemError::Measurement(
+                "NetworksList line measurement work was not admitted",
+            ));
+        }
+        #[cfg(test)]
+        self.registry
+            .networks_line_measurements
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state = self.registry.state.lock();
+        let current = current_networks_claim_fitting(&state, self.typed_claim)?;
+        if current != Some(self.typed_claim) {
+            return Err(myownmesh_core::ResourceMailboxItemError::Measurement(
+                "NetworksList changed typed shape before line measurement",
+            ));
+        }
+        let line_ceiling = networks_line_ceiling(&BorrowedNetworksData {
+            networks: NetworksView(&state),
+        })?;
+        drop(state);
+        Ok(MeasuredNetworksList {
+            registry: self.registry,
+            typed_claim: self.typed_claim,
+            work_claim: self.work_claim,
+            line_ceiling,
+        })
+    }
+}
+
+impl MeasuredNetworksList<'_> {
+    pub(crate) fn line_ceiling(&self) -> usize {
+        self.line_ceiling
+    }
+
+    pub(crate) fn commit(
+        self,
+        retention: myownmesh_core::ResourceLease,
+        work: myownmesh_core::ResourceLease,
+    ) -> Result<FundedNetworksList, (myownmesh_core::ResourceLease, myownmesh_core::ResourceLease)>
+    {
+        let admitted = retention.claim();
+        if admitted != self.typed_claim || work.claim() != self.work_claim {
+            return Err((retention, work));
+        }
+        #[cfg(test)]
+        self.registry
+            .networks_commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let state = self.registry.state.lock();
+        let count = state.canonical_count();
+        let base_claim = match networks_claim(count, 0, 0) {
+            Ok(claim) if claim_fits(claim, admitted) => claim,
+            _ => return Err((retention, work)),
+        };
+        // The fixed row box is the first allocation and its exact requested
+        // layout is covered by `base_claim` before allocation. `Vec` is
+        // deliberately not used here: its spare capacity is not part of the
+        // public contract and therefore cannot be measured exactly.
+        let mut rows = empty_prepared_slots(count);
+        let mut built = 0usize;
+        let mut actual = base_claim;
+        let mut refused = false;
+        state.for_each_canonical_in_config_order(|entry| {
+            if refused {
+                return;
+            }
+            entry.joined.with_network_summary_view(
+                |config_id, network_id, label, phase, topology, traffic| {
+                    // Refuse before the first allocation whose requested shape
+                    // would cross the capacity acquired from pass zero.
+                    let fits = add_network_row_fitting(
+                        &mut actual,
+                        admitted,
+                        config_id,
+                        network_id,
+                        label,
+                        topology,
+                    );
+                    if !matches!(fits, Ok(true)) {
+                        refused = true;
+                        return;
+                    }
+                    let Some(slot) = rows.get_mut(built) else {
+                        refused = true;
+                        return;
+                    };
+                    #[cfg(test)]
+                    self.registry
+                        .networks_rows_built
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    slot.0 = Some(PreparedNetworkSummary::from_view(
+                        config_id, network_id, label, phase, topology, traffic,
+                    ));
+                    built += 1;
+                },
+            );
+        });
+        drop(state);
+
+        if refused || built != count || actual != admitted {
+            drop(rows);
+            return Err((retention, work));
+        }
+        let actual_line = match networks_line_ceiling(&PreparedNetworksData { networks: &rows }) {
+            Ok(line) => line,
+            Err(_) => {
+                drop(rows);
+                return Err((retention, work));
+            }
+        };
+        if actual_line != self.line_ceiling {
+            drop(rows);
+            return Err((retention, work));
+        }
+        Ok(FundedNetworksList {
+            rows,
+            _retention: retention,
+            _work: work,
+        })
+    }
+}
+
 /// Outcome of a [`NetworkRegistry::remove`] call.
 pub enum RemoveResult {
     /// The runtime was torn down: drivers dropped, engine driver retired,
@@ -717,12 +1792,24 @@ mod tests {
     }
 
     fn network(config_id: &str, network_id: &str) -> myownmesh_core::NetworkConfig {
+        network_with_topology(
+            config_id,
+            network_id,
+            myownmesh_core::TopologyMode::FullMesh,
+        )
+    }
+
+    fn network_with_topology(
+        config_id: &str,
+        network_id: &str,
+        topology: myownmesh_core::TopologyMode,
+    ) -> myownmesh_core::NetworkConfig {
         myownmesh_core::NetworkConfig {
             id: config_id.to_string(),
             network_id: network_id.to_string(),
             label: config_id.to_string(),
             kind: Default::default(),
-            topology: myownmesh_core::TopologyMode::FullMesh,
+            topology,
             signaling: myownmesh_core::config::SignalingConfig::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
@@ -730,6 +1817,357 @@ mod tests {
             pinned_peers: Vec::new(),
             auto_approve: true,
         }
+    }
+
+    fn widest_traffic() -> myownmesh_core::engine::traffic::TrafficSnapshot {
+        let lane = myownmesh_core::engine::traffic::LaneSnapshot {
+            frames: u64::MAX,
+            bytes: u64::MAX,
+        };
+        myownmesh_core::engine::traffic::TrafficSnapshot {
+            keepalive_tx: lane,
+            keepalive_rx: lane,
+            control_tx: lane,
+            control_rx: lane,
+            gossip_tx: lane,
+            gossip_rx: lane,
+            app_tx: lane,
+            app_rx: lane,
+            other_tx: lane,
+            other_rx: lane,
+            announces_rx: u64::MAX,
+            announces_tx: u64::MAX,
+            negotiation_rx: u64::MAX,
+            negotiation_tx: u64::MAX,
+            reliable_pending: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn v4_r3_daemon_the_networks_work_ceiling_covers_every_fixed_field() {
+        let topologies = [
+            myownmesh_core::TopologyMode::Ring {
+                n_preferred: Some(u32::MAX),
+            },
+            myownmesh_core::TopologyMode::Star { hub: String::new() },
+            myownmesh_core::TopologyMode::Hubs {
+                hubs: Vec::new(),
+                spoke_redundancy: Some(u32::MAX),
+            },
+            myownmesh_core::TopologyMode::FullMesh,
+        ];
+        let traffic = widest_traffic();
+        for topology in &topologies {
+            let row = PreparedNetworkSummary::from_view(
+                "",
+                "",
+                "",
+                myownmesh_core::MeshPhase::Discovering,
+                topology,
+                traffic,
+            );
+            let encoded = serde_json::to_vec(&row).expect("the closed row shape serializes");
+            assert!(
+                u64::try_from(encoded.len()).expect("the control row fits u64")
+                    <= WIDEST_FIXED_NETWORK_ROW_JSON_BYTES,
+                "the fixed-row constant covers {topology:?}: {} > {}",
+                encoded.len(),
+                WIDEST_FIXED_NETWORK_ROW_JSON_BYTES
+            );
+        }
+
+        let mut rows = empty_prepared_slots(1);
+        rows[0].0 = Some(PreparedNetworkSummary::from_view(
+            "",
+            "",
+            "",
+            myownmesh_core::MeshPhase::Discovering,
+            &myownmesh_core::TopologyMode::Hubs {
+                hubs: Vec::new(),
+                spoke_redundancy: Some(u32::MAX),
+            },
+            traffic,
+        ));
+        let line = networks_line_ceiling(&PreparedNetworksData { networks: &rows })
+            .expect("the widest fixed line is representable");
+        let typed = networks_claim(1, 0, 0).expect("one empty row has an exact claim");
+        let work = networks_work_claim(typed).expect("the work ceiling is representable");
+        let three_walks_and_sources = u64::try_from(line)
+            .expect("the fixed line fits u64")
+            .checked_mul(NETWORKS_SERIALIZATION_PASSES)
+            .and_then(|walks| {
+                typed
+                    .amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
+                    .checked_mul(NETWORKS_TYPED_SOURCE_PASSES)
+                    .and_then(|sources| walks.checked_add(sources))
+            })
+            .expect("the control work is representable");
+        assert!(
+            work.amount(myownmesh_core::ResourceClass::ParsingOrCpuWork) >= three_walks_and_sources,
+            "the mechanically derived lease covers serialization, fit scans, and construction"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_r3_daemon_networks_drift_refuses_before_overbudget_build_and_rolls_back() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let grant = myownmesh_core::ResourceClaim::try_from_entries([
+            (myownmesh_core::ResourceClass::AccountedMemoryBytes, 1 << 20),
+            (myownmesh_core::ResourceClass::ParsingOrCpuWork, 1 << 20),
+            (
+                myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+                1 << 20,
+            ),
+        ])
+        .expect("the drift-control grant is representable");
+
+        // Growth after exact line measurement cannot allocate even its row box
+        // under the empty pass-zero claim.
+        let registry = NetworkRegistry::new();
+        let newcomer = mesh
+            .join(network("growth-config", "growth-wire"))
+            .await
+            .expect("the growth runtime is ready before the measured pass");
+        let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the drift grant funds its process scope");
+        let scope = port.process_scope();
+        let baseline = provider.in_use();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("the empty plan is representable");
+        let typed = port
+            .acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                plan.typed_claim(),
+            )
+            .expect("the empty typed claim is funded");
+        let work = port
+            .acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                plan.work_claim(),
+            )
+            .expect("the empty work ceiling is funded");
+        let measured = plan
+            .measure_line_ceiling(&work)
+            .expect("the empty line is measured");
+        assert!(
+            registry.insert(newcomer, None).into_refusal().is_none(),
+            "the roster really grows between the two passes"
+        );
+        let (typed, work) = match measured.commit(typed, work) {
+            Ok(_funded) => panic!("growth beyond the admitted row box must refuse"),
+            Err(leases) => leases,
+        };
+        drop((typed, work));
+        assert_eq!(
+            registry.networks_rows_built_for_test(),
+            0,
+            "growth refuses before the first row construction"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "growth rollback releases exactly"
+        );
+        let _ = registry.shutdown_all().await;
+
+        // Equal typed retention is not equal wire width: replacing `aa` with a
+        // newline plus one byte preserves the exact allocation/length terms but
+        // expands JSON. The private row may be built under admitted retention;
+        // it must still be rolled back before publication.
+        let registry = NetworkRegistry::new();
+        let mut before_config = network("line-config", "line-wire");
+        before_config.label = "aa".to_string();
+        let mut after_config = before_config.clone();
+        after_config.label = "\n?".to_string();
+        let before = mesh
+            .join(before_config)
+            .await
+            .expect("the predecessor joins");
+        let after = mesh
+            .join(after_config)
+            .await
+            .expect("the same-sized successor joins independently");
+        assert!(registry.insert(before, None).into_refusal().is_none());
+
+        let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the line-drift grant funds its process scope");
+        let scope = port.process_scope();
+        let baseline = provider.in_use();
+        let plan = registry
+            .prepare_networks_list()
+            .expect("the predecessor plan is representable");
+        let typed_claim = plan.typed_claim();
+        let typed = port
+            .acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                typed_claim,
+            )
+            .expect("the predecessor typed claim is funded");
+        let work = port
+            .acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                plan.work_claim(),
+            )
+            .expect("the predecessor work ceiling is funded");
+        let measured = plan
+            .measure_line_ceiling(&work)
+            .expect("the predecessor line is measured");
+        assert!(matches!(
+            registry.remove("line-config").await,
+            RemoveResult::Removed(Ok(()))
+        ));
+        assert!(
+            registry.insert(after, None).into_refusal().is_none(),
+            "the same-sized successor installs after its predecessor stopped"
+        );
+        let successor_claim = registry
+            .prepare_networks_list()
+            .expect("the successor is representable")
+            .typed_claim();
+        assert_eq!(
+            successor_claim, typed_claim,
+            "non-vacuity: only encoded width changed, not typed retention"
+        );
+        let (typed, work) = match measured.commit(typed, work) {
+            Ok(_funded) => panic!("a wider line must not publish under the predecessor ceiling"),
+            Err(leases) => leases,
+        };
+        drop((typed, work));
+        assert_eq!(
+            registry.networks_rows_built_for_test(),
+            1,
+            "the equal-retention successor reaches the private row build"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "line-mismatch rollback releases typed and work funding exactly"
+        );
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn v4_r3_daemon_the_prepared_network_rows_are_the_legacy_rows_on_the_wire() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let cases = [
+            (
+                "01-ring",
+                "wire-ring",
+                myownmesh_core::TopologyMode::Ring {
+                    n_preferred: Some(9),
+                },
+            ),
+            (
+                "02-star-\n-label",
+                "wire-star",
+                myownmesh_core::TopologyMode::Star {
+                    hub: "star-hub".to_string(),
+                },
+            ),
+            (
+                "03-hubs",
+                "wire-hubs",
+                myownmesh_core::TopologyMode::Hubs {
+                    hubs: vec!["hub-a".to_string(), "hub-b".to_string()],
+                    spoke_redundancy: Some(2),
+                },
+            ),
+            (
+                "04-full",
+                "wire-full",
+                myownmesh_core::TopologyMode::FullMesh,
+            ),
+        ];
+        for (config_id, network_id, topology) in cases {
+            let joined = mesh
+                .join(network_with_topology(config_id, network_id, topology))
+                .await
+                .expect("the topology fixture joins");
+            assert!(
+                registry.insert(joined, None).into_refusal().is_none(),
+                "each distinct runtime installs"
+            );
+        }
+
+        let plan = registry
+            .prepare_networks_list()
+            .expect("all four topology variants are representable");
+        let grant = myownmesh_core::ResourceClaim::try_from_entries([
+            (myownmesh_core::ResourceClass::AccountedMemoryBytes, 1 << 20),
+            (myownmesh_core::ResourceClass::ParsingOrCpuWork, 1 << 20),
+            (
+                myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+                1 << 20,
+            ),
+        ])
+        .expect("the fixture grant is representable");
+        let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the fixture grant funds its process scope");
+        let scope = port.process_scope();
+        let baseline = provider.in_use();
+        let typed = port
+            .acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                plan.typed_claim(),
+            )
+            .expect("the typed row owner is admitted");
+        let work = port
+            .acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                plan.work_claim(),
+            )
+            .expect("the snapshot and serialization work is admitted");
+        let plan = plan
+            .measure_line_ceiling(&work)
+            .expect("the funded traversal measures the exact line");
+        let line_ceiling = plan.line_ceiling();
+        let funded = match plan.commit(typed, work) {
+            Ok(funded) => funded,
+            Err((_typed, _work)) => panic!("the unchanged authoritative pass commits"),
+        };
+
+        #[derive(serde::Serialize)]
+        struct LegacyNetworks<'a> {
+            networks: &'a [NetworkSummary],
+        }
+        let legacy = registry.summaries();
+        let legacy_json = serde_json::to_vec(&LegacyNetworks { networks: &legacy })
+            .expect("legacy NetworkSummary rows serialize");
+        let prepared_json =
+            serde_json::to_vec(&funded).expect("the funded prepared rows serialize");
+        assert_eq!(
+            prepared_json, legacy_json,
+            "all topology variants, escaped labels, field order, and config-id order match"
+        );
+        assert_eq!(
+            line_ceiling,
+            "{\"ok\":true,\"data\":".len() + prepared_json.len() + "}\n".len(),
+            "the measured full response line includes the exact wrapper and newline"
+        );
+        assert!(
+            provider.in_use() != baseline,
+            "the funded rows genuinely hold their typed and work leases"
+        );
+        drop(funded);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the funded owner releases exactly"
+        );
+        let _ = registry.shutdown_all().await;
     }
 
     /// Exactly one caller may claim a runtime for teardown.

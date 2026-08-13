@@ -13,10 +13,19 @@ use tracing::{debug, warn};
 use myownmesh_core::realtime as core_realtime;
 use myownmesh_core::transport as core_webrtc;
 
-use super::{
-    decode_realtime_send_unit, encode_realtime_recv_unit_with_ceiling, ControlState,
-    FrameAdmission, RealtimePipeDirection, RealtimeRecvUnit, REALTIME_FRAME_HEADER,
-};
+// The two codec helpers are named where they are defined, not through the
+// parent. `control` binds `ControlState` (its own item), `RealtimePipeDirection`
+// (`pub use wire::…`) and `FrameAdmission` + `REALTIME_FRAME_HEADER` (its own
+// `use framing::…`, which a child module can see even though it is private) —
+// but it binds neither of these two, so `super::` has no name to resolve. They
+// are `pub(super)` in `framing`, which makes them visible throughout `control`
+// and every descendant of it, this module included. Importing them from their
+// real location is therefore the whole fix; re-exporting them from `control`
+// would widen their reach for no reason.
+use super::framing::{encode_realtime_recv_fields_with_ceiling, inspect_realtime_send_unit};
+use super::{ControlState, FrameAdmission, RealtimePipeDirection, REALTIME_FRAME_HEADER};
+
+const REALTIME_BUFFER_ALLOCATIONS: u64 = 1;
 
 /// What one realtime pipe is bound to, once its fields have been checked
 /// against its direction.
@@ -37,6 +46,45 @@ pub(super) enum RealtimePipeBinding {
     Inbound { network: String, peer: String },
 }
 
+pub(super) enum RealtimePipeBindingPlan<'a> {
+    Outbound {
+        network: &'a str,
+        flow_capability: &'a str,
+    },
+    Inbound {
+        network: &'a str,
+        peer: &'a str,
+    },
+}
+
+impl RealtimePipeBindingPlan<'_> {
+    pub(super) fn retained_lengths(&self) -> [usize; 2] {
+        match self {
+            Self::Outbound {
+                network,
+                flow_capability,
+            } => [network.len(), flow_capability.len()],
+            Self::Inbound { network, peer } => [network.len(), peer.len()],
+        }
+    }
+
+    pub(super) fn build(self) -> RealtimePipeBinding {
+        match self {
+            Self::Outbound {
+                network,
+                flow_capability,
+            } => RealtimePipeBinding::Outbound {
+                network: network.to_string(),
+                flow_capability: flow_capability.to_string(),
+            },
+            Self::Inbound { network, peer } => RealtimePipeBinding::Inbound {
+                network: network.to_string(),
+                peer: peer.to_string(),
+            },
+        }
+    }
+}
+
 impl RealtimePipeBinding {
     /// The network both directions are bound through.
     ///
@@ -49,23 +97,6 @@ impl RealtimePipeBinding {
             Self::Outbound { network, .. } | Self::Inbound { network, .. } => network,
         }
     }
-
-    /// The lengths of the two buffers this binding owns.
-    ///
-    /// For the funding that has to outlive the decoded request these were copied
-    /// out of. A pipe runs for as long as its client keeps it open, and the
-    /// request's own admission is derived from the encoded line — so it is the
-    /// padding a client chose, not these two coordinates, and it must not be
-    /// what pays for them.
-    pub(super) fn retained_lengths(&self) -> [usize; 2] {
-        match self {
-            Self::Outbound {
-                network,
-                flow_capability,
-            } => [network.len(), flow_capability.len()],
-            Self::Inbound { network, peer } => [network.len(), peer.len()],
-        }
-    }
 }
 
 /// Validate a [`Request::RealtimePipe`]'s fields against its direction.
@@ -75,14 +106,43 @@ impl RealtimePipeBinding {
 /// like one that honoured it — and for `peer` on an outbound pipe that
 /// misreading is the finding itself, a client believing its units are bound to
 /// a peer when what actually binds them is a flow.
+///
+/// The plan-and-build pair collapsed into one call, for controls that assert on
+/// the *rule* rather than on when the retention is taken. Production never uses
+/// this: it holds the plan across its admission and builds inside it — see
+/// `serve`'s `RealtimePipe` arm, which answers a refusal with
+/// `PreparedReply::StaticError(message)` and only calls `plan.build()` under
+/// `Retained::admit_building`.
+///
+/// The error is the plan's own `&'static str`, forwarded rather than copied.
+/// Allocating a `String` here would be a second error shape for the same
+/// refusal, and it would put an allocation on a path whose entire point is that
+/// the refusal text is already static and costs nothing to answer with.
+///
+/// `cfg(test)` because its only consumer is: `control`'s import of it is
+/// `#[cfg(test)]` too, so without this gate the item is unused in a release
+/// build. Nothing is gated that production reaches —
+/// [`realtime_pipe_binding_plan`] and [`RealtimePipeBindingPlan::build`], the
+/// two halves this composes, both stay ungated and are what `serve` calls.
+#[cfg(test)]
 pub(super) fn realtime_pipe_binding(
     direction: RealtimePipeDirection,
     network: &str,
     peer: Option<&str>,
     flow_capability: Option<&str>,
-) -> std::result::Result<RealtimePipeBinding, String> {
+) -> std::result::Result<RealtimePipeBinding, &'static str> {
+    realtime_pipe_binding_plan(direction, network, peer, flow_capability)
+        .map(RealtimePipeBindingPlan::build)
+}
+
+pub(super) fn realtime_pipe_binding_plan<'a>(
+    direction: RealtimePipeDirection,
+    network: &'a str,
+    peer: Option<&'a str>,
+    flow_capability: Option<&'a str>,
+) -> std::result::Result<RealtimePipeBindingPlan<'a>, &'static str> {
     if network.trim().is_empty() {
-        return Err("realtime_pipe requires a network".to_string());
+        return Err("realtime_pipe requires a network");
     }
     match direction {
         RealtimePipeDirection::Outbound => {
@@ -91,20 +151,18 @@ pub(super) fn realtime_pipe_binding(
                     "realtime_pipe outbound takes no peer: it writes to the exact flow \
                      its flow_capability names, and a peer selector here would be \
                      re-resolved per unit — which is how a pipe outliving its session \
-                     ended up writing into the replacement's flow of the same name"
-                        .to_string(),
+                     ended up writing into the replacement's flow of the same name",
                 );
             }
             let Some(flow_capability) = flow_capability else {
                 return Err(
                     "realtime_pipe outbound requires a flow_capability: the value \
-                     realtime_flow_open issued is the only thing that authorizes a write"
-                        .to_string(),
+                     realtime_flow_open issued is the only thing that authorizes a write",
                 );
             };
-            Ok(RealtimePipeBinding::Outbound {
-                network: network.to_string(),
-                flow_capability: flow_capability.to_string(),
+            Ok(RealtimePipeBindingPlan::Outbound {
+                network,
+                flow_capability,
             })
         }
         RealtimePipeDirection::Inbound => {
@@ -112,21 +170,16 @@ pub(super) fn realtime_pipe_binding(
                 return Err(
                     "realtime_pipe inbound takes no flow_capability: it claims a \
                      session's whole unit stream rather than one flow, and every unit \
-                     carries the name of the flow it arrived on"
-                        .to_string(),
+                     carries the name of the flow it arrived on",
                 );
             }
             let Some(peer) = peer.filter(|peer| !peer.trim().is_empty()) else {
                 return Err(
                     "realtime_pipe inbound requires a peer: the stream it claims \
-                     belongs to one session"
-                        .to_string(),
+                     belongs to one session",
                 );
             };
-            Ok(RealtimePipeBinding::Inbound {
-                network: network.to_string(),
-                peer: peer.to_string(),
-            })
+            Ok(RealtimePipeBindingPlan::Inbound { network, peer })
         }
     }
 }
@@ -186,11 +239,18 @@ where
                 return Ok(());
             }
         };
+        let _allocation = match admission.admit_allocator_residual(REALTIME_BUFFER_ALLOCATIONS) {
+            Ok(allocation) => allocation,
+            Err(refusal) => {
+                warn!("realtime frame allocation not admitted: {refusal} â€” dropping pipe");
+                return Ok(());
+            }
+        };
         let mut body = vec![0u8; len];
         if reader.read_exact(&mut body).await.is_err() {
             return Ok(());
         }
-        let Some(unit) = decode_realtime_send_unit(&body) else {
+        let Some(unit) = inspect_realtime_send_unit(&body) else {
             warn!("malformed realtime send unit ({len} bytes) — skipped");
             continue;
         };
@@ -198,8 +258,11 @@ where
         // bytes go to core, and the lossy rendering exists solely so a refusal
         // can name the flow in a log line. A label is opaque application bytes,
         // so it has no guaranteed text form and none is invented for the wire.
-        let logged = label_for_log(&unit.flow_label);
-        let label = unit.flow_label;
+        let label_range = unit.flow_label.clone();
+        let payload_range = unit.payload.clone();
+        let duration_us = unit.duration_us;
+        let body = bytes::Bytes::from(body);
+        let label = &body[label_range];
         // No marker: an outbound unit does not carry one, at any layer. The
         // marker bit states something about packetization that the flow's
         // framing policy decides and the packetizer alone is positioned to get
@@ -208,8 +271,8 @@ where
         // otherwise, which is what stops a client from believing it still has a
         // say.
         let outbound = core_webrtc::WebRtcRealtimeOutboundUnit {
-            duration: std::time::Duration::from_micros(u64::from(unit.duration_us)),
-            data: unit.payload.into(),
+            duration: std::time::Duration::from_micros(u64::from(duration_us)),
+            data: body.slice(payload_range),
         };
         // Lent for exactly this unit and never held: the borrow ends with the
         // closure, so the daemon's stored handle stays the only one and a close
@@ -223,7 +286,7 @@ where
             // is already chosen — so a mismatch is a client naming one of its
             // own flows on the wrong pipe, which is worth telling it about and
             // is never worth guessing at.
-            if flow.label() != label.as_slice() {
+            if flow.label() != label {
                 return Err(None);
             }
             net.send_webrtc_realtime(flow, outbound).map_err(Some)
@@ -234,7 +297,7 @@ where
             // nothing left to write to, and the pipe ends rather than idling
             // against a capability that will never resolve again.
             debug!(
-                label = %logged,
+                label = %label_for_log(label),
                 "realtime outbound pipe closing: its flow is no longer held by this client"
             );
             return Ok(());
@@ -243,7 +306,7 @@ where
             Ok(()) => {}
             Err(None) => {
                 debug!(
-                    label = %logged,
+                    label = %label_for_log(label),
                     "realtime unit names a different flow than this pipe is bound to — dropped"
                 );
             }
@@ -260,13 +323,13 @@ where
             Err(Some(refusal)) => {
                 if matches!(refusal, core_realtime::RealtimeRefusal::SessionNotCurrent) {
                     warn!(
-                        label = %logged,
+                        label = %label_for_log(label),
                         code = refusal.code(),
                         "realtime outbound pipe closing: its session is no longer current"
                     );
                     return Ok(());
                 }
-                debug!(label = %logged, code = refusal.code(), "realtime send refused");
+                debug!(label = %label_for_log(label), code = refusal.code(), "realtime send refused");
             }
         }
     }
@@ -313,12 +376,11 @@ pub(super) async fn release_owned_registrations(
     // unfund the very `network` string the lookup below reads. It goes at the
     // end of the iteration, with the strings it paid for.
     let mut flows = removed.handle.drain_realtime_flows();
-    while let Some((network, flow, funding)) = flows.pop() {
-        let Some(net) = state.registry.get(&network) else {
+    while let Some(flow) = flows.pop() {
+        let Some(net) = state.registry.get(flow.network()) else {
             continue;
         };
-        let _ = net.close_realtime(flow).await;
-        drop((network, funding));
+        let _ = flow.close_through(&net).await;
     }
     // Methods next, and *before* the routes -- which is the order this comment
     // used to claim while the code did the opposite. Each `ForgottenMethod`
@@ -407,8 +469,9 @@ where
             warn!(%peer, bytes = arrival.unit.data.len(), "realtime unit cannot be framed — dropped");
             continue;
         };
-        // Funded for this iteration, which covers the copy into `unit` and the
-        // encoded body written from it. Inbound units are core's to produce and
+        // Funded for this iteration, which covers the one encoded output body.
+        // The arrival's label and payload are borrowed directly while encoding;
+        // there is no intermediate unit or payload copy. Inbound units are core's to produce and
         // this daemon's to hold on their way out, so they are accounted here
         // even though no local client chose their size — a session sending
         // faster than a client reads is exactly when this has to hold.
@@ -419,14 +482,20 @@ where
                 continue;
             }
         };
-        let unit = RealtimeRecvUnit {
-            flow_label: arrival.label,
-            marker: arrival.unit.marker,
-            rtp_timestamp: arrival.unit.rtp_timestamp,
-            payload: arrival.unit.data.to_vec(),
+        let _allocation = match admission.admit_allocator_residual(REALTIME_BUFFER_ALLOCATIONS) {
+            Ok(allocation) => allocation,
+            Err(refusal) => {
+                warn!(%peer, "realtime output allocation not admitted: {refusal} â€” dropped");
+                continue;
+            }
         };
-        let Some(body) = encode_realtime_recv_unit_with_ceiling(&unit, admission.framing_ceiling())
-        else {
+        let Some(body) = encode_realtime_recv_fields_with_ceiling(
+            &arrival.label,
+            arrival.unit.marker,
+            arrival.unit.rtp_timestamp,
+            &arrival.unit.data,
+            admission.framing_ceiling(),
+        ) else {
             // Larger than the framing can express. Dropped here, and the pipe
             // continues: the alternative is writing a frame whose length prefix
             // or inner length is wrong, which the client cannot interpret and
@@ -435,8 +504,8 @@ where
             // reason to take down a session's whole inbound path.
             warn!(
                 %peer,
-                label = %label_for_log(&unit.flow_label),
-                bytes = unit.payload.len(),
+                label = %label_for_log(&arrival.label),
+                bytes = arrival.unit.data.len(),
                 "realtime unit too large to frame — dropped"
             );
             continue;

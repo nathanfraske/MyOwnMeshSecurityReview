@@ -34,24 +34,85 @@ use std::hash::{BuildHasher, Hash};
 
 use super::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease};
 
-/// One retained entry: the caller's key and value, the lease that paid for this
-/// node, and the two links.
+/// One retained entry: the caller's key and value, and the two links.
 ///
-/// Field order is the drop order and is chosen: the key and value are destroyed
-/// first, and only then is the allocation that held them paid back. A lease
-/// released before the thing it accounts for is gone would leave a window in
-/// which the provider believes memory is free while it is still occupied.
+/// The lease that funds this allocation is deliberately **not** here. It lives
+/// in the [`FundedNode`] link that owns the box, because a lease stored inside
+/// the allocation it pays for is released by that allocation's own drop glue —
+/// which runs while the allocation is still there. See [`FundedNode`].
 struct LeasedMapNode<K, V> {
     key: K,
     value: V,
-    /// Covers only this map node's allocation. Any off-node retention in
-    /// `key` or `value` owns a separate lease for its full lifetime.
-    _entry: ResourceLease,
     /// Heap order. A balancing detail — never compared for identity, never
     /// serialized, never shown to a caller.
     priority: u64,
-    left: Option<Box<LeasedMapNode<K, V>>>,
-    right: Option<Box<LeasedMapNode<K, V>>>,
+    left: Option<FundedNode<K, V>>,
+    right: Option<FundedNode<K, V>>,
+}
+
+/// A node allocation and the lease that pays for it, in that order.
+///
+/// **The lease is a sibling of the box, not a field inside it.** Drop glue runs
+/// a value's fields before freeing the value, so a lease held inside the node
+/// would go back to the provider while the node's memory was still allocated —
+/// a window in which the ledger says the bytes are free and they are not. As a
+/// sibling declared *after* the box, the box is dropped first and the lease is
+/// released only once the allocation is genuinely gone. Every path gets this,
+/// including the ones that never intended to release anything: the map's own
+/// teardown, a refused insert's natural drop, and any link overwritten in
+/// place.
+///
+/// There is no way to take the box out. [`Deref`](std::ops::Deref) borrows the
+/// node so the whole module reads and rebuilds the tree exactly as it did when
+/// the links were plain boxes, and [`FundedNode::into_entry`] is the single
+/// consuming exit, written so the allocation is freed before the lease goes
+/// back. A `(Box, ResourceLease)` accessor is not offered on purpose — it would
+/// hand a caller the two halves and let it drop them in the wrong order, which
+/// is the exact defect this shape exists to make unspellable.
+struct FundedNode<K, V> {
+    node: Box<LeasedMapNode<K, V>>,
+    /// Covers only this map node's allocation. Any off-node retention in `key`
+    /// or `value` owns a separate lease for its full lifetime.
+    ///
+    /// Declared after `node`, and that order is the entire point.
+    _entry: ResourceLease,
+}
+
+/// Borrowing a link reaches the node, so every walk in this module is written
+/// against `LeasedMapNode` and never has to name the funding.
+///
+/// This deliberately cannot move the node out: `FundedNode` is not a smart
+/// pointer a caller can dereference-and-move through, so the only consuming
+/// path is [`FundedNode::into_entry`].
+impl<K, V> std::ops::Deref for FundedNode<K, V> {
+    type Target = LeasedMapNode<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl<K, V> std::ops::DerefMut for FundedNode<K, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
+    }
+}
+
+impl<K, V> FundedNode<K, V> {
+    /// Detach the entry, free its allocation, and only then release its lease.
+    ///
+    /// The order is load-bearing and is the reason removal does not simply drop
+    /// the link: moving out of `*node` frees the allocation at the end of that
+    /// statement, and `_entry` — a local from this function's own destructuring
+    /// — is released after it, on return. The key and value are handed back
+    /// still owning whatever separate leases their off-node storage holds.
+    fn into_entry(self) -> (K, V) {
+        let FundedNode { node, _entry } = self;
+        let LeasedMapNode { key, value, .. } = *node;
+        // The allocation is gone as of the statement above. `_entry` is
+        // released below, when this frame ends — never before.
+        (key, value)
+    }
 }
 
 /// The candidate an insert refused, still in the node that was allocated and
@@ -63,10 +124,11 @@ struct LeasedMapNode<K, V> {
 /// truthful answer: nothing was unpacked, nothing was rebuilt, and the caller
 /// holds exactly what it supplied.
 ///
-/// **Dropping it is the release, and there is nothing else to do with it.** The
-/// node's fields are destroyed in declaration order — key, then value, then the
-/// lease that paid for all three — so the funding goes back only once what it
-/// accounted for is gone. Its links were never attached, so this is a leaf's
+/// **Dropping it is the release, and there is nothing else to do with it.**
+/// Dropping a [`FundedNode`] frees the node allocation and only then releases
+/// the lease that paid for it, so this path needs no destructor of its own to
+/// be truthful — the ordering is a property of the link type rather than of
+/// each site that drops one. Its links were never attached, so this is a leaf's
 /// drop and cannot recurse.
 ///
 /// There is deliberately no accessor. A caller that could take the value back
@@ -74,9 +136,9 @@ struct LeasedMapNode<K, V> {
 /// the node around it, and every caller in the crate wants only the fact of the
 /// refusal.
 pub struct LeasedMapInsertRefusal<K, V> {
-    /// Never read; it exists to be dropped. Underscored for the same reason a
-    /// node's `_entry` is: the whole content of this field is its destructor.
-    _node: Box<LeasedMapNode<K, V>>,
+    /// Never read; it exists to be dropped. Underscored because the whole
+    /// content of this field is its destructor.
+    _node: FundedNode<K, V>,
 }
 
 /// Names the refusal and nothing inside it.
@@ -98,7 +160,10 @@ impl<K, V> std::fmt::Debug for LeasedMapInsertRefusal<K, V> {
 /// names and for its live flows, and two copies of it would be two places to
 /// get the drop order wrong.
 pub struct LeasedMap<K, V> {
-    root: Option<Box<LeasedMapNode<K, V>>>,
+    /// The root link, and with it the root node's lease. Every other node's
+    /// lease is held by the link in its parent, so no lease in the whole tree
+    /// sits inside the allocation it pays for.
+    root: Option<FundedNode<K, V>>,
     len: usize,
     /// Seeds the per-entry priority. Per map and per process, so the tree's
     /// shape is not a function a caller can compute.
@@ -130,8 +195,10 @@ impl<K, V> Drop for LeasedMap<K, V> {
                 }
                 None => {
                     root = node.right.take();
-                    // `node` drops here with no children: its key and value
-                    // first, then the lease that funded it.
+                    // `node` drops here with no children. It is a `FundedNode`,
+                    // so the box is freed and only then is the lease released —
+                    // this arm does not have to spell that ordering out, and
+                    // could not get it wrong if it tried.
                 }
             }
         }
@@ -156,12 +223,21 @@ impl<K, V> LeasedMap<K, V> {
     /// Everything one entry costs: exactly this map's node.
     ///
     /// The single calibration point. An owner never writes the node's size
-    /// itself. The node's size is
-    /// `size_of` over the concrete node type, so it already includes the key
-    /// and value inline, the lease handle, the priority and both links; the
-    /// residual is 1 because the entry is exactly one allocation, and unlike a
-    /// B-tree slot that residual is released at the moment the entry is.
-    /// Off-node retention owned by `K` or `V` carries its own lease in that
+    /// itself. The node's size is `size_of` over the concrete node type, so it
+    /// already includes the key and value inline, the priority, and both links
+    /// — and each link is now a pointer *and* the child's lease handle, since
+    /// [`FundedNode`] holds a child's funding beside the child's box rather
+    /// than inside it. Those inline lease handles are part of this allocation
+    /// and are counted here exactly once, by the parent that allocates them.
+    ///
+    /// This entry's own lease is not in this allocation at all: it is held by
+    /// the link in the parent, or by the map's `root` field for the root node.
+    /// Nothing is double-counted and nothing is missed — every node allocation
+    /// is paid for by exactly one claim, taken here.
+    ///
+    /// The residual is 1 because the entry is exactly one allocation, and
+    /// unlike a B-tree slot that residual is released at the moment the entry
+    /// is. Off-node retention owned by `K` or `V` carries its own lease in that
     /// value, so removal may release this node and safely return both values.
     #[must_use = "the entry claim must be acquired before the entry is inserted"]
     pub fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
@@ -179,12 +255,13 @@ impl<K, V> LeasedMap<K, V> {
 
     /// How many entries are live.
     ///
-    /// Controls only. No owner asks a leased map its size: what an owner is
-    /// bounded by is its grant, and the entry count is a second number that
-    /// could disagree with it. The count exists because the controls below have
-    /// to check that a removal removed exactly one node and no more, which the
-    /// resource ledger alone cannot say.
-    #[cfg(test)]
+    /// Controls only, including cross-crate transport-lab controls. No owner
+    /// asks a leased map its size: what an owner is bounded by is its grant, and
+    /// the entry count is a second number that could disagree with it. The
+    /// count exists because controls have to check that settlement removed
+    /// exactly one node and no more, which the resource ledger alone cannot
+    /// say.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
@@ -219,6 +296,62 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             visit(node.right.as_deref(), visit_entry);
         }
         visit(self.root.as_deref(), &mut visit_entry);
+    }
+
+    /// The greatest live key and its value, borrowed.
+    ///
+    /// One descent down the right spine and nothing else: no allocation, no
+    /// traversal of the rest of the map, and the borrow ends with the caller's
+    /// `&self`. A caller fixing an upper bound for an ordered pass needs this
+    /// one node, and reaching it through [`Self::for_each`] would visit every
+    /// entry to learn the same fact.
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        let mut node = self.root.as_deref()?;
+        while let Some(right) = node.right.as_deref() {
+            node = right;
+        }
+        Some((&node.key, &node.value))
+    }
+
+    /// The least live key strictly greater than `after`, and its value.
+    ///
+    /// `None` for `after` answers the least key in the map, so one ordered pass
+    /// is `successor_after(None)` followed by `successor_after(Some(previous))`
+    /// and needs no separate first-entry call.
+    ///
+    /// **One descent per step, not one traversal per step.** The walk keeps the
+    /// closest right-hand candidate seen so far and goes left when the current
+    /// key is a better one, so it touches the tree's depth rather than its size.
+    /// That is the whole reason this exists: a caller resuming an ordered pass
+    /// through [`Self::for_each`] performs a complete walk for every step, which
+    /// turns a pass over `n` entries into `n` full traversals while whatever
+    /// lock protects the map is held.
+    ///
+    /// `after` is a borrowed key rather than a `Borrow<Q>` bound because the
+    /// cursor a caller resumes from is a key it already holds, and the narrower
+    /// signature keeps inference at the call site unambiguous.
+    ///
+    /// Nothing is allocated and nothing is removed. The returned borrows name
+    /// nodes the map still owns, so the funding of every entry is untouched by
+    /// asking.
+    pub fn successor_after(&self, after: Option<&K>) -> Option<(&K, &V)> {
+        let mut node = self.root.as_deref();
+        let mut best: Option<&LeasedMapNode<K, V>> = None;
+        while let Some(current) = node {
+            let ahead = match after {
+                Some(after) => current.key > *after,
+                // No cursor yet, so every key is a candidate and the least one
+                // is the leftmost.
+                None => true,
+            };
+            if ahead {
+                best = Some(current);
+                node = current.left.as_deref();
+            } else {
+                node = current.right.as_deref();
+            }
+        }
+        best.map(|node| (&node.key, &node.value))
     }
 
     /// Borrow one live value satisfying `predicate` mutably.
@@ -264,14 +397,16 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         entry: ResourceLease,
     ) -> Result<(), LeasedMapInsertRefusal<K, V>> {
         let priority = self.priority(&key);
-        let node = Box::new(LeasedMapNode {
-            key,
-            value,
+        let node = FundedNode {
+            node: Box::new(LeasedMapNode {
+                key,
+                value,
+                priority,
+                left: None,
+                right: None,
+            }),
             _entry: entry,
-            priority,
-            left: None,
-            right: None,
-        });
+        };
         match Self::insert_node(&mut self.root, node) {
             Some(refused) => Err(LeasedMapInsertRefusal { _node: refused }),
             None => {
@@ -311,9 +446,9 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// the owner funded, and on a path that must not allocate to unwind — so it
     /// is written iteratively rather than recursively.
     fn insert_node(
-        slot: &mut Option<Box<LeasedMapNode<K, V>>>,
-        node: Box<LeasedMapNode<K, V>>,
-    ) -> Option<Box<LeasedMapNode<K, V>>> {
+        slot: &mut Option<FundedNode<K, V>>,
+        node: FundedNode<K, V>,
+    ) -> Option<FundedNode<K, V>> {
         let Some(mut current) = slot.take() else {
             *slot = Some(node);
             return None;
@@ -343,8 +478,9 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         child.is_some_and(|child| child.priority > priority)
     }
 
-    /// Move the left child above this node. Allocates nothing.
-    fn rotate_right(mut node: Box<LeasedMapNode<K, V>>) -> Box<LeasedMapNode<K, V>> {
+    /// Move the left child above this node. Allocates nothing, and moves each
+    /// node's lease with the link that holds it.
+    fn rotate_right(mut node: FundedNode<K, V>) -> FundedNode<K, V> {
         let mut pivot = node
             .left
             .take()
@@ -354,8 +490,9 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         pivot
     }
 
-    /// Move the right child above this node. Allocates nothing.
-    fn rotate_left(mut node: Box<LeasedMapNode<K, V>>) -> Box<LeasedMapNode<K, V>> {
+    /// Move the right child above this node. Allocates nothing, and moves each
+    /// node's lease with the link that holds it.
+    fn rotate_left(mut node: FundedNode<K, V>) -> FundedNode<K, V> {
         let mut pivot = node
             .right
             .take()
@@ -368,9 +505,9 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// Join two subtrees, every key in `left` ordering before every key in
     /// `right`. Allocates nothing.
     fn merge(
-        left: Option<Box<LeasedMapNode<K, V>>>,
-        right: Option<Box<LeasedMapNode<K, V>>>,
-    ) -> Option<Box<LeasedMapNode<K, V>>> {
+        left: Option<FundedNode<K, V>>,
+        right: Option<FundedNode<K, V>>,
+    ) -> Option<FundedNode<K, V>> {
         match (left, right) {
             (None, right) => right,
             (left, None) => left,
@@ -467,12 +604,9 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             .len
             .checked_sub(1)
             .expect("an entry was removed, so the count was not zero");
-        let LeasedMapNode {
-            key, value, _entry, ..
-        } = *node;
-        // `_entry` is released here, after the key and value it funded have
-        // been detached and are no longer this map's to account for.
-        Some((key, value))
+        // Frees the node allocation first and releases its lease after; see
+        // `FundedNode::into_entry`.
+        Some(node.into_entry())
     }
 
     /// Remove and return the first ordered entry without cloning a key.
@@ -488,10 +622,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             .len
             .checked_sub(1)
             .expect("an entry was removed, so the count was not zero");
-        let LeasedMapNode {
-            key, value, _entry, ..
-        } = *node;
-        Some((key, value))
+        Some(node.into_entry())
     }
 
     /// Remove and return the first ordered entry accepted by `predicate`.
@@ -511,10 +642,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             .len
             .checked_sub(1)
             .expect("an entry was removed, so the count was not zero");
-        let LeasedMapNode {
-            key, value, _entry, ..
-        } = *node;
-        Some((key, value))
+        Some(node.into_entry())
     }
 
     fn find<Q>(&self, key: &Q) -> Option<&LeasedMapNode<K, V>>
@@ -553,10 +681,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     ///
     /// The detached node comes back with both children taken, so its own drop
     /// is a leaf's drop and cannot recurse.
-    fn remove_node<Q>(
-        slot: &mut Option<Box<LeasedMapNode<K, V>>>,
-        key: &Q,
-    ) -> Option<Box<LeasedMapNode<K, V>>>
+    fn remove_node<Q>(slot: &mut Option<FundedNode<K, V>>, key: &Q) -> Option<FundedNode<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -577,9 +702,7 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// Detach the first ordered node without first borrowing or cloning its
     /// key. The detached node has no children, so dropping its box cannot
     /// recurse through the remaining tree.
-    fn remove_first_node(
-        slot: &mut Option<Box<LeasedMapNode<K, V>>>,
-    ) -> Option<Box<LeasedMapNode<K, V>>> {
+    fn remove_first_node(slot: &mut Option<FundedNode<K, V>>) -> Option<FundedNode<K, V>> {
         let mut current = slot.take()?;
         if current.left.is_some() {
             let removed = Self::remove_first_node(&mut current.left)
@@ -598,9 +721,9 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// so the returned box has no children and dropping it cannot recurse into
     /// the live tree.
     fn remove_first_where_node(
-        slot: &mut Option<Box<LeasedMapNode<K, V>>>,
+        slot: &mut Option<FundedNode<K, V>>,
         predicate: &mut impl FnMut(&K, &V) -> bool,
-    ) -> Option<Box<LeasedMapNode<K, V>>> {
+    ) -> Option<FundedNode<K, V>> {
         let mut current = slot.take()?;
 
         if let Some(removed) = Self::remove_first_where_node(&mut current.left, predicate) {
@@ -1024,6 +1147,243 @@ mod tests {
                 .amount(ResourceClass::OpaqueDependencyResidual),
             0,
             "no entry's allocation residual outlived the map that held it"
+        );
+    }
+
+    /// The ordered cursor answers the exact lower bound, and the greatest key.
+    ///
+    /// Every clause is a way a successor walk is got wrong. Strictness, so a
+    /// caller resuming after the entry it just handled is not handed that same
+    /// entry again forever. An absent cursor key, because a caller's cursor
+    /// names an entry that may have been removed since — the answer must be the
+    /// next live key, not nothing. Past the end, because a pass has to finish.
+    /// And `None` for the cursor answering the least key, because that is what
+    /// lets one pass be a single operation repeated rather than a first-entry
+    /// call followed by a different one.
+    ///
+    /// The keys are inserted out of order so nothing here would pass against a
+    /// structure that ignored its priorities and chained entries in arrival
+    /// order.
+    #[test]
+    fn v4_r3_core_the_ordered_cursor_answers_the_exact_lower_bound() {
+        let dropped = drop_log();
+        let (_provider, port, scope) = control_provider(4);
+        let mut map: LeasedMap<u32, ControlValue> = LeasedMap::new();
+
+        assert!(
+            map.successor_after(None).is_none(),
+            "an empty map has no least key"
+        );
+        assert!(map.last_key_value().is_none(), "and no greatest key either");
+
+        for key in [30u32, 10, 40, 20] {
+            map.insert(
+                key,
+                control_value(key, &dropped, &port, &scope),
+                control_lease(&port, &scope),
+            )
+            .expect("the control grant funds this entry");
+        }
+
+        let key_after = |map: &LeasedMap<u32, ControlValue>, after: Option<u32>| {
+            map.successor_after(after.as_ref()).map(|(key, _)| *key)
+        };
+
+        assert_eq!(
+            key_after(&map, None),
+            Some(10),
+            "no cursor answers the least"
+        );
+        assert_eq!(
+            key_after(&map, Some(10)),
+            Some(20),
+            "the successor is strictly greater, so a cursor cannot answer itself"
+        );
+        assert_eq!(
+            key_after(&map, Some(25)),
+            Some(30),
+            "a cursor naming no live entry still answers the next live one"
+        );
+        assert_eq!(
+            key_after(&map, Some(40)),
+            None,
+            "and the last has no successor"
+        );
+        assert_eq!(
+            key_after(&map, Some(41)),
+            None,
+            "nor does a cursor past every entry"
+        );
+        assert_eq!(
+            map.last_key_value().map(|(key, _)| *key),
+            Some(40),
+            "the greatest key is the greatest, not the last inserted"
+        );
+
+        // The bound follows the map rather than being remembered from the walk
+        // that established it.
+        map.remove(&40).expect("the greatest entry is removed");
+        assert_eq!(map.last_key_value().map(|(key, _)| *key), Some(30));
+        assert_eq!(key_after(&map, Some(30)), None);
+    }
+
+    /// One ordered pass costs one descent per step, not one traversal per step.
+    ///
+    /// **The counter is the observation and it is exact.** `CountedKey` counts
+    /// every order comparison the map makes, so what is asserted is work the
+    /// implementation really did rather than elapsed time or an inspection of
+    /// its shape. A pass driven by a complete walk per step — which is what a
+    /// caller resuming through `for_each` performs — compares at least once per
+    /// live entry on every step, so `n` steps cost at least `n * n`. The bound
+    /// below is far under that and comfortably over one descent per step.
+    ///
+    /// `1024` entries make the two shapes separate by more than an order of
+    /// magnitude: a per-step traversal costs at least 1_048_576 comparisons,
+    /// while a descent costs the tree's depth — expected near fourteen — for a
+    /// pass total near 14_000. The assertion is set at 32_768 so it is neither
+    /// a restatement of the expected figure nor reachable by the shape it
+    /// excludes, and so a randomized treap's depth variation cannot reach it.
+    ///
+    /// Asking is also free of the provider: the ledger is read on both sides of
+    /// the pass and must not move, because a borrowed cursor that allocated or
+    /// released would be doing something a caller holding a lock did not ask
+    /// for.
+    #[test]
+    fn v4_r3_core_an_ordered_pass_walks_one_descent_per_step() {
+        use std::hash::Hasher;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        /// A key that reports how often the map compared it.
+        #[derive(Clone)]
+        struct CountedKey {
+            key: u32,
+            compares: Arc<AtomicUsize>,
+        }
+
+        impl PartialEq for CountedKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other).is_eq()
+            }
+        }
+        impl Eq for CountedKey {}
+        impl PartialOrd for CountedKey {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for CountedKey {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.compares.fetch_add(1, AtomicOrdering::Relaxed);
+                self.key.cmp(&other.key)
+            }
+        }
+        // Hashed by the ordering key alone: the counter is instrumentation and
+        // must not make two equal keys hash differently.
+        impl std::hash::Hash for CountedKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.key.hash(state);
+            }
+        }
+
+        const ENTRIES: u32 = 1024;
+        const COMPARISON_CEILING: usize = 32 * ENTRIES as usize;
+
+        let entry = LeasedMap::<CountedKey, u32>::entry_claim()
+            .expect("the counted entry claim is representable");
+        let scope_record = FiniteResourceProvider::scope_record_charge_for_test();
+        let node = entry
+            .checked_add(scope_record)
+            .expect("the counted entry plus its reservation record is representable");
+        let grant = (0..ENTRIES)
+            .try_fold(scope_record, |total, _| total.checked_add(node))
+            .expect("the bounded counted grant is representable");
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone())
+            .expect("the counted grant accounts for the process scope");
+        let scope = port.process_scope();
+
+        let compares = Arc::new(AtomicUsize::new(0));
+        let mut map: LeasedMap<CountedKey, u32> = LeasedMap::new();
+        // Arrival order is scrambled by an odd stride over a power-of-two ring,
+        // which visits every key exactly once and in no useful order.
+        for step in 0..ENTRIES {
+            let key = step.wrapping_mul(613) % ENTRIES;
+            map.insert(
+                CountedKey {
+                    key,
+                    compares: Arc::clone(&compares),
+                },
+                key,
+                port.acquire(&scope, ResourceAuthorityClass::Admitted, entry)
+                    .expect("the counted grant funds this entry"),
+            )
+            .expect("every key in the ring is distinct");
+        }
+
+        // Read per dimension rather than as a whole claim: the claim type is
+        // deliberately not `Debug`, and naming the two dimensions an entry
+        // actually moves says what a drift would have been.
+        let held = |provider: &FiniteResourceProvider| {
+            (
+                provider
+                    .in_use()
+                    .amount(ResourceClass::AccountedMemoryBytes),
+                provider
+                    .in_use()
+                    .amount(ResourceClass::OpaqueDependencyResidual),
+            )
+        };
+        let before = held(&provider);
+        // Only the pass is measured. Building the map compared too, and those
+        // comparisons are not what this control is about.
+        compares.store(0, AtomicOrdering::Relaxed);
+
+        let mut cursor: Option<CountedKey> = None;
+        let mut seen = 0usize;
+        let mut previous: Option<u32> = None;
+        loop {
+            let Some((key, value)) = map.successor_after(cursor.as_ref()) else {
+                break;
+            };
+            assert_eq!(
+                key.key, *value,
+                "the cursor answers a key with its own value"
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    key.key > previous,
+                    "the pass is strictly increasing, so nothing is revisited: \
+                     {previous} then {}",
+                    key.key
+                );
+            }
+            previous = Some(key.key);
+            seen += 1;
+            cursor = Some(key.clone());
+        }
+
+        assert_eq!(
+            seen, ENTRIES as usize,
+            "non-vacuity: the pass reached every entry exactly once"
+        );
+        let walked = compares.load(AtomicOrdering::Relaxed);
+        assert!(
+            walked > 0,
+            "non-vacuity: the pass really did compare keys, so the ceiling below \
+             is a bound on work that happened"
+        );
+        assert!(
+            walked < COMPARISON_CEILING,
+            "one ordered pass over {ENTRIES} entries compared {walked} times; a \
+             traversal-per-step shape costs at least {} and this ceiling is \
+             {COMPARISON_CEILING}",
+            ENTRIES as usize * ENTRIES as usize
+        );
+        assert_eq!(
+            held(&provider),
+            before,
+            "and the pass acquired and released nothing: a borrowed cursor is \
+             not an allocation the caller has to fund"
         );
     }
 }

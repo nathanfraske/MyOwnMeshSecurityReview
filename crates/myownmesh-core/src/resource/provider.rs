@@ -660,6 +660,40 @@ pub trait ResourceProvider: Send + Sync + 'static {
         claim: ResourceClaim,
     );
 
+    /// Add one holder to a live reservation.
+    ///
+    /// The claim does not change: this is bookkeeping on an allocation that was
+    /// already admitted, and it is how several owners of one shared allocation
+    /// come to hold exactly one funding between them. The provider records the
+    /// count in the reservation record it already keeps, so a second holder
+    /// costs no second record and no further capacity.
+    ///
+    /// Refuses rather than saturates. A count that wrapped would let the final
+    /// decrement arrive early and release a claim whose allocation was still
+    /// live, which is the precise failure this whole mechanism exists to
+    /// prevent.
+    fn retain_shared(
+        &self,
+        provider_authority: &ResourceProviderAuthority,
+        reservation_id: u64,
+        scope_id: ResourceScopeId,
+    ) -> Result<(), ResourceUnavailable>;
+
+    /// Remove one holder, releasing the claim if and only if it was the last.
+    ///
+    /// The counterpart to [`ResourceProvider::retain_shared`]. For a singly
+    /// held reservation this is exactly [`ResourceProvider::release`]; for a
+    /// multiply held one it returns capacity to nobody until the final holder
+    /// is gone.
+    fn release_shared(
+        &self,
+        provider_authority: &ResourceProviderAuthority,
+        reservation_id: u64,
+        scope_id: ResourceScopeId,
+        authority: ResourceAuthorityClass,
+        claim: ResourceClaim,
+    );
+
     /// Consume a reservation whose underlying cleanup failed.
     ///
     /// The provider must retain the exact charge. It must not make that
@@ -1210,6 +1244,291 @@ impl Drop for ResourceLease {
     }
 }
 
+/// One reservation held by several owners at once.
+///
+/// The counterpart to [`ResourceLease`] for an allocation that genuinely has
+/// more than one owner — an `Arc` whose clones outlive each other in no fixed
+/// order. Cloning this adds a holder to the *same* reservation rather than
+/// taking out a second one, so the allocation is funded exactly once no matter
+/// how many handles exist, and the claim goes back on the final drop and not
+/// before.
+///
+/// **No new allocation.** The holder count lives in the reservation record the
+/// provider already keeps, and this handle is the same inline fields
+/// [`ResourceLease`] has. Sharing therefore costs no second record, which is
+/// what keeps the accounting exact rather than merely conservative.
+///
+/// **Deliberately not convertible back.** There is no way to turn this into a
+/// [`ResourceLease`], and it has neither `transition` nor
+/// `retain_after_failed_cleanup`. Both of those speak for a whole reservation,
+/// and a holder that shares one cannot speak for the owners it does not know
+/// about. Making them unspellable is the enforcement; the provider also refuses
+/// an outright `release` of a multiply held reservation, so neither layer
+/// relies on the other being careful.
+///
+/// **Private, and never re-exported.** This type is clonable, and a clone that
+/// could be obtained on its own would be a reservation token separated from the
+/// allocation it funds — attach two such clones to two different `Arc`s and one
+/// claim would silently fund both. So it is reachable only through
+/// [`FundedArc`] and [`FundedWeak`], whose `clone`, `downgrade` and `upgrade`
+/// are the only callers of `Clone` here and always move a pointer alongside it.
+/// Construction takes an exclusive [`ResourceLease`] by value and converts it
+/// internally, so a caller never holds one of these to hand out twice.
+struct SharedResourceLease {
+    provider: Arc<dyn ResourceProvider>,
+    reservation_id: Option<u64>,
+    scope: ResourceScope,
+    authority: ResourceAuthorityClass,
+    claim: ResourceClaim,
+}
+
+impl fmt::Debug for SharedResourceLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedResourceLease")
+            .field("scope_id", &self.scope.id())
+            .field("authority", &self.authority)
+            .field("claim", &self.claim)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedResourceLease {
+    /// Take over an exclusive lease's reservation without releasing it.
+    ///
+    /// The lease's reservation is moved across, so the incoming lease drops
+    /// having released nothing and the claim never lapses in between.
+    ///
+    /// **A speculative lease is refused, and comes back intact.** A speculative
+    /// reservation carries a reclaim target: the provider may ask its owner to
+    /// retire. Sharing it would leave no single owner able to answer that, so
+    /// the refusal returns the lease itself rather than an error code — the
+    /// caller is left holding exactly the funding it arrived with, which is the
+    /// only refusal that cannot leak.
+    fn from_lease(mut lease: ResourceLease) -> Result<Self, ResourceLease> {
+        if lease.authority == ResourceAuthorityClass::Speculative {
+            return Err(lease);
+        }
+        // Taken, not copied: the lease must not also release this reservation
+        // when it drops at the end of this call.
+        let reservation_id = lease.reservation_id.take();
+        Ok(Self {
+            provider: Arc::clone(&lease.provider),
+            reservation_id,
+            scope: lease.scope.clone(),
+            authority: lease.authority,
+            claim: lease.claim,
+        })
+    }
+}
+
+/// Cloning adds a holder to the one reservation this handle already owns.
+///
+/// **Why this is allowed to be infallible.** `Clone` cannot report a refusal,
+/// so the holder increment must not be one that can legitimately fail. It is
+/// not: the count is bounded by the number of live handles, and every one of
+/// those required a successful `Arc` or `Weak` clone first, so exhausting a
+/// `u64` of them is unreachable for exactly the reason exhausting `Arc`'s own
+/// count is. The provider still checks rather than assuming, and a violated
+/// invariant panics rather than wrapping — the same choice `Arc::clone` makes
+/// when it aborts past `isize::MAX`. A wrapped count would let the final
+/// decrement arrive early and release a claim whose allocation was still live,
+/// which is the precise failure this type exists to prevent.
+impl Clone for SharedResourceLease {
+    fn clone(&self) -> Self {
+        let reservation_id = self
+            .reservation_id
+            .expect("a live shared lease always owns its reservation");
+        self.provider
+            .retain_shared(
+                &self.scope.inner.provider_authority,
+                reservation_id,
+                self.scope.id(),
+            )
+            .expect("a live shared reservation admits another holder");
+        Self {
+            provider: Arc::clone(&self.provider),
+            reservation_id: Some(reservation_id),
+            scope: self.scope.clone(),
+            authority: self.authority,
+            claim: self.claim,
+        }
+    }
+}
+
+impl Drop for SharedResourceLease {
+    fn drop(&mut self) {
+        if let Some(reservation_id) = self.reservation_id.take() {
+            self.provider.release_shared(
+                &self.scope.inner.provider_authority,
+                reservation_id,
+                self.scope.id(),
+                self.authority,
+                self.claim,
+            );
+        }
+    }
+}
+
+/// A shared allocation and the funding that outlives it.
+///
+/// **The token is a sibling of the pointer, declared after it.** On the final
+/// handle's drop the `Arc` goes first — which is when the allocation is
+/// actually freed, since no strong and no weak reference remains — and only
+/// then does the token decrement and release the claim. A lease stored *inside*
+/// the pointee would instead be released by the pointee's own drop glue, while
+/// the allocation was still there, which is the defect this type exists to make
+/// unspellable.
+///
+/// Clones follow the same order: pointer first, token second. Every handle,
+/// strong or weak, carries a token, so the reservation stays live for as long
+/// as any of them can still reach the allocation.
+///
+/// There is no accessor returning the inner `Arc`. Handing one out would let a
+/// caller keep the allocation reachable after the last funded handle had gone,
+/// which is the same false release wearing a different shape.
+pub struct FundedArc<T: ?Sized> {
+    value: Arc<T>,
+    _shared: SharedResourceLease,
+}
+
+/// A weak handle that keeps its allocation's funding alive.
+///
+/// A live [`std::sync::Weak`] keeps the shared allocation itself alive — the
+/// strong count reaching zero destroys the value but not the storage — so a
+/// weak observer that carried no funding would be pointing at accounted memory
+/// the provider had been told was free. This carries a token for that reason,
+/// and the claim is released only once every handle of either kind is gone.
+pub struct FundedWeak<T: ?Sized> {
+    value: std::sync::Weak<T>,
+    _shared: SharedResourceLease,
+}
+
+impl<T> FundedArc<T> {
+    /// Fund and share one new allocation.
+    ///
+    /// Takes the exclusive lease **by value** and converts it internally. The
+    /// shared token is never a thing a caller holds, so it cannot be cloned
+    /// away from its allocation and attached to a second one — one lease in,
+    /// one allocation funded, and no way to spell anything else.
+    ///
+    /// A speculative lease is refused and handed straight back, still funding
+    /// exactly what it funded on the way in: a speculative reservation may be
+    /// asked to retire, and no single holder of a shared one could answer that.
+    pub fn new(value: T, funding: ResourceLease) -> Result<Self, ResourceLease> {
+        let shared = SharedResourceLease::from_lease(funding)?;
+        Ok(Self {
+            value: Arc::new(value),
+            _shared: shared,
+        })
+    }
+}
+
+impl<T: ?Sized> FundedArc<T> {
+    /// Adopt an `Arc` that was already built and already admitted.
+    ///
+    /// The one way to hold an unsized pointee — `Arc<dyn Fn(..)>` and the like —
+    /// since unsizing has to happen at the `Arc::new` that this crate performs
+    /// before wrapping. Crate-private precisely because the caller supplies the
+    /// pointer: an outside caller could pass one it had kept a second copy of,
+    /// and the funding would then describe an allocation with a reachable
+    /// unfunded alias. Callers outside this crate build through
+    /// [`FundedArc::new`], which cannot have that problem because it allocates
+    /// the value itself.
+    ///
+    /// Nothing escapes afterwards: there is still no accessor handing the
+    /// pointer back out, and as with [`FundedArc::new`] the exclusive lease is
+    /// taken by value and internalized, so no shared token is ever in a
+    /// caller's hands to clone onto a second allocation.
+    pub(crate) fn from_admitted_arc(
+        value: Arc<T>,
+        funding: ResourceLease,
+    ) -> Result<Self, ResourceLease> {
+        let shared = SharedResourceLease::from_lease(funding)?;
+        Ok(Self {
+            value,
+            _shared: shared,
+        })
+    }
+
+    /// A weak handle that keeps this allocation's funding alive.
+    pub fn downgrade(&self) -> FundedWeak<T> {
+        // Pointer first, token second — the same order as `clone`.
+        let value = Arc::downgrade(&self.value);
+        let shared = self._shared.clone();
+        FundedWeak {
+            value,
+            _shared: shared,
+        }
+    }
+
+    /// Whether two handles name the same allocation.
+    ///
+    /// Exposes the *answer*, not the pointer. An owner proving that the handle
+    /// it is holding is the exact one a table still records — rather than a
+    /// successor that legitimately took its place — needs this comparison and
+    /// nothing else, and giving it the comparison keeps the `Arc` itself from
+    /// escaping. Without it a caller would have to invent a second identity to
+    /// compare, which is the drift this type exists to prevent.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        Arc::ptr_eq(&this.value, &other.value)
+    }
+
+    /// How many strong handles share this allocation. Controls only.
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.value)
+    }
+}
+
+impl<T: ?Sized> Clone for FundedArc<T> {
+    fn clone(&self) -> Self {
+        // The pointer is cloned before the token, so a panic in the token's
+        // increment cannot leave a strong reference behind with no holder
+        // recorded for it.
+        let value = Arc::clone(&self.value);
+        let shared = self._shared.clone();
+        Self {
+            value,
+            _shared: shared,
+        }
+    }
+}
+
+impl<T: ?Sized> std::ops::Deref for FundedArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T: ?Sized> FundedWeak<T> {
+    /// A strong handle, if the value is still live.
+    ///
+    /// The allocation is funded either way — this handle's own token saw to
+    /// that — so upgrading only decides whether the *value* is still there.
+    pub fn upgrade(&self) -> Option<FundedArc<T>> {
+        let value = self.value.upgrade()?;
+        let shared = self._shared.clone();
+        Some(FundedArc {
+            value,
+            _shared: shared,
+        })
+    }
+}
+
+impl<T: ?Sized> Clone for FundedWeak<T> {
+    fn clone(&self) -> Self {
+        let value = std::sync::Weak::clone(&self.value);
+        let shared = self._shared.clone();
+        Self {
+            value,
+            _shared: shared,
+        }
+    }
+}
+
 /// Result of a cooperative resource acquisition.
 #[must_use = "a pending demand owns a fairness turn and dropping it cancels that turn"]
 #[derive(Debug)]
@@ -1362,6 +1681,19 @@ mod finite {
         claim: ResourceClaim,
         lifecycle: ReservationLifecycle,
         reclaim_target: Option<ResourceReclaimTarget>,
+        /// How many owners hold this one reservation.
+        ///
+        /// One for every reservation an ordinary [`ResourceLease`] owns, and
+        /// that never changes: only a shared reservation moves this, and only
+        /// through `retain_shared` and `release_shared`. The claim is released
+        /// by the final decrement and by nothing else, which is what lets
+        /// several owners of one `Arc` allocation keep exactly one funding
+        /// alive between them.
+        ///
+        /// This is a field of the record the provider already keeps, not a new
+        /// record: sharing a reservation allocates nothing and prices nothing
+        /// extra. See `bookkeeping_claim`.
+        holders: u64,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2668,6 +3000,7 @@ mod finite {
                             claim,
                             lifecycle: ReservationLifecycle::Live,
                             reclaim_target: pending.reclaim_target,
+                            holders: 1,
                         },
                     );
                     state.in_use = next;
@@ -2989,6 +3322,7 @@ mod finite {
                     claim,
                     lifecycle: ReservationLifecycle::Live,
                     reclaim_target: None,
+                    holders: 1,
                 },
             );
             state.in_use = replacement;
@@ -3097,6 +3431,7 @@ mod finite {
                         claim,
                         lifecycle: ReservationLifecycle::Live,
                         reclaim_target: Some(reclaim_target),
+                        holders: 1,
                     },
                 );
                 // Recorded only here, once the whole atomic transaction has
@@ -3256,6 +3591,7 @@ mod finite {
                     claim,
                     lifecycle: ReservationLifecycle::Live,
                     reclaim_target: None,
+                    holders: 1,
                 },
             );
             state.in_use = replacement;
@@ -3321,6 +3657,7 @@ mod finite {
                         claim,
                         lifecycle: ReservationLifecycle::Live,
                         reclaim_target,
+                        holders: 1,
                     },
                 );
                 #[cfg(test)]
@@ -3446,6 +3783,7 @@ mod finite {
                     claim,
                     lifecycle: ReservationLifecycle::Live,
                     reclaim_target: Some(reclaim_target),
+                    holders: 1,
                 },
             );
             state.in_use = replacement;
@@ -3738,6 +4076,12 @@ mod finite {
             if reservation.scope_id != scope_id
                 || reservation.authority != authority
                 || reservation.claim != claim
+                // A multiply held reservation must never reach an outright
+                // release: its capacity belongs to owners this call does not
+                // speak for. `release_shared` decrements down to one holder and
+                // only then delegates here, so anything else arriving with a
+                // count above one is a caller that bypassed the shared handle.
+                || reservation.holders != 1
             {
                 Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                 return;
@@ -3754,6 +4098,124 @@ mod finite {
             state.free_reservation_ids.insert(reservation_id);
             state.in_use = next;
             Self::arbitrate(&mut state);
+        }
+
+        /// One more owner of an already-admitted reservation.
+        ///
+        /// Deliberately touches nothing but the count. `in_use` does not move,
+        /// no arbitration runs, and no reclaim decision is revisited, because
+        /// nothing about the provider's capacity has changed — the same claim
+        /// is simply held by one more owner than before.
+        fn retain_shared(
+            &self,
+            provider_authority: &ResourceProviderAuthority,
+            reservation_id: u64,
+            scope_id: ResourceScopeId,
+        ) -> Result<(), ResourceUnavailable> {
+            let mut state = self.lock_state();
+            Self::require_provider_authority(&state, provider_authority)?;
+            if !state.scopes.contains_key(&scope_id) {
+                Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                return Err(ResourceUnavailable::ProviderInvariant {
+                    dimension: ResourceClass::OpaqueDependencyResidual,
+                });
+            }
+            let Some(reservation) = state.reservations.get(&reservation_id) else {
+                Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                return Err(ResourceUnavailable::ProviderInvariant {
+                    dimension: ResourceClass::OpaqueDependencyResidual,
+                });
+            };
+            // A retired or reclaiming reservation must not gain owners: the
+            // holder that would arrive is one this provider has already decided
+            // the fate of.
+            if reservation.scope_id != scope_id
+                || reservation.lifecycle != ReservationLifecycle::Live
+                || reservation.holders == 0
+            {
+                Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                return Err(ResourceUnavailable::ProviderInvariant {
+                    dimension: ResourceClass::OpaqueDependencyResidual,
+                });
+            }
+            let Some(next) = reservation.holders.checked_add(1) else {
+                Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                return Err(ResourceUnavailable::ProviderInvariant {
+                    dimension: ResourceClass::OpaqueDependencyResidual,
+                });
+            };
+            state
+                .reservations
+                .get_mut(&reservation_id)
+                .expect("the reservation was found under this same held lock")
+                .holders = next;
+            Ok(())
+        }
+
+        /// One fewer owner, and a full release only for the last of them.
+        ///
+        /// The lock is released before delegating, because [`Self::release`]
+        /// takes it again and this provider's state mutex is not reentrant.
+        fn release_shared(
+            &self,
+            provider_authority: &ResourceProviderAuthority,
+            reservation_id: u64,
+            scope_id: ResourceScopeId,
+            authority: ResourceAuthorityClass,
+            claim: ResourceClaim,
+        ) {
+            {
+                let mut state = self.lock_state();
+                if Self::require_provider_authority(&state, provider_authority).is_err() {
+                    return;
+                }
+                if !state.scopes.contains_key(&scope_id) {
+                    Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                    return;
+                }
+                let Some(reservation) = state.reservations.get(&reservation_id) else {
+                    Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                    return;
+                };
+                // The same exact reservation identity `release` demands, checked
+                // on the non-final path too. A decrement is a claim on ownership
+                // of this reservation, so it has to prove the same thing an
+                // outright release proves — otherwise the one path that changes
+                // no capacity would be the one path that never checked whose
+                // capacity it was.
+                //
+                // Lifecycle is deliberately not constrained here: a retiring
+                // reservation must remain releasable by its owners, and only
+                // `retain_shared` requires a `Live` one, because gaining an
+                // owner is the operation that would contradict a decision the
+                // provider has already taken.
+                let holders = reservation.holders;
+                if reservation.scope_id != scope_id
+                    || reservation.authority != authority
+                    || reservation.claim != claim
+                    || holders == 0
+                {
+                    Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
+                    return;
+                }
+                if holders > 1 {
+                    // Not the last owner. Capacity stays exactly where it is:
+                    // the allocation this claim funds is still reachable.
+                    state
+                        .reservations
+                        .get_mut(&reservation_id)
+                        .expect("the reservation was found under this same held lock")
+                        .holders = holders - 1;
+                    return;
+                }
+            }
+            self.release(
+                provider_authority,
+                reservation_id,
+                scope_id,
+                authority,
+                claim,
+            );
         }
 
         fn retain_after_failed_cleanup(
@@ -8168,5 +8630,120 @@ mod tests {
                 .expect("third scope receives next turn"),
         );
         drop(third_lease);
+    }
+
+    /// One claim funds one shared allocation, and funds it until the last
+    /// handle of *either* kind is gone.
+    ///
+    /// Three separate things would each break this, and each is asserted apart
+    /// from the others rather than folded into one end-to-end number:
+    ///
+    /// - **Cloning must share, not re-acquire.** If a clone took out its own
+    ///   reservation the ledger would climb with every handle, so the grant is
+    ///   deliberately far larger than one unit — a control that could only fail
+    ///   by running out of capacity would be measuring the wrong thing. The
+    ///   assertion is that `in_use` does not move at all across three strong
+    ///   clones and a weak one.
+    /// - **A weak handle must keep the funding.** This is the discriminating
+    ///   arm. Dropping every strong handle destroys the value but *not* the
+    ///   allocation, because a live `Weak` keeps the backing storage alive. A
+    ///   design that released on the last strong drop would pass every other
+    ///   assertion here and still be telling the provider that occupied memory
+    ///   was free. `upgrade` returning `None` is what proves the value really
+    ///   is gone at that point, so the funding that remains is funding for
+    ///   storage and not for a value still in use.
+    /// - **The last handle must release exactly the original claim.** Not less,
+    ///   which would leak; not more, which would mean the shared handles had
+    ///   been charged for separately after all.
+    #[test]
+    fn v4_r3_core_one_claim_funds_a_shared_allocation_until_its_last_handle() {
+        let grant = claim(&[
+            (ResourceClass::QueuedBytes, 8),
+            (ResourceClass::OpaqueDependencyResidual, 4096),
+        ]);
+        let provider = DeterministicGrantProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
+        let scope = port.process_scope();
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+        let idle = provider.in_use().amount(ResourceClass::QueuedBytes);
+        let lease = port
+            .acquire(&scope, ResourceAuthorityClass::Admitted, one)
+            .expect("the grant funds one shared allocation");
+        let funded = FundedArc::new(7_u32, lease).expect("an admitted lease may be shared");
+        let held = provider.in_use().amount(ResourceClass::QueuedBytes);
+        assert_eq!(held, idle + 1, "the allocation is funded exactly once");
+
+        let second = funded.clone();
+        let third = funded.clone();
+        let weak = funded.downgrade();
+        assert_eq!(
+            provider.in_use().amount(ResourceClass::QueuedBytes),
+            held,
+            "four handles share one reservation and take out no second one"
+        );
+        assert_eq!(*second, 7, "a clone reaches the same value");
+        assert_eq!(*third, 7);
+        assert_eq!(funded.strong_count(), 3);
+
+        drop((funded, second, third));
+        assert!(
+            weak.upgrade().is_none(),
+            "every strong handle is gone, so the value is destroyed"
+        );
+        assert_eq!(
+            provider.in_use().amount(ResourceClass::QueuedBytes),
+            held,
+            "a live weak handle still reaches the allocation, so the funding stays"
+        );
+
+        drop(weak);
+        assert_eq!(
+            provider.in_use().amount(ResourceClass::QueuedBytes),
+            idle,
+            "the final handle releases exactly the claim the first one took"
+        );
+    }
+
+    /// A speculative lease is refused for sharing, and comes back funding
+    /// exactly what it funded before.
+    ///
+    /// The refusal returns the lease itself rather than an error code, so the
+    /// arm that matters is the ledger: a refusal that dropped the lease on the
+    /// way out would look like a clean rejection and would silently release the
+    /// caller's funding underneath it.
+    #[test]
+    fn v4_r3_core_a_speculative_lease_is_refused_for_sharing_and_keeps_its_funding() {
+        let grant = claim(&[
+            (ResourceClass::QueuedBytes, 4),
+            (ResourceClass::OpaqueDependencyResidual, 4096),
+        ]);
+        let provider = DeterministicGrantProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone()).expect("process bookkeeping");
+        let scope = port.process_scope();
+        let one = ResourceClaim::single(ResourceClass::QueuedBytes, 1);
+
+        let idle = provider.in_use().amount(ResourceClass::QueuedBytes);
+        let lease = port
+            .acquire(&scope, ResourceAuthorityClass::Speculative, one)
+            .expect("the grant funds one speculative allocation");
+        let held = provider.in_use().amount(ResourceClass::QueuedBytes);
+        assert_eq!(held, idle + 1);
+
+        let returned = FundedArc::new(7_u32, lease)
+            .err()
+            .expect("a speculative reservation may not be shared");
+        assert_eq!(
+            provider.in_use().amount(ResourceClass::QueuedBytes),
+            held,
+            "the refused lease still funds its allocation"
+        );
+
+        drop(returned);
+        assert_eq!(
+            provider.in_use().amount(ResourceClass::QueuedBytes),
+            idle,
+            "and releases normally when the caller is done with it"
+        );
     }
 }

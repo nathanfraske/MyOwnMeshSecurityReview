@@ -301,6 +301,39 @@ struct QueuedInboundUnit {
     _payload: RealtimePayloadLease,
 }
 
+impl QueuedInboundUnit {
+    /// Turn one whole delivery into one whole queue entry.
+    ///
+    /// **A move, not a split.** There is no accessor anywhere that hands back a
+    /// delivery's parts — no tuple, no bare payload lease — because a shape that
+    /// produces three bindings is a shape in which some later refusal can drop
+    /// one of them while the others are still standing. This reads the parent
+    /// module's private fields directly, which a child module may do, and the
+    /// only fallible step is the last expression: once it succeeds the entry
+    /// exists, and nothing after it can refuse.
+    ///
+    /// A delivery with no lease is refused here, and refusing costs nothing that
+    /// matters — the label and unit bound above it fall together at the same
+    /// return, and there is no lease among them to strand. Only the realtime
+    /// queue mints one and it attaches before it queues, so this is a shape
+    /// production cannot produce in the first place.
+    ///
+    /// Every check a caller wants to make *before* this is a question about the
+    /// label, which it can borrow while the delivery is still whole.
+    fn from_delivery(delivery: RealtimeInboundDelivery) -> Option<Self> {
+        let RealtimeInboundDelivery {
+            label,
+            unit,
+            payload,
+        } = delivery;
+        Some(Self {
+            label,
+            unit,
+            _payload: payload?,
+        })
+    }
+}
+
 /// The reader an inbound consumer awaits: one whole unit per arrival.
 ///
 /// A wrapper rather than the raw stream reader, so the payload lease inside a
@@ -1095,27 +1128,30 @@ impl SessionRealtimeFlows {
     /// to take it; a unit for a flow that has gone is dropped with its lease,
     /// which releases the bytes rather than stranding them.
     ///
-    /// **Takes the delivery whole, and splits it here.** The engine drives this
-    /// — it is where the promoted session's flow set lives, and the connector
-    /// cannot deliver anything because it holds no session — but the engine must
-    /// never hold the three parts separately. A `RealtimePayloadLease` in the
-    /// engine's hands is an accounting claim it could drop independently of the
-    /// unit it belongs to, so the type stays inside `transport::webrtc` and the
-    /// split happens on this side of that line. `pub(crate)` on this method
-    /// exposes only the opaque delivery.
+    /// **Takes the delivery whole, and never holds it in pieces.** The engine
+    /// drives this — it is where the promoted session's flow set lives, and the
+    /// connector cannot deliver anything because it holds no session — but the
+    /// engine must never hold the three parts separately. A
+    /// `RealtimePayloadLease` in the engine's hands is an accounting claim it
+    /// could drop independently of the unit it belongs to, so the type stays
+    /// inside `transport::webrtc`. `pub(crate)` on this method exposes only the
+    /// opaque delivery.
     ///
-    /// A delivery that arrives without a lease is refused before anything is
-    /// looked up. Only the realtime queue mints one and it attaches before it
-    /// queues, so a leaseless delivery did not come through the accounting path
-    /// at all. The refusal belongs here rather than ahead of the fence because
-    /// splitting the delivery is what reveals it, and one place deciding what a
-    /// leaseless delivery means is worth more than saving a lock acquisition on
-    /// a path that cannot occur.
+    /// **Every refusal happens while the delivery is still whole.** The flow
+    /// lookup, the direction check and the queue-record reservation all read a
+    /// borrowed label, so a refusal here drops one value — unit and payload
+    /// lease together — rather than dropping a lease whose unit is still bound
+    /// in a local. The conversion is the last step and cannot fail after it
+    /// starts, which is what makes "the parts exist separately" untrue rather
+    /// than merely unlikely.
+    ///
+    /// A delivery that arrives without a lease is refused by that conversion,
+    /// which is the only thing that can see it. Only the realtime queue mints
+    /// one and it attaches before it queues, so a leaseless delivery did not come
+    /// through the accounting path at all; it costs a queue record that is
+    /// released on the way out, on a path that cannot occur.
     pub(crate) fn deliver_inbound(&self, delivery: RealtimeInboundDelivery) -> bool {
-        let Some((label, unit, payload)) = delivery.into_parts() else {
-            return false;
-        };
-        let Some(flow) = self.flows.get(label.name().as_bytes()) else {
+        let Some(flow) = self.flows.get(delivery.label().name().as_bytes()) else {
             return false;
         };
         if !matches!(flow.queue, FlowQueue::Inbound) {
@@ -1123,22 +1159,18 @@ impl SessionRealtimeFlows {
         }
         // The node this arrival will wait in, funded against the flow that
         // received it. An owner with nothing left to give refuses here, and the
-        // unit is dropped with its payload lease — which releases the bytes
-        // rather than queueing them unaccounted.
+        // whole delivery is dropped — which releases the bytes with the unit
+        // they belong to rather than queueing them unaccounted.
         let Ok(record) = flow
             .port
             .reserve_queue_record_checked::<QueuedInboundUnit>()
         else {
             return false;
         };
-        self.arrivals.push(
-            QueuedInboundUnit {
-                label,
-                unit,
-                _payload: payload,
-            },
-            record,
-        );
+        let Some(queued) = QueuedInboundUnit::from_delivery(delivery) else {
+            return false;
+        };
+        self.arrivals.push(queued, record);
         true
     }
 

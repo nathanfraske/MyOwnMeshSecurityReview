@@ -28,11 +28,11 @@ use super::*;
 fn remove_channel_member(
     tables: &mut RegistryTables,
     key: &ClaimKey,
-    client: ClientId,
+    membership: ChannelMembershipId,
 ) -> Option<RetiredRoute> {
     let empty = match tables.channel_subs.get_mut(key) {
         Some(route) => {
-            route.members.remove(&client);
+            route.members.remove(&membership);
             !route.members.any_value(|_| true)
         }
         None => return None,
@@ -188,6 +188,7 @@ impl ClientRegistry {
                 next_id: AtomicU64::new(0),
                 next_call_stream_id: AtomicU64::new(0),
                 next_operation_id: AtomicU64::new(0),
+                next_membership_id: AtomicU64::new(0),
                 next_handler_generation: AtomicU64::new(0),
                 idle: tokio::sync::Notify::new(),
                 closing: tokio::sync::Notify::new(),
@@ -525,7 +526,7 @@ impl ClientRegistry {
     pub fn register(
         &self,
         writer_tx: ResourceMailboxSender<ServerOut>,
-    ) -> Result<Arc<ClientHandle>, IpcAdmissionError> {
+    ) -> Result<FundedArc<ClientHandle>, IpcAdmissionError> {
         // Checked twice, and the second one is the load-bearing one.
         //
         // This first check is only an early exit: it saves minting a capability
@@ -538,19 +539,29 @@ impl ClientRegistry {
             .resources
             .acquire(client_record_claim().map_err(IpcAdmissionError::Claim)?)
             .map_err(IpcAdmissionError::Resources)?;
-        let entry = self.inner.lease_entry::<ClientId, Arc<ClientHandle>>()?;
-        let id = ClientId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let handle = Arc::new(ClientHandle {
-            id,
-            capability: ClientCapability::mint(),
-            connected: AtomicBool::new(true),
-            disconnected: tokio::sync::Notify::new(),
-            writer_tx,
-            method_claims: HeldNames::default(),
-            channel_subs: HeldNames::default(),
-            _record: record,
-            realtime_flows: Mutex::new(LeasedMap::new()),
-        });
+        let entry = self
+            .inner
+            .lease_entry::<ClientId, FundedArc<ClientHandle>>()?;
+        let id = ClientId(
+            self.inner
+                .next_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| IpcAdmissionError::IdentityExhausted)?,
+        );
+        let handle = FundedArc::new(
+            ClientHandle {
+                id,
+                capability: ClientCapability::mint(),
+                connected: AtomicBool::new(true),
+                disconnected: tokio::sync::Notify::new(),
+                writer_tx,
+                method_claims: HeldNames::default(),
+                channel_subs: HeldNames::default(),
+                realtime_flows: Mutex::new(LeasedMap::new()),
+            },
+            record,
+        )
+        .unwrap_or_else(|_| unreachable!("an admitted client-record lease may be shared"));
         // The real guard: rechecked in the same acquisition as the insert, so a
         // drain that started while this client was being built refuses it here
         // rather than leaving it installed in tables already walked. Refusing
@@ -575,7 +586,7 @@ impl ClientRegistry {
         client.capability.expose()
     }
 
-    pub fn authenticate(&self, id: ClientId, presented: &str) -> Option<Arc<ClientHandle>> {
+    pub fn authenticate(&self, id: ClientId, presented: &str) -> Option<FundedArc<ClientHandle>> {
         let client = self.client(id)?;
         client.capability.matches(presented).then_some(client)
     }
@@ -592,7 +603,7 @@ impl ClientRegistry {
     /// closing it is yours — which is why one `Err` shape carries both.
     pub fn install_realtime_flow(
         &self,
-        owner: &Arc<ClientHandle>,
+        owner: &FundedArc<ClientHandle>,
         network: String,
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
     ) -> Result<RealtimeFlowCapability, RealtimeFlowRejected> {
@@ -662,7 +673,7 @@ impl ClientRegistry {
     /// nothing outside can install past the disconnect seam.
     pub(super) fn install_if_live<T, R>(
         &self,
-        owner: &Arc<ClientHandle>,
+        owner: &FundedArc<ClientHandle>,
         entry_claim: Result<ResourceClaim, ResourceClaimArithmeticError>,
         retained_claim: Result<ResourceClaim, ResourceClaimArithmeticError>,
         value: T,
@@ -679,7 +690,7 @@ impl ClientRegistry {
         }
         let live = match tables.client(owner.id) {
             Some(current) => {
-                Arc::ptr_eq(&current, owner) && owner.connected.load(Ordering::Acquire)
+                std::ptr::eq(&*current, &**owner) && owner.connected.load(Ordering::Acquire)
             }
             None => false,
         };
@@ -738,7 +749,9 @@ impl ClientRegistry {
         // the copies this path actually used were charged to nobody.
         let mut forget = crate::ipc::LeasedList::new();
         while let Some((key, held)) = handle.method_claims.pop_first() {
-            let HeldName { retained, cleanup } = held;
+            let HeldName {
+                retained, cleanup, ..
+            } = held;
             if tables.handler_claims.get(&key).map(|claim| claim.value) != Some(id) {
                 continue;
             }
@@ -773,8 +786,14 @@ impl ClientRegistry {
         // allocations alive together, and only one slot per name is funded.
         let mut routes = crate::ipc::LeasedList::new();
         while let Some((key, held)) = handle.channel_subs.pop_first() {
-            let HeldName { retained, cleanup } = held;
-            if let Some(route) = remove_channel_member(&mut tables, &key, id) {
+            let HeldName {
+                retained,
+                cleanup,
+                membership,
+            } = held;
+            if let Some(route) = membership
+                .and_then(|membership| remove_channel_member(&mut tables, &key, membership))
+            {
                 // Into a node the subscription that took this name pre-paid for,
                 // on the same pattern as `forget`.
                 routes.push(route, cleanup);
@@ -800,7 +819,7 @@ impl ClientRegistry {
         })
     }
 
-    pub fn client(&self, id: ClientId) -> Option<Arc<ClientHandle>> {
+    pub fn client(&self, id: ClientId) -> Option<FundedArc<ClientHandle>> {
         self.inner.tables.lock().client(id)
     }
 
@@ -922,14 +941,14 @@ impl ClientRegistry {
     /// method therefore holds no daemon lock when it calls `commit_with`, and
     /// every registration it displaces or fails to file is dropped out here,
     /// after core's lock is released — dropping one takes that lock.
-    pub fn claim_method_committing(
+    pub fn claim_method_committing_with_key(
         &self,
         key: ClaimKey,
         new_owner: ClientId,
         mode: HandlerMode,
         generation: HandlerGeneration,
         prepared: myownmesh_core::rpc::PreparedRegistration,
-    ) -> Result<Option<ClientId>, RegistrationError> {
+    ) -> Result<Option<(ClientId, ClaimKey)>, RegistrationError> {
         let committed = prepared
             .commit_with(|| self.claim_under_lock(&key, new_owner, mode, generation))
             .into_result();
@@ -965,7 +984,20 @@ impl ClientRegistry {
         // this far.
         drop(stale);
         drop(retired);
-        Ok(displaced)
+        Ok(displaced.map(|owner| (owner, key)))
+    }
+
+    #[cfg(test)]
+    pub fn claim_method_committing(
+        &self,
+        key: ClaimKey,
+        new_owner: ClientId,
+        mode: HandlerMode,
+        generation: HandlerGeneration,
+        prepared: myownmesh_core::rpc::PreparedRegistration,
+    ) -> Result<Option<ClientId>, RegistrationError> {
+        self.claim_method_committing_with_key(key, new_owner, mode, generation, prepared)
+            .map(|displaced| displaced.map(|(owner, _)| owner))
     }
 
     /// Claim a method with no core registration behind it.
@@ -1113,7 +1145,14 @@ impl ClientRegistry {
                         .map_err(IpcAdmissionError::Claim)?,
                 );
                 let cleanup = cleanup.map_err(IpcAdmissionError::Resources)?;
-                Some((node, HeldName { retained, cleanup }))
+                Some((
+                    node,
+                    HeldName {
+                        retained,
+                        cleanup,
+                        membership: None,
+                    },
+                ))
             }
         };
         // Nothing below can fail, so from here the claim is installed whole.
@@ -1255,9 +1294,9 @@ impl ClientRegistry {
     /// it stayed subscribed to a route with no pump. The three arms of
     /// [`ChannelJoin`] are the three real cases, and two of them mean *do not
     /// answer the client yet*.
-    pub(crate) fn subscribe_channel(
+    pub(crate) fn subscribe_channel_borrowed(
         &self,
-        key: ClaimKey,
+        key: &ClaimKey,
         client: ClientId,
     ) -> Result<ChannelJoin, RegistrationError> {
         let mut tables = self.inner.tables.lock();
@@ -1265,10 +1304,7 @@ impl ClientRegistry {
         let Some(c) = tables.client(client) else {
             return Err(RegistrationError::ClientGone);
         };
-        let already_member = match tables.channel_subs.get(&key) {
-            Some(route) => route.members.contains_key(&client),
-            None => false,
-        };
+        let already_member = c.channel_subs.holds(&key);
         // The retained heap of this key, once per copy that is kept: the
         // client's own held-name table and the registry's subscriber table each
         // keep one. The client's copy also acquires the node it will occupy in
@@ -1289,7 +1325,14 @@ impl ClientRegistry {
                             .map_err(IpcAdmissionError::Claim)?,
                     )
                     .map_err(IpcAdmissionError::Resources)?;
-                Some((node, HeldName { retained, cleanup }))
+                Some((
+                    node,
+                    HeldName {
+                        retained,
+                        cleanup,
+                        membership: None,
+                    },
+                ))
             }
         };
         let set_entry = match tables.channel_subs.contains_key(&key) {
@@ -1315,21 +1358,32 @@ impl ClientRegistry {
         };
         let member_entry = match already_member {
             true => None,
-            false => Some(self.inner.lease_entry::<ClientId, ()>()?),
+            false => Some(self.inner.lease_entry::<ChannelMembershipId, ClientId>()?),
+        };
+        let membership = match already_member {
+            true => None,
+            false => Some(ChannelMembershipId(
+                self.inner
+                    .next_membership_id
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                    .map_err(|_| RegistrationError::IdentityExhausted)?,
+            )),
         };
         // Nothing below can fail.
-        if let Some((node, retained)) = held_entry {
+        if let Some((node, mut retained)) = held_entry {
+            retained.membership = membership;
             c.channel_subs.hold(key.clone(), node, retained);
         }
         let installing = match set_entry {
             Some((node, retained, signals)) => {
-                let ready = Arc::new(RouteReady::new(signals));
+                let ready = FundedArc::new(RouteReady::new(), signals)
+                    .unwrap_or_else(|_| unreachable!("an admitted readiness lease may be shared"));
                 tables
                     .channel_subs
                     .insert(
                         key.clone(),
                         ChannelRoute {
-                            state: RouteState::Installing(Arc::clone(&ready)),
+                            state: RouteState::Installing(ready.clone()),
                             members: LeasedMap::new(),
                             _retained: retained,
                         },
@@ -1344,10 +1398,10 @@ impl ClientRegistry {
             .channel_subs
             .get_mut(&key)
             .expect("the route exists or was just inserted");
-        if let Some(entry) = member_entry {
+        if let (Some(entry), Some(membership)) = (member_entry, membership) {
             route
                 .members
-                .insert(client, (), entry)
+                .insert(membership, client, entry)
                 .expect("absence was established while these tables were held");
         }
         // Membership is recorded either way, and only then is the role decided.
@@ -1356,9 +1410,21 @@ impl ClientRegistry {
         // can deliver to it yet.
         Ok(match (installing, &route.state) {
             (Some(ready), _) => ChannelJoin::Install(ready),
-            (None, RouteState::Installing(ready)) => ChannelJoin::Pending(Arc::clone(ready)),
+            (None, RouteState::Installing(ready)) => ChannelJoin::Pending(ready.clone()),
             (None, RouteState::Live(_)) => ChannelJoin::Live,
         })
+    }
+
+    /// Owned convenience for controls that are about registry semantics rather
+    /// than the pre-build boundary. Production uses the borrowed form above so
+    /// decoded coordinates are not cloned before admission.
+    #[cfg(test)]
+    pub(crate) fn subscribe_channel(
+        &self,
+        key: ClaimKey,
+        client: ClientId,
+    ) -> Result<ChannelJoin, RegistrationError> {
+        self.subscribe_channel_borrowed(&key, client)
     }
 
     /// A funded stop-signal for one pump.
@@ -1368,13 +1434,16 @@ impl ClientRegistry {
     /// asked for it has been removed. A refusal reaches the installer before
     /// its pump is spawned, and unwinds the whole route through
     /// [`Self::finish_channel_install`], so subscribe stays all-or-nothing.
-    pub(crate) fn route_cancellation(&self) -> Result<Arc<RouteCancellation>, IpcAdmissionError> {
+    pub(crate) fn route_cancellation(
+        &self,
+    ) -> Result<FundedArc<RouteCancellation>, IpcAdmissionError> {
         let retained = self
             .inner
             .resources
             .acquire(route_cancellation_retained().map_err(IpcAdmissionError::Claim)?)
             .map_err(IpcAdmissionError::Resources)?;
-        Ok(Arc::new(RouteCancellation::new(retained)))
+        Ok(FundedArc::new(RouteCancellation::new(), retained)
+            .unwrap_or_else(|_| unreachable!("an admitted cancellation lease may be shared")))
     }
 
     /// Publish the outcome of an install, and wake everyone waiting on it.
@@ -1393,8 +1462,8 @@ impl ClientRegistry {
     pub(crate) fn finish_channel_install(
         &self,
         key: &ClaimKey,
-        ready: &Arc<RouteReady>,
-        pump: Option<(Arc<RouteCancellation>, tokio::task::JoinHandle<()>)>,
+        ready: &FundedArc<RouteReady>,
+        pump: Option<(FundedArc<RouteCancellation>, tokio::task::JoinHandle<()>)>,
     ) -> Option<RetiredRoute> {
         enum Outcome {
             Live,
@@ -1406,7 +1475,7 @@ impl ClientRegistry {
             // Same key, but is it the same route? A route can be removed by its
             // last unsubscribe and recreated by a new subscriber while a slow
             // install is still running, and the key alone cannot tell those
-            // apart. `Arc::ptr_eq` against the readiness this installer was
+            // apart. `FundedArc::ptr_eq` against the readiness this installer was
             // handed can: identity, not coordinates.
             //
             // Without it a late finish publishes its pump into the successor's
@@ -1414,7 +1483,7 @@ impl ClientRegistry {
             // deletes a route that was perfectly healthy.
             let ours = matches!(
                 tables.channel_subs.get(key).map(|route| &route.state),
-                Some(RouteState::Installing(current)) if Arc::ptr_eq(current, ready)
+                Some(RouteState::Installing(current)) if FundedArc::ptr_eq(current, ready)
             );
             match (ours, pump) {
                 (false, pump) => {
@@ -1455,7 +1524,7 @@ impl ClientRegistry {
                     // built here would be sized by how many clients subscribed
                     // and funded by none of them, on a path that has no honest
                     // way to decline an allocation.
-                    while let Some((member, _)) = route.members.pop_first_entry() {
+                    while let Some((_membership, member)) = route.members.pop_first_entry() {
                         if let Some(handle) = tables.client(member) {
                             handle.channel_subs.release(key);
                         }
@@ -1488,10 +1557,11 @@ impl ClientRegistry {
         client: ClientId,
     ) -> Option<RetiredRoute> {
         let mut tables = self.inner.tables.lock();
-        if let Some(c) = tables.client(client) {
-            c.channel_subs.release(key);
-        }
-        remove_channel_member(&mut tables, key, client)
+        let membership = tables
+            .client(client)
+            .and_then(|c| c.channel_subs.release(key))
+            .and_then(|held| held.membership);
+        membership.and_then(|membership| remove_channel_member(&mut tables, key, membership))
     }
 
     /// One step of a channel fan-out: the next subscriber after `after`.
@@ -1513,21 +1583,24 @@ impl ClientRegistry {
     /// and a cursor is how a caller resumes without holding it.
     ///
     /// **Exact by three identities, and none of them is a position.** The
-    /// subscriber cursor is a [`ClientId`], which is monotonic and never reused,
-    /// so a subscriber removed between two steps is skipped rather than
-    /// re-resolved into whoever occupies its place. The route is matched by the
+    /// subscriber cursor is a [`ChannelMembershipId`], which is monotonic and
+    /// never reused even when the same client unsubscribes and subscribes again,
+    /// so a membership removed between two steps is skipped rather than
+    /// re-resolved into its successor. The route is matched by the
     /// exact [`RouteOwner`] the pump holds, so a route removed and reinstalled
     /// under the same key answers `Gone` rather than handing the predecessor's
     /// pump the successor's subscribers. And the frame is bounded by a
     /// high-water member id fixed at its first step, so a stream of new
-    /// subscriptions — which necessarily carry larger ids — cannot extend one
-    /// frame's fan-out indefinitely and starve the next frame.
+    /// subscriptions — whose new memberships necessarily carry larger ids —
+    /// cannot extend one frame's fan-out indefinitely and starve the next frame.
     ///
-    /// None of the three is a new piece of state. The client id, the route's own
-    /// cancellation `Arc` and the membership map all already exist; this reads
-    /// them, and it is why there is no vector to return — a resource-backed
-    /// snapshot would be a per-frame allocation to fund, and an allocation that
-    /// does not happen cannot be refused.
+    /// None of the three is a new piece of state. The membership id, the route's own
+    /// cancellation [`FundedArc`] and the membership map all already exist;
+    /// this reads them, and it is why there is no vector to return — a
+    /// resource-backed snapshot would be a per-frame allocation to fund, and an
+    /// allocation that does not happen cannot be refused. `FundedArc::ptr_eq`
+    /// binds route identity to that exact funded allocation without exposing a
+    /// raw pointer or relying on its pointee layout.
     ///
     /// An unpublished route answers `End` rather than `Gone`. A pump can pull a
     /// frame between its own spawn and its own `finish_channel_install`, and it
@@ -1540,11 +1613,11 @@ impl ClientRegistry {
     /// It is a subscription whose client has been removed and whose membership
     /// has not been swept yet, and there is nobody to deliver to.
     ///
-    /// The cost is one lock acquisition and one ordered walk per subscriber
-    /// rather than one of each per frame, and that is stated rather than hidden:
-    /// the walk compares fixed-size ids, so its work is chosen by how many
-    /// clients subscribed and never by what a peer sent. The work that *is*
-    /// peer-sized now happens with no lock held at all.
+    /// The cost is one lock acquisition and one `O(log n)` successor descent
+    /// per subscriber, plus one last-key descent when the frame fixes its
+    /// ceiling. Every comparison is between fixed-size membership identities,
+    /// so the work is chosen by how many clients subscribed and never by what a
+    /// peer sent. The work that *is* peer-sized happens with no lock held.
     pub(crate) fn subscriber_after(
         &self,
         key: &ClaimKey,
@@ -1562,51 +1635,40 @@ impl ClientRegistry {
         match owner {
             RouteOwner::Pump(pump) => match live {
                 None => return ChannelFanoutStep::End,
-                Some(live) if !Arc::ptr_eq(live, pump) => return ChannelFanoutStep::Gone,
+                Some(live) if !FundedArc::ptr_eq(live, pump) => return ChannelFanoutStep::Gone,
                 Some(_) => {}
             },
             #[cfg(test)]
             RouteOwner::Any => {}
         }
-        // The frame's boundary, fixed once. `for_each` walks in key order, so
-        // the last member visited is the largest id this route holds now.
+        // Fix the frame boundary to the newest subscription present now. A
+        // later re-subscription has a fresh identity and cannot inherit it.
         if position.ceiling.is_none() {
-            let mut highest = None;
-            route.members.for_each(|client, _| highest = Some(*client));
-            let Some(highest) = highest else {
+            let Some((highest, _)) = route.members.last_key_value() else {
                 return ChannelFanoutStep::End;
             };
-            position.ceiling = Some(highest);
+            position.ceiling = Some(*highest);
         }
         let ceiling = match position.ceiling {
             Some(ceiling) => ceiling,
             // Unreachable: the branch above either set it or returned.
             None => return ChannelFanoutStep::End,
         };
-        let mut next = None;
-        // In key order, so the first match is the smallest id greater than the
-        // cursor and every later visit is one `is_some` check.
-        route.members.for_each(|client, _| {
-            if next.is_some() || *client > ceiling {
-                return;
-            }
-            let past_cursor = match position.after {
-                Some(previous) => *client > previous,
-                None => true,
+        loop {
+            let Some((membership, client_id)) =
+                route.members.successor_after(position.after.as_ref())
+            else {
+                return ChannelFanoutStep::End;
             };
-            if !past_cursor {
-                return;
+            if *membership > ceiling {
+                return ChannelFanoutStep::End;
             }
-            if let Some(handle) = tables.clients.get(client) {
-                next = Some((*client, handle.clone()));
+            position.after = Some(*membership);
+            if let Some(client) = tables.clients.get(client_id) {
+                return ChannelFanoutStep::Next {
+                    client: client.clone(),
+                };
             }
-        });
-        match next {
-            Some((cursor, client)) => {
-                position.after = Some(cursor);
-                ChannelFanoutStep::Next { client }
-            }
-            None => ChannelFanoutStep::End,
         }
     }
 
@@ -1626,7 +1688,7 @@ impl ClientRegistry {
     pub fn for_each_subscriber(
         &self,
         key: &ClaimKey,
-        mut visit: impl FnMut(&Arc<ClientHandle>),
+        mut visit: impl FnMut(&FundedArc<ClientHandle>),
     ) -> bool {
         let mut position = ChannelFanout::frame();
         loop {
@@ -1643,10 +1705,11 @@ impl ClientRegistry {
     /// id internally but doesn't expose it; the IPC layer
     /// generates its own correlation id so clients can match
     /// chunks back to their originating call.
-    pub fn next_call_stream_id(&self) -> u64 {
+    pub fn next_call_stream_id(&self) -> Result<u64, IpcAdmissionError> {
         self.inner
             .next_call_stream_id
-            .fetch_add(1, Ordering::Relaxed)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| IpcAdmissionError::IdentityExhausted)
     }
 
     /// Fund one inbound call before any of it is built.
@@ -1690,6 +1753,11 @@ impl ClientRegistry {
         let (entry, retained) = self
             .inner
             .lease_entry_pair::<PendingKey, PendingRecord>(retained)?;
+        let cancellation = self
+            .inner
+            .resources
+            .acquire(pending_cancellation_claim().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
         let cleanup = self
             .inner
             .resources
@@ -1704,6 +1772,7 @@ impl ClientRegistry {
             owner,
             entry,
             retained,
+            cancellation,
             cleanup,
         })
     }
@@ -1765,6 +1834,7 @@ impl ClientRegistry {
             owner,
             entry,
             retained,
+            cancellation,
             cleanup,
         } = prepared;
         if class != expected {
@@ -1792,21 +1862,32 @@ impl ClientRegistry {
         if tables.exact_pending_inbound.contains_key(&key) {
             return Err(PendingRefusal::Duplicate);
         }
+        // The identity is the last fallible admission and is consumed before
+        // construction. Exhaustion therefore invokes no builder. Once minted
+        // it is never returned to the counter, even if a later invariant bug
+        // were to make the infallible tail stop short of publication.
+        let operation_id = self
+            .inner
+            .next_operation_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| PendingRefusal::Admission(IpcAdmissionError::IdentityExhausted))?;
         // Past every refusal, and still holding the lock the insertion is made
         // under: what this builds cannot be refused and cannot be left behind.
         let (effect, caller) = build();
         // One charge, two owners. It is released when the later of the record
         // and the ticket goes, which is the only moment at which no copy of
         // these buffers is still live.
-        let funding = Arc::new(PendingFunding {
-            _retained: retained,
-        });
-        let operation_id = self.inner.next_operation_id.fetch_add(1, Ordering::Relaxed);
+        let funding = FundedArc::new(PendingFunding, retained)
+            .unwrap_or_else(|_| unreachable!("admitted pending funding may be shared"));
         let ticket_key = key.clone();
-        let cancelled = Arc::new(PendingCancellation {
-            cancelled: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-        });
+        let cancelled = FundedArc::new(
+            PendingCancellation {
+                cancelled: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            },
+            cancellation,
+        )
+        .unwrap_or_else(|_| unreachable!("an admitted cancellation lease may be shared"));
         tables
             .exact_pending_inbound
             .insert(
@@ -1817,7 +1898,7 @@ impl ClientRegistry {
                     effect,
                     cancelled: cancelled.clone(),
                     cleanup: Some(cleanup),
-                    _funding: Arc::clone(&funding),
+                    _funding: funding.clone(),
                 },
                 entry,
             )
@@ -1967,6 +2048,22 @@ impl ClientRegistry {
                 })
             }
         };
+        let cancellation = match pending_cancellation_claim()
+            .map_err(IpcAdmissionError::Claim)
+            .and_then(|claim| {
+                self.inner
+                    .resources
+                    .acquire(claim)
+                    .map_err(IpcAdmissionError::Resources)
+            }) {
+            Ok(cancellation) => cancellation,
+            Err(reason) => {
+                return Err(PendingRejected {
+                    effect,
+                    reason: reason.into(),
+                })
+            }
+        };
         // The node this record will occupy if a claim displacement has to detach
         // it, as its own lease. Acquired here, moved into that node when the
         // sweep builds it, released after the node is freed. Refused, nothing
@@ -1987,18 +2084,33 @@ impl ClientRegistry {
                 })
             }
         };
+        let operation_id = match self.inner.next_operation_id.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |id| id.checked_add(1),
+        ) {
+            Ok(operation_id) => operation_id,
+            Err(_) => {
+                return Err(PendingRejected {
+                    effect,
+                    reason: PendingRefusal::Admission(IpcAdmissionError::IdentityExhausted),
+                })
+            }
+        };
         // One charge, two owners. It is released when the later of the record
         // and the ticket goes, which is the only moment at which no copy of
         // these buffers is still live.
-        let funding = Arc::new(PendingFunding {
-            _retained: retained,
-        });
-        let operation_id = self.inner.next_operation_id.fetch_add(1, Ordering::Relaxed);
+        let funding = FundedArc::new(PendingFunding, retained)
+            .unwrap_or_else(|_| unreachable!("admitted pending funding may be shared"));
         let ticket_key = key.clone();
-        let cancelled = Arc::new(PendingCancellation {
-            cancelled: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-        });
+        let cancelled = FundedArc::new(
+            PendingCancellation {
+                cancelled: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            },
+            cancellation,
+        )
+        .unwrap_or_else(|_| unreachable!("an admitted cancellation lease may be shared"));
         tables
             .exact_pending_inbound
             .insert(
@@ -2009,7 +2121,7 @@ impl ClientRegistry {
                     effect,
                     cancelled: cancelled.clone(),
                     cleanup: Some(cleanup),
-                    _funding: Arc::clone(&funding),
+                    _funding: funding.clone(),
                 },
                 entry,
             )

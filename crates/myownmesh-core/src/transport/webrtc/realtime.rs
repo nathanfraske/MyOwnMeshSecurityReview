@@ -163,22 +163,43 @@ impl RealtimeReadyQueue {
     }
 }
 
+/// One link of the retained-fragment list: the allocation, and the lease that
+/// funds it.
+///
+/// The lease is a **sibling of** the `Box`, declared after it, and that order is
+/// the whole point. A lease stored *inside* the node would be released by the
+/// node's own drop glue — that is, before the allocation it is paying for is
+/// freed — leaving a window in which the provider believes the bytes are back
+/// while they are still held. Declared here and after `node`, the allocation is
+/// freed first and the lease is returned second, which is the order the claim
+/// describes.
+struct FundedFragmentLeaseLink {
+    node: Box<RealtimeFragmentLeaseNode>,
+    _fragment: ResourceLease,
+}
+
 struct RealtimeFragmentLeaseNode {
-    _lease: ResourceLease,
-    next: Option<Box<Self>>,
+    next: Option<FundedFragmentLeaseLink>,
 }
 
 #[derive(Default)]
 struct RealtimeFragmentLeases {
-    head: Option<Box<RealtimeFragmentLeaseNode>>,
+    head: Option<FundedFragmentLeaseLink>,
 }
 
 impl RealtimeFragmentLeases {
+    /// Retain one admitted fragment's lease for the assembly's lifetime.
+    ///
+    /// Each push allocates exactly one node, so the list holds as many
+    /// allocations as it holds leases; the link the new lease joins is the one
+    /// that owns the allocation made for it.
     fn push(&mut self, lease: ResourceLease) {
-        self.head = Some(Box::new(RealtimeFragmentLeaseNode {
-            _lease: lease,
-            next: self.head.take(),
-        }));
+        self.head = Some(FundedFragmentLeaseLink {
+            node: Box::new(RealtimeFragmentLeaseNode {
+                next: self.head.take(),
+            }),
+            _fragment: lease,
+        });
     }
 }
 
@@ -187,8 +208,12 @@ impl Drop for RealtimeFragmentLeases {
         // Avoid recursive destruction when a generic provider admits many
         // fragments. Provider capacity bounds every node even when no local
         // compatibility ceiling is installed.
-        while let Some(mut node) = self.head.take() {
-            self.head = node.next.take();
+        //
+        // Unlinking first and letting `link` fall at the end of the iteration
+        // keeps the per-node order: this node's allocation is freed, and only
+        // then is the lease that funded it released.
+        while let Some(mut link) = self.head.take() {
+            self.head = link.node.next.take();
         }
     }
 }
@@ -494,9 +519,14 @@ impl RealtimeFlowRegistry {
 
     /// The cost of retaining one inbound fragment until its unit completes.
     ///
-    /// Two dependency nodes: one owns the fragment lease and one owns the
-    /// ordered payload entry the assembler keeps it in. Both persist for
+    /// Two dependency nodes: the retained-lease list node this fragment pushes,
+    /// and the ordered payload entry the assembler keeps it in. Both persist for
     /// exactly the assembly lifetime.
+    ///
+    /// The byte term is the boxed node's own shape, which is what a push
+    /// allocates — exactly one node per fragment. The lease that funds that
+    /// allocation is not inside it: it sits beside the pointer in
+    /// [`FundedFragmentLeaseLink`], so it is still held when the node is freed.
     pub(super) fn ordered_fragment_claim(
         content_bytes: usize,
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
@@ -1213,11 +1243,11 @@ impl RealtimeFlowRegistry {
             key,
             domain,
             _lifetime: lifetime,
-            _lease: lease,
             fragment_leases: RealtimeFragmentLeases::default(),
             retained_bytes: 0,
             retained_fragments: 0,
             active: true,
+            _lease: lease,
         })
     }
 
@@ -1638,16 +1668,31 @@ impl RealtimeFlowPort {
     }
 }
 
+/// One in-progress assembly and the funding for the whole of it.
+///
+/// **`_lease` is declared last, and that is deliberate.**
+/// [`RealtimeFlowRegistry::assembly_claim`] prices
+/// `size_of::<RealtimeAssemblyReservation>()` — the complete inline shape of
+/// this value, including whatever `fragment_leases` holds inline and the
+/// lifetime handle above it. Fields are destroyed in declaration order, so a
+/// lease sitting in the middle would be handed back while the rest of the state
+/// it paid for was still standing. Last, it is released only once every field
+/// it funds is gone.
+///
+/// The explicit [`Drop`] below does not weaken this: an explicit `drop` body
+/// runs before any field is destroyed, so the registry bookkeeping there still
+/// sees a fully intact reservation.
 pub(super) struct RealtimeAssemblyReservation {
     registry: Arc<RealtimeFlowRegistry>,
     key: RealtimeFlowKey,
     domain: RealtimeFlowDomain,
     _lifetime: Arc<RealtimeFlowLifetime>,
-    _lease: ResourceLease,
     fragment_leases: RealtimeFragmentLeases,
     retained_bytes: usize,
     retained_fragments: usize,
     active: bool,
+    /// Last, because it funds every field above it.
+    _lease: ResourceLease,
 }
 
 impl RealtimeAssemblyReservation {
@@ -1821,16 +1866,19 @@ pub(super) struct RealtimeOutputReservation {
 impl RealtimeOutputReservation {
     pub(super) fn into_payload_lease(mut self) -> RealtimePayloadLease {
         self.active = false;
-        RealtimePayloadLease(Arc::new(RealtimePayloadReservation {
-            registry: Arc::clone(&self.registry),
-            key: self.key,
-            domain: self.domain,
-            lease: self
-                .lease
-                .take()
-                .expect("an active output reservation owns one provider lease"),
-            bytes: self.bytes,
-        }))
+        let funding = self
+            .lease
+            .take()
+            .expect("an active output reservation owns one provider lease");
+        RealtimePayloadLease {
+            reservation: Box::new(RealtimePayloadReservation {
+                registry: Arc::clone(&self.registry),
+                key: self.key,
+                domain: self.domain,
+                bytes: self.bytes,
+            }),
+            funding,
+        }
     }
 }
 
@@ -1844,11 +1892,17 @@ impl Drop for RealtimeOutputReservation {
     }
 }
 
+/// The registry bookkeeping for one delivered payload — and deliberately not
+/// its funding.
+///
+/// The provider lease that pays for this allocation lives in
+/// [`RealtimePayloadLease`], beside the pointer rather than inside it. A lease
+/// held here would be returned by this value's own drop glue, before the
+/// allocation it funds is freed.
 struct RealtimePayloadReservation {
     registry: Arc<RealtimeFlowRegistry>,
     key: RealtimeFlowKey,
     domain: RealtimeFlowDomain,
-    lease: ResourceLease,
     bytes: usize,
 }
 
@@ -1867,26 +1921,40 @@ impl Drop for RealtimePayloadReservation {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct RealtimePayloadLease(Arc<RealtimePayloadReservation>);
+/// Exclusive ownership of one delivered payload's bytes.
+///
+/// **Not `Clone`, and not an `Arc`.** One delivery's bytes have exactly one
+/// owner: the queue mints this, the delivery carries it, and whoever takes the
+/// unit takes it. A shared owner would make "who releases these bytes" a
+/// question with more than one answer, and it would put the funding lease inside
+/// the shared allocation, where it would be returned before that allocation was
+/// freed.
+///
+/// Field order carries the same weight as the choice of `Box`. `reservation` is
+/// destroyed first — running the registry bookkeeping in its [`Drop`] and then
+/// freeing the allocation — and `funding` is returned to the provider only after
+/// that. There is no accessor that hands out either half alone: a raw split
+/// would let the bytes' accounting be dropped separately from the payload it
+/// accounts for.
+pub(super) struct RealtimePayloadLease {
+    reservation: Box<RealtimePayloadReservation>,
+    funding: ResourceLease,
+}
 
 impl RealtimePayloadLease {
     fn transition_to_retained_payload(
         &mut self,
     ) -> std::result::Result<(), RealtimeFlowDropReason> {
-        let reservation =
-            Arc::get_mut(&mut self.0).ok_or(RealtimeFlowDropReason::OwnershipMismatch)?;
-        let replacement = RealtimeFlowRegistry::retained_payload_claim(reservation.bytes)
+        let replacement = RealtimeFlowRegistry::retained_payload_claim(self.reservation.bytes)
             .map_err(RealtimeFlowDropReason::ResourceUnavailable)?;
-        reservation
-            .lease
+        self.funding
             .transition(replacement)
             .map_err(RealtimeFlowDropReason::ResourceUnavailable)
     }
 
     #[cfg(test)]
     fn claim(&self) -> ResourceClaim {
-        self.0.lease.claim()
+        self.funding.claim()
     }
 }
 
@@ -1894,8 +1962,8 @@ impl std::fmt::Debug for RealtimePayloadLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RealtimePayloadLease")
-            .field("key", &self.0.key)
-            .field("bytes", &self.0.bytes)
+            .field("key", &self.reservation.key)
+            .field("bytes", &self.reservation.bytes)
             .finish()
     }
 }

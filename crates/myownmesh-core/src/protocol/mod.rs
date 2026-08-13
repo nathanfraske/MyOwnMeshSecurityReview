@@ -64,6 +64,82 @@ pub use topology::{ShelveMessage, UnshelveMessage};
 
 use serde::{Deserialize, Serialize};
 
+/// Exactly how many bytes `value`'s compact JSON encoding occupies, counted
+/// without building it.
+///
+/// **Why counting is not the same as encoding and measuring.** A retained buffer
+/// has to be funded before it exists, or the acquisition it is supposed to be
+/// gated by happens after the allocation it was gating — and every refusal path
+/// pays for a buffer it then throws away. Counting first makes the refusal free:
+/// under pressure, a stale session, or a closed gateway, nothing was built.
+///
+/// The count is exact rather than an upper bound. It is produced by the same
+/// serializer, over the same borrowed value, that
+/// [`encode_json_exact`] then runs — so a claim taken for this number funds
+/// precisely the buffer that follows, with nothing rounded up to be safe.
+///
+/// `None` for a value that will not serialize, and for one whose encoding would
+/// not fit in a `usize`. Both are refusals rather than panics: this counts
+/// application- and peer-supplied values.
+///
+/// **Private, and generic only inside this module.** "Counting is free" is a
+/// claim about the `Serialize` impl being walked, not about this writer: a
+/// hand-written impl may allocate, or do arbitrary work, while it writes. The
+/// two shapes below are derived over crate-owned types, so the property is
+/// checkable by reading them. Exposing the generic form would let a future
+/// caller pass a type nobody checked and escape the guarantee silently, so
+/// callers reach it through the concrete wrappers instead.
+fn encoded_json_len<T>(value: &T) -> Option<usize>
+where
+    T: Serialize + ?Sized,
+{
+    struct CountingWriter(usize);
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "encoded length exceeds the addressable range",
+                )
+            })?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
+/// Encode `value` into one allocation of exactly `len` bytes.
+///
+/// One allocation and no growth: the buffer is created at the counted size, so
+/// there is no doubling as it fills and no second buffer when it is boxed. That
+/// is what makes "the claim funds this allocation" a statement about a single
+/// object rather than about a peak.
+///
+/// `None` if the encoding does not come out at exactly `len`. A mismatch would
+/// mean the value changed between counting and encoding, and installing a buffer
+/// of one size under a lease taken for another is the defect this whole pattern
+/// exists to prevent — so it is refused rather than reconciled.
+///
+/// Private for the same reason as [`encoded_json_len`], and it must stay paired
+/// with it: the two have to walk the same impl for the count to describe the
+/// buffer.
+fn encode_json_exact<T>(value: &T, len: usize) -> Option<Box<[u8]>>
+where
+    T: Serialize + ?Sized,
+{
+    let mut buffer = Vec::with_capacity(len);
+    serde_json::to_writer(&mut buffer, value).ok()?;
+    (buffer.len() == len).then(|| buffer.into_boxed_slice())
+}
+
 /// First-stage classification obtained from the small leading JSON tag only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameAdmission {
@@ -248,9 +324,123 @@ pub enum MeshMessage {
     },
 }
 
+/// [`MeshMessage::ChannelSeq`] with its two owned fields borrowed.
+///
+/// **Why a mirror instead of the variant.** Building the variant means owning
+/// its fields: a `String` copied out of the caller's channel name, and the
+/// payload moved in. A reliable send has to know the frame's exact encoded size
+/// *before* it acquires the capacity to retain it, and constructing the variant
+/// to find that out allocates on every path — including the ones that then
+/// refuse. This serializes from what the caller already has.
+///
+/// **It must encode byte-identically, and that is pinned by a control.** The
+/// tag is written first and then the fields in declaration order, which is
+/// exactly what `#[serde(tag = "kind")]` does for the variant, and the tag
+/// string is the `rename_all = "snake_case"` form of its name. Anything that
+/// changes `ChannelSeq`'s shape without changing this produces frames a peer
+/// cannot read, so [`tests::borrowed_channel_seq_encodes_exactly_like_the_variant`]
+/// fails on that change rather than shipping it.
+#[derive(Serialize)]
+pub(crate) struct BorrowedChannelSeq<'a> {
+    kind: &'static str,
+    stream: u64,
+    seq: u64,
+    channel: &'a str,
+    payload: &'a serde_json::Value,
+}
+
+impl<'a> BorrowedChannelSeq<'a> {
+    pub(crate) fn new(
+        stream: u64,
+        seq: u64,
+        channel: &'a str,
+        payload: &'a serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: "channel_seq",
+            stream,
+            seq,
+            channel,
+            payload,
+        }
+    }
+
+    /// Exactly how many bytes this frame will occupy on the wire, without
+    /// building it.
+    ///
+    /// Free of allocation because of what it walks: four scalars and two
+    /// borrows, all with derived or serde_json's own `Serialize`. The payload is
+    /// a `Value` the caller already owns, and writing one out neither copies it
+    /// nor builds an intermediate.
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        encoded_json_len(self)
+    }
+
+    /// The frame, in one allocation of exactly `len` bytes.
+    pub(crate) fn encode_exact(&self, len: usize) -> Option<Box<[u8]>> {
+        encode_json_exact(self, len)
+    }
+}
+
+impl CapabilityAdvert {
+    /// Exactly how many bytes this advertisement encodes to, without building
+    /// it.
+    ///
+    /// The shape is closed and its `Serialize` is derived, so the walk is a
+    /// `Vec<String>`, an `Option<String>` and a `Value` — no impl of anyone's
+    /// choosing runs here, which is what makes "counting costs nothing" a
+    /// property of this type rather than a hope about the caller's.
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        encoded_json_len(self)
+    }
+
+    /// The advertisement, in one allocation of exactly `len` bytes.
+    pub(crate) fn encode_exact(&self, len: usize) -> Option<Box<[u8]>> {
+        encode_json_exact(self, len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The borrowed frame is the wire frame, byte for byte.
+    ///
+    /// This is what lets a reliable send count its size from borrowed fields and
+    /// then encode the bytes it actually puts on the wire from the same value.
+    /// If the two ever diverge, peers get a frame they cannot read — so the
+    /// comparison is over the whole encoding, not over its length, and the
+    /// values below exercise the parts most likely to drift: a channel name
+    /// needing escapes, and a payload that is a nested tree rather than a scalar.
+    #[test]
+    fn borrowed_channel_seq_encodes_exactly_like_the_variant() {
+        let channel = "chat/\"room\"\n1";
+        let payload = serde_json::json!({
+            "nested": ["a", 1, true, null],
+            "unicode": "ü\u{1F600}",
+        });
+
+        let owned = serde_json::to_vec(&MeshMessage::ChannelSeq {
+            stream: 9,
+            seq: 4_294_967_297,
+            channel: channel.to_string(),
+            payload: payload.clone(),
+        })
+        .expect("the owned variant serializes");
+        let mirror = BorrowedChannelSeq::new(9, 4_294_967_297, channel, &payload);
+        let borrowed = serde_json::to_vec(&mirror).expect("the borrowed mirror serializes");
+
+        assert_eq!(
+            String::from_utf8_lossy(&borrowed),
+            String::from_utf8_lossy(&owned),
+            "the borrowed mirror must produce the exact frame the variant does"
+        );
+        assert_eq!(
+            mirror.encoded_len(),
+            Some(owned.len()),
+            "counting must agree with encoding, since the claim is taken from the count"
+        );
+    }
 
     #[test]
     fn bounded_leading_tag_classifies_without_parsing_application_payload() {

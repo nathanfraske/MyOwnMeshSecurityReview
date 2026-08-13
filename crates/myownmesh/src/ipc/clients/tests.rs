@@ -10,7 +10,7 @@ use super::*;
 fn fresh_client(
     registry: &ClientRegistry,
 ) -> (
-    Arc<ClientHandle>,
+    FundedArc<ClientHandle>,
     myownmesh_core::ResourceMailboxReceiver<ServerOut>,
 ) {
     let (tx, rx) = myownmesh_core::resource_mailbox(crate::test_application_scope())
@@ -44,6 +44,47 @@ fn ids_are_monotonic_and_unique() {
     assert!(reg.client(ClientId(99)).is_none());
     assert!(reg.authenticate(a.id, reg.capability(&a)).is_some());
     assert!(reg.authenticate(b.id, reg.capability(&a)).is_none());
+}
+
+#[test]
+fn every_never_reused_daemon_identity_refuses_exhaustion() {
+    let reg = ClientRegistry::default();
+    reg.inner.next_id.store(u64::MAX, Ordering::Relaxed);
+    let (tx, _rx) = myownmesh_core::resource_mailbox(crate::test_application_scope())
+        .expect("the writer mailbox itself is admitted");
+    assert!(matches!(
+        reg.register(tx),
+        Err(IpcAdmissionError::IdentityExhausted)
+    ));
+
+    let reg = ClientRegistry::default();
+    reg.inner
+        .next_call_stream_id
+        .store(u64::MAX, Ordering::Relaxed);
+    assert!(matches!(
+        reg.next_call_stream_id(),
+        Err(IpcAdmissionError::IdentityExhausted)
+    ));
+
+    let (a, _ra) = fresh_client(&reg);
+    let (b, _rb) = fresh_client(&reg);
+    let key = ("net".to_string(), "exhausted-membership".to_string());
+    reg.subscribe_channel(key.clone(), a.id)
+        .expect("non-vacuity: one membership is installed before exhaustion");
+    reg.inner
+        .next_membership_id
+        .store(u64::MAX, Ordering::Relaxed);
+    assert!(matches!(
+        reg.subscribe_channel(key.clone(), b.id),
+        Err(RegistrationError::IdentityExhausted)
+    ));
+    let mut members = Vec::new();
+    assert!(reg.for_each_subscriber(&key, |client| members.push(client.id)));
+    assert_eq!(
+        members,
+        vec![a.id],
+        "exhaustion neither reuses an identity nor installs the refused member"
+    );
 }
 
 #[test]
@@ -112,7 +153,7 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
 
     let returned = reg.unregister(owner.id).expect("registered owner");
     assert!(
-        Arc::ptr_eq(&returned.handle, &owner),
+        std::ptr::eq(&*returned.handle, &*owner),
         "disconnect answers with the same handle the install landed in"
     );
     assert_eq!(
@@ -421,7 +462,7 @@ async fn v4_f2_daemon_a_stale_installer_cannot_touch_the_route_that_replaced_it(
         panic!("the route was removed, so B installs a new one")
     };
     assert!(
-        !Arc::ptr_eq(&first, &second),
+        !std::ptr::eq(&*first, &*second),
         "the fixture is only meaningful if these are different generations"
     );
 
@@ -492,7 +533,7 @@ fn v4_f2_daemon_the_last_unsubscribe_retires_the_route() {
     let cancel = reg
         .route_cancellation()
         .expect("the daemon test grant funds one pump cancellation");
-    let waiting = Arc::clone(&cancel);
+    let waiting = cancel.clone();
     let pump = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -539,13 +580,13 @@ fn v4_f2_daemon_the_last_unsubscribe_retires_the_route() {
 fn fixture_pump(
     registry: &ClientRegistry,
 ) -> (
-    Arc<crate::ipc::RouteCancellation>,
+    FundedArc<crate::ipc::RouteCancellation>,
     tokio::task::JoinHandle<()>,
 ) {
     let cancel = registry
         .route_cancellation()
         .expect("the daemon test grant funds one pump cancellation");
-    let waiting = Arc::clone(&cancel);
+    let waiting = cancel.clone();
     let join = tokio::spawn(async move { waiting.cancelled().await });
     (cancel, join)
 }
@@ -776,6 +817,51 @@ async fn v4_r2_daemon_a_fanout_cursor_skips_removed_members_and_never_repeats_on
     );
 }
 
+#[tokio::test]
+async fn a_resubscription_cannot_inherit_an_in_flight_frame() {
+    let reg = ClientRegistry::default();
+    let (a, _ra) = fresh_client(&reg);
+    let (b, _rb) = fresh_client(&reg);
+    let key = ("net".to_string(), "membership".to_string());
+
+    let ChannelJoin::Install(installing) = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the first exact membership is admitted")
+    else {
+        panic!("the first subscriber owns installation")
+    };
+    reg.subscribe_channel(key.clone(), b.id)
+        .expect("the second exact membership is admitted");
+    assert!(reg
+        .finish_channel_install(&key, &installing, Some(fixture_pump(&reg)))
+        .is_none());
+
+    let mut old_frame = crate::ipc::ChannelFanout::frame();
+    let crate::ipc::ChannelFanoutStep::Next { client } =
+        reg.subscriber_after(&key, crate::ipc::RouteOwner::Any, &mut old_frame)
+    else {
+        panic!("non-vacuity: the old frame selects its first member")
+    };
+    assert_eq!(client.id, a.id);
+
+    assert!(reg.unsubscribe_channel(&key, b.id).is_none());
+    reg.subscribe_channel(key.clone(), b.id)
+        .expect("the same client receives a fresh membership");
+    assert!(matches!(
+        reg.subscriber_after(&key, crate::ipc::RouteOwner::Any, &mut old_frame),
+        crate::ipc::ChannelFanoutStep::End
+    ));
+
+    let mut next_frame = crate::ipc::ChannelFanout::frame();
+    let mut delivered = Vec::new();
+    while let crate::ipc::ChannelFanoutStep::Next { client } =
+        reg.subscriber_after(&key, crate::ipc::RouteOwner::Any, &mut next_frame)
+    {
+        delivered.push(client.id);
+    }
+    assert_eq!(delivered, vec![a.id, b.id]);
+}
+
 /// A route that was replaced answers `Gone` to its predecessor's pump, and the
 /// predecessor cannot reach the successor's members.
 ///
@@ -808,7 +894,7 @@ async fn v4_r2_daemon_a_replaced_route_answers_gone_to_its_predecessors_pump() {
         panic!("the first subscriber owns the install")
     };
     let (first_cancel, first_join) = fixture_pump(&reg);
-    let predecessor = Arc::clone(&first_cancel);
+    let predecessor = first_cancel.clone();
     assert!(reg
         .finish_channel_install(&key, &first, Some((first_cancel, first_join)))
         .is_none());
@@ -829,13 +915,13 @@ async fn v4_r2_daemon_a_replaced_route_answers_gone_to_its_predecessors_pump() {
         panic!("the route was removed, so this installs a new one")
     };
     let (second_cancel, second_join) = fixture_pump(&reg);
-    let successor = Arc::clone(&second_cancel);
+    let successor = second_cancel.clone();
     assert!(reg
         .finish_channel_install(&key, &second, Some((second_cancel, second_join)))
         .is_none());
     assert!(second.wait().await);
     assert!(
-        !Arc::ptr_eq(&predecessor, &successor),
+        !std::ptr::eq(&*predecessor, &*successor),
         "non-vacuity: these are different route identities"
     );
 
@@ -896,7 +982,7 @@ fn pending_fixture_claim(
     };
     let client = planned(client_record_claim()?)
         .checked_add(planned(
-            LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?,
+            LeasedMap::<ClientId, FundedArc<ClientHandle>>::entry_claim()?,
         ))?;
     let pending_entry = planned(LeasedMap::<PendingKey, PendingRecord>::entry_claim()?)
         .checked_add(planned(pending_retained_for(
@@ -905,6 +991,7 @@ fn pending_fixture_claim(
             remote_peer,
             remote_request_id,
         )?))?
+        .checked_add(planned(pending_cancellation_claim()?))?
         .checked_add(planned(
             crate::ipc::LeasedList::<PendingRecord>::node_claim()?,
         ))?;
@@ -1051,6 +1138,40 @@ async fn v4_r2_daemon_a_pending_call_cannot_be_filed_in_a_class_it_was_not_funde
         .commit_exact_single_pending(prepared, "peer", "req")
         .expect("the same coordinates are still vacant, and the matching class files");
     drop(ticket);
+}
+
+#[test]
+fn pending_identity_exhaustion_refuses_before_the_effect_builder_runs() {
+    let reg = ClientRegistry::default();
+    let (owner, _) = fresh_client(&reg);
+    let key: ClaimKey = ("n".to_string(), "m".to_string());
+    let prepared = reg
+        .prepare_exact_pending(&key, "peer", "req", HandlerMode::Single, owner.id)
+        .expect("non-vacuity: the pending call itself is fully funded");
+    reg.inner
+        .next_operation_id
+        .store(u64::MAX, Ordering::Relaxed);
+
+    let mut builds = 0;
+    let refusal =
+        match reg.commit_exact_pending_as(prepared, "peer", "req", HandlerMode::Single, || {
+            builds += 1;
+            let (tx, rx) = oneshot::channel();
+            (PendingInbound::Single(tx), rx)
+        }) {
+            Ok(_) => panic!("an exhausted identity space cannot publish a pending call"),
+            Err(refusal) => refusal,
+        };
+    assert!(matches!(
+        refusal,
+        PendingRefusal::Admission(IpcAdmissionError::IdentityExhausted)
+    ));
+    assert_eq!(builds, 0, "the effect builder is strictly post-admission");
+    assert_eq!(
+        reg.residue().pending_inbound,
+        0,
+        "and exhaustion publishes no record"
+    );
 }
 
 #[tokio::test]
@@ -1798,7 +1919,7 @@ fn a_pending_calls_funding_outlives_its_record_and_ends_with_its_ticket() {
     //
     // `unregister` removes the *table's* copy of the handle; it does not and
     // must not release the record, because the funding for a client record
-    // follows the last live `Arc<ClientHandle>` rather than the table entry. A
+    // follows the last live `FundedArc<ClientHandle>` rather than the table entry. A
     // real disconnect has several of those in flight -- the read loop, the
     // writer task, the released registrations -- and releasing the record when
     // the table entry went would unfund a handle those are still reading.

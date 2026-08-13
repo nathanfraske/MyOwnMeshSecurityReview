@@ -67,8 +67,11 @@ pub type ClaimKey = (String, String);
 pub struct ClientCapability(String);
 
 impl ClientCapability {
+    const RAW_BYTES: usize = 32;
+    pub(super) const ENCODED_LEN: usize = (Self::RAW_BYTES * 8 + 5) / 6;
+
     pub(super) fn mint() -> Self {
-        let mut bytes = [0_u8; 32];
+        let mut bytes = [0_u8; Self::RAW_BYTES];
         getrandom::getrandom(&mut bytes)
             .expect("OS randomness is required for local IPC authority");
         Self(data_encoding::BASE64URL_NOPAD.encode(&bytes))

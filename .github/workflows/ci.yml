@@ -456,6 +456,40 @@ jobs:
             v4_f2_core_a_subscribe_installs_exactly_one_channel_and_one_subscriber \
             v4_f2_core_a_refused_subscribe_leaves_no_channel_no_subscriber_and_no_lease
 
+          # Review 4928180106: exact planning, borrowed ordered traversal and
+          # shared-allocation funding controls. Qualify the shared
+          # `v4_r3_core_` prefix by module so the two ignored handler-start
+          # controls do not enter these ordinary counts.
+          run_exact_ordinary_group config::tests::v4_r3_core_ 4 \
+            v4_r3_core_the_planning_floor_covers_a_defaulted_config \
+            v4_r3_core_an_empty_object_is_priced_for_what_it_becomes \
+            v4_r3_core_the_plan_covers_many_minimally_specified_networks \
+            v4_r3_core_the_plan_covers_every_populated_repeatable_family
+          run_exact_ordinary_group resource::map::tests::v4_r3_core_ 2 \
+            v4_r3_core_the_ordered_cursor_answers_the_exact_lower_bound \
+            v4_r3_core_an_ordered_pass_walks_one_descent_per_step
+          run_exact_ordinary_group resource::provider::tests::v4_r3_core_ 2 \
+            v4_r3_core_one_claim_funds_a_shared_allocation_until_its_last_handle \
+            v4_r3_core_a_speculative_lease_is_refused_for_sharing_and_keeps_its_funding
+          run_exact_ordinary_group identity::tests::v4_r3_core_f7_ 6 \
+            v4_r3_core_f7_a_refused_network_id_plan_builds_nothing \
+            v4_r3_core_f7_a_funded_network_id_commit_spends_exactly_its_plan \
+            v4_r3_core_f7_a_network_id_plan_measures_what_it_will_build \
+            v4_r3_core_f7_the_funded_and_unfunded_network_id_rules_are_one_rule \
+            v4_r3_core_f7_display_id_length_is_exact_without_building_it \
+            v4_r3_core_f7_the_inline_and_owned_display_suffixes_are_one_suffix
+          run_exact_ordinary_group engine::peer_snapshot::peers_snapshot_controls::v4_r3_core_f7_ 8 \
+            v4_r3_core_f7_a_funded_peers_commit_spends_exactly_its_plan \
+            v4_r3_core_f7_a_peers_commit_refuses_a_lease_it_did_not_plan \
+            v4_r3_core_f7_a_same_size_replacement_voids_the_whole_snapshot \
+            v4_r3_core_f7_a_changed_peer_voids_the_whole_snapshot \
+            v4_r3_core_f7_a_raw_advert_copy_keeps_its_bytes_and_its_capacity \
+            v4_r3_core_f7_the_funded_peer_row_is_the_unfunded_one_on_the_wire \
+            v4_r3_core_f7_the_row_ceiling_covers_the_widest_fixed_row \
+            v4_r3_core_f7_a_line_wider_than_admitted_is_refused_before_publication
+          run_exact_control borrowed_channel_seq_encodes_exactly_like_the_variant
+          run_exact_control v4_arc03f_realtime_bytes_follow_the_payload_owner_through_downstream_queues
+
           run_exact_ordinary_group v4_f3_ 3 \
             v4_f3_stale_channel_and_rpc_handles_cannot_repopulate_a_closed_gateway \
             v4_f3_a_registration_prepared_before_close_refuses_to_commit_after_it \
@@ -503,12 +537,15 @@ jobs:
           run_exact_control a_stream_chunk_this_side_cannot_carry_ends_the_producers_session --ignored
           run_exact_control receiver_chunk_pressure_ends_the_remote_producer --ignored
 
-          # Review 4923134324: handler revocation encloses the first invocation
-          # poll and every reply/chunk/terminal send. Both controls exercise a
-          # local WebRTC object and are intentionally ignored outside this
-          # serialized transport-lab gate.
+          # Reviews 4923134324 and 4928180106: handler revocation is fenced at
+          # the synchronous start and encloses the first future poll plus every
+          # reply/chunk/terminal send. These controls exercise a local WebRTC
+          # object and are intentionally ignored outside this serialized
+          # transport-lab gate.
           run_exact_control revocation_before_the_first_poll_never_reaches_the_embedder --ignored
           run_exact_control revocation_at_the_send_boundary_ends_the_task_with_no_reply --ignored
+          run_exact_control v4_r3_core_f3_revocation_at_the_precommit_point_refuses_the_start --ignored
+          run_exact_control v4_r3_core_f3_revocation_after_the_start_commit_still_enters_the_closure --ignored
 
           # Exact realtime flow-handle authority. Its own family because it is
           # about what a *handle* names rather than about session-owned
@@ -612,8 +649,8 @@ jobs:
             v4_r2_daemon_a_split_moves_matching_nodes_without_touching_the_others
 
           # Framing admission and decoded-request transfer. Running the module
-          # once avoids eight compile/link cycles while each exact name remains
-          # independently load-bearing.
+          # once avoids repeated compile/link cycles while each exact name
+          # remains independently load-bearing.
           run_named_set control::framing::tests:: \
             an_admitted_line_carries_its_own_storage_past_its_reader \
             a_funded_connection_reader_is_built_once \
@@ -624,7 +661,13 @@ jobs:
             a_malformed_line_is_reported_as_malformed_and_not_as_pressure \
             the_decoded_request_carries_its_own_funding_past_the_line \
             v4_r2_daemon_a_padded_decode_releases_its_parse_work_and_keeps_its_retention \
-            v4_r2_daemon_encoded_output_pressure_builds_no_buffer_and_returns_to_baseline
+            v4_r2_daemon_encoded_output_pressure_builds_no_buffer_and_returns_to_baseline \
+            inbound_realtime_encoding_constructs_exactly_one_output_buffer \
+            v4_r2_daemon_prepared_reply_pressure_invokes_no_typed_builder \
+            network_id_pressure_precedes_generation_and_the_exact_line_build \
+            status_pressure_invokes_no_snapshot_builder_and_the_full_grant_builds_once \
+            v4_r3_daemon_networks_pressure_precedes_snapshot_build_and_exact_line \
+            v4_r3_daemon_peers_pressure_precedes_commit_and_exact_wrapper_copy
 
           # Daemon registry accounting, exact channel-route ownership, atomic
           # method registration and the terminal lifecycle.
@@ -649,7 +692,10 @@ jobs:
             v4_r2_daemon_a_pending_call_cannot_be_filed_in_a_class_it_was_not_funded_for \
             v4_r2_daemon_pending_ipc_pressure_refuses_before_the_call_is_built \
             v4_r2_daemon_a_fanout_cursor_skips_removed_members_and_never_repeats_one \
-            v4_r2_daemon_a_replaced_route_answers_gone_to_its_predecessors_pump
+            v4_r2_daemon_a_replaced_route_answers_gone_to_its_predecessors_pump \
+            every_never_reused_daemon_identity_refuses_exhaustion \
+            a_resubscription_cannot_inherit_an_in_flight_frame \
+            pending_identity_exhaustion_refuses_before_the_effect_builder_runs
 
           # The bridge control crosses the real core PreparedRegistration /
           # OwnedMethodRegistration seam, so keep it as its own exact gate
@@ -659,6 +705,14 @@ jobs:
           # The borrowed frame measurement and the constructed mailbox item
           # must agree byte-for-byte and claim-for-claim.
           run_exact_daemon_control v4_r2_daemon_a_measured_inbound_frame_matches_the_frame_it_becomes
+          run_exact_daemon_control v4_r2_daemon_a_displacement_frame_is_measured_before_its_id_string_exists
+
+          # A coherent borrowed services snapshot must price both populated and
+          # absent listener forms before building its funded owner.
+          run_exact_daemon_control services_status_measurement_matches_built_multidigit_folded_projection
+          run_exact_daemon_control v4_r3_daemon_the_networks_work_ceiling_covers_every_fixed_field
+          run_exact_daemon_control v4_r3_daemon_networks_drift_refuses_before_overbudget_build_and_rolls_back
+          run_exact_daemon_control v4_r3_daemon_the_prepared_network_rows_are_the_legacy_rows_on_the_wire
 
           # A production channel pump parks after subscriber selection and
           # before building its peer-sized frame; registry mutations must still
@@ -684,6 +738,11 @@ jobs:
           # control socket and pauses EventsSubscribe immediately before its
           # registry commit while shutdown publishes Closing.
           run_exact_daemon_control a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing
+
+          # The same Ubuntu-only lane owns the real-socket RPC shutdown
+          # witness: a filed call is withdrawn while the exact session remains
+          # live, before the control task and registry finish closing.
+          run_exact_daemon_control v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes
 
       - name: Arc 04 native endpoint-auth controls (transport-lab only)
         run: |

@@ -17,9 +17,13 @@ mod map;
 pub mod provider;
 pub(crate) mod queue;
 
-pub(crate) use mailbox::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
-};
+pub(crate) use mailbox::strings_measure;
+/// The borrowed-measurement kit: measure a source, combine the parts, claim,
+/// acquire, and only then build the owned value. Public because an owner
+/// outside this crate has the same obligation to fund a snapshot before it
+/// allocates one, and reimplementing these would be a second source of truth
+/// for the same arithmetic.
+pub use mailbox::{checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim};
 pub use mailbox::{
     prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
     serialized_mailbox_item_claim_as, PreparedResourceMailbox, ResourceMailboxAdmissionError,
@@ -31,9 +35,9 @@ pub use map::{LeasedMap, LeasedMapInsertRefusal};
 pub(crate) use queue::LeasedQueue;
 
 pub use provider::{
-    FiniteResourceProvider, ReclaimResult, ResourceAcquireDemand, ResourceAdmission,
-    ResourceAuthorityClass, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
-    ResourceLease, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
+    FiniteResourceProvider, FundedArc, FundedWeak, ReclaimResult, ResourceAcquireDemand,
+    ResourceAdmission, ResourceAuthorityClass, ResourceClaim, ResourceClaimArithmeticError,
+    ResourceClass, ResourceLease, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
     ResourceProviderConflict, ResourceProviderPort, ResourceReclaimSubscription,
     ResourceReclaimTarget, ResourceReservationState, ResourceScope, ResourceScopeId,
     ResourceUnavailable, RESOURCE_CLASS_COUNT,

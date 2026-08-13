@@ -39,9 +39,9 @@ use crate::identity::DeviceId;
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
     checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
-    LeasedMap, LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError,
-    ResourceClass, ResourceLease, ResourceMailboxItem, ResourceMailboxItemError,
-    ResourceMailboxReceiver,
+    FundedArc, LeasedMap, LocalApplicationResourceScope, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxItem,
+    ResourceMailboxItemError, ResourceMailboxReceiver,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -146,30 +146,39 @@ impl RpcResponse {
 pub type RpcHandlerFuture =
     Pin<Box<dyn Future<Output = Result<RpcResponse, String>> + Send + 'static>>;
 
-/// One registered single-shot handler and the registration funding that keeps
-/// it alive, in one allocation.
+/// One registered single-shot handler, in one allocation funded by the
+/// [`FundedArc`] that owns it.
 ///
-/// The lease lives **inside** this value rather than beside it in
-/// [`HandlerEntry`], and that placement is the whole point. Dispatch clones the
-/// callable out of the registry and invokes it after the registry lock is gone,
-/// so a lease held by the map entry would be released the instant that entry
-/// was replaced or forgotten — while the clone was still running. The charge
-/// would then have funded the registration for less than the lifetime of the
-/// thing it was charged for. Held here, every clone carries the charge, and the
-/// charge is returned when the last clone drops.
+/// **The registration charge must outlive every invocation clone, and it must
+/// also outlive the allocation itself.** Dispatch clones the handler out of the
+/// registry and invokes it after the registry lock is gone, so funding held by
+/// the map entry would be released the instant that entry was replaced — while
+/// the clone was still running. That is why the charge is not in
+/// [`HandlerEntry`]. But putting it *inside* this struct, as it used to be,
+/// bought the first property at the cost of the second: a lease among these
+/// fields is released by this value's own drop glue, which runs while the
+/// allocation is still there.
+///
+/// [`FundedArc`] gives both. Every strong clone holds the same reservation, so
+/// the charge spans every invocation; and the token sits beside the pointer
+/// rather than inside the pointee, so it is released only once the allocation
+/// is actually gone.
+///
 /// One allocation, and that is load-bearing rather than tidy: the callable is
 /// the trailing **unsized** field, so `Arc<FundedRpcHandler<F>>` coerces to
 /// `Arc<FundedRpcHandler>` without boxing the closure separately. A
 /// `Box<dyn Fn>` beside the counts would be a second allocation that the
 /// registration charge would have to name, and an accounting formula that has
-/// to remember a representation detail is one that drifts from it.
+/// to remember a representation detail is one that drifts from it. That
+/// coercion is why construction goes through `FundedArc::from_admitted_arc`:
+/// unsizing has to happen at the `Arc::new` here, before the funding is
+/// attached.
 pub struct FundedRpcHandler<C: ?Sized = dyn Fn(RpcCall) -> RpcHandlerFuture + Send + Sync + 'static>
 {
     /// Which registration installed this handler. Compared, never displayed:
     /// it exists so a cleanup handle can remove the exact handler it installed
     /// and refuse to remove a successor that legitimately took the name.
     registration: RegistrationIdentity,
-    _retention: ResourceLease,
     /// Last, because a struct may only be unsized in its final field.
     call: C,
 }
@@ -184,7 +193,15 @@ impl FundedRpcHandler {
     }
 }
 
-pub type RpcHandler = Arc<FundedRpcHandler>;
+/// A registered single-shot handler, funded for the whole life of its
+/// allocation.
+///
+/// `FundedArc` rather than `Arc`: cloning one for an invocation shares the
+/// registration's single reservation instead of taking out another, and the
+/// charge goes back only after the last clone is gone *and* the allocation with
+/// it. Reading through it is unchanged — `Deref` reaches the handler — so
+/// `handler.invoke(call)` and `handler.registration()` still work as written.
+pub type RpcHandler = FundedArc<FundedRpcHandler>;
 
 /// Streaming-handler item. Every successful handler must explicitly terminate;
 /// disappearance without `End` is a failed stream, never clean success.
@@ -214,13 +231,13 @@ pub type RpcStreamHandlerFuture = Pin<
 >;
 
 /// The streaming twin of [`FundedRpcHandler`], on the same rule and for the
-/// same reason: the funding and the callable are one allocation, so an
-/// invocation clone cannot outlive the charge that paid for it.
+/// same reason: one allocation, funded by the [`FundedArc`] that owns it, so an
+/// invocation clone cannot outlive the charge that paid for it and the charge
+/// cannot outlive being needed.
 pub struct FundedRpcStreamHandler<
     C: ?Sized = dyn Fn(RpcCall) -> RpcStreamHandlerFuture + Send + Sync + 'static,
 > {
     registration: RegistrationIdentity,
-    _retention: ResourceLease,
     call: C,
 }
 
@@ -234,7 +251,8 @@ impl FundedRpcStreamHandler {
     }
 }
 
-pub type RpcStreamHandler = Arc<FundedRpcStreamHandler>;
+/// [`RpcHandler`] for the streaming twin, shared and funded the same way.
+pub type RpcStreamHandler = FundedArc<FundedRpcStreamHandler>;
 
 /// Names one installation of one handler, so a cleanup handle can act on
 /// exactly the registration it made.
@@ -591,11 +609,12 @@ pub(crate) fn handler_task_claim(
 
 /// Which of the two handler shapes a method is registered under.
 ///
-/// Neither variant carries a retention lease any more: the registration charge
-/// lives inside [`FundedRpcHandler`] / [`FundedRpcStreamHandler`], so it
+/// Neither variant carries a retention lease of its own: the registration
+/// charge is held by the [`FundedArc`] that owns the handler allocation, so it
 /// travels with every invocation clone rather than being released the moment
-/// this entry is replaced. What this entry still owns is its position in the
-/// map, funded by the node lease the map holds.
+/// this entry is replaced — and it is released only once the last of those
+/// clones has gone and the allocation with it. What this entry still owns is
+/// its position in the map, funded by the node lease the map holds.
 pub enum HandlerEntry {
     Single { handler: RpcHandler },
     Stream { handler: RpcStreamHandler },
@@ -824,14 +843,17 @@ impl FundedRpcHandler {
         Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
     {
         let call = move |request: RpcCall| -> RpcHandlerFuture { Box::pin(call(request)) };
-        let _retention = test_handler_scope()
+        let retention = test_handler_scope()
             .acquire(unregistered_handler_claim(funded_handler_layout(&call)))
             .expect("the isolated test grant funds one handler allocation");
-        Arc::new(FundedRpcHandler {
+        // Unsized here, funded after: the coercion has to happen at this
+        // `Arc::new`, which is exactly what `from_admitted_arc` is for.
+        let handler: Arc<FundedRpcHandler> = Arc::new(FundedRpcHandler {
             registration: RegistrationIdentity(0),
-            _retention,
             call,
-        })
+        });
+        FundedArc::from_admitted_arc(handler, retention)
+            .expect("an admitted handler lease may be shared")
     }
 }
 
@@ -847,16 +869,17 @@ impl FundedRpcStreamHandler {
             + 'static,
     {
         let call = move |request: RpcCall| -> RpcStreamHandlerFuture { Box::pin(call(request)) };
-        let _retention = test_handler_scope()
+        let retention = test_handler_scope()
             .acquire(unregistered_handler_claim(funded_stream_handler_layout(
                 &call,
             )))
             .expect("the isolated test grant funds one handler allocation");
-        Arc::new(FundedRpcStreamHandler {
+        let handler: Arc<FundedRpcStreamHandler> = Arc::new(FundedRpcStreamHandler {
             registration: RegistrationIdentity(0),
-            _retention,
             call,
-        })
+        });
+        FundedArc::from_admitted_arc(handler, retention)
+            .expect("an admitted handler lease may be shared")
     }
 }
 
@@ -1690,7 +1713,13 @@ impl SessionRpcState {
     /// session's own map. A count is the smallest thing that does that; it
     /// exposes no effect, no identity and no way to reach an entry, so it
     /// cannot become a settling path by accident.
-    #[cfg(test)]
+    ///
+    /// Also reached from another crate's controls through
+    /// [`crate::JoinedNetwork::pending_call_count_for_test`], which is why the
+    /// gate is the `transport-lab` feature and not `test` alone: `cfg(test)`
+    /// holds only while this crate compiles its own tests. One count with two
+    /// callers, rather than a second witness that could disagree with it.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -2431,11 +2460,9 @@ impl Rpc {
                     .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
             )
             .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
-        let handler: RpcHandler = Arc::new(FundedRpcHandler {
-            registration,
-            _retention: retention,
-            call,
-        });
+        let handler: Arc<FundedRpcHandler> = Arc::new(FundedRpcHandler { registration, call });
+        let handler = FundedArc::from_admitted_arc(handler, retention)
+            .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?;
         self.inner
             .prepare_entry(method, HandlerEntry::Single { handler })
     }
@@ -2543,11 +2570,10 @@ impl Rpc {
                     .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
             )
             .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
-        let handler: RpcStreamHandler = Arc::new(FundedRpcStreamHandler {
-            registration,
-            _retention: retention,
-            call,
-        });
+        let handler: Arc<FundedRpcStreamHandler> =
+            Arc::new(FundedRpcStreamHandler { registration, call });
+        let handler = FundedArc::from_admitted_arc(handler, retention)
+            .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?;
         self.inner
             .prepare_entry(method, HandlerEntry::Stream { handler })
     }
@@ -2843,11 +2869,12 @@ mod tests {
         let retention = scope
             .acquire(retention_claim)
             .expect("the isolated scope funds the predecessor handler");
-        let handler: RpcHandler = Arc::new(FundedRpcHandler {
+        let handler: Arc<FundedRpcHandler> = Arc::new(FundedRpcHandler {
             registration: RegistrationIdentity(7),
-            _retention: retention,
             call,
         });
+        let handler: RpcHandler = FundedArc::from_admitted_arc(handler, retention)
+            .expect("an admitted handler lease may be shared");
         let node = scope
             .acquire(
                 LeasedMap::<String, HandlerEntry>::entry_claim()

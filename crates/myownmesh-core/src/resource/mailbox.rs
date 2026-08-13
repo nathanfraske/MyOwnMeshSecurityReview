@@ -81,7 +81,21 @@ pub fn serialized_mailbox_item_claim_as<T>(
     mailbox_retained_claim::<T>(retained, queued, allocations)
 }
 
-pub(crate) fn mailbox_measure_serialized(
+/// Measure a borrowed value as three totals: retained bytes, queued bytes, and
+/// allocations.
+///
+/// The measurement kit an owner needs when the thing to be funded is *not* one
+/// serializable value but several borrowed pieces that will be assembled after
+/// admission. [`serialized_mailbox_item_claim_as`] is this composed with
+/// [`mailbox_retained_claim`] for the single-value case; an owner measuring a
+/// borrowed source field by field composes the parts with
+/// [`checked_measure_add`] instead and only then acquires.
+///
+/// **Measures, never acquires, and borrows throughout.** Nothing here reserves
+/// capacity, and nothing here clones the caller's source — which is the whole
+/// point at a call site that must decide whether it may build an owned snapshot
+/// before it builds one.
+pub fn mailbox_measure_serialized(
     value: &impl serde::Serialize,
 ) -> Result<(usize, usize, usize), ResourceMailboxItemError> {
     struct CountBytes(Option<usize>);
@@ -120,7 +134,16 @@ pub(crate) fn mailbox_measure_serialized(
     Ok((retained, encoded, allocations))
 }
 
-pub(crate) fn mailbox_retained_claim<T>(
+/// Turn a completed measurement into the exact claim for retaining one `T`.
+///
+/// `T` supplies the inline size of the value that will actually be held; the
+/// three measured totals supply everything it reaches. The residual is the
+/// measured allocation count plus one for the value's own.
+///
+/// The final step of the borrowed-measurement path: measure with
+/// [`mailbox_measure_serialized`], combine with [`checked_measure_add`], claim
+/// here, acquire, and only then build the owned value.
+pub fn mailbox_retained_claim<T>(
     retained_bytes: usize,
     queued_bytes: usize,
     allocations: usize,
@@ -153,7 +176,13 @@ pub(crate) fn mailbox_retained_claim<T>(
     ])?)
 }
 
-pub(crate) fn checked_measure_add(
+/// Add two measurements, refusing rather than wrapping on any of the three.
+///
+/// How an owner measuring a composite borrowed source accumulates its parts
+/// before a single acquisition. Each total is checked in its own dimension, so
+/// an overflow names the class it happened in rather than being absorbed into a
+/// figure that would then underfund the value.
+pub fn checked_measure_add(
     left: (usize, usize, usize),
     right: (usize, usize, usize),
 ) -> Result<(usize, usize, usize), ResourceMailboxItemError> {

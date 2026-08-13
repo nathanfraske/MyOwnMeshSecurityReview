@@ -1361,6 +1361,7 @@ name = "myownmesh"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "data-encoding",
  "dirs",

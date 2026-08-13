@@ -126,6 +126,11 @@ pub(crate) enum ServerOutView<'a> {
         payload: &'a Value,
         streaming: bool,
     },
+    HandlerDisplaced {
+        network: &'a str,
+        method: &'a str,
+        by: crate::ipc::clients::ClientId,
+    },
 }
 
 /// Off-node retention owned by one queued outbound frame.

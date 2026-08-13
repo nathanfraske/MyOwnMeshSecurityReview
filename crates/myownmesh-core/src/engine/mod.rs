@@ -27,6 +27,7 @@ pub mod ice_watchdog;
 pub mod ladder;
 pub mod network_watch;
 pub(crate) mod peer_registry;
+pub(crate) mod peer_snapshot;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
@@ -3178,13 +3179,13 @@ mod inbound_rpc_refusal_controls {
         });
 
         assert!(validate_rpc_handler_class(
-            PreparedRpcHandler::Single(Arc::clone(&single_handler)),
+            PreparedRpcHandler::Single(single_handler.clone()),
             "single",
             false,
         )
         .is_ok());
         assert!(validate_rpc_handler_class(
-            PreparedRpcHandler::Stream(Arc::clone(&stream_handler)),
+            PreparedRpcHandler::Stream(stream_handler.clone()),
             "stream",
             true,
         )
@@ -3561,24 +3562,53 @@ async fn on_rpc_request(
                     crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
                 // Released when this task ends, whichever arm ends it.
                 let _task_lease = _task_lease;
-                // **The whole run, including the invocation.** `invoke` calls
-                // the embedder's `Fn` synchronously to obtain its future, and a
-                // valid handler may do work in that synchronous body before
-                // returning it. Building the future outside this block ran that
-                // body at spawn time — after the authority could already have
-                // ended, and before the witness had ever been polled. Inside,
-                // the first thing that happens when this future is polled is
-                // the call itself, and the `biased` select below polls
-                // revocation first: a session already gone never reaches the
-                // embedder's closure at all.
+                // **The run's start, and the only thing that decides it.**
                 //
-                // Once that synchronous body has begun it is ordered before any
-                // later revocation and cannot be taken back; what this shape
-                // guarantees is that it never *begins* after one, and that
-                // every await afterwards — the handler's own future and the
-                // terminal send — ends when the witness ends.
+                // The select below is a race, and a biased race answers
+                // revocation first at every poll — including a poll that
+                // happens an instant after a start this fence had already
+                // authorized. Leaving the decision to that bias would let a
+                // scheduling artefact erase a logically started run. So the
+                // start is committed here instead: synchronously, under the
+                // same mutation fence governance revocation must take before it
+                // can invalidate this session, and against the exact captured
+                // installation rather than a re-resolved device id.
+                //
+                // A revocation that lands before this refuses the run outright
+                // and the embedder's closure is entered zero times. The hook
+                // argument is that "before" made reachable: it runs inside
+                // `begin`, after the early read and before the fence, and is
+                // empty in a production build.
+                let started =
+                    match peer_registry::AdmittedHandlerRun::new(owner.clone(), witness.clone())
+                        .begin(&state.peers, || state.reach_rpc_handler_precommit_point())
+                    {
+                        Ok(started) => started,
+                        // Nothing is sent. The session that authorized this run
+                        // is gone and its replacement did not ask for it, so the
+                        // terminal frame would have no owner to go to. The task
+                        // ends with its lease.
+                        Err(_revoked) => return,
+                    };
+                // Inert unless a control has armed it; see
+                // `NetworkState::reach_rpc_handler_start_boundary`. A revocation
+                // delivered here is a revocation of a run that has already
+                // started, and the next line runs anyway — which is the whole
+                // point of having committed.
+                state.reach_rpc_handler_start_boundary().await;
+                // **The synchronous body, once, outside every lock.** `invoke`
+                // calls the embedder's `Fn` to obtain its future, and a valid
+                // handler may do work in that body before returning one. It
+                // happens here rather than inside the raced future because the
+                // start is already committed: a revocation from this point on
+                // may cancel every await that follows, but it cannot retract the
+                // fact that the closure was called.
+                let invoked = h.invoke(call);
                 let run = async move {
-                    let resp = h.invoke(call).await;
+                    // Held for the whole run, so the authority to have started
+                    // and the work it authorized end together.
+                    let _started: peer_registry::StartedHandlerRun = started;
+                    let resp = invoked.await;
                     let frame = match resp {
                         Ok(r) => RpcResponseMessage {
                             request_id,
@@ -3625,15 +3655,29 @@ async fn on_rpc_request(
                 let _run_epilogue =
                     crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
                 let _task_lease = _task_lease;
+                // The same start point as the unary arm, and for the same
+                // reasons — see there. A stream's closure is entered exactly
+                // once too, and revoking after that cancels the open, the
+                // receive loop and every send rather than un-starting it.
+                let started =
+                    match peer_registry::AdmittedHandlerRun::new(owner.clone(), witness.clone())
+                        .begin(&state.peers, || state.reach_rpc_handler_precommit_point())
+                    {
+                        Ok(started) => started,
+                        Err(_revoked) => return,
+                    };
+                state.reach_rpc_handler_start_boundary().await;
+                let invoked = h.invoke(call);
                 // The same shape as the unary arm, and for the same reasons:
-                // the invocation, the open, every chunk send and every terminal
-                // send are one future, raced once against the witness. The loop
-                // used to select per iteration, which left the sends between
-                // iterations outside the race — a revoked session could still be
-                // spending this task's lease inside `send_to_peer_owner` until
-                // the transport returned.
+                // the open, every chunk send and every terminal send are one
+                // future, raced once against the witness. The loop used to
+                // select per iteration, which left the sends between iterations
+                // outside the race — a revoked session could still be spending
+                // this task's lease inside `send_to_peer_owner` until the
+                // transport returned.
                 let run = async move {
-                    let opened = h.invoke(call).await;
+                    let _started: peer_registry::StartedHandlerRun = started;
+                    let opened = invoked.await;
                     let mut rx = match opened {
                         Ok(rx) => rx,
                         Err(e) => {
@@ -5508,10 +5552,150 @@ async fn insert_promoted_peer(state: &Arc<NetworkState>, device_id: &str) -> Pro
 /// for the fixture's lifetime, because dropping either receiver stops that
 /// connector's pump and the link the control asserts on would stop being the
 /// link that was up.
-#[cfg(all(test, feature = "transport-lab"))]
-struct LinkedPromotedPeer {
-    peer: Arc<PeerConnection>,
-    receive_ready: crate::endpoint_auth::native_link::ReceiveReadyLinkBeforeEngineOpen,
+/// Gated on the feature alone: this crate's own controls use it, and so does
+/// the `transport-lab` fixture [`crate::JoinedNetwork`] hands to another
+/// crate's controls, where this crate's `cfg(test)` is not set.
+#[cfg(feature = "transport-lab")]
+pub(crate) struct LinkedPromotedPeer {
+    pub(crate) peer: Arc<PeerConnection>,
+    pub(crate) receive_ready: crate::endpoint_auth::native_link::ReceiveReadyLinkBeforeEngineOpen,
+}
+
+/// The same link with **both** engines participating.
+///
+/// [`LinkedPromotedPeer`] alone gives a near session over a live link whose far
+/// end is merely held open. That is enough for a control that only needs bytes
+/// to leave, but not for one whose subject is what a *remote* side does with
+/// them: nothing installs the near node on the far state, and nothing hands the
+/// far engine its inbound frames, so a call filed near never reaches a handler
+/// served far and the far side can never be the cause of anything.
+///
+/// This adds the far half the way the crate's own two-engine controls do:
+/// the far connector's genuine open handoff — the one the receive-ready fixture
+/// was already holding — becomes the far peer's authenticated channel, and every
+/// **raw** far event is handed to [`handle_transport_event`], which is the
+/// production seam a transport driver feeds.
+///
+/// Raw and unaccepted, both deliberately. A pump that accepted events itself and
+/// acted only on `Message` would deliver frames perfectly well and silently swallow
+/// `DataChannelClosed`, so the far peer would never be dropped and its session
+/// never revoked — a control waiting on that cancellation would wait forever for
+/// something nothing was going to cause.
+///
+/// No second RPC dispatcher is created here. [`crate::rpc::Rpc::attach`] returns
+/// the gateway's existing one, so the far side's handlers are the ones its own
+/// owner registered; a fixture that stood up a parallel dispatcher would be a
+/// second witness that could disagree with the first.
+#[cfg(feature = "transport-lab")]
+pub(crate) struct LinkedPromotedSession {
+    near: LinkedPromotedPeer,
+    /// The far state's owner token for the near node. Held, so the far peer
+    /// outlives the control even if the far registry replaces it.
+    _far_peer: Arc<PeerConnection>,
+    /// Ends when the far connector's event stream does, which is what closing
+    /// the link does to it.
+    pump: tokio::task::JoinHandle<()>,
+}
+
+/// Promote both directions of one real link: `far`'s device becomes a peer of
+/// `near`, `near`'s device becomes a peer of `far`, and the far end is pumped.
+///
+/// Device ids are each state's own identity rather than caller-chosen strings,
+/// so a call addressed to the id this returns is addressed to the network that
+/// actually answers on the other end of this link.
+#[cfg(feature = "transport-lab")]
+pub(crate) async fn install_promoted_session_over_real_link(
+    near_state: &Arc<NetworkState>,
+    far_state: &Arc<NetworkState>,
+) -> LinkedPromotedSession {
+    let far_device_id = far_state.identity.public_id().to_string();
+    let near_device_id = near_state.identity.public_id().to_string();
+    let mut near = insert_promoted_peer_over_real_link(near_state, far_state, &far_device_id).await;
+
+    let handoff = near.receive_ready.take_right_handoff();
+    let far_peer = Arc::new(PeerConnection::new(
+        near_device_id.clone(),
+        Some(Arc::clone(&near.receive_ready.link.right)),
+    ));
+    {
+        let mut data = far_peer.state.write();
+        data.authenticated = true;
+        data.status = PeerStatus::Active;
+        data.data_channel_open = true;
+    }
+    far_peer.install_authenticated_channel_over_for_test(
+        handoff,
+        &far_state.network_id,
+        far_state.identity.public_id(),
+    );
+    install_peer(&far_state.peers, Arc::clone(&far_peer));
+    assert!(
+        far_state.peers.owner(&near_device_id).is_some(),
+        "the far side has just installed the near node"
+    );
+
+    let pumping = Arc::clone(far_state);
+    let mut events = near.receive_ready.link.take_right_events();
+    let pump = tokio::spawn(async move {
+        // No deadline: this loop's termination is an observation, not a
+        // timeout. It ends when the native close ends the event stream.
+        while let Some(event) = events.recv().await {
+            let _acted = handle_transport_event(&pumping, near_device_id.clone(), event).await;
+        }
+    });
+
+    LinkedPromotedSession {
+        near,
+        _far_peer: far_peer,
+        pump,
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+impl LinkedPromotedSession {
+    /// The device id the far network answers under, which is also the id the
+    /// near session was installed against.
+    pub(crate) fn peer_device_id(&self) -> &str {
+        &self.near.peer.device_id
+    }
+
+    /// Close both connectors, then wait for the far pump to observe the end of
+    /// its stream.
+    ///
+    /// The order is the point: joining before closing would wait for a stream
+    /// nothing had ended yet. Neither installed peer is retired here — retiring
+    /// them is each engine's own shutdown work, which is the behaviour a control
+    /// over this fixture is measuring.
+    pub(crate) async fn close_outcomes(self) -> Vec<crate::Result<()>> {
+        let LinkedPromotedSession {
+            near,
+            _far_peer,
+            pump,
+        } = self;
+        let outcomes = near.close_outcomes().await;
+        let _ended = pump.await;
+        drop(_far_peer);
+        outcomes
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+impl LinkedPromotedPeer {
+    /// Close both fixture connectors, releasing the far side's retained
+    /// ownership only after both closes have been awaited.
+    ///
+    /// The installed peer is deliberately *not* retired here: retiring it is
+    /// the near engine's own work, and a fixture that did it first would be
+    /// standing in for the shutdown path a control is asserting on.
+    pub(crate) async fn close_outcomes(self) -> Vec<crate::Result<()>> {
+        let LinkedPromotedPeer {
+            peer,
+            receive_ready,
+        } = self;
+        let outcomes = receive_ready.close_outcomes().await;
+        drop(peer);
+        outcomes
+    }
 }
 
 /// Install `device_id` as a promoted peer over a live link to `peer_state`.
@@ -5521,8 +5705,8 @@ struct LinkedPromotedPeer {
 /// generic handoff, then commit — and that exact worker and handoff become the
 /// peer's authenticated channel. So the installed peer is the same shape
 /// `insert_promoted_peer` produces, differing only in having a far side.
-#[cfg(all(test, feature = "transport-lab"))]
-async fn insert_promoted_peer_over_real_link(
+#[cfg(feature = "transport-lab")]
+pub(crate) async fn insert_promoted_peer_over_real_link(
     state: &Arc<NetworkState>,
     peer_state: &Arc<NetworkState>,
     device_id: &str,
@@ -7153,6 +7337,17 @@ mod tests {
             .expect("non-vacuity: a second owned send is admitted before revocation")
             .begin_for_test(&state.peers)
             .expect("the second send crosses its effect-begin point before revocation");
+        // The same delayed shape for an inbound handler run: authority captured
+        // while the session is live, started only after revocation has
+        // committed. A dispatched call carries exactly this pair, so this is the
+        // value `on_rpc_request` would be holding when its task is first polled.
+        let delayed_run = peer_registry::AdmittedHandlerRun::new(
+            owner.clone(),
+            fixture
+                .peer
+                .with_live_session(|session| session.validity_witness())
+                .expect("non-vacuity: the live session yields its witness before revocation"),
+        );
         fixture.peer.state.write().media_reneg_pending = true;
         let delayed_renegotiation = state
             .peers
@@ -7232,6 +7427,27 @@ mod tests {
             fixture.peer.state.read().diag.frames_out,
             frames_before_effects,
             "refusal before effect-begin never reaches the native-send/accounting half",
+        );
+        // The inbound half of the same rule. A handler run captured while the
+        // session was live does not get to start once revocation has committed:
+        // the embedder's closure is never entered, because the start point is a
+        // fenced decision rather than a race the run might happen to win.
+        //
+        // Nothing is invoked here to observe that — invoking is precisely what
+        // must not happen — so the refusal itself is the observation, and it is
+        // named as revocation like every other arm.
+        // Matched rather than `expect_err`ed: the success type is the start
+        // authority itself, which is deliberately not `Debug` — a token that
+        // could be printed is a token that has a representation, and this one
+        // is nothing but evidence. So the wrong outcome is named here instead
+        // of being formatted.
+        let delayed_run_error = match delayed_run.begin(&state.peers, || {}) {
+            Ok(_started) => panic!("an already-minted handler run is synchronously revoked"),
+            Err(error) => error,
+        };
+        assert!(
+            delayed_run_error.to_string().contains("was revoked"),
+            "the delayed handler run names revocation rather than starting: {delayed_run_error}"
         );
         // Non-vacuity for the arm below: the connector's close fence really has
         // committed by now, so the started arm cannot be passing merely because
@@ -14249,6 +14465,279 @@ mod tests {
                  entered the embedder's closure — the count is still the one the \
                  live run made ({} arm)",
                 if streaming { "stream" } else { "unary" }
+            );
+        }
+    }
+
+    /// Revocation delivered *at* the start's pre-commit point refuses the run,
+    /// and the embedder's closure is entered zero times.
+    ///
+    /// The negative half of the fenced start, and the instant nothing else can
+    /// reach. `revocation_before_the_first_poll_...` above revokes before the
+    /// spawned task has run at all, which the current-thread runtime makes
+    /// reachable for free; this revokes *inside* `AdmittedHandlerRun::begin`,
+    /// after its early validity read has passed and before it takes the
+    /// mutation fence. That is the window where a start could still be wrongly
+    /// granted on the strength of a read that had already gone stale.
+    ///
+    /// **Reached through the production arm, not around it.** The hook is
+    /// `NetworkState::reach_rpc_handler_precommit_point`, and the only thing
+    /// that passes it is `on_rpc_request`'s spawned dispatch. There is
+    /// deliberately no test-only `begin` variant to call instead: a control that
+    /// called one would observe this refusal in isolation and prove nothing
+    /// about whether the production path ever consults it. The staged action
+    /// being *consumed* is what says the run traversed that path.
+    ///
+    /// Revoking from inside the hook is sound: the hook runs before
+    /// `peers.mutation` is taken, so the governance locks the revocation needs
+    /// are all free.
+    ///
+    /// No timer anywhere. `settle_until` only bounds a hang; the negative is
+    /// that the count is still the live run's after the runtime has been driven
+    /// as far as it will go.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r3_core_f3_revocation_at_the_precommit_point_refuses_the_start() {
+        for streaming in [false, true] {
+            let handler_task = crate::rpc::handler_task_claim_for(
+                "device-b",
+                "refused",
+                "starts",
+                &serde_json::Value::Null,
+            )
+            .expect("the handler task is representable");
+            let (state, rpc, b, _c) =
+                two_authenticated_peers_with("arc04r3-precommit-refusal", handler_task).await;
+            let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            if streaming {
+                let invoked = Arc::clone(&invoked);
+                rpc.serve_stream("starts", move |_call: crate::rpc::RpcCall| {
+                    // The embedder's synchronous body — everything a real
+                    // handler does before it has a future to return.
+                    invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        Err::<
+                            crate::resource::ResourceMailboxReceiver<crate::rpc::RpcStreamItem>,
+                            String,
+                        >("unreachable in this control".into())
+                    }
+                })
+                .expect("the live gateway admits a streaming handler");
+            } else {
+                let invoked = Arc::clone(&invoked);
+                rpc.serve("starts", move |_call: crate::rpc::RpcCall| {
+                    invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Ok(crate::rpc::RpcResponse::from_value(serde_json::json!(1))) }
+                })
+                .expect("the live gateway admits a handler");
+            }
+
+            // Non-vacuity for fixture and handler alike, taken before anything
+            // is staged: the same frame under a live session reaches the
+            // embedder exactly once. Its run is then drained rather than merely
+            // observed, because the fixture funds one handler task and a first
+            // run still holding its lease would make the second mint fail for
+            // capacity — and a second run that was never minted would satisfy
+            // every assertion below without reaching the window they are about.
+            deliver_rpc_request(&state, "device-b", "live", "starts", streaming).await;
+            assert!(
+                settle_until(|| invoked.load(std::sync::atomic::Ordering::SeqCst) == 1).await,
+                "a run under a live session reaches the embedder ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert!(
+                settle_until(|| state.rpc_send_boundary.finished() == 1).await,
+                "and that run ends, returning the handler task the second one needs"
+            );
+
+            // Armed from here, and asserted at zero below. On this fixture the
+            // peer's frame count cannot move whatever the engine decides — its
+            // connector has no open data channel — so the count alone would be a
+            // weak negative. `entered` is the strong one: it says no run reached
+            // the point at which a reply is sent at all.
+            state.rpc_send_boundary.arm();
+            let frames_before = b.peer.state.read().diag.frames_out;
+
+            let peer = state.peers.get("device-b").expect("B is installed");
+            state.stage_rpc_handler_precommit_action(move || peer.revoke_promoted_session());
+            deliver_rpc_request(&state, "device-b", "refused", "starts", streaming).await;
+
+            assert!(
+                settle_until(|| state.rpc_send_boundary.finished() == 2).await,
+                "non-vacuity: a second run really was minted and spawned, and it \
+                 ended — releasing the task lease it was refused while holding \
+                 ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert!(
+                !state.rpc_handler_precommit_action_pending(),
+                "non-vacuity: the staged revocation was consumed, so that run \
+                 traversed the production start's pre-commit point rather than \
+                 being turned away somewhere earlier ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                invoked.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "and the embedder's closure was entered zero times for it — the \
+                 count is still the live run's ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                state.rpc_send_boundary.entered(),
+                0,
+                "a refused run builds no reply, so it never reaches a send boundary"
+            );
+            assert_eq!(
+                b.peer.state.read().diag.frames_out,
+                frames_before,
+                "and nothing reached the peer's connector"
+            );
+        }
+    }
+
+    /// Revocation delivered *after* the start has committed still enters the
+    /// embedder's closure, exactly once, and cancels everything after it.
+    ///
+    /// The positive half, and the one that says the fence is a commit rather
+    /// than a checkpoint. A run whose authority was live when the fence let it
+    /// through has *started*; a revocation landing an instant later may cancel
+    /// every await it has left, but it cannot retract the fact that the closure
+    /// was called. Without this arm, a build that refused the run here would
+    /// satisfy the negative control above and lose nothing.
+    ///
+    /// `NetworkState::reach_rpc_handler_start_boundary` is the seam, and it sits
+    /// between `begin` returning and `invoke` being called — which the
+    /// `invoked == 0` assertion at the park pins, because a boundary placed
+    /// after `invoke` would already read one there.
+    ///
+    /// The park is *not* an arm of the run's select: it is awaited directly by
+    /// the spawned task, so revoking while the run stands on it wakes nothing.
+    /// Only [`RpcSendBoundary::release`] moves it, which is what makes "revoked
+    /// strictly between the commit and the closure" a state this control sets
+    /// rather than races for.
+    ///
+    /// The send boundary is armed too. It is never expected to be reached, so
+    /// arming it costs nothing here and turns "no reply was built" into a direct
+    /// observation; a regression that let the run through would park there and
+    /// fail the lease assertion below rather than passing quietly.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r3_core_f3_revocation_after_the_start_commit_still_enters_the_closure() {
+        for streaming in [false, true] {
+            let handler_task = crate::rpc::handler_task_claim_for(
+                "device-b",
+                "parked",
+                "starts",
+                &serde_json::Value::Null,
+            )
+            .expect("the handler task is representable");
+            let (state, rpc, b, _c) =
+                two_authenticated_peers_with("arc04r3-post-commit-start", handler_task).await;
+            let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            if streaming {
+                let (invoked, polled) = (Arc::clone(&invoked), Arc::clone(&polled));
+                rpc.serve_stream("starts", move |_call: crate::rpc::RpcCall| {
+                    invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let polled = Arc::clone(&polled);
+                    async move {
+                        // An async block runs nothing until it is polled, so
+                        // this line is the returned future's first poll and
+                        // nothing else.
+                        polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err::<
+                            crate::resource::ResourceMailboxReceiver<crate::rpc::RpcStreamItem>,
+                            String,
+                        >("unreachable in this control".into())
+                    }
+                })
+                .expect("the live gateway admits a streaming handler");
+            } else {
+                let (invoked, polled) = (Arc::clone(&invoked), Arc::clone(&polled));
+                rpc.serve("starts", move |_call: crate::rpc::RpcCall| {
+                    invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let polled = Arc::clone(&polled);
+                    async move {
+                        polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(crate::rpc::RpcResponse::from_value(serde_json::json!(1)))
+                    }
+                })
+                .expect("the live gateway admits a handler");
+            }
+
+            let frames_before = b.peer.state.read().diag.frames_out;
+            // Subscribed before the frame is delivered: the arrival is a
+            // notification, not a level, and a control that asked afterwards
+            // could miss it.
+            let arrival = state.rpc_handler_start_boundary.arrival();
+            tokio::pin!(arrival);
+            arrival.as_mut().enable();
+            state.rpc_handler_start_boundary.arm();
+            state.rpc_send_boundary.arm();
+
+            deliver_rpc_request(&state, "device-b", "parked", "starts", streaming).await;
+            arrival.await;
+            assert_eq!(
+                state.rpc_handler_start_boundary.entered(),
+                1,
+                "non-vacuity: the run committed its start and is parked on the \
+                 committed side of it ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                invoked.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "and the park is genuinely before the closure — a boundary placed \
+                 after `invoke` would already read one here ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+
+            // The authority ends while the run stands there, and only then is
+            // the run allowed to continue.
+            let peer = state.peers.get("device-b").expect("B is installed");
+            peer.revoke_promoted_session();
+            state.rpc_handler_start_boundary.release();
+
+            assert!(
+                settle_until(|| state.rpc_send_boundary.finished() == 1).await,
+                "the run ends and releases its task lease ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                state.rpc_handler_start_boundary.passed(),
+                1,
+                "having left the start boundary by being released rather than by \
+                 being dropped on it — so what follows is about a run that really \
+                 did continue past a committed start"
+            );
+            assert_eq!(
+                invoked.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the embedder's closure was entered anyway, exactly once: the \
+                 start was ordered before that revocation and revocation cannot \
+                 retract it ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                polled.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "while everything the closure returned was cancelled — the future \
+                 it handed back was dropped without a single poll, which is the \
+                 other half of the same rule ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                state.rpc_send_boundary.entered(),
+                0,
+                "so no reply was ever built, and no send boundary was reached"
+            );
+            assert_eq!(
+                b.peer.state.read().diag.frames_out,
+                frames_before,
+                "and nothing reached the peer's connector"
             );
         }
     }

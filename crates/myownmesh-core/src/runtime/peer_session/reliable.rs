@@ -31,7 +31,7 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
-use crate::protocol::MeshMessage;
+use crate::protocol::BorrowedChannelSeq;
 use crate::resource::{
     LeasedQueue, ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease,
 };
@@ -362,23 +362,18 @@ impl ReliableState {
             )));
             return;
         };
-        let encoded = match serde_json::to_vec(&MeshMessage::ChannelSeq {
-            stream: self.stream,
-            seq,
-            channel: channel.to_string(),
-            payload,
-        }) {
-            // Canonicalized before anything is measured or charged. The encoder
-            // returns a growable buffer whose capacity it chose; boxing it here
-            // makes length and capacity the same number, so the claim below is
-            // the retained size rather than a lower bound on it.
-            Ok(encoded) => encoded.into_boxed_slice(),
-            Err(e) => {
-                let _ = reply.send(Err(Error::Serde(e)));
-                return;
-            }
+        // The frame, borrowed rather than built. Counting its exact encoded size
+        // from the caller's own channel name and payload is what lets every
+        // refusal below cost nothing: no copied channel string, no growable
+        // buffer, no boxed slice on a path that ends in a refusal.
+        let frame = BorrowedChannelSeq::new(self.stream, seq, channel, &payload);
+        let Some(encoded_len) = frame.encoded_len() else {
+            let _ = reply.send(Err(Error::Transport(
+                "reliable frame does not encode to a measurable size".into(),
+            )));
+            return;
         };
-        let claim = match retained_frame_claim(encoded.len()) {
+        let claim = match retained_frame_claim(encoded_len) {
             Ok(claim) => claim,
             Err(e) => {
                 let _ = reply.send(Err(Error::Transport(format!(
@@ -418,9 +413,28 @@ impl ReliableState {
                 return;
             }
         };
-        // The reservation is taken immediately before the retention it pays for
-        // and nothing between the two can fail, so a refusal drops the encoded
-        // buffer here and this queue retains nothing that was not funded.
+        // Both reservations are held, and only now is the frame built: one
+        // allocation, at the counted size, for the bytes the claim was taken
+        // for. Every refusal above this line built nothing at all.
+        //
+        // A length that does not match the count would mean the value changed
+        // under the borrow between counting and encoding. It cannot here — the
+        // borrow is held across both — but installing a buffer of one size under
+        // a lease taken for another is exactly the defect being prevented, so it
+        // is refused rather than assumed away.
+        let Some(encoded) = frame.encode_exact(encoded_len) else {
+            let _ = reply.send(Err(Error::Transport(
+                "reliable frame did not encode to its counted size".into(),
+            )));
+            return;
+        };
+        // The borrow ends above, so the caller's payload can go now rather than
+        // at the end of this call. Its heap is the caller's, not this queue's,
+        // and holding it across the push would keep unfunded bytes alive for no
+        // reason.
+        drop(payload);
+        // Nothing between the funded encode and the push can fail, so this queue
+        // retains nothing that was not funded.
         self.next_seq = seq;
         self.pending.push(
             PendingFrame {

@@ -26,19 +26,70 @@
 
 use super::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease};
 
-/// One retained entry: the caller's value, the lease that paid for this node,
-/// and the link to the next.
+/// One retained entry: the caller's value and the link to the next.
 ///
-/// Removal moves the node out of its `Box`, which frees the allocation before
-/// the moved lease is released. A lease released before the thing it accounts
-/// for is gone would leave a window in which the provider believes memory is
-/// free while it is still occupied.
+/// The lease that funds this allocation is deliberately **not** here. It lives
+/// in the [`FundedNode`] link that owns the box, because a lease stored inside
+/// the allocation it pays for is released by that allocation's own drop glue —
+/// which runs while the allocation is still there. See [`FundedNode`].
 struct LeasedQueueNode<T> {
     value: T,
+    next: Option<FundedNode<T>>,
+}
+
+/// A node allocation and the lease that pays for it, in that order.
+///
+/// **The lease is a sibling of the box, not a field inside it.** The removal
+/// paths here were already careful to move a node out of its `Box` before
+/// releasing the lease, but care is not a property — [`LeasedQueue::retain`]
+/// drops a rejected node without moving it out, and that path released the
+/// funding while the allocation was still there. Making the link own the lease
+/// makes every path right at once, including the ones that only ever drop.
+///
+/// The box cannot be taken out. [`Deref`](std::ops::Deref) borrows the node so
+/// the chain walks and reversals below read exactly as they did when the links
+/// were plain boxes, and [`FundedNode::into_value`] is the single consuming
+/// exit, written so the allocation is freed before the lease goes back.
+struct FundedNode<T> {
+    node: Box<LeasedQueueNode<T>>,
     /// Covers only this queue node's allocation. Any off-node retention in
     /// `value` owns a separate lease for its full lifetime.
+    ///
+    /// Declared after `node`, and that order is the entire point.
     _entry: ResourceLease,
-    next: Option<Box<LeasedQueueNode<T>>>,
+}
+
+impl<T> std::ops::Deref for FundedNode<T> {
+    type Target = LeasedQueueNode<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl<T> std::ops::DerefMut for FundedNode<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
+    }
+}
+
+impl<T> FundedNode<T> {
+    /// Detach the value, free its allocation, and only then release its lease.
+    ///
+    /// Moving out of `*node` frees the allocation at the end of that statement,
+    /// and `_entry` — a local from this function's own destructuring — is
+    /// released after it, on return. The value is handed back still owning
+    /// whatever separate lease its off-node storage holds.
+    ///
+    /// Callers reach this with `next` already taken, so nothing downstream is
+    /// dropped here and this cannot walk the rest of the chain.
+    fn into_value(self) -> T {
+        let FundedNode { node, _entry } = self;
+        let LeasedQueueNode { value, .. } = *node;
+        // The allocation is gone as of the statement above. `_entry` is
+        // released below, when this frame ends — never before.
+        value
+    }
 }
 
 /// A first-in, first-out queue whose every entry is separately funded.
@@ -54,9 +105,12 @@ struct LeasedQueueNode<T> {
 /// to get the drop order wrong.
 pub(crate) struct LeasedQueue<T> {
     /// Oldest first. The head is the front of the queue whenever it is present.
-    oldest: Option<Box<LeasedQueueNode<T>>>,
+    ///
+    /// Holds the head node's lease as well as the head node, since a link owns
+    /// the funding of the node it points at.
+    oldest: Option<FundedNode<T>>,
     /// Newest first. Empty until something is pushed onto a live queue.
-    newest: Option<Box<LeasedQueueNode<T>>>,
+    newest: Option<FundedNode<T>>,
     len: usize,
 }
 
@@ -67,10 +121,10 @@ pub(crate) struct LeasedQueue<T> {
 /// be worth accounting is deep enough to overflow the stack while being freed.
 /// Unlinking first means every node is dropped with an empty `next`.
 ///
-/// Moving a node out of its `Box` frees that node's allocation first; the value
-/// and node lease then drop from locals, in that order. An owner whose entry
-/// carries a completion signal, a payload lease or a reply channel therefore
-/// gets all of them resolved here, with nothing to remember to call.
+/// Each node is dropped as a [`FundedNode`]: the value is destroyed, the node's
+/// allocation is freed, and only then does its lease go back. An owner whose
+/// entry carries a completion signal, a payload lease or a reply channel
+/// therefore gets all of them resolved here, with nothing to remember to call.
 ///
 /// The chains are merged first, so entries are destroyed oldest-first. Dropping
 /// the push chain as it stands would destroy the newest entries first, and an
@@ -81,15 +135,11 @@ impl<T> Drop for LeasedQueue<T> {
     fn drop(&mut self) {
         self.merge();
         let mut cursor = self.oldest.take();
-        while let Some(node) = cursor {
-            let LeasedQueueNode {
-                value,
-                _entry,
-                next,
-            } = *node;
-            cursor = next;
-            drop(value);
-            drop(_entry);
+        while let Some(mut node) = cursor {
+            cursor = node.next.take();
+            // `node` drops here with an empty `next`, so this cannot recurse
+            // through the rest of the chain. The link owns the ordering: box
+            // first, lease after.
         }
     }
 }
@@ -115,8 +165,16 @@ impl<T> LeasedQueue<T> {
     /// itself — it states only its own retention, and this adds the exact
     /// representation term for the entry that will hold it. The node's size is
     /// `size_of` over the concrete node type, so it already includes the
-    /// caller's value inline, the lease handle, and the link; the residual is 1
-    /// because the entry is exactly one allocation.
+    /// caller's value inline and the link — and the link is now a pointer *and*
+    /// the next node's lease handle, since [`FundedNode`] holds a node's funding
+    /// beside its box rather than inside it. That inline lease handle is part of
+    /// this allocation and is counted here exactly once, by the node that
+    /// allocates it.
+    ///
+    /// This entry's own lease is not in this allocation at all: it is held by
+    /// the previous node's link, or by the queue's `oldest`/`newest` field for a
+    /// chain head. Every node allocation is paid for by exactly one claim, taken
+    /// here. The residual is 1 because the entry is exactly one allocation.
     ///
     /// Anything `T` retains off-node owns a separate lease inside `T`. That
     /// separation is load-bearing: [`Self::pop_front`] releases the removed
@@ -143,11 +201,13 @@ impl<T> LeasedQueue<T> {
     /// acquired. A push that could still fail would leave the caller holding a
     /// lease for an entry that does not exist.
     pub(crate) fn push(&mut self, value: T, entry: ResourceLease) {
-        self.newest = Some(Box::new(LeasedQueueNode {
-            value,
+        self.newest = Some(FundedNode {
+            node: Box::new(LeasedQueueNode {
+                value,
+                next: self.newest.take(),
+            }),
             _entry: entry,
-            next: self.newest.take(),
-        }));
+        });
         // Not saturating: the count and the chain must agree, and a saturated
         // count would disagree silently. It cannot overflow either — every
         // entry is a live allocation, so `usize::MAX` of them is unreachable —
@@ -179,13 +239,8 @@ impl<T> LeasedQueue<T> {
     /// Remove and return the oldest entry, releasing only its node lease.
     pub(crate) fn pop_front(&mut self) -> Option<T> {
         self.expose_front();
-        let node = *self.oldest.take()?;
-        let LeasedQueueNode {
-            value,
-            _entry,
-            next,
-        } = node;
-        self.oldest = next;
+        let mut node = self.oldest.take()?;
+        self.oldest = node.next.take();
         // Reached only after a node really came off the chain, so this cannot
         // underflow unless the count and the chain have already diverged —
         // which is the thing worth failing on rather than absorbing.
@@ -193,9 +248,10 @@ impl<T> LeasedQueue<T> {
             .len
             .checked_sub(1)
             .expect("an entry was removed, so the count was not zero");
-        // `_entry` funds only the removed node and is released here. Any
-        // off-node retention travels with `value` under a lease owned by T.
-        Some(value)
+        // The node lease funds only the removed node; `into_value` frees that
+        // allocation before releasing it. Any off-node retention travels with
+        // the value under a lease owned by T.
+        Some(node.into_value())
     }
 
     /// Remove and return the newest entry, releasing only its node lease.
@@ -209,12 +265,14 @@ impl<T> LeasedQueue<T> {
         loop {
             let is_last = cursor.as_ref()?.next.is_none();
             if is_last {
-                let node = *cursor.take()?;
+                // Already the tail, so its `next` is empty and nothing else
+                // leaves the chain with it.
+                let node = cursor.take()?;
                 self.len = self
                     .len
                     .checked_sub(1)
                     .expect("an entry was removed, so the count was not zero");
-                return Some(node.value);
+                return Some(node.into_value());
             }
             cursor = &mut cursor.as_mut()?.next;
         }
@@ -248,7 +306,10 @@ impl<T> LeasedQueue<T> {
     /// entry naming a closed flow, wherever those entries sit. Each removed
     /// entry is dropped here, which releases its funding at the moment it stops
     /// being retained — the same rule as [`Self::pop_front`], applied to a
-    /// different question about which entry goes.
+    /// different question about which entry goes. A rejected node is dropped
+    /// rather than moved out, and it is [`FundedNode`] that makes that ordering
+    /// right: this loop does not have to remember to free before releasing,
+    /// because it cannot express the other order.
     ///
     /// Kept entries keep their nodes and their leases. Nothing is reallocated
     /// and nothing is re-funded, because nothing that stays ever stopped
@@ -323,9 +384,9 @@ impl<T> LeasedQueue<T> {
     ///
     /// Moves nodes; allocates nothing and drops nothing.
     fn reverse_onto(
-        chain: Option<Box<LeasedQueueNode<T>>>,
-        acc: Option<Box<LeasedQueueNode<T>>>,
-    ) -> Option<Box<LeasedQueueNode<T>>> {
+        chain: Option<FundedNode<T>>,
+        acc: Option<FundedNode<T>>,
+    ) -> Option<FundedNode<T>> {
         let mut cursor = chain;
         let mut acc = acc;
         while let Some(mut node) = cursor {

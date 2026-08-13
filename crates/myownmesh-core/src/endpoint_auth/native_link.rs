@@ -16,21 +16,34 @@
 //! incidental: the negative fails *because* of the substitution, and the
 //! positive proves the same construction promotes when nothing is substituted.
 //!
-//! [`connect_before_engine_open`] is the second fixture, and it exists because
-//! [`connect`] performs the promotion itself. The open-path controls need the
+//! `connect_before_engine_open` is the second fixture, and it exists because
+//! `connect` performs the promotion itself. The open-path controls need the
 //! production engine arm to be the thing that promotes, so that fixture stops at
 //! the left connector's own native open callback and hands it over unconsumed.
 //! It is the fixture, not a re-implementation of the arm: it opens the link and
-//! nothing else.
+//! nothing else. Both are named in code spans rather than linked: both are
+//! `cfg(test)`, while this module compiles on the feature alone, so an
+//! intra-doc link here would be broken in exactly the configuration the
+//! `transport-lab` consumers build.
 
+// The endpoint-authentication half of this module belongs to the twins, which
+// are this crate's own controls. The link half is also reached from a
+// `transport-lab` fixture in another crate, so it compiles whenever the feature
+// is on; everything only the twins use stays behind `cfg(test)` so a
+// feature-only build carries no unused item.
+#[cfg(test)]
 use super::contribution::{LocalContribution, PeerContribution};
+#[cfg(test)]
 use super::transcript;
+#[cfg(test)]
 use super::{
     EndpointAuthContext, EndpointAuthError, EndpointAuthSetupError, EndpointAuthTask,
     LocalIdentitySigner,
 };
+#[cfg(test)]
 use crate::connector::EndpointAuthBinding;
 use crate::engine::state::NetworkState;
+#[cfg(test)]
 use crate::protocol::handshake::AuthResponseMessage;
 use crate::transport::webrtc::WebRtcConnectorEventReceiver;
 use crate::transport::{
@@ -48,6 +61,7 @@ use std::time::Duration;
 /// either of which would quietly weaken the live-link controls that keep the
 /// right side up. They are lifetime anchors — held, never read, never dropped
 /// early.
+#[cfg(test)]
 pub(crate) struct TestLink {
     pub(crate) left: Arc<WebRtcConnectorWorker>,
     pub(crate) _left_events: WebRtcConnectorEventReceiver,
@@ -65,6 +79,7 @@ pub(crate) struct TestLink {
 /// authentication rather than selected here, and the signing key moves into the
 /// task. A fixture that constructed the context differently could prove nothing
 /// about the production transition.
+#[cfg(test)]
 async fn task_for_open_channel(
     state: &Arc<NetworkState>,
     worker: &Arc<WebRtcConnectorWorker>,
@@ -90,6 +105,7 @@ async fn task_for_open_channel(
 }
 
 /// Open a real offerer/answerer pair and promote both data channels.
+#[cfg(test)]
 pub(crate) async fn connect(
     left_state: &Arc<NetworkState>,
     right_state: &Arc<NetworkState>,
@@ -276,6 +292,22 @@ impl ReceiveReadyLinkBeforeEngineOpen {
             .take()
             .expect("the far handoff is taken exactly once")
     }
+
+    /// Close both connectors and hand back what each close reported, then
+    /// release the far side's retained ownership witness.
+    ///
+    /// The witness is dropped only after both closes have been awaited: it is
+    /// the far connector's own connected claim, and returning it early would
+    /// retire the far half of a link this fixture is still closing.
+    pub(crate) async fn close_outcomes(self) -> Vec<crate::Result<()>> {
+        let Self {
+            link,
+            right_handoff,
+        } = self;
+        let outcomes = link.close_outcomes().await;
+        drop(right_handoff);
+        outcomes
+    }
 }
 
 impl LinkBeforeEngineOpen {
@@ -285,12 +317,14 @@ impl LinkBeforeEngineOpen {
     /// Only a control that is itself standing in for the near engine has any
     /// business here — an ordinary control's near side is driven by the engine
     /// under test.
+    #[cfg(test)]
     pub(crate) fn left_events_mut(&mut self) -> &mut WebRtcConnectorEventReceiver {
         &mut self._left_events
     }
 
     /// Borrow the far connector's event stream, to scan it for an expected
     /// frame.
+    #[cfg(test)]
     pub(crate) fn right_events_mut(&mut self) -> &mut WebRtcConnectorEventReceiver {
         self.right_events
             .as_mut()
@@ -323,11 +357,25 @@ impl LinkBeforeEngineOpen {
     ///
     /// Both connectors are always closed, in the same order, before anything is
     /// returned — a control cannot use this to skip closing one of them.
+    ///
+    /// Destructured rather than field-borrowed so that closing is the one place
+    /// every anchor is accounted for: both event receivers and any unconsumed
+    /// open callback are named here and released together, after both closes
+    /// have been awaited, in every build of this module.
     pub(crate) async fn close_outcomes(self) -> Vec<crate::Result<()>> {
+        let Self {
+            left,
+            _left_events,
+            right,
+            right_events,
+            left_open_event,
+        } = self;
         let mut outcomes = Vec::with_capacity(2);
-        for worker in [&self.left, &self.right] {
+        for worker in [&left, &right] {
             outcomes.push(worker.retire_and_close().await);
         }
+        drop(right_events);
+        drop(left_open_event);
         outcomes
     }
 }
@@ -337,6 +385,14 @@ impl LinkBeforeEngineOpen {
 /// Neither side is promoted and no task is built: promotion is what the
 /// production engine arm is supposed to perform, so a fixture that performed it
 /// first would be standing in for the code under test.
+///
+/// `cfg(test)` because every caller is: only this crate's own open-path controls
+/// want a link with *no* far-side readiness, and a `transport-lab` build asks
+/// for the receive-ready sibling below instead. The shared body stays ungated —
+/// it is what that sibling calls — so nothing about the link is test-only. This
+/// is the one-line entry point that would otherwise be an unused item in a
+/// feature-only build.
+#[cfg(test)]
 pub(crate) async fn connect_before_engine_open(
     left_state: &Arc<NetworkState>,
     right_state: &Arc<NetworkState>,
@@ -347,10 +403,14 @@ pub(crate) async fn connect_before_engine_open(
 }
 
 /// Open the same real pair while also proving the right connector is ready to
-/// receive a frame. This is narrower than [`connect_before_engine_open`]: only
+/// receive a frame. This is narrower than `connect_before_engine_open`: only
 /// the controls that assert on bytes reaching the far side need the far-side
 /// connected ownership, while the open-path controls deliberately stop without
 /// promoting it.
+///
+/// Named in a code span rather than linked, because that sibling is `cfg(test)`
+/// and this item is not: an intra-doc link would resolve in one configuration
+/// and be a broken link in the other.
 pub(crate) async fn connect_before_engine_open_receive_ready(
     left_state: &Arc<NetworkState>,
     right_state: &Arc<NetworkState>,
@@ -426,7 +486,28 @@ async fn connect_before_engine_open_inner(
                 if let Some(event) = left.accept_event(event) {
                     let (event, _callback_resources) = event.into_parts();
                     if let TransportEvent::LocalIceCandidate(Some(candidate)) = event {
-                        right.add_remote_candidate(candidate).await.expect("right accepts candidate");
+                        // The ungated admission entry point, not the
+                        // `cfg(test)` projection over it.
+                        //
+                        // This fixture is reached from a `transport-lab` build
+                        // with no `cfg(test)`, where that projection does not
+                        // exist — see the module gate. `add_remote_candidate` is
+                        // literally `add_remote_candidate_observed(..).await?
+                        // .disposition`, so this is the same call with the same
+                        // ownership check, the same admission and the same
+                        // resource-scope accounting; the only difference is that
+                        // the report also names the candidate kind.
+                        //
+                        // Discarded here because this fixture plumbs candidates
+                        // rather than observing them: it needs ICE to complete,
+                        // and the disposition it would read is already implied by
+                        // the link reaching `DataChannelOpen` below. The
+                        // production reader of the full report is
+                        // `engine::handle_signaling_inbound`'s `Candidate` arm.
+                        right
+                            .add_remote_candidate_observed(candidate)
+                            .await
+                            .expect("right accepts candidate");
                     }
                 }
             }
@@ -436,7 +517,11 @@ async fn connect_before_engine_open_inner(
                     let (event, _callback_resources) = event.into_parts();
                     match event {
                         TransportEvent::LocalIceCandidate(Some(candidate)) => {
-                            left.add_remote_candidate(candidate).await.expect("left accepts candidate");
+                            // The ungated entry point, for the reason given on
+                            // the left arm above.
+                            left.add_remote_candidate_observed(candidate)
+                                .await
+                                .expect("left accepts candidate");
                         }
                         TransportEvent::DataChannelOpen
                             if require_right_ready && right_handoff.is_none() =>
@@ -476,6 +561,7 @@ async fn connect_before_engine_open_inner(
 }
 
 /// Everything one twin needs to play the peer against a live left-side task.
+#[cfg(test)]
 struct LiveAttempt {
     state_a: Arc<NetworkState>,
     state_b: Arc<NetworkState>,
@@ -493,6 +579,7 @@ struct LiveAttempt {
 /// Shared verbatim by both twins: same states, same connectors, same task, same
 /// bound contribution pair. Only the fingerprint the peer's proof commits to is
 /// chosen afterwards, by the caller, so the twins differ in exactly that value.
+#[cfg(test)]
 async fn live_attempt(suffix_a: &str, suffix_b: &str) -> LiveAttempt {
     let state_a = crate::engine::build_test_state(suffix_a);
     let state_b = crate::engine::build_test_state(suffix_b);
@@ -552,6 +639,7 @@ async fn live_attempt(suffix_a: &str, suffix_b: &str) -> LiveAttempt {
     }
 }
 
+#[cfg(test)]
 impl LiveAttempt {
     /// The peer's half, committing to the caller's chosen remote fingerprint.
     ///

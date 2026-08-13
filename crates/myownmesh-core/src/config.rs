@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::identity::DeviceId;
+use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 
 /// Flood-protection limits for the self-hosted signaling relay. Defined
 /// in the signaling crate (its natural home) and re-used here so the
@@ -594,10 +595,320 @@ fn require_current_version(cfg: MeshConfig) -> Result<MeshConfig> {
     Ok(cfg)
 }
 
+/// A conservative upper bound on the bytes one **defaulted** config occupies,
+/// both as an owned value's heap and as normalized JSON.
+///
+/// **A planning floor, not a measurement, and that is the point.** Missing
+/// fields expand to default constructors, so an input's own length prices
+/// nothing about what it becomes: `{}` is two bytes and parses to a complete
+/// config with every sub-struct present. A ceiling derived only from input
+/// length would therefore underfund exactly the smallest inputs. This floor is
+/// added to every plan so that every absent field is paid for whether or not it
+/// appeared in the file.
+///
+/// Not computed at runtime, because a planning figure has to exist before
+/// anything is read, parsed or constructed. Held honest by
+/// `the_planning_floor_covers_a_defaulted_config`, which serializes the real
+/// default and fails if it ever grows past this.
+///
+/// **This is the root floor only.** It prices the top-level structs that a
+/// completely empty document expands into. It does *not* bound repeated
+/// elements — see [`CONFIG_EXPANSION_BYTES_PER_SOURCE_BYTE`], which is what
+/// covers those.
+const DEFAULT_CONFIG_PLANNING_FLOOR_BYTES: usize = 4096;
+
+/// How many normalized bytes one source byte is allowed to become.
+///
+/// **A single root floor is not a ceiling, and this is why.** `networks` is an
+/// array, and each `NetworkConfig` element omitting `stun_servers`,
+/// `turn_servers`, `signaling` and `topology` expands into all four defaults.
+/// The expansion is therefore *per element*, so a document of many minimal
+/// `{"id":…,"network_id":…}` entries accumulates it linearly and will pass any
+/// fixed global figure once there are enough of them. Bounding it needs a term
+/// that grows with the input, which this is.
+///
+/// The bound is sound because every element costs input bytes too: an element
+/// cannot appear without its two required fields, so the worst achievable ratio
+/// is one element's default expansion divided by the smallest input that can
+/// produce it. This constant sits comfortably above that ratio rather than at
+/// it — a planning figure that is merely *exactly* right today becomes wrong
+/// the first time a defaulted field is added, and being short is the one
+/// direction it must never be.
+///
+/// Held honest by `the_plan_covers_many_minimally_specified_networks`, which
+/// builds a document of repeated minimal entries and fails if either the
+/// normalized encoding or the retained measurement escapes the plan.
+const CONFIG_EXPANSION_BYTES_PER_SOURCE_BYTE: usize = 128;
+
+/// How many separate allocations one source byte is allowed to become.
+///
+/// **Bytes are not the only thing a parsed config costs.** Every `String`,
+/// `Vec` and `PathBuf` it retains is an independent allocation with its own
+/// allocator residual, and one defaulted `NetworkConfig` brings roughly fifteen
+/// of them — the two reference STUN/TURN entries alone contribute a vector, a
+/// url vector, a url, a username and a credential each. A byte ceiling funds
+/// none of that, so the residual term needs its own bound, scaling for the same
+/// reason the byte term does: the count is per element.
+///
+/// Sound on the same argument: an element costs input bytes it cannot avoid,
+/// so the worst achievable ratio is one element's allocation count over the
+/// smallest input that can produce it — comfortably under one. This sits well
+/// above that, because a residual is a counter rather than a byte and paying
+/// for headroom here is cheap next to being short.
+///
+/// Counted for real by `the_plan_covers_many_minimally_specified_networks`,
+/// which walks the parsed structure and tallies its actual owned allocations.
+const CONFIG_ALLOCATIONS_PER_SOURCE_BYTE: usize = 4;
+
+/// The allocation counterpart to [`DEFAULT_CONFIG_PLANNING_FLOOR_BYTES`]: what
+/// the root's own defaulted sub-structs retain before any network exists.
+const DEFAULT_CONFIG_ALLOCATION_FLOOR: usize = 256;
+
+/// The one parse-and-quarantine decision, shared by [`MeshConfig::load`] and
+/// [`PreparedConfigLoad::commit`].
+///
+/// Shared rather than duplicated so the two entry points cannot drift: the
+/// quarantine, the fail-safe default and the version refusal are one behaviour
+/// with two callers, and a second copy would be a second source of truth for
+/// what a corrupt config means.
+fn parse_or_quarantine(raw: &str, path: &std::path::Path) -> Result<MeshConfig> {
+    // Corrupt config (power cut mid-write on an appliance, or a
+    // hand-edit gone wrong) → quarantine + defaults, loudly. A
+    // parse error here used to stop the daemon from starting at
+    // all — the worst brick, since embedders (NanoKVM, AllMyStuff)
+    // re-add their networks over the control socket and rewrite
+    // this file on their own once the daemon is up. Defaults are
+    // fail-safe: no networks joined, no services exposed.
+    match serde_json::from_str::<MeshConfig>(raw) {
+        Ok(cfg) => require_current_version(cfg),
+        Err(e) => {
+            let kept = crate::persist::quarantine(path);
+            tracing::error!(
+                path = %path.display(),
+                quarantined = ?kept,
+                "config file is corrupt ({e}) — starting from \
+                 defaults; the previous contents were kept at the \
+                 quarantine path for hand-recovery"
+            );
+            Ok(MeshConfig::default())
+        }
+    }
+}
+
+/// Where a prepared load will get its bytes.
+enum PreparedConfigSource {
+    /// No file. The plan will produce [`MeshConfig::default`] and reads
+    /// nothing.
+    Missing,
+    /// An **already-open** handle and the length the plan was measured
+    /// against. Opened during planning rather than at commit so the bytes that
+    /// get read are the bytes that were measured, not whatever a later `open`
+    /// would find.
+    Present { file: std::fs::File, len: u64 },
+}
+
+/// A measured, funded-but-not-yet-performed config load.
+///
+/// **Nothing is parsed and no config exists yet.** Planning opens the file and
+/// measures it; it allocates no `MeshConfig` and no raw buffer. That is what
+/// lets a caller decide whether it may afford the load *before* the load
+/// happens, and what makes a refusal provably free of any read, parse or
+/// snapshot construction.
+///
+/// **Core keeps the file semantics; the caller keeps the admission decision.**
+/// There is deliberately no scope or provider parameter here and no acquisition
+/// inside: the caller acquires against [`Self::typed_retention_claim`] and
+/// [`Self::load_work_claim`] — and against
+/// whatever its own output path derives from [`Self::encoding_ceiling`] — and
+/// hands the lease to [`Self::commit`]. Quarantine, the fail-safe default and
+/// the version refusal stay in this crate, where they are already the one
+/// source of truth.
+///
+/// Move-only, and there is no accessor for the handle. A plan is a single
+/// permission to perform one load.
+#[must_use = "a prepared load has opened the config file and must be committed or dropped"]
+pub struct PreparedConfigLoad {
+    source: PreparedConfigSource,
+    /// Kept because quarantine needs the path, and the plan may be the only
+    /// thing still holding it by the time a corrupt parse is discovered.
+    path: PathBuf,
+    typed_retention_claim: ResourceClaim,
+    load_work_claim: ResourceClaim,
+    encoding_ceiling: usize,
+}
+
+/// One config, and the funding that keeps it.
+///
+/// Value before lease: the config is destroyed first and its funding released
+/// after, so the claim never describes memory that has already gone — nor is it
+/// released while the value it pays for is still standing.
+///
+/// Borrowed access only. There is no method handing the `MeshConfig` out on its
+/// own, because a caller holding one would have a config whose funding had been
+/// released with the owner around it.
+pub struct FundedMeshConfig {
+    value: MeshConfig,
+    _typed: ResourceLease,
+}
+
+impl FundedMeshConfig {
+    pub fn get(&self) -> &MeshConfig {
+        &self.value
+    }
+}
+
+impl PreparedConfigLoad {
+    /// What retaining the parsed config will cost, for as long as it is held.
+    ///
+    /// Memory only. Parse work is *not* here: the parse is over by the time
+    /// this retention begins, and holding a `ParsingOrCpuWork` charge for the
+    /// life of a response would tell the provider that work was in flight long
+    /// after it had finished. That charge lives in
+    /// [`Self::load_work_claim`] instead, and ends with the load.
+    pub const fn typed_retention_claim(&self) -> ResourceClaim {
+        self.typed_retention_claim
+    }
+
+    /// What performing the load costs *while it happens*, and not afterwards.
+    ///
+    /// The raw text and the parsed config exist at the same moment: the config
+    /// is built from a buffer that is still there. A plan that priced only the
+    /// result would underfund exactly that peak. This is the other half — the
+    /// raw buffer's bytes, the parse work, and the plan's own path — and
+    /// [`Self::commit`] releases it before returning, so the transient cost is
+    /// charged for the interval it is actually incurred in.
+    ///
+    /// The path is here rather than in the retention because it dies with the
+    /// load: nothing beyond `commit` can reach it, and the parsed config does
+    /// not hold it.
+    pub const fn load_work_claim(&self) -> ResourceClaim {
+        self.load_work_claim
+    }
+
+    /// A conservative upper bound on the normalized JSON this config will
+    /// produce.
+    ///
+    /// For a caller sizing an output buffer or a response line. Compact
+    /// encoding: this bounds `serde_json::to_string`, not the pretty form
+    /// [`MeshConfig::save`] writes.
+    pub const fn encoding_ceiling(&self) -> usize {
+        self.encoding_ceiling
+    }
+
+    /// Read, parse and retain, now that the retention is funded.
+    ///
+    /// The read is bounded by the length measured during planning, and a file
+    /// that **grew** since then is refused *before* anything is parsed or
+    /// quarantined — a file being rewritten underneath us is not a corrupt
+    /// file, and treating it as one would quarantine a perfectly good config
+    /// that simply arrived mid-write.
+    ///
+    /// Everything else is exactly [`MeshConfig::load`]'s behaviour, because it
+    /// is literally the same function: complete-read corrupt files are
+    /// quarantined and fall back to defaults, and a config whose version is not
+    /// current is refused.
+    /// Takes **both** leases because both costs are real at different times:
+    /// `work_lease` covers the raw buffer and the parse while they exist, and
+    /// is released here once the buffer is gone; `typed_lease` covers the
+    /// config and travels out inside the returned owner.
+    pub fn commit(
+        self,
+        typed_lease: ResourceLease,
+        work_lease: ResourceLease,
+    ) -> Result<FundedMeshConfig> {
+        use std::io::Read;
+
+        // The leases have to be *these* leases. `ResourceLease::claim` is public,
+        // so without this the prepare-then-acquire discipline would be a
+        // convention a caller could simply not follow: two unrelated leases, or
+        // two zero ones, would buy a `FundedMeshConfig` whose funding describes
+        // something else. Checked before the file is read, before anything is
+        // parsed, and before a default is constructed, so a caller that gets this
+        // wrong has still caused no work.
+        //
+        // Both leases are dropped on the way out, which returns their capacity to
+        // whatever they were taken from. That is the only sound thing to do with
+        // them: they are not this plan's, so they cannot be handed back as this
+        // plan's, and holding them would strand capacity on a refusal.
+        if typed_lease.claim() != self.typed_retention_claim {
+            return Err(Error::Config(
+                "config retention lease was not taken for this plan's typed retention claim"
+                    .to_string(),
+            ));
+        }
+        if work_lease.claim() != self.load_work_claim {
+            return Err(Error::Config(
+                "config load lease was not taken for this plan's load work claim".to_string(),
+            ));
+        }
+
+        // Named rather than reached through `self`, so the path can be released
+        // deliberately below rather than at the end of this call — after the
+        // charge that covers it has already gone back.
+        let PreparedConfigLoad {
+            source,
+            path,
+            typed_retention_claim: _,
+            load_work_claim: _,
+            encoding_ceiling: _,
+        } = self;
+
+        let value = match source {
+            PreparedConfigSource::Missing => MeshConfig::default(),
+            PreparedConfigSource::Present { file, len } => {
+                // One byte past the measurement: enough to *detect* growth,
+                // never enough to read an unbounded file.
+                //
+                // Reserved up front, at exactly the capacity `load_work_claim`
+                // priced. `String::new()` would start empty and grow
+                // geometrically toward the same size, asking the allocator for
+                // capacity nobody had funded — and doing so *before* the growth
+                // refusal below could fire.
+                let capacity = usize::try_from(len)
+                    .ok()
+                    .and_then(|measured| measured.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::Config(format!("config {} is too large to read", path.display()))
+                    })?;
+                let mut raw = String::with_capacity(capacity);
+                file.take(len.saturating_add(1))
+                    .read_to_string(&mut raw)
+                    .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+                if raw.len() as u64 > len {
+                    return Err(Error::Config(format!(
+                        "config {} grew past its measured {len} bytes while being read",
+                        path.display()
+                    )));
+                }
+                let parsed = parse_or_quarantine(&raw, &path)?;
+                // The buffer's bytes go back before the charge for them does,
+                // and both go back before this call returns: the peak where the
+                // text and the config are both alive is exactly the interval
+                // `work_lease` was acquired for.
+                drop(raw);
+                parsed
+            }
+        };
+        // The plan's own path is the second allocation `load_work_claim` funds,
+        // and it goes back before the charge for it does — the same order the
+        // raw buffer follows above.
+        drop(path);
+        drop(work_lease);
+        Ok(FundedMeshConfig {
+            value,
+            _typed: typed_lease,
+        })
+    }
+}
+
 impl MeshConfig {
     /// Load the config from the default location. Missing file
     /// returns [`MeshConfig::default`] — embedders should call
     /// `save()` afterward if they want the file to exist.
+    ///
+    /// Unfunded, and kept that way for embedders that have no resource scope.
+    /// A caller that must fund the retention before it happens uses
+    /// [`MeshConfig::prepare_load`] instead; both share one parse.
     pub fn load() -> Result<Self> {
         let path = crate::dirs::config_path()?;
         if !path.exists() {
@@ -605,28 +916,138 @@ impl MeshConfig {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
-        // Corrupt config (power cut mid-write on an appliance, or a
-        // hand-edit gone wrong) → quarantine + defaults, loudly. A
-        // parse error here used to stop the daemon from starting at
-        // all — the worst brick, since embedders (NanoKVM, AllMyStuff)
-        // re-add their networks over the control socket and rewrite
-        // this file on their own once the daemon is up. Defaults are
-        // fail-safe: no networks joined, no services exposed.
-        let cfg: MeshConfig = match serde_json::from_str(&raw) {
-            Ok(c) => c,
-            Err(e) => {
-                let kept = crate::persist::quarantine(&path);
-                tracing::error!(
-                    path = %path.display(),
-                    quarantined = ?kept,
-                    "config file is corrupt ({e}) — starting from \
-                     defaults; the previous contents were kept at the \
-                     quarantine path for hand-recovery"
-                );
-                return Ok(Self::default());
+        parse_or_quarantine(&raw, &path)
+    }
+
+    /// Measure a config load without performing it.
+    ///
+    /// Opens and stats the file — so the plan is measured against the same
+    /// handle it will later read — and computes what the parsed config will
+    /// cost. It allocates no config and no raw buffer, and parses nothing, so a
+    /// caller that refuses on the resulting claim has provably performed no
+    /// read, no parse and no construction.
+    ///
+    /// It does allocate one thing: the path it opened, which the plan keeps
+    /// because quarantine needs it. That allocation is priced into
+    /// [`PreparedConfigLoad::load_work_claim`] and released inside `commit`
+    /// before that lease is. It is unfunded between here and the caller's
+    /// acquisition, necessarily — the plan is what tells the caller what to
+    /// acquire.
+    ///
+    /// Both figures include [`DEFAULT_CONFIG_PLANNING_FLOOR_BYTES`], because
+    /// absent fields expand to defaults and the input's own length says nothing
+    /// about that expansion.
+    pub fn prepare_load() -> Result<PreparedConfigLoad> {
+        let path = crate::dirs::config_path()?;
+        let source = match std::fs::File::open(&path) {
+            Ok(file) => {
+                let len = file
+                    .metadata()
+                    .map_err(|e| Error::Config(format!("stat {}: {e}", path.display())))?
+                    .len();
+                PreparedConfigSource::Present { file, len }
             }
+            // Absent is the ordinary first-run case, not a failure: the plan
+            // will produce defaults, and the floor already prices them.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PreparedConfigSource::Missing,
+            Err(e) => return Err(Error::Config(format!("open {}: {e}", path.display()))),
         };
-        require_current_version(cfg)
+
+        let raw_bytes = match &source {
+            PreparedConfigSource::Missing => 0,
+            PreparedConfigSource::Present { len, .. } => usize::try_from(*len).map_err(|_| {
+                Error::Config(format!(
+                    "config {} is larger than this address space",
+                    path.display()
+                ))
+            })?,
+        };
+        let too_large = || Error::Config(format!("config {} is too large to plan", path.display()));
+        // Every source byte may expand, and the root's own defaults expand from
+        // nothing at all — so the ceiling needs both a term that scales with
+        // the input and a term that does not.
+        let encoding_ceiling = raw_bytes
+            .checked_mul(CONFIG_EXPANSION_BYTES_PER_SOURCE_BYTE)
+            .and_then(|expanded| expanded.checked_add(DEFAULT_CONFIG_PLANNING_FLOOR_BYTES))
+            .ok_or_else(too_large)?;
+
+        // What is kept: the owned value's inline shape plus the heap it can
+        // reach, bounded by what it can possibly encode to. Memory only — the
+        // parse is finished before this retention starts.
+        let retained = std::mem::size_of::<MeshConfig>()
+            .checked_add(encoding_ceiling)
+            .ok_or_else(too_large)?;
+        // Every retained String, Vec and PathBuf is its own allocation with its
+        // own residual, and the count is per element for the same reason the
+        // bytes are — so this scales with the input too.
+        let retained_allocations = raw_bytes
+            .checked_mul(CONFIG_ALLOCATIONS_PER_SOURCE_BYTE)
+            .and_then(|scaled| scaled.checked_add(DEFAULT_CONFIG_ALLOCATION_FLOOR))
+            .ok_or_else(too_large)?;
+        let not_representable =
+            || Error::Config("config planning claim is not representable".to_string());
+        let typed_retention_claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(retained).map_err(|_| not_representable())?,
+            ),
+            (
+                ResourceClass::OpaqueDependencyResidual,
+                u64::try_from(retained_allocations).map_err(|_| not_representable())?,
+            ),
+        ])
+        .map_err(|_| not_representable())?;
+
+        // What is spent to get there: the raw text's buffer, alive at the same
+        // moment as the config built from them, and the work of parsing it.
+        // Released by `commit` rather than carried for the value's lifetime.
+        //
+        // `raw_bytes + 1`, not `raw_bytes`, and the extra byte is not a
+        // rounding habit: the read deliberately asks for one byte past the
+        // measurement so that growth is *detectable*, and `commit` reserves
+        // exactly that much up front. Pricing only `raw_bytes` would leave the
+        // detection byte unfunded — and a buffer that had to grow to hold it
+        // would request unpriced capacity before the growth refusal it exists
+        // to trigger could fire.
+        let read_capacity = raw_bytes.checked_add(1).ok_or_else(too_large)?;
+        // The plan holds a path, and a path is an allocation like any other. It
+        // is charged here rather than to the retention because it dies with the
+        // load: `commit` releases it just before it releases this lease, and a
+        // plan that is never committed drops it with the plan.
+        //
+        // Capacity, not length, because capacity is what the allocator is
+        // holding — the same rule the retained-shape walk follows.
+        //
+        // **The window this does not cover, stated rather than implied.** The
+        // path exists from the moment `prepare_load` derives it, which is before
+        // the caller can possibly hold a lease for it: the plan is what tells
+        // them what to acquire. That is inherent to letting the caller acquire —
+        // it is one path allocation, bounded by the config directory, and it is
+        // funded for the whole interval in which any funding exists at all.
+        let planning_bytes = read_capacity
+            .checked_add(path.capacity())
+            .ok_or_else(too_large)?;
+        let planning_bytes_u64 = u64::try_from(planning_bytes).map_err(|_| not_representable())?;
+        let parse_work_u64 = u64::try_from(read_capacity).map_err(|_| not_representable())?;
+        let load_work_claim = ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, planning_bytes_u64),
+            // Work scales with the text that is parsed, and the path is not
+            // parsed — so this stays the read capacity rather than following the
+            // bytes above.
+            (ResourceClass::ParsingOrCpuWork, parse_work_u64),
+            // The raw buffer and the plan's path: two allocations, two
+            // residuals.
+            (ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+        .map_err(|_| not_representable())?;
+
+        Ok(PreparedConfigLoad {
+            source,
+            path,
+            typed_retention_claim,
+            load_work_claim,
+            encoding_ceiling,
+        })
     }
 
     /// Persist to the default location. Pretty-printed JSON for
@@ -653,6 +1074,386 @@ impl MeshConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The planning floor really does cover a fully defaulted config, in both
+    /// the shapes it is used for.
+    ///
+    /// This is the control the floor's honesty rests on. The floor is a
+    /// constant because planning has to happen before anything is constructed,
+    /// and a constant that nobody checks is exactly the sort of figure that
+    /// silently stops being true as fields are added. Serializing the real
+    /// `Default` is what keeps it true: add a sub-struct big enough to push a
+    /// defaulted config past the floor and this fails here, in a test naming
+    /// the reason, rather than as an under-funded load in production.
+    ///
+    /// Both encodings are checked because the floor prices both — compact for
+    /// [`PreparedConfigLoad::encoding_ceiling`], pretty because
+    /// [`MeshConfig::save`] writes that form and a later reader plans against
+    /// its length.
+    #[test]
+    fn v4_r3_core_the_planning_floor_covers_a_defaulted_config() {
+        let default = MeshConfig::default();
+        let compact = serde_json::to_string(&default).expect("a default config serializes");
+        let pretty = serde_json::to_string_pretty(&default).expect("a default config serializes");
+
+        assert!(
+            compact.len() <= DEFAULT_CONFIG_PLANNING_FLOOR_BYTES,
+            "a defaulted config encodes to {} compact bytes, past the {} byte planning floor — \
+             raise the floor rather than letting a planned load underfund it",
+            compact.len(),
+            DEFAULT_CONFIG_PLANNING_FLOOR_BYTES
+        );
+        assert!(
+            pretty.len() <= DEFAULT_CONFIG_PLANNING_FLOOR_BYTES,
+            "a defaulted config pretty-prints to {} bytes, past the {} byte planning floor",
+            pretty.len(),
+            DEFAULT_CONFIG_PLANNING_FLOOR_BYTES
+        );
+    }
+
+    /// An empty JSON object is the case a length-derived ceiling gets wrong.
+    ///
+    /// `{}` is two bytes and parses to a complete config with every sub-struct
+    /// present, so a plan that priced only the input would fund almost nothing
+    /// and retain everything. The floor is what closes that, and this states it
+    /// as a property rather than leaving it as a comment: the config a
+    /// two-byte input becomes must still fit inside what a two-byte input was
+    /// planned for.
+    #[test]
+    fn v4_r3_core_an_empty_object_is_priced_for_what_it_becomes() {
+        let expanded: MeshConfig = serde_json::from_str("{}").expect("an empty object parses");
+        let encoded = serde_json::to_string(&expanded).expect("the expansion serializes");
+        let planned = "{}".len() + DEFAULT_CONFIG_PLANNING_FLOOR_BYTES;
+
+        assert!(
+            encoded.len() > "{}".len(),
+            "the point of this control is that the expansion is larger than its input"
+        );
+        assert!(
+            encoded.len() <= planned,
+            "a two-byte input expands to {} bytes, past the {planned} a two-byte input is \
+             planned for",
+            encoded.len()
+        );
+    }
+
+    /// Repeated minimal network entries stay inside the plan.
+    ///
+    /// **The case a single global floor gets wrong.** `networks` is an array,
+    /// and every element that omits `stun_servers`, `turn_servers`,
+    /// `signaling` and `topology` expands into all four defaults. That
+    /// expansion is per element, so it accumulates linearly with the entry
+    /// count and will pass any fixed constant once the document is long
+    /// enough — the one-`{}` controls above cannot see this at all, because a
+    /// single empty object expands exactly once.
+    ///
+    /// All three figures the plan publishes are checked, because being short in
+    /// any of them is an under-funded load: the normalized encoding against
+    /// `encoding_ceiling`, the retained bytes against the planned retention,
+    /// and the **count of separate allocations** against the planned residual.
+    ///
+    /// The allocation tally walks the parsed structure and counts its actual
+    /// owned `String`s and `Vec`s. It deliberately does *not* go through
+    /// `mailbox_measure_serialized`: that helper models a decoded
+    /// `serde_json::Value` tree, whose per-node overhead is many times the
+    /// bytes it came from, while `MeshConfig` is a typed struct. Measuring one
+    /// with the other would compare unlike things and fail for a reason that
+    /// says nothing about this plan.
+    ///
+    /// The entry count is far past anything a real deployment carries, on
+    /// purpose: the property is that the *ratio* holds, and a control that used
+    /// two entries would pass on a constant that fails at fifty.
+    #[test]
+    fn v4_r3_core_the_plan_covers_many_minimally_specified_networks() {
+        const ENTRIES: usize = 256;
+
+        // Minimal in exactly the sense that matters: both required fields, and
+        // nothing else, so every defaulted field expands per element.
+        let entries: Vec<String> = (0..ENTRIES)
+            .map(|index| format!(r#"{{"id":"n{index}","network_id":"w{index}"}}"#))
+            .collect();
+        let raw = format!(
+            r#"{{"version":{CONFIG_VERSION},"networks":[{}]}}"#,
+            entries.join(",")
+        );
+
+        let parsed: MeshConfig = serde_json::from_str(&raw).expect("minimal network entries parse");
+        assert_eq!(
+            parsed.networks.len(),
+            ENTRIES,
+            "the control must actually exercise every entry"
+        );
+
+        let planned_ceiling = raw.len() * CONFIG_EXPANSION_BYTES_PER_SOURCE_BYTE
+            + DEFAULT_CONFIG_PLANNING_FLOOR_BYTES;
+        let encoded = serde_json::to_string(&parsed).expect("the expansion serializes");
+        assert!(
+            encoded.len() > raw.len(),
+            "the point of this control is that {ENTRIES} minimal entries expand"
+        );
+        assert!(
+            encoded.len() <= planned_ceiling,
+            "{ENTRIES} minimal entries encode to {} bytes, past the planned ceiling of \
+             {planned_ceiling} — raise CONFIG_EXPANSION_BYTES_PER_SOURCE_BYTE rather than \
+             letting a planned load underfund it",
+            encoded.len()
+        );
+
+        let planned_retention = std::mem::size_of::<MeshConfig>() + planned_ceiling;
+        let planned_allocations =
+            raw.len() * CONFIG_ALLOCATIONS_PER_SOURCE_BYTE + DEFAULT_CONFIG_ALLOCATION_FLOOR;
+        let held = std::mem::size_of::<MeshConfig>() + config_owned_bytes(&parsed);
+        let allocations = config_owned_allocations(&parsed);
+        assert!(
+            allocations > ENTRIES,
+            "the point of this control is that each entry retains several allocations"
+        );
+        assert!(
+            held <= planned_retention,
+            "{ENTRIES} minimal entries hold {held} bytes, past the planned {planned_retention}"
+        );
+        assert!(
+            allocations <= planned_allocations,
+            "{ENTRIES} minimal entries retain {allocations} separate allocations, past the \
+             planned {planned_allocations} — raise CONFIG_ALLOCATIONS_PER_SOURCE_BYTE rather \
+             than letting the residual term underfund them"
+        );
+    }
+
+    /// The same three figures, against a document that populates **every**
+    /// repeatable family this schema has.
+    ///
+    /// The minimal-entry control above finds the worst *ratio*, because an
+    /// element that says almost nothing still expands into all its defaults.
+    /// It cannot find the worst *magnitude*, because nothing in it is
+    /// populated: no extra STUN urls, no second TURN server, no signaling
+    /// relays, no denylist, no pinned peers, and — the family that lives
+    /// outside `networks` entirely — no TURN **service** credentials. Each of
+    /// those is an array whose contents scale with the input, and a ceiling
+    /// proved only against defaults would say nothing about any of them.
+    ///
+    /// `services.turn.credentials` matters particularly: it is the one
+    /// repeatable family at the document root rather than inside a network, so
+    /// a control that walked only `networks` would miss it however many entries
+    /// it used.
+    #[test]
+    fn v4_r3_core_the_plan_covers_every_populated_repeatable_family() {
+        const ENTRIES: usize = 64;
+        const PER_FAMILY: usize = 8;
+
+        let list = |prefix: &str, index: usize| -> String {
+            (0..PER_FAMILY)
+                .map(|item| format!(r#""{prefix}-{index}-{item}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let networks: Vec<String> = (0..ENTRIES)
+            .map(|index| {
+                let stun = list("stun:host", index);
+                let turn = list("turn:host", index);
+                format!(
+                    r#"{{"id":"n{index}","network_id":"w{index}","label":"long label {index}",
+                       "signaling":{{"strategy":"nostr","servers":[{}],"denylist":[{}]}},
+                       "stun_servers":[{{"urls":[{stun}]}}],
+                       "turn_servers":[{{"urls":[{turn}],"username":"user-{index}",
+                                         "credential":"secret-{index}"}}],
+                       "pinned_peers":[{}]}}"#,
+                    list("wss://relay", index),
+                    list("denied", index),
+                    list("peer", index),
+                )
+            })
+            .collect();
+        let credentials: Vec<String> = (0..ENTRIES)
+            .map(|index| format!(r#"{{"username":"svc-{index}","password":"pw-{index}"}}"#))
+            .collect();
+        let raw = format!(
+            r#"{{"version":{CONFIG_VERSION},"networks":[{}],
+                 "services":{{"turn":{{"credentials":[{}]}}}}}}"#,
+            networks.join(","),
+            credentials.join(",")
+        );
+
+        let parsed: MeshConfig = serde_json::from_str(&raw).expect("a populated document parses");
+        // Every family is genuinely exercised — a typo in the document above
+        // would otherwise let this pass while measuring defaults.
+        assert_eq!(parsed.networks.len(), ENTRIES);
+        assert_eq!(parsed.services.turn.credentials.len(), ENTRIES);
+        let first = &parsed.networks[0];
+        assert_eq!(first.stun_servers[0].urls.len(), PER_FAMILY);
+        assert_eq!(first.turn_servers[0].urls.len(), PER_FAMILY);
+        assert!(first.turn_servers[0].username.is_some());
+        assert!(first.turn_servers[0].credential.is_some());
+        assert_eq!(first.signaling.servers.len(), PER_FAMILY);
+        assert_eq!(first.signaling.denylist.len(), PER_FAMILY);
+        assert_eq!(first.pinned_peers.len(), PER_FAMILY);
+
+        let planned_ceiling = raw.len() * CONFIG_EXPANSION_BYTES_PER_SOURCE_BYTE
+            + DEFAULT_CONFIG_PLANNING_FLOOR_BYTES;
+        let planned_retention = std::mem::size_of::<MeshConfig>() + planned_ceiling;
+        let planned_allocations =
+            raw.len() * CONFIG_ALLOCATIONS_PER_SOURCE_BYTE + DEFAULT_CONFIG_ALLOCATION_FLOOR;
+
+        let encoded = serde_json::to_string(&parsed).expect("the document serializes");
+        let held = std::mem::size_of::<MeshConfig>() + config_owned_bytes(&parsed);
+        let allocations = config_owned_allocations(&parsed);
+
+        assert!(
+            encoded.len() <= planned_ceiling,
+            "a fully populated document encodes to {} bytes, past the planned {planned_ceiling}",
+            encoded.len()
+        );
+        assert!(
+            held <= planned_retention,
+            "a fully populated document holds {held} bytes, past the planned {planned_retention}"
+        );
+        assert!(
+            allocations <= planned_allocations,
+            "a fully populated document retains {allocations} separate allocations, past the \
+             planned {planned_allocations}"
+        );
+    }
+
+    /// The inline records a vector's own buffer holds — capacity, not length,
+    /// because that is what it reserved from the allocator.
+    fn vec_buffer_bytes<T>(values: &Vec<T>) -> usize {
+        values.capacity() * std::mem::size_of::<T>()
+    }
+
+    fn string_vec_bytes(values: &Vec<String>) -> usize {
+        vec_buffer_bytes(values) + values.iter().map(String::capacity).sum::<usize>()
+    }
+
+    fn string_vec_allocations(values: &Vec<String>) -> usize {
+        1 + values.len()
+    }
+
+    /// Every heap byte one network element retains.
+    ///
+    /// Walks capacity rather than length throughout: a `Vec` or `String` holds
+    /// whatever it reserved, not whatever it filled, and a tally that measured
+    /// length would understate exactly the case where a parser over-reserved.
+    /// Element buffers are counted separately from the elements' own contents,
+    /// because a `Vec<String>` owns `size_of::<String>() * capacity` of inline
+    /// records *before* any of the strings behind them.
+    fn network_owned_bytes(network: &NetworkConfig) -> usize {
+        let mut bytes =
+            network.id.capacity() + network.network_id.capacity() + network.label.capacity();
+        bytes += network.signaling.strategy.capacity();
+        bytes += string_vec_bytes(&network.signaling.servers);
+        bytes += string_vec_bytes(&network.signaling.denylist);
+        bytes += vec_buffer_bytes(&network.stun_servers);
+        for stun in &network.stun_servers {
+            bytes += string_vec_bytes(&stun.urls);
+        }
+        bytes += vec_buffer_bytes(&network.turn_servers);
+        for turn in &network.turn_servers {
+            bytes += string_vec_bytes(&turn.urls);
+            bytes += turn.username.as_ref().map_or(0, String::capacity);
+            bytes += turn.credential.as_ref().map_or(0, String::capacity);
+        }
+        bytes += string_vec_bytes(&network.pinned_peers);
+        bytes += network
+            .roster_path
+            .as_ref()
+            .map_or(0, |path| path.capacity());
+        if let TopologyMode::Hubs { hubs, .. } = &network.topology {
+            bytes += vec_buffer_bytes(hubs);
+        }
+        bytes
+    }
+
+    fn network_owned_allocations(network: &NetworkConfig) -> usize {
+        // Three owned strings, counted even when empty. A ceiling that assumed
+        // an empty `String` elides its allocation would be short the moment
+        // somebody fills the field in.
+        let mut count = 3;
+        count += 1; // signaling strategy
+        count += string_vec_allocations(&network.signaling.servers);
+        count += string_vec_allocations(&network.signaling.denylist);
+        count += 1; // the stun vector
+        for stun in &network.stun_servers {
+            count += string_vec_allocations(&stun.urls);
+        }
+        count += 1; // the turn vector
+        for turn in &network.turn_servers {
+            count += string_vec_allocations(&turn.urls);
+            count += usize::from(turn.username.is_some());
+            count += usize::from(turn.credential.is_some());
+        }
+        count += string_vec_allocations(&network.pinned_peers);
+        count += usize::from(network.roster_path.is_some());
+        if let TopologyMode::Hubs { hubs, .. } = &network.topology {
+            count += 1 + hubs.len();
+        }
+        count
+    }
+
+    /// Every heap byte the whole config retains, root families included.
+    ///
+    /// The root is not only the `networks` array: `services.turn.credentials`
+    /// is a second family that scales with the input, and the update, daemon
+    /// and service structs each own strings of their own. A tally that walked
+    /// only `networks` would be measuring a strict subset of what the plan is
+    /// asked to fund.
+    fn config_owned_bytes(config: &MeshConfig) -> usize {
+        let mut bytes = config
+            .identity_path
+            .as_ref()
+            .map_or(0, |path| path.capacity());
+        bytes += config.auto_update.channel.capacity() + config.auto_update.auto_apply.capacity();
+        bytes += config
+            .auto_update
+            .stable_url
+            .as_ref()
+            .map_or(0, String::capacity);
+        bytes += config
+            .auto_update
+            .beta_url
+            .as_ref()
+            .map_or(0, String::capacity);
+        bytes += config
+            .daemon
+            .control_socket
+            .as_ref()
+            .map_or(0, |path| path.capacity());
+        bytes += config.daemon.log_level.capacity();
+        bytes += config.services.signaling.bind.capacity();
+        bytes += config.services.stun.bind.capacity();
+        bytes += config.services.turn.bind.capacity()
+            + config.services.turn.public_ip.capacity()
+            + config.services.turn.realm.capacity();
+        bytes += vec_buffer_bytes(&config.services.turn.credentials);
+        for credential in &config.services.turn.credentials {
+            bytes += credential.username.capacity() + credential.password.capacity();
+        }
+        bytes += vec_buffer_bytes(&config.networks);
+        bytes += config
+            .networks
+            .iter()
+            .map(network_owned_bytes)
+            .sum::<usize>();
+        bytes
+    }
+
+    fn config_owned_allocations(config: &MeshConfig) -> usize {
+        let mut count = usize::from(config.identity_path.is_some());
+        count += 2; // update channel and auto-apply
+        count += usize::from(config.auto_update.stable_url.is_some());
+        count += usize::from(config.auto_update.beta_url.is_some());
+        count += usize::from(config.daemon.control_socket.is_some());
+        count += 1; // daemon log level
+        count += 2; // signaling and stun bind addresses
+        count += 3; // turn bind, public ip and realm
+        count += 1 + config.services.turn.credentials.len() * 2;
+        count += 1; // the networks buffer
+        count += config
+            .networks
+            .iter()
+            .map(network_owned_allocations)
+            .sum::<usize>();
+        count
+    }
 
     #[test]
     fn default_is_current_with_defaults() {

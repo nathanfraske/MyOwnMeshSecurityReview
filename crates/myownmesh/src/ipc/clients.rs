@@ -50,9 +50,9 @@ use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use myownmesh_core::{
-    LeasedMap, LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError,
-    ResourceClass, ResourceLease, ResourceMailboxAdmissionError, ResourceMailboxSender,
-    ResourceUnavailable,
+    FundedArc, LeasedMap, LocalApplicationResourceScope, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
+    ResourceMailboxSender, ResourceUnavailable,
 };
 
 use super::wire::ServerOut;
@@ -95,6 +95,8 @@ pub enum IpcAdmissionError {
     /// retry — is identical for all three arms.
     #[error("the control runtime is closing and admits nothing further")]
     Closing,
+    #[error("this daemon has no unused process-local identities left")]
+    IdentityExhausted,
 }
 
 /// Everything one registry is still holding, at one instant.
@@ -199,6 +201,8 @@ pub enum RegistrationError {
     /// wrapped counter reuses generations that are still installed.
     #[error("this daemon has no unused handler generations left")]
     GenerationExhausted,
+    #[error("this daemon has no unused process-local identities left")]
+    IdentityExhausted,
     #[error(transparent)]
     Admission(#[from] IpcAdmissionError),
 }
@@ -259,7 +263,7 @@ impl MethodRelease {
 /// this replaced did — made "delivered to nobody" and "there is nothing here to
 /// deliver through" the same answer.
 pub(crate) enum ChannelFanoutStep {
-    Next { client: Arc<ClientHandle> },
+    Next { client: FundedArc<ClientHandle> },
     End,
     Gone,
 }
@@ -279,7 +283,7 @@ pub(crate) enum ChannelFanoutStep {
 /// pointer equality on the value that already means "this pump".
 pub(crate) enum RouteOwner<'a> {
     /// A live pump, matched against the route's own owner.
-    Pump(&'a Arc<RouteCancellation>),
+    Pump(&'a FundedArc<RouteCancellation>),
     /// No pump to match. Controls only: a control inspects a route's membership
     /// without being one of its pumps, including while the route is still
     /// installing.
@@ -300,11 +304,11 @@ pub(crate) enum RouteOwner<'a> {
 /// not part of that frame, which is the truthful answer: it was not subscribed
 /// when the frame arrived.
 pub(crate) struct ChannelFanout {
-    /// Resume strictly after this client.
-    after: Option<ClientId>,
+    /// Resume strictly after this subscription instance.
+    after: Option<ChannelMembershipId>,
     /// The largest member id this frame may reach, fixed at the first step.
     /// `None` until then.
-    ceiling: Option<ClientId>,
+    ceiling: Option<ChannelMembershipId>,
 }
 
 impl ChannelFanout {
@@ -325,7 +329,7 @@ impl Default for ChannelFanout {
 
 /// One removed client, and what removing it left for a caller with networks.
 pub struct UnregisteredClient {
-    pub handle: Arc<ClientHandle>,
+    pub handle: FundedArc<ClientHandle>,
     /// Methods this client was the last claimant of, each carrying the core
     /// registration that removes its synthetic handler.
     ///
@@ -416,6 +420,7 @@ pub struct PreparedPending {
     owner: ClientId,
     entry: ResourceLease,
     retained: ResourceLease,
+    cancellation: ResourceLease,
     cleanup: ResourceLease,
 }
 
@@ -550,7 +555,7 @@ fn task_claim_retaining(retained: usize) -> Result<ResourceClaim, ResourceClaimA
 
 /// Exact claim for one registered client's own record.
 ///
-/// Covers what the handle itself retains: its `Arc` allocation and the minted
+/// Covers what the handle itself retains: its shared allocation and the minted
 /// capability's bytes. The three tables it owns are inline fields, so
 /// `size_of::<ClientHandle>()` already counts them — an empty [`LeasedMap`] is a
 /// null root pointer, a length and a hash seed, and allocates nothing until
@@ -567,7 +572,7 @@ fn task_claim_retaining(retained: usize) -> Result<ResourceClaim, ResourceClaimA
 /// scope in the same admission, and it has to be a separate claim because the
 /// node belongs to the registry's table and is released when the entry is
 /// removed, which is a different moment from when the last reference to the
-/// handle goes.
+/// handle goes. `FundedArc` internalizes this lease beside every pointer clone.
 fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     let overflow = || ResourceClaimArithmeticError::Overflow {
         dimension: ResourceClass::AccountedMemoryBytes,
@@ -761,13 +766,7 @@ fn pending_retained_for(
     // The two `Arc` pointees, in bytes and not merely as residuals. Both sizes
     // are known here — they are this crate's own types — so naming them as
     // opaque would be understating a figure that is available.
-    let shared = retained_claim(
-        total_len([
-            arc_allocation_bytes::<PendingFunding>()?,
-            arc_allocation_bytes::<PendingCancellation>()?,
-        ])?,
-        2,
-    )?;
+    let shared = retained_claim(arc_allocation_bytes::<PendingFunding>()?, 1)?;
     key_retention
         .checked_scale(2)?
         .checked_add(shared)?
@@ -780,6 +779,10 @@ fn pending_retained_for(
     // cannot be a term of a claim released when the table entry is removed --
     // the node outlives that removal by construction, since it is what the
     // removal produces.
+}
+
+fn pending_cancellation_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    retained_claim(arc_allocation_bytes::<PendingCancellation>()?, 1)
 }
 
 /// Everything one installed realtime flow retains beyond its table node.
@@ -857,10 +860,10 @@ pub(crate) fn registry_fixture_claim(
     };
     let records = planned(client_record_claim()?)
         .checked_add(planned(
-            LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?,
+            LeasedMap::<ClientId, FundedArc<ClientHandle>>::entry_claim()?,
         ))?
         .checked_scale(clients)?;
-    let entry = planned(LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?)
+    let entry = planned(LeasedMap::<ClientId, FundedArc<ClientHandle>>::entry_claim()?)
         .checked_add(planned(
             LeasedMap::<ClaimKey, Funded<ClientId>>::entry_claim()?,
         ))?
@@ -875,7 +878,8 @@ pub(crate) fn registry_fixture_claim(
         .checked_add(planned(LeasedMap::<ClaimKey, ResourceLease>::entry_claim()?))?
         .checked_add(planned(
             LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?,
-        ))?;
+        ))?
+        .checked_add(planned(pending_cancellation_claim()?))?;
     // The off-node half, priced from the same helpers the registry charges
     // with. A `PendingKey` carries four coordinates and a `ClaimKey` two, and
     // the realtime table's key is one -- so a fixture naming everything
@@ -900,11 +904,9 @@ pub(crate) fn registry_fixture_claim(
         .checked_add(planned(
             crate::ipc::LeasedList::<PendingRecord>::node_claim()?,
         ))?
-        .checked_add(planned(crate::ipc::LeasedList::<(
-            String,
-            myownmesh_core::realtime::RealtimeFlowHandle,
-            ResourceLease,
-        )>::node_claim()?))?;
+        .checked_add(planned(
+            crate::ipc::LeasedList::<OwnedRealtimeFlow>::node_claim()?,
+        ))?;
     let entry = entry
         .checked_add(widest_key.checked_scale(8)?)?
         .checked_add(cleanup.checked_scale(8)?)?;
@@ -925,12 +927,7 @@ pub use identity::{ClaimKey, ClientCapability, ClientId, RealtimeFlowCapability}
 /// The network travels with the handle because closing needs a `JoinedNetwork`
 /// to close *through*, and asking the client which network its own flow is on
 /// would be taking a routing decision from the party being authorized.
-struct OwnedRealtimeFlow {
-    /// The capability key's bytes and this network name's, funded together and
-    /// released when this value drops — which, taken out through
-    /// `pop_first_entry`, is after the owned key has gone wherever it is going.
-    /// The node lease cannot carry this: it ends inside the removal call.
-    _retained: ResourceLease,
+pub(crate) struct OwnedRealtimeFlow {
     /// The node this flow will occupy in the disconnect drain's list.
     ///
     /// `Option` for the same reason [`PendingRecord`]'s is: it has to leave the
@@ -939,7 +936,30 @@ struct OwnedRealtimeFlow {
     /// builds no node.
     cleanup: Option<ResourceLease>,
     network: String,
-    flow: myownmesh_core::realtime::RealtimeFlowHandle,
+    flow: Option<myownmesh_core::realtime::RealtimeFlowHandle>,
+    /// The capability key's bytes and this network name's, funded together and
+    /// released when this value drops — which, taken out through
+    /// `pop_first_entry`, is after the owned key has gone wherever it is going.
+    /// The node lease cannot carry this: it ends inside the removal call. It is
+    /// last so it outlives the values whose retained allocation it funds.
+    _retained: ResourceLease,
+}
+
+impl OwnedRealtimeFlow {
+    pub(crate) fn network(&self) -> &str {
+        &self.network
+    }
+
+    pub(crate) async fn close_through(
+        mut self,
+        network: &myownmesh_core::JoinedNetwork,
+    ) -> Result<(), myownmesh_core::realtime::RealtimeRefusal> {
+        let flow = self
+            .flow
+            .take()
+            .expect("an owned realtime flow is consumed only once");
+        network.close_realtime(flow).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -955,7 +975,7 @@ struct PendingRecord {
     owner: ClientId,
     operation_id: u64,
     effect: PendingInbound,
-    cancelled: Arc<PendingCancellation>,
+    cancelled: FundedArc<PendingCancellation>,
     /// The node this record will occupy in the one sweep that has to collect.
     ///
     /// An `Option` so it can be moved out and handed to the list as that node's
@@ -970,7 +990,7 @@ struct PendingRecord {
     cleanup: Option<ResourceLease>,
     /// See [`PendingFunding`]. Shared with the ticket, so the record leaving the
     /// table releases nothing while the ticket is still alive. Held, never read.
-    _funding: Arc<PendingFunding>,
+    _funding: FundedArc<PendingFunding>,
 }
 
 /// Everything one pending call retains, funded once and released last.
@@ -985,9 +1005,7 @@ struct PendingRecord {
 /// Behind an `Arc` shared by both, so the charge is taken once and returned when
 /// the *last* of the two goes. That is the general rule this registry now
 /// follows: funding follows the last live copy, not the table node.
-struct PendingFunding {
-    _retained: ResourceLease,
-}
+struct PendingFunding;
 
 struct PendingCancellation {
     cancelled: AtomicBool,
@@ -1032,10 +1050,10 @@ pub struct PendingTicket {
     registry: std::sync::Weak<RegistryInner>,
     key: PendingKey,
     operation_id: u64,
-    cancelled: Arc<PendingCancellation>,
+    cancelled: FundedArc<PendingCancellation>,
     /// The other half of the shared charge. Declared last so this ticket's copy
     /// of the key is dropped before the funding that paid for it.
-    _funding: Arc<PendingFunding>,
+    _funding: FundedArc<PendingFunding>,
 }
 
 impl PendingTicket {
@@ -1118,12 +1136,6 @@ pub struct ClientHandle {
     /// Channel subscriptions this client currently holds.
     /// Same disconnect-cleanup rationale, and the same reason for being private.
     channel_subs: HeldNames,
-    /// Funding for this record, held rather than read.
-    ///
-    /// Released when the last reference to this handle goes, which is what
-    /// makes an unregistered client's capacity available to the next one
-    /// without an explicit release step that a disconnect path could miss.
-    _record: ResourceLease,
     /// Realtime flows this client has open, each under the capability issued
     /// for it.
     ///
@@ -1138,6 +1150,16 @@ pub struct ClientHandle {
     /// way: an accessor that lent one out by value would let a caller keep a
     /// flow the close path believes it has taken.
     realtime_flows: Mutex<LeasedMap<String, OwnedRealtimeFlow>>,
+}
+
+impl ClientHandle {
+    pub(crate) fn capability(&self) -> &str {
+        self.capability.expose()
+    }
+
+    pub(crate) const fn capability_encoded_len() -> usize {
+        ClientCapability::ENCODED_LEN
+    }
 }
 
 /// One client's own set of claimed names, funded one name at a time.
@@ -1174,6 +1196,7 @@ pub struct ClientHandle {
 struct HeldName {
     retained: ResourceLease,
     cleanup: ResourceLease,
+    membership: Option<ChannelMembershipId>,
 }
 
 /// The names one client holds, each with the two leases its name owes.
@@ -1203,8 +1226,8 @@ impl HeldNames {
         let _ = self.0.lock().insert(key, held, node);
     }
 
-    fn release(&self, key: &ClaimKey) {
-        self.0.lock().remove(key);
+    fn release(&self, key: &ClaimKey) -> Option<HeldName> {
+        self.0.lock().remove(key)
     }
 
     /// Take one name out, still carrying the funding that pays for it.
@@ -1260,10 +1283,10 @@ impl ClientHandle {
             .insert(
                 capability.expose().to_string(),
                 OwnedRealtimeFlow {
-                    _retained: retained,
                     cleanup: Some(cleanup),
                     network,
-                    flow,
+                    flow: Some(flow),
+                    _retained: retained,
                 },
                 entry,
             )
@@ -1298,7 +1321,11 @@ impl ClientHandle {
     ) -> Option<R> {
         let flows = self.realtime_flows.lock();
         let owned = flows.get(capability)?;
-        (owned.network == network).then(|| effect(&owned.flow))
+        if owned.network != network {
+            return None;
+        }
+        let flow = owned.flow.as_ref()?;
+        Some(effect(flow))
     }
 
     /// Take one of this client's flows out, for a close that will consume it.
@@ -1315,19 +1342,12 @@ impl ClientHandle {
     /// this function has returned. Dropping it on the way out would unfund a
     /// buffer still in use, which is the defect this whole shape exists to
     /// prevent and is easy to reintroduce by destructuring the value here.
-    pub fn take_realtime_flow(
-        &self,
-        capability: &str,
-    ) -> Option<(
-        String,
-        myownmesh_core::realtime::RealtimeFlowHandle,
-        ResourceLease,
-    )> {
+    pub(crate) fn take_realtime_flow(&self, capability: &str) -> Option<OwnedRealtimeFlow> {
         let owned = self.realtime_flows.lock().remove(capability)?;
         // `owned.cleanup` is left behind and released here. This answers one
         // flow directly to a caller that asked for it by name; no drain node is
         // built, so the funding for one is not owed to anything.
-        Some((owned.network, owned.flow, owned._retained))
+        Some(owned)
     }
 
     /// Take every flow this client still owns.
@@ -1355,13 +1375,7 @@ impl ClientHandle {
     /// returned list stay funded for as long as the caller holds them — and each
     /// one lands in a node whose own funding was acquired when the flow was
     /// installed and is released only after that node is freed.
-    pub(crate) fn drain_realtime_flows(
-        &self,
-    ) -> crate::ipc::LeasedList<(
-        String,
-        myownmesh_core::realtime::RealtimeFlowHandle,
-        ResourceLease,
-    )> {
+    pub(crate) fn drain_realtime_flows(&self) -> crate::ipc::LeasedList<OwnedRealtimeFlow> {
         let mut flows = self.realtime_flows.lock();
         let mut taken = crate::ipc::LeasedList::new();
         while let Some((_capability, mut owned)) = flows.pop_first_entry() {
@@ -1369,7 +1383,7 @@ impl ClientHandle {
                 .cleanup
                 .take()
                 .expect("an installed flow holds the funding for its own drain node");
-            taken.push((owned.network, owned.flow, owned._retained), node);
+            taken.push(owned, node);
         }
         taken
     }
@@ -1387,6 +1401,13 @@ impl ClientHandle {
         self.writer_tx
             .send(frame)
             .map_err(|refusal| refusal.into_admission_error())
+    }
+
+    pub(crate) fn send_building<B>(&self, builder: B) -> Result<(), ResourceMailboxAdmissionError>
+    where
+        B: myownmesh_core::ResourceMailboxItemBuilder<ServerOut>,
+    {
+        self.writer_tx.send_building(builder)
     }
 
     pub async fn wait_disconnected(&self) {
@@ -1513,6 +1534,7 @@ struct RegistryInner {
     next_id: AtomicU64,
     next_call_stream_id: AtomicU64,
     next_operation_id: AtomicU64,
+    next_membership_id: AtomicU64,
     /// Which installation of a method name a handler belongs to.
     ///
     /// Monotonic and never reused, so "is this still the handler I installed?"
@@ -1546,7 +1568,7 @@ struct RegistryTables {
     /// for tasks. One lock over both means an admission either happens entirely
     /// before the transition or is refused by it.
     live_tasks: u64,
-    clients: LeasedMap<ClientId, Arc<ClientHandle>>,
+    clients: LeasedMap<ClientId, FundedArc<ClientHandle>>,
     handler_claims: LeasedMap<ClaimKey, Funded<ClientId>>,
     /// Subscribers per (network, channel), as a funded set of funded members.
     ///
@@ -1571,7 +1593,7 @@ impl RegistryTables {
     /// Exists because [`ClientRegistry::client`] takes the same lock, and this
     /// mutex is not reentrant: every method here that both locks and needs a
     /// client handle calls this instead, which is the whole of the discipline.
-    fn client(&self, id: ClientId) -> Option<Arc<ClientHandle>> {
+    fn client(&self, id: ClientId) -> Option<FundedArc<ClientHandle>> {
         self.clients.get(&id).cloned()
     }
 }
@@ -1749,17 +1771,20 @@ struct Funded<T> {
 /// cannot disagree.
 pub(crate) struct ChannelRoute {
     state: RouteState,
-    members: LeasedMap<ClientId, ()>,
+    members: LeasedMap<ChannelMembershipId, ClientId>,
     /// The channel key's own buffers and this route's share of cleanup.
     /// Declared last so it outlives the members it accounts for.
     _retained: ResourceLease,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ChannelMembershipId(u64);
+
 enum RouteState {
     /// One subscriber is off building the pump. Nobody may be told they are
     /// subscribed yet — not even the installer, which reports only after it
     /// has finished.
-    Installing(Arc<RouteReady>),
+    Installing(FundedArc<RouteReady>),
     /// The pump exists, and this is what will stop it.
     Live(PumpOwner),
 }
@@ -1769,18 +1794,18 @@ enum RouteState {
 /// A `Notify` alone would say "something happened" and not "it worked". The
 /// outcome has to be carried, because a follower that woke on a failed install
 /// and reported success would be exactly the bug the route exists to remove.
+///
+/// This value's own `Arc` allocation, funded before that allocation exists.
+///
+/// Not folded into [`ChannelRoute`]'s lease, deliberately. Clones of this
+/// readiness outlive the route by design — a failed install removes the
+/// route and *then* its waiters observe `FAILED` through their own clones —
+/// so funding tied to the route would be returned while the thing it paid
+/// for was still being read. Funding follows the last live copy, which for
+/// an `Arc` means the `Arc` itself.
 pub(crate) struct RouteReady {
     outcome: AtomicU8,
     woken: tokio::sync::Notify,
-    /// This value's own `Arc` allocation, funded before that allocation exists.
-    ///
-    /// Not folded into [`ChannelRoute`]'s lease, deliberately. Clones of this
-    /// readiness outlive the route by design — a failed install removes the
-    /// route and *then* its waiters observe `FAILED` through their own clones —
-    /// so funding tied to the route would be returned while the thing it paid
-    /// for was still being read. Funding follows the last live copy, which for
-    /// an `Arc` means the `Arc` itself.
-    _retained: ResourceLease,
 }
 
 impl RouteReady {
@@ -1788,11 +1813,10 @@ impl RouteReady {
     const LIVE: u8 = 1;
     const FAILED: u8 = 2;
 
-    fn new(retained: ResourceLease) -> Self {
+    fn new() -> Self {
         Self {
             outcome: AtomicU8::new(Self::INSTALLING),
             woken: tokio::sync::Notify::new(),
-            _retained: retained,
         }
     }
 
@@ -1863,7 +1887,7 @@ impl RouteReady {
 /// waits on a channel nobody publishes to, and the join that follows never
 /// returns. The flag is what a late-arriving waiter reads instead.
 struct PumpOwner {
-    cancel: Arc<RouteCancellation>,
+    cancel: FundedArc<RouteCancellation>,
     join: tokio::task::JoinHandle<()>,
 }
 
@@ -1877,21 +1901,19 @@ struct PumpOwner {
 /// follows waits forever on a channel nobody publishes to. A late waiter reads
 /// the flag instead.
 ///
-/// The lease is here rather than in [`ChannelRoute`] for the same reason
-/// [`RouteReady`]'s is: the pump holds a clone and is still using it while it
+/// Its `FundedArc` carries the lease beside the pointer for the same reason as
+/// [`RouteReady`]: the pump holds a clone and is still using it while it
 /// unwinds, after the route that created it is gone.
 pub(crate) struct RouteCancellation {
     cancelled: AtomicBool,
     woken: tokio::sync::Notify,
-    _retained: ResourceLease,
 }
 
 impl RouteCancellation {
-    fn new(retained: ResourceLease) -> Self {
+    fn new() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
             woken: tokio::sync::Notify::new(),
-            _retained: retained,
         }
     }
 
@@ -1918,7 +1940,7 @@ impl RouteCancellation {
     }
 }
 
-/// One `Arc<RouteReady>` pointee, funded before it exists.
+/// One `FundedArc<RouteReady>` pointee, funded before it exists.
 ///
 /// Its own lease and not the route's, because waiters read this after the route
 /// is gone. [`RouteCancellation`] is funded separately by
@@ -1930,7 +1952,7 @@ fn route_ready_retained() -> Result<ResourceClaim, ResourceClaimArithmeticError>
     retained_claim(arc_allocation_bytes::<RouteReady>()?, 1)
 }
 
-/// One `Arc<RouteCancellation>` pointee, funded before it exists.
+/// One `FundedArc<RouteCancellation>` pointee, funded before it exists.
 fn route_cancellation_retained() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     retained_claim(arc_allocation_bytes::<RouteCancellation>()?, 1)
 }
@@ -1944,9 +1966,9 @@ fn route_cancellation_retained() -> Result<ResourceClaim, ResourceClaimArithmeti
 pub(crate) enum ChannelJoin {
     /// This caller owns the install. Report to its client only after calling
     /// [`ClientRegistry::finish_channel_install`].
-    Install(Arc<RouteReady>),
+    Install(FundedArc<RouteReady>),
     /// Someone else is installing. Await this before reporting anything.
-    Pending(Arc<RouteReady>),
+    Pending(FundedArc<RouteReady>),
     /// The pump is already running.
     Live,
 }
@@ -1983,7 +2005,7 @@ enum Retired {
     /// The install never finished. Its installer will find the route gone and
     /// settle only its own generation, so these followers are nobody else's to
     /// answer.
-    Installing(Arc<RouteReady>),
+    Installing(FundedArc<RouteReady>),
 }
 
 impl RetiredRoute {
@@ -1995,7 +2017,10 @@ impl RetiredRoute {
     }
 
     /// A pump that was built for a route that no longer wants it.
-    fn orphaned_pump(cancel: Arc<RouteCancellation>, join: tokio::task::JoinHandle<()>) -> Self {
+    fn orphaned_pump(
+        cancel: FundedArc<RouteCancellation>,
+        join: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self(Retired::Pump(PumpOwner { cancel, join }))
     }
 

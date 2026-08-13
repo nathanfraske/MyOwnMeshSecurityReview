@@ -277,7 +277,11 @@ pub(crate) fn authenticated_for_test(
 /// The binding components are derived from the two Device ids so that two peers
 /// in one control do not share a binding digest — a shared digest would let a
 /// cross-peer confusion pass unnoticed.
-#[cfg(test)]
+///
+/// Reachable under `transport-lab` without this crate's `cfg(test)` because the
+/// promoted-peer fixture another crate's controls construct promotes through
+/// exactly this path.
+#[cfg(any(test, feature = "transport-lab"))]
 pub(crate) fn authenticated_over_for_test(
     handoff: ConnectedChannelHandoff,
     mesh_context: &str,

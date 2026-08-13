@@ -79,6 +79,17 @@ impl PeerOwnerToken {
     pub(crate) fn device_id(&self) -> &str {
         &self.peer.device_id
     }
+
+    /// The exact installed connection this token names.
+    ///
+    /// Borrowed, and holding it proves nothing on its own: an owner token
+    /// outlives the installation it names, which is the whole reason it exists.
+    /// A caller that must act on the peer settles that first with
+    /// [`PeerRegistry::get_if_current`], and uses this only to *read* the
+    /// connection it already measured.
+    pub(super) fn peer(&self) -> &Arc<PeerConnection> {
+        &self.peer
+    }
 }
 
 impl Default for PeerRegistry {
@@ -746,6 +757,43 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Stage at most `limit` installed peers as owner tokens, in a boxed slice.
+    ///
+    /// The bounded form of [`Self::values_snapshot`], for a caller that had to
+    /// pay for the list before it could exist. The retained form is
+    /// `Box<[PeerOwnerToken]>` rather than a `Vec` for one reason: a boxed slice
+    /// has no capacity. Its layout is exactly `len * size_of::<PeerOwnerToken>()`,
+    /// so a caller that funded that arithmetic funded what it holds.
+    /// `Vec::with_capacity` guarantees only *at least* the requested capacity,
+    /// so a claim resting on it would be a lower bound wearing an exact number's
+    /// clothes. The `Vec` below is transient scaffolding, and
+    /// `into_boxed_slice` shrinks it to exactly `len` on the way out.
+    ///
+    /// **This is a bound, not a fence.** A peer installed after the count that
+    /// produced `limit` is simply not in this observation, exactly as it would
+    /// not be in a `values_snapshot` taken a moment earlier — and the caller can
+    /// see that happened, because the returned length is shorter than the limit
+    /// it asked for. What the caller gets instead of a fence is identity: every
+    /// entry is an owner token, so a *replacement* under a staged device id is
+    /// detectable by [`Self::get_if_current`] rather than silently substituted.
+    ///
+    /// The loop clones two `Arc`s per entry and nothing else — no allocation,
+    /// no acquisition, and no peer-state lock — so the shard guard `iter` holds
+    /// is released without ever having been held across either.
+    pub(super) fn stage_owners(&self, limit: usize) -> Box<[PeerOwnerToken]> {
+        let mut staged = Vec::with_capacity(limit);
+        for entry in self.peers.iter() {
+            if staged.len() == limit {
+                break;
+            }
+            staged.push(PeerOwnerToken {
+                peer: Arc::clone(&entry.value().peer),
+                installation: Arc::clone(&entry.value().installation),
+            });
+        }
+        staged.into_boxed_slice()
+    }
+
     /// Build one output vector from an `Arc`-only snapshot. The DashMap guards
     /// are released before the callback can take a peer-state lock. This avoids
     /// the old key clones without introducing a registry-to-peer lock order.
@@ -1299,6 +1347,120 @@ impl StartedApplicationOperation {
         data.diag.frames_out += 1;
         Ok(sent)
     }
+}
+
+/// Authority to *start* one inbound handler run, before the embedder's code is
+/// entered.
+///
+/// The same shape as [`AdmittedApplicationOperation`] and for the same reason,
+/// with one difference that decides everything about it: there is no connector
+/// to hold. A send's begin point can take native authority and so can promise
+/// the effect lands; a handler run cannot promise anything about what the
+/// handler will later do. What it can establish — and what the whole type
+/// exists for — is *when the run started*, as a synchronous point ordered
+/// against every peer mutation and every governance commit.
+///
+/// **Why a fenced point at all, rather than the outer race.** The run is
+/// already raced against its witness, and a biased select answers revocation
+/// first at every poll. That makes revocation win every tie, including ties it
+/// should lose: a run whose authority was live when it was admitted, and which
+/// was revoked in the instant before its first poll, would silently never enter
+/// the embedder's closure — the select would erase a start that had already been
+/// authorized. Bias is a scheduling artefact, not a commit. This is the commit,
+/// and it is reached exactly once.
+///
+/// After it, revocation may cancel every await the run has left — the handler's
+/// own future, the terminal send — but it cannot retract the fact that the
+/// closure was called. Before it, revocation refuses the run outright and the
+/// closure is never called at all. Those are the only two outcomes.
+///
+/// Deliberately not `Clone`, `Copy`, `Debug` or `Default`, and consumed by
+/// value, so one admission starts one run.
+#[must_use = "an admitted handler run authorizes exactly one start and must be consumed"]
+pub(super) struct AdmittedHandlerRun {
+    validity: crate::runtime::session_broker::SessionValidityWitness,
+    owner: PeerOwnerToken,
+}
+
+impl AdmittedHandlerRun {
+    /// Capture the exact installation and session a dispatched call was
+    /// admitted under.
+    ///
+    /// Both are captured rather than resolved later, for the reason the whole
+    /// owner-token pattern exists: a device id re-resolved at start time can
+    /// name a replacement installation, and a run would then be started under
+    /// authority that never asked for it.
+    pub(super) fn new(
+        owner: PeerOwnerToken,
+        validity: crate::runtime::session_broker::SessionValidityWitness,
+    ) -> Self {
+        Self { validity, owner }
+    }
+
+    /// Cross the run's synchronous start point.
+    ///
+    /// Governance revocation takes the same mutation lock before invalidating
+    /// the session, so this either refuses without the embedder's closure ever
+    /// being entered, or returns a start ordered before any later commit. No
+    /// registry or `parking_lot` guard escapes this method — the caller invokes
+    /// user code only after it has returned, and never under a lock.
+    ///
+    /// `at_precommit` runs between the early validity read and the fenced
+    /// commit, which is the one window nothing else can reach: everything
+    /// before it is a single atomic read and everything after it is this
+    /// method's own. There is one caller and it passes
+    /// [`crate::engine::state::NetworkState::reach_rpc_handler_precommit_point`],
+    /// which is empty in a production build and runs a control's staged action
+    /// under test. Deliberately **not** a second test-only entry point: a
+    /// control calling its own variant would observe this refusal without
+    /// proving the production arm honours it, which is the only thing worth
+    /// proving here.
+    ///
+    /// The hook takes nothing and returns nothing, so it can act on the wider
+    /// system but cannot inspect or influence this run's own decision.
+    pub(super) fn begin(
+        self,
+        peers: &PeerRegistry,
+        at_precommit: impl FnOnce(),
+    ) -> Result<StartedHandlerRun> {
+        // An already-dead witness is refused for the reason it is actually
+        // dead, and without touching the registry-wide lock every peer mutation
+        // contends on. Not the linearization point: it reads no registry state,
+        // and the authoritative check is the one under the fence below.
+        if !self.validity.is_live() {
+            return Err(Self::revoked());
+        }
+        at_precommit();
+        let _mutation = peers.mutation.lock();
+        let current = peers
+            .peers
+            .get(self.owner.device_id())
+            .filter(|current| Arc::ptr_eq(&current.value().installation, &self.owner.installation));
+        if current.is_none() || !self.validity.is_live() {
+            return Err(Self::revoked());
+        }
+        Ok(StartedHandlerRun { _started: () })
+    }
+
+    /// The one refusal a revoked start gives, from either check, built in one
+    /// place so the two cannot drift apart or leak which of them fired.
+    fn revoked() -> Error {
+        Error::Transport("the session authorizing this handler run was revoked".into())
+    }
+}
+
+/// A handler run that crossed its fenced start point.
+///
+/// Opaque and empty on purpose. It carries no connector, no lock and no lease,
+/// because it makes no claim about any of them: it is the *evidence* that the
+/// start was ordered before any later revocation, and evidence is all the
+/// caller needs to know it may enter the embedder's closure exactly once.
+///
+/// Held by the run for its whole life rather than dropped at the start, so the
+/// authority to have started and the running work end together.
+#[must_use = "a started handler run is the evidence the closure may be entered"]
+pub(super) struct StartedHandlerRun {
+    _started: (),
 }
 
 /// One claimed renegotiation: the connector to drive, plus the exact owner it

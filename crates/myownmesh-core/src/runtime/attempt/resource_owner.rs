@@ -581,11 +581,27 @@ enum ConnectorCleanupFunding {
     },
 }
 
+/// One queued cleanup job: the work, its two callbacks, and the funding that
+/// pays for all of it.
+///
+/// **`_funding` is declared last, and that is the whole of the ordering.**
+/// [`cleanup_job_claim`] prices this job's inline bytes *and* four residuals
+/// standing for the boxed close future, the boxed completion callback, the
+/// boxed failure callback and the channel node — so the funding covers three
+/// heap allocations that live in the three `Option` fields above it. Fields are
+/// destroyed in declaration order, so funding declared first would be handed
+/// back while all three of those allocations were still there. Declared last,
+/// it is released only once every allocation it names is gone.
+///
+/// This type has its own [`Drop`], and that does not change the rule: an
+/// explicit `drop` body runs *before* any field is destroyed, so the failure
+/// callback below still fires with the funding fully intact, and the three
+/// boxes are freed after it and before the funding goes back.
 pub(crate) struct ConnectorCleanupJob {
-    _funding: ConnectorCleanupFunding,
     future: Option<ConnectorCleanupFuture>,
     on_complete: Option<ConnectorCleanupCompletion>,
     on_failure: Option<ConnectorCleanupFailure>,
+    _funding: ConnectorCleanupFunding,
 }
 
 impl ConnectorCleanupJob {
@@ -596,12 +612,12 @@ impl ConnectorCleanupJob {
         on_failure: ConnectorCleanupFailure,
     ) -> Self {
         Self {
-            _funding: ConnectorCleanupFunding::Connector {
-                _capability: capability,
-            },
             future: Some(future),
             on_complete: Some(on_complete),
             on_failure: Some(on_failure),
+            _funding: ConnectorCleanupFunding::Connector {
+                _capability: capability,
+            },
         }
     }
 
@@ -613,10 +629,10 @@ impl ConnectorCleanupJob {
         on_failure: ConnectorCleanupFailure,
     ) -> Self {
         Self {
-            _funding: ConnectorCleanupFunding::Subordinate { _lease: funding },
             future: Some(future),
             on_complete: Some(on_complete),
             on_failure: Some(on_failure),
+            _funding: ConnectorCleanupFunding::Subordinate { _lease: funding },
         }
     }
 

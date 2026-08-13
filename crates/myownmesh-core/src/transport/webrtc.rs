@@ -447,28 +447,16 @@ impl RealtimeInboundDelivery {
         self.payload.as_mut()
     }
 
-    /// Split the delivery into the three parts a flow set enqueues.
+    /// The flow this arrival is bound to, borrowed.
     ///
-    /// **Private, and that is the whole point of its scope.** Everything it
-    /// hands back names [`RealtimePayloadLease`], which is a connector-internal
-    /// type; a wider visibility would put a private type in a signature the
-    /// engine could name, and the engine holding a bare lease is exactly the
-    /// ownership it must not have — it could then drop the bytes' accounting
-    /// separately from the unit they belong to. Rust's module privacy makes this
-    /// callable from this module's descendants, which is precisely the set that
-    /// may legally hold one: the flow set that enqueues it.
-    ///
-    /// By value on purpose: the three parts move together, so a delivery that
-    /// has been split cannot be accidentally delivered twice.
-    ///
-    /// `None` for a delivery that never received a lease. That is not a state
-    /// anything models — it means the delivery bypassed the one path that mints
-    /// one — so it is refused rather than carried further as an `Option` into a
-    /// flow set where it would have no meaning. Refused, not asserted: this
-    /// rides an inbound path, and a wiring mistake should cost a dropped unit
-    /// rather than the process.
-    fn into_parts(self) -> Option<(RealtimeFlowLabel, RealtimeRecvUnit, RealtimePayloadLease)> {
-        Some((self.label, self.unit, self.payload?))
+    /// Every question a flow set asks before it accepts an arrival — is there
+    /// such a flow, is it inbound, is there capacity for a node — is a question
+    /// about this label, and none of them needs the delivery taken apart. A
+    /// borrowed answer is what lets those refusals happen while the delivery is
+    /// still whole, so a refused arrival drops its unit and its payload lease
+    /// together instead of releasing one while the other is still standing.
+    fn label(&self) -> &RealtimeFlowLabel {
+        &self.label
     }
 }
 
@@ -877,16 +865,23 @@ fn negotiated_inbound_record_claim() -> std::result::Result<
 /// An `AtomicBool` read before and after registering gives the same guarantee in
 /// one allocation whose bytes are exact.
 ///
-/// The lease lives **inside**, because every claimant and every waiter holds a
-/// clone of this `Arc` and any of them can outlive the table's record. A lease on
-/// the record would tell the provider this allocation was gone while a loser was
-/// still parked on it.
+/// **The funding must outlive every waiter, and the allocation too.** Every
+/// claimant and every waiter holds a handle to this cell and any of them can
+/// outlive the table's record, so a lease held by the record would tell the
+/// provider this allocation was gone while a loser was still parked on it. That
+/// is why the funding is not on the record — but keeping it *inside* this
+/// struct, as it used to be, only moved the problem: a lease among these fields
+/// is released by this value's own drop glue, while the allocation is still
+/// there.
+///
+/// [`FundedArc`] answers both at once. Every handle shares the one reservation,
+/// so the charge spans every waiter; and the token sits beside the pointer, so
+/// it is released only after the allocation is genuinely gone.
 struct RealtimeRetirementSignal {
     /// Flips once the responsibility has been *discharged*.
     done: AtomicBool,
     /// Wakes everyone parked, exactly once, after `done` is already `true`.
     wake: tokio::sync::Notify,
-    _lease: crate::resource::ResourceLease,
 }
 
 impl RealtimeRetirementSignal {
@@ -914,12 +909,15 @@ impl RealtimeRetirementSignal {
         ])
     }
 
-    fn mint(lease: crate::resource::ResourceLease) -> Arc<Self> {
-        Arc::new(Self {
-            done: AtomicBool::new(false),
-            wake: tokio::sync::Notify::new(),
-            _lease: lease,
-        })
+    fn mint(lease: crate::resource::ResourceLease) -> crate::resource::FundedArc<Self> {
+        crate::resource::FundedArc::new(
+            Self {
+                done: AtomicBool::new(false),
+                wake: tokio::sync::Notify::new(),
+            },
+            lease,
+        )
+        .expect("an admitted completion-cell lease may be shared")
     }
 
     /// Announce that the retirement attempt has ended, however it ended.
@@ -953,7 +951,7 @@ struct RealtimeRetirement {
     /// ends the attempt, including the ones that end it without stopping
     /// anything. A claimant that returned without announcing would leave every
     /// later loser parked on a completion nobody is left to make.
-    done: Arc<RealtimeRetirementSignal>,
+    done: crate::resource::FundedArc<RealtimeRetirementSignal>,
 }
 
 /// What a won claim carries out of the lock: the right to stop this one thing,
@@ -962,7 +960,7 @@ struct RealtimeRetirement {
 struct RealtimeTrackClaim {
     identity: Arc<RealtimeTrackIdentity>,
     transceiver: Arc<dyn NativeRealtimeTransceiverPort>,
-    done: Arc<RealtimeRetirementSignal>,
+    done: crate::resource::FundedArc<RealtimeRetirementSignal>,
     /// Taken out of the record with the claim, so the transceiver's own charge
     /// travels with the one party that may retire it.
     ///
@@ -989,12 +987,15 @@ impl RealtimeRetirement {
     /// what makes a loser's wait and a winner's announcement the same fact.
     fn claim(
         &mut self,
-    ) -> std::result::Result<Arc<RealtimeRetirementSignal>, Arc<RealtimeRetirementSignal>> {
+    ) -> std::result::Result<
+        crate::resource::FundedArc<RealtimeRetirementSignal>,
+        crate::resource::FundedArc<RealtimeRetirementSignal>,
+    > {
         if self.claimed {
-            return Err(Arc::clone(&self.done));
+            return Err(self.done.clone());
         }
         self.claimed = true;
-        Ok(Arc::clone(&self.done))
+        Ok(self.done.clone())
     }
 }
 
@@ -1158,7 +1159,7 @@ impl Drop for RealtimeInboundRetirement {
 /// registering is what makes a completion that already happened return
 /// immediately. Neither alone is sufficient and this is not a retry loop: it
 /// goes round only when a spurious wake arrives.
-async fn await_retirement(done: Arc<RealtimeRetirementSignal>) {
+async fn await_retirement(done: crate::resource::FundedArc<RealtimeRetirementSignal>) {
     loop {
         if done.is_done() {
             return;
@@ -1741,12 +1742,13 @@ impl WebRtcConnectorEvent {
     /// it exposes no payload: the answer is a bool, and the event's resources
     /// and its incarnation stay unreachable.
     ///
-    /// Gated to match its only caller. The live pre-open fixture needs
-    /// `transport-lab`, so gating on `test` alone would leave this with no
-    /// caller in a default-feature test build — an orphan the compiler is right
-    /// to refuse, and one that would have to be silenced with a mask rather
-    /// than fixed.
-    #[cfg(all(test, feature = "transport-lab"))]
+    /// Gated to match its only caller: the live pre-open fixture, which is
+    /// gated on `transport-lab` alone. `test` is deliberately not part of the
+    /// condition — gating on `test` alone would leave this with no caller in a
+    /// default-feature test build, and requiring `test` as well would leave the
+    /// fixture without it in the feature-only build another crate's controls
+    /// compile against.
+    #[cfg(feature = "transport-lab")]
     pub(crate) fn is_data_channel_open(&self) -> bool {
         matches!(self.event, TransportEvent::DataChannelOpen)
     }
@@ -10827,8 +10829,22 @@ mod tests {
         assert!(registry.open_outbound_flow().is_some());
     }
 
+    /// The bytes follow the delivery, whole, into whatever holds it next.
+    ///
+    /// This used to move the lease by *cloning* it, when the payload owner was
+    /// an `Arc`, and asserted the bytes stayed charged until the last of several
+    /// owners went away. There is no last-of-several now, and no way to reach
+    /// the lease at all: the delivery has no accessor that hands its parts back,
+    /// so the only thing a downstream holder can be given is the whole value.
+    ///
+    /// That is what this proves, and it is the strongest statement the shape
+    /// admits: moving the delivery downstream moves the charge with it — the
+    /// place it came from releases nothing — and the bytes come back exactly
+    /// when the downstream holder drops it. A control that took the delivery
+    /// apart to watch one part would be exercising an escape production does not
+    /// have.
     #[test]
-    fn v4_arc03f_realtime_bytes_follow_payload_clones_through_downstream_queues() {
+    fn v4_arc03f_realtime_bytes_follow_the_payload_owner_through_downstream_queues() {
         let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
         let registry = test_realtime_registry(policy);
         let flow = registry
@@ -10848,10 +10864,23 @@ mod tests {
         let TransportEvent::RealtimeUnit(delivery) = queued.event else {
             panic!("fixture receives its real-time unit");
         };
-        let downstream_clone = delivery.payload.clone();
-        drop(delivery);
-        assert_eq!(retained_realtime_bytes(&registry.state.lock()), 5);
-        drop(downstream_clone);
+        assert!(
+            format!("{delivery:?}").contains("leased: true"),
+            "non-vacuity: the delivery really is holding the payload owner, so \
+             the release below is caused by dropping it rather than by there \
+             being nothing to release"
+        );
+
+        // Downstream: the delivery moves on as one value, which is the only way
+        // it can move at all.
+        let downstream = vec![delivery];
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            5,
+            "the charge travelled with the delivery instead of being released \
+             where it came from"
+        );
+        drop(downstream);
         assert_eq!(retained_realtime_bytes(&registry.state.lock()), 0);
     }
 
@@ -15801,7 +15830,7 @@ mod tests {
         let mut retirement = RealtimeRetirement::new(signal);
 
         // `let ... else` rather than `expect`/`expect_err`. Both arms of
-        // `claim` are `Arc<RealtimeRetirementSignal>`, and that type has no
+        // `claim` are `FundedArc<RealtimeRetirementSignal>`, and that type has no
         // `Debug` — deliberately, because a completion cell's contents are not
         // a thing to print — so the panicking helpers cannot name it. Giving it
         // one to satisfy a test would put a formatting surface on a
