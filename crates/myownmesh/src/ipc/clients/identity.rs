@@ -68,7 +68,7 @@ pub struct ClientCapability(String);
 
 impl ClientCapability {
     const RAW_BYTES: usize = 32;
-    pub(super) const ENCODED_LEN: usize = (Self::RAW_BYTES * 8 + 5) / 6;
+    pub(super) const ENCODED_LEN: usize = (Self::RAW_BYTES * 8).div_ceil(6);
 
     pub(super) fn mint() -> Self {
         let mut bytes = [0_u8; Self::RAW_BYTES];

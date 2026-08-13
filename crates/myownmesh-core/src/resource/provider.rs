@@ -1305,6 +1305,10 @@ impl SharedResourceLease {
     /// the refusal returns the lease itself rather than an error code — the
     /// caller is left holding exactly the funding it arrived with, which is the
     /// only refusal that cannot leak.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the Err *is* the caller's lease, handed back intact so it keeps funding exactly what it funded on the way in; boxing it would allocate on the refusal path, and any smaller error would mean dropping the lease here — releasing a reservation the caller still believes it holds"
+    )]
     fn from_lease(mut lease: ResourceLease) -> Result<Self, ResourceLease> {
         if lease.authority == ResourceAuthorityClass::Speculative {
             return Err(lease);
@@ -1415,6 +1419,10 @@ impl<T> FundedArc<T> {
     /// A speculative lease is refused and handed straight back, still funding
     /// exactly what it funded on the way in: a speculative reservation may be
     /// asked to retire, and no single holder of a shared one could answer that.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the Err is the funding lease returned by value, still funding what it arrived funding; the whole point of taking it by value is that a refusal leaks nothing, which a boxed or narrowed error cannot express"
+    )]
     pub fn new(value: T, funding: ResourceLease) -> Result<Self, ResourceLease> {
         let shared = SharedResourceLease::from_lease(funding)?;
         Ok(Self {
@@ -1440,6 +1448,10 @@ impl<T: ?Sized> FundedArc<T> {
     /// pointer back out, and as with [`FundedArc::new`] the exclusive lease is
     /// taken by value and internalized, so no shared token is ever in a
     /// caller's hands to clone onto a second allocation.
+    #[expect(
+        clippy::result_large_err,
+        reason = "same contract as [`FundedArc::new`]: the refused lease comes back by value, intact and still funding its reservation, so the refusal path allocates nothing and releases nothing"
+    )]
     pub(crate) fn from_admitted_arc(
         value: Arc<T>,
         funding: ResourceLease,

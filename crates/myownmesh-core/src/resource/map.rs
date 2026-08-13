@@ -385,11 +385,23 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
     /// still holding a name for, and refusing while keeping the lease would
     /// retain funding for an entry that does not exist.
     ///
-    /// The `Err` is one pointer wide, which is not a micro-optimisation: this
-    /// signature is on the success path of every insert in the crate, and
-    /// handing back an unpacked value and lease would widen every one of them
-    /// by the size of the caller's payload to describe a case that did not
-    /// happen.
+    /// The `Err` carries the whole rejected node — the boxed entry and the
+    /// lease that funded it — precisely so that dropping it releases both. It
+    /// is **not** small: a [`ResourceLease`] alone is well over a hundred bytes,
+    /// and that is what makes this a deliberate exception to
+    /// `clippy::result_large_err` rather than an oversight. The alternative the
+    /// lint suggests is boxing the error, which would allocate on the refusal
+    /// path — the one path that must not need the allocator, since it is
+    /// reached because capacity is already contended.
+    ///
+    /// What the shape does buy is that the candidate comes back *packed*:
+    /// handing the caller an unpacked value and lease would widen the success
+    /// path too, to describe a case that did not happen.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the Err is the rejected node itself, returned by value so dropping it \
+                  releases its lease; boxing would allocate on the refusal path"
+    )]
     pub fn insert(
         &mut self,
         key: K,

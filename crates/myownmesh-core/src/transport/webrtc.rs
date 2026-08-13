@@ -431,6 +431,10 @@ impl RealtimeInboundDelivery {
     /// refused lease back so it is released rather than stranded. Overwriting
     /// would drop a live lease silently and leave the bytes it accounted for
     /// charged to nothing.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the Err is the refused lease itself, returned by value so the caller drops it and the bytes it accounted for are released. Boxing it would allocate on the refusal path, and any smaller error would mean this fn keeps the lease it just declined — stranding exactly the accounting the refusal exists to prevent"
+    )]
     fn attach(
         &mut self,
         payload: RealtimePayloadLease,
@@ -985,6 +989,10 @@ impl RealtimeRetirement {
     /// subscription to the winner's announcement — not a refusal, and never to
     /// be treated as "already done". Both arms are the same allocation, which is
     /// what makes a loser's wait and a winner's announcement the same fact.
+    #[expect(
+        clippy::result_large_err,
+        reason = "both arms are the same funded allocation, which is the whole point: the loser's Err is not a diagnosis but its subscription to the winner's announcement, and it must arrive already funded. Boxing the Err would allocate on the very path that lost the race, and narrowing it would destroy the one property being asserted — that the two arms name one allocation"
+    )]
     fn claim(
         &mut self,
     ) -> std::result::Result<
@@ -1781,6 +1789,10 @@ struct QueuedTransportEvent {
 }
 
 impl QueuedTransportEvent {
+    #[expect(
+        clippy::result_large_err,
+        reason = "same by-value refusal as [`RealtimeDelivery::attach`], which this forwards to: both arms hand the reservation back intact — the second-attachment arm and the wrong-event-kind arm alike — so a refusal releases rather than strands. Boxing would allocate on the refusal path"
+    )]
     fn attach_realtime_reservation(
         &mut self,
         reservation: RealtimePayloadLease,

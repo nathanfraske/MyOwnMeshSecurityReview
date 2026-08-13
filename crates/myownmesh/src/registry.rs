@@ -476,7 +476,7 @@ impl RegistryState {
                 .aliases
                 .iter()
                 .filter(|(key, entry)| key.as_str() == entry.joined.config_id())
-                .filter(|(key, _)| after.map_or(true, |after| key.as_str() > after))
+                .filter(|(key, _)| after.is_none_or(|after| key.as_str() > after))
                 .min_by(|(left, _), (right, _)| left.cmp(right));
             let Some((key, entry)) = next else { break };
             visit(entry);
@@ -1527,6 +1527,10 @@ impl StatusSource<'_> {
             ))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the exact admitted lease must be returned by value; boxing would allocate on refusal"
+    )]
     pub(crate) fn commit(
         self,
         retention: myownmesh_core::ResourceLease,
@@ -1607,6 +1611,10 @@ impl MeasuredNetworksList<'_> {
         self.line_ceiling
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "both exact admitted leases must be returned by value; boxing would allocate on refusal"
+    )]
     pub(crate) fn commit(
         self,
         retention: myownmesh_core::ResourceLease,

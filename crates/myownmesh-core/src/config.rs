@@ -1324,6 +1324,21 @@ mod tests {
         vec_buffer_bytes(values) + values.iter().map(String::capacity).sum::<usize>()
     }
 
+    /// One allocation for the vector's own buffer, plus one per string it
+    /// holds.
+    ///
+    /// The leading `1` is the whole reason this takes `&Vec<String>` and not
+    /// `&[String]`: it counts the container's *own* heap allocation, and only a
+    /// `Vec` has one. A slice is a borrowed view whose backing store might be a
+    /// `Vec`, an array, or a boxed slice, so the same body against `&[String]`
+    /// would be adding one for an allocation it can no longer prove exists.
+    /// The signature is the proof, which is why the lint is suppressed here
+    /// rather than followed.
+    #[expect(
+        clippy::ptr_arg,
+        reason = "the Vec-ness is load-bearing: the leading 1 counts the vector's own \
+                  buffer allocation, which a slice cannot attest to"
+    )]
     fn string_vec_allocations(values: &Vec<String>) -> usize {
         1 + values.len()
     }

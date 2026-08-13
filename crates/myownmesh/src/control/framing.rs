@@ -618,21 +618,9 @@ impl serde::Serialize for ControlOut<'_> {
 pub(super) enum PreparedReply {
     StaticError(&'static str),
     Error(PreparedText),
-    Bool {
-        key: &'static str,
-        value: bool,
-    },
-    Usize {
-        key: &'static str,
-        value: usize,
-    },
-    Text {
-        key: &'static str,
-        value: PreparedText,
-    },
-    TraceSubscribed {
-        network: PreparedText,
-    },
+    Bool { key: &'static str, value: bool },
+    Usize { key: &'static str, value: usize },
+    TraceSubscribed { network: PreparedText },
     EventsSubscribed(myownmesh_core::FundedArc<crate::ipc::ClientHandle>),
     ServicesStatus(crate::services::FundedServicesStatus),
     Config(myownmesh_core::config::FundedMeshConfig),
@@ -944,18 +932,6 @@ impl serde::Serialize for PreparedReply {
                 let mut response = serializer.serialize_struct("Response", 2)?;
                 response.serialize_field("ok", &true)?;
                 response.serialize_field("data", &Field { key, value })?;
-                response.end()
-            }
-            Self::Text { key, value } => {
-                let mut response = serializer.serialize_struct("Response", 2)?;
-                response.serialize_field("ok", &true)?;
-                response.serialize_field(
-                    "data",
-                    &Field {
-                        key,
-                        value: &value.value,
-                    },
-                )?;
                 response.end()
             }
             Self::TraceSubscribed { network } => {
@@ -2846,10 +2822,7 @@ mod tests {
             builds, 1,
             "the sole builder runs exactly once after admission"
         );
-        let reply = PreparedReply::Text {
-            key: "value",
-            value,
-        };
+        let reply = PreparedReply::Error(value);
         let line = AdmittedLineOut::encode(ControlOut::Prepared(&reply), &funded)
             .expect("the same grant funds encoded output beside the typed field");
         assert!(line
@@ -2969,7 +2942,19 @@ mod tests {
         let line_ceiling = source
             .line_ceiling()
             .expect("status line remains representable");
-        let (funded, provider) = probed_admission_granting_bytes(1 << 16);
+        let line_bytes_claim = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            u64::try_from(line_ceiling).expect("the Status line fits the resource model"),
+        );
+        let line_allocation_claim = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            LINE_WRITE_ALLOCATIONS,
+        );
+        let (funded, provider) = probed_admission_for_reservations([
+            typed_claim,
+            line_bytes_claim,
+            line_allocation_claim,
+        ]);
         let baseline = provider.in_use();
         let mut commits = 0usize;
         let (status, output) =

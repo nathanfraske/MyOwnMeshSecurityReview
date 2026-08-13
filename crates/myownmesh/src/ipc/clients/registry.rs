@@ -1304,14 +1304,14 @@ impl ClientRegistry {
         let Some(c) = tables.client(client) else {
             return Err(RegistrationError::ClientGone);
         };
-        let already_member = c.channel_subs.holds(&key);
+        let already_member = c.channel_subs.holds(key);
         // The retained heap of this key, once per copy that is kept: the
         // client's own held-name table and the registry's subscriber table each
         // keep one. The client's copy also acquires the node it will occupy in
         // the disconnect drain's route list, as its own lease, for the reason
         // the method claim gives.
-        let retained = claim_key_retained(&key).map_err(IpcAdmissionError::Claim)?;
-        let held_entry = match c.channel_subs.holds(&key) {
+        let retained = claim_key_retained(key).map_err(IpcAdmissionError::Claim)?;
+        let held_entry = match c.channel_subs.holds(key) {
             true => None,
             false => {
                 let (node, retained) = self
@@ -1335,7 +1335,7 @@ impl ClientRegistry {
                 ))
             }
         };
-        let set_entry = match tables.channel_subs.contains_key(&key) {
+        let set_entry = match tables.channel_subs.contains_key(key) {
             true => None,
             false => {
                 // The route's node and key bytes, and the readiness `Arc` it
@@ -1396,7 +1396,7 @@ impl ClientRegistry {
         };
         let route = tables
             .channel_subs
-            .get_mut(&key)
+            .get_mut(key)
             .expect("the route exists or was just inserted");
         if let (Some(entry), Some(membership)) = (member_entry, membership) {
             route

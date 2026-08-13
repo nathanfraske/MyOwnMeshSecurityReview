@@ -377,10 +377,11 @@ impl PeerRowLengths {
         for len in [self.device_id, self.label] {
             total = total.checked_add(json_string_ceiling(len)?)?;
         }
-        for optional in [self.verification_code_received, self.verification_code_sent] {
-            if let Some(len) = optional {
-                total = total.checked_add(json_string_ceiling(len)?)?;
-            }
+        for len in [self.verification_code_received, self.verification_code_sent]
+            .into_iter()
+            .flatten()
+        {
+            total = total.checked_add(json_string_ceiling(len)?)?;
         }
         // The advertisement is copied verbatim, so it expands by nothing.
         match self.capabilities {
@@ -838,11 +839,12 @@ impl PreparedPeerSnapshot<'_> {
             // Under the observation: settle equality, copy. Nothing here
             // validates, so the peer's state guard and its promoted-session
             // slot are held for a `memcpy` and no longer.
-            let (mut row, copied) = peer.with_peer_view(|view| build_row(view, *planned))?;
+            let BuiltRow { mut row, advert } =
+                peer.with_peer_view(|view| build_row(view, *planned))?;
             // Outside it: validate. Two passes over peer-chosen bytes is the
             // work the work claim paid for, and it is the part that must not
             // run while a peer's own writers are blocked behind it.
-            if let Some(bytes) = copied {
+            if let Some(bytes) = advert {
                 row.capabilities = Some(validated_raw_advert(bytes)?);
             }
             rows.push(row);
@@ -941,6 +943,21 @@ fn encoded_line_len(peers: &[PublishedPeer]) -> Option<usize> {
     Some(counter.0)
 }
 
+/// One row as it leaves the observation: built, but not yet finished.
+///
+/// A named pair rather than a tuple, because the two halves are in different
+/// states and the distinction is the whole point of the split. `row` is
+/// complete except for its advertisement; `advert` is that advertisement, still
+/// an unvalidated copy, waiting for the caller to validate it once the peer's
+/// locks are released. Returning `(PublishedPeer, Option<Box<[u8]>>)` said the
+/// same thing in a shape a reader has to decode positionally.
+struct BuiltRow {
+    row: PublishedPeer,
+    /// `None` when this peer's session has heard no advertisement — not when
+    /// one is merely still pending.
+    advert: Option<Box<[u8]>>,
+}
+
 /// Build one published row from the observation that just re-measured it,
 /// leaving the advertisement as an unvalidated copy for the caller to finish
 /// outside the observation.
@@ -952,13 +969,13 @@ fn encoded_line_len(peers: &[PublishedPeer]) -> Option<usize> {
 /// released.
 ///
 /// The row comes back with `capabilities: None` whether or not this peer
-/// advertised. The returned bytes, not the row, are what say which: a row that
+/// advertised. [`BuiltRow::advert`], not the row, is what says which: a row that
 /// carried a half-built advertisement would be a value that is briefly a lie
 /// about the peer.
 fn build_row(
     view: PeerView<'_>,
     planned: PeerRowLengths,
-) -> std::result::Result<(PublishedPeer, Option<Box<[u8]>>), PeerSnapshotRefusal> {
+) -> std::result::Result<BuiltRow, PeerSnapshotRefusal> {
     if PeerRowLengths::measure(view) != planned {
         return Err(PeerSnapshotRefusal::PeerChanged);
     }
@@ -970,8 +987,8 @@ fn build_row(
         .session
         .and_then(|app| app.capabilities_encoded())
         .map(Box::from);
-    Ok((
-        PublishedPeer {
+    Ok(BuiltRow {
+        row: PublishedPeer {
             device_id: Box::from(view.device_id),
             status: data.status,
             tier: data.tier,
@@ -997,8 +1014,8 @@ fn build_row(
             remote_candidates: data.diag.remote_candidates.clone(),
             selected_pair: data.selected_pair,
         },
-        copied,
-    ))
+        advert: copied,
+    })
 }
 
 /// Turn one copied advertisement into the carrier that publishes it.

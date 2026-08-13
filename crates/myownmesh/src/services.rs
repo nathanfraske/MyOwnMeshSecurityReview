@@ -464,6 +464,10 @@ impl ServicesStatusSource<'_> {
         self.captured.build()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the exact admitted lease must be returned by value; boxing would allocate on refusal"
+    )]
     pub(crate) fn commit(
         self,
         retention: myownmesh_core::ResourceLease,
