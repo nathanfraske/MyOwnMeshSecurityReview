@@ -350,7 +350,6 @@ mod tests {
         let mut services = myownmesh_core::MeshConfig::default().services;
         services.node.enabled = false;
         let cfg = myownmesh_core::MeshConfig {
-            identity_path: Some(temp.path().join("identity.json")),
             auto_update: myownmesh_core::AutoUpdateConfig {
                 enabled: false,
                 ..Default::default()
@@ -360,7 +359,19 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = start_infrastructure_only(cfg, crate::test_resource_provider())
+        // Parallel test binaries must not race over the process identity
+        // anchor in the runner's home directory. Identity injection changes
+        // only key storage; `start_with_mesh` below is the same embedded
+        // daemon path whose control task and shutdown ordering this control
+        // owns.
+        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            cfg.clone(),
+            std::sync::Arc::new(myownmesh_core::Identity::ephemeral()),
+            crate::test_resource_provider(),
+        )
+        .await
+        .expect("the test identity opens an infrastructure-only mesh");
+        let daemon = start_with_mesh(cfg, mesh, control::RealtimeAdvert::unsupported())
             .await
             .expect("the daemon test grant starts an infrastructure-only daemon");
 
