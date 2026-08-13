@@ -1059,10 +1059,21 @@ mod terminal_shutdown_tests {
     /// 4. and when `serve` does return, the registry is `Closed` and holds
     ///    nothing — no client, flow, handler claim, installed handler, channel
     ///    subscription, pending call or task lease.
+    ///
+    /// The socket parent is deliberately absent. Production creates it with
+    /// owner-only permissions before binding the socket. Using the temporary
+    /// directory itself would exercise the refusal path on Unix hosts where
+    /// that directory is group- or other-accessible, leaving the client to wait
+    /// for a listener that was correctly never created.
     #[tokio::test]
     async fn a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing() {
         let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("control.sock");
+        let parent = directory.path().join("private");
+        let socket = parent.join("control.sock");
+        assert!(
+            !parent.exists(),
+            "non-vacuity: production must create and secure the socket parent"
+        );
         let (barrier, arrived, release) = DispatchBarrier::paired();
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
