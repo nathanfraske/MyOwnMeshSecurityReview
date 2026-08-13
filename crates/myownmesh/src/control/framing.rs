@@ -130,14 +130,32 @@ impl FrameAdmission {
     /// to slack the fixture happened to have.
     #[cfg(test)]
     pub(super) fn over_grant(grant: myownmesh_core::ResourceClaim, ceiling: Option<usize>) -> Self {
+        Self::over_grant_probed(grant, ceiling).0
+    }
+
+    /// [`Self::over_grant`], with the provider handed back so a control can read
+    /// the ledger it is asserting about.
+    ///
+    /// The provider is *cloned*, not moved out: this admission keeps spending
+    /// through its own port, and what comes back is a second handle onto the
+    /// same accounting. A control that had to build its own provider to observe
+    /// one would be observing a different provider than the one under test.
+    #[cfg(test)]
+    pub(super) fn over_grant_probed(
+        grant: myownmesh_core::ResourceClaim,
+        ceiling: Option<usize>,
+    ) -> (Self, myownmesh_core::FiniteResourceProvider) {
         let provider = myownmesh_core::FiniteResourceProvider::new(grant);
-        let port = myownmesh_core::ResourceProviderPort::new(provider)
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
             .expect("the control grant funds its own process scope");
         let scope = port.process_scope();
-        Self {
-            owner: FrameOwner::Direct(std::sync::Arc::new((port, scope))),
-            ceiling,
-        }
+        (
+            Self {
+                owner: FrameOwner::Direct(std::sync::Arc::new((port, scope))),
+                ceiling,
+            },
+            provider,
+        )
     }
 
     /// Admit one whole frame of `bytes` and answer the funding that holds it.
@@ -255,6 +273,30 @@ impl FrameAdmission {
         )])
         .map_err(FrameRefusal::Claim)?;
         self.acquire_claim(claim)
+    }
+
+    /// Fund the buffers one long-lived value owns, before it is built.
+    ///
+    /// The pair [`Self::admit_allocation`] and [`Self::admit_allocator_residual`]
+    /// always travel together for a value that will be retained — the bytes it
+    /// asks for, and the separate fact that they live in `allocations` separate
+    /// heap blocks whose true size the allocator picks. Spelled once here so a
+    /// caller cannot take one and forget the other, which is the shape of the
+    /// under-charge this whole module exists to prevent.
+    ///
+    /// Two leases and not one, because the caller may need them to end at
+    /// different moments; a caller that does not can drop them together.
+    pub(super) fn admit_retained(
+        &self,
+        bytes: usize,
+        allocations: u64,
+    ) -> std::result::Result<
+        (myownmesh_core::ResourceLease, myownmesh_core::ResourceLease),
+        FrameRefusal,
+    > {
+        let bytes = self.admit_allocation(bytes)?;
+        let allocations = self.admit_allocator_residual(allocations)?;
+        Ok((bytes, allocations))
     }
 
     /// Acquire one already-derived claim against this connection's scope.
@@ -445,6 +487,25 @@ impl AdmittedLine {
     /// The obvious `(value, lease)` spelling would release the funding while the
     /// value it accounts for was still live, which is the defect one layer up.
     ///
+    /// **The parse work does not come back with it.** Core's claim covers two
+    /// different things with two different lifetimes: the CPU the parse spends,
+    /// which is over the instant `from_str` returns, and the tree that parse
+    /// built, which lives as long as the caller holds the value. Handing both
+    /// back as one lease made a client able to pin the first by holding the
+    /// second — a whitespace-padded line decoding to a tiny variant, followed by
+    /// a subscription that never ends, reserved the padded line's worst-case
+    /// parse and CPU capacity for the whole life of that subscription. The work
+    /// lease is therefore acquired here, held across `from_str` and dropped on
+    /// the way out; only the retention travels.
+    ///
+    /// The split is by *class* and not by a second formula. The whole claim is
+    /// core's, taken from the same function as before; what leaves in the work
+    /// lease is exactly its [`ResourceClass::ParsingOrCpuWork`] dimension and
+    /// what stays is exactly the remainder, so the two together are still the
+    /// claim core derived and neither half can drift from it.
+    ///
+    /// [`ResourceClass::ParsingOrCpuWork`]: myownmesh_core::ResourceClass::ParsingOrCpuWork
+    ///
     /// Concrete in `Request` on purpose, rather than generic over
     /// `DeserializeOwned`. The claim bounds the cost of the *structure*
     /// `serde_json` builds out of an input of this length; a `Deserialize` impl
@@ -460,13 +521,29 @@ impl AdmittedLine {
         admission: &FrameAdmission,
     ) -> std::result::Result<(myownmesh_core::ResourceLease, super::wire::Request), DecodeRefusal>
     {
-        let claim = myownmesh_core::application_gateway::json_input_work_claim(self.line.len())
+        let whole = myownmesh_core::application_gateway::json_input_work_claim(self.line.len())
             .map_err(|error| DecodeRefusal::Admission(FrameRefusal::Claim(error)))?;
-        let lease = admission
-            .acquire_claim(claim)
+        let work = myownmesh_core::ResourceClaim::single(
+            myownmesh_core::ResourceClass::ParsingOrCpuWork,
+            whole.amount(myownmesh_core::ResourceClass::ParsingOrCpuWork),
+        );
+        let retained = whole
+            .checked_sub(work)
+            .map_err(|error| DecodeRefusal::Admission(FrameRefusal::Claim(error)))?;
+        // Retention first, so a refusal of it costs no parse capacity, and so
+        // the pair is acquired before either is spent. Both are acquired before
+        // `from_str` runs, which is the ordering the whole seam exists for.
+        let retained = admission
+            .acquire_claim(retained)
+            .map_err(DecodeRefusal::Admission)?;
+        let work = admission
+            .acquire_claim(work)
             .map_err(DecodeRefusal::Admission)?;
         let value = serde_json::from_str(&self.line).map_err(DecodeRefusal::Malformed)?;
-        Ok((lease, value))
+        // The parse is over. Anything still held for it from here would be
+        // capacity this daemon reports as spent on work that has finished.
+        drop(work);
+        Ok((retained, value))
     }
 }
 
@@ -484,6 +561,203 @@ pub(super) enum DecodeRefusal {
     Admission(#[from] FrameRefusal),
     #[error("control request is not valid JSON: {0}")]
     Malformed(serde_json::Error),
+}
+
+/// Everything this control socket writes, as a closed set.
+///
+/// Closed, and not `impl Serialize`, and that is what makes the admission below
+/// enforceable rather than merely intended. The measurement is taken by running
+/// the encoder into a sink that counts, so the promise the seam depends on is
+/// that *counting allocates nothing* — and a generic `Serialize` bound cannot
+/// promise that. A caller's impl is free to build a `String`, collect a `Vec` or
+/// do arbitrary work on its way past, and the refusal path would then have
+/// allocated before it refused.
+///
+/// Every arm here is one this module can check. [`Response`] and [`ServerOut`]
+/// are derived impls over scalars, `String`s and `serde_json::Value`s; `Value`'s
+/// own impl walks the tree it already holds; [`ConnTrace`] is a derived impl
+/// over scalars, `String`s and `Vec<String>`. None of them allocates to
+/// serialize. Adding an arm is a deliberate act with that sentence attached to
+/// it.
+///
+/// [`Response`]: super::wire::Response
+/// [`ServerOut`]: crate::ipc::ServerOut
+/// [`ConnTrace`]: myownmesh_core::ConnTrace
+pub(super) enum ControlOut<'a> {
+    /// One request's answer, including every typed refusal.
+    Response(&'a super::wire::Response),
+    /// One pushed frame on an events subscription.
+    Frame(&'a crate::ipc::ServerOut),
+    /// One connection-state record on a trace subscription.
+    Trace(&'a myownmesh_core::ConnTrace),
+    /// The trace stream's lag marker, which is a bare JSON object rather than
+    /// one of the protocol's own shapes.
+    Marker(&'a serde_json::Value),
+}
+
+impl serde::Serialize for ControlOut<'_> {
+    /// Delegates, and adds nothing. The wire shape of each arm is the arm's own
+    /// and this wrapper must not change it: a client parses a `Response`, not a
+    /// `ControlOut`.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Response(value) => value.serialize(serializer),
+            Self::Frame(value) => value.serialize(serializer),
+            Self::Trace(value) => value.serialize(serializer),
+            Self::Marker(value) => value.serialize(serializer),
+        }
+    }
+}
+
+/// One outbound control line, funded before it is encoded.
+///
+/// Every answer this socket writes is a second live allocation beside whatever
+/// produced it. An event frame's mailbox lease funds the *typed* frame and the
+/// work of serializing it; it says nothing about the encoded bytes, which exist
+/// simultaneously and are sized by the frame rather than by anything the daemon
+/// chose. A peer-controlled channel payload fanned out to many subscribers is
+/// that allocation once per subscriber, and none of them was admitted.
+///
+/// The measurement cannot be the buffer. `serde_json` has no way to answer "how
+/// long will this be" other than by writing it, so the length is taken by
+/// writing the value into a sink that counts and allocates nothing, and only
+/// then is the buffer funded and built. Encoding twice is the price of being
+/// able to refuse; the alternative — encode, then charge — is funding storage
+/// that already exists, which is not an admission at all. What makes the
+/// counting pass allocation-free is [`ControlOut`] being closed.
+///
+/// Field order is the usual one: `line` is destroyed before the leases that
+/// paid for it.
+pub(super) struct AdmittedLineOut {
+    line: Vec<u8>,
+    _bytes: myownmesh_core::ResourceLease,
+    _allocation: myownmesh_core::ResourceLease,
+}
+
+/// The live allocations one outbound line holds: its single byte buffer.
+const LINE_WRITE_ALLOCATIONS: u64 = 1;
+
+/// The line terminator this protocol's framing is defined by, as the one byte
+/// the encoder appends. Named rather than written as an escape at the append,
+/// so the capacity funded above and the byte written below cannot disagree.
+const NEWLINE: u8 = b'\n';
+
+/// An `io::Write` that keeps only the count.
+///
+/// The whole point is that it never allocates: it is how a value's encoded
+/// length is learned without first paying for the encoding. Overflow is an
+/// error rather than a saturation, on the same reasoning as
+/// [`FrameAdmission::admit_growth`] — a saturated length is a smaller number
+/// than the truth, and a smaller number is a smaller charge.
+#[derive(Default)]
+struct CountingSink {
+    bytes: usize,
+}
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.checked_add(buf.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded control line length is not representable",
+            )
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Why one outbound control line was not produced.
+///
+/// Apart for the same reason [`DecodeRefusal`]'s arms are: a value this daemon
+/// cannot encode is a defect here, and a refused buffer is the daemon at the
+/// edge of its grant. An operator reading one as the other would go looking in
+/// the wrong place.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum EncodeRefusal {
+    #[error("control response buffer was not admitted: {0}")]
+    Admission(#[from] FrameRefusal),
+    #[error("control response could not be encoded: {0}")]
+    Malformed(serde_json::Error),
+    /// The encoder disagreed with itself between the two passes.
+    ///
+    /// Impossible for the arms [`ControlOut`] admits, and reported rather than
+    /// assumed away: it would mean a funded capacity had been silently exceeded
+    /// by a reallocation nothing charged for, which is the exact failure this
+    /// type exists to prevent and is not something to discover from a memory
+    /// graph.
+    #[error("control response encoded to {encoded} bytes after {funded} were funded")]
+    Unstable { funded: usize, encoded: usize },
+}
+
+impl AdmittedLineOut {
+    /// Measure, fund, then encode — in that order and no other.
+    pub(super) fn encode(
+        value: ControlOut<'_>,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<Self, EncodeRefusal> {
+        Self::encode_building(value, admission, Vec::with_capacity)
+    }
+
+    /// [`Self::encode`] with the buffer's construction passed in.
+    ///
+    /// `build` is not a hook placed near the allocation; it *is* the allocation,
+    /// on the same pattern as [`AdmittedReader::admit_building`]. A control can
+    /// therefore count constructions and know the count is exact, because there
+    /// is no other expression in this function that allocates an output buffer —
+    /// and the two `?`s above it are what a refusal returns through. Moving the
+    /// construction means moving the observation with it.
+    fn encode_building<B>(
+        value: ControlOut<'_>,
+        admission: &FrameAdmission,
+        build: B,
+    ) -> std::result::Result<Self, EncodeRefusal>
+    where
+        B: FnOnce(usize) -> Vec<u8>,
+    {
+        let mut counted = CountingSink::default();
+        serde_json::to_writer(&mut counted, &value).map_err(EncodeRefusal::Malformed)?;
+        // The terminating newline is part of what this connection will hold.
+        let capacity = counted.bytes.checked_add(1).ok_or({
+            EncodeRefusal::Admission(FrameRefusal::Claim(
+                myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                    dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                },
+            ))
+        })?;
+        // No ceiling. The owner's frame ceiling bounds what a *client* may send;
+        // applying it to the daemon's own answer would let a small ceiling make
+        // an operation unanswerable rather than refused.
+        let bytes = admission.admit_allocation(capacity)?;
+        let allocation = admission.admit_allocator_residual(LINE_WRITE_ALLOCATIONS)?;
+        let mut line = build(capacity);
+        serde_json::to_writer(&mut line, &value).map_err(EncodeRefusal::Malformed)?;
+        line.push(NEWLINE);
+        // Checked, not assumed. The two passes wrote the same value through the
+        // same encoder, so this cannot fire for any arm `ControlOut` admits --
+        // and an arm for which it did would have grown the buffer past its
+        // funding, silently, which is precisely what must not be discoverable
+        // only from the outside.
+        if line.len() > capacity {
+            return Err(EncodeRefusal::Unstable {
+                funded: capacity,
+                encoded: line.len(),
+            });
+        }
+        Ok(Self {
+            line,
+            _bytes: bytes,
+            _allocation: allocation,
+        })
+    }
+
+    /// The encoded line, newline included, for one `write_all`.
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.line
+    }
 }
 
 /// Read one line of the control protocol, admitting each growth step before it
@@ -1426,6 +1700,205 @@ mod tests {
         ])
         .expect("the control grant is representable");
         FrameAdmission::over_grant(grant, None)
+    }
+
+    /// [`admission_granting_bytes`], with the provider it spends from.
+    fn probed_admission_granting_bytes(
+        bytes: u64,
+    ) -> (FrameAdmission, myownmesh_core::FiniteResourceProvider) {
+        let grant = myownmesh_core::ResourceClaim::try_from_entries([
+            (myownmesh_core::ResourceClass::AccountedMemoryBytes, bytes),
+            (myownmesh_core::ResourceClass::ParsingOrCpuWork, 1 << 20),
+            (
+                myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+                1 << 20,
+            ),
+        ])
+        .expect("the control grant is representable");
+        FrameAdmission::over_grant_probed(grant, None)
+    }
+
+    /// One parse-work reading off a provider.
+    fn parse_work(provider: &myownmesh_core::FiniteResourceProvider) -> u64 {
+        provider
+            .in_use()
+            .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork)
+    }
+
+    /// One accounted-bytes reading off a provider.
+    fn held_bytes(provider: &myownmesh_core::FiniteResourceProvider) -> u64 {
+        provider
+            .in_use()
+            .amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
+    }
+
+    /// A padded request's parse capacity is released by `decode_request` itself,
+    /// while the value it decoded to is still held.
+    ///
+    /// **The unit half of the padded-subscribe finding, and deliberately only
+    /// that.** It does not open a stream and cannot: what it drives is one
+    /// decode, and what it observes is that the two halves of core's claim have
+    /// the two different lifetimes this seam split them into. The connection
+    /// branch that must not re-retain the work half is a different subject, with
+    /// a different control, at the `handle_client` level.
+    ///
+    /// The attack behind the split is cheap and quiet: send a tiny request
+    /// behind a lot of whitespace, then keep the connection open forever. The
+    /// structural claim is derived from the *line's* length, because that is
+    /// what bounds what `serde_json` may build out of it — so a padded line
+    /// reserves a large parse and CPU figure. If that figure travelled with the
+    /// decoded value, one subscription that never ends would hold the padded
+    /// line's worst case for the daemon's lifetime, and a handful of such
+    /// clients would report the daemon as out of parse capacity while it was
+    /// doing nothing at all.
+    ///
+    /// Three readings, and the middle one is the finding. Parse work is back at
+    /// its baseline while the decoded request and its retention are still held;
+    /// accounted bytes are *above* baseline at the same instant, which is what
+    /// makes the first reading a release rather than a decode that never
+    /// happened; and the padded line's claim really did carry parse work worth
+    /// releasing, which is what stops the whole control passing vacuously on a
+    /// claim that was zero.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_padded_decode_releases_its_parse_work_and_keeps_its_retention() {
+        // Whitespace, so the line is long and the value is small: exactly the
+        // asymmetry the claim is derived over.
+        let padded = format!("{}{{\"op\":\"events_subscribe\"}}\n", " ".repeat(4096));
+        let (admission, provider) = probed_admission_granting_bytes(1 << 20);
+        let baseline_work = parse_work(&provider);
+        let baseline_bytes = held_bytes(&provider);
+
+        // Non-vacuity: the claim this line is admitted under really does reserve
+        // parse capacity, so there is something for the release to be about.
+        let padded_claim =
+            myownmesh_core::application_gateway::json_input_work_claim(padded.len() - 1)
+                .expect("the padded line's claim is representable");
+        assert!(
+            padded_claim.amount(myownmesh_core::ResourceClass::ParsingOrCpuWork) > 0,
+            "non-vacuity: a padded line reserves parse capacity"
+        );
+
+        let mut reader = tokio::io::BufReader::new(padded.as_bytes());
+        let line = read_bounded_json_line(&mut reader, &admission)
+            .await
+            .expect("the padded line is funded")
+            .expect("a complete line");
+        let (retained, request) = line
+            .decode_request(&admission)
+            .expect("this grant funds the padded line's decode");
+        // The raw line goes exactly where `handle_client` drops it. Past here,
+        // what is held is what a live subscription holds.
+        drop(line);
+        assert!(
+            matches!(request, Request::EventsSubscribe),
+            "and it decoded to the small variant the padding was hiding"
+        );
+
+        assert_eq!(
+            parse_work(&provider),
+            baseline_work,
+            "the padded line's parse capacity came back when the parse finished, \
+             not when the subscription it opened finally ends"
+        );
+        assert!(
+            held_bytes(&provider) > baseline_bytes,
+            "and the decoded request is still funded at that same instant, so \
+             what came back was the work and not the retention"
+        );
+
+        drop((retained, request));
+        assert_eq!(
+            held_bytes(&provider),
+            baseline_bytes,
+            "and the retention comes back with the value it accounted for"
+        );
+    }
+
+    /// Refusing to encode an outbound line constructs no buffer, writes nothing,
+    /// and returns to the exact baseline.
+    ///
+    /// The measurement pass is a serializer run into a counting sink, which is
+    /// the concession this seam makes: it invokes `Serialize`, because there is
+    /// no way to know an encoded length without encoding. What it must not do is
+    /// *allocate* — a refusal that had already built the output buffer would be
+    /// a daemon taking the memory it was about to decline, at whatever rate a
+    /// peer chose to make it decline.
+    ///
+    /// The buffer's construction is the closure, so the count is exact: there is
+    /// no other expression in `encode_building` that allocates an output buffer,
+    /// and both refusals return through the `?`s above it. No socket appears
+    /// here at all, and that is not an omission — `encode_building` is handed no
+    /// writer, so "writes nothing on refusal" is a property of its signature
+    /// rather than of this control's luck.
+    ///
+    /// Positive and negative on the same value, because "constructed nothing"
+    /// is only interesting if the same input on a sufficient grant constructs
+    /// exactly one.
+    #[test]
+    fn v4_r2_daemon_encoded_output_pressure_builds_no_buffer_and_returns_to_baseline() {
+        let response = crate::control::wire::Response::ok(serde_json::json!({
+            "answer": "a payload long enough that its encoded length is not zero",
+            "items": [1, 2, 3, 4, 5, 6, 7, 8],
+        }));
+
+        // A grant of no accounted bytes: the counting pass still runs, and the
+        // first acquisition after it cannot be met.
+        let (starved, provider) = probed_admission_granting_bytes(0);
+        let baseline = provider.in_use();
+        let mut built = 0usize;
+        let refusal = match AdmittedLineOut::encode_building(
+            ControlOut::Response(&response),
+            &starved,
+            |capacity| {
+                built += 1;
+                Vec::with_capacity(capacity)
+            },
+        ) {
+            Ok(_) => panic!("a grant of no accounted bytes cannot fund an encoded line"),
+            Err(refusal) => refusal,
+        };
+        assert!(
+            matches!(
+                refusal,
+                EncodeRefusal::Admission(FrameRefusal::Resources(_))
+            ),
+            "refused as pressure, not as a malformed value: {refusal:?}"
+        );
+        assert_eq!(
+            built, 0,
+            "and no output buffer was constructed on the way to being refused"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "and the refusal left the ledger exactly where it found it"
+        );
+
+        // Non-vacuity: the same value, on a grant that fits.
+        let (funded, provider) = probed_admission_granting_bytes(1 << 16);
+        let baseline = provider.in_use();
+        let mut built = 0usize;
+        let line = AdmittedLineOut::encode_building(
+            ControlOut::Response(&response),
+            &funded,
+            |capacity| {
+                built += 1;
+                Vec::with_capacity(capacity)
+            },
+        )
+        .expect("a sufficient grant funds this line");
+        assert_eq!(built, 1, "exactly one buffer, built after its funding");
+        assert!(
+            line.bytes().ends_with(b"\n"),
+            "and it is a whole line, terminator included"
+        );
+        assert!(
+            held_bytes(&provider)
+                > baseline.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes),
+            "held while the line is"
+        );
+        drop(line);
+        assert_eq!(provider.in_use(), baseline, "and returned with it");
     }
 
     /// A reader that counts the times anything polled it.

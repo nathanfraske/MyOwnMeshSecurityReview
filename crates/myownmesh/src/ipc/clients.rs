@@ -248,6 +248,81 @@ impl MethodRelease {
     }
 }
 
+/// One step of a channel fan-out.
+///
+/// Three outcomes because a caller answers them differently. `Next` is the
+/// subscriber to deliver to; the registry advances the cursor inside the
+/// caller's [`ChannelFanout`]. `End` means this frame has no further subscribers
+/// to reach, which is an ordinary end to one frame's fan-out; `Gone` means this
+/// pump's route is no longer the route under this key, which is the end of the
+/// pump rather than of the frame. Collapsing the last two — which the boolean
+/// this replaced did — made "delivered to nobody" and "there is nothing here to
+/// deliver through" the same answer.
+pub(crate) enum ChannelFanoutStep {
+    Next { client: Arc<ClientHandle> },
+    End,
+    Gone,
+}
+
+/// Which installation of a route a fan-out step belongs to.
+///
+/// A channel key is coordinates. The route under it can be removed and
+/// reinstalled — last subscriber leaves, a new one arrives — while a pump that
+/// belonged to the *previous* installation is between two steps of a frame it
+/// started earlier. Matching on the key alone would let that pump walk the
+/// successor's subscriber set and deliver a frame from a subscription those
+/// clients never made.
+///
+/// The identity is the one the route lifecycle already has: the exact
+/// [`RouteCancellation`] `Arc` the pump was given and the route holds in its
+/// `Live` state. No generation, no ledger, no second answer to keep in step —
+/// pointer equality on the value that already means "this pump".
+pub(crate) enum RouteOwner<'a> {
+    /// A live pump, matched against the route's own owner.
+    Pump(&'a Arc<RouteCancellation>),
+    /// No pump to match. Controls only: a control inspects a route's membership
+    /// without being one of its pumps, including while the route is still
+    /// installing.
+    #[cfg(test)]
+    Any,
+}
+
+/// One frame's position in its own fan-out: who it has reached, and the
+/// boundary it may not walk past.
+///
+/// Built once per frame and threaded through that frame's steps. The boundary is
+/// the finding: client ids are monotonic, so every client that subscribes during
+/// a fan-out has an id greater than the cursor and would be walked to next — and
+/// a channel whose subscribers keep arriving would keep one frame's fan-out
+/// going for as long as they kept arriving, so the pump would never take the
+/// next frame. Fixing the highest member at the first step bounds the frame by
+/// the membership it began with. A client that subscribes mid-frame is simply
+/// not part of that frame, which is the truthful answer: it was not subscribed
+/// when the frame arrived.
+pub(crate) struct ChannelFanout {
+    /// Resume strictly after this client.
+    after: Option<ClientId>,
+    /// The largest member id this frame may reach, fixed at the first step.
+    /// `None` until then.
+    ceiling: Option<ClientId>,
+}
+
+impl ChannelFanout {
+    /// A fresh position, for one frame.
+    pub(crate) fn frame() -> Self {
+        Self {
+            after: None,
+            ceiling: None,
+        }
+    }
+}
+
+impl Default for ChannelFanout {
+    fn default() -> Self {
+        Self::frame()
+    }
+}
+
 /// One removed client, and what removing it left for a caller with networks.
 pub struct UnregisteredClient {
     pub handle: Arc<ClientHandle>,
@@ -261,9 +336,18 @@ pub struct UnregisteredClient {
     /// is held.
     ///
     /// Each entry also carries the funding for its own name, so the names in
-    /// this vector are accounted for as long as the caller holds them and are
+    /// this list are accounted for as long as the caller holds them and are
     /// released when it drops them — not when they left the table.
-    pub forget: Vec<ForgottenMethod>,
+    ///
+    /// A [`LeasedList`] and not a `Vec`, and the difference is not cosmetic: a
+    /// `Vec`'s buffer is sized by capacity rather than by length, and its `Drop`
+    /// destroys every element — and any lease inside one — before it frees the
+    /// shared buffer those elements sat in. Here each entry is its own
+    /// allocation, funded by a lease the client acquired when it took the claim
+    /// and released only after that allocation is gone.
+    ///
+    /// [`LeasedList`]: crate::ipc::LeasedList
+    pub(crate) forget: crate::ipc::LeasedList<ForgottenMethod>,
     /// Routes this client was the last subscriber of.
     ///
     /// Returned rather than finished in `unregister`, for the same reason
@@ -272,12 +356,12 @@ pub struct UnregisteredClient {
     /// reports the client released — and it must, because `serve` will not
     /// return while any of these pumps is still counted alive.
     ///
-    /// One vector, not one per outcome: a route that was live and a route that
+    /// One list, not one per outcome: a route that was live and a route that
     /// was still installing are the same obligation at different stages, and
-    /// splitting them would be a second unfunded allocation to say so. Each slot
-    /// was pre-paid by the channel subscription that will occupy it, through the
-    /// same cleanup term that funds `forget`.
-    pub(crate) routes: Vec<RetiredRoute>,
+    /// splitting them would be a second allocation to say so. Each node was
+    /// pre-paid by the channel subscription that occupies it, on the same
+    /// pattern as `forget`.
+    pub(crate) routes: crate::ipc::LeasedList<RetiredRoute>,
 }
 
 /// One method a disconnect retired: its name, still funded, and the core
@@ -303,7 +387,47 @@ impl ForgottenMethod {
     }
 }
 
+/// One inbound call's funding, acquired before the call's own state exists.
+///
+/// The first half of a two-phase filing, and the reason it exists is an ordering
+/// rather than a refactor. The shape this replaces built the `PendingKey` — four
+/// copies of peer-chosen coordinates — and the oneshot or stream inbox that
+/// answers the call, and *then* asked whether any of it could be admitted. A
+/// remote peer could therefore force those allocations at whatever rate it chose
+/// to call, and the refusal, when it came, came after the memory it was refusing
+/// had already been taken.
+///
+/// Everything here is derived from *borrowed* coordinates, so a refusal costs
+/// nothing but the answer. What the caller builds afterwards — the key, the
+/// channel, the frame — is built against funding that already exists.
+///
+/// The outbound frame is deliberately **not** here. It was, in the shape of a
+/// third network copy, and that was an overcharge with the right instinct: this
+/// lease lives until the call settles, while the frame dies as soon as the
+/// client's writer mailbox has taken it, so binding the two would report a
+/// network name as retained for the whole of an operation that stopped holding
+/// it in the first millisecond. The frame is admitted by the writer mailbox
+/// itself, from a borrowed measurement, and funded by that mailbox's own lease
+/// for exactly the window in which it exists — see `bridge::RpcInboundBuilder`.
+#[must_use = "a prepared pending call has acquired funding that its commit or its drop must account for"]
+pub struct PreparedPending {
+    key: ClaimKey,
+    class: HandlerMode,
+    owner: ClientId,
+    entry: ResourceLease,
+    retained: ResourceLease,
+    cleanup: ResourceLease,
+}
+
 /// An inbound call that could not be tracked, handed back with why.
+///
+/// Controls only. Production files through
+/// [`ClientRegistry::prepare_exact_pending`] and
+/// [`ClientRegistry::commit_exact_pending`], whose refusals construct no effect
+/// at all and so have none to hand back — which is the stronger property, since
+/// an effect returned from a refusal outlives the prepared leases that were
+/// covering it.
+#[cfg(test)]
 pub struct PendingRejected {
     /// The engine-side awaiter, returned so the caller drops it deliberately
     /// rather than having it disappear inside a refusal.
@@ -319,6 +443,16 @@ pub enum PendingRefusal {
     OwnerGone,
     #[error("the inbound call could not be accounted: {0}")]
     Admission(#[from] IpcAdmissionError),
+    /// The class a call was funded under is not the class it was filed under.
+    ///
+    /// Unreachable from production, and checked anyway. The two narrowed commits
+    /// each pass a constant that matches the preparation they accept, so this
+    /// cannot be produced by calling them — but "unreachable by construction" is
+    /// a claim that stops being true silently, and what it would cost to be
+    /// wrong is a stream's sender filed under a single-shot's funding, answering
+    /// a peer in a shape it never asked for.
+    #[error("the inbound call was funded in one handler class and filed in another")]
+    ClassMismatch,
 }
 
 /// One accepted task's funding and its place in the join count.
@@ -448,13 +582,12 @@ fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> 
         (ResourceClass::AccountedMemoryBytes, bytes),
         // The `Arc` allocation and the capability string's own buffer.
         (ResourceClass::OpaqueDependencyResidual, 2),
-    ])?
-    // The slot this client occupies in the id vector `shutdown` builds before
-    // it unregisters anyone. That vector is sized by how many clients are
-    // connected, so it is pre-paid per client for the same reason every other
-    // sweep slot is: a shutdown path that had to acquire before it could
-    // proceed would have no honest answer to a refusal.
-    .checked_add(cleanup_slot_claim::<ClientId>()?)
+    ])
+    // No sweep slot. `shutdown` used to snapshot every connected client's id
+    // into a vector this term pre-paid for, and there is no vector any more:
+    // the drain takes the first client still in the table, releases it, and
+    // asks again. An allocation that does not happen needs no funding and
+    // cannot be refused, which is a stronger answer than pre-payment.
 }
 
 /// What one table entry retains *beyond* the node the map funds.
@@ -520,12 +653,35 @@ fn claim_key_retained(key: &ClaimKey) -> Result<ResourceClaim, ResourceClaimArit
 /// `remote_request_id`, which come off the wire rather than from the local
 /// client — a remote peer's contribution to what this daemon retains, funded
 /// from the same grant because the memory is just as real.
+#[cfg(test)]
 fn pending_key_retained(key: &PendingKey) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    pending_key_retained_for(
+        &key.network,
+        &key.method,
+        &key.remote_peer,
+        &key.remote_request_id,
+    )
+}
+
+/// The same measurement, from coordinates that have not been copied yet.
+///
+/// This is the seam that lets a pending call be *admitted before it is built*.
+/// Every term above is a length, and a length is readable from a borrow — so the
+/// claim can be derived, and refused, while the peer's coordinates still exist
+/// only as the borrowed fields of the inbound call. The keyed form calls this one
+/// rather than restating it, so the pre-admission figure and the figure the
+/// record is finally charged cannot drift.
+fn pending_key_retained_for(
+    network: &str,
+    method: &str,
+    remote_peer: &str,
+    remote_request_id: &str,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     let bytes = total_len([
-        key.network.len(),
-        key.method.len(),
-        key.remote_peer.len(),
-        key.remote_request_id.len(),
+        network.len(),
+        method.len(),
+        remote_peer.len(),
+        remote_request_id.len(),
     ])?;
     retained_claim(bytes, 4)
 }
@@ -583,8 +739,25 @@ fn arc_allocation_bytes<T>() -> Result<usize, ResourceClaimArithmeticError> {
 /// The multiplicity is the part a node-shaped charge misses entirely.
 /// `entry_claim` prices one node; every copy above lives somewhere the map never
 /// sees.
+#[cfg(test)]
 fn pending_retained(key: &PendingKey) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    let key_retention = pending_key_retained(key)?;
+    pending_retained_for(
+        &key.network,
+        &key.method,
+        &key.remote_peer,
+        &key.remote_request_id,
+    )
+}
+
+/// [`pending_retained`] from borrowed coordinates, for the admission that runs
+/// before any of them has been copied.
+fn pending_retained_for(
+    network: &str,
+    method: &str,
+    remote_peer: &str,
+    remote_request_id: &str,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let key_retention = pending_key_retained_for(network, method, remote_peer, remote_request_id)?;
     // The two `Arc` pointees, in bytes and not merely as residuals. Both sizes
     // are known here — they are this crate's own types — so naming them as
     // opaque would be understating a figure that is available.
@@ -601,12 +774,12 @@ fn pending_retained(key: &PendingKey) -> Result<ResourceClaim, ResourceClaimArit
         // The effect's channel state is a library allocation whose size is not
         // this crate's to state, so it stays an honestly named residual rather
         // than a guess dressed as a measurement.
-        .checked_add(retained_claim(0, 1)?)?
-        // One slot, for the one sweep that still builds a vector: displacing a
-        // method claim must detach the previous owner's in-flight calls under
-        // the same acquisition that moves the claim, so it cannot settle as it
-        // goes. The disconnect and shutdown sweeps allocate nothing at all.
-        .checked_add(cleanup_slot_claim::<PendingRecord>()?)
+        .checked_add(retained_claim(0, 1)?)
+    // The sweep node is *not* here. It is acquired as its own lease beside this
+    // one and travels into the node it pays for, because a node's funding
+    // cannot be a term of a claim released when the table entry is removed --
+    // the node outlives that removal by construction, since it is what the
+    // removal produces.
 }
 
 /// Everything one installed realtime flow retains beyond its table node.
@@ -622,46 +795,42 @@ fn realtime_flow_retained(
     capability: usize,
     network: &str,
 ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    retained_claim(total_len([capability, network.len()])?, 2)?.checked_add(cleanup_slot_claim::<(
-        String,
-        myownmesh_core::realtime::RealtimeFlowHandle,
-        ResourceLease,
-    )>()?)
+    retained_claim(total_len([capability, network.len()])?, 2)
+    // The drain node is acquired as its own lease beside this one, for the
+    // reason `pending_retained` gives: a node's funding cannot be a term of a
+    // claim released when the table entry is removed.
 }
 
-/// One slot in the cleanup vector this entry will one day be swept into, funded
-/// now.
-///
-/// Cleanup allocates: `unregister` builds a `Vec` of the names it has to forget
-/// through the engine, `shutdown` builds one of every client id, and claim
-/// displacement builds one of the calls it is cancelling. Every one of those is
-/// sized by a count a local client chose, and none of them was funded.
-///
-/// Funding them *at cleanup time* is not the fix, and this is the reason the
-/// charge is here instead. A cleanup claim can be refused, and a disconnect path
-/// that cannot allocate has no honest answer left — it cannot decline to clean
-/// up, so it would either leak or panic on the very path that exists to stop
-/// leaks. Charging the slot when the entry is installed makes the client pay in
-/// advance for its own removal, so the sweep is allocation-work the daemon has
-/// already been paid for and cannot be refused.
-fn cleanup_slot_claim<T>() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    // One allocation per entry over-counts a `Vec` that holds several: the
-    // residual names "an allocation exists that this entry may cause", and a
-    // vector of ten entries is charged ten rather than one. Over-funding by a
-    // constant in the safe direction, and the alternative -- charging the first
-    // entry for a vector every entry shares -- would make the charge depend on
-    // insertion order.
-    retained_claim(std::mem::size_of::<T>(), 1)
-}
+// `cleanup_slot_claim` is gone, and what replaced it is not a better number but
+// a different owner. It charged `size_of::<T>()` and one residual per installed
+// entry against a shared-capacity `Vec`, which was wrong in two mechanical ways:
+// a `Vec`'s allocation is sized by capacity rather than length, so geometric
+// growth retained slots no entry had paid for and extra residuals do not fund
+// missing bytes; and the per-entry funding was released when the entry left the
+// table, while the shared buffer went on living. Cleanup storage is now
+// [`LeasedList`], one allocation per item, and each entry acquires that node's
+// claim as a *separate* lease that travels into the node it pays for and is
+// released after that node is freed.
+//
+// The reason the charge is still taken at install time is unchanged and was
+// always the right half of the old design: a cleanup claim taken on the
+// disconnect path could be refused, and a disconnect path that cannot allocate
+// has no honest answer left -- it cannot decline to clean up. Charging when the
+// entry is installed makes the client pay in advance for its own removal.
+//
+// [`LeasedList`]: crate::ipc::LeasedList
 
 /// Everything this registry's fixtures acquire, priced from the real APIs.
 ///
-/// `clients` funds that many client records; `entries` funds that many entries
-/// *in each* of the registry's tables, at `coordinate` bytes of client-chosen
-/// name per entry. Summing the eight node shapes rather than picking the widest
-/// is deliberate over-funding, and it is the right kind: a fixture grant that is
-/// generous fails only by hiding headroom, while one that is tight fails by
-/// refusing a control for reasons the control is not about.
+/// `clients` funds that many client records and client-index nodes; `entries`
+/// funds that many entries *in each* of the registry's tables, at `coordinate`
+/// bytes of client-chosen name per entry. Every reservation is priced through
+/// `FiniteResourceProvider::reservation_planning_charge`, and the total also
+/// includes the registry scope's planning charge. Summing the eight node shapes
+/// rather than picking the widest is deliberate over-funding, and it is the
+/// right kind: a fixture grant that is generous fails only by hiding headroom,
+/// while one that is tight fails by refusing a control for reasons the control
+/// is not about.
 ///
 /// `coordinate` is not decoration. Entries now cost node *plus* the heap their
 /// keys own, so a grant derived from node size alone would refuse ordinary
@@ -682,31 +851,66 @@ pub(crate) fn registry_fixture_claim(
     entries: u64,
     coordinate: usize,
 ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    let records = client_record_claim()?.checked_scale(clients)?;
-    let entry = LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?
-        .checked_add(LeasedMap::<ClaimKey, Funded<ClientId>>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClaimKey, InstalledHandler>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClaimKey, ChannelRoute>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClientId, ()>::entry_claim()?)?
-        .checked_add(LeasedMap::<PendingKey, PendingRecord>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClaimKey, ResourceLease>::entry_claim()?)?
-        .checked_add(LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?)?;
+    let planned = |claim| {
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("a fixture reservation charge is representable")
+    };
+    let records = planned(client_record_claim()?)
+        .checked_add(planned(
+            LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?,
+        ))?
+        .checked_scale(clients)?;
+    let entry = planned(LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?)
+        .checked_add(planned(
+            LeasedMap::<ClaimKey, Funded<ClientId>>::entry_claim()?,
+        ))?
+        .checked_add(planned(
+            LeasedMap::<ClaimKey, InstalledHandler>::entry_claim()?,
+        ))?
+        .checked_add(planned(LeasedMap::<ClaimKey, ChannelRoute>::entry_claim()?))?
+        .checked_add(planned(LeasedMap::<ClientId, ()>::entry_claim()?))?
+        .checked_add(planned(
+            LeasedMap::<PendingKey, PendingRecord>::entry_claim()?,
+        ))?
+        .checked_add(planned(LeasedMap::<ClaimKey, ResourceLease>::entry_claim()?))?
+        .checked_add(planned(
+            LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?,
+        ))?;
     // The off-node half, priced from the same helpers the registry charges
     // with. A `PendingKey` carries four coordinates and a `ClaimKey` two, and
     // the realtime table's key is one -- so a fixture naming everything
     // `coordinate` bytes long pays for the worst of them at every entry rather
     // than for an average nothing actually charges.
-    let widest_key = pending_key_retained(&PendingKey {
+    let widest_key = planned(pending_key_retained(&PendingKey {
         network: "x".repeat(coordinate),
         method: "x".repeat(coordinate),
         remote_peer: "x".repeat(coordinate),
         remote_request_id: "x".repeat(coordinate),
         class: HandlerMode::Single,
-    })?;
+    })?);
+    // And the cleanup nodes each entry pre-pays for, priced from the list that
+    // will hold them rather than from a size restated here. Four kinds, summed
+    // rather than picked between, on the same over-funding reasoning as the
+    // eight node shapes above: a fixture grant that is generous fails only by
+    // hiding headroom.
+    let cleanup = planned(crate::ipc::LeasedList::<ForgottenMethod>::node_claim()?)
+        .checked_add(planned(
+            crate::ipc::LeasedList::<RetiredRoute>::node_claim()?
+        ))?
+        .checked_add(planned(
+            crate::ipc::LeasedList::<PendingRecord>::node_claim()?,
+        ))?
+        .checked_add(planned(crate::ipc::LeasedList::<(
+            String,
+            myownmesh_core::realtime::RealtimeFlowHandle,
+            ResourceLease,
+        )>::node_claim()?))?;
     let entry = entry
         .checked_add(widest_key.checked_scale(8)?)?
-        .checked_add(cleanup_slot_claim::<PendingKey>()?.checked_scale(8)?)?;
-    records.checked_add(entry.checked_scale(entries)?)
+        .checked_add(cleanup.checked_scale(8)?)?;
+    myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+        .checked_add(records)?
+        .checked_add(entry.checked_scale(entries)?)
 }
 
 /// Who is asking, and which of their things: the client id, the claim key, and
@@ -727,6 +931,13 @@ struct OwnedRealtimeFlow {
     /// `pop_first_entry`, is after the owned key has gone wherever it is going.
     /// The node lease cannot carry this: it ends inside the removal call.
     _retained: ResourceLease,
+    /// The node this flow will occupy in the disconnect drain's list.
+    ///
+    /// `Option` for the same reason [`PendingRecord`]'s is: it has to leave the
+    /// value without moving it. Dropped unused by
+    /// [`ClientHandle::take_realtime_flow`], which answers one flow directly and
+    /// builds no node.
+    cleanup: Option<ResourceLease>,
     network: String,
     flow: myownmesh_core::realtime::RealtimeFlowHandle,
 }
@@ -745,6 +956,18 @@ struct PendingRecord {
     operation_id: u64,
     effect: PendingInbound,
     cancelled: Arc<PendingCancellation>,
+    /// The node this record will occupy in the one sweep that has to collect.
+    ///
+    /// An `Option` so it can be moved out and handed to the list as that node's
+    /// own funding without moving the record — which is the sequence that makes
+    /// the funding follow the allocation rather than the record. `None` once it
+    /// has been handed over.
+    ///
+    /// The other two sweeps settle a record at a time straight out of the table
+    /// and build no node at all, so theirs is simply released with the record.
+    /// Only claim displacement collects, because it must detach the previous
+    /// owner's in-flight calls under the same acquisition that moves the claim.
+    cleanup: Option<ResourceLease>,
     /// See [`PendingFunding`]. Shared with the ticket, so the record leaving the
     /// table releases nothing while the ticket is still alive. Held, never read.
     _funding: Arc<PendingFunding>,
@@ -933,15 +1156,36 @@ pub struct ClientHandle {
 /// also only ever locked while the registry's own table lock is held, which is
 /// what makes the two orders consistent by construction rather than by
 /// convention.
-#[derive(Default)]
-/// The names one client holds, each with the funding for its own buffers.
+/// One name a client holds, and the two leases that name owes.
 ///
-/// The value is the lease rather than `()`, so [`Self::drain`] can hand back
-/// owned names that are still funded while the caller holds them. The previous
-/// shape cloned every key into a fresh vector on disconnect: the clones were
+/// Two, because they end at different moments in different places and a single
+/// lease cannot be released twice. `retained` pays for the name's own buffers
+/// and goes when the last copy of the name does. `cleanup` pays for the node
+/// this name will occupy in the caller's cleanup list, and it is *moved into
+/// that node* when the sweep builds it — so the node's funding was acquired
+/// before the node existed and is released after the node is freed, which is
+/// the whole property. Folding the two together would fund the node with a
+/// lease released when the table entry was removed, before the node it paid for
+/// had even been built.
+///
+/// A name that is swept but not forgotten — a claim a successor took over, a
+/// subscription whose route was already gone — drops `cleanup` unused, which is
+/// correct: no node was built.
+struct HeldName {
+    retained: ResourceLease,
+    cleanup: ResourceLease,
+}
+
+/// The names one client holds, each with the two leases its name owes.
+///
+/// The value is a [`HeldName`] rather than `()`, so [`Self::pop_first`] can hand
+/// back owned names that are still funded while the caller holds them, together
+/// with the node funding for the cleanup entry each one becomes. The shape this
+/// replaced cloned every key into a fresh vector on disconnect: the clones were
 /// unfunded, the vector was unfunded, and both were sized by how many names the
 /// client had chosen to claim.
-struct HeldNames(Mutex<LeasedMap<ClaimKey, ResourceLease>>);
+#[derive(Default)]
+struct HeldNames(Mutex<LeasedMap<ClaimKey, HeldName>>);
 
 impl HeldNames {
     fn holds(&self, key: &ClaimKey) -> bool {
@@ -955,8 +1199,8 @@ impl HeldNames {
     /// corrected rather than charged twice. Every caller in this module checks
     /// [`Self::holds`] first under the registry's table lock, so the refusal
     /// path is a backstop and not the ordinary case.
-    fn hold(&self, key: ClaimKey, node: ResourceLease, retained: ResourceLease) {
-        let _ = self.0.lock().insert(key, retained, node);
+    fn hold(&self, key: ClaimKey, node: ResourceLease, held: HeldName) {
+        let _ = self.0.lock().insert(key, held, node);
     }
 
     fn release(&self, key: &ClaimKey) {
@@ -975,7 +1219,7 @@ impl HeldNames {
     /// `pop_first_entry` also means no key is ever cloned: the name is *moved*
     /// out with its lease, so the funding follows the last live copy instead of
     /// being released while a copy is still in use.
-    fn pop_first(&self) -> Option<(ClaimKey, ResourceLease)> {
+    fn pop_first(&self) -> Option<(ClaimKey, HeldName)> {
         self.0.lock().pop_first_entry()
     }
 }
@@ -1008,6 +1252,7 @@ impl ClientHandle {
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
         entry: ResourceLease,
         retained: ResourceLease,
+        cleanup: ResourceLease,
     ) -> RealtimeFlowCapability {
         let capability = RealtimeFlowCapability::mint();
         self.realtime_flows
@@ -1016,6 +1261,7 @@ impl ClientHandle {
                 capability.expose().to_string(),
                 OwnedRealtimeFlow {
                     _retained: retained,
+                    cleanup: Some(cleanup),
                     network,
                     flow,
                 },
@@ -1078,15 +1324,21 @@ impl ClientHandle {
         ResourceLease,
     )> {
         let owned = self.realtime_flows.lock().remove(capability)?;
+        // `owned.cleanup` is left behind and released here. This answers one
+        // flow directly to a caller that asked for it by name; no drain node is
+        // built, so the funding for one is not owed to anything.
         Some((owned.network, owned.flow, owned._retained))
     }
 
     /// Take every flow this client still owns.
     ///
-    /// For disconnect and shutdown, where the flows have to be closed *through*
-    /// their networks rather than merely dropped — dropping a handle releases
-    /// nothing, by design, so a client that vanished would otherwise leave its
-    /// labels claimed and its native halves up until the session itself ended.
+    /// For disconnect and shutdown, where the flows are closed *through* their
+    /// networks rather than dropped here. Not because dropping would release
+    /// nothing — a `RealtimeFlowHandle`'s Drop performs exact flow cleanup — but
+    /// because an explicit close awaits the native retirement and can report it,
+    /// and a shutdown that reports the control surface closed should have waited
+    /// for the native halves rather than left them retiring behind it. Drop
+    /// remains the backstop for the paths that cannot await.
     /// Taken under one acquisition of the table, unlike the two-phase walk this
     /// replaces: a flow opened between the old snapshot and the old removal
     /// survived the drain and was never closed.
@@ -1100,19 +1352,24 @@ impl ClientHandle {
     /// rather than merely paid for.
     ///
     /// Each value carries its own retained lease, so the network names in the
-    /// returned vector stay funded for as long as the caller holds them — and
-    /// the slot each one occupies was pre-paid when the flow was installed.
-    pub fn drain_realtime_flows(
+    /// returned list stay funded for as long as the caller holds them — and each
+    /// one lands in a node whose own funding was acquired when the flow was
+    /// installed and is released only after that node is freed.
+    pub(crate) fn drain_realtime_flows(
         &self,
-    ) -> Vec<(
+    ) -> crate::ipc::LeasedList<(
         String,
         myownmesh_core::realtime::RealtimeFlowHandle,
         ResourceLease,
     )> {
         let mut flows = self.realtime_flows.lock();
-        let mut taken = Vec::new();
-        while let Some((_capability, owned)) = flows.pop_first_entry() {
-            taken.push((owned.network, owned.flow, owned._retained));
+        let mut taken = crate::ipc::LeasedList::new();
+        while let Some((_capability, mut owned)) = flows.pop_first_entry() {
+            let node = owned
+                .cleanup
+                .take()
+                .expect("an installed flow holds the funding for its own drain node");
+            taken.push((owned.network, owned.flow, owned._retained), node);
         }
         taken
     }
@@ -1154,6 +1411,63 @@ impl ClientHandle {
 // and nothing else. A pump that had a fallback would silently take it whenever
 // the pipe was missing, which is the case that should be visible.
 
+/// A one-shot pause for the channel pump, at the line between selecting a
+/// subscriber and building that subscriber's frame.
+///
+/// That line is the finding. The fan-out used to clone a publisher-chosen
+/// payload and hand it to a mailbox with the registry's tables still held, so
+/// for the whole of one large frame a disconnect could not be recorded and a
+/// shutdown could not begin. A control that only checks the cursor method
+/// returns without the lock is checking the easy half; parking the pump *here*,
+/// with the frame not yet built, is the interval the old shape could not answer
+/// in.
+///
+/// One pump and one only: both halves are taken on first use, so a second pump
+/// -- or the same pump's second subscriber -- runs straight through. The
+/// alternative would freeze every fan-out in the binary.
+#[cfg(test)]
+#[derive(Default)]
+pub struct FanoutBarrier {
+    arrived: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl FanoutBarrier {
+    /// The barrier and the two ends a control drives it by.
+    pub fn paired() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                arrived: Mutex::new(Some(arrived_tx)),
+                release: Mutex::new(Some(release_rx)),
+            }),
+            arrived_rx,
+            release_tx,
+        )
+    }
+
+    /// Announce arrival and wait, once.
+    ///
+    /// Both halves are taken before anything is awaited, so no lock is held
+    /// across the suspension.
+    async fn pass(&self) {
+        let arrived = self.arrived.lock().take();
+        let release = self.release.lock().take();
+        if let Some(arrived) = arrived {
+            let _ = arrived.send(());
+        }
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+    }
+}
+
 /// Daemon-wide registry of connected clients + their
 /// registrations.
 #[derive(Clone)]
@@ -1170,6 +1484,13 @@ struct RegistryInner {
     /// could see a claim installed and the client that owned it already gone.
     /// There is one acquisition now, and no way to read one table without it.
     tables: Mutex<RegistryTables>,
+    /// Where a control parks one channel pump, if one asked to.
+    ///
+    /// Its own lock and never the tables', which is the whole point: the barrier
+    /// is passed at a line the pump reaches *after* it has released the tables,
+    /// so a control holding it there is holding nothing the registry needs.
+    #[cfg(test)]
+    fanout_barrier: Mutex<Option<Arc<FanoutBarrier>>>,
     /// The one acquisition port everything this registry admits is funded
     /// from. It is supplied rather than reached for: the registry has no
     /// authority of its own, and a daemon that could mint some here would be
@@ -1794,7 +2115,7 @@ pub struct ClaimCommitted {
     /// Everything the displaced owner had in flight on this exact method,
     /// detached under the same acquisition that moved the claim so no call can
     /// be admitted to an owner that has just stopped being one.
-    settled: Vec<PendingRecord>,
+    settled: crate::ipc::LeasedList<PendingRecord>,
 }
 
 /// A registry reference that does not keep the registry alive.

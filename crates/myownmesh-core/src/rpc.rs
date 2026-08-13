@@ -285,14 +285,117 @@ pub(crate) struct SessionRpcState {
     /// charges its own node from its own `size_of`, so the two halves are read
     /// where each is knowable and cannot drift apart.
     pending: crate::resource::LeasedMap<String, PendingOp>,
+    /// How many pending effects *this* state has constructed.
+    ///
+    /// Counted at the one site that calls [`PendingShape::build`], so what a
+    /// control reads is production's own construction and not a stand-in the
+    /// control supplied — a closure the control wrote could only ever prove that
+    /// the control's own closure had not run.
+    ///
+    /// Per-state rather than a process-wide static, deliberately: controls run
+    /// concurrently in one process, and a global counter would make "nothing was
+    /// built" a statement about every test at once.
+    #[cfg(test)]
+    effects_built: usize,
 }
 
 impl SessionRpcState {
     pub(crate) fn new() -> Self {
         Self {
             pending: crate::resource::LeasedMap::new(),
+            #[cfg(test)]
+            effects_built: 0,
         }
     }
+
+    /// How many pending effects this state has constructed. Test-only; see the
+    /// field.
+    #[cfg(test)]
+    pub(crate) fn effects_built(&self) -> usize {
+        self.effects_built
+    }
+}
+
+/// One pending class, the entry it stores, and the half its caller keeps —
+/// declared together, in one place, so a filing cannot fund one shape and store
+/// another.
+///
+/// This exists because the obvious form of the prepared filing does not work.
+/// Taking a [`PendingClass`] beside a closure returning an arbitrary
+/// [`PendingEntry`] leaves the two free to disagree: a caller can fund a `Single`
+/// and store a `Stream`, and the only thing standing between that and a
+/// mis-classed entry is the caller getting two arguments to match. A
+/// `debug_assert` does not close it either — release builds do not run it, and by
+/// the time it could run the entry has already been built under the wrong claim,
+/// which is the state it was meant to prevent.
+///
+/// So the class is not a parameter. It is a constant on the same impl that
+/// builds the entry, and the filing reads both from there. There is no argument
+/// a caller can pass that makes them disagree, and no runtime check to skip.
+///
+/// **Sealed**, and that is what makes the previous sentence true rather than
+/// merely usual. A `pub(crate)` trait anyone in the crate can implement is not a
+/// closed mapping: a third impl elsewhere could pair `CLASS = Single` with a
+/// `build` returning `PendingEntry::Stream`, and the filing would do exactly
+/// what it was told. The supertrait below lives in a private module, so it
+/// cannot be named — and therefore cannot be implemented — outside this one.
+/// The two impls that follow are the whole mapping, they are next to each other,
+/// and adding a third means editing this file.
+mod sealed {
+    /// Nameable only inside `rpc`, which is the seal.
+    pub trait PendingShapeSeal {}
+    impl PendingShapeSeal for super::Unary {}
+    impl PendingShapeSeal for super::Streaming {}
+}
+
+pub(crate) trait PendingShape: sealed::PendingShapeSeal {
+    /// The half the caller keeps — the receiver for a unary call, the shared
+    /// inbox for a stream.
+    type Caller;
+    /// The class this shape's operations are funded as.
+    const CLASS: PendingClass;
+    /// Build both halves. Called only past every refusal.
+    fn build() -> (PendingEntry, Self::Caller);
+}
+
+/// A single-response call. The caller keeps the receiving half.
+pub(crate) struct Unary;
+
+impl PendingShape for Unary {
+    type Caller = oneshot::Receiver<FundedRpcResult>;
+    const CLASS: PendingClass = PendingClass::Single;
+
+    fn build() -> (PendingEntry, Self::Caller) {
+        let (tx, rx) = oneshot::channel();
+        (PendingEntry::Single(tx), rx)
+    }
+}
+
+/// A streaming call. The caller keeps a clone of the shared inbox.
+pub(crate) struct Streaming;
+
+impl PendingShape for Streaming {
+    type Caller = Arc<RpcStreamInbox>;
+    const CLASS: PendingClass = PendingClass::Stream;
+
+    fn build() -> (PendingEntry, Self::Caller) {
+        let inbox = Arc::new(RpcStreamInbox::new());
+        (PendingEntry::Stream(Arc::clone(&inbox)), inbox)
+    }
+}
+
+/// A filing that has passed every refusal and holds everything it was funded
+/// for, but has not yet built or stored an effect.
+///
+/// The intermediate state exists so the two filing paths — one that builds its
+/// effect from a shape and one, test-only, that was handed a finished entry —
+/// share a single refusal sequence without either being able to reach the
+/// other's construction rule. Both leases are held here, so an abandoned
+/// `FundedFiling` releases exactly what it reserved.
+struct FundedFiling {
+    request_id: String,
+    op_id: PendingOpId,
+    node: ResourceLease,
 }
 
 impl Drop for SessionRpcState {
@@ -1338,59 +1441,138 @@ impl RpcStream {
 /// exclusive step, so a refused frame performs zero action, zero removal and
 /// zero mutation, and the operation under that id is left exactly as it was.
 impl SessionRpcState {
-    /// Claim `request_id` for one locally-originated operation.
+    /// Claim `request_id` for one locally-originated operation, constructing its
+    /// effect **only after** the session has funded it.
     ///
-    /// `Ok(filed)` means the id was unused and is now owned by an
-    /// entry under a freshly minted identity, which comes back with
-    /// it. `Err(effect)` means an operation already owns it and was
-    /// **not** displaced; the effect is handed back unconsumed, so
-    /// refusing is a decision the caller still holds its own channel
-    /// through rather than a displacement it could not undo.
+    /// `Ok((filed, caller))` means the id was unused and is now owned by an
+    /// entry under a freshly minted identity, which comes back with the caller's
+    /// own half of what was built. Every `Err` means nothing happened: no entry
+    /// was displaced, no capacity was taken, and no effect exists — which is why
+    /// the refusal carries a reason and not a returned effect.
     ///
-    /// The occupancy test and the insert are one entry-API step, so
-    /// there is no window in which the id reads as free and is then
-    /// taken by a concurrent call before this one writes. The
-    /// identity is minted inside that same step, so an entry is
-    /// never observable without one.
+    /// The occupancy test and the insert are separated only by this function's
+    /// own steps, all of them under one exclusive borrow of `self`, so there is
+    /// no window in which the id reads as free and is then taken by a concurrent
+    /// call before this one writes. The identity is minted around the lease, so
+    /// an entry is never observable without one.
+    ///
+    /// The order is the whole point, and it is the one the review named. Every
+    /// caller used to build its effect first — `Rpc::call` its `oneshot`,
+    /// `Rpc::call_stream` its `Arc<RpcStreamInbox>` — and hand the finished
+    /// value in. The claim then named allocations that already existed, so a
+    /// refusal could not refuse them: the peer-sized work was done before the
+    /// owner was asked, and "no capacity" arrived after the capacity had been
+    /// spent. Acquiring first and building from the shape afterwards makes the
+    /// refusal real. On any arm below, nothing was built.
+    ///
+    /// The class is not a parameter: it is [`PendingShape::CLASS`], read off the
+    /// same impl that builds the entry, so the claim this filing is funded under
+    /// and the entry it stores cannot name different operations. See
+    /// [`PendingShape`] for why the parameter form does not work.
+    ///
+    /// `S::Caller` is the caller's own half of whatever was built: the
+    /// `Receiver` for a unary call, the `Arc<RpcStreamInbox>` for a stream. It
+    /// travels out with the filing so no out-parameter is needed and no second
+    /// lookup can disagree about which effect was filed.
+    fn claim_request_id_prepared<S: PendingShape>(
+        &mut self,
+        request_id: String,
+        peer: &str,
+        session: &crate::runtime::session_broker::SessionCapability,
+    ) -> Result<(LocalRequest, S::Caller), RpcRegistrationRefusal> {
+        let funded = self.reserve_filing(request_id, peer, session, S::CLASS)?;
+        // Past every refusal. The effect is built here and nowhere earlier.
+        let (effect, caller) = S::build();
+        #[cfg(test)]
+        {
+            self.effects_built += 1;
+        }
+        Ok((self.commit_filing(funded, effect), caller))
+    }
+
+    /// [`Self::claim_request_id_prepared`] for a caller that already holds its
+    /// effect and only needs it filed.
+    ///
+    /// Controls only. Production never has an effect before the funding — that
+    /// is the whole property the prepared form exists to enforce — so this is
+    /// gated to the controls that drive the filing itself and have no caller
+    /// half to receive. It takes the class *from the effect it was handed*,
+    /// which is the same "one source" rule the shape enforces for production:
+    /// here there really is an entry to ask, so asking it is what makes a
+    /// mismatch unrepresentable on this path too.
+    #[cfg(test)]
     fn claim_request_id(
         &mut self,
         request_id: String,
         peer: &str,
         session: &crate::runtime::session_broker::SessionCapability,
         effect: PendingEntry,
-    ) -> Result<LocalRequest, (PendingEntry, RpcRegistrationRefusal)> {
-        // Occupancy first, and the effect never enters the map on this arm.
-        // Displacing the owner would strand its caller on a oneshot nothing can
-        // resolve. This is a plain read rather than an entry API because
-        // `&mut self` is the exclusion: nothing else can touch this map between
-        // the question and the insert, so there is no window to close.
+    ) -> Result<LocalRequest, RpcRegistrationRefusal> {
+        let funded = self.reserve_filing(request_id, peer, session, effect.class())?;
+        Ok(self.commit_filing(funded, effect))
+    }
+
+    /// Everything a filing must have before it may build or store anything:
+    /// the id is free, the operation is funded, and the map node is funded.
+    ///
+    /// Split from the commit so that the two callers above share one refusal
+    /// path. Nothing here constructs an effect, which is the property that makes
+    /// every early return below an honest refusal — on each of them the caller
+    /// has allocated nothing and there is nothing to hand back.
+    fn reserve_filing(
+        &mut self,
+        request_id: String,
+        peer: &str,
+        session: &crate::runtime::session_broker::SessionCapability,
+        class: PendingClass,
+    ) -> Result<FundedFiling, RpcRegistrationRefusal> {
+        // Occupancy first, and nothing is built on this arm. Displacing the
+        // owner would strand its caller on a oneshot nothing can resolve. This
+        // is a plain read rather than an entry API because `&mut self` is the
+        // exclusion: nothing else can touch this map between the question and
+        // the insert, so there is no window to close.
+        //
+        // The refusal no longer hands an effect back, because there is no
+        // longer an effect to hand back — a colliding call destroys nothing
+        // because it created nothing.
         if self.pending.contains_key(request_id.as_str()) {
-            return Err((effect, RpcRegistrationRefusal::RequestIdCollision));
+            return Err(RpcRegistrationRefusal::RequestIdCollision);
         }
-        // Measured, then funded, then filed. Two reservations because two things
-        // are retained and each is released by its own owner: the operation's,
-        // held by the identity every half of it clones, and the node's, held by
-        // the map entry.
-        // The class comes from the effect itself rather than from a caller's
-        // word for it, so what is funded is what is about to be stored.
-        let Ok(claim) = pending_operation_claim(request_id.len(), peer.len(), effect.class())
-        else {
-            return Err((effect, RpcRegistrationRefusal::Unrepresentable));
+        // Measured, then funded, then built, then filed. Two reservations
+        // because two things are retained and each is released by its own
+        // owner: the operation's, held by the identity every half of it clones,
+        // and the node's, held by the map entry.
+        let Ok(claim) = pending_operation_claim(request_id.len(), peer.len(), class) else {
+            return Err(RpcRegistrationRefusal::Unrepresentable);
         };
         let lease = match session.reserve_retained(claim) {
             Ok(lease) => lease,
-            Err(e) => return Err((effect, RpcRegistrationRefusal::ResourceUnavailable(e))),
+            Err(e) => return Err(RpcRegistrationRefusal::ResourceUnavailable(e)),
         };
         // The identity is minted around the lease, so no state exists between
         // "funded" and "named" in which one could be dropped without the other.
         let op_id = PendingOpId::funded(lease);
         let Ok(node_claim) = crate::resource::LeasedMap::<String, PendingOp>::entry_claim() else {
-            return Err((effect, RpcRegistrationRefusal::Unrepresentable));
+            return Err(RpcRegistrationRefusal::Unrepresentable);
         };
         let node = match session.reserve_retained(node_claim) {
             Ok(node) => node,
-            Err(e) => return Err((effect, RpcRegistrationRefusal::ResourceUnavailable(e))),
+            Err(e) => return Err(RpcRegistrationRefusal::ResourceUnavailable(e)),
         };
+        Ok(FundedFiling {
+            request_id,
+            op_id,
+            node,
+        })
+    }
+
+    /// Store a funded filing's entry. Infallible by construction.
+    fn commit_filing(&mut self, funded: FundedFiling, effect: PendingEntry) -> LocalRequest {
+        let FundedFiling {
+            request_id,
+            op_id,
+            node,
+        } = funded;
         self.pending
             .insert(
                 request_id.clone(),
@@ -1401,15 +1583,17 @@ impl SessionRpcState {
                 },
                 node,
             )
-            // The map refuses a key it already holds, and the occupancy test
-            // above ran under this same `&mut self` — nothing can have inserted
-            // between them, because nothing else can hold this map at all. So
-            // this arm is a violation of the map's own contract rather than a
-            // state a caller can reach, and it is deliberately not given a
-            // refusal variant: inventing one would mean fabricating an effect
-            // to hand back, since the refusal has already taken the candidate.
-            .expect("the id was vacant under this same exclusive borrow");
-        Ok(LocalRequest { request_id, op_id })
+            // The map refuses a key it already holds, and the occupancy test in
+            // `reserve_filing` ran under the *caller's* single exclusive borrow
+            // of `self`, which spans that call and this one — nothing can have
+            // inserted between them, because nothing else can hold this map at
+            // all. So this arm is a violation of the map's own contract rather
+            // than a state a caller can reach, and it is deliberately not given
+            // a refusal variant: by here the effect has been built and the
+            // caller's half handed out, so there is no refusal that could
+            // truthfully say nothing happened.
+            .expect("the id was vacant under the caller's same exclusive borrow");
+        LocalRequest { request_id, op_id }
     }
 
     /// Register one locally-originated pending operation under a
@@ -1427,12 +1611,27 @@ impl SessionRpcState {
     /// "never displace" is total either way — while reading as a
     /// policy that will eventually secure an id, when the honest
     /// answer is that one collision fails the call.
-    /// The refusal is typed and the effect is dropped here, deliberately in
-    /// that order. Dropping the effect resolves the caller's own channel with a
-    /// receive error, which says nothing; the returned reason is what the caller
-    /// reports instead, and it is returned rather than logged because only the
-    /// caller knows whether "no session yet" is worth retrying and "out of
-    /// capacity" is not.
+    /// The refusal is typed, and on every arm of it nothing was built: there is
+    /// no effect to drop and no channel to resolve with a bare receive error,
+    /// which said nothing. The returned reason is what the caller reports
+    /// instead, and it is returned rather than logged because only the caller
+    /// knows whether "no session yet" is worth retrying and "out of capacity" is
+    /// not.
+    pub(crate) fn register_local_request_prepared<S: PendingShape>(
+        &mut self,
+        peer: &str,
+        session: &crate::runtime::session_broker::SessionCapability,
+    ) -> Result<(LocalRequest, S::Caller), RpcRegistrationRefusal> {
+        self.claim_request_id_prepared::<S>(new_request_id(), peer, session)
+    }
+
+    /// [`Self::register_local_request_prepared`] for a control that already
+    /// holds its effect.
+    ///
+    /// Test-only for the same reason [`Self::claim_request_id`] is: production
+    /// has no effect to hand in before the funding, and a production caller
+    /// that did would be the defect the prepared form removes.
+    #[cfg(test)]
     pub(crate) fn register_local_request(
         &mut self,
         peer: &str,
@@ -1440,7 +1639,6 @@ impl SessionRpcState {
         effect: PendingEntry,
     ) -> Result<LocalRequest, RpcRegistrationRefusal> {
         self.claim_request_id(new_request_id(), peer, session, effect)
-            .map_err(|(_effect, reason)| reason)
     }
 
     /// Drop a local operation the caller is abandoning, but only if
@@ -2367,7 +2565,6 @@ impl Rpc {
         method: &str,
         payload: serde_json::Value,
     ) -> Result<RpcResponse, RpcError> {
-        let (tx, rx) = oneshot::channel();
         // Bound to `peer` at insertion: only that canonical device
         // may resolve this oneshot, and only with a single
         // response. `send_to_peer` resolves the destination by
@@ -2376,10 +2573,18 @@ impl Rpc {
         // entry no inbound frame could ever match. Registration also
         // hands back the identity of the entry it filed, which is
         // what the failure path withdraws.
+        //
+        // The channel is created *inside* the filing, past the session's
+        // funding of it. Built out here, as it used to be, the pending claim
+        // named an allocation that already existed and a refusal could not
+        // refuse it — the caller had already paid for what it was about to be
+        // told it could not have. The shape is what says "unary" once: the
+        // class the claim is derived from and the entry that gets stored both
+        // come from `Unary` and cannot disagree.
         let network = self.inner.network.upgrade().ok_or(RpcError::NetworkDown)?;
-        let filed = network
+        let (filed, rx) = network
             .application_gateway
-            .register_rpc_request(&network, peer, PendingEntry::Single(tx))
+            .register_rpc_request_prepared::<Unary>(&network, peer)
             .map_err(|refusal| refusal.into_rpc_error(peer))?;
         let cancellation = PendingCancellation::new(&network, peer, filed);
         let frame = crate::protocol::RpcRequestMessage {
@@ -2413,15 +2618,15 @@ impl Rpc {
         method: &str,
         payload: serde_json::Value,
     ) -> Result<RpcStream, RpcError> {
-        let inbox = Arc::new(RpcStreamInbox::new());
         // Bound exactly as the single-shot path above, with the
         // stream class: only `peer` may feed this receiver, and
         // only through chunk and end frames. Withdrawal on a failed
-        // send is by identity, exactly as above.
+        // send is by identity, exactly as above — and the inbox, like the
+        // channel above, is allocated only once the session has funded it.
         let network = self.inner.network.upgrade().ok_or(RpcError::NetworkDown)?;
-        let filed = network
+        let (filed, inbox) = network
             .application_gateway
-            .register_rpc_request(&network, peer, PendingEntry::Stream(Arc::clone(&inbox)))
+            .register_rpc_request_prepared::<Streaming>(&network, peer)
             .map_err(|refusal| refusal.into_rpc_error(peer))?;
         let cancellation = PendingCancellation::new(&network, peer, filed);
         let frame = crate::protocol::RpcRequestMessage {
@@ -2918,7 +3123,7 @@ mod tests {
                 PendingEntry::Single(tx),
             ) {
                 Ok(request) => filed.push(request),
-                Err((_effect, _refusal)) => break,
+                Err(_refusal) => break,
             }
         }
         assert!(
@@ -2982,7 +3187,7 @@ mod tests {
         // about a session that had run out of something else — the wide and
         // short ids allocate identically, two id buffers and one peer buffer
         // each, so the only dimension their costs differ in is this one.
-        let (_returned, refusal) = match pending.claim_request_id(
+        let refusal = match pending.claim_request_id(
             wide_id(9000, extra),
             peer,
             &session,
@@ -3068,23 +3273,35 @@ mod tests {
             .expect("the session funds the incumbent")
             .request_id;
 
-        // A second local call collides on that exact id.
-        let challenger = Arc::new(RpcStreamInbox::new());
-        let returned = pending
-            .claim_request_id(
-                request_id.clone(),
-                "peer-under-test",
-                &session,
-                PendingEntry::Stream(Arc::clone(&challenger)),
-            )
-            .expect_err("an already-owned request id is never claimed twice");
-        assert!(
-            matches!(returned.0, PendingEntry::Stream(_)),
-            "the colliding call gets its own effect back unconsumed, so the retry \
-             loop can re-file it under a fresh id"
+        // A second local call collides on that exact id. Driven through the
+        // prepared form production uses, so what is observed is the production
+        // arm: the filing builds its own effect from the shape, and whether it
+        // built one is a fact about production rather than about a closure this
+        // control wrote.
+        let built_before = pending.effects_built();
+        let refusal = match pending.claim_request_id_prepared::<Streaming>(
+            request_id.clone(),
+            "peer-under-test",
+            &session,
+        ) {
+            Ok(_) => panic!("an already-owned request id is never claimed twice"),
+            Err(refusal) => refusal,
+        };
+        // The colliding call built nothing at all. This is the stronger form of
+        // what this control used to assert: it checked that the effect came
+        // back unconsumed, which was the best available answer while the caller
+        // had to construct one before asking. Now the occupancy test is reached
+        // before the constructor, so there is no effect to hand back and none
+        // to consume — a collision costs the challenger nothing and the
+        // incumbent nothing.
+        assert_eq!(
+            pending.effects_built(),
+            built_before,
+            "a colliding claim never runs its effect constructor, so the retry \
+             is free and nothing was allocated to be handed back"
         );
         assert!(
-            matches!(returned.1, RpcRegistrationRefusal::RequestIdCollision),
+            matches!(refusal, RpcRegistrationRefusal::RequestIdCollision),
             "and it is told the id collided — not that the session was gone or \
              that the owner was short, which are the two facts this refusal used \
              to be reported as"
@@ -3108,9 +3325,159 @@ mod tests {
             serde_json::json!("mine"),
             "and its own caller receives its own response"
         );
+    }
+
+    /// A filing the session will not fund builds nothing.
+    ///
+    /// The property the prepared form exists for, on the arm that matters most.
+    /// A collision is cheap to refuse and always was; capacity is the one a
+    /// peer can drive. While the caller constructed its own effect first, the
+    /// pending claim named an allocation that already existed — so "no
+    /// capacity" was answered *after* the capacity had been spent, and a
+    /// refusal could not refuse the work it was refusing.
+    ///
+    /// Observed by production's own constructor rather than by a size: the one
+    /// site that calls [`PendingShape::build`] counts, and the count is the
+    /// whole assertion. A control that instead compared provider figures would
+    /// pass against a build that allocated and then released, and one that
+    /// watched a closure it supplied itself would only ever prove something
+    /// about that closure.
+    ///
+    /// The positive half runs first. Without it a session that refused
+    /// everything would satisfy the negative on its own, and this control would
+    /// pass against a filing path that had stopped working.
+    #[tokio::test]
+    async fn a_refused_filing_never_builds_its_effect() {
+        let session =
+            crate::runtime::session_broker::session_for_test(crate::runtime::runtime_for_test());
+        let mut pending = SessionRpcState::new();
+        let peer = "peer-under-test";
+
+        // Positive: an affordable filing does run its constructor, and hands
+        // back exactly the half it built.
+        let (_filed, mut rx) = pending
+            .claim_request_id_prepared::<Unary>(fixed_width_id(0), peer, &session)
+            .expect("the fixture session funds one pending operation");
+        assert_eq!(
+            pending.effects_built(),
+            1,
+            "non-vacuity: a funded filing builds its effect"
+        );
         assert!(
-            challenger.try_recv().is_none(),
-            "the colliding call was never filed, so nothing is routed to it"
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "and the caller's half is the live end of what was filed — empty, \
+             not closed, so the sender the filing kept is the one it built"
+        );
+
+        // Fill the rest of the grant. Bounded so a fixture that funded
+        // everything fails as an assertion rather than as a test that never
+        // returns.
+        let mut filed = Vec::new();
+        for index in 1..4096u32 {
+            match pending.claim_request_id(
+                fixed_width_id(index),
+                peer,
+                &session,
+                PendingEntry::Single(oneshot::channel().0),
+            ) {
+                Ok(request) => filed.push(request),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            filed.len() < 4095,
+            "the fixture session's grant is finite, so filling it must end in a \
+             refusal"
+        );
+
+        // The baseline the negatives must not move. Read here rather than
+        // assumed to be the positive's `1`: the fill above goes through the
+        // test-only `claim_request_id`, which is handed an already-built entry
+        // and so constructs nothing and counts nothing. Reading the counter
+        // keeps this control correct whichever path the fill takes.
+        let built_before = pending.effects_built();
+
+        // Negative, unary: the constructor is never reached.
+        let refusal = match pending.claim_request_id_prepared::<Unary>(
+            fixed_width_id(9000),
+            peer,
+            &session,
+        ) {
+            Ok(_) => panic!("the filled session funds no further operation"),
+            Err(refusal) => refusal,
+        };
+        assert!(
+            matches!(refusal, RpcRegistrationRefusal::ResourceUnavailable(_)),
+            "and it is refused for capacity, which is the arm this control is \
+             about — a collision or an unrepresentable claim would prove \
+             nothing about peer-driven work"
+        );
+        assert_eq!(
+            pending.effects_built(),
+            built_before,
+            "a filing the session will not fund never runs its effect \
+             constructor, so the allocation the refusal is about never happened"
+        );
+
+        // Negative, streaming: the same pressure, the heavier effect. Both
+        // arms are needed because they are two constructors behind two call
+        // sites — `call` builds a `oneshot`, `call_stream` builds an
+        // `Arc<RpcStreamInbox>` — and only one of them is the shared inbox a
+        // stream would then have to be told to drop.
+        let refusal = match pending.claim_request_id_prepared::<Streaming>(
+            fixed_width_id(9001),
+            peer,
+            &session,
+        ) {
+            Ok(_) => panic!("the filled session funds no further stream either"),
+            Err(refusal) => refusal,
+        };
+        assert!(
+            matches!(refusal, RpcRegistrationRefusal::ResourceUnavailable(_)),
+            "for capacity, on this arm too"
+        );
+        assert_eq!(
+            pending.effects_built(),
+            built_before,
+            "and a refused stream allocates no inbox — the arm where the effect \
+             is a shared allocation and not a channel half"
+        );
+    }
+
+    /// The funded class and the stored entry are the same operation, on both
+    /// shapes.
+    ///
+    /// The invariant [`PendingShape`] exists to make unrepresentable, asserted
+    /// where it is observable. Before the shape, the filing took a
+    /// [`PendingClass`] beside a closure returning an arbitrary
+    /// [`PendingEntry`], and only a `debug_assert_eq!` stood between them — so a
+    /// release build could fund a `Single` and store a `Stream`, and the entry
+    /// would then be settled by frames the claim never paid for. `accepts` is
+    /// the observable: it answers on the stored entry's class, so a filing whose
+    /// two halves disagreed would answer for the class it was *not* funded as.
+    #[tokio::test]
+    async fn a_filed_operation_is_stored_as_the_class_it_was_funded_as() {
+        let session =
+            crate::runtime::session_broker::session_for_test(crate::runtime::runtime_for_test());
+        let mut pending = SessionRpcState::new();
+        let peer = "peer-under-test";
+
+        let (unary, _rx) = pending
+            .claim_request_id_prepared::<Unary>(fixed_width_id(0), peer, &session)
+            .expect("the fixture session funds one unary operation");
+        let (streaming, _inbox) = pending
+            .claim_request_id_prepared::<Streaming>(fixed_width_id(1), peer, &session)
+            .expect("and one streaming operation");
+
+        assert!(
+            pending.accepts(&unary.request_id, PendingClass::Single)
+                && !pending.accepts(&unary.request_id, PendingClass::Stream),
+            "a unary filing is stored as a unary operation and nothing else"
+        );
+        assert!(
+            pending.accepts(&streaming.request_id, PendingClass::Stream)
+                && !pending.accepts(&streaming.request_id, PendingClass::Single),
+            "and a streaming filing as a streaming one"
         );
     }
 

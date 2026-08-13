@@ -693,6 +693,19 @@ pub struct NetworkState {
     #[cfg(test)]
     pub(crate) exact_retirement_barrier: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 
+    /// The park an armed control puts at the RPC reply's send boundary.
+    ///
+    /// Sibling of the barrier above and there for the same kind of reason: the
+    /// property is about what happens *during* an operation, and no control can
+    /// reach the inside of a spawned run from outside it. Revoking before the
+    /// run starts and revoking after it finishes are both easy and neither is
+    /// the case the finding names.
+    ///
+    /// Test observation and staging only. Nothing admits, accounts, retains or
+    /// refuses on it, and it does not exist in a production build.
+    #[cfg(test)]
+    pub(crate) rpc_send_boundary: RpcSendBoundary,
+
     /// Force-reconnect handle for the signaling driver, stashed by
     /// [`crate::engine::signaling_bridge::attach_nostr`] once the
     /// Nostr driver is up. Bumping the generation makes every relay
@@ -909,6 +922,8 @@ impl NetworkState {
             channel_ack_attempts: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             exact_retirement_barrier: Mutex::new(None),
+            #[cfg(test)]
+            rpc_send_boundary: RpcSendBoundary::default(),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
@@ -975,6 +990,176 @@ impl NetworkState {
         self.exact_retirement_barrier.lock().is_some()
     }
 
+    /// The point in an RPC handler run at which the reply is about to reach the
+    /// wire, and the last point at which revocation can still take it back.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist. Under test, and only while a control has armed it, a run that
+    /// reaches here parks until that control releases it — which is what lets a
+    /// control revoke the authority *while the send is in flight* rather than
+    /// before it starts or after it finished. Those are the two states an
+    /// unassisted control can reach, and neither is the one the finding is
+    /// about.
+    ///
+    /// No timer is involved on either side. The park ends when the control
+    /// releases it or when the run is cancelled, and the cancellation is what
+    /// the control observes.
+    pub(crate) async fn reach_rpc_send_boundary(&self) {
+        #[cfg(test)]
+        self.rpc_send_boundary.reach().await;
+    }
+}
+
+/// A control-armed park at the RPC send boundary, and the record of what
+/// happened to every run that reached it.
+///
+/// The three counters are what make the observation causal rather than
+/// circumstantial. `entered` says a run got as far as the boundary at all —
+/// without it, "no frame was sent" is equally true of a run that never started.
+/// `abandoned` is written by a guard living *inside* the parked future, so it is
+/// incremented by the cancellation itself: a run whose task is dropped at the
+/// boundary records that fact as it unwinds, and the task lease held beside it
+/// is released in the same drop. `passed` is the post-boundary effect, and it
+/// staying at zero is the assertion.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RpcSendBoundary {
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicUsize,
+    passed: std::sync::atomic::AtomicUsize,
+    abandoned: std::sync::atomic::AtomicUsize,
+    finished: std::sync::atomic::AtomicUsize,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// Records, on drop, that the run holding it left the boundary without passing
+/// it — which for a parked run means its task was cancelled here.
+#[cfg(test)]
+struct RpcSendBoundaryVisit<'a> {
+    boundary: &'a RpcSendBoundary,
+    passed: bool,
+}
+
+#[cfg(test)]
+impl Drop for RpcSendBoundaryVisit<'_> {
+    fn drop(&mut self) {
+        if !self.passed {
+            self.boundary
+                .abandoned
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+impl RpcSendBoundary {
+    async fn reach(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Unarmed is the whole of production and the whole of every other
+        // control: one load and a return, with nothing to park on.
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        // Subscribed *before* the arrival is announced. A control that released
+        // the boundary the instant it saw the arrival would otherwise race a
+        // notification against a subscription that had not happened yet, and
+        // `Notify` does not keep one for a waiter that is not yet waiting.
+        let release = self.release.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
+
+        let mut visit = RpcSendBoundaryVisit {
+            boundary: self,
+            passed: false,
+        };
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.reached.notify_waiters();
+        release.await;
+        visit.passed = true;
+        self.passed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Park every run that reaches the boundary from here on.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A future that resolves when a run arrives at the boundary.
+    ///
+    /// Handed out as a future rather than polled for, so a control can subscribe
+    /// before it delivers the frame and cannot miss the arrival.
+    pub(crate) fn arrival(&self) -> tokio::sync::futures::Notified<'_> {
+        self.reached.notified()
+    }
+
+    /// How many runs reached the boundary.
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many runs got past it — the post-boundary effect.
+    pub(crate) fn passed(&self) -> usize {
+        self.passed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many runs were dropped while parked on it.
+    pub(crate) fn abandoned(&self) -> usize {
+        self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many handler tasks have finished **and released their lease**.
+    ///
+    /// The one that answers "the task ended", as against
+    /// [`Self::abandoned`], which answers "the run left the boundary". Those are
+    /// not the same instant: the boundary guard is dropped inside the run
+    /// future, and the task's own epilogue — the task lease among it — runs
+    /// afterwards. A control that read `abandoned` and concluded the lease was
+    /// released would be racing that epilogue.
+    ///
+    /// See [`RpcRunEpilogue`] for why this is ordered after the lease and not
+    /// merely near it.
+    pub(crate) fn finished(&self) -> usize {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Records one handler task's end, **after** that task's lease has been
+/// released.
+///
+/// The ordering is the whole value of this type and it is structural, not
+/// hopeful: locals drop in reverse declaration order, so the spawned run
+/// declares this guard *before* it rebinds `_task_lease`. The lease is therefore
+/// released first and this increment happens strictly afterwards — which makes
+/// the count an observation of "the task is gone and has stopped costing its
+/// owner", rather than of "the run stopped running", which is an earlier and
+/// weaker fact.
+///
+/// Test-only. It exists because task completion is otherwise unobservable from
+/// outside a spawned task: a cancelled run sends nothing, and its absence is
+/// equally true of a run that never started.
+#[cfg(test)]
+pub(crate) struct RpcRunEpilogue(std::sync::Arc<NetworkState>);
+
+#[cfg(test)]
+impl RpcRunEpilogue {
+    pub(crate) fn new(state: std::sync::Arc<NetworkState>) -> Self {
+        Self(state)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RpcRunEpilogue {
+    fn drop(&mut self) {
+        self.0
+            .rpc_send_boundary
+            .finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl NetworkState {
     /// Read observations for this live joined network instance.
     pub fn resource_report(&self) -> ResourceReport {
         self.resource_scope.report()

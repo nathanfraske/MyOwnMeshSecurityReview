@@ -13,9 +13,9 @@
 //!
 //! Here they cannot disagree. One entry is one `Box`, whose size is
 //! `size_of::<LeasedQueueNode<T>>()` and whose spare capacity is zero, and the
-//! lease that paid for it lives inside it. Popping the entry drops the lease;
-//! dropping the queue drops every entry and therefore every lease. There is no
-//! sweep, no capacity term, and nothing to reconcile.
+//! lease that paid for it lives inside it. Popping an entry and dropping the
+//! whole queue both move each node out of its `Box` before releasing the node
+//! lease. There is no sweep, no capacity term, and nothing to reconcile.
 //!
 //! **What it deliberately is not.** It carries no waker, no notification, no
 //! ceiling and no expiry. Admission is the owner refusing to fund the next
@@ -29,10 +29,10 @@ use super::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass, Resource
 /// One retained entry: the caller's value, the lease that paid for this node,
 /// and the link to the next.
 ///
-/// Field order is the drop order and is chosen: the value is destroyed first,
-/// and only then is the allocation that held it paid back. A lease released
-/// before the thing it accounts for is gone would leave a window in which the
-/// provider believes memory is free while it is still occupied.
+/// Removal moves the node out of its `Box`, which frees the allocation before
+/// the moved lease is released. A lease released before the thing it accounts
+/// for is gone would leave a window in which the provider believes memory is
+/// free while it is still occupied.
 struct LeasedQueueNode<T> {
     value: T,
     /// Covers only this queue node's allocation. Any off-node retention in
@@ -67,10 +67,10 @@ pub(crate) struct LeasedQueue<T> {
 /// be worth accounting is deep enough to overflow the stack while being freed.
 /// Unlinking first means every node is dropped with an empty `next`.
 ///
-/// Each node's own drop is what releases that entry — the value first, then its
-/// lease — so an owner whose entry carries a completion signal, a payload lease
-/// or a reply channel gets all of them resolved by this, with nothing to
-/// remember to call.
+/// Moving a node out of its `Box` frees that node's allocation first; the value
+/// and node lease then drop from locals, in that order. An owner whose entry
+/// carries a completion signal, a payload lease or a reply channel therefore
+/// gets all of them resolved here, with nothing to remember to call.
 ///
 /// The chains are merged first, so entries are destroyed oldest-first. Dropping
 /// the push chain as it stands would destroy the newest entries first, and an
@@ -81,8 +81,15 @@ impl<T> Drop for LeasedQueue<T> {
     fn drop(&mut self) {
         self.merge();
         let mut cursor = self.oldest.take();
-        while let Some(mut node) = cursor {
-            cursor = node.next.take();
+        while let Some(node) = cursor {
+            let LeasedQueueNode {
+                value,
+                _entry,
+                next,
+            } = *node;
+            cursor = next;
+            drop(value);
+            drop(_entry);
         }
     }
 }
@@ -560,25 +567,26 @@ mod tests {
     #[test]
     fn v4_arc05_dropping_the_queue_drops_and_releases_every_entry() {
         let dropped = drop_log();
-        let (provider, port, scope) = control_provider(4);
+        let (provider, port, scope) = control_provider(5);
         let mut queue = LeasedQueue::new();
         for order in 1..=3 {
             push_control_entry(&mut queue, &port, &scope, order, &dropped);
         }
         // Entries in both chains at once: the front lookup draws the first
-        // three across, and the fourth is pushed after it, so a drop that
-        // reached only the chain a reader had already touched would leave the
-        // fourth entry — and a drop that took the chains as they stand would
-        // answer 4 before 1.
+        // three across, then two more land newest-first on the push chain. A
+        // drop that skipped the merge would destroy that second chain as 5, 4
+        // instead of 4, 5, which makes the merge itself load-bearing here.
         assert_eq!(queue.front().map(|entry| entry.order), Some(1));
-        push_control_entry(&mut queue, &port, &scope, 4, &dropped);
+        for order in 4..=5 {
+            push_control_entry(&mut queue, &port, &scope, order, &dropped);
+        }
         assert!(dropped_orders(&dropped).is_empty());
 
         drop(queue);
 
         assert_eq!(
             dropped_orders(&dropped),
-            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5],
             "every entry's own drop ran, oldest first — which is the order an \
              owner's per-entry completion signals are answered in"
         );

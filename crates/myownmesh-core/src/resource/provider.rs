@@ -1854,10 +1854,21 @@ mod finite {
         /// Provider-owned planning charge for one future reservation: the
         /// requested claim plus the exact bookkeeping record the provider will
         /// retain for its lease. This computes capacity only and acquires none.
-        pub(crate) fn reservation_planning_charge(
+        pub fn reservation_planning_charge(
             claim: ResourceClaim,
         ) -> Result<ResourceClaim, ResourceUnavailable> {
             Self::reservation_charge(claim)
+        }
+
+        /// Provider-owned planning charge for creating one scope.
+        ///
+        /// A finite provider retains this bookkeeping record for the process
+        /// scope opened by [`ResourceProviderPort::new`] and for every child
+        /// scope created later. Publishing the planner lets an exact fixture
+        /// price the production operation without copying the provider's
+        /// private record shape. It computes capacity only and acquires none.
+        pub fn scope_planning_charge() -> ResourceClaim {
+            Self::bookkeeping_claim()
         }
 
         #[cfg(any(test, feature = "transport-lab"))]

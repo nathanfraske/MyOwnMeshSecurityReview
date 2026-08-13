@@ -98,6 +98,36 @@ pub enum ServerOut {
     },
 }
 
+/// A borrowed mirror of [`ServerOut::RpcInbound`], for measuring a frame that
+/// does not exist yet.
+///
+/// The mailbox prices an item by serializing it, and an inbound RPC frame is
+/// assembled from a call whose payload a remote peer chose the size of. Building
+/// it in order to ask whether it can be admitted is the admission arriving after
+/// the allocation it was about, so the question is asked of this instead: the
+/// same tag, the same field names, the same order, every field a borrow.
+///
+/// **It must serialize byte-for-byte as the variant it mirrors.** That is the
+/// whole of its contract and the only reason it is here rather than in `bridge`,
+/// where the builder that uses it lives: a mirror kept beside the thing it
+/// mirrors is one a change to either has to walk past. `v4_r2_daemon_a_measured_\
+/// inbound_frame_matches_the_frame_it_becomes` is what checks it, and it checks
+/// the encoded bytes rather than the fields, because equal fields that encode
+/// differently is exactly the failure a hand-written mirror has.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ServerOutView<'a> {
+    RpcInbound {
+        network: &'a str,
+        from: &'a str,
+        request_id: &'a str,
+        operation_id: u64,
+        method: &'a str,
+        payload: &'a Value,
+        streaming: bool,
+    },
+}
+
 /// Off-node retention owned by one queued outbound frame.
 ///
 /// Every variant is pure serializable data — no oneshot, sender, or socket

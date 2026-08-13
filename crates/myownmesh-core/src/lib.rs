@@ -157,16 +157,17 @@ pub use network_state::{
 };
 pub use protocol::CapabilityAdvert;
 pub use resource::{
-    resource_mailbox, serialized_mailbox_item_claim, FiniteResourceProvider, LeasedMap,
-    LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
-    ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass, ResourceClaim,
-    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
-    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
-    ResourceMailboxItemError, ResourceMailboxPlanningError, ResourceMailboxReceiver,
-    ResourceMailboxSendError, ResourceMailboxSender, ResourcePressure, ResourceProvider,
-    ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
-    ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
-    RESOURCE_CLASS_COUNT,
+    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
+    serialized_mailbox_item_claim_as, FiniteResourceProvider, LeasedMap, LeasedMapInsertRefusal,
+    LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
+    PreparedResourceMailbox, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
+    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease,
+    ResourceMailboxAdmissionError, ResourceMailboxCreateError, ResourceMailboxDelivery,
+    ResourceMailboxItem, ResourceMailboxItemBuilder, ResourceMailboxItemError,
+    ResourceMailboxPlanningError, ResourceMailboxReceiver, ResourceMailboxSendError,
+    ResourceMailboxSender, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
+    ResourceProviderConflict, ResourceProviderPort, ResourceReservationState, ResourceScope,
+    ResourceScopeId, ResourceUnavailable, RESOURCE_CLASS_COUNT,
 };
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};

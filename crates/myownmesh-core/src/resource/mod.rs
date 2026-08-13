@@ -21,10 +21,11 @@ pub(crate) use mailbox::{
     checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
 };
 pub use mailbox::{
-    resource_mailbox, serialized_mailbox_item_claim, ResourceMailboxAdmissionError,
+    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
+    serialized_mailbox_item_claim_as, PreparedResourceMailbox, ResourceMailboxAdmissionError,
     ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
-    ResourceMailboxItemError, ResourceMailboxPlanningError, ResourceMailboxReceiver,
-    ResourceMailboxSendError, ResourceMailboxSender,
+    ResourceMailboxItemBuilder, ResourceMailboxItemError, ResourceMailboxPlanningError,
+    ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender,
 };
 pub use map::{LeasedMap, LeasedMapInsertRefusal};
 pub(crate) use queue::LeasedQueue;

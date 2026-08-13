@@ -138,8 +138,35 @@ const TEST_CONTROL_INBOUND_FRAMES: u64 = 16;
 /// provider-bookkeeping objects.
 #[cfg(test)]
 pub(crate) fn test_resource_provider() -> myownmesh_core::ResourceProviderPort {
-    static PROVIDER: std::sync::OnceLock<myownmesh_core::ResourceProviderPort> =
-        std::sync::OnceLock::new();
+    test_resource_pair().0
+}
+
+/// The same grant's ledger, for controls that assert about what it holds.
+///
+/// It is the *provider*, not a second one: `in_use` read through this is the
+/// figure every acquisition in this binary moves. A control that built its own
+/// provider to look at would be looking at a different accounting than the code
+/// under test spends from.
+///
+/// **Whatever reads this must run alone.** The grant is process-wide and shared
+/// by every control in the binary, so a delta taken across a step is only
+/// attributable to that step if nothing else is running -- which is what
+/// `#[ignore]` plus an exact-name invocation buys, and why the one control that
+/// reads it is marked that way.
+#[cfg(all(test, unix))]
+pub(crate) fn test_resource_ledger() -> myownmesh_core::FiniteResourceProvider {
+    test_resource_pair().1
+}
+
+#[cfg(test)]
+fn test_resource_pair() -> (
+    myownmesh_core::ResourceProviderPort,
+    myownmesh_core::FiniteResourceProvider,
+) {
+    static PROVIDER: std::sync::OnceLock<(
+        myownmesh_core::ResourceProviderPort,
+        myownmesh_core::FiniteResourceProvider,
+    )> = std::sync::OnceLock::new();
     PROVIDER
         .get_or_init(|| {
             let connectors = TEST_PROCESS_CONNECTOR_CAPACITY as u64;
@@ -264,10 +291,10 @@ pub(crate) fn test_resource_provider() -> myownmesh_core::ResourceProviderPort {
                 .and_then(|claim| claim.checked_add(ipc_registry))
                 .and_then(|claim| claim.checked_add(control_inbound))
                 .expect("daemon test resource grant is representable");
-            myownmesh_core::ResourceProviderPort::new(myownmesh_core::FiniteResourceProvider::new(
-                claim,
-            ))
-            .expect("daemon test resource provider admits its process scope")
+            let provider = myownmesh_core::FiniteResourceProvider::new(claim);
+            let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+                .expect("daemon test resource provider admits its process scope");
+            (port, provider)
         })
         .clone()
 }

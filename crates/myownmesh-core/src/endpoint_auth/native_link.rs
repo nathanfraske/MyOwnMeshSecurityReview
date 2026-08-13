@@ -227,7 +227,21 @@ pub(crate) struct LinkBeforeEngineOpen {
     /// would retire the very link the controls are asserting is live.
     pub(crate) _left_events: WebRtcConnectorEventReceiver,
     pub(crate) right: Arc<WebRtcConnectorWorker>,
-    pub(crate) _right_events: WebRtcConnectorEventReceiver,
+    /// The far connector's event stream.
+    ///
+    /// Lifetime anchor first and foremost: dropping it stops that connector's
+    /// event pump, which would retire the very link the controls assert is live.
+    /// Most controls therefore only ever borrow it, through
+    /// [`Self::right_events_mut`], to scan for a frame they expect.
+    ///
+    /// An `Option` so that a control which needs to *drive* the far side —
+    /// feeding its frames into a far engine rather than reading them on its own
+    /// thread — can take the receiver out and own it, while the rest of the
+    /// fixture stays alive. A fixture whose receiver has been taken is one whose
+    /// far side is being pumped by somebody else, and asking it to scan for a
+    /// frame is a mistake rather than a wait; that is why taking leaves `None`
+    /// and the borrow panics rather than blocking forever.
+    right_events: Option<WebRtcConnectorEventReceiver>,
     /// The left connector's genuine `DataChannelOpen` callback, unconsumed.
     ///
     /// An `Option` so a caller can take the event out while the fixture — and
@@ -244,10 +258,53 @@ pub(crate) struct LinkBeforeEngineOpen {
 /// `link`, unconsumed, for the production engine arm to promote.
 pub(crate) struct ReceiveReadyLinkBeforeEngineOpen {
     pub(crate) link: LinkBeforeEngineOpen,
-    _right_handoff: crate::connector::ConnectedChannelHandoff,
+    /// The far connector's own ownership witness, from its own open callback.
+    ///
+    /// Held, not consumed, by every control that only needs the far side to be
+    /// *receiving*. An `Option` so that a control which needs the far side to be
+    /// a full participant — with its own promoted session, dispatching what it
+    /// receives — can take this handoff and install it, which is the one thing
+    /// that turns a receiving far side into a responding one.
+    right_handoff: Option<crate::connector::ConnectedChannelHandoff>,
+}
+
+impl ReceiveReadyLinkBeforeEngineOpen {
+    /// Take the far connector's handoff, to promote a session over it. Exactly
+    /// once per fixture.
+    pub(crate) fn take_right_handoff(&mut self) -> crate::connector::ConnectedChannelHandoff {
+        self.right_handoff
+            .take()
+            .expect("the far handoff is taken exactly once")
+    }
 }
 
 impl LinkBeforeEngineOpen {
+    /// Borrow the near connector's event stream, to read what the far side
+    /// sent.
+    ///
+    /// Only a control that is itself standing in for the near engine has any
+    /// business here — an ordinary control's near side is driven by the engine
+    /// under test.
+    pub(crate) fn left_events_mut(&mut self) -> &mut WebRtcConnectorEventReceiver {
+        &mut self._left_events
+    }
+
+    /// Borrow the far connector's event stream, to scan it for an expected
+    /// frame.
+    pub(crate) fn right_events_mut(&mut self) -> &mut WebRtcConnectorEventReceiver {
+        self.right_events
+            .as_mut()
+            .expect("this fixture's far side is being pumped by its own engine, so its events are not this control's to read")
+    }
+
+    /// Take the far connector's event stream, to drive a far-side engine with
+    /// it. Exactly once per fixture; see [`Self::right_events`].
+    pub(crate) fn take_right_events(&mut self) -> WebRtcConnectorEventReceiver {
+        self.right_events
+            .take()
+            .expect("the far event stream is taken exactly once")
+    }
+
     /// Take the genuine native open callback. Exactly once per fixture.
     pub(crate) fn take_open_event(&mut self) -> WebRtcConnectorEvent {
         self.left_open_event
@@ -302,7 +359,9 @@ pub(crate) async fn connect_before_engine_open_receive_ready(
         connect_before_engine_open_inner(left_state, right_state, true).await;
     ReceiveReadyLinkBeforeEngineOpen {
         link,
-        _right_handoff: right_handoff.expect("receive-ready construction yields a right handoff"),
+        right_handoff: Some(
+            right_handoff.expect("receive-ready construction yields a right handoff"),
+        ),
     }
 }
 
@@ -409,7 +468,7 @@ async fn connect_before_engine_open_inner(
             left,
             _left_events: left_events,
             right,
-            _right_events: right_events,
+            right_events: Some(right_events),
             left_open_event: Some(left_open_event.expect("left data channel opens")),
         },
         right_handoff,

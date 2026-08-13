@@ -39,10 +39,16 @@
 
 pub mod bridge;
 pub mod clients;
+/// Cleanup storage whose funding and whose allocation are the same value's.
+///
+/// Crate-private: nothing outside this daemon hands a caller a funded
+/// collection, and an embedder that could build one could push into it
+/// without a lease.
+mod leased;
 pub mod wire;
 
 #[cfg(test)]
-pub use clients::RegistryResidue;
+pub use clients::{FanoutBarrier, RegistryResidue};
 /// Channel-route lifecycle machinery, which is this daemon's own and not an
 /// embedder's authority.
 ///
@@ -54,8 +60,13 @@ pub use clients::RegistryResidue;
 /// [`clients::RetiredRoute`] -- travel with them for the same reason and to keep
 /// their effective visibility matched, which is what stops a public signature
 /// naming a crate-private type.
+pub(crate) use leased::LeasedList;
+
 #[allow(unused_imports)]
-pub(crate) use clients::{ChannelJoin, RetiredRoute, RouteCancellation, RouteReady};
+pub(crate) use clients::{
+    ChannelFanout, ChannelFanoutStep, ChannelJoin, RetiredRoute, RouteCancellation, RouteOwner,
+    RouteReady,
+};
 #[allow(unused_imports)]
 pub use clients::{
     ClientHandle, ClientId, ClientRegistry, ForgottenMethod, HandlerGeneration, Lifecycle,

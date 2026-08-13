@@ -71,12 +71,49 @@ pub(crate) enum FrameAdmission {
     Application,
 }
 
+/// What this side owes when a frame of this kind cannot be carried.
+///
+/// Read from the same bounded leading tag as [`FrameAdmission`], and read there
+/// for the same reason: the path that most needs the answer is the one where the
+/// frame was *never decoded*. A frame the resource owner will not fund is
+/// refused before its bytes are parsed, so a receiver that wants to distinguish
+/// "lost one datagram" from "stranded a caller" cannot ask the decoded message —
+/// asking it would mean parsing exactly the payload the refusal exists to avoid
+/// parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailurePolicy {
+    /// Dropping this frame settles nothing and strands nobody. Nothing local is
+    /// waiting on it, and the sender's contract for it is best-effort, so the
+    /// loss is the whole of the damage and the session carries on.
+    DropFrame,
+    /// This frame is the completion something local is waiting for, or is
+    /// itself a delivery contract. Dropping it leaves that waiter with nothing
+    /// else coming — the peer has already sent its one answer — so the session
+    /// that could not carry it ends, and the ending is what resolves the waiter.
+    EndSession,
+}
+
+/// A frame's admission phase and its failure policy, both from the leading tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClassifiedFrame {
+    pub(crate) admission: FrameAdmission,
+    pub(crate) on_failure: FailurePolicy,
+}
+
 /// Parse only the canonical leading `kind` envelope emitted by this protocol.
 ///
 /// Mixed-version support is intentionally absent. A peer that reorders the tag
 /// behind attacker-controlled payload is malformed rather than making the
 /// classifier scan or deserialize that payload before admission.
-pub(crate) fn classify_frame(bytes: &[u8]) -> Option<FrameAdmission> {
+///
+/// **The failure policy defaults to [`FailurePolicy::EndSession`]**, including
+/// for a kind that is in the closed set but not named below and for one that is
+/// not in it at all. That is the fail-closed direction here: ending a session
+/// this side could not serve is the existing behaviour of every refusal site, so
+/// an unnamed kind keeps it, and only a kind proved to strand nobody is
+/// downgraded. A default of `DropFrame` would silently make some future
+/// completion-bearing variant lose its caller.
+pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
     const PREFIX: &[u8] = br#"{"kind":""#;
     const MAX_KIND_BYTES: usize = 32;
     let rest = bytes.strip_prefix(PREFIX)?;
@@ -89,8 +126,35 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<FrameAdmission> {
     }
     let kind = std::str::from_utf8(&rest[..end]).ok()?;
     Some(match kind {
-        "hello" | "auth_response" | "approve" | "deny" => FrameAdmission::Protocol,
-        _ => FrameAdmission::Application,
+        // The four pre-admission frames. Their policy is never read: they are
+        // handled before any session exists, so there is none to end. Named
+        // `EndSession` anyway rather than given a third variant meaning
+        // "inapplicable", which would be a value every consumer had to handle
+        // and no consumer could act on.
+        "hello" | "auth_response" | "approve" | "deny" => ClassifiedFrame {
+            admission: FrameAdmission::Protocol,
+            on_failure: FailurePolicy::EndSession,
+        },
+        // The one best-effort application delivery. A plain `Channel` frame
+        // carries no sequence, is acknowledged by nobody, and resolves no local
+        // wait: `MeshMessage::Channel` is delivered to whatever subscribers
+        // exist and forgotten. Its acknowledged counterpart is `ChannelSeq`,
+        // which is *not* named here — a sender retains that one until it is
+        // acked, so losing it silently is a hole in the contract this side
+        // publishes.
+        //
+        // This is the kind a peer can make expensive at will, and so the one a
+        // peer could otherwise use to end a session on demand by sending
+        // payload the owner will not fund. Backpressure is not a reason to
+        // destroy a session that is working.
+        "channel" => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::DropFrame,
+        },
+        _ => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
+        },
     })
 }
 
@@ -190,15 +254,67 @@ mod tests {
 
     #[test]
     fn bounded_leading_tag_classifies_without_parsing_application_payload() {
+        // Every payload below is unparseable JSON, and every answer is
+        // nonetheless exact: the classifier reads the tag and stops. That is
+        // the property both fields depend on, since the frame whose policy
+        // matters most is the one whose bytes are never decoded.
         assert_eq!(
             classify_frame(br#"{"kind":"hello","payload":[}}"#),
-            Some(FrameAdmission::Protocol)
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Protocol,
+                on_failure: FailurePolicy::EndSession,
+            })
         );
         assert_eq!(
             classify_frame(br#"{"kind":"channel","payload":[}}"#),
-            Some(FrameAdmission::Application)
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Application,
+                on_failure: FailurePolicy::DropFrame,
+            })
         );
         assert_eq!(classify_frame(br#"{"payload":[],"kind":"hello"}"#), None);
+    }
+
+    /// Only the best-effort delivery is droppable, and the acknowledged one is
+    /// not.
+    ///
+    /// The discrimination the policy exists for, at the level it is decided.
+    /// `channel` and `channel_seq` share a prefix, a shape and a payload field;
+    /// they differ in that a `ChannelSeq` sender retains its frame until this
+    /// side acknowledges it. A policy that read the shape rather than the tag —
+    /// or that matched on a prefix — would give both the same answer, and one of
+    /// those answers is a silent hole in an acknowledged-delivery contract.
+    #[test]
+    fn only_the_best_effort_channel_frame_is_droppable() {
+        let policy = |raw: &str| {
+            classify_frame(raw.as_bytes())
+                .expect("a canonical envelope classifies")
+                .on_failure
+        };
+        assert_eq!(
+            policy(r#"{"kind":"channel","x":1}"#),
+            FailurePolicy::DropFrame
+        );
+        for completion_bearing in [
+            r#"{"kind":"channel_seq","x":1}"#,
+            r#"{"kind":"channel_ack","x":1}"#,
+            r#"{"kind":"rpc_response","x":1}"#,
+            r#"{"kind":"rpc_stream_chunk","x":1}"#,
+            r#"{"kind":"rpc_stream_end","x":1}"#,
+        ] {
+            assert_eq!(
+                policy(completion_bearing),
+                FailurePolicy::EndSession,
+                "a frame something local is waiting on is never silently lost: \
+                 {completion_bearing}"
+            );
+        }
+        // And the fail-closed default: a kind this build does not implement is
+        // not a licence to drop frames quietly.
+        assert_eq!(
+            policy(r#"{"kind":"definitely_not_a_real_kind","x":1}"#),
+            FailurePolicy::EndSession
+        );
     }
 
     #[test]

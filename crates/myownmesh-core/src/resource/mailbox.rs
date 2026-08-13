@@ -31,6 +31,26 @@ pub trait ResourceMailboxItem {
     fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError>;
 }
 
+/// A mailbox value described before it is constructed.
+///
+/// Some values are assembled from buffers an admitted caller already owns. In
+/// that case requiring a finished [`ResourceMailboxItem`] before admission
+/// makes the construction itself unaccounted: pressure can refuse the value,
+/// but only after the allocation or copy already happened. A builder measures
+/// the borrowed inputs, then consumes them only after the mailbox has acquired
+/// both the value-retention and queue-node leases.
+///
+/// The claim has the same contract as [`ResourceMailboxItem::retained_claim`]:
+/// it names the finished value's off-node retention only, and must equal the
+/// claim `build()`'s result would answer. Controls for a borrowed mirror should
+/// compare the two directly; the mailbox cannot do so without constructing the
+/// value before admission and defeating this interface. The mailbox adds its
+/// scheduled-work obligation and owns the queue node separately.
+pub trait ResourceMailboxItemBuilder<T: ResourceMailboxItem> {
+    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError>;
+    fn build(self) -> T;
+}
+
 /// Conservatively measure a serializable, JSON-shaped mailbox value and return
 /// the off-node claim that must remain leased while the typed value is queued.
 ///
@@ -42,6 +62,20 @@ pub trait ResourceMailboxItem {
 /// handles or effects must add those dependencies in their own implementation.
 pub fn serialized_mailbox_item_claim<T: serde::Serialize>(
     value: &T,
+) -> Result<ResourceClaim, ResourceMailboxItemError> {
+    serialized_mailbox_item_claim_as::<T>(value)
+}
+
+/// Measure a serializable borrowed view as the mailbox value it will build.
+///
+/// The view must encode byte-for-byte like `T`. Its serialization supplies the
+/// decoded-tree, queued-byte and allocation measurements, while `T` supplies
+/// the inline size of the value the mailbox will actually retain. Using
+/// [`serialized_mailbox_item_claim`] on the view itself would instead charge
+/// for its references and could underfund the owned value constructed after
+/// admission.
+pub fn serialized_mailbox_item_claim_as<T>(
+    value: &impl serde::Serialize,
 ) -> Result<ResourceClaim, ResourceMailboxItemError> {
     let (retained, queued, allocations) = mailbox_measure_serialized(value)?;
     mailbox_retained_claim::<T>(retained, queued, allocations)
@@ -272,6 +306,45 @@ pub struct ResourceMailboxReceiver<T> {
     inner: Arc<MailboxInner<T>>,
 }
 
+/// A mailbox whose shared allocation is funded but not constructed.
+///
+/// Owners that must re-check identity or lifecycle immediately before
+/// publishing an effect can acquire the root first, perform that final check,
+/// and then call [`Self::commit`] without another fallible operation. Dropping
+/// a preparation releases the unused root lease and constructs nothing.
+#[must_use = "a prepared mailbox owns a root lease until it is committed or dropped"]
+pub struct PreparedResourceMailbox<T> {
+    owner: LocalApplicationResourceScope,
+    root: ResourceLease,
+    item: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> PreparedResourceMailbox<T> {
+    /// Construct both mailbox halves from the already-acquired root.
+    ///
+    /// Infallible: every provider operation happened in
+    /// [`prepare_resource_mailbox`], so this is suitable for an identity-exact
+    /// commit section after its last refusal.
+    pub fn commit(self) -> (ResourceMailboxSender<T>, ResourceMailboxReceiver<T>) {
+        let Self { owner, root, .. } = self;
+        let inner = Arc::new(MailboxInner {
+            queue: Mutex::new(LeasedQueue::new()),
+            ready: tokio::sync::Notify::new(),
+            closed_ready: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            senders: std::sync::atomic::AtomicUsize::new(1),
+            owner,
+            _root: root,
+        });
+        (
+            ResourceMailboxSender {
+                inner: Arc::clone(&inner),
+            },
+            ResourceMailboxReceiver { inner },
+        )
+    }
+}
+
 /// One delivered value. Its off-node retention stays funded until this value
 /// is consumed or dropped; the queue-node lease is released by the pop.
 pub struct ResourceMailboxDelivery<T> {
@@ -289,24 +362,21 @@ impl<T> ResourceMailboxDelivery<T> {
 pub fn resource_mailbox<T>(
     owner: LocalApplicationResourceScope,
 ) -> Result<(ResourceMailboxSender<T>, ResourceMailboxReceiver<T>), ResourceMailboxCreateError> {
+    Ok(prepare_resource_mailbox(owner)?.commit())
+}
+
+/// Acquire one mailbox root without constructing its shared allocation.
+pub fn prepare_resource_mailbox<T>(
+    owner: LocalApplicationResourceScope,
+) -> Result<PreparedResourceMailbox<T>, ResourceMailboxCreateError> {
     let root = owner
         .acquire(ResourceMailboxSender::<T>::root_claim()?)
         .map_err(ResourceMailboxCreateError::Pressure)?;
-    let inner = Arc::new(MailboxInner {
-        queue: Mutex::new(LeasedQueue::new()),
-        ready: tokio::sync::Notify::new(),
-        closed_ready: tokio::sync::Notify::new(),
-        closed: std::sync::atomic::AtomicBool::new(false),
-        senders: std::sync::atomic::AtomicUsize::new(1),
+    Ok(PreparedResourceMailbox {
         owner,
-        _root: root,
-    });
-    Ok((
-        ResourceMailboxSender {
-            inner: Arc::clone(&inner),
-        },
-        ResourceMailboxReceiver { inner },
-    ))
+        root,
+        item: std::marker::PhantomData,
+    })
 }
 
 impl<T> ResourceMailboxSender<T> {
@@ -391,22 +461,51 @@ impl<T> ResourceMailboxSender<T> {
             notified.await;
         }
     }
+
+    /// Measure and admit a value before constructing it.
+    ///
+    /// `builder.build()` is not called when the mailbox is already closed, the
+    /// claim is not representable, or either provider acquisition refuses.
+    /// Once both leases exist the construction is infallible and the ordinary
+    /// lossless commit installs the value. A close racing that final commit may
+    /// still receive and immediately drop the constructed value; no admission
+    /// API can revoke construction synchronously after it has begun.
+    pub fn send_building<B>(&self, builder: B) -> Result<(), ResourceMailboxAdmissionError>
+    where
+        T: ResourceMailboxItem,
+        B: ResourceMailboxItemBuilder<T>,
+    {
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResourceMailboxAdmissionError::Closed);
+        }
+        let retention_claim = builder
+            .retained_claim()?
+            .checked_add(Self::scheduled_work_claim().map_err(ResourceMailboxItemError::from)?)
+            .map_err(ResourceMailboxItemError::from)?;
+        let retention = self
+            .inner
+            .owner
+            .acquire(retention_claim)
+            .map_err(ResourceMailboxAdmissionError::Pressure)?;
+        let node = self
+            .inner
+            .owner
+            .acquire(Self::node_claim().map_err(ResourceMailboxItemError::from)?)
+            .map_err(ResourceMailboxAdmissionError::Pressure)?;
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ResourceMailboxAdmissionError::Closed);
+        }
+        self.accept(builder.build(), retention, node)
+            .map_err(|(_value, _retention, _node)| ResourceMailboxAdmissionError::Closed)
+    }
 }
 
 impl<T: ResourceMailboxItem> ResourceMailboxSender<T> {
-    /// Exact provider capacity consumed by accepting this concrete value.
-    ///
-    /// The mailbox makes two reservations per item: one for the value plus its
-    /// scheduled-work obligation, and one for the queue node. This planning
-    /// result includes the provider's bookkeeping record for each reservation.
-    /// It creates no scope, lease or admission and is intended for owners that
-    /// must size a finite grant from the production admission shape.
-    pub fn accepted_item_planning_charge(
-        value: &T,
+    fn item_planning_charge(
+        item: ResourceClaim,
     ) -> Result<ResourceClaim, ResourceMailboxPlanningError> {
         let scheduled = Self::scheduled_work_claim().map_err(ResourceMailboxItemError::from)?;
-        let retention = value
-            .retained_claim()?
+        let retention = item
             .checked_add(scheduled)
             .map_err(ResourceMailboxItemError::from)?;
         let retention = super::FiniteResourceProvider::reservation_planning_charge(retention)
@@ -418,6 +517,31 @@ impl<T: ResourceMailboxItem> ResourceMailboxSender<T> {
             .checked_add(node)
             .map_err(ResourceMailboxItemError::from)
             .map_err(ResourceMailboxPlanningError::from)
+    }
+
+    /// Exact provider capacity consumed by accepting this concrete value.
+    ///
+    /// The mailbox makes two reservations per item: one for the value plus its
+    /// scheduled-work obligation, and one for the queue node. This planning
+    /// result includes the provider's bookkeeping record for each reservation.
+    /// It creates no scope, lease or admission and is intended for owners that
+    /// must size a finite grant from the production admission shape.
+    pub fn accepted_item_planning_charge(
+        value: &T,
+    ) -> Result<ResourceClaim, ResourceMailboxPlanningError> {
+        Self::item_planning_charge(value.retained_claim()?)
+    }
+
+    /// Exact provider capacity consumed by accepting what this builder will
+    /// construct. Computes capacity only; it invokes neither `build` nor any
+    /// provider operation.
+    pub fn building_item_planning_charge<B>(
+        builder: &B,
+    ) -> Result<ResourceClaim, ResourceMailboxPlanningError>
+    where
+        B: ResourceMailboxItemBuilder<T>,
+    {
+        Self::item_planning_charge(builder.retained_claim()?)
     }
 
     /// Exact provider charge for accepting one concrete item in a fixture.

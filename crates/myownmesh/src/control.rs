@@ -57,8 +57,8 @@ pub use framing::{
     RealtimeSendUnit, MAX_REALTIME_FLOW_LABEL_BYTES,
 };
 use framing::{
-    optional_nonzero_bytes, read_bounded_json_line, AdmittedReader, DecodeRefusal, FrameAdmission,
-    REALTIME_FRAME_HEADER,
+    optional_nonzero_bytes, read_bounded_json_line, AdmittedLineOut, AdmittedReader, ControlOut,
+    DecodeRefusal, FrameAdmission, REALTIME_FRAME_HEADER,
 };
 
 /// Places a control can reach into `serve` without production having a branch.
@@ -87,6 +87,18 @@ pub(crate) struct ControlHooks {
     /// left behind. Fired once, immediately after construction.
     #[cfg(test)]
     registry: Option<tokio::sync::oneshot::Sender<crate::ipc::ClientRegistry>>,
+    /// Pauses one connection task at the instant `EventsSubscribe` becomes a
+    /// live stream.
+    ///
+    /// Past the ack, before the first poll of the stream loop. That is the only
+    /// instant at which "this connection is subscribed" and "this connection has
+    /// finished with the request that subscribed it" are both true, which is
+    /// what a control asserting the request's funding is gone has to stand on. A
+    /// barrier at the ack would be a line too early -- the write can still fail
+    /// -- and one inside the loop would be a line too late, since the loop only
+    /// returns when the stream is over.
+    #[cfg(test)]
+    at_events_stream_entry: Option<Arc<DispatchBarrier>>,
 }
 
 /// A one-shot pause, for controls that need a task stopped at an exact line.
@@ -142,6 +154,228 @@ impl DispatchBarrier {
         if let Some(release) = release {
             let _ = release.await;
         }
+    }
+}
+
+/// Everything that ends one accepted control connection, besides the client.
+///
+/// A write to a local socket completes when its peer reads it. A same-user
+/// client that stops reading can therefore park an accepted task inside
+/// `write_all` or `flush` indefinitely, and a client that sends nothing can park
+/// one inside a stream receive — neither of which the client is obliged to stop
+/// doing because this daemon has begun shutting down. Every long-lived mode on
+/// this socket races its work against one of these instead.
+///
+/// Two owners, not one, because the connection modes genuinely have two. Before
+/// an `EventsSubscribe` there is no client record, so the runtime's close signal
+/// is the only cancellation there is; after one, the exact client this
+/// connection registered is a second and more specific one — the drain removes
+/// clients one at a time, and this is how a connection learns that its own was
+/// taken.
+///
+/// Owned rather than borrowed, and cheaply: a `ClientRegistry` and an
+/// `Arc<ClientHandle>` are each one pointer clone. Borrowing would put a
+/// lifetime on every writer helper below and buy nothing.
+#[derive(Clone)]
+struct ConnectionCancel {
+    clients: crate::ipc::ClientRegistry,
+    owner: Option<Arc<crate::ipc::ClientHandle>>,
+}
+
+impl ConnectionCancel {
+    /// A connection with no client record of its own.
+    fn runtime(clients: &crate::ipc::ClientRegistry) -> Self {
+        Self {
+            clients: clients.clone(),
+            owner: None,
+        }
+    }
+
+    /// A connection that has registered, and is now ended by its own removal as
+    /// well as by the runtime's close.
+    ///
+    /// This closes the gap the frame mailbox cannot. The connection task holds
+    /// its own `Arc<ClientHandle>`, so the writer sender inside it stays alive
+    /// after the registry entry is removed and the mailbox never reports closed.
+    /// An idle client on a quiet mesh would otherwise wait forever for a source
+    /// that had already been taken away from it, holding an accepted task and
+    /// with it the whole drain.
+    fn owned_by(
+        clients: &crate::ipc::ClientRegistry,
+        owner: &Arc<crate::ipc::ClientHandle>,
+    ) -> Self {
+        Self {
+            clients: clients.clone(),
+            owner: Some(owner.clone()),
+        }
+    }
+
+    /// Resolves when this connection must stop, whatever the socket is doing.
+    ///
+    /// Both halves are edge-safe on their own: `closing` subscribes before it
+    /// reads the lifecycle, and `wait_disconnected` re-checks its flag around
+    /// the subscription. A signal that arrived before this future was built
+    /// therefore resolves it at once rather than being waited for a second time.
+    async fn cancelled(&self) {
+        match &self.owner {
+            Some(owner) => {
+                tokio::select! {
+                    () = self.clients.closing() => {}
+                    () = owner.wait_disconnected() => {}
+                }
+            }
+            None => self.clients.closing().await,
+        }
+    }
+}
+
+/// Tells `serve` that one accepted connection has ended, however it ended.
+///
+/// A guard rather than a line at the bottom of the task, because a task can end
+/// three ways — returning, panicking, and being dropped mid-await — and all
+/// three have to reach the join loop. Only a `Drop` covers the last two.
+struct ConnectionEnded(Arc<ControlState>);
+
+impl Drop for ConnectionEnded {
+    fn drop(&mut self) {
+        // Count first, then wake. A waiter woken before the count was published
+        // could read zero and conclude there was nothing to reap, which is the
+        // one ordering that turns an exact signal back into a hint.
+        self.0
+            .ended
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.0.finished.notify_one();
+    }
+}
+
+/// What became of one attempt to put a line on this socket.
+///
+/// `Ended` covers a broken socket and a cancelled write together, deliberately.
+/// The caller's answer to both is the same — this connection is over — and the
+/// distinction it would otherwise carry is one no caller can act on: a client
+/// that stopped reading and a runtime that stopped waiting leave the same
+/// unfinished line on the wire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wrote {
+    Sent,
+    Ended,
+}
+
+/// Encode one value, fund the bytes before they exist, and write them — or stop.
+///
+/// Three steps in one function because they have to happen in one order.
+/// [`AdmittedLineOut`] measures the encoding without allocating it and acquires
+/// the buffer before building it, so an answer this daemon cannot afford is
+/// refused rather than allocated and then noticed. The write is then raced
+/// against this connection's cancellation, so the encoded buffer — whose lease
+/// lives in the value and is released when it drops — cannot be pinned by a
+/// client that has stopped reading.
+///
+/// A cancelled write may leave a partial line on the socket, and that is the
+/// intended terminal answer. A shutdown that depended on a malicious or stalled
+/// client accepting a final response would not be terminal at all: where the
+/// socket is writable the client gets its typed refusal, and where it is not it
+/// gets EOF. No timer chooses between those.
+///
+/// [`ControlOut`] rather than a generic `Serialize`, because the measurement
+/// runs the encoder: the seam is only refusable if counting allocates nothing,
+/// and that is a property of a closed set of shapes rather than of a trait
+/// bound.
+async fn write_line<W>(
+    writer: &mut W,
+    frames: &FrameAdmission,
+    cancel: &ConnectionCancel,
+    value: ControlOut<'_>,
+) -> Result<Wrote>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let line =
+        AdmittedLineOut::encode(value, frames).context("control response was not admitted")?;
+    let write = async {
+        writer.write_all(line.bytes()).await?;
+        writer.flush().await
+    };
+    // Biased to the *write*, and this is the one place in this module where
+    // cancellation is not polled first. The two are only ever both ready when
+    // the socket would accept the line without blocking and the runtime is
+    // already closing — which is exactly the case the review requires an answer
+    // for: where the socket is writable, a pre-commit request receives its typed
+    // `Closing` refusal rather than a dropped connection. Polling cancellation
+    // first would make that answer a coin toss.
+    //
+    // Terminality is unaffected, because the bias only decides a tie. A write
+    // that cannot make progress returns `Pending`, cancellation is polled next
+    // and wins, and every loop that calls this has cancellation polled first in
+    // its own select — so no sequence of instantly-writable lines can keep a
+    // connection alive past the drain.
+    tokio::select! {
+        biased;
+        result = write => Ok(match result {
+            Ok(()) => Wrote::Sent,
+            Err(_) => Wrote::Ended,
+        }),
+        () = cancel.cancelled() => Ok(Wrote::Ended),
+    }
+}
+
+/// One value a connection-long mode keeps, and the funding for exactly the
+/// buffers it owns.
+///
+/// A subscription or a pipe outlives the request that started it, and what it
+/// really retains is a field or two out of that request rather than the decoded
+/// tree. Funding those as themselves is what lets the request's own admission be
+/// released when the stream begins — and that admission is derived from the
+/// *encoded* length, so it is as large as whatever padding the client chose to
+/// send.
+///
+/// Field order is load-bearing in the usual direction: `value` is destroyed
+/// before the leases that paid for it.
+struct Retained<T> {
+    value: T,
+    _bytes: myownmesh_core::ResourceLease,
+    _allocation: myownmesh_core::ResourceLease,
+}
+
+impl<T> Retained<T> {
+    /// Fund `lengths` buffers totalling their sum, then take ownership.
+    ///
+    /// `lengths` is supplied rather than derived, because only the caller knows
+    /// which of a value's buffers it is keeping. One allocation is counted per
+    /// length, on the same reasoning as every other retained claim in this
+    /// daemon: a `String` reserves at least its length and the excess is the
+    /// allocator's, not this code's to state.
+    fn admit(
+        value: T,
+        lengths: impl IntoIterator<Item = usize>,
+        frames: &FrameAdmission,
+    ) -> Result<Self> {
+        let mut bytes = 0usize;
+        let mut allocations = 0u64;
+        for length in lengths {
+            bytes = bytes
+                .checked_add(length)
+                .context("retained control field lengths are not representable")?;
+            allocations = allocations
+                .checked_add(1)
+                .context("retained control field count is not representable")?;
+        }
+        let (bytes, allocation) = frames
+            .admit_retained(bytes, allocations)
+            .context("the fields this control stream keeps were not admitted")?;
+        Ok(Self {
+            value,
+            _bytes: bytes,
+            _allocation: allocation,
+        })
+    }
+}
+
+impl<T> std::ops::Deref for Retained<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
     }
 }
 
@@ -215,6 +449,8 @@ async fn serve_with_hooks(
     let listener = bind_listener(&target)?;
     info!(?target, "control socket listening");
     let state = Arc::new(ControlState {
+        finished: tokio::sync::Notify::new(),
+        ended: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
         services,
@@ -224,15 +460,43 @@ async fn serve_with_hooks(
         realtime,
         #[cfg(test)]
         before_events_subscribe_commit: hooks.before_events_subscribe_commit,
+        #[cfg(test)]
+        at_events_stream_entry: hooks.at_events_stream_entry,
     });
     #[cfg(not(test))]
     let _ = hooks;
+
+    // Every accepted connection's join handle, one funded node each.
+    //
+    // Retained rather than detached, and this is the difference between waiting
+    // for a count and joining a task. The count reaching zero says each task's
+    // `TaskAdmission` was dropped, which a task ending *or being dropped
+    // mid-await* both do; it cannot observe a panic, and a panicking connection
+    // task would decrement exactly like a clean one and leave `serve` reporting
+    // a tidy close over a connection that had aborted mid-request. Joining
+    // observes the `JoinError`.
+    //
+    // Funded, and not an ordinary `Vec`: the storage is sized by how many
+    // connections a local client chose to open, which is the same reason every
+    // other collection in this daemon is admitted. One node per live connection
+    // rather than per connection ever accepted -- see the reap below.
+    let mut accepted: crate::ipc::LeasedList<tokio::task::JoinHandle<()>> =
+        crate::ipc::LeasedList::new();
 
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
                 info!("control socket shutting down");
                 break;
+            }
+            // A connection ended. Reaping is driven by completion rather than
+            // by the next accept, so a listener that goes quiet after its last
+            // client leaves does not keep that connection's funding charged
+            // until shutdown. `join_finished` waits out the finalization the
+            // signal races; see its own note for why that wait terminates
+            // without a timer.
+            () = state.finished.notified() => {
+                join_finished(&state.ended, &mut accepted).await;
             }
             res = listener.accept() => {
                 match res {
@@ -259,8 +523,43 @@ async fn serve_with_hooks(
                                 continue;
                             }
                         };
+                        // Connections that have already ended, joined and
+                        // released before another is funded. No lock is held
+                        // here and none is needed: this list belongs to the
+                        // control task alone. Without it the daemon would hold
+                        // one funded node per connection it had *ever* accepted
+                        // and would eventually refuse a live client on behalf of
+                        // tasks that finished hours ago.
+                        join_finished(&state.ended, &mut accepted).await;
+                        // The node that will hold this connection's handle,
+                        // funded before the task it will name exists. Refused,
+                        // the connection is closed here rather than spawned into
+                        // a handle nothing could join -- which is the detached
+                        // task this whole list exists to remove.
+                        let node = match crate::ipc::LeasedList::<
+                            tokio::task::JoinHandle<()>,
+                        >::node_claim()
+                        .map_err(crate::ipc::clients::IpcAdmissionError::Claim)
+                        .and_then(|claim| state.clients.acquire_claim(claim))
+                        {
+                            Ok(node) => node,
+                            Err(refusal) => {
+                                warn!(
+                                    "control connection refused, its join could not be \
+                                     retained: {refusal}"
+                                );
+                                drop(task);
+                                drop(stream);
+                                continue;
+                            }
+                        };
+                        let ended = ConnectionEnded(state.clone());
                         let state = state.clone();
-                        tokio::spawn(async move {
+                        let join = tokio::spawn(async move {
+                            // Declared first so it is dropped last: the
+                            // completion signal is the final thing this task
+                            // does, after its funding has been released.
+                            let _ended = ended;
                             // Moved in, so the lease is released exactly when
                             // this task stops — including if it is dropped
                             // mid-await rather than returning.
@@ -269,6 +568,7 @@ async fn serve_with_hooks(
                                 debug!("control client error: {e:#}");
                             }
                         });
+                        accepted.push(join, node);
                     }
                     Err(e) => {
                         warn!("accept failed: {e}");
@@ -297,29 +597,64 @@ async fn serve_with_hooks(
     //
     // 3. The drain itself. Every client's flows are closed and every handler it
     //    was the last claimant of is forgotten, through their own networks.
-    //    Dropping the handles would release nothing — a flow handle owns no part
-    //    of the flow — so a daemon that shut down without this would leave
-    //    native transceivers and senders behind for as long as their sessions
-    //    lived.
+    //    Closed rather than dropped, and the difference is no longer that
+    //    dropping releases nothing: a `RealtimeFlowHandle`'s own Drop performs
+    //    exact flow cleanup now. Explicit close is still the stronger of the
+    //    two, because it awaits the native retirement and can report what it
+    //    found, where Drop is the non-blocking backstop for the paths that
+    //    cannot await one. A shutdown that reports the control surface closed
+    //    should have waited for the native halves rather than left them
+    //    retiring behind it.
     //
     // 4. And only then does this return. `serve` returning is a claim that the
     //    control surface is over, and it was not true before: a connection task
     //    outliving it would still be holding a registry, a mesh handle and a
     //    socket that this function's caller is entitled to treat as finished
-    //    with. Waiting for the count to reach zero is what makes the claim true.
+    //    with. Joining every retained connection handle is what makes the claim
+    //    true; the task count that follows is the weaker, wider check, and it
+    //    covers what this list does not — the channel pumps and inbound-stream
+    //    watchdogs the registry admitted on those connections' behalf. A count
+    //    alone never made the claim: it decrements identically for a task that
+    //    returned and one that panicked.
+    //
+    //    The wait terminates because every long-lived mode observes step 1's
+    //    signal: an events stream, a trace stream, a realtime pipe and every
+    //    socket write are each raced against the runtime's close, and a
+    //    registered client's connection is raced against its own removal in
+    //    step 3 as well. Without those the count could stay above zero for as
+    //    long as an idle client chose to stay connected, and this wait would be
+    //    the hang rather than the join.
     if state.clients.begin_closing() {
-        // One client at a time, released before the next is taken. The registry
-        // hands back ids rather than records for exactly this reason: a record
-        // carries the client's retired routes and forgotten names, and
-        // collecting every one of them first would hold every client's cleanup
-        // state at once instead of one client's.
-        for client in state.clients.shutdown_ids() {
-            if let Some(removed) = state.clients.unregister(client) {
-                release_owned_registrations(&state, removed).await;
+        // One client at a time, released before the next is taken, and asked for
+        // one at a time too. The registry answers an id rather than a record for
+        // exactly this reason: a record carries the client's retired routes and
+        // forgotten names, so collecting every one of them first would hold
+        // every client's cleanup state at once instead of one client's. And it
+        // answers one id rather than all of them because a snapshot of every
+        // connected client is an allocation sized by how many connected —
+        // `unregister` removes what this answered, so asking again is what
+        // makes progress rather than a list to walk.
+        while let Some(client) = state.clients.shutdown_next() {
+            match state.clients.unregister(client) {
+                Some(removed) => release_owned_registrations(&state, removed).await,
+                // Removed by something else between the two calls. The table no
+                // longer holds it, so the next question moves past it.
+                None => continue,
             }
         }
         state.clients.shutdown_settle_pending();
     }
+    // Every accepted connection, joined. This is the claim `serve` returning
+    // makes, and a decrementing counter cannot make it: a task that panicked
+    // released its admission exactly like one that returned. Each node is freed
+    // before its own funding is released, and the list is empty by the time this
+    // returns.
+    join_all(&mut accepted).await;
+    // And then the count, which covers what this list does not: the channel
+    // pumps and inbound-stream watchdogs the registry admitted on connections'
+    // behalf. It should already be zero -- retiring a route joins its pump --
+    // and waiting on it is what makes that a checked fact rather than an
+    // assumption.
     state.clients.wait_for_tasks().await;
     // Answers the state rather than asserting one, so a second `serve` over the
     // same registry — which drained nothing — cannot publish `Closed` on the
@@ -333,7 +668,111 @@ async fn serve_with_hooks(
     Ok(())
 }
 
+/// Join every accepted connection that has already finished.
+///
+/// **Awaited, never dropped.** Dropping a finished `JoinHandle` detaches it and
+/// discards its `JoinError`, so a connection task that panicked would be
+/// indistinguishable from one that returned — which is the whole reason these
+/// handles are retained rather than merely counted. A dropped finished handle is
+/// not a join.
+///
+/// Split first, so the awaits happen over a list of this function's own rather
+/// than during a walk of the one `serve` is still adding to. Each handle's node
+/// is freed and its funding released as it is popped.
+///
+/// **Waits out finalization rather than looking once.** `ended` counts tasks
+/// that have run their completion guard and not yet been joined, and that guard
+/// runs *inside* the task's future — so a handle can be counted here and still
+/// report `is_finished() == false` for the moment it takes the runtime to
+/// finalize it. Looking once would consume the wake, find nothing, and leave
+/// that connection's funded node charged until the next completion, the next
+/// accept, or shutdown; on a listener that has gone quiet after its last client
+/// left, that is until shutdown.
+///
+/// The spin has an exact, non-timer termination condition, and the count is what
+/// supplies it: a nonzero `ended` means some handle *already ran its guard*, and
+/// a handle is only removed from `accepted` by being joined here, so that handle
+/// is still in the list and will report finished. Every iteration either extracts
+/// at least one — which decrements — or yields the runtime the step it needs.
+/// Nothing waits on elapsed time and no bound is invented.
+///
+/// The two arms that call this are arms of one select in one task, so a task
+/// spawned in the accept arm is always pushed before the completion arm can be
+/// polled; there is no counted guard whose handle is not yet in the list. The
+/// empty-list check is a backstop for that invariant rather than the mechanism.
+///
+/// Answers how many ended abnormally, so a control can observe that this joins
+/// rather than discards — the two are otherwise identical from outside.
+async fn join_finished(
+    ended: &std::sync::atomic::AtomicUsize,
+    accepted: &mut crate::ipc::LeasedList<tokio::task::JoinHandle<()>>,
+) -> usize {
+    let mut abnormal = 0;
+    loop {
+        if ended.load(std::sync::atomic::Ordering::Acquire) == 0 || accepted.is_empty() {
+            return abnormal;
+        }
+        let mut finished = accepted.split_where(|join| join.is_finished());
+        let reaped = finished.len();
+        if reaped == 0 {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        // Never more than were counted: a handle reports finished only after its
+        // own guard ran, and each handle is joined exactly once.
+        ended.fetch_sub(reaped, std::sync::atomic::Ordering::AcqRel);
+        abnormal += join_all(&mut finished).await;
+    }
+}
+
+/// Join everything in `handles`, whether it has finished or not, and answer how
+/// many ended abnormally.
+async fn join_all(handles: &mut crate::ipc::LeasedList<tokio::task::JoinHandle<()>>) -> usize {
+    let mut abnormal = 0;
+    while let Some(join) = handles.pop() {
+        if let Err(e) = join.await {
+            abnormal += 1;
+            warn!("control connection task did not end cleanly: {e}");
+        }
+    }
+    abnormal
+}
+
 struct ControlState {
+    /// Woken when one accepted connection task ends, however it ends.
+    ///
+    /// The reap signal. Without it a finished connection's funded join node is
+    /// released only by the *next* accept, so a daemon whose listener goes quiet
+    /// after a client disconnects keeps that node charged for as long as the
+    /// quiet lasts — funding held on behalf of a task that ended.
+    ///
+    /// Here rather than in a new `Arc`, because every connection task already
+    /// holds one of these: the signal costs a `Notify` in a struct that exists,
+    /// and no allocation at all.
+    ///
+    /// `notify_one` rather than `notify_waiters`, deliberately: it stores a
+    /// permit when nobody is waiting, so a completion landing between two polls
+    /// of the accept loop is consumed by the next poll rather than lost. One
+    /// permit is enough because the reap drains *every* finished handle rather
+    /// than one.
+    finished: tokio::sync::Notify,
+    /// How many connection tasks have signalled completion and not yet been
+    /// joined.
+    ///
+    /// The wake alone is not enough, and this is what makes the reap exact
+    /// rather than opportunistic. A task signals from a drop guard *inside* its
+    /// own future, so at the instant the signal lands its `JoinHandle` is not
+    /// yet finalized and reports `is_finished() == false`. A reap that looked
+    /// once and gave up would consume the permit, find nothing, and — on a
+    /// listener that then went quiet — leave that connection's funded node
+    /// charged until shutdown.
+    ///
+    /// A nonzero count is a *causal* guarantee that some retained handle is in
+    /// finalization, which is what gives [`join_finished`] an exact termination
+    /// condition to spin on instead of a duration. Incremented by the guard,
+    /// decremented by the join that consumes it, so it can only be nonzero while
+    /// there is really something to reap.
+    ended: std::sync::atomic::AtomicUsize,
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
@@ -343,6 +782,9 @@ struct ControlState {
     realtime_frame_bytes: Option<usize>,
     #[cfg(test)]
     before_events_subscribe_commit: Option<Arc<DispatchBarrier>>,
+    /// See [`ControlHooks::at_events_stream_entry`].
+    #[cfg(test)]
+    at_events_stream_entry: Option<Arc<DispatchBarrier>>,
 }
 
 // The daemon keeps no realtime flow state of its own, and deliberately holds
@@ -386,6 +828,10 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
     // Requests already being dispatched are not interrupted — the select is at
     // the top of the loop, not around the dispatch — so shutting down cannot
     // leave a request half-applied. It costs one more round trip at worst.
+    // What ends this connection besides its own client. Rebound to the exact
+    // client inside the modes that register one; until then the runtime's close
+    // signal is the only cancellation a connection with no record can have.
+    let cancel = ConnectionCancel::runtime(&state.clients);
     loop {
         let line = tokio::select! {
             biased;
@@ -395,323 +841,496 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 None => break,
             },
         };
-        // Funded before the parse runs, and the lease outlives the decoded value
-        // it accounts for: `(lease, request)` drops `request` first, because
-        // bindings from one pattern drop in reverse. The parsed `Request` owns
-        // dynamically allocated strings and payload that live for as long as the
-        // dispatch below, which may be the connection's whole life -- an earlier
-        // comment here said the line's bytes were the only thing worth
-        // accounting past this point and dropped the funding outright, leaving
-        // that decoded state charged to nobody.
-        let (_decoded, request) = match line.decode_request(&json_lines) {
+        // Funded before the parse runs, and what comes back is the *retention*
+        // alone: the parse work is acquired, spent and released inside
+        // `decode_request`, so the padded worst case of a line's parse and CPU
+        // claim cannot be pinned by whatever the request turns into. The lease
+        // that does come back outlives the decoded value it accounts for --
+        // `(lease, request)` drops `request` first, because bindings from one
+        // pattern drop in reverse.
+        let (decoded, request) = match line.decode_request(&json_lines) {
             Ok(decoded) => decoded,
             Err(DecodeRefusal::Malformed(e)) => {
                 let resp = Response::err(format!("parse: {e}"));
-                let error = serde_json::to_string(&resp)? + "\n";
-                writer.write_all(error.as_bytes()).await?;
-                continue;
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Response(&resp),
+                )
+                .await?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
             }
             Err(refusal @ DecodeRefusal::Admission(_)) => {
                 let resp = Response::err(refusal.to_string());
-                let error = serde_json::to_string(&resp)? + "\n";
-                writer.write_all(error.as_bytes()).await?;
-                continue;
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Response(&resp),
+                )
+                .await?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
             }
         };
         // The raw line's bytes are dead weight from here -- the decoded request
-        // owns its own copies -- so the byte leases go now while the structural
-        // lease above stays with what it funds.
+        // owns its own copies -- so the byte leases go now while the retention
+        // above stays with what it funds.
         drop(line);
-        // EventsSubscribe converts the connection into a server-
-        // push channel: the daemon writes mesh events plus any
-        // IPC-routed frames (RpcInbound, ChannelInbound, ...)
-        // until the client disconnects. Allocate a ClientId so
-        // subsequent RPC/channel-management requests on OTHER
-        // command sockets can target this connection.
-        if matches!(request, Request::EventsSubscribe) {
-            // One acquisition subtree per event-subscribed connection.
-            // `local_application_resource_scope` already issues a child of the
-            // runtime's owner, so this connection's queued frames are accounted
-            // as their own subtree and every byte behind them is released when
-            // both mailbox ends drop at disconnect — without the daemon naming
-            // a frame count anywhere.
-            let scope = state
-                .mesh
-                .local_application_resource_scope()
-                .context("issue this client's local application resource scope")?;
-            let (tx, rx) = myownmesh_core::resource_mailbox(scope)
-                .context("fund this client's outbound frame mailbox")?;
-            // Registration is an admission now. A refusal is answered on this
-            // connection rather than raised: the socket is healthy and the
-            // client is entitled to know why it was not subscribed, whereas
-            // returning would drop the connection and leave it guessing.
-            // The seam is here and not a line earlier or later. Above it the
-            // mailbox is funded and the scope issued but nothing is filed;
-            // below it the client is in the table. A control that paused
-            // anywhere else would be asserting about a different race.
-            #[cfg(test)]
-            if let Some(barrier) = &state.before_events_subscribe_commit {
-                barrier.pass().await;
-            }
-            let client = match state.clients.register(tx) {
-                Ok(client) => client,
-                Err(refusal) => {
-                    let resp = Response::err(format!("events subscribe refused: {refusal}"));
-                    let line = serde_json::to_string(&resp)? + "\n";
-                    writer.write_all(line.as_bytes()).await?;
-                    continue;
+        // Taken by value, and the three connection-converting variants are
+        // handled here rather than through `dispatch`, because each of them
+        // starts something that outlives the request. Each releases `decoded`
+        // before its stream begins, having first funded the one or two fields it
+        // is actually keeping. Everything else falls through with its funding
+        // intact, which is correct: an ordinary request is still being processed
+        // for exactly as long as its decoded tree is alive.
+        let request = match request {
+            // EventsSubscribe converts the connection into a server-push
+            // channel: the daemon writes mesh events plus any IPC-routed frames
+            // (RpcInbound, ChannelInbound, ...) until the client disconnects. A
+            // ClientId is allocated so subsequent RPC/channel-management
+            // requests on OTHER command sockets can target this connection.
+            Request::EventsSubscribe => {
+                // Nothing of the request survives this line. `events_subscribe`
+                // carries no fields, so there is no field to move anywhere and
+                // no retention to acquire -- a padded one funds nothing at all
+                // past here.
+                drop(decoded);
+                // One acquisition subtree per event-subscribed connection.
+                // `local_application_resource_scope` already issues a child of
+                // the runtime's owner, so this connection's queued frames are
+                // accounted as their own subtree and every byte behind them is
+                // released when both mailbox ends drop at disconnect -- without
+                // the daemon naming a frame count anywhere.
+                let scope = state
+                    .mesh
+                    .local_application_resource_scope()
+                    .context("issue this client's local application resource scope")?;
+                let (tx, rx) = myownmesh_core::resource_mailbox(scope)
+                    .context("fund this client's outbound frame mailbox")?;
+                // Registration is an admission now. A refusal is answered on
+                // this connection rather than raised: the socket is healthy and
+                // the client is entitled to know why it was not subscribed,
+                // whereas returning would drop the connection and leave it
+                // guessing.
+                // The seam is here and not a line earlier or later. Above it the
+                // mailbox is funded and the scope issued but nothing is filed;
+                // below it the client is in the table. A control that paused
+                // anywhere else would be asserting about a different race.
+                #[cfg(test)]
+                if let Some(barrier) = &state.before_events_subscribe_commit {
+                    barrier.pass().await;
                 }
-            };
-            let client_id = client.id;
-            // Ack carries the client_id so the caller knows what
-            // to pass back on subsequent `client_id`-bearing ops.
-            let ack = Response::ok(serde_json::json!({
-                "subscribed": true,
-                "client_id": client_id.to_string(),
-                "client_capability": state.clients.capability(&client),
-            }));
-            let line = serde_json::to_string(&ack)? + "\n";
-            writer.write_all(line.as_bytes()).await?;
-            let result = run_events_stream(&state, &mut writer, rx).await;
-            // Clean up the client's claims regardless of how the stream ended.
-            //
-            // What comes back is what the registry cannot release on its own:
-            // the handle, whose realtime flows have to be *closed* rather than
-            // dropped — a flow handle owns nothing, so dropping one leaves the
-            // label claimed and the native half up until the session itself
-            // ends — and the methods this client was the last claimant of, whose
-            // synthetic handlers are still installed. This is the one place that
-            // knows both those and the networks to reach them through.
-            //
-            // `None` means something else already removed this client, and that
-            // something else is the shutdown sweep, which does the same release
-            // with the same handle. Doing nothing here is not skipping the work.
-            if let Some(removed) = state.clients.unregister(client_id) {
-                release_owned_registrations(&state, removed).await;
-            }
-            result?;
-            break;
-        }
-        // TraceSubscribe is the same server-push pattern as
-        // EventsSubscribe but carries only ConnTrace records and needs
-        // no ClientId (it routes nothing back in). An unknown network
-        // is reported as a plain error response and the connection
-        // stays open for another request.
-        if let Request::TraceSubscribe { network } = &request {
-            let network = network.clone();
-            match state.registry.get(&network) {
-                Some(net) => {
-                    let ack = Response::ok(serde_json::json!({
-                        "subscribed": true,
-                        "stream": "conn_trace",
-                        "network": network,
-                    }));
-                    let line = serde_json::to_string(&ack)? + "\n";
-                    writer.write_all(line.as_bytes()).await?;
-                    let rx = net.state().subscribe_conn_trace();
-                    let result = run_trace_stream(&mut writer, rx).await;
-                    result?;
-                    break;
+                let client = match state.clients.register(tx) {
+                    Ok(client) => client,
+                    Err(refusal) => {
+                        let resp = Response::err(format!("events subscribe refused: {refusal}"));
+                        match write_line(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            ControlOut::Response(&resp),
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    }
+                };
+                let client_id = client.id;
+                // From here the exact client is a cancellation owner too. See
+                // [`ConnectionCancel::owned_by`]: the mailbox alone cannot end
+                // this task, because this task is holding the handle its sender
+                // lives in.
+                let cancel = ConnectionCancel::owned_by(&state.clients, &client);
+                // Ack carries the client_id so the caller knows what to pass
+                // back on subsequent `client_id`-bearing ops.
+                let ack = Response::ok(serde_json::json!({
+                    "subscribed": true,
+                    "client_id": client_id.to_string(),
+                    "client_capability": state.clients.capability(&client),
+                }));
+                let result = match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Response(&ack),
+                )
+                .await?
+                {
+                    Wrote::Sent => {
+                        // The subscription is live and the request that opened
+                        // it is finished with. See
+                        // [`ControlHooks::at_events_stream_entry`].
+                        #[cfg(test)]
+                        if let Some(barrier) = &state.at_events_stream_entry {
+                            barrier.pass().await;
+                        }
+                        run_events_stream(
+                            &json_lines,
+                            &cancel,
+                            &mut writer,
+                            rx,
+                            state.mesh.events(),
+                        )
+                        .await
+                    }
+                    // The client never learned its own id, so there is nothing
+                    // for it to do with the subscription. Cleanup below is the
+                    // same either way.
+                    Wrote::Ended => Ok(()),
+                };
+                // Clean up the client's claims regardless of how the stream
+                // ended.
+                //
+                // What comes back is what the registry cannot release on its
+                // own: the handle, whose realtime flows are closed through their
+                // own networks rather than merely dropped -- explicit close
+                // awaits the native retirement and can report it, where the
+                // handle's own Drop is the non-blocking backstop -- and the
+                // methods this client was the last claimant of, whose synthetic
+                // handlers are still installed. This is the one place that knows
+                // both those and the networks to reach them through.
+                //
+                // `None` means something else already removed this client, and
+                // that something else is the shutdown sweep, which does the same
+                // release with the same handle. Doing nothing here is not
+                // skipping the work.
+                if let Some(removed) = state.clients.unregister(client_id) {
+                    release_owned_registrations(&state, removed).await;
                 }
-                None => {
-                    let resp = Response::err(format!("unknown network: {network}"));
-                    let line = serde_json::to_string(&resp)? + "\n";
-                    writer.write_all(line.as_bytes()).await?;
-                    continue;
-                }
+                result?;
+                break;
             }
-        }
-        // RealtimePipe converts the connection into a one-way binary stream of
-        // realtime units, the EventsSubscribe pattern in whichever direction was
-        // asked for. After the ack the connection speaks only length-prefixed
-        // binary frames — no per-frame JSON, no base64.
-        if let Request::RealtimePipe {
-            direction,
-            network,
-            peer,
-            client_id,
-            client_capability,
-            flow_capability,
-        } = &request
-        {
-            // Field shapes are checked before the ack, and extras are refused
-            // rather than ignored. A pipe that acked and then behaved as though
-            // a field had not been sent would be indistinguishable, from the
-            // client's side, from one that honoured it.
-            let bound = match realtime_pipe_binding(
-                *direction,
+            // TraceSubscribe is the same server-push pattern as EventsSubscribe
+            // but carries only ConnTrace records and needs no ClientId (it
+            // routes nothing back in). An unknown network is reported as a plain
+            // error response and the connection stays open for another request.
+            Request::TraceSubscribe { network } => {
+                // The one field this stream keeps, funded as itself before the
+                // request's own funding is released -- so the buffer is never
+                // live unaccounted, and a padded `trace_subscribe` reserves the
+                // network name and nothing else for the subscription's life.
+                let lengths = [network.len()];
+                let network = Retained::admit(network, lengths, &json_lines)?;
+                drop(decoded);
+                let Some(net) = state.registry.get(&network) else {
+                    let resp = Response::err(format!("unknown network: {}", *network));
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Response(&resp),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                let ack = Response::ok(serde_json::json!({
+                    "subscribed": true,
+                    "stream": "conn_trace",
+                    "network": *network,
+                }));
+                let rx = net.state().subscribe_conn_trace();
+                // A trace client has no registry entry to be unregistered, so
+                // the runtime's close is its only cancellation -- and without
+                // one, a connected trace client on a quiet network held the
+                // whole drain open.
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Response(&ack),
+                )
+                .await?
+                {
+                    Wrote::Sent => run_trace_stream(&json_lines, &cancel, &mut writer, rx).await?,
+                    Wrote::Ended => {}
+                }
+                break;
+            }
+            // RealtimePipe converts the connection into a one-way binary stream
+            // of realtime units, the EventsSubscribe pattern in whichever
+            // direction was asked for. After the ack the connection speaks only
+            // length-prefixed binary frames -- no per-frame JSON, no base64.
+            Request::RealtimePipe {
+                direction,
                 network,
-                peer.as_deref(),
-                flow_capability.as_deref(),
-            ) {
-                Ok(bound) => bound,
-                Err(message) => {
-                    let resp = Response::err(message);
-                    writer
-                        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-                        .await?;
-                    continue;
-                }
-            };
-            // Both directions are owned now. Inbound has always needed an owner
-            // to end with; outbound needs one because the flow it writes to
-            // belongs to a client, and the client capability is what proves this
-            // connection is that client.
-            let pipe_owner = {
-                let (Some(client_id), Some(capability)) =
-                    (*client_id, client_capability.as_deref())
-                else {
-                    let resp = Response::err(
-                        "realtime_pipe requires client_id and client_capability: a pipe \
-                         is owned by the client that opened its flow, and possession of \
-                         the capability is what proves this connection is that client",
-                    );
-                    writer
-                        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-                        .await?;
-                    continue;
+                peer,
+                client_id,
+                client_capability,
+                flow_capability,
+            } => {
+                // Field shapes are checked before the ack, and extras are
+                // refused rather than ignored. A pipe that acked and then
+                // behaved as though a field had not been sent would be
+                // indistinguishable, from the client's side, from one that
+                // honoured it.
+                let bound = match realtime_pipe_binding(
+                    direction,
+                    &network,
+                    peer.as_deref(),
+                    flow_capability.as_deref(),
+                ) {
+                    Ok(bound) => bound,
+                    Err(message) => {
+                        let resp = Response::err(message);
+                        match write_line(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            ControlOut::Response(&resp),
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    }
                 };
-                let Some(owner) = state.clients.authenticate(client_id, capability) else {
-                    let resp = Response::err("invalid local client authority");
-                    writer
-                        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-                        .await?;
-                    continue;
+                // Both directions are owned now. Inbound has always needed an
+                // owner to end with; outbound needs one because the flow it
+                // writes to belongs to a client, and the client capability is
+                // what proves this connection is that client.
+                let pipe_owner = {
+                    let (Some(client_id), Some(capability)) =
+                        (client_id, client_capability.as_deref())
+                    else {
+                        let resp = Response::err(
+                            "realtime_pipe requires client_id and client_capability: a pipe \
+                             is owned by the client that opened its flow, and possession of \
+                             the capability is what proves this connection is that client",
+                        );
+                        match write_line(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            ControlOut::Response(&resp),
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    };
+                    let Some(owner) = state.clients.authenticate(client_id, capability) else {
+                        let resp = Response::err("invalid local client authority");
+                        match write_line(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            ControlOut::Response(&resp),
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    };
+                    owner
                 };
-                owner
-            };
-            let bound_network = match &bound {
-                RealtimePipeBinding::Outbound { network, .. }
-                | RealtimePipeBinding::Inbound { network, .. } => network.clone(),
-            };
-            let Some(net) = state.registry.get(&bound_network) else {
-                let resp = Response::err(format!("unknown network: {bound_network}"));
-                writer
-                    .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-                    .await?;
-                continue;
-            };
-            // An inbound pipe claims the session's unit stream BEFORE the ack.
-            // The claim is once per session, so it can legitimately fail — a
-            // second pipe for the same peer, or a session that is already gone —
-            // and those must be refusals, not an ack followed by a connection
-            // that silently never delivers anything.
-            //
-            // The claim is an exclusive lease, and the reader IS the lease:
-            // dropping it returns it. So when this pipe ends — cleanly, or
-            // because the client crashed and its socket died — the next pipe for
-            // the same session claims successfully and resumes. Nothing is lost
-            // in the gap, because units accumulate on the session's own queue
-            // and never in the reader.
-            //
-            // Which is why the daemon caches nothing here. Holding a reader
-            // across reconnects, or remembering which sessions were claimed,
-            // would give the daemon a lease to release correctly and a mirror to
-            // keep in step. The lease already releases itself, and the queue it
-            // guards belongs to the session.
-            //
-            // A refusal therefore means what it says: the session is gone, or a
-            // pipe for it is live right now. Neither is a lingering claim from a
-            // pipe that has already died.
-            //
-            // An outbound pipe proves its flow before the ack for the mirror
-            // reason: a client that acked and then found every unit refused
-            // would have to discover from silence that its capability was wrong.
-            let inbound_stream = match &bound {
-                RealtimePipeBinding::Inbound { peer, .. } => match net.realtime_inbound(peer) {
-                    Some(stream) => Some(stream),
-                    None => {
-                        let resp = Response::err(format!(
-                            "no inbound realtime stream for {peer}: the session is not \
+                // The binding made its own copies of the two coordinates it
+                // keeps, and those are all the pipe retains. Funded as
+                // themselves here, and only then is the decoded request -- whose
+                // claim is sized by the encoded line rather than by these two
+                // strings -- released. The capability was consumed by the
+                // authentication above and the rest was never needed past this
+                // point, so all of it goes together and the funding goes last.
+                let lengths = bound.retained_lengths();
+                let bound = Retained::admit(bound, lengths, &json_lines)?;
+                drop((network, peer, client_capability, flow_capability, decoded));
+                // The pipe's owner is a real client, so this connection ends on
+                // its disconnect or on the runtime's close, whichever comes
+                // first.
+                let cancel = ConnectionCancel::owned_by(&state.clients, &pipe_owner);
+                // Borrowed, not cloned. The binding already owns this name and
+                // the lookup only reads it; the copy this used to take was a
+                // third live allocation of a client-chosen string, and removing
+                // it is a better answer than funding it.
+                let Some(net) = state.registry.get(bound.network()) else {
+                    let resp = Response::err(format!("unknown network: {}", bound.network()));
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Response(&resp),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                // An inbound pipe claims the session's unit stream BEFORE the
+                // ack. The claim is once per session, so it can legitimately
+                // fail -- a second pipe for the same peer, or a session that is
+                // already gone -- and those must be refusals, not an ack
+                // followed by a connection that silently never delivers
+                // anything.
+                //
+                // The claim is an exclusive lease, and the reader IS the lease:
+                // dropping it returns it. So when this pipe ends -- cleanly, or
+                // because the client crashed and its socket died -- the next
+                // pipe for the same session claims successfully and resumes.
+                // Nothing is lost in the gap, because units accumulate on the
+                // session's own queue and never in the reader.
+                //
+                // Which is why the daemon caches nothing here. Holding a reader
+                // across reconnects, or remembering which sessions were claimed,
+                // would give the daemon a lease to release correctly and a
+                // mirror to keep in step. The lease already releases itself, and
+                // the queue it guards belongs to the session.
+                //
+                // A refusal therefore means what it says: the session is gone,
+                // or a pipe for it is live right now. Neither is a lingering
+                // claim from a pipe that has already died.
+                //
+                // An outbound pipe proves its flow before the ack for the mirror
+                // reason: a client that acked and then found every unit refused
+                // would have to discover from silence that its capability was
+                // wrong.
+                let inbound_stream = match &*bound {
+                    RealtimePipeBinding::Inbound { peer, .. } => match net.realtime_inbound(peer) {
+                        Some(stream) => Some(stream),
+                        None => {
+                            let resp = Response::err(format!(
+                                "no inbound realtime stream for {peer}: the session is not \
                                  current, or a live pipe already holds it — one inbound pipe \
                                  per session, and the lease returns when that pipe ends"
-                        ));
-                        writer
-                            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-                            .await?;
-                        continue;
+                            ));
+                            match write_line(
+                                &mut writer,
+                                &json_lines,
+                                &cancel,
+                                ControlOut::Response(&resp),
+                            )
+                            .await?
+                            {
+                                Wrote::Sent => continue,
+                                Wrote::Ended => break,
+                            }
+                        }
+                    },
+                    RealtimePipeBinding::Outbound {
+                        network,
+                        flow_capability,
+                    } => {
+                        if pipe_owner
+                            .with_realtime_flow(flow_capability, network, |_flow| ())
+                            .is_none()
+                        {
+                            let resp = Response::err(
+                                "unknown flow_capability on this network: it was never issued \
+                                 to this client, or the flow it named has already been closed",
+                            );
+                            match write_line(
+                                &mut writer,
+                                &json_lines,
+                                &cancel,
+                                ControlOut::Response(&resp),
+                            )
+                            .await?
+                            {
+                                Wrote::Sent => continue,
+                                Wrote::Ended => break,
+                            }
+                        }
+                        None
                     }
-                },
-                RealtimePipeBinding::Outbound {
-                    network,
-                    flow_capability,
-                } => {
-                    if pipe_owner
-                        .with_realtime_flow(flow_capability, network, |_flow| ())
-                        .is_none()
-                    {
-                        let resp = Response::err(
-                            "unknown flow_capability on this network: it was never issued \
-                             to this client, or the flow it named has already been closed",
-                        );
-                        writer
-                            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-                            .await?;
-                        continue;
-                    }
-                    None
+                };
+                let ack = Response::ok(serde_json::json!({ "realtime_pipe": true }));
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Response(&ack),
+                )
+                .await?
+                {
+                    Wrote::Sent => {}
+                    Wrote::Ended => break,
                 }
-            };
-            let ack = Response::ok(serde_json::json!({ "realtime_pipe": true }));
-            writer
-                .write_all((serde_json::to_string(&ack)? + "\n").as_bytes())
-                .await?;
-            writer.flush().await?;
-            // Recover the buffered reader — it may already hold the first frame.
-            let pipe = async {
-                match (inbound_stream, &bound) {
-                    (
-                        None,
-                        RealtimePipeBinding::Outbound {
-                            network,
-                            flow_capability,
-                        },
-                    ) => {
-                        run_realtime_outbound_pipe(
-                            &net,
-                            &pipe_owner,
-                            flow_capability,
-                            network,
-                            // The frames, not the admitted reader. Handing the
-                            // wrapper over would move it, and its leases fund
-                            // the buffer these bytes arrive in -- the pipe would
-                            // be reading from an allocation whose funding had
-                            // travelled with a value it does not know it owns.
-                            // Borrowing leaves the owner here, alive for exactly
-                            // as long as the pipe runs.
-                            reader.frames(),
-                            &realtime_frames,
-                        )
-                        .await
+                // Recover the buffered reader — it may already hold the first
+                // frame.
+                let pipe = async {
+                    match (inbound_stream, &*bound) {
+                        (
+                            None,
+                            RealtimePipeBinding::Outbound {
+                                network,
+                                flow_capability,
+                            },
+                        ) => {
+                            run_realtime_outbound_pipe(
+                                &net,
+                                &pipe_owner,
+                                flow_capability,
+                                network,
+                                // The frames, not the admitted reader. Handing
+                                // the wrapper over would move it, and its leases
+                                // fund the buffer these bytes arrive in -- the
+                                // pipe would be reading from an allocation whose
+                                // funding had travelled with a value it does not
+                                // know it owns. Borrowing leaves the owner here,
+                                // alive for exactly as long as the pipe runs.
+                                reader.frames(),
+                                &realtime_frames,
+                            )
+                            .await
+                        }
+                        (Some(stream), RealtimePipeBinding::Inbound { peer, .. }) => {
+                            run_realtime_inbound_pipe(
+                                &net,
+                                peer,
+                                &stream,
+                                reader.frames(),
+                                &mut writer,
+                                &realtime_frames,
+                            )
+                            .await
+                        }
+                        // Unreachable by construction — the claim above is taken
+                        // on exactly the inbound arm — and spelled as a refusal
+                        // rather than a panic, because a control connection
+                        // failing closed is always preferable to a daemon that
+                        // stops.
+                        _ => Ok(()),
                     }
-                    (Some(stream), RealtimePipeBinding::Inbound { peer, .. }) => {
-                        run_realtime_inbound_pipe(
-                            &net,
-                            peer,
-                            &stream,
-                            reader.frames(),
-                            &mut writer,
-                            &realtime_frames,
-                        )
-                        .await
-                    }
-                    // Unreachable by construction — the claim above is taken on
-                    // exactly the inbound arm — and spelled as a refusal rather
-                    // than a panic, because a control connection failing closed
-                    // is always preferable to a daemon that stops.
-                    _ => Ok(()),
-                }
-            };
-            let result = tokio::select! {
-                result = pipe => result,
-                () = pipe_owner.wait_disconnected() => Ok(()),
-            };
-            result?;
-            break;
-        }
+                };
+                // The pipe's own writes are inside `pipe`, so this one select
+                // ends them as well as the pump: a client that stops reading an
+                // inbound pipe cannot hold the drain inside a frame write.
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Ok(()),
+                    result = pipe => result,
+                };
+                result?;
+                break;
+            }
+            other => other,
+        };
         let resp = dispatch(&state, request).await;
-        let line = serde_json::to_string(&resp)? + "\n";
-        writer.write_all(line.as_bytes()).await?;
+        match write_line(
+            &mut writer,
+            &json_lines,
+            &cancel,
+            ControlOut::Response(&resp),
+        )
+        .await?
+        {
+            Wrote::Sent => {}
+            Wrote::Ended => break,
+        }
     }
     Ok(())
 }
@@ -735,91 +1354,180 @@ mod dispatch;
 
 use dispatch::dispatch;
 
-/// Stream events to one connected subscriber. Drains two
-/// sources concurrently:
+/// Stream events to one connected subscriber. Drains two sources concurrently:
 ///
-/// 1. The mesh-wide [`MeshHandle::events`] broadcast — peer /
-///    phase / diag entries the engine emits.
-/// 2. The per-client mpsc — `ServerOut` frames the IPC bridge
-///    (RPC inbound, channel inbound, handler-displaced
-///    notifications) pushes for this specific client.
+/// 1. The mesh-wide [`MeshHandle::events`] broadcast — peer / phase / diag
+///    entries the engine emits.
+/// 2. The per-client mailbox — `ServerOut` frames the IPC bridge (RPC inbound,
+///    channel inbound, handler-displaced notifications) pushes for this specific
+///    client.
 ///
-/// Returns when the writer breaks (client gone) or both source
-/// streams close. Source 1 closes only on daemon shutdown;
-/// source 2 closes when the client's `unregister` drops the
-/// last sender, which the caller invokes after this function
-/// returns.
+/// **Neither source is preferred, and cancellation outranks both.** The two are
+/// separate questions and the selects are nested to keep them separate.
+///
+/// Fairness is between the *sources*, and it is **explicit alternation** rather
+/// than randomness. The single select this replaces was biased with the
+/// per-client mailbox first, which is deterministic starvation rather than
+/// ordinary scheduling variance — a sustained sequence of IPC-routed frames
+/// keeps that branch continuously ready, so mesh events are never polled at all
+/// until the broadcast ring gives up and reports lag, and the lag report is then
+/// the first the subscriber hears of events it should have been given.
+///
+/// An unbiased select would fix the starvation and would only fix it
+/// *probably*: with both sources continuously ready, each round is a coin toss,
+/// so the guarantee is statistical and a control asserting it can only be
+/// statistical too. `first` names which source gets the first look this round
+/// and is flipped by whichever one is served, so between any two frames from one
+/// source the other has been looked at. That is a property a control can assert
+/// exactly, and it is the same bound in the worst case.
+///
+/// No service count is fixed anywhere, because none would be right for two
+/// sources whose rates this daemon does not choose. Alternation is not a count:
+/// a source with nothing ready is passed over rather than waited for.
+///
+/// Cancellation is not a third source and must not be fair with them. Folding it
+/// into one unbiased select would make the close signal merely *probable* while
+/// either source stayed continuously ready — a subscriber under sustained load
+/// would leave the drain waiting on repeated coin tosses. The outer select is
+/// biased with cancellation first, so it is observed at the first opportunity
+/// and the sources compete only for what is left.
+///
+/// Returns when the writer breaks, when both sources close, or when this
+/// connection is cancelled — its own client removed, or the control runtime
+/// closing. The cancellation arm is what makes an idle subscriber on a quiet
+/// mesh terminal: the connection task holds the handle its mailbox sender lives
+/// in, so the mailbox never closes on its own and the two receive branches would
+/// otherwise both park forever.
+///
+/// Takes the mesh receiver rather than the `ControlState` it comes off, for the
+/// reason [`run_channel_pump`] takes its subscription: the alternation above is
+/// the whole subject of a control, and a control that had to stand up a mesh,
+/// a network registry and a service manager to reach it would end up asserting
+/// against a copy of this loop instead of this loop.
+///
+/// [`run_channel_pump`]: crate::ipc::bridge
 async fn run_events_stream<W>(
-    state: &Arc<ControlState>,
+    frames: &FrameAdmission,
+    cancel: &ConnectionCancel,
     writer: &mut W,
     mut client_rx: myownmesh_core::ResourceMailboxReceiver<crate::ipc::ServerOut>,
+    mut mesh_rx: broadcast::Receiver<myownmesh_core::events::MeshEvent>,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut mesh_rx = state.mesh.events();
+    /// One admitted frame out, and whether this connection is still serving.
+    async fn emit<W>(
+        writer: &mut W,
+        frames: &FrameAdmission,
+        cancel: &ConnectionCancel,
+        frame: &crate::ipc::ServerOut,
+    ) -> Result<bool>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        Ok(write_line(writer, frames, cancel, ControlOut::Frame(frame)).await? == Wrote::Sent)
+    }
+
+    // Which source gets the first look this round. Starts on the client, so a
+    // connection whose mailbox already has frames waiting when the stream opens
+    // sends one before looking at the mesh -- the ordering the previous shape
+    // had, kept for the first round only.
+    let mut mesh_first = false;
     loop {
-        tokio::select! {
+        let serving = tokio::select! {
             biased;
-            // Per-client frames first — drains IPC-routed
-            // RpcInbound / ChannelInbound / etc.
-            maybe_frame = client_rx.recv() => {
-                let Some(delivery) = maybe_frame else {
-                    // Sender dropped — only happens after the
-                    // outer handle_client called `unregister`,
-                    // which only fires after this returns. In
-                    // practice this branch never fires while
-                    // the connection is live; treat as benign
-                    // shutdown.
-                    return Ok(());
-                };
-                // The retention lease stays bound across the write and is
-                // dropped only after the bytes have left. Releasing it at pop
-                // would report the frame's memory as free while this task still
-                // holds and serializes it, which is the window a client that
-                // stopped reading would otherwise be admitted through twice.
-                let (frame, _retention) = delivery.into_parts();
-                let line = serde_json::to_string(&frame)? + "\n";
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    return Ok(());
-                }
-                if writer.flush().await.is_err() {
-                    return Ok(());
-                }
-            }
-            recv = mesh_rx.recv() => match recv {
-                Ok(event) => {
-                    let frame = crate::ipc::ServerOut::Event { event };
-                    let line = serde_json::to_string(&frame)? + "\n";
-                    if writer.write_all(line.as_bytes()).await.is_err() {
-                        return Ok(());
+            () = cancel.cancelled() => false,
+            serving = async {
+                // Both orderings are `biased`, and which one runs is decided by
+                // the flag rather than by the scheduler. Each arm flips it, so
+                // the source that was just served is the one looked at second
+                // next time -- and a source with nothing ready costs only the
+                // poll, since the other arm is tried in the same round.
+                //
+                // The retention lease on a client frame stays bound across the
+                // write and is dropped only after the bytes have left. Releasing
+                // it at pop would report the frame's memory as free while this
+                // task still holds and serializes it, which is the window a
+                // client that stopped reading would otherwise be admitted
+                // through twice. The encoded copy beside it is funded
+                // separately, by `write_line`, because it is a second
+                // simultaneously live allocation and this lease says nothing
+                // about it.
+                //
+                // `None` from the mailbox means every sender is gone. In
+                // practice the outer cancellation arm wins that race, because
+                // the handle holding the last sender is this task's own; it is
+                // treated as a benign end either way.
+                if mesh_first {
+                    tokio::select! {
+                        biased;
+                        recv = mesh_rx.recv() => {
+                            mesh_first = false;
+                            match recv {
+                                Ok(event) => emit(writer, frames, cancel, &crate::ipc::ServerOut::Event { event }).await,
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    emit(writer, frames, cancel, &crate::ipc::ServerOut::Lagged { skipped: n }).await
+                                }
+                                Err(broadcast::error::RecvError::Closed) => Ok(false),
+                            }
+                        }
+                        maybe_frame = client_rx.recv() => {
+                            mesh_first = true;
+                            let Some(delivery) = maybe_frame else {
+                                return Ok(false);
+                            };
+                            let (frame, _retention) = delivery.into_parts();
+                            emit(writer, frames, cancel, &frame).await
+                        }
                     }
-                    if writer.flush().await.is_err() {
-                        return Ok(());
+                } else {
+                    tokio::select! {
+                        biased;
+                        maybe_frame = client_rx.recv() => {
+                            mesh_first = true;
+                            let Some(delivery) = maybe_frame else {
+                                return Ok(false);
+                            };
+                            let (frame, _retention) = delivery.into_parts();
+                            emit(writer, frames, cancel, &frame).await
+                        }
+                        recv = mesh_rx.recv() => {
+                            mesh_first = false;
+                            match recv {
+                                Ok(event) => emit(writer, frames, cancel, &crate::ipc::ServerOut::Event { event }).await,
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    emit(writer, frames, cancel, &crate::ipc::ServerOut::Lagged { skipped: n }).await
+                                }
+                                Err(broadcast::error::RecvError::Closed) => Ok(false),
+                            }
+                        }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let frame = crate::ipc::ServerOut::Lagged { skipped: n };
-                    let line = serde_json::to_string(&frame)? + "\n";
-                    if writer.write_all(line.as_bytes()).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            },
+            } => serving?,
+        };
+        if !serving {
+            return Ok(());
         }
     }
 }
 
-/// Stream one network's connection-state transitions to a connected
-/// `ctl trace` client. Writes each [`myownmesh_core::ConnTrace`] as a
-/// compact JSON object on its own line (clean JSONL for
-/// `scripts/merge-traces.py` and `jq`). On broadcast lag — a
-/// transition storm outran a slow reader — emits a `{"lagged":N}`
-/// marker rather than silently skipping, so a gap in the timeline is
-/// always explicit. Returns when the client disconnects or the network
-/// shuts down.
+/// Stream one network's connection-state transitions to a connected `ctl trace`
+/// client. Writes each [`myownmesh_core::ConnTrace`] as a compact JSON object on
+/// its own line (clean JSONL for `scripts/merge-traces.py` and `jq`). On
+/// broadcast lag — a transition storm outran a slow reader — emits a
+/// `{"lagged":N}` marker rather than silently skipping, so a gap in the timeline
+/// is always explicit.
+///
+/// Returns when the client disconnects, when the network shuts down, or when the
+/// control runtime closes. That last arm is the whole reason the receive is
+/// wrapped in a select at all: a trace client has no registry entry to be
+/// unregistered and no per-client mailbox to be closed, so on a quiet network
+/// there is nothing else that would ever end this task — and `serve` waits for
+/// every task it accepted.
 async fn run_trace_stream<W>(
+    frames: &FrameAdmission,
+    cancel: &ConnectionCancel,
     writer: &mut W,
     mut rx: broadcast::Receiver<myownmesh_core::ConnTrace>,
 ) -> Result<()>
@@ -827,19 +1535,26 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        match rx.recv().await {
+        // Biased: there is one source here, so nothing competes for fairness
+        // and the close signal is polled first.
+        let received = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            received = rx.recv() => received,
+        };
+        match received {
             Ok(trace) => {
-                let line = serde_json::to_string(&trace)? + "\n";
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    return Ok(());
-                }
-                if writer.flush().await.is_err() {
+                if write_line(writer, frames, cancel, ControlOut::Trace(&trace)).await?
+                    == Wrote::Ended
+                {
                     return Ok(());
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                let line = serde_json::to_string(&serde_json::json!({ "lagged": n }))? + "\n";
-                if writer.write_all(line.as_bytes()).await.is_err() {
+                let marker = serde_json::json!({ "lagged": n });
+                if write_line(writer, frames, cancel, ControlOut::Marker(&marker)).await?
+                    == Wrote::Ended
+                {
                     return Ok(());
                 }
             }
@@ -991,6 +1706,597 @@ mod request_wire_tests {
     }
 }
 
+/// What `serve` does with the connection tasks it accepted.
+///
+/// Driven against the join helpers directly rather than through a socket,
+/// because what is under test is a property of the *handles* — that they are
+/// awaited rather than discarded — and reaching it through a real connection
+/// would need a connection task that panics on demand, which is a production
+/// branch this daemon should not have.
+#[cfg(test)]
+mod accepted_task_tests {
+    use super::*;
+
+    /// Bytes this provider holds beyond `baseline`, so every assertion here is
+    /// a delta and none depends on which dimensions the provider's own
+    /// bookkeeping happens to touch.
+    fn charged(provider: &myownmesh_core::FiniteResourceProvider, baseline: u64) -> u64 {
+        provider
+            .in_use()
+            .amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
+            .saturating_sub(baseline)
+    }
+
+    /// A provider granting exactly `nodes` join-list nodes, the port that spends
+    /// it, and what that port had already charged before any node existed.
+    ///
+    /// Exact including the provider's own records — one for the process scope and
+    /// one per reservation, asked of core rather than restated here, and without
+    /// which this grant refuses its own second node. Locally owned and installed
+    /// nowhere.
+    fn join_grant(
+        nodes: u64,
+    ) -> (
+        myownmesh_core::FiniteResourceProvider,
+        myownmesh_core::ResourceProviderPort,
+        myownmesh_core::ResourceScope,
+        u64,
+    ) {
+        // Asked of core rather than restated here. The provider retains a
+        // bookkeeping record per reservation and one for the scope, so a grant
+        // sized to the node claims alone is short by one residual per node plus
+        // one -- and short in a residual, which refuses a *later* acquisition
+        // than the one that was underfunded, so the fixture would fail somewhere
+        // other than where it was wrong. A figure restated on this side would be
+        // a second answer to a question core already answers, which is the exact
+        // drift this crate's accounting notes are written against.
+        let node = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the node claim is representable");
+        let claim = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(node)
+            .expect("a node reservation is representable")
+            .checked_scale(nodes)
+            .expect("the fixture grant is representable")
+            .checked_add(myownmesh_core::FiniteResourceProvider::scope_planning_charge())
+            .expect("the process scope record is representable");
+        let provider = myownmesh_core::FiniteResourceProvider::new(claim);
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the fixture grant funds its own process scope");
+        let scope = port.process_scope();
+        // Read after the port: opening the process scope is itself a charge.
+        let baseline = charged(&provider, 0);
+        (provider, port, scope, baseline)
+    }
+
+    fn join_node(
+        port: &myownmesh_core::ResourceProviderPort,
+        scope: &myownmesh_core::ResourceScope,
+    ) -> myownmesh_core::ResourceLease {
+        port.acquire(
+            scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+                .expect("the node claim is representable"),
+        )
+        .expect("the fixture grant funds this node")
+    }
+
+    /// A finished connection task is *joined*, and a live one is left alone.
+    ///
+    /// The finding this pins is that a dropped `JoinHandle` is not a join.
+    /// Dropping one detaches its task and discards its `JoinError`, so a
+    /// connection that aborted mid-request would be indistinguishable from one
+    /// that returned — and the whole reason `serve` retains these handles rather
+    /// than counting task admissions is that a count cannot tell those apart
+    /// either. `join_finished` answers how many ended abnormally, which is the
+    /// one observation that separates the two implementations.
+    ///
+    /// Three tasks, because the reap has to be selective as well as truthful:
+    /// one that returns, one that panics, and one that never finishes. The last
+    /// must still be in the list afterwards, still funded — reaping it would
+    /// mean awaiting a connection that is still serving a client, inside the
+    /// accept loop.
+    ///
+    /// Nothing here waits on a duration. The tasks are polled to completion by
+    /// yielding until they report finished, which is their own state and not a
+    /// clock.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_finished_connection_task_is_joined_rather_than_discarded() {
+        let (provider, port, scope, baseline) = join_grant(3);
+        let node_bytes = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the node claim is representable")
+            .amount(myownmesh_core::ResourceClass::AccountedMemoryBytes);
+        let mut accepted = crate::ipc::LeasedList::new();
+
+        let returned = tokio::spawn(async {});
+        let aborted = tokio::spawn(async {
+            panic!("a connection task aborted mid-request");
+        });
+        let serving = tokio::spawn(std::future::pending::<()>());
+        // Their own state, not a duration: this ends when the two tasks under
+        // test have really finished and never otherwise.
+        while !returned.is_finished() || !aborted.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !serving.is_finished(),
+            "non-vacuity: the third connection is still serving"
+        );
+
+        accepted.push(returned, join_node(&port, &scope));
+        accepted.push(aborted, join_node(&port, &scope));
+        accepted.push(serving, join_node(&port, &scope));
+        assert_eq!(
+            charged(&provider, baseline),
+            3 * node_bytes,
+            "non-vacuity: three connections are retained and funded"
+        );
+
+        let ended = std::sync::atomic::AtomicUsize::new(2);
+        let abnormal = join_finished(&ended, &mut accepted).await;
+        assert_eq!(
+            abnormal, 1,
+            "the panicking connection was joined and its JoinError observed; a \
+             reap that dropped its handle would answer zero here"
+        );
+        assert_eq!(
+            accepted.len(),
+            1,
+            "and the connection that is still serving was not reaped"
+        );
+        assert_eq!(
+            charged(&provider, baseline),
+            node_bytes,
+            "two nodes' funding came back with the tasks that ended, and the live \
+             one's did not"
+        );
+
+        assert_eq!(
+            ended.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "and both counted completions were consumed by the join"
+        );
+
+        // The remaining handle is detached deliberately here: this control owns
+        // no runtime to shut down, and `serve`'s own drain is what joins it in
+        // production.
+        drop(accepted);
+    }
+
+    /// One connection, then a quiet listener: its funded node comes back at the
+    /// completion rather than at some later event.
+    ///
+    /// This is the edge the counter exists for. A task signals from a drop guard
+    /// *inside* its own future, so at the instant the signal lands its handle is
+    /// not yet finalized. Here the task has not been polled at all — this is a
+    /// current-thread runtime and nothing has yielded to it — so `is_finished()`
+    /// is certainly false when the reap begins. A reap that looked once would
+    /// return having freed nothing, and with no further connection ever accepted
+    /// there would be no second look before shutdown.
+    ///
+    /// The assertion is on the ledger, not on a log line: the node's bytes are
+    /// back, which can only be true if the node was reaped.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_completion_reaps_its_node_even_before_the_handle_is_finalized() {
+        let (provider, port, scope, baseline) = join_grant(1);
+        let node_bytes = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the node claim is representable")
+            .amount(myownmesh_core::ResourceClass::AccountedMemoryBytes);
+        let mut accepted = crate::ipc::LeasedList::new();
+
+        let connection = tokio::spawn(async {});
+        assert!(
+            !connection.is_finished(),
+            "non-vacuity: the runtime has not polled this task, so the reap below \
+             begins with a handle that is not finalized"
+        );
+        accepted.push(connection, join_node(&port, &scope));
+        assert_eq!(
+            charged(&provider, baseline),
+            node_bytes,
+            "non-vacuity: the connection's node is funded and held"
+        );
+
+        // Exactly what the completion guard publishes, and nothing else. No
+        // second connection follows, and no accept ever will.
+        let ended = std::sync::atomic::AtomicUsize::new(1);
+        assert_eq!(
+            join_finished(&ended, &mut accepted).await,
+            0,
+            "the connection returned rather than aborting"
+        );
+        assert!(
+            accepted.is_empty(),
+            "the completed connection was reaped by its own completion, with no \
+             later accept to do it"
+        );
+        assert_eq!(
+            charged(&provider, baseline),
+            0,
+            "and its funding came back with it"
+        );
+        assert_eq!(
+            ended.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the counted completion was consumed exactly once"
+        );
+    }
+}
+
+/// What ends a connection's outbound half when the runtime closes.
+///
+/// Unit-level and platform-neutral, because what is under test is the
+/// cancellation composition rather than a socket. Both controls drive the
+/// production functions directly, over a writer whose readiness this module
+/// owns: [`NeverWritable`] where the point is a write that cannot proceed, and
+/// a `tokio::io::duplex` pair where the point is one that can and whose bytes
+/// are then read back.
+#[cfg(test)]
+mod stream_cancellation_tests {
+    use super::*;
+
+    /// A failure detector, and nothing here derives authority from it.
+    ///
+    /// Every step in both controls resolves on an event -- a writer signalling
+    /// its own first poll, a runtime publishing its own close. What this bounds
+    /// is only how a *regression* is reported: the shape each control replaces
+    /// does not fail an assertion, it never reaches one, and without a guard
+    /// that arrives as the whole suite timing out with nothing named. Long
+    /// enough that a loaded machine will not trip it.
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn guarded<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        match tokio::time::timeout(HANG_GUARD, future).await {
+            Ok(value) => value,
+            Err(_) => panic!("hang guard: {what}"),
+        }
+    }
+
+    /// A grant generous enough that nothing here is refused for capacity.
+    ///
+    /// Deliberately not tight: these controls are about cancellation, and a
+    /// refusal would end the write for a reason neither of them is testing.
+    fn writable_admission() -> FrameAdmission {
+        let grant = myownmesh_core::ResourceClaim::try_from_entries([
+            (myownmesh_core::ResourceClass::AccountedMemoryBytes, 1 << 20),
+            (
+                myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+                1 << 20,
+            ),
+        ])
+        .expect("the control grant is representable");
+        FrameAdmission::over_grant(grant, None)
+    }
+
+    /// A writer that never accepts a byte, and says so the first time it is
+    /// asked to.
+    ///
+    /// The blocked half of the control below used to be a `duplex` with a small
+    /// buffer and no reader, which blocks reliably and is still the wrong thing:
+    /// it makes a buffer size the authority for whether the control is testing
+    /// what it says it is. This owns readiness outright. `poll_write` never
+    /// returns `Ready`, and it registers no waker, so nothing this writer does
+    /// can ever wake the write arm — the only thing that can finish the future
+    /// is the arm the control exists to prove.
+    ///
+    /// The signal is sent from inside `poll_write`, which makes "the write is at
+    /// the writer" an event rather than an inference. A control that closed the
+    /// runtime before the write had been polled would be proving that
+    /// cancellation beats a write that never started, which is a weaker claim
+    /// and the easy one.
+    struct NeverWritable {
+        /// Fired on the first `poll_write` and never again.
+        reached: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncWrite for NeverWritable {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if let Some(reached) = self.reached.take() {
+                // The receiver may already be gone if the control finished; a
+                // failed send is that and nothing else.
+                let _ = reached.send(());
+            }
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A continuously ready client mailbox cannot starve one mesh event.
+    ///
+    /// The finding this pins is deterministic starvation, not scheduling
+    /// variance. The select this replaces was biased with the per-client mailbox
+    /// first, so a subscriber whose mailbox never went empty was never shown a
+    /// mesh event at all — until the broadcast ring gave up and reported lag,
+    /// which is the subscriber being told about events instead of given them.
+    ///
+    /// Every source is loaded *before* the stream is started, so the whole
+    /// schedule is fixed by the alternation and not by arrival order or by the
+    /// scheduler: two client frames are already queued and one mesh event is
+    /// already published when the first poll happens. The alternation begins on
+    /// the client, so the only order this loop can produce is
+    /// `client, mesh, client` — and the shape it replaces can only produce
+    /// `client, client, mesh`, because the mailbox is ready every time it is
+    /// asked. One assertion separates them, and neither a duration nor a service
+    /// count appears in it.
+    ///
+    /// The middle frame is the finding: the mesh event goes out while a client
+    /// frame is still queued and ready behind it.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_ready_client_mailbox_cannot_starve_a_mesh_event() {
+        let clients = crate::ipc::ClientRegistry::default();
+        let (client_tx, client_rx) = myownmesh_core::resource_mailbox::<crate::ipc::ServerOut>(
+            crate::test_application_scope(),
+        )
+        .expect("the daemon test grant funds one subscriber mailbox");
+        let (mesh_tx, mesh_rx) = broadcast::channel::<myownmesh_core::events::MeshEvent>(4);
+
+        // Loaded first, all of it. Past this line both sources are ready and
+        // stay ready, which is the condition the old shape starved under.
+        for channel in ["first", "second"] {
+            client_tx
+                .send(crate::ipc::ServerOut::ChannelInbound {
+                    network: "home".to_string(),
+                    from: "peer".to_string(),
+                    channel: channel.to_string(),
+                    payload: serde_json::json!({ "seq": channel }),
+                })
+                .expect("the subscriber mailbox admits a preloaded frame");
+        }
+        mesh_tx
+            .send(myownmesh_core::events::MeshEvent::Peer(
+                myownmesh_core::events::PeerEvent::Sighted {
+                    network_id: "home".to_string(),
+                    device_id: "the-event-that-must-not-wait".to_string(),
+                },
+            ))
+            .expect("the broadcast has a live receiver");
+
+        let (daemon_side, client_side) = tokio::io::duplex(1 << 20);
+        let streaming = {
+            let clients = clients.clone();
+            tokio::spawn(async move {
+                let frames = writable_admission();
+                let cancel = ConnectionCancel::runtime(&clients);
+                let mut daemon_side = daemon_side;
+                run_events_stream(&frames, &cancel, &mut daemon_side, client_rx, mesh_rx).await
+            })
+        };
+
+        // Three lines, in the only order the alternation can produce.
+        let mut reader = tokio::io::BufReader::new(client_side);
+        let mut kinds = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            guarded("the subscriber is written to", async {
+                tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await
+            })
+            .await
+            .expect("the daemon writes whole lines");
+            let frame: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("each line is one frame");
+            kinds.push(
+                frame["kind"]
+                    .as_str()
+                    .expect("every server frame is tagged")
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                "channel_inbound".to_string(),
+                "event".to_string(),
+                "channel_inbound".to_string(),
+            ],
+            "the mesh event went out between the two client frames, so the second \
+             client frame was ready and waiting when it did -- a mailbox-first \
+             loop answers `[channel_inbound, channel_inbound, event]` here"
+        );
+
+        // Ended the way production ends it, and drained.
+        clients.begin_closing();
+        guarded("the stream ends when the runtime closes", streaming)
+            .await
+            .expect("the stream task did not panic")
+            .expect("a cancelled stream ends cleanly");
+    }
+
+    /// A trace stream on a quiet network ends when the runtime closes.
+    ///
+    /// The finding this pins is that a trace subscriber has no registry entry
+    /// and therefore no per-client cancellation: the runtime's own close is the
+    /// only thing that can end it. Without that arm, one connected trace client
+    /// on a network that happens to be quiet held the whole drain open — and
+    /// "quiet" is not an unusual state, it is the normal one.
+    ///
+    /// Nothing is published, and that is the point rather than an omission: the
+    /// broadcast sender is held open for the whole run, so the stream's one
+    /// source is live and simply has nothing to say. The shape this replaces
+    /// does not fail an assertion below; it never reaches one, which is what the
+    /// hang guard exists to name. The control first polls the live stream to
+    /// `Pending` and only then closes the runtime, so `closing()`'s
+    /// subscribe-before-read ordering is part of the witness rather than a
+    /// property inferred from a close that happened before the stream began.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_quiet_trace_stream_ends_when_the_runtime_closes() {
+        let clients = crate::ipc::ClientRegistry::default();
+        let frames = writable_admission();
+        let cancel = ConnectionCancel::runtime(&clients);
+        // Held for the whole run: the source is open and quiet, not closed.
+        let (traces, trace_rx) = broadcast::channel(4);
+        // Room for a line, so nothing here is blocked on the socket instead.
+        let (mut daemon_side, client_side) = tokio::io::duplex(4096);
+
+        let mut streaming = Box::pin(run_trace_stream(
+            &frames,
+            &cancel,
+            &mut daemon_side,
+            trace_rx,
+        ));
+        std::future::poll_fn(
+            |cx| match std::future::Future::poll(streaming.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("non-vacuity: the open quiet stream ended before Closing: {result:?}")
+                }
+            },
+        )
+        .await;
+
+        // Close only after the stream itself has reached its quiet receive. This
+        // makes `closing()`'s subscribe-before-read ordering load-bearing: a
+        // one-shot notification lost between those operations would hang here.
+        clients.begin_closing();
+        guarded(
+            "a quiet trace stream ends when the runtime closes",
+            streaming,
+        )
+        .await
+        .expect("a cancelled trace stream ends cleanly rather than erroring");
+
+        // Nothing was written, which is what makes this the quiet case: the
+        // stream ended because the runtime closed and for no other reason.
+        drop(daemon_side);
+        let mut drained = Vec::new();
+        let mut client_side = client_side;
+        guarded(
+            "the client half drains",
+            tokio::io::AsyncReadExt::read_to_end(&mut client_side, &mut drained),
+        )
+        .await
+        .expect("the duplex half reads to end");
+        assert!(
+            drained.is_empty(),
+            "a quiet network produced no trace event, so the stream ended on the \
+             close and not on a frame: {drained:?}"
+        );
+        assert_eq!(
+            traces.receiver_count(),
+            0,
+            "and the stream really did let go of its receiver"
+        );
+    }
+
+    /// A write that cannot complete still ends when the runtime closes.
+    ///
+    /// The terminal-shutdown claim rests on this. A client that stops reading
+    /// leaves the daemon's writer blocked on a socket that will never drain, and
+    /// a connection task blocked there is one `serve` would wait for forever —
+    /// so "serve returns without a timer" is only true if a blocked write is
+    /// itself cancellable.
+    ///
+    /// The block is owned rather than arranged: [`NeverWritable`] decides its
+    /// own readiness, so no buffer size, socket, or scheduler behaviour is
+    /// standing in for "this write cannot make progress". And the runtime is
+    /// closed only *after* the writer has said the write reached it, so what is
+    /// proved is that a write already parked at the writer ends — not that
+    /// cancellation beats a write that never started.
+    ///
+    /// The bias is deliberate and this control is consistent with it: the write
+    /// arm is polled first, cannot proceed, and only then does cancellation
+    /// answer. An immediately writable refusal still goes out as itself, which
+    /// is the second half below.
+    ///
+    /// The hang guard is a failure detector and not the authority: every step
+    /// here resolves on an event, and the guard exists so that the shape this
+    /// replaces — which does not fail an assertion, it never returns — is
+    /// reported as a named failure rather than as the suite timing out.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_blocked_write_still_ends_when_the_runtime_closes() {
+        let clients = crate::ipc::ClientRegistry::default();
+        let frames = writable_admission();
+        let cancel = ConnectionCancel::runtime(&clients);
+        let response = wire::Response::ok(serde_json::json!({
+            "filler": "a line with something in it, so there is a write to park",
+        }));
+
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let mut writer = NeverWritable {
+            reached: Some(reached_tx),
+        };
+        let writing = write_line(
+            &mut writer,
+            &frames,
+            &cancel,
+            ControlOut::Response(&response),
+        );
+        tokio::pin!(writing);
+        // Driven only as far as the write boundary. The writer itself says when
+        // that is; the runtime is still open at this point, so the cancel arm
+        // cannot be what ends the select below.
+        guarded("the write reaches the writer", async {
+            tokio::select! {
+                _ = &mut writing => panic!(
+                    "a writer that never accepts a byte cannot have completed a write"
+                ),
+                signal = reached => signal.expect("the writer signals its first poll"),
+            }
+        })
+        .await;
+
+        // Now, and only now: the write is parked where nothing but cancellation
+        // can reach it.
+        clients.begin_closing();
+        let wrote = guarded("a parked write ends when the runtime closes", writing)
+            .await
+            .expect("a cancelled write ends cleanly rather than erroring");
+        assert_eq!(
+            wrote,
+            Wrote::Ended,
+            "the write could not have completed, so `Sent` here would mean the \
+             control was not testing a parked writer at all"
+        );
+
+        // Non-vacuity: the same value, the same admission, on a socket somebody
+        // is draining -- and it goes out as itself.
+        let live = crate::ipc::ClientRegistry::default();
+        let cancel = ConnectionCancel::runtime(&live);
+        let (mut daemon_side, client_side) = tokio::io::duplex(4096);
+        let wrote = guarded(
+            "an unblocked write completes",
+            write_line(
+                &mut daemon_side,
+                &frames,
+                &cancel,
+                ControlOut::Response(&response),
+            ),
+        )
+        .await
+        .expect("an admitted write succeeds");
+        assert_eq!(wrote, Wrote::Sent);
+        drop(daemon_side);
+        let mut drained = Vec::new();
+        let mut client_side = client_side;
+        guarded(
+            "the client half drains",
+            tokio::io::AsyncReadExt::read_to_end(&mut client_side, &mut drained),
+        )
+        .await
+        .expect("the duplex half reads to end");
+        assert!(
+            drained.ends_with(b"\n"),
+            "and it is a whole line: {}",
+            String::from_utf8_lossy(&drained)
+        );
+    }
+}
+
 /// The control surface's shutdown, driven end to end over a real socket.
 ///
 /// Unix-only because it needs a socket at a path this control chooses.
@@ -1032,6 +2338,298 @@ mod terminal_shutdown_tests {
         )
         .await
         .expect("the daemon test grant opens an infrastructure-only mesh")
+    }
+
+    /// A live `EventsSubscribe` ends with the runtime, and `serve` returns
+    /// having joined it and closed.
+    ///
+    /// The ordinary terminal case, and the one the review names first. A
+    /// subscribed connection is parked in the stream loop with nothing to send
+    /// it, which is the state a `serve` that returned on the shutdown signal
+    /// alone would abandon: the socket would still be open, the client still in
+    /// the registry, and the daemon would report itself closed while a
+    /// connection task it accepted was still running.
+    ///
+    /// Four claims, none of them timed:
+    ///
+    /// 1. the connection is really subscribed before anything is asked of it —
+    ///    one client, one accepted task, `Running`;
+    /// 2. the drain begins, observed through the registry's own signal;
+    /// 3. `serve` returns — which it cannot do until the connection task it
+    ///    accepted has ended and been joined;
+    /// 4. and the registry is `Closed` holding nothing.
+    ///
+    /// The client's halves are held across `serve`'s return on purpose. Dropping
+    /// them first would let the client's own close end the connection, and this
+    /// control would then pass against a `serve` that cancelled nothing. End of
+    /// file is read afterwards, as the witness that the daemon closed its end.
+    #[tokio::test]
+    async fn v4_r2_daemon_a_live_events_subscriber_ends_with_the_runtime() {
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let socket = directory.path().join("private").join("control.sock");
+        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let mesh = test_mesh().await;
+        let networks = NetworkRegistry::new();
+        let services = ServiceManager::new(mesh.clone(), networks.clone());
+        let serving = tokio::spawn(serve_with_hooks(
+            mesh,
+            networks,
+            services,
+            Some(socket.clone()),
+            RealtimeAdvert {
+                supported: false,
+                encodings: Vec::new(),
+                flow_ceiling: None,
+            },
+            shutdown_rx,
+            ControlHooks {
+                before_events_subscribe_commit: None,
+                registry: Some(registry_tx),
+                at_events_stream_entry: None,
+            },
+        ));
+        let clients = guarded("serve publishes its registry", registry_rx)
+            .await
+            .expect("serve publishes the registry it built");
+
+        let name = socket
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the control socket path is a valid fs name");
+        let stream = guarded("client connects", async {
+            loop {
+                match LocalSocketStream::connect(name.clone()).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        let (client_reader, mut client_writer) = stream.split();
+        let mut client_reader = BufReader::new(client_reader);
+        client_writer
+            .write_all(b"{\"op\":\"events_subscribe\"}\n")
+            .await
+            .expect("the client sends its subscribe");
+
+        // (1) The ack is the causal barrier: past it the connection is in the
+        // registry and parked in the stream loop.
+        let mut ack = String::new();
+        guarded(
+            "the subscription is acked",
+            client_reader.read_line(&mut ack),
+        )
+        .await
+        .expect("the daemon answers the subscribe");
+        let ack: Response =
+            serde_json::from_str(ack.trim()).expect("the ack is a control response");
+        assert!(ack.ok, "the subscription succeeded: {:?}", ack.error);
+        let residue = clients.residue();
+        assert_eq!(residue.clients, 1, "non-vacuity: one live subscriber");
+        assert_eq!(residue.live_tasks, 1, "carried by one accepted task");
+        assert_eq!(residue.lifecycle, crate::ipc::Lifecycle::Running);
+
+        // (2) The drain begins.
+        shutdown_tx
+            .send(())
+            .expect("the shutdown broadcast is live");
+        guarded("serve begins closing", clients.closing()).await;
+
+        // (3) And `serve` returns, which it cannot do with an accepted task
+        // still live.
+        guarded("serve returns", serving)
+            .await
+            .expect("the serve task did not panic")
+            .expect("serve returns without error");
+
+        // (4) Holding nothing.
+        assert_eq!(
+            clients.residue(),
+            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+            "no client, flow, handler, subscription, pending call or task lease remains"
+        );
+
+        // The socket witness, read only now.
+        drop(client_writer);
+        let mut rest = Vec::new();
+        guarded(
+            "the client's connection ended",
+            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
+        )
+        .await
+        .expect("the client's half reads to end");
+    }
+
+    /// A padded `EventsSubscribe` holds none of its line's parse capacity once
+    /// the stream it opened is live.
+    ///
+    /// The integration half of the padded-request finding, and the half a
+    /// decode-level control cannot reach. `decode_request` releasing the work
+    /// dimension is one property; the *connection branch* not re-retaining it —
+    /// not carrying the decoded request into the stream loop, not holding the
+    /// line, not keeping the lease that funded either — is a different one, and
+    /// it is the one a client exploits by subscribing and never leaving.
+    ///
+    /// The barrier is the whole reason this can be asserted at all. It sits past
+    /// the ack and before the first poll of the stream loop, which is the one
+    /// instant at which the connection is *both* subscribed and finished with
+    /// the request that subscribed it. Nothing here waits out a duration: the
+    /// stream being live is a `oneshot` the daemon itself sends from that line,
+    /// the shutdown transition is the registry's own signal, and the end is
+    /// `serve` returning.
+    ///
+    /// **Ignored, and it has to be.** The reading is the whole binary's grant,
+    /// which every other control in this binary also spends from, so a delta
+    /// across a step is attributable to that step only when nothing else is
+    /// running. `run_exact_control ... --ignored` is what gives it that.
+    ///
+    /// Three claims:
+    ///
+    /// 1. the padded line really did reserve parse capacity — otherwise there is
+    ///    nothing for the release to be about and the middle claim is vacuous;
+    /// 2. at the instant the stream goes live, parse capacity is back exactly
+    ///    where it was before the connection existed, while the connection is
+    ///    provably subscribed — one client, one accepted task, in a `Running`
+    ///    registry;
+    /// 3. and the connection is still a real one afterwards: the shutdown ends
+    ///    it, `serve` returns, and the registry closes holding nothing.
+    #[tokio::test]
+    #[ignore = "reads the test binary's shared resource ledger and must run alone"]
+    async fn v4_r2_daemon_a_padded_events_subscribe_holds_no_parse_capacity_once_live() {
+        // Whitespace, so the line is long and the value it decodes to is empty:
+        // `events_subscribe` carries no fields at all, which is the asymmetry a
+        // client would reach for.
+        let padded = format!("{}{{\"op\":\"events_subscribe\"}}\n", " ".repeat(4096));
+        // (1) Non-vacuity, taken from the same function the daemon admits with.
+        let padded_work =
+            myownmesh_core::application_gateway::json_input_work_claim(padded.len() - 1)
+                .expect("the padded line's claim is representable")
+                .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
+        assert!(
+            padded_work > 0,
+            "non-vacuity: a padded line reserves parse capacity, so there is \
+             something for the release below to be about"
+        );
+
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let socket = directory.path().join("private").join("control.sock");
+        let (barrier, live, resume) = DispatchBarrier::paired();
+        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let mesh = test_mesh().await;
+        let networks = NetworkRegistry::new();
+        let services = ServiceManager::new(mesh.clone(), networks.clone());
+        let serving = tokio::spawn(serve_with_hooks(
+            mesh,
+            networks,
+            services,
+            Some(socket.clone()),
+            RealtimeAdvert {
+                supported: false,
+                encodings: Vec::new(),
+                flow_ceiling: None,
+            },
+            shutdown_rx,
+            ControlHooks {
+                before_events_subscribe_commit: None,
+                registry: Some(registry_tx),
+                at_events_stream_entry: Some(barrier),
+            },
+        ));
+        let clients = guarded("serve publishes its registry", registry_rx)
+            .await
+            .expect("serve publishes the registry it built");
+
+        // The reading to compare against: `serve` is up and listening, and no
+        // connection exists. Taken after the registry is published so the
+        // listener's own acquisitions are already in it.
+        let ledger = crate::test_resource_ledger();
+        let idle = ledger
+            .in_use()
+            .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
+
+        let name = socket
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the control socket path is a valid fs name");
+        let stream = guarded("client connects", async {
+            loop {
+                match LocalSocketStream::connect(name.clone()).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        let (client_reader, mut client_writer) = stream.split();
+        let mut client_reader = BufReader::new(client_reader);
+        client_writer
+            .write_all(padded.as_bytes())
+            .await
+            .expect("the client sends its padded subscribe");
+
+        // (2) The daemon itself says when the stream is live, from the line
+        // between the ack and the first poll of the loop.
+        guarded("the subscription goes live", live)
+            .await
+            .expect("the connection task reached the stream barrier");
+        let residue = clients.residue();
+        assert_eq!(
+            residue.clients, 1,
+            "non-vacuity: the padded subscribe really is subscribed"
+        );
+        assert_eq!(
+            residue.live_tasks, 1,
+            "and its connection is a live accepted task"
+        );
+        assert_eq!(
+            residue.lifecycle,
+            crate::ipc::Lifecycle::Running,
+            "with nothing shutting down yet"
+        );
+        assert_eq!(
+            ledger
+                .in_use()
+                .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork),
+            idle,
+            "the padded line's parse capacity is back where it was before this \
+             connection existed, while the stream it opened is live -- so the \
+             connection kept none of it, and a client that subscribes and never \
+             leaves pins none of it"
+        );
+
+        // (3) And it is a real connection, ended by the runtime rather than by
+        // its client. Both halves are held across `serving` deliberately: a
+        // control that dropped them first would let the client's own close stand
+        // in for the cancellation this asserts, and would pass against a `serve`
+        // that never cancelled anything.
+        resume.send(()).expect("the paused task is still waiting");
+        shutdown_tx
+            .send(())
+            .expect("the shutdown broadcast is live");
+        guarded("serve begins closing", clients.closing()).await;
+        guarded("serve returns", serving)
+            .await
+            .expect("the serve task did not panic")
+            .expect("serve returns without error");
+        assert_eq!(
+            clients.residue(),
+            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+            "and the padded subscriber left nothing behind"
+        );
+        // The socket witness, read only now: the client half was open the whole
+        // time, so end of file here is the daemon having closed its end.
+        drop(client_writer);
+        let mut rest = Vec::new();
+        guarded(
+            "the client's connection ended",
+            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
+        )
+        .await
+        .expect("the client's half reads to end");
     }
 
     /// A shutdown arriving while an `EventsSubscribe` is mid-commit loses
@@ -1095,6 +2693,7 @@ mod terminal_shutdown_tests {
             ControlHooks {
                 before_events_subscribe_commit: Some(barrier),
                 registry: Some(registry_tx),
+                at_events_stream_entry: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)

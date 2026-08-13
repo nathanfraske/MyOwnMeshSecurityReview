@@ -64,17 +64,24 @@ fn remove_channel_member(
 /// caller settles them after releasing — settling here would deadlock for the
 /// reason [`settle_pending_where`] gives.
 ///
-/// No key clones: `pop_first_where` detaches matches in place. The vector is the
-/// only allocation left, and each slot in it is pre-paid by the record it will
-/// hold — see [`pending_retained`].
+/// No key clones: `pop_first_where` detaches matches in place. What is left is
+/// one node per record, and each record carries the lease that funds its own
+/// node — acquired when the call was filed, moved into the node here, released
+/// after that node is freed. A `Vec` was wrong twice over: its buffer is sized
+/// by capacity rather than by length, and its `Drop` destroys the records before
+/// it frees the buffer they sat in.
 fn take_pending_under(
     tables: &mut RegistryTables,
     mut names: impl FnMut(&PendingKey, &PendingRecord) -> bool,
-) -> Vec<PendingRecord> {
-    let mut taken = Vec::new();
-    while let Some((_key, pending)) = tables.exact_pending_inbound.pop_first_where(&mut names) {
+) -> crate::ipc::LeasedList<PendingRecord> {
+    let mut taken = crate::ipc::LeasedList::new();
+    while let Some((_key, mut pending)) = tables.exact_pending_inbound.pop_first_where(&mut names) {
         pending.cancelled.cancel();
-        taken.push(pending);
+        let node = pending
+            .cleanup
+            .take()
+            .expect("a filed pending record holds the funding for its own sweep node");
+        taken.push(pending, node);
     }
     taken
 }
@@ -184,6 +191,8 @@ impl ClientRegistry {
                 next_handler_generation: AtomicU64::new(0),
                 idle: tokio::sync::Notify::new(),
                 closing: tokio::sync::Notify::new(),
+                #[cfg(test)]
+                fanout_barrier: Mutex::new(None),
                 tables: Mutex::new(RegistryTables {
                     lifecycle: Lifecycle::Running,
                     live_tasks: 0,
@@ -197,12 +206,60 @@ impl ClientRegistry {
         }
     }
 
+    /// Park the next channel pump at the line after it has selected a
+    /// subscriber and before it builds that subscriber's frame.
+    ///
+    /// See [`FanoutBarrier`]. Installed rather than passed as an argument
+    /// because the pump is spawned by production code from a real subscription,
+    /// and a control that had to construct the pump itself would not be driving
+    /// the production fan-out at all.
+    #[cfg(test)]
+    pub fn park_fanout_after_selection(&self, barrier: Arc<FanoutBarrier>) {
+        *self.inner.fanout_barrier.lock() = Some(barrier);
+    }
+
+    /// Pass the installed fan-out barrier, if a control installed one.
+    ///
+    /// The `Arc` is cloned out and the lock released before anything is
+    /// awaited, so a parked pump holds no registry lock of any kind -- which is
+    /// exactly the property the control that installs one is asserting.
+    #[cfg(test)]
+    pub(crate) async fn pass_fanout_barrier(&self) {
+        let barrier = self.inner.fanout_barrier.lock().clone();
+        if let Some(barrier) = barrier {
+            barrier.pass().await;
+        }
+    }
+
     /// Issue one acquisition subtree under this registry's own port.
     ///
     /// For things with a lifetime of their own — an inbound stream's queue is
     /// the one caller today — so that everything the thing holds is released as
     /// a unit when it ends, rather than lingering in the registry's scope until
     /// the daemon stops.
+    /// Acquire one already-derived claim against this registry's own port.
+    ///
+    /// For funding whose shape is decided by the type being funded rather than
+    /// by this registry — a [`LeasedList`] node is the live case, and its size
+    /// is the list's to state, not this module's. Narrower than
+    /// [`Self::child_resources`], which hands out a whole scope: this admits one
+    /// claim and answers with one lease.
+    ///
+    /// Not gated on the lifecycle. The callers are the control runtime's own
+    /// bookkeeping, and a registry that refused to fund the storage its drain
+    /// hands back would be refusing to be shut down.
+    ///
+    /// [`LeasedList`]: crate::ipc::LeasedList
+    pub(crate) fn acquire_claim(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, IpcAdmissionError> {
+        self.inner
+            .resources
+            .acquire(claim)
+            .map_err(IpcAdmissionError::Resources)
+    }
+
     pub fn child_resources(&self) -> Result<LocalApplicationResourceScope, IpcAdmissionError> {
         self.inner
             .resources
@@ -543,12 +600,40 @@ impl ClientRegistry {
         // it exists; the network name is the client-influenced half and is the
         // reason this is computed per call rather than being a constant.
         let retained = realtime_flow_retained(REALTIME_CAPABILITY_BYTES, &network);
+        // The node this flow will occupy in the disconnect drain's list, as its
+        // own lease. Acquired before the install rather than folded into
+        // `retained`, because the two are released in different places: the
+        // retention with the flow's own strings, the node lease after the drain
+        // node it funds has been freed. If the install refuses, this drops with
+        // the closure that never ran.
+        let cleanup = match crate::ipc::LeasedList::<(
+            String,
+            myownmesh_core::realtime::RealtimeFlowHandle,
+            ResourceLease,
+        )>::node_claim()
+        .map_err(IpcAdmissionError::Claim)
+        .and_then(|claim| {
+            self.inner
+                .resources
+                .acquire(claim)
+                .map_err(IpcAdmissionError::Resources)
+        }) {
+            Ok(cleanup) => cleanup,
+            Err(reason) => {
+                return Err(RealtimeFlowRejected {
+                    flow,
+                    reason: RegistrationError::Admission(reason),
+                });
+            }
+        };
         self.install_if_live(
             owner,
             LeasedMap::<String, OwnedRealtimeFlow>::entry_claim(),
             retained,
             flow,
-            |flow, entry, retained| owner.register_realtime_flow(network, flow, entry, retained),
+            |flow, entry, retained| {
+                owner.register_realtime_flow(network, flow, entry, retained, cleanup)
+            },
         )
         .map_err(|(flow, reason)| RealtimeFlowRejected { flow, reason })
     }
@@ -651,24 +736,34 @@ impl ClientRegistry {
         // whole time it holds them. The previous shape cloned every key into an
         // unfunded vector and released the original's funding immediately, so
         // the copies this path actually used were charged to nobody.
-        let mut forget = Vec::new();
-        while let Some((key, funding)) = handle.method_claims.pop_first() {
+        let mut forget = crate::ipc::LeasedList::new();
+        while let Some((key, held)) = handle.method_claims.pop_first() {
+            let HeldName { retained, cleanup } = held;
             if tables.handler_claims.get(&key).map(|claim| claim.value) != Some(id) {
                 continue;
             }
             tables.handler_claims.remove(&key);
             if let Some(installed) = tables.installed_handlers.remove(&key) {
-                // The name moves into the caller's vector together with the
-                // lease that pays for its buffers and the registration that
-                // removes its handler, and the slot it occupies here was
-                // pre-paid when the claim was taken. Nothing is released under
+                // The name moves into the caller's list together with the lease
+                // that pays for its buffers and the registration that removes
+                // its handler, and it lands in a node whose own funding was
+                // acquired when the claim was taken. Nothing is released under
                 // this lock.
-                forget.push(ForgottenMethod::new(key, Some(installed), funding));
+                forget.push(
+                    ForgottenMethod::new(key, Some(installed), retained),
+                    cleanup,
+                );
             }
+            // A name whose claim a successor took over, or whose handler was
+            // already gone, drops both leases here: no node was built for it.
         }
-        // Channel subscriptions. The fan-out task running for this
-        // (network, channel) notices the empty subscriber set and exits on its
-        // next iteration; an emptied set is removed with its last member.
+        // Channel subscriptions. An emptied set is removed with its last
+        // member, and the fan-out task running for this (network, channel) is
+        // stopped *exactly*: the route comes back as a `RetiredRoute` and the
+        // caller awaits `retire`, which cancels the pump and joins it. It does
+        // not notice anything -- the shape that left it to spot an empty
+        // subscriber set on its next frame never ended on a channel nobody was
+        // publishing to.
         // Routes this client was the last subscriber of. Collected rather than
         // retired: retiring one means awaiting a task or waking waiters, and
         // this method is synchronous and holding the tables.
@@ -676,16 +771,19 @@ impl ClientRegistry {
         // One name at a time, and one output vector. Draining every name into a
         // vector first and then building a second one beside it would keep two
         // allocations alive together, and only one slot per name is funded.
-        let mut routes = Vec::new();
-        while let Some((key, funding)) = handle.channel_subs.pop_first() {
+        let mut routes = crate::ipc::LeasedList::new();
+        while let Some((key, held)) = handle.channel_subs.pop_first() {
+            let HeldName { retained, cleanup } = held;
             if let Some(route) = remove_channel_member(&mut tables, &key, id) {
-                // Pre-paid by the subscription that took this name, through the
-                // same cleanup term that funds `forget`.
-                routes.push(route);
+                // Into a node the subscription that took this name pre-paid for,
+                // on the same pattern as `forget`.
+                routes.push(route, cleanup);
             }
             // Nothing further owns this name, so its funding goes with the last
-            // copy of it rather than at the moment it left the table.
-            drop((key, funding));
+            // copy of it rather than at the moment it left the table. A
+            // subscription whose route was already gone drops its unused node
+            // lease here too.
+            drop((key, retained));
         }
         // Released before the pending sweep, which takes and releases it once per
         // record so that no settlement happens under it.
@@ -706,29 +804,38 @@ impl ClientRegistry {
         self.inner.tables.lock().client(id)
     }
 
-    /// Snapshot the clients that shutdown must unregister one at a time.
+    /// The next client the shutdown drain has to release, or `None` when the
+    /// table is empty.
     ///
-    /// The caller passes each id through [`Self::unregister`] and releases that
-    /// client's returned realtime flows and synthetic handlers before moving to
-    /// the next. This synchronous function has no network handle and cannot
-    /// await that release, so the work belongs to its caller.
-    #[must_use = "the returned client ids still have to be unregistered and their registrations released"]
-    pub fn shutdown_ids(&self) -> Vec<ClientId> {
-        // Ids rather than handles, and copied rather than detached: `unregister`
-        // takes the same lock, so the table cannot still be held while the
-        // caller walks these. Each id's slot in this vector was pre-paid by its
-        // client's record claim, so the allocation is work already charged for.
-        //
-        // Ids and not the released records themselves, deliberately. Collecting
-        // every `UnregisteredClient` here would build a second vector, sized by
-        // how many clients connected and funded by none of them — and each
-        // record holds retired routes and forgotten names, so the peak would be
-        // every client's cleanup state alive at once instead of one client's.
-        // The caller unregisters and releases one at a time.
+    /// **No snapshot, and therefore nothing to fund.** This answered a
+    /// `Vec<ClientId>` sized by how many clients had connected, with each slot
+    /// pre-paid by its client's record claim. Pre-payment was the right instinct
+    /// and the wrong shape: the vector's allocation is sized by capacity rather
+    /// than by length, and the per-client funding was released as the loop
+    /// unregistered each one while the shared buffer stayed alive to the end.
+    /// An allocation that never happens needs no funding and cannot be refused,
+    /// which is the stronger answer wherever it is available.
+    ///
+    /// The caller takes one id, passes it through [`Self::unregister`], releases
+    /// that client's realtime flows and synthetic handlers, and asks again.
+    /// Progress is guaranteed because `unregister` removes the entry this
+    /// answered: an id that comes back has not been released, and one that was
+    /// removed by another path is simply not answered again.
+    ///
+    /// The first key rather than a cursor, because ids are only ever removed
+    /// during the drain — nothing is inserted, `begin_closing` having already
+    /// refused every admitting path — so "the first one still here" walks the
+    /// whole table exactly once.
+    #[must_use = "the answered client still has to be unregistered and its registrations released"]
+    pub fn shutdown_next(&self) -> Option<ClientId> {
         let tables = self.inner.tables.lock();
-        let mut ids = Vec::new();
-        tables.clients.for_each(|id, _| ids.push(*id));
-        ids
+        let mut first = None;
+        tables.clients.for_each(|id, _| {
+            if first.is_none() {
+                first = Some(*id);
+            }
+        });
+        first
     }
 
     /// The one sweep that follows a full shutdown walk.
@@ -849,9 +956,9 @@ impl ClientRegistry {
         let ClaimCommitted {
             displaced,
             retired,
-            settled,
+            mut settled,
         } = committed;
-        for pending in settled {
+        while let Some(pending) = settled.pop() {
             settle_one(pending, "local IPC handler displaced");
         }
         // Both outside every daemon lock, which is the point of carrying them
@@ -899,7 +1006,8 @@ impl ClientRegistry {
                 }
             }
         }
-        for pending in committed.settled {
+        let mut settled = committed.settled;
+        while let Some(pending) = settled.pop() {
             settle_one(pending, "local IPC handler displaced");
         }
         drop(committed.retired);
@@ -970,10 +1078,7 @@ impl ClientRegistry {
         };
         // Three tables each keep their own clone of this key, so the client's
         // chosen name is retained three times over and each copy is funded
-        // where it is made. The `handler_claims` copy also pre-pays for the
-        // slot it will occupy in `unregister`'s forget vector -- see
-        // [`cleanup_slot_claim`] for why that charge is taken now rather than
-        // on the disconnect path that cannot afford to be refused.
+        // where it is made.
         let retained = claim_key_retained(key).map_err(IpcAdmissionError::Claim)?;
         let claim_entry = match tables.handler_claims.contains_key(key) {
             true => None,
@@ -990,28 +1095,32 @@ impl ClientRegistry {
             ),
         };
         // The per-client copy is the one that has to survive the disconnect
-        // sweep, so its retained lease also carries the cleanup slot: this name
-        // is the one that ends up in `unregister`'s forget vector.
+        // sweep, so it carries a *second* lease beside its retention: the node
+        // it will occupy in `unregister`'s forget list. Separate and not summed,
+        // because the two are released in different places at different moments
+        // -- the retention with the last copy of the name, the node lease after
+        // the node it funds has been freed. Acquired now rather than on the
+        // disconnect path, which cannot decline to clean up and so has no honest
+        // answer to a refusal.
         let held_entry = match client.method_claims.holds(key) {
             true => None,
             false => {
-                let retained = retained
-                    .checked_add(
-                        cleanup_slot_claim::<ForgottenMethod>()
-                            .map_err(IpcAdmissionError::Claim)?,
-                    )
-                    .map_err(IpcAdmissionError::Claim)?;
-                Some(
-                    self.inner
-                        .lease_entry_pair::<ClaimKey, ResourceLease>(retained)?,
-                )
+                let (node, retained) = self
+                    .inner
+                    .lease_entry_pair::<ClaimKey, HeldName>(retained)?;
+                let cleanup = self.inner.resources.acquire(
+                    crate::ipc::LeasedList::<ForgottenMethod>::node_claim()
+                        .map_err(IpcAdmissionError::Claim)?,
+                );
+                let cleanup = cleanup.map_err(IpcAdmissionError::Resources)?;
+                Some((node, HeldName { retained, cleanup }))
             }
         };
         // Nothing below can fail, so from here the claim is installed whole.
         // The per-client cache goes first so on-disconnect cleanup sees the new
         // claim even if it runs the instant this lock is released.
-        if let Some((node, retained)) = held_entry {
-            client.method_claims.hold(key.clone(), node, retained);
+        if let Some((node, held)) = held_entry {
+            client.method_claims.hold(key.clone(), node, held);
         }
         let prev = match claim_entry {
             Some((node, retained)) => {
@@ -1072,7 +1181,7 @@ impl ClientRegistry {
             return Ok(ClaimCommitted {
                 displaced: None,
                 retired,
-                settled: Vec::new(),
+                settled: crate::ipc::LeasedList::new(),
             });
         };
         if let Some(prev_client) = tables.client(prev_owner) {
@@ -1162,21 +1271,25 @@ impl ClientRegistry {
         };
         // The retained heap of this key, once per copy that is kept: the
         // client's own held-name table and the registry's subscriber table each
-        // keep one, and the client's copy pre-pays for the disconnect sweep
-        // slot it will occupy.
+        // keep one. The client's copy also acquires the node it will occupy in
+        // the disconnect drain's route list, as its own lease, for the reason
+        // the method claim gives.
         let retained = claim_key_retained(&key).map_err(IpcAdmissionError::Claim)?;
         let held_entry = match c.channel_subs.holds(&key) {
             true => None,
             false => {
-                let retained = retained
-                    .checked_add(
-                        cleanup_slot_claim::<RetiredRoute>().map_err(IpcAdmissionError::Claim)?,
+                let (node, retained) = self
+                    .inner
+                    .lease_entry_pair::<ClaimKey, HeldName>(retained)?;
+                let cleanup = self
+                    .inner
+                    .resources
+                    .acquire(
+                        crate::ipc::LeasedList::<RetiredRoute>::node_claim()
+                            .map_err(IpcAdmissionError::Claim)?,
                     )
-                    .map_err(IpcAdmissionError::Claim)?;
-                Some(
-                    self.inner
-                        .lease_entry_pair::<ClaimKey, ResourceLease>(retained)?,
-                )
+                    .map_err(IpcAdmissionError::Resources)?;
+                Some((node, HeldName { retained, cleanup }))
             }
         };
         let set_entry = match tables.channel_subs.contains_key(&key) {
@@ -1381,39 +1494,148 @@ impl ClientRegistry {
         remove_channel_member(&mut tables, key, client)
     }
 
-    /// Visit every subscriber of one channel, under one acquisition.
+    /// One step of a channel fan-out: the next subscriber after `after`.
     ///
-    /// This replaced a method that answered `Vec<ClientId>`. That vector was
-    /// allocated once per pumped frame and sized by how many clients had
-    /// subscribed — a per-message allocation, on a hot path, that nothing
-    /// funded. Visiting in place removes it rather than pricing it, which is the
-    /// better answer to an unfunded allocation whenever it is available.
+    /// **The lock is released between subscribers, and that is the whole point
+    /// of this shape.** The method this replaces held `RegistryTables` across
+    /// the caller's entire callback, and the caller's callback deep-cloned a
+    /// peer-controlled JSON payload, measured its serialized size, acquired
+    /// against the provider, inserted into a mailbox and logged refusals — once
+    /// per subscriber. Every one of those is synchronous, but the *duration* of
+    /// the whole is chosen by the remote payload's shape multiplied by the local
+    /// subscriber count, and it was chosen while the one lock protecting
+    /// clients, method claims, channel routes, pending calls, installed
+    /// handlers, lifecycle state and live-task accounting was held. A client
+    /// disconnect, a control shutdown, a method displacement, a pending RPC
+    /// settlement and a route retirement all queued behind a remote peer's
+    /// choice of payload. Visiting in place is not enough when what is visited
+    /// is attacker-sized; the lock has to be released before that work happens,
+    /// and a cursor is how a caller resumes without holding it.
     ///
-    /// Answers whether the route still has subscribers, so a pump can tell
-    /// "delivered to nobody" from "there is no longer a route here".
+    /// **Exact by three identities, and none of them is a position.** The
+    /// subscriber cursor is a [`ClientId`], which is monotonic and never reused,
+    /// so a subscriber removed between two steps is skipped rather than
+    /// re-resolved into whoever occupies its place. The route is matched by the
+    /// exact [`RouteOwner`] the pump holds, so a route removed and reinstalled
+    /// under the same key answers `Gone` rather than handing the predecessor's
+    /// pump the successor's subscribers. And the frame is bounded by a
+    /// high-water member id fixed at its first step, so a stream of new
+    /// subscriptions — which necessarily carry larger ids — cannot extend one
+    /// frame's fan-out indefinitely and starve the next frame.
     ///
-    /// `visit` runs under the tables lock and **must not re-enter this
-    /// registry** — sending to a client's mailbox is an admission and returns
-    /// immediately, which is why it is safe here, but anything that takes this
-    /// lock again would deadlock and anything that awaits would hold it across a
-    /// suspension point.
+    /// None of the three is a new piece of state. The client id, the route's own
+    /// cancellation `Arc` and the membership map all already exist; this reads
+    /// them, and it is why there is no vector to return — a resource-backed
+    /// snapshot would be a per-frame allocation to fund, and an allocation that
+    /// does not happen cannot be refused.
+    ///
+    /// An unpublished route answers `End` rather than `Gone`. A pump can pull a
+    /// frame between its own spawn and its own `finish_channel_install`, and it
+    /// cannot tell its own pending install from a successor's — but neither may
+    /// deliver, so both get the same answer: nothing this frame, and the route
+    /// is still here. Exiting instead would end a pump whose route was about to
+    /// publish it.
+    ///
+    /// A member with no live client record is passed over inside the same walk.
+    /// It is a subscription whose client has been removed and whose membership
+    /// has not been swept yet, and there is nobody to deliver to.
+    ///
+    /// The cost is one lock acquisition and one ordered walk per subscriber
+    /// rather than one of each per frame, and that is stated rather than hidden:
+    /// the walk compares fixed-size ids, so its work is chosen by how many
+    /// clients subscribed and never by what a peer sent. The work that *is*
+    /// peer-sized now happens with no lock held at all.
+    pub(crate) fn subscriber_after(
+        &self,
+        key: &ClaimKey,
+        owner: RouteOwner<'_>,
+        position: &mut ChannelFanout,
+    ) -> ChannelFanoutStep {
+        let tables = self.inner.tables.lock();
+        let Some(route) = tables.channel_subs.get(key) else {
+            return ChannelFanoutStep::Gone;
+        };
+        let live = match &route.state {
+            RouteState::Live(owner) => Some(&owner.cancel),
+            RouteState::Installing(_) => None,
+        };
+        match owner {
+            RouteOwner::Pump(pump) => match live {
+                None => return ChannelFanoutStep::End,
+                Some(live) if !Arc::ptr_eq(live, pump) => return ChannelFanoutStep::Gone,
+                Some(_) => {}
+            },
+            #[cfg(test)]
+            RouteOwner::Any => {}
+        }
+        // The frame's boundary, fixed once. `for_each` walks in key order, so
+        // the last member visited is the largest id this route holds now.
+        if position.ceiling.is_none() {
+            let mut highest = None;
+            route.members.for_each(|client, _| highest = Some(*client));
+            let Some(highest) = highest else {
+                return ChannelFanoutStep::End;
+            };
+            position.ceiling = Some(highest);
+        }
+        let ceiling = match position.ceiling {
+            Some(ceiling) => ceiling,
+            // Unreachable: the branch above either set it or returned.
+            None => return ChannelFanoutStep::End,
+        };
+        let mut next = None;
+        // In key order, so the first match is the smallest id greater than the
+        // cursor and every later visit is one `is_some` check.
+        route.members.for_each(|client, _| {
+            if next.is_some() || *client > ceiling {
+                return;
+            }
+            let past_cursor = match position.after {
+                Some(previous) => *client > previous,
+                None => true,
+            };
+            if !past_cursor {
+                return;
+            }
+            if let Some(handle) = tables.clients.get(client) {
+                next = Some((*client, handle.clone()));
+            }
+        });
+        match next {
+            Some((cursor, client)) => {
+                position.after = Some(cursor);
+                ChannelFanoutStep::Next { client }
+            }
+            None => ChannelFanoutStep::End,
+        }
+    }
+
+    /// Every current subscriber of one channel, in id order.
+    ///
+    /// Controls only, and a thin loop over [`Self::subscriber_after`] rather
+    /// than a second implementation: a control that wants the whole set is not
+    /// on the fan-out path and has no lock-duration problem to solve, while
+    /// production must release the lock between subscribers. Written in terms of
+    /// the cursor so the two cannot disagree about who a subscriber is.
+    ///
+    /// Answers `false` only when the route itself is gone, which is the
+    /// distinction every caller of it actually makes: a route with no members is
+    /// removed with its last one, so "no route" and "no members" arrive
+    /// together.
+    #[cfg(test)]
     pub fn for_each_subscriber(
         &self,
         key: &ClaimKey,
         mut visit: impl FnMut(&Arc<ClientHandle>),
     ) -> bool {
-        let tables = self.inner.tables.lock();
-        let Some(route) = tables.channel_subs.get(key) else {
-            return false;
-        };
-        let mut any = false;
-        route.members.for_each(|client, _| {
-            any = true;
-            if let Some(handle) = tables.clients.get(client) {
-                visit(handle);
+        let mut position = ChannelFanout::frame();
+        loop {
+            match self.subscriber_after(key, RouteOwner::Any, &mut position) {
+                ChannelFanoutStep::Gone => return false,
+                ChannelFanoutStep::End => return true,
+                ChannelFanoutStep::Next { client, .. } => visit(&client),
             }
-        });
-        any
+        }
     }
 
     /// Monotonic counter used to tag outbound stream calls.
@@ -1427,6 +1649,256 @@ impl ClientRegistry {
             .fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Fund one inbound call before any of it is built.
+    ///
+    /// **Borrowed coordinates in, funding out, and nothing constructed.** Every
+    /// term of the claim is a length, and a length is readable from the inbound
+    /// call's own fields — so this can be refused while the peer's coordinates
+    /// still exist only as borrows of the call core already funded. The shape
+    /// this replaces copied all four coordinates into a `PendingKey` and built
+    /// the channel that answers the call *first*, and asked for funding second,
+    /// which is not an admission: the memory a refusal was about had already
+    /// been taken, at whatever rate the peer chose to call.
+    ///
+    /// The liveness checks are here too, and deliberately not only here: a
+    /// closing runtime or a departed owner refuses before anything is acquired,
+    /// and [`Self::commit_exact_pending`] re-checks under the lock that finally
+    /// writes. Neither check alone is enough — this one cannot hold the lock
+    /// across the caller's construction, and that one would be refusing after
+    /// the construction it exists to prevent.
+    ///
+    /// The duplicate check is *not* here, because it cannot be: the key it would
+    /// ask about is the thing this exists to avoid building. It is the commit's,
+    /// where the key exists and the lock is held.
+    pub fn prepare_exact_pending(
+        &self,
+        key: &ClaimKey,
+        remote_peer: &str,
+        remote_request_id: &str,
+        class: HandlerMode,
+        owner: ClientId,
+    ) -> Result<PreparedPending, PendingRefusal> {
+        {
+            let tables = self.inner.tables.lock();
+            admitting(&tables)?;
+            if tables.client(owner).is_none() {
+                return Err(PendingRefusal::OwnerGone);
+            }
+        }
+        let retained = pending_retained_for(&key.0, &key.1, remote_peer, remote_request_id)
+            .map_err(IpcAdmissionError::Claim)?;
+        let (entry, retained) = self
+            .inner
+            .lease_entry_pair::<PendingKey, PendingRecord>(retained)?;
+        let cleanup = self
+            .inner
+            .resources
+            .acquire(
+                crate::ipc::LeasedList::<PendingRecord>::node_claim()
+                    .map_err(IpcAdmissionError::Claim)?,
+            )
+            .map_err(IpcAdmissionError::Resources)?;
+        Ok(PreparedPending {
+            key: key.clone(),
+            class,
+            owner,
+            entry,
+            retained,
+            cleanup,
+        })
+    }
+
+    /// File a prepared call against the effect that answers it.
+    ///
+    /// The coordinates are copied here, into funding acquired before this was
+    /// called.
+    ///
+    /// **`build` runs past every refusal, never before one.** It is infallible
+    /// and it is called under the same lock the insertion is made under, after
+    /// lifecycle, owner and duplicate have all been re-checked — so a refusal
+    /// constructs no effect and there is none to hand back. The shape this
+    /// replaces took a built `PendingInbound` and returned it inside the
+    /// refusal, where it outlived the prepared leases that were covering it:
+    /// the leases were dropped at the return and the caller was left holding an
+    /// unfunded channel, on exactly the commit-race path that is hardest to
+    /// reach and therefore least likely to be noticed.
+    ///
+    /// `build` also answers the caller's half of whatever it made — the
+    /// response receiver, the close probe — because that half is created in the
+    /// same breath as the effect and nothing outside can name it.
+    ///
+    /// Infallible is a real constraint, and it is what shapes the streaming
+    /// path. Funding a stream's queue can be *refused*, and a refusal here has
+    /// nowhere to go: this section runs past the last point at which anything
+    /// could be handed back, so an acquisition inside it would either have to
+    /// panic or leave a half-filed record. That is the constraint — not a
+    /// blanket rule about the provider and the tables, which other paths on this
+    /// type legitimately break by acquiring under the lock where the acquisition
+    /// is allowed to fail. So the streaming caller acquires the queue's root
+    /// *before* preparing and carries the result in — a
+    /// `PreparedResourceMailbox`, which
+    /// is funding and nothing else. No `Arc`, no queue, no sender and no
+    /// receiver exist until `build` runs here; a refusal above returns the
+    /// prepared root, which releases what it holds and leaves nothing behind
+    /// that anyone could have been handed. The single-shot `oneshot` is built
+    /// here for a different reason: nothing but the pending lease covers its
+    /// allocation, so it must not exist on a path where that lease is going
+    /// away.
+    ///
+    /// **Not a production entry point.** Pairing a prepared call's class with
+    /// the effect that answers it is the invariant this seam exists to keep, and
+    /// a caller free to choose both would be free to file a stream's sender
+    /// under a single-shot's funding. The two narrowed forms below each pass a
+    /// constant; this one checks anyway, and a control drives it directly to
+    /// prove the check discriminates.
+    pub(crate) fn commit_exact_pending_as<E>(
+        &self,
+        prepared: PreparedPending,
+        remote_peer: &str,
+        remote_request_id: &str,
+        expected: HandlerMode,
+        build: impl FnOnce() -> (PendingInbound, E),
+    ) -> Result<(PendingTicket, E), PendingRefusal> {
+        let PreparedPending {
+            key: claim_key,
+            class,
+            owner,
+            entry,
+            retained,
+            cleanup,
+        } = prepared;
+        if class != expected {
+            return Err(PendingRefusal::ClassMismatch);
+        }
+        let key = PendingKey {
+            network: claim_key.0,
+            method: claim_key.1,
+            remote_peer: remote_peer.to_string(),
+            remote_request_id: remote_request_id.to_string(),
+            class,
+        };
+        let mut tables = self.inner.tables.lock();
+        // Re-checked under the lock that writes. The preparation's checks
+        // refused early and cheaply; these are the ones the insertion is atomic
+        // with. Every one of them returns before `build` is called, and the
+        // prepared leases are released by that return with nothing outstanding
+        // for them to have been covering.
+        if let Err(reason) = admitting(&tables) {
+            return Err(reason.into());
+        }
+        if tables.client(owner).is_none() {
+            return Err(PendingRefusal::OwnerGone);
+        }
+        if tables.exact_pending_inbound.contains_key(&key) {
+            return Err(PendingRefusal::Duplicate);
+        }
+        // Past every refusal, and still holding the lock the insertion is made
+        // under: what this builds cannot be refused and cannot be left behind.
+        let (effect, caller) = build();
+        // One charge, two owners. It is released when the later of the record
+        // and the ticket goes, which is the only moment at which no copy of
+        // these buffers is still live.
+        let funding = Arc::new(PendingFunding {
+            _retained: retained,
+        });
+        let operation_id = self.inner.next_operation_id.fetch_add(1, Ordering::Relaxed);
+        let ticket_key = key.clone();
+        let cancelled = Arc::new(PendingCancellation {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        tables
+            .exact_pending_inbound
+            .insert(
+                key,
+                PendingRecord {
+                    owner,
+                    operation_id,
+                    effect,
+                    cancelled: cancelled.clone(),
+                    cleanup: Some(cleanup),
+                    _funding: Arc::clone(&funding),
+                },
+                entry,
+            )
+            .expect("absence was established while these tables were held");
+        Ok((
+            PendingTicket {
+                registry: Arc::downgrade(&self.inner),
+                key: ticket_key,
+                operation_id,
+                cancelled,
+                _funding: funding,
+            },
+            caller,
+        ))
+    }
+
+    /// File a prepared single-shot call, and answer the receiver its response
+    /// will arrive on.
+    ///
+    /// The class is this method's, not its caller's: a single-shot preparation
+    /// is the only thing it accepts and a `oneshot` is the only thing it builds,
+    /// so the two cannot disagree.
+    pub fn commit_exact_single_pending(
+        &self,
+        prepared: PreparedPending,
+        remote_peer: &str,
+        remote_request_id: &str,
+    ) -> Result<
+        (
+            PendingTicket,
+            tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>>,
+        ),
+        PendingRefusal,
+    > {
+        self.commit_exact_pending_as(
+            prepared,
+            remote_peer,
+            remote_request_id,
+            HandlerMode::Single,
+            || {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (PendingInbound::Single(tx), rx)
+            },
+        )
+    }
+
+    /// File a prepared streaming call against an already-funded queue root, and
+    /// answer the receiver its chunks travel on together with a sender clone the
+    /// caller's watchdog watches for closure.
+    ///
+    /// Same pairing guarantee as the single-shot form, and the same reason for
+    /// taking the queue as *preparation* rather than as halves: the two halves
+    /// are built past the last refusal, inside the fence that installs them.
+    pub fn commit_exact_stream_pending(
+        &self,
+        prepared: PreparedPending,
+        remote_peer: &str,
+        remote_request_id: &str,
+        queue: myownmesh_core::PreparedResourceMailbox<myownmesh_core::rpc::RpcStreamItem>,
+    ) -> Result<
+        (
+            PendingTicket,
+            myownmesh_core::ResourceMailboxReceiver<myownmesh_core::rpc::RpcStreamItem>,
+            myownmesh_core::ResourceMailboxSender<myownmesh_core::rpc::RpcStreamItem>,
+        ),
+        PendingRefusal,
+    > {
+        self.commit_exact_pending_as(
+            prepared,
+            remote_peer,
+            remote_request_id,
+            HandlerMode::Stream,
+            move || {
+                let (tx, rx) = queue.commit();
+                let probe = tx.clone();
+                (PendingInbound::Stream(tx), (rx, probe))
+            },
+        )
+        .map(|(ticket, (rx, probe))| (ticket, rx, probe))
+    }
+
     /// Track one inbound call so a later `RpcRespond` or stream frame can settle
     /// it, and answer the ticket that owns its removal.
     ///
@@ -1437,6 +1909,13 @@ impl ClientRegistry {
     /// this call would need. Reporting all three as a duplicate — which is what
     /// a bare `Err(effect)` left the caller to do — told the peer to fix
     /// something that was not wrong.
+    /// Controls only. Production files through
+    /// [`Self::prepare_exact_pending`] and [`Self::commit_exact_pending`],
+    /// because a caller that already holds a built `PendingKey` has already
+    /// taken the allocation the split exists to make refusable. This form is
+    /// kept for the controls that drive the table directly and have no inbound
+    /// call to borrow coordinates from.
+    #[cfg(test)]
     pub fn insert_exact_pending(
         &self,
         key: PendingKey,
@@ -1488,6 +1967,26 @@ impl ClientRegistry {
                 })
             }
         };
+        // The node this record will occupy if a claim displacement has to detach
+        // it, as its own lease. Acquired here, moved into that node when the
+        // sweep builds it, released after the node is freed. Refused, nothing
+        // has been written and the effect goes back to the caller.
+        let cleanup = match crate::ipc::LeasedList::<PendingRecord>::node_claim()
+            .map_err(IpcAdmissionError::Claim)
+            .and_then(|claim| {
+                self.inner
+                    .resources
+                    .acquire(claim)
+                    .map_err(IpcAdmissionError::Resources)
+            }) {
+            Ok(cleanup) => cleanup,
+            Err(reason) => {
+                return Err(PendingRejected {
+                    effect,
+                    reason: reason.into(),
+                })
+            }
+        };
         // One charge, two owners. It is released when the later of the record
         // and the ticket goes, which is the only moment at which no copy of
         // these buffers is still live.
@@ -1509,6 +2008,7 @@ impl ClientRegistry {
                     operation_id,
                     effect,
                     cancelled: cancelled.clone(),
+                    cleanup: Some(cleanup),
                     _funding: Arc::clone(&funding),
                 },
                 entry,

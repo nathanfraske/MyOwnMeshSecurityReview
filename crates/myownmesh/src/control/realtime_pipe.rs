@@ -37,6 +37,37 @@ pub(super) enum RealtimePipeBinding {
     Inbound { network: String, peer: String },
 }
 
+impl RealtimePipeBinding {
+    /// The network both directions are bound through.
+    ///
+    /// Borrowed rather than cloned, and the caller reads it that way. The pipe
+    /// path used to take a third copy of this client-chosen name purely to look
+    /// the network up; removing the allocation is a better answer than pricing
+    /// it.
+    pub(super) fn network(&self) -> &str {
+        match self {
+            Self::Outbound { network, .. } | Self::Inbound { network, .. } => network,
+        }
+    }
+
+    /// The lengths of the two buffers this binding owns.
+    ///
+    /// For the funding that has to outlive the decoded request these were copied
+    /// out of. A pipe runs for as long as its client keeps it open, and the
+    /// request's own admission is derived from the encoded line — so it is the
+    /// padding a client chose, not these two coordinates, and it must not be
+    /// what pays for them.
+    pub(super) fn retained_lengths(&self) -> [usize; 2] {
+        match self {
+            Self::Outbound {
+                network,
+                flow_capability,
+            } => [network.len(), flow_capability.len()],
+            Self::Inbound { network, peer } => [network.len(), peer.len()],
+        }
+    }
+}
+
 /// Validate a [`Request::RealtimePipe`]'s fields against its direction.
 ///
 /// Every field is required or refused; none is accepted and ignored. A pipe
@@ -250,12 +281,17 @@ where
 /// outstanding but not release it, since releasing needs a `JoinedNetwork` and
 /// an await, and the registry holds neither.
 ///
-/// Dropping a flow handle would be silent and wrong: a handle is non-owning by
-/// design, so dropping one releases neither the label nor the transceiver or
-/// sender behind it, and a client that crashed would leave both held until its
-/// session happened to end. Each flow is taken out of the client's table before
-/// its close runs, so a close racing this drain reaches core at most once for a
-/// given flow.
+/// Each flow is *closed* rather than dropped, and the reason is no longer that
+/// dropping releases nothing. A `RealtimeFlowHandle`'s own Drop removes the flow
+/// from its set and hands the native half back as remains that retire when they
+/// drop, so an abandoned handle is cleaned up rather than leaked. What an
+/// explicit close still buys is the acknowledgement: it awaits that retirement,
+/// so this path can say the client's flows are down and be telling the truth,
+/// where a drop has nobody to tell and returns before the native half is gone.
+/// Drop is the backstop for the paths that cannot await one; this one can.
+///
+/// Each flow is taken out of the client's table before its close runs, so a
+/// close racing this drain reaches core at most once for a given flow.
 ///
 /// A handler left installed is the quieter version of the same leak: it holds
 /// the retention the engine funded for it and answers "no claim" to every
@@ -276,26 +312,39 @@ pub(super) async fn release_owned_registrations(
     // and network-name buffers, and dropping it at the top of the body would
     // unfund the very `network` string the lookup below reads. It goes at the
     // end of the iteration, with the strings it paid for.
-    for (network, flow, funding) in removed.handle.drain_realtime_flows() {
+    let mut flows = removed.handle.drain_realtime_flows();
+    while let Some((network, flow, funding)) = flows.pop() {
         let Some(net) = state.registry.get(&network) else {
             continue;
         };
         let _ = net.close_realtime(flow).await;
         drop((network, funding));
     }
-    // Methods need no loop at all any more. Each `ForgottenMethod` carries the
-    // core registration that removes its own handler, so dropping `removed` at
-    // the end of this function forgets every one of them -- from the dispatcher
-    // it was installed on, whether or not this daemon still has that network in
-    // its map, and only if a successor has not legitimately taken the name in
-    // the meantime.
+    // Methods next, and *before* the routes -- which is the order this comment
+    // used to claim while the code did the opposite. Each `ForgottenMethod`
+    // carries the core registration that removes its own handler, so dropping
+    // one forgets it from the dispatcher it was installed on, whether or not
+    // this daemon still has that network in its map, and only if a successor has
+    // not legitimately taken the name in the meantime.
     //
+    // Dropping them here rather than letting `removed` fall out of scope is two
+    // things at once. It makes the stated ordering true: a handler that is still
+    // installed can be re-entered by an inbound call, and a call that arrives
+    // while this client's channel routes are mid-retirement is a call routed
+    // into a fan-out being taken apart. And it releases each method's list node
+    // one at a time, as the F2 storage shape requires, rather than holding every
+    // node until the last route has been awaited.
+    let mut forget = removed.forget;
+    while let Some(forgotten) = forget.pop() {
+        drop(forgotten);
+    }
     // Last, and awaited. Each of these is either a pump that has not been told
     // to stop yet or an install whose followers have not been answered, and
     // `serve` counts the pumps among the tasks it will not return without. A
     // disconnect that skipped this would leave a fan-out task delivering into a
     // channel whose only subscriber is gone.
-    for route in removed.routes {
+    let mut routes = removed.routes;
+    while let Some(route) = routes.pop() {
         route.retire().await;
     }
 }

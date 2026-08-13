@@ -191,9 +191,11 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             client_capability,
         } => {
             // Authenticated before anything is opened, because the flow the
-            // open produces has to be *owned*, and a flow opened for nobody
-            // would have to be dropped — which releases nothing — or filed
-            // under a coordinate, which is what this finding removes.
+            // open produces has to be *owned*. A flow opened for nobody would
+            // have to be dropped — which now closes it, so the open would have
+            // been a round trip to core and back for nothing — or filed under a
+            // coordinate, which is what this finding removes. Refusing first
+            // means neither.
             let Some(owner) = state.clients.authenticate(client_id, &client_capability) else {
                 return Response::err("invalid local client authority");
             };

@@ -2566,7 +2566,7 @@ async fn handle_inbound_frame_from(
     bytes: Bytes,
 ) {
     let device_id = owner.device_id();
-    let Some(admission) = crate::protocol::classify_frame(&bytes) else {
+    let Some(class) = crate::protocol::classify_frame(&bytes) else {
         warn!(peer = %device_id, "discarding frame without a canonical bounded kind envelope");
         return;
     };
@@ -2584,7 +2584,10 @@ async fn handle_inbound_frame_from(
     // `handshake::on_approve`). This check is synchronous, not swept: a
     // never-admitted peer must get *zero* application processing, so there is
     // no grace window a periodic revalidation could open.
-    let application = matches!(admission, crate::protocol::FrameAdmission::Application);
+    let application = matches!(
+        class.admission,
+        crate::protocol::FrameAdmission::Application
+    );
     // The liveness commit for an inbound frame. Protocol frames take the plain
     // owner fence, because they are what *establishes* admission and must not
     // require it. An application frame takes the admission fence instead, so the
@@ -2772,16 +2775,42 @@ async fn handle_inbound_frame_from(
             witness,
             frame: None,
         }) => {
-            // The session that could not be funded ends here, under the owner
-            // captured above and against its own exact identity. A replacement
-            // that promoted in the meantime is left untouched — which is what
-            // the barrier below lets a control put there.
-            state.reach_exact_retirement_barrier();
-            if state.peers.retire_exact_session(owner, &witness) {
-                trace!(
-                    peer = %device_id,
-                    "retiring a session whose owner would not fund its inbound frame"
-                );
+            // What an unfundable frame costs depends on what that frame was
+            // for, and the answer comes from the leading tag rather than from
+            // the bytes — which is the whole reason the classifier carries it.
+            // These bytes were never decoded, and decoding them here to find
+            // out would be the exact work the refusal declined to fund.
+            //
+            // A completion-bearing frame is terminal: something local is
+            // waiting on it, the peer has already sent its one answer, and
+            // dropping it strands that waiter forever. The session that could
+            // not be funded ends here, under the owner captured above and
+            // against its own exact identity — a replacement that promoted in
+            // the meantime is left untouched, which is what the barrier below
+            // lets a control put there.
+            //
+            // A best-effort frame is not. Losing one plain `Channel` delivery
+            // under backpressure settles nothing and strands nobody, and
+            // retiring for it handed every admitted peer a way to end its own
+            // session on demand: send payload the owner will not fund, and the
+            // refusal does the rest. Backpressure is a reason to drop a frame,
+            // not to destroy a session that is otherwise working.
+            match class.on_failure {
+                crate::protocol::FailurePolicy::EndSession => {
+                    state.reach_exact_retirement_barrier();
+                    if state.peers.retire_exact_session(owner, &witness) {
+                        trace!(
+                            peer = %device_id,
+                            "retiring a session whose owner would not fund its inbound frame"
+                        );
+                    }
+                }
+                crate::protocol::FailurePolicy::DropFrame => {
+                    trace!(
+                        peer = %device_id,
+                        "dropping a best-effort frame its session would not fund, and keeping that session"
+                    );
+                }
             }
             return;
         }
@@ -2801,6 +2830,16 @@ async fn handle_inbound_frame_from(
         // this side can act on, and keeping the session would mean funding and
         // parsing the next one too. Exactly this session — a replacement that
         // promoted while the parse ran fails the identity check and survives.
+        //
+        // The failure policy is deliberately *not* consulted here, and the
+        // difference from the unfunded arm above is the difference between the
+        // two failures. That one is this side saying "not now" to a frame that
+        // was well-formed as far as anyone could tell; a peer must not be able
+        // to convert our own backpressure into a session teardown. This one is
+        // the peer emitting bytes that are not a frame at all over a channel it
+        // authenticated, which is a statement about the channel rather than
+        // about one delivery — and it is not a state a peer can be pushed into
+        // by anything this side does.
         state.reach_exact_retirement_barrier();
         if state.peers.retire_exact_session(owner, &witness) {
             trace!(
@@ -3511,127 +3550,169 @@ async fn on_rpc_request(
     let state = state.clone();
     match handler {
         PreparedRpcHandler::Single(h) => {
-            let fut = h.invoke(call);
             tokio::spawn(async move {
-                let mut task_lease = Some(_task_lease);
-                // Selected against the exact session that authorized this run,
-                // with no timer on either arm. A handler that never finishes is
-                // not a slow handler to be given a deadline — it is work whose
+                // **Declared before the lease so it is dropped after it.**
+                // Locals unwind in reverse declaration order, which is what
+                // makes this an observation of "the task ended and stopped
+                // costing its owner" rather than of "the run stopped running".
+                // Does not exist in a production build.
+                #[cfg(test)]
+                let _run_epilogue =
+                    crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
+                // Released when this task ends, whichever arm ends it.
+                let _task_lease = _task_lease;
+                // **The whole run, including the invocation.** `invoke` calls
+                // the embedder's `Fn` synchronously to obtain its future, and a
+                // valid handler may do work in that synchronous body before
+                // returning it. Building the future outside this block ran that
+                // body at spawn time — after the authority could already have
+                // ended, and before the witness had ever been polled. Inside,
+                // the first thing that happens when this future is polled is
+                // the call itself, and the `biased` select below polls
+                // revocation first: a session already gone never reaches the
+                // embedder's closure at all.
+                //
+                // Once that synchronous body has begun it is ordered before any
+                // later revocation and cannot be taken back; what this shape
+                // guarantees is that it never *begins* after one, and that
+                // every await afterwards — the handler's own future and the
+                // terminal send — ends when the witness ends.
+                let run = async move {
+                    let resp = h.invoke(call).await;
+                    let frame = match resp {
+                        Ok(r) => RpcResponseMessage {
+                            request_id,
+                            ok: Some(r.body),
+                            error: None,
+                        },
+                        Err(e) => RpcResponseMessage {
+                            request_id,
+                            ok: None,
+                            error: Some(e),
+                        },
+                    };
+                    // The last point at which this run is still take-back-able.
+                    // Inert unless a control has armed it; see
+                    // `NetworkState::reach_rpc_send_boundary`.
+                    state.reach_rpc_send_boundary().await;
+                    let _ =
+                        send_to_peer_owner(&state, &owner, &MeshMessage::RpcResponse(frame)).await;
+                };
+                // No timer on either arm. A handler that never finishes is not a
+                // slow handler to be given a deadline — it is work whose
                 // authority may end, and the only thing that ends it is that
-                // authority ending. A deadline would additionally cut short a
-                // legitimately long handler whose session is perfectly live.
-                let resp = tokio::select! {
-                    resp = fut => resp,
-                    () = witness.revoked() => {
-                        // Nothing is sent. The session that authorized this run
-                        // is gone, and its replacement did not ask for this. The
-                        // future and the lease are released here, before any
-                        // post-barrier effect, so a revoked run stops costing
-                        // the owner at the moment it stops being authorized.
-                        drop(task_lease.take());
-                        return;
-                    }
-                };
-                let _task_lease = task_lease;
-                let frame = match resp {
-                    Ok(r) => RpcResponseMessage {
-                        request_id,
-                        ok: Some(r.body),
-                        error: None,
-                    },
-                    Err(e) => RpcResponseMessage {
-                        request_id,
-                        ok: None,
-                        error: Some(e),
-                    },
-                };
-                let _ = send_to_peer_owner(&state, &owner, &MeshMessage::RpcResponse(frame)).await;
+                // authority ending. `biased` so the order is stated rather than
+                // drawn: revocation is asked first at every poll, including the
+                // first.
+                //
+                // The revoked arm sends nothing. The session that authorized
+                // this run is gone and its replacement did not ask for this, so
+                // the terminal frame it would address has no owner to go to.
+                // Dropping `run` here releases the handler future, and the task
+                // ends with its lease — a revoked run stops costing the owner at
+                // the moment it stops being authorized, including mid-send.
+                tokio::select! {
+                    biased;
+                    () = witness.revoked() => {}
+                    () = run => {}
+                }
             });
         }
         PreparedRpcHandler::Stream(h) => {
-            let fut = h.invoke(call);
             tokio::spawn(async move {
-                let mut task_lease = Some(_task_lease);
-                // The producing future, on the same terms as the unary arm.
-                let opened = tokio::select! {
-                    opened = fut => opened,
-                    () = witness.revoked() => {
-                        drop(task_lease.take());
-                        return;
-                    }
-                };
-                let mut rx = match opened {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        let _ = send_to_peer_owner(
-                            &state,
-                            &owner,
-                            &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
-                                request_id,
-                                error: Some(e),
-                            }),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                let mut seq = 0u64;
-                // And the receive loop, which is where a stream actually spends
-                // its life. Revocation releases the lease and returns, and the
-                // return drops the receiver — which ends the handler's side of
-                // the stream too. No terminal frame is sent: the session it
-                // would have been owner-bound to no longer exists.
-                //
-                // The receiver is not dropped explicitly inside the arm because
-                // the other branch's future borrows it; returning is what
-                // releases it, and it happens before any further send.
-                loop {
-                    let delivery = tokio::select! {
-                        delivery = rx.recv() => delivery,
-                        () = witness.revoked() => {
-                            drop(task_lease.take());
-                            return;
-                        }
-                    };
-                    let Some(delivery) = delivery else { break };
-                    let (item, _retention) = delivery.into_parts();
-                    let payload = match item {
-                        crate::rpc::RpcStreamItem::Chunk(payload) => payload,
-                        crate::rpc::RpcStreamItem::End(result) => {
+                // Before the lease, for the reason given in the unary arm.
+                #[cfg(test)]
+                let _run_epilogue =
+                    crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
+                let _task_lease = _task_lease;
+                // The same shape as the unary arm, and for the same reasons:
+                // the invocation, the open, every chunk send and every terminal
+                // send are one future, raced once against the witness. The loop
+                // used to select per iteration, which left the sends between
+                // iterations outside the race — a revoked session could still be
+                // spending this task's lease inside `send_to_peer_owner` until
+                // the transport returned.
+                let run = async move {
+                    let opened = h.invoke(call).await;
+                    let mut rx = match opened {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            // A terminal send, and so the same boundary as the
+                            // chunk one below. Inert unless armed.
+                            state.reach_rpc_send_boundary().await;
                             let _ = send_to_peer_owner(
                                 &state,
                                 &owner,
                                 &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                                     request_id,
-                                    error: result.err(),
+                                    error: Some(e),
                                 }),
                             )
                             .await;
                             return;
                         }
                     };
-                    seq += 1;
+                    let mut seq = 0u64;
+                    // And the receive loop, which is where a stream actually spends
+                    // its life. It no longer races the witness itself: the whole of
+                    // this future is one arm of the select below, so revocation ends
+                    // the receive, the chunk send and the terminal send alike.
+                    // Dropping this future drops the receiver, which ends the
+                    // handler's side of the stream too, and no terminal frame is
+                    // sent — the session it would have been owner-bound to no longer
+                    // exists.
+                    loop {
+                        let Some(delivery) = rx.recv().await else {
+                            break;
+                        };
+                        let (item, _retention) = delivery.into_parts();
+                        let payload = match item {
+                            crate::rpc::RpcStreamItem::Chunk(payload) => payload,
+                            crate::rpc::RpcStreamItem::End(result) => {
+                                let _ = send_to_peer_owner(
+                                    &state,
+                                    &owner,
+                                    &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+                                        request_id,
+                                        error: result.err(),
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        seq += 1;
+                        // The chunk half of the same boundary. Inert unless a
+                        // control has armed it.
+                        state.reach_rpc_send_boundary().await;
+                        let _ = send_to_peer_owner(
+                            &state,
+                            &owner,
+                            &MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
+                                request_id: request_id.clone(),
+                                seq,
+                                payload,
+                            }),
+                        )
+                        .await;
+                    }
                     let _ = send_to_peer_owner(
                         &state,
                         &owner,
-                        &MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
-                            request_id: request_id.clone(),
-                            seq,
-                            payload,
+                        &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+                            request_id,
+                            error: Some(
+                                "RPC stream handler disappeared without terminal state".into(),
+                            ),
                         }),
                     )
                     .await;
+                };
+                tokio::select! {
+                    biased;
+                    () = witness.revoked() => {}
+                    () = run => {}
                 }
-                let _task_lease = task_lease;
-                let _ = send_to_peer_owner(
-                    &state,
-                    &owner,
-                    &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
-                        request_id,
-                        error: Some("RPC stream handler disappeared without terminal state".into()),
-                    }),
-                )
-                .await;
             });
         }
     }
@@ -3786,22 +3867,24 @@ async fn on_rpc_stream_chunk(
     // reaches one session's own `SessionRpcState`, so a chunk can only ever
     // find a stream that session opened. A different peer, or a replacement of
     // this one, is not refused so much as looking at a different map.
-    // The outcome is deliberately not acted on here. Every refusal inside has
-    // already settled the stream with the reason it refused for, and a chunk
-    // that was accepted needs nothing further; a dispatch that captured no
-    // session did nothing at all. Discarded explicitly rather than bound and
-    // then guarded, because a guard whose only arm is the end of this function
-    // reads as though something follows it.
-    let _ = dispatch.with_captured_session_state(&state.peers, |session, app| {
+    let unsettleable = dispatch.with_captured_session_state(&state.peers, |session, app| {
         let Some(stream) = app
             .rpc_mut()
             .stream_chunk_sender(&chunk.request_id, chunk.seq)
         else {
+            // A chunk that names no open stream, or names one out of order.
+            // The local caller is finished with the reason, and nothing further
+            // is owed: there is no producer to stop that this side has any
+            // record of — either the stream was already ended or the peer is
+            // sending for one that never existed here. Deliberately not
+            // terminal for the session, and deliberately unchanged: it is not
+            // the arm the finding is about, and it is not a state this side's
+            // own capacity can put a peer into.
             if let Some(extracted) = app.rpc_mut().take_stream_end(&chunk.request_id) {
                 let (stream, _funding) = extracted.into_parts();
                 stream.finish_borrowed(Some("RPC stream sequence violation"));
             }
-            return false;
+            return None;
         };
         // Settled with the reason the admission actually gave. A single
         // sentence for both arms used to say "refused by resource owner" for a
@@ -3809,12 +3892,16 @@ async fn on_rpc_stream_chunk(
         // provider was short when what had happened was that a peer sent an
         // item this side could not admit. The two want different responses from
         // whoever reads them, so they are told apart here.
-        let refusal = match stream.push(session, chunk.payload) {
-            Ok(()) => return true,
-            Err(crate::application_gateway::GatewayRefusal::Malformed) => {
-                "RPC stream item could not be admitted".to_string()
-            }
-            Err(e) => format!("RPC stream refused by resource owner: {e:?}"),
+        let (refusal, reason) = match stream.push(session, chunk.payload) {
+            Ok(()) => return None,
+            Err(crate::application_gateway::GatewayRefusal::Malformed) => (
+                "RPC stream item could not be admitted".to_string(),
+                "delivered a stream item that could not be admitted",
+            ),
+            Err(e) => (
+                format!("RPC stream refused by resource owner: {e:?}"),
+                "would not fund the stream item it delivered",
+            ),
         };
         if let Some(extracted) = app.rpc_mut().take_stream_end(&chunk.request_id) {
             let (stream, _funding) = extracted.into_parts();
@@ -3823,8 +3910,31 @@ async fn on_rpc_stream_chunk(
             // still funded by the session that delivered the chunk.
             stream.finish_owned(session, refusal);
         }
-        false
+        // Terminal for this exact session, and this is the half that was
+        // missing. Finishing the inbox answers the *local* caller and nothing
+        // else: the entry is gone, so every further chunk lands on the arm
+        // above and is discarded, while the remote producer — which was never
+        // told anything — goes on generating and sending them for as long as it
+        // has items. That is a peer left producing into a stream this side has
+        // already abandoned, driven by a refusal the peer cannot observe.
+        //
+        // There is no cancel frame to send: the frame set is closed and carries
+        // no requester-to-responder stream cancellation, so the one causal act
+        // available is ending the session that carries the stream. Doing that
+        // drops the connector's promoted session, which is what the producer
+        // actually notices. The local caller keeps the specific reason it was
+        // finished with above — that happened first, and under the session that
+        // funded it — so ending the session costs it nothing it had not already
+        // been told.
+        Some((session.validity_witness(), reason))
     });
+    if let Some(Some((witness, reason))) = unsettleable {
+        // Outside the capture: retirement takes the same mutation lock.
+        state.reach_exact_retirement_barrier();
+        if state.peers.retire_exact_session(dispatch.owner(), &witness) {
+            trace!(%reason, "retiring a session whose stream chunk could not be carried");
+        }
+    }
 }
 
 async fn on_rpc_stream_end(
@@ -3876,7 +3986,7 @@ async fn on_channel_frame(
     // Refusal is the intended outcome for a superseded installation: the
     // payload is dropped rather than delivered under an id someone else now
     // holds, and no subscriber is owed a notification of that.
-    let unsettleable = dispatch.with_captured_session_state(&state.peers, |session, _record| {
+    let disposition = dispatch.with_captured_session_state(&state.peers, |session, _record| {
         // An endpoint frame is never interpreted as an ordinary-member routing
         // envelope: the inbound path delivers to subscribers and forwards to
         // nobody.
@@ -3888,35 +3998,89 @@ async fn on_channel_frame(
             dispatch.owner().device_id(),
             payload,
         );
-        // Only two of the refusals say anything about this session, and they are
-        // the two that will say it again about the next frame: the owner will
-        // not fund this peer's traffic, and the peer sent something that cannot
-        // be represented. Both are taken inside the capture, so the witness
-        // names the session that actually refused.
+        // A plain `Channel` frame is best-effort delivery, and the three
+        // refusals below are sorted by whether they say something about the
+        // *session* or only about this one delivery.
         //
-        // `NoReceiver` is deliberately not among them. Nobody having subscribed
-        // to a channel is an ordinary state of a healthy session, and retiring
-        // for it would end a session because the local application had not
-        // asked for that channel yet.
+        // `Pressure` says only the latter, and used to be treated as terminal.
+        // Nothing local is waiting on a `Channel` frame — it carries no
+        // sequence, is acknowledged by nobody, and its acknowledged counterpart
+        // is `ChannelSeq`, which keeps its own retirement — so losing one under
+        // an owner that would not fund the subscriber queue settles nothing and
+        // strands nobody. Retiring for it meant an admitted peer could end its
+        // own working session at will by sending payload we could not afford,
+        // and could do it to a session carrying other peers' answers. The frame
+        // is dropped; the session carries on. This is the inner half of the same
+        // rule the outer admission arm applies before decode, and the two are
+        // deliberately the same rule: a peer must not be able to convert this
+        // side's backpressure into a teardown at either point.
+        //
+        // `Malformed` still is terminal, and the difference is the same one the
+        // decode site draws: a payload that cannot be represented as a claim at
+        // all is the peer emitting something that is not a deliverable frame,
+        // which it will emit again, and which no amount of local capacity would
+        // have accepted.
+        //
+        // `NoReceiver` was never among them. Nobody having subscribed to a
+        // channel is an ordinary state of a healthy session, and retiring for it
+        // would end a session because the local application had not asked for
+        // that channel yet.
         match outcome {
-            Err(crate::application_gateway::GatewayRefusal::Pressure(_)) => Some((
-                session.validity_witness(),
-                "would not fund the channel frame it delivered",
-            )),
-            Err(crate::application_gateway::GatewayRefusal::Malformed) => Some((
-                session.validity_witness(),
-                "delivered a channel frame that is not representable",
-            )),
-            _ => None,
+            Err(crate::application_gateway::GatewayRefusal::Pressure(_)) => {
+                ChannelDisposition::Dropped
+            }
+            // Taken inside the capture, so the witness names the session that
+            // actually refused rather than whichever holds the id afterwards.
+            Err(crate::application_gateway::GatewayRefusal::Malformed) => {
+                ChannelDisposition::Unsettleable(
+                    session.validity_witness(),
+                    "delivered a channel frame that is not representable",
+                )
+            }
+            _ => ChannelDisposition::Settled,
         }
     });
-    if let Some(Some((witness, reason))) = unsettleable {
-        // Outside the capture: retirement takes the same mutation lock.
-        state.reach_exact_retirement_barrier();
-        if state.peers.retire_exact_session(dispatch.owner(), &witness) {
-            trace!(%reason, "retiring a session whose channel frame could not be admitted");
+    match disposition {
+        Some(ChannelDisposition::Unsettleable(witness, reason)) => {
+            // Outside the capture: retirement takes the same mutation lock.
+            state.reach_exact_retirement_barrier();
+            if state.peers.retire_exact_session(dispatch.owner(), &witness) {
+                trace!(%reason, "retiring a session whose channel frame could not be admitted");
+            }
         }
+        Some(ChannelDisposition::Dropped) => {
+            trace!(
+                peer = %dispatch.owner().device_id(),
+                %channel,
+                "dropping a best-effort channel frame its session would not fund, and keeping that session"
+            );
+        }
+        // Delivered, refused for a reason that says nothing about the session,
+        // or captured nothing at all because the installation was superseded —
+        // in which case the payload was dropped rather than delivered under an
+        // id someone else now holds, and no subscriber is owed a notification.
+        Some(ChannelDisposition::Settled) | None => {}
     }
+}
+
+/// What one channel delivery attempt leaves owed to the session it ran under.
+///
+/// Three outcomes rather than an `Option<witness>`, because "dropped" is a real
+/// answer here and not the absence of one: it is the arm that says the frame is
+/// gone *and* the session stays, which is exactly the distinction a bare
+/// `None` — shared with "delivered" and with "captured nothing" — could not
+/// carry.
+enum ChannelDisposition {
+    /// Delivered, or refused for a reason that says nothing about the session.
+    Settled,
+    /// Best-effort, and this side could not afford it. The frame is lost and
+    /// the session is kept.
+    Dropped,
+    /// Terminal for the session named by the witness, for the stated reason.
+    Unsettleable(
+        crate::runtime::session_broker::SessionValidityWitness,
+        &'static str,
+    ),
 }
 
 /// Resolve the exact current owner once, then send through it.
@@ -5424,10 +5588,11 @@ async fn expect_native_frame(
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        let Some(event) = tokio::time::timeout(Duration::from_secs(1), link._right_events.recv())
-            .await
-            .ok()
-            .flatten()
+        let Some(event) =
+            tokio::time::timeout(Duration::from_secs(1), link.right_events_mut().recv())
+                .await
+                .ok()
+                .flatten()
         else {
             continue;
         };
@@ -9251,7 +9416,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
             let Some(event) =
-                tokio::time::timeout(Duration::from_secs(1), link._right_events.recv())
+                tokio::time::timeout(Duration::from_secs(1), link.right_events_mut().recv())
                     .await
                     .ok()
                     .flatten()
@@ -12964,6 +13129,591 @@ mod tests {
         );
     }
 
+    /// Backpressure on a best-effort channel frame loses the frame and keeps the
+    /// exact session, at both points it can be refused.
+    ///
+    /// The asymmetry this control exists for. Every other refusal on the inbound
+    /// path is terminal because something is waiting on the frame — a caller's
+    /// pending operation, a sender's retained reliable entry, an open stream — so
+    /// dropping it silently strands somebody, and ending the session is what
+    /// resolves them. A plain `Channel` frame is the one delivery with nobody on
+    /// the other end of it: no sequence, no acknowledgement, no local wait. The
+    /// whole cost of losing one is that one payload.
+    ///
+    /// Retiring for it was therefore not a conservative choice but a hole. The
+    /// payload size is the sender's, the refusal is a function of that size, and
+    /// the session it ends carries every other peer-scoped thing the connection
+    /// holds. Any admitted peer could end its own working session on demand, at
+    /// a moment of its choosing, by sending a frame this side could not afford —
+    /// and could do it repeatedly.
+    ///
+    /// **Both refusal points, because they are two different mechanisms.** The
+    /// outer one refuses before the bytes are decoded, so it can only know what
+    /// the leading tag said — that is what the classifier's failure policy is
+    /// for. The inner one refuses after decode, in `accept_channel`, where the
+    /// message is in hand. A repair to one is not a repair to the other.
+    ///
+    /// **The discriminator is the next frame, not a liveness flag.** After each
+    /// refusal the control checks that B still holds *the exact operation it
+    /// filed*, which a replacement session would not, and it finishes by
+    /// delivering one more affordable frame and reading it off the subscriber.
+    /// That last read is doing two jobs: it proves the session still delivers
+    /// rather than merely existing, and — because the subscriber is a queue —
+    /// the fact that the payload arriving is `"after"` and not one of the two
+    /// refused bodies is what proves the refusals refused anything at all. A
+    /// mis-sized seal that let both frames through fails there.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn channel_backpressure_keeps_the_exact_session_it_refused() {
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f6-channel-pressure").await;
+        let channel =
+            crate::channels::Channel::<serde_json::Value>::new("app".into(), Arc::clone(&state));
+        // Held for the whole control. Without a live subscriber `accept_channel`
+        // answers `NoReceiver` before it looks at any claim, and the inner arm
+        // below would pass through a refusal that was never about capacity.
+        let mut subscriber = channel
+            .subscribe()
+            .expect("the fixture funds one subscriber");
+        let (bystander, _bystander_rx) = file_pending(&state, "device-c");
+        let owner_b = state.peers.owner("device-b").expect("B is installed");
+
+        // Filed before any seal, and the identity every assertion below is
+        // against: a session that ended and was replaced would not hold it.
+        let (b_operation, _b_rx) = file_pending(&state, "device-b");
+
+        let frame = |body: &str| {
+            frame_bytes(&MeshMessage::Channel {
+                channel: "app".into(),
+                payload: serde_json::json!(body),
+            })
+        };
+        // Positive companion: an affordable frame is delivered, so the path
+        // below is refusing something that otherwise works.
+        handle_inbound_frame_from(&state, &owner_b, frame("before")).await;
+        assert_eq!(
+            next_channel_payload(&mut subscriber).await,
+            serde_json::json!("before"),
+            "non-vacuity: an affordable channel frame reaches the subscriber"
+        );
+
+        // Outer arm: refused at `AdmittedApplicationFrame::admit`, before these
+        // bytes are ever decoded. The policy the retirement decision reads there
+        // came from the leading tag, which is the only thing that has been
+        // looked at.
+        let refused_outer = frame("refused-before-decode");
+        let sealed = seal_retained_memory_below_admission(&state, "device-b", refused_outer.len());
+        handle_inbound_frame_from(&state, &owner_b, refused_outer).await;
+        // Released before the assertions: a session still holding the whole
+        // grant would make the affordable frame at the end fail to be admitted,
+        // for a reason this control is not about.
+        drop(sealed);
+        assert!(
+            still_holds_operation(&state, "device-b", &b_operation),
+            "a frame refused before decode leaves the session that refused it — \
+             the same session, holding the same operation, not a replacement"
+        );
+
+        // Inner arm: the envelope is affordable and the frame is admitted and
+        // decoded, so what refuses it is a claim taken *after* the decode —
+        // `accept_channel`'s delivery claim being the one this control is
+        // about. The seal is sized to leave exactly the envelope and nothing
+        // after it, which pins the refusal to the post-decode side of the split
+        // without pinning which post-decode claim it is; the property asserted
+        // is the same either way, and the outer arm above is the one that is
+        // provably pre-decode.
+        let refused_inner = frame("refused-after-decode");
+        let sealed = seal_retained_memory_to_admit(&state, "device-b", refused_inner.len());
+        handle_inbound_frame_from(&state, &owner_b, refused_inner).await;
+        drop(sealed);
+        assert!(
+            still_holds_operation(&state, "device-b", &b_operation),
+            "and so does one refused after decode, by the delivery claim"
+        );
+
+        // The discriminator. One more affordable frame, and the payload that
+        // comes off the subscriber must be this one: the session still carries
+        // traffic, and neither refused body was delivered on the way.
+        handle_inbound_frame_from(&state, &owner_b, frame("after")).await;
+        assert_eq!(
+            next_channel_payload(&mut subscriber).await,
+            serde_json::json!("after"),
+            "the session still delivers, and what it delivers is the frame it \
+             could afford — a refused body arriving here would mean the seals \
+             refused nothing"
+        );
+
+        assert!(
+            still_holds_operation(&state, "device-c", &bystander),
+            "and C, which was never sealed, is untouched throughout"
+        );
+    }
+
+    /// A stream chunk this side cannot carry ends the session carrying the
+    /// stream, so the remote producer stops.
+    ///
+    /// The mirror image of the control above, and the reason the two are written
+    /// together: the same refusal, on a frame that *is* completion-bearing, must
+    /// go the other way.
+    ///
+    /// Finishing the inbox answers the **local** caller and nobody else. The
+    /// pending entry is gone, so every further chunk lands on the
+    /// no-such-stream arm and is discarded — while the remote producer, which
+    /// was told nothing, goes on generating items and putting them on the wire
+    /// for as long as it has any. Each one is admitted, funded and thrown away
+    /// by a session that has already abandoned the stream. That is a peer left
+    /// producing into a void by a refusal it cannot observe, and this side is
+    /// the one paying for the frames.
+    ///
+    /// There is no cancel frame to send: the frame set is closed and carries no
+    /// requester-to-responder stream cancellation. Ending the session is the one
+    /// causal act available, and it is what the producer observes.
+    ///
+    /// **What this control witnesses is that act** — the exact session that
+    /// carried the stream is gone, and the caller was given the specific reason
+    /// first. It does not witness the far side's own reaction; that would need a
+    /// linked pair and a real responder, and the causal step being verified here
+    /// is the one that was missing.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn a_stream_chunk_this_side_cannot_carry_ends_the_producers_session() {
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04f6-stream-terminal").await;
+        let (bystander, _bystander_rx) = file_pending(&state, "device-c");
+
+        let inbox = Arc::new(crate::rpc::RpcStreamInbox::new());
+        let filed = state
+            .application_gateway
+            .register_rpc_request(
+                &state,
+                "device-b",
+                crate::rpc::PendingEntry::Stream(Arc::clone(&inbox)),
+            )
+            .expect("the exact promoted session funds one pending stream");
+
+        // Positive companion: an affordable chunk is accepted, and accepting it
+        // leaves the stream open and the session live. Without it a control that
+        // refused every chunk would satisfy everything below on its own.
+        deliver_rpc_stream_chunk_seq(
+            &state,
+            "device-b",
+            &filed.request_id,
+            1,
+            serde_json::json!(1),
+        )
+        .await;
+        assert!(
+            !inbox.is_finished(),
+            "non-vacuity: an affordable chunk is accepted rather than settling \
+             the stream"
+        );
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            Some(1),
+            "and the stream stays open, waiting for its end frame"
+        );
+
+        // The refused one: the same shape, one sequence further on, under a
+        // session sealed to exactly one admission's worth. The envelope is
+        // admitted and decoded; the mailbox claim inside `push` is the first to
+        // find nothing left, which is the `Pressure` arm.
+        let refused = MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
+            request_id: filed.request_id.clone(),
+            seq: 2,
+            payload: serde_json::json!(1),
+        });
+        let refused_len = serde_json::to_vec(&refused)
+            .expect("the control frame serializes")
+            .len();
+        let sealed = seal_retained_memory_to_admit(&state, "device-b", refused_len);
+        deliver_rpc_stream_chunk_seq(
+            &state,
+            "device-b",
+            &filed.request_id,
+            2,
+            serde_json::json!(1),
+        )
+        .await;
+        // Released before the assertions, for the reason given in the F5
+        // controls: a session still holding the whole grant would make the
+        // replacement below fail to promote for a reason this control is not
+        // about.
+        drop(sealed);
+
+        assert!(
+            settle_until(|| inbox.is_finished()).await,
+            "the local caller is settled with the reason the refusal gave, and \
+             settled first — ending the session below costs it nothing it had \
+             not already been told"
+        );
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            None,
+            "and the session carrying the stream is gone, which is the one act \
+             available that the remote producer can observe — without it the \
+             producer keeps sending chunks into a stream this side has already \
+             abandoned, and this side keeps funding them"
+        );
+
+        assert!(
+            still_holds_operation(&state, "device-c", &bystander),
+            "C is untouched: the retirement named one session by identity, not \
+             whatever holds a device id"
+        );
+
+        let _replacement = insert_admitted_peer(&state, "device-b").await;
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            Some(0),
+            "and the device id is usable again, with its own empty state"
+        );
+    }
+
+    /// The next payload this subscription receives, or a failure if none
+    /// arrives.
+    ///
+    /// Bounded rather than awaited outright: a control asserting that a session
+    /// still delivers must fail if it does not, and an unbounded `recv` on a
+    /// session that has stopped delivering hangs instead of failing.
+    ///
+    /// A free function rather than a closure, because a closure taking `&mut`
+    /// and returning a future cannot name the borrow in its own return type.
+    async fn next_channel_payload(
+        subscriber: &mut crate::channels::ChannelSubscription<serde_json::Value>,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("a delivered channel payload reaches its subscriber")
+            .expect("the subscription is live")
+            .expect("and carries a payload rather than a lag report")
+            .body
+    }
+
+    /// Whether `device_id`'s current session is live **and** still holds the
+    /// exact operation `filed` names.
+    ///
+    /// Identity rather than a count, and one predicate rather than the two
+    /// separate reads it replaces: "the session is live" and "the session is the
+    /// one that filed this" are the same question here, and a control that asked
+    /// only the first would be satisfied by a replacement.
+    fn still_holds_operation(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+        filed: &crate::rpc::LocalRequest,
+    ) -> bool {
+        let Some(owner) = state.peers.owner(device_id) else {
+            return false;
+        };
+        state
+            .peers
+            .with_live_session_state(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |_session, app| app.rpc_mut().still_holds(filed),
+            )
+            .unwrap_or(false)
+    }
+
+    /// A far side that is not merely *receiving* but **participating**: its own
+    /// promoted session over the same link, and a pump feeding what that link
+    /// delivers into its own engine.
+    ///
+    /// [`two_authenticated_peers_over_a_real_link`] gives a far side that can be
+    /// read from — enough to prove bytes crossed, which is what the reliable
+    /// controls need. It cannot answer, because nothing installs a peer on the
+    /// far state and nothing hands the far engine its inbound frames. A control
+    /// about what happens to a *remote handler* needs both.
+    ///
+    /// Neither half is a re-implementation of production. The install consumes
+    /// the far connector's own genuine open handoff — the one its own open
+    /// callback produced, which the receive-ready fixture was already holding —
+    /// and the pump hands **every** raw event to `handle_transport_event`, which
+    /// is the production seam a transport driver feeds.
+    ///
+    /// That last point is load-bearing and was got wrong once. A pump that
+    /// accepts the event itself and acts only on `TransportEvent::Message`
+    /// delivers frames perfectly well and silently drops `DataChannelClosed` —
+    /// so the far peer is never dropped, its session is never revoked, and a
+    /// control waiting on a producer cancellation waits forever for a
+    /// cancellation nothing was going to cause. `handle_transport_event` does
+    /// the current-worker accept, dispatches `Message`, and takes
+    /// `DataChannelClosed` to `drop_peer_if_current`, which is the far half of
+    /// the whole causal chain. It must therefore be given the event *unaccepted*
+    /// — accepting first would hand it a stale or twice-accepted event.
+    #[cfg(feature = "transport-lab")]
+    struct FarSideEngine {
+        state: Arc<NetworkState>,
+        rpc: crate::rpc::Rpc,
+        /// The far state's owner token for the near node.
+        _peer: Arc<PeerConnection>,
+        /// Ends when the link does, which is one of the things being observed.
+        pump: tokio::task::JoinHandle<()>,
+    }
+
+    /// Install the near node as a promoted peer on `far`, over the far end of
+    /// the link, and start pumping that end into `far`'s engine.
+    #[cfg(feature = "transport-lab")]
+    fn start_far_side_engine(
+        far: &Arc<NetworkState>,
+        near_device_id: &str,
+        link: &mut crate::endpoint_auth::native_link::LinkBeforeEngineOpen,
+        handoff: crate::connector::ConnectedChannelHandoff,
+    ) -> FarSideEngine {
+        let peer = Arc::new(PeerConnection::new(
+            near_device_id.to_string(),
+            Some(Arc::clone(&link.right)),
+        ));
+        {
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        peer.install_authenticated_channel_over_for_test(
+            handoff,
+            &far.network_id,
+            far.identity.public_id(),
+        );
+        install_peer(&far.peers, Arc::clone(&peer));
+        assert!(
+            far.peers.owner(near_device_id).is_some(),
+            "the far side has just installed the near node"
+        );
+        let rpc = crate::rpc::Rpc::attach(far).expect("the far owner funds one RPC dispatcher");
+
+        let pumping = Arc::clone(far);
+        let near = near_device_id.to_string();
+        let mut events = link.take_right_events();
+        let pump = tokio::spawn(async move {
+            // Raw events, straight to the production seam — see the type's
+            // doc for why nothing is accepted or filtered here. Ends when the
+            // connector's event stream ends, which is what the native close
+            // does to it. No deadline: the loop's termination is an
+            // observation, not a timeout.
+            while let Some(event) = events.recv().await {
+                let _acted = handle_transport_event(&pumping, near.clone(), event).await;
+            }
+        });
+        FarSideEngine {
+            state: Arc::clone(far),
+            rpc,
+            _peer: peer,
+            pump,
+        }
+    }
+
+    /// Read the next frame the far side put on the wire, as bytes.
+    ///
+    /// The near half of the same job the pump does for the far half, done inline
+    /// rather than in a task because this control must decide what to do with
+    /// each frame — in particular, it must seal the session *between* receiving
+    /// the chunk and admitting it. The bound is a failure detector: a far
+    /// producer that never sent must fail this control rather than hang it.
+    #[cfg(feature = "transport-lab")]
+    async fn next_frame_from_the_far_side(
+        link: &mut crate::endpoint_auth::native_link::LinkBeforeEngineOpen,
+    ) -> Bytes {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let Some(event) =
+                tokio::time::timeout(Duration::from_secs(1), link.left_events_mut().recv())
+                    .await
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Some(accepted) = link.left.accept_event(event) else {
+                continue;
+            };
+            let (event, _callback_resources) = accepted.into_parts();
+            if let TransportEvent::Message(bytes) = event {
+                return bytes;
+            }
+        }
+        panic!("the far side put no frame on the wire before the deadline");
+    }
+
+    /// Chunk pressure at the receiver ends the **remote** producer.
+    ///
+    /// The far half of the stream-terminal finding, and the one that cannot be
+    /// argued from this side's state. `a_stream_chunk_this_side_cannot_carry_...`
+    /// proves the local act — the exact session is retired — but a retirement
+    /// only helps if the peer actually notices it. If it does not, the producer
+    /// goes on generating items and putting them on a wire nobody is reading,
+    /// and this side goes on funding and discarding them: the same defect, moved
+    /// one hop.
+    ///
+    /// So both engines are real here. The far side has its own promoted session
+    /// over the same link, its own RPC dispatcher, its own handler, and a pump
+    /// feeding it what the link delivers. The producer it runs is a genuine
+    /// streaming run: it hands back a funded mailbox, sends its first chunk, and
+    /// then parks on `recv` with the sender still alive — so it is *still
+    /// producing* at the moment the receiver refuses, which is the state the
+    /// finding is about.
+    ///
+    /// **The causal chain, and what witnesses each link.**
+    /// 1. The near side refuses the chunk for capacity — sealed to admit the
+    ///    envelope and nothing after it, so the refusal is `push`'s.
+    /// 2. `on_rpc_stream_chunk` retires the exact session. Witness:
+    ///    `pending_len` answers `None`.
+    /// 3. Retirement drops the promoted session, whose authenticated capability
+    ///    owns the `ConnectedChannelHandoff`, whose `Drop` starts the connector
+    ///    close that reaches `RTCPeerConnection::close()`.
+    /// 4. The far connector's event stream ends. Witness: the pump's own loop
+    ///    returns, and the `JoinHandle` completes.
+    /// 5. The far session is revoked and the producer's run is cancelled.
+    ///    Witness: the far state's own `RpcRunEpilogue` fires — a guard declared
+    ///    before the task lease, so the count moves only after that lease has
+    ///    been released.
+    ///
+    /// **No timer is the authority for any of it.** The two bounded waits are
+    /// failure detectors: one fails a far producer that never sent, the other
+    /// fails a cancellation that never arrived. Nothing passes because time
+    /// elapsed.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a real linked connector pair; run explicitly in the isolated WSL harness"]
+    async fn receiver_chunk_pressure_ends_the_remote_producer() {
+        let (state, _rpc, mut b, _c, far) =
+            two_authenticated_peers_over_a_real_link("arc04f6-remote-producer").await;
+        let handoff = b.receive_ready.take_right_handoff();
+        let far_side = start_far_side_engine(
+            &far,
+            state.identity.public_id(),
+            &mut b.receive_ready.link,
+            handoff,
+        );
+
+        // The far producer: one real chunk, then parked on a mailbox whose
+        // sender **this control** holds. That is not decoration. A stream with
+        // no live sender is a stream that ends by itself — the run's next `recv`
+        // would see zero senders and finish, on a schedule this control does not
+        // set, and every observation below would be true for the wrong reason.
+        // The keeper holds the exact sender across the whole sequence, so the
+        // producer is genuinely waiting for an item that is never coming, and
+        // the only thing that can end it is the cancellation under test.
+        #[allow(clippy::type_complexity)]
+        let keeper: Arc<
+            parking_lot::Mutex<
+                Option<crate::resource::ResourceMailboxSender<crate::rpc::RpcStreamItem>>,
+            >,
+        > = Arc::new(parking_lot::Mutex::new(None));
+        let producing = Arc::clone(&far_side.state);
+        let kept = Arc::clone(&keeper);
+        far_side
+            .rpc
+            .serve_stream("produces", move |_call: crate::rpc::RpcCall| {
+                let producing = Arc::clone(&producing);
+                let kept = Arc::clone(&kept);
+                async move {
+                    let (tx, rx) =
+                        funded_stream_parts_with_one_chunk(&producing, serde_json::json!("chunk"))?;
+                    *kept.lock() = Some(tx);
+                    Ok(rx)
+                }
+            })
+            .expect("the far gateway admits a streaming handler");
+
+        // The near side files the stream and puts the request on the wire. The
+        // frame goes out through the ordinary owner-bound send, not through a
+        // fixture shortcut.
+        let inbox = Arc::new(crate::rpc::RpcStreamInbox::new());
+        let filed = state
+            .application_gateway
+            .register_rpc_request(
+                &state,
+                "device-b",
+                crate::rpc::PendingEntry::Stream(Arc::clone(&inbox)),
+            )
+            .expect("the near session funds one pending stream");
+        let owner_b = state.peers.owner("device-b").expect("B is installed");
+        send_to_peer_owner(
+            &state,
+            &owner_b,
+            &MeshMessage::RpcRequest(RpcRequestMessage {
+                request_id: filed.request_id.clone(),
+                method: "produces".into(),
+                payload: serde_json::Value::Null,
+                streaming: true,
+            }),
+        )
+        .await
+        .expect("the request reaches the far side over the live link");
+
+        // The far producer's first chunk, taken off the wire but **not yet
+        // admitted**. Holding it here is what lets the seal be sized from these
+        // exact bytes and applied before they are delivered.
+        let chunk = next_frame_from_the_far_side(&mut b.receive_ready.link).await;
+        assert!(
+            keeper.lock().is_some(),
+            "the producer's own sender is held here, so its mailbox has not \
+             closed and its next `recv` is a wait rather than an end"
+        );
+        assert_eq!(
+            far_side.state.rpc_send_boundary.finished(),
+            0,
+            "non-vacuity: the far producer is still running — it sent a chunk \
+             and did not end, so what ends it below is the receiver and not \
+             the handler finishing on its own"
+        );
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            Some(1),
+            "and the near side still holds the stream it filed"
+        );
+
+        // The refusal. Sealed from the chunk's own encoded length, so the
+        // envelope is admitted and decoded and the mailbox claim inside `push`
+        // is the first to find nothing left.
+        let sealed = seal_retained_memory_to_admit(&state, "device-b", chunk.len());
+        handle_inbound_frame_from(&state, &owner_b, chunk).await;
+        // Released before the observations: a session still holding the whole
+        // grant is not what this control is about.
+        drop(sealed);
+
+        assert!(
+            settle_until(|| inbox.is_finished()).await,
+            "the local caller is settled with the reason the refusal gave"
+        );
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            None,
+            "and the exact session carrying the stream is retired"
+        );
+
+        // The far side, which was told nothing and asked for nothing.
+        //
+        // `Ok(Ok(()))`, not merely "the wait returned". The outer `Ok` is the
+        // bounded wait, which is only a failure detector; the inner one is the
+        // join result. Accepting anything else would let a *panicking* pump — a
+        // task that died rather than a link that closed — read as a clean native
+        // close, which is the opposite of what this asserts.
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(20), far_side.pump).await,
+                Ok(Ok(()))
+            ),
+            "the retirement reaches the far connector: its event stream ends, so \
+             the pump's loop returns normally. This is the step that decides \
+             whether retiring a session is a real remedy or only a local one"
+        );
+        assert!(
+            settle_until(|| far_side.state.rpc_send_boundary.finished() == 1).await,
+            "and the far producer's run is cancelled — its task ends and \
+             releases the lease it was holding, which is what the retirement was \
+             for. A producer still running here would mean the remote goes on \
+             generating items for a stream this side has already abandoned"
+        );
+
+        // Released only now, after the cancellation has been observed. Held any
+        // less long and the producer could have ended because its mailbox
+        // closed, which is the one alternative explanation this control has to
+        // rule out. Dropped rather than leaked: the sender is ordinary state
+        // with an ordinary lifetime, and forgetting it would trade one
+        // unexplained outcome for another.
+        drop(keeper.lock().take());
+    }
+
     /// `device_id`'s current session's receive-side stream binding and mark, or
     /// `None` if it has no live session.
     ///
@@ -13365,18 +14115,409 @@ mod tests {
         }
     }
 
-    /// Deliver one `rpc_stream_chunk` frame as `device_id`.
+    /// Deliver one `rpc_request` frame as `device_id`, through the same mint the
+    /// inbound path uses, and return without yielding to the runtime.
+    ///
+    /// The "without yielding" is load-bearing for
+    /// [`revocation_before_the_first_poll_never_reaches_the_embedder`] and is why
+    /// this is a helper rather than three lines inline: `on_rpc_request` spawns
+    /// its run and returns with no await after the spawn, so a caller that does
+    /// not await either is guaranteed to be running before the spawned task has
+    /// ever been polled.
+    async fn deliver_rpc_request(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+        request_id: &str,
+        method: &str,
+        streaming: bool,
+    ) {
+        let frame = MeshMessage::RpcRequest(RpcRequestMessage {
+            request_id: request_id.to_string(),
+            method: method.to_string(),
+            payload: serde_json::Value::Null,
+            streaming,
+        });
+        let (msg, _admission, dispatch) = rpc_dispatch_for(state, device_id, frame);
+        let MeshMessage::RpcRequest(req) = msg else {
+            panic!("the authority carries the frame it admitted");
+        };
+        on_rpc_request(state, &dispatch, req).await;
+    }
+
+    /// Revocation between the mint and the run's first poll never reaches the
+    /// embedder's code at all.
+    ///
+    /// The earliest of the three boundaries, and the one nothing else covers.
+    /// `v4_f4_e_...` revokes a handler that has already been entered, which
+    /// exercises the awaits inside the run; this exercises the `biased` in the
+    /// select, which is what decides whether a run authorized by a session that
+    /// died in the intervening instant ever calls user code.
+    ///
+    /// **The observable is the embedder's synchronous `Fn`, not its future.**
+    /// `invoke` calls that closure to *obtain* the future, and a real handler may
+    /// do work in that body — allocate, take a lock, touch a database handle.
+    /// Counting the future's first poll would miss all of it. The counter below
+    /// is incremented in the closure body itself, so zero means the embedder was
+    /// never entered in any sense.
+    ///
+    /// **How the window is reached without a hook.** `on_rpc_request` spawns the
+    /// run and returns with no await between the spawn and the return, and the
+    /// revocation below is synchronous. On the current-thread runtime a
+    /// `#[tokio::test]` gives, a spawned task is polled only when the runtime is
+    /// next driven at an await point — and there is none between the spawn and
+    /// the revoke. So the revoke lands strictly inside the window by
+    /// construction rather than by racing for it. That is why the revocation
+    /// here is `revoke_promoted_session` and not `insert_admitted_peer`: the
+    /// latter awaits, and the await is the poll.
+    ///
+    /// No timer, on either half. `settle_until` bounds a hang; it is never the
+    /// authority for the negative — the negative is that the count is still zero
+    /// after the runtime has been driven as far as it will go.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn revocation_before_the_first_poll_never_reaches_the_embedder() {
+        for streaming in [false, true] {
+            let handler_task = crate::rpc::handler_task_claim_for(
+                "device-b",
+                "unpolled",
+                "counts",
+                &serde_json::Value::Null,
+            )
+            .expect("the handler task is representable");
+            let (state, rpc, _b, _c) =
+                two_authenticated_peers_with("arc04f5-unpolled-run", handler_task).await;
+            let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            if streaming {
+                let invoked = Arc::clone(&invoked);
+                rpc.serve_stream("counts", move |_call: crate::rpc::RpcCall| {
+                    // The embedder's synchronous body. Everything a real
+                    // handler would do before returning a future happens here.
+                    invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        Err::<
+                            crate::resource::ResourceMailboxReceiver<crate::rpc::RpcStreamItem>,
+                            String,
+                        >("unreachable in this control".into())
+                    }
+                })
+                .expect("the live gateway admits a streaming handler");
+            } else {
+                let invoked = Arc::clone(&invoked);
+                rpc.serve("counts", move |_call: crate::rpc::RpcCall| {
+                    invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Ok(crate::rpc::RpcResponse::from_value(serde_json::json!(1))) }
+                })
+                .expect("the live gateway admits a handler");
+            }
+
+            // Non-vacuity: the same fixture, the same frame, and no revocation
+            // — the embedder is reached exactly once. Without this the control
+            // would pass against a build whose handler could never run.
+            deliver_rpc_request(&state, "device-b", "polled", "counts", streaming).await;
+            assert!(
+                settle_until(|| invoked.load(std::sync::atomic::Ordering::SeqCst) == 1).await,
+                "a run under a live session reaches the embedder ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            // Drained before the second frame, not merely observed. The fixture
+            // funds exactly one handler task, so a first run still holding its
+            // lease would make the second mint fail for capacity — and a control
+            // whose second run was never minted would satisfy every assertion
+            // below without ever reaching the window it is about.
+            assert!(
+                settle_until(|| state.rpc_send_boundary.finished() == 1).await,
+                "and that run ends, returning the one handler task the fixture \
+                 funds"
+            );
+
+            // The window. Mint and spawn, then revoke with no await in between.
+            let peer = state.peers.get("device-b").expect("B is installed");
+            deliver_rpc_request(&state, "device-b", "unpolled", "counts", streaming).await;
+            peer.revoke_promoted_session();
+
+            assert!(
+                settle_until(|| state.rpc_send_boundary.finished() == 2).await,
+                "non-vacuity: a second run really was minted and spawned, and it \
+                 ended — so what follows is about a run that existed ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                invoked.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "and a run whose authority ended before its first poll never \
+                 entered the embedder's closure — the count is still the one the \
+                 live run made ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+        }
+    }
+
+    /// A funded stream producer holding exactly one chunk, and the receiver a
+    /// streaming handler hands back.
+    ///
+    /// Test-only stand-in for whatever an embedder's own producer would be, and
+    /// it exists for one reason: the streaming send boundary is only reachable
+    /// behind a *real* chunk, and a real chunk needs a real
+    /// `ResourceMailboxReceiver`. Every other streaming control in this crate
+    /// answers `Err` or never resolves, so none of them can reach it.
+    ///
+    /// Funded the ordinary way throughout. The mailbox takes its root claim from
+    /// a child of the state's own local-application scope, and the item is
+    /// charged its retention and its queue node before it is accepted — the same
+    /// measure-fund-retain order every admission in this crate takes. The
+    /// retention figure is the production one for a JSON body of this shape, so
+    /// the producer is not quietly cheaper than the thing it stands in for.
+    ///
+    /// The scope the two item leases come from is dropped here, which is sound:
+    /// a `ResourceLease` owns its provider handle and its scope, so it outlives
+    /// the scope handle that issued it and releases exactly what it took.
+    fn funded_stream_with_one_chunk(
+        state: &Arc<NetworkState>,
+        payload: serde_json::Value,
+    ) -> std::result::Result<
+        crate::resource::ResourceMailboxReceiver<crate::rpc::RpcStreamItem>,
+        String,
+    > {
+        // The sender is dropped here, which closes the mailbox after its one
+        // chunk. That is sound **only** for a run that never gets as far as
+        // asking for a second item — the send-boundary control parks on the
+        // first chunk's send and is cancelled there. A control that needs the
+        // producer to still be producing must take the sender and keep it: see
+        // [`funded_stream_parts_with_one_chunk`].
+        funded_stream_parts_with_one_chunk(state, payload).map(|(_tx, rx)| rx)
+    }
+
+    /// [`funded_stream_with_one_chunk`], handing back the sender too.
+    ///
+    /// A stream with no live sender is a stream that ends by itself: the run's
+    /// next `recv` sees zero senders and finishes. For a control about what
+    /// *cancels* a producer, that is fatal — the producer would end on its own,
+    /// on a schedule the control does not set, and every observation about
+    /// cancellation would be true for the wrong reason. Such a control keeps
+    /// this sender alive across the whole sequence, so the run is genuinely
+    /// parked waiting for an item that is never coming.
+    fn funded_stream_parts_with_one_chunk(
+        state: &Arc<NetworkState>,
+        payload: serde_json::Value,
+    ) -> std::result::Result<
+        (
+            crate::resource::ResourceMailboxSender<crate::rpc::RpcStreamItem>,
+            crate::resource::ResourceMailboxReceiver<crate::rpc::RpcStreamItem>,
+        ),
+        String,
+    > {
+        let scope = state
+            .local_application_resource_scope()
+            .map_err(|error| format!("the fixture owner funds a stream mailbox: {error}"))?;
+        let items = scope
+            .child()
+            .map_err(|error| format!("and one child scope for its items: {error:?}"))?;
+        let (tx, rx) = crate::resource::resource_mailbox::<crate::rpc::RpcStreamItem>(scope)
+            .map_err(|error| format!("the mailbox itself is funded: {error:?}"))?;
+        let retention = items
+            .acquire(
+                crate::rpc::single_response_claim(Some(&payload), None)
+                    .map_err(|error| format!("the chunk is representable: {error}"))?,
+            )
+            .map_err(|error| format!("and its retention funded: {error:?}"))?;
+        let node = items
+            .acquire(
+                crate::resource::ResourceMailboxSender::<crate::rpc::RpcStreamItem>::node_claim()
+                    .map_err(|error| format!("the queue node is representable: {error}"))?,
+            )
+            .map_err(|error| format!("and funded: {error:?}"))?;
+        tx.accept(crate::rpc::RpcStreamItem::Chunk(payload), retention, node)
+            .map_err(|_| "a fresh mailbox accepts its first item".to_string())?;
+        Ok((tx, rx))
+    }
+
+    /// Revocation *during* the reply send ends the task and leaves no
+    /// post-boundary effect.
+    ///
+    /// The third boundary, and the one that needs a seam. A control can revoke
+    /// before a run starts (above) or after it has finished (`v4_f4_e_...`);
+    /// what it cannot otherwise reach is the instant between the handler
+    /// resolving and its answer reaching the wire. That instant is the one the
+    /// finding is about, because the run holds its task lease across it and the
+    /// old shape had no arm that could take it back there.
+    ///
+    /// `NetworkState::reach_rpc_send_boundary` is that seam: armed, it parks the
+    /// run at exactly that point, and the park is released by a control or by
+    /// the run being cancelled. Nothing else in the crate arms it.
+    ///
+    /// Three observables, and each rules out a different way of passing
+    /// vacuously:
+    ///
+    /// * `entered == 1` — a run really did get to the boundary. Without it, the
+    ///   two below are equally true of a run that never started.
+    /// * `abandoned == 1` — the cancellation is recorded by a guard living
+    ///   inside the parked future, so it is written by the task's own unwinding.
+    ///   The task lease is a local of that task and is released in the same
+    ///   drop, which is what "the lease ends" means here.
+    /// * `passed == 0`, and the peer's outbound frame count unchanged — nothing
+    ///   after the boundary ran, so no reply reached the connector.
+    ///
+    /// No timer is the authority anywhere: the park has no deadline, and
+    /// `settle_until` only bounds a hang.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn revocation_at_the_send_boundary_ends_the_task_with_no_reply() {
+        for streaming in [false, true] {
+            // The handler task, plus — on the streaming arm — exactly what the
+            // producer below retains: the mailbox root, one chunk's retention,
+            // and one queue node. Derived from the same production functions
+            // that will charge them rather than guessed at, and added to the
+            // fixture rather than the fixture being widened generally, so no
+            // other control gains capacity it was written without.
+            let mut extra = crate::rpc::handler_task_claim_for(
+                "device-b",
+                "parked",
+                "answers",
+                &serde_json::Value::Null,
+            )
+            .expect("the handler task is representable");
+            if streaming {
+                for producer in [
+                    crate::resource::ResourceMailboxSender::<crate::rpc::RpcStreamItem>::root_claim(
+                    )
+                    .expect("the mailbox root is representable"),
+                    crate::rpc::single_response_claim(Some(&serde_json::json!(1)), None)
+                        .expect("the chunk is representable"),
+                    crate::resource::ResourceMailboxSender::<crate::rpc::RpcStreamItem>::node_claim(
+                    )
+                    .expect("the queue node is representable"),
+                ] {
+                    extra = extra
+                        .checked_add(producer)
+                        .expect("the producer's total is representable");
+                }
+            }
+            let (state, rpc, b, _c) =
+                two_authenticated_peers_with("arc04f5-send-boundary", extra).await;
+            let produced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            if streaming {
+                // A real producer with a real chunk, so the run parks at the
+                // **chunk** send — the send a live stream actually spends its
+                // life in, and the one whose lease was being held across a
+                // revocation before this finding.
+                let producing = Arc::clone(&state);
+                let built = Arc::clone(&produced);
+                rpc.serve_stream("answers", move |_call: crate::rpc::RpcCall| {
+                    let producing = Arc::clone(&producing);
+                    let built = Arc::clone(&built);
+                    async move {
+                        let rx = funded_stream_with_one_chunk(&producing, serde_json::json!(1))?;
+                        built.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(rx)
+                    }
+                })
+                .expect("the live gateway admits a streaming handler");
+            } else {
+                rpc.serve("answers", move |_call: crate::rpc::RpcCall| async move {
+                    Ok(crate::rpc::RpcResponse::from_value(serde_json::json!(1)))
+                })
+                .expect("the live gateway admits a handler");
+            }
+
+            let frames_before = b.peer.state.read().diag.frames_out;
+            // Subscribed before the frame is delivered: the arrival is a
+            // notification, not a level, and a control that asked afterwards
+            // could miss it.
+            let arrival = state.rpc_send_boundary.arrival();
+            tokio::pin!(arrival);
+            arrival.as_mut().enable();
+            state.rpc_send_boundary.arm();
+
+            deliver_rpc_request(&state, "device-b", "parked", "answers", streaming).await;
+            arrival.await;
+            assert_eq!(
+                state.rpc_send_boundary.entered(),
+                1,
+                "non-vacuity: the run reached the send boundary and is parked on \
+                 it ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                produced.load(std::sync::atomic::Ordering::SeqCst),
+                streaming,
+                "and on the streaming arm it got there behind a real chunk. The \
+                 stream path has a second send — the terminal on a refused open \
+                 — which is instrumented too, so a producer that failed to be \
+                 funded would still have parked the run and this control would \
+                 have passed without ever exercising the chunk send it names"
+            );
+            assert_eq!(state.rpc_send_boundary.passed(), 0, "and has not passed it");
+
+            // The authority ends mid-send.
+            let peer = state.peers.get("device-b").expect("B is installed");
+            peer.revoke_promoted_session();
+
+            // The authoritative one, and it is `finished` rather than
+            // `abandoned`. The boundary guard is dropped *inside* the run
+            // future, so `abandoned` says the run left the boundary — it says
+            // nothing about the task's epilogue, and reading it as "the lease is
+            // released" would be racing that epilogue. `finished` is written by
+            // a guard declared before the lease binding, so reverse drop order
+            // releases the lease first and this increments strictly after.
+            assert!(
+                settle_until(|| state.rpc_send_boundary.finished() == 1).await,
+                "the task ends and releases the lease it was holding across the \
+                 send ({} arm)",
+                if streaming { "stream" } else { "unary" }
+            );
+            assert_eq!(
+                state.rpc_send_boundary.abandoned(),
+                1,
+                "and it ended by being dropped where it stood, on the boundary — \
+                 not by passing it and finishing normally"
+            );
+            assert_eq!(
+                state.rpc_send_boundary.passed(),
+                0,
+                "nothing after the boundary ran"
+            );
+            assert_eq!(
+                b.peer.state.read().diag.frames_out,
+                frames_before,
+                "and no reply reached the peer's connector — the send the run \
+                 was parked on never happened"
+            );
+        }
+    }
+
+    /// Deliver the first `rpc_stream_chunk` of a stream as `device_id`.
     async fn deliver_rpc_stream_chunk(
         state: &Arc<NetworkState>,
         device_id: &str,
         request_id: &str,
         payload: serde_json::Value,
     ) {
+        deliver_rpc_stream_chunk_seq(state, device_id, request_id, 1, payload).await;
+    }
+
+    /// The same, at a stated sequence.
+    ///
+    /// Separate from the helper above rather than folded into it: `seq` is
+    /// checked by `stream_chunk_sender`, so a control that needs a second chunk
+    /// on the same stream must say which one it is, while every control that
+    /// only needs *a* chunk should not have to name a number it does not care
+    /// about.
+    async fn deliver_rpc_stream_chunk_seq(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+        request_id: &str,
+        seq: u64,
+        payload: serde_json::Value,
+    ) {
         let frame = MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
             request_id: request_id.to_string(),
-            seq: 1,
+            seq,
             payload,
         });
+        // `_admission` is bound, not discarded: it is the frame's own funding,
+        // and production holds it across the dispatch.
         let (msg, _admission, dispatch) = rpc_dispatch_for(state, device_id, frame);
         let MeshMessage::RpcStreamChunk(chunk) = msg else {
             panic!("the authority carries the frame it admitted");

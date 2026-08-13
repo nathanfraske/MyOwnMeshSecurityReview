@@ -33,6 +33,41 @@ impl ApplicationGateway {
         self.resources.child().map_err(GatewayRefusal::Pressure)
     }
 
+    /// File one locally-originated operation against `peer`'s exact current
+    /// session, building its effect only once that session has funded it.
+    ///
+    /// The shape `S` supplies both the class the filing is funded under and the
+    /// entry it stores, so the two cannot name different operations; the effect
+    /// is built inside the session fence and past every refusal, so a caller
+    /// that is refused has allocated nothing. See [`crate::rpc::PendingShape`].
+    /// What comes back is the filing and the caller's own half of what was
+    /// built.
+    pub(crate) fn register_rpc_request_prepared<S: crate::rpc::PendingShape>(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        peer: &str,
+    ) -> Result<(crate::rpc::LocalRequest, S::Caller), crate::rpc::RpcRegistrationRefusal> {
+        let owner = state
+            .peers
+            .owner(peer)
+            .ok_or(crate::rpc::RpcRegistrationRefusal::SessionNotCurrent)?;
+        state
+            .peers
+            .with_live_session_state(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |session, app| {
+                    app.rpc_mut()
+                        .register_local_request_prepared::<S>(peer, session)
+                },
+            )
+            .ok_or(crate::rpc::RpcRegistrationRefusal::SessionNotCurrent)?
+    }
+
+    /// [`Self::register_rpc_request_prepared`] for a control that already holds
+    /// its effect. Test-only, for the reason given there.
+    #[cfg(test)]
     pub(crate) fn register_rpc_request(
         &self,
         state: &crate::engine::state::NetworkState,

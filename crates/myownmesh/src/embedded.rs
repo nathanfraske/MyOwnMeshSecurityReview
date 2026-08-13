@@ -39,6 +39,23 @@ pub struct EmbeddedDaemon {
     registry: std::sync::Arc<NetworkRegistry>,
     service_manager: std::sync::Arc<ServiceManager>,
     shutdown_tx: broadcast::Sender<()>,
+    /// The control surface, retained so shutdown can wait for it.
+    ///
+    /// Held rather than detached, and that is the whole of it: dropping the
+    /// handle this spawn returns detaches the task, so [`Self::shutdown`] had no
+    /// way to know whether `control::serve` had returned. Its `serve` is what
+    /// makes the terminal claim — no accepted connection task is still live and
+    /// the client registry has reached `Closed` — and an embedder that returned
+    /// from `shutdown` without it was reporting a daemon closed while its
+    /// control socket, its connection tasks and their registrations were all
+    /// still up.
+    control: tokio::task::JoinHandle<()>,
+    /// Test witness set by the control task after `serve` returns.
+    #[cfg(all(test, unix))]
+    control_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Snapshot of `control_finished` at the boundary before service teardown.
+    #[cfg(all(test, unix))]
+    control_drained_before_teardown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EmbeddedDaemon {
@@ -47,9 +64,43 @@ impl EmbeddedDaemon {
         &self.mesh
     }
 
+    /// Observe the ordering boundary the embedded-shutdown control owns.
+    #[cfg(all(test, unix))]
+    fn control_drained_before_teardown_for_test(
+        &self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.control_drained_before_teardown)
+    }
+
     /// Graceful teardown, exactly like the serve binary's signal path.
+    ///
+    /// The control surface goes first and is *awaited*, and the order is the
+    /// contract rather than a preference. Everything below this line removes
+    /// state a control request can still be dispatched against — hosted
+    /// services, then every joined network — so a connection task outliving the
+    /// broadcast would be operating on a daemon that had already reported those
+    /// gone. Awaiting `serve` is what establishes that no such task exists: it
+    /// does not return until every connection it accepted has ended and its
+    /// client registry has reached `Closed`.
+    ///
+    /// Nothing here is timed. `serve`'s own drain is what ends the accepted
+    /// tasks, and it ends them by signalling rather than by aborting, so a
+    /// request already in flight is finished rather than dropped half-applied.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
+        // The control surface, before anything it might still be serving is
+        // taken away. A panic in the control task is reported rather than
+        // swallowed: it means the drain did not complete, and the teardown below
+        // is then running against state the control surface may still hold.
+        if let Err(e) = self.control.await {
+            warn!("control task did not end cleanly: {e}");
+        }
+        #[cfg(all(test, unix))]
+        self.control_drained_before_teardown.store(
+            self.control_finished
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
         // Stop hosted services before tearing down networks.
         self.service_manager.shutdown().await;
         // Say goodbye before we go: a graceful `leave` per network so peers
@@ -164,7 +215,15 @@ async fn start_with_mesh(
     let ctl_services = service_manager.clone();
     let ctl_shutdown = shutdown_tx.subscribe();
     let ctl_socket = cfg.daemon.control_socket.clone();
-    tokio::spawn(async move {
+    #[cfg(all(test, unix))]
+    let control_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(all(test, unix))]
+    let control_finished_by_task = std::sync::Arc::clone(&control_finished);
+    #[cfg(all(test, unix))]
+    let control_drained_before_teardown =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Kept, not discarded. See [`EmbeddedDaemon::control`].
+    let control = tokio::spawn(async move {
         if let Err(e) = control::serve(
             ctl_mesh,
             ctl_registry,
@@ -177,6 +236,8 @@ async fn start_with_mesh(
         {
             warn!("control socket exited with error: {e:#}");
         }
+        #[cfg(all(test, unix))]
+        control_finished_by_task.store(true, std::sync::atomic::Ordering::Release);
     });
 
     Ok(EmbeddedDaemon {
@@ -184,6 +245,11 @@ async fn start_with_mesh(
         registry,
         service_manager,
         shutdown_tx,
+        control,
+        #[cfg(all(test, unix))]
+        control_finished,
+        #[cfg(all(test, unix))]
+        control_drained_before_teardown,
     })
 }
 
@@ -225,6 +291,138 @@ mod tests {
             myownmesh_core::PendingRemoteCandidatePolicy::new(nz(8), nz(16_384), nz(8), nz(8)),
         );
         myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), webrtc)
+    }
+
+    /// `shutdown` does not return before `control::serve` and the connections it
+    /// accepted have ended.
+    ///
+    /// The finding this pins is that the spawn's `JoinHandle` used to be
+    /// dropped. Dropping one detaches the task, so `shutdown` had nothing to
+    /// wait on and returned while the control socket, its connection tasks and
+    /// their registrations were all still up — and it then tore down the
+    /// services and networks those tasks were still dispatching against. An
+    /// embedder was told the daemon was closed while it was not.
+    ///
+    /// The load-bearing observation is taken at the ordering boundary itself:
+    /// the control task sets a witness only after `serve` returns, and shutdown
+    /// snapshots that witness immediately before it starts service teardown.
+    /// A detached task that happens to finish on the next await cannot make that
+    /// earlier snapshot true.
+    ///
+    /// Two external consequences are asserted as companions, and neither is a
+    /// duration:
+    ///
+    /// 1. the client's own socket reaches end of file, which happens when the
+    ///    connection task that was serving it has ended;
+    /// 2. and a fresh connect to the same path is refused, which can only be
+    ///    true once `serve` has returned and taken its listener with it.
+    ///
+    /// The subscription is what makes the first claim non-vacuous. An idle
+    /// connection might end for any number of reasons; an `events_subscribe`
+    /// that has been acked is a connection parked in the stream loop, which is
+    /// exactly the task the old shape returned without waiting for.
+    ///
+    /// Unix-only, for the reason the control-surface shutdown controls are: a
+    /// socket at a path this control chooses. Elsewhere the name is
+    /// process-wide and two controls in one binary would fight over it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v4_r2_daemon_embedded_shutdown_waits_for_its_control_surface() {
+        use interprocess::local_socket::{tokio::prelude::*, GenericFilePath, ToFsName};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        /// Long enough that a loaded machine will not trip it, short enough that
+        /// a genuine hang is named. Nothing below asserts because of it.
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+        async fn guarded<F: std::future::Future>(what: &str, future: F) -> F::Output {
+            match tokio::time::timeout(HANG_GUARD, future).await {
+                Ok(value) => value,
+                Err(_) => panic!("hang guard: {what}"),
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temporary daemon state");
+        // The parent is deliberately absent: production creates it with
+        // owner-only permissions before binding.
+        let socket = temp.path().join("private").join("daemon.sock");
+        let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
+        daemon_config.control_socket = Some(socket.clone());
+        let mut services = myownmesh_core::MeshConfig::default().services;
+        services.node.enabled = false;
+        let cfg = myownmesh_core::MeshConfig {
+            identity_path: Some(temp.path().join("identity.json")),
+            auto_update: myownmesh_core::AutoUpdateConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            daemon: daemon_config,
+            services,
+            ..Default::default()
+        };
+
+        let daemon = start_infrastructure_only(cfg, crate::test_resource_provider())
+            .await
+            .expect("the daemon test grant starts an infrastructure-only daemon");
+
+        let name = socket
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the control socket path is a valid fs name");
+        let stream = guarded("client connects", async {
+            loop {
+                // The listener binds inside the spawned control task, so the
+                // first connect can lose the race with it. The guard is what
+                // fails if it never appears at all.
+                match LocalSocketStream::connect(name.clone()).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        let (client_reader, mut client_writer) = stream.split();
+        let mut client_reader = BufReader::new(client_reader);
+        client_writer
+            .write_all(b"{\"op\":\"events_subscribe\"}\n")
+            .await
+            .expect("the client sends its subscribe");
+        let mut ack = String::new();
+        guarded(
+            "the subscription is acked",
+            client_reader.read_line(&mut ack),
+        )
+        .await
+        .expect("the daemon answers the subscribe");
+        assert!(
+            ack.contains("\"subscribed\":true"),
+            "non-vacuity: this connection is parked in the stream loop: {ack}"
+        );
+
+        let drained_before_teardown = daemon.control_drained_before_teardown_for_test();
+
+        // The claim. The witness was sampled inside shutdown, before its first
+        // service-teardown await, rather than after this call returned.
+        guarded("embedded shutdown returns", daemon.shutdown()).await;
+        assert!(
+            drained_before_teardown.load(std::sync::atomic::Ordering::Acquire),
+            "control::serve and every connection it accepted ended before \
+             embedded shutdown began tearing down services"
+        );
+
+        // External companion (1): the connection that served this client ended.
+        let mut rest = Vec::new();
+        guarded(
+            "the client's connection ended",
+            client_reader.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the client's half reads to end");
+
+        // External companion (2): the listener is gone with it.
+        assert!(
+            LocalSocketStream::connect(name).await.is_err(),
+            "serve returned, so its control socket no longer accepts connections"
+        );
     }
 
     #[tokio::test]

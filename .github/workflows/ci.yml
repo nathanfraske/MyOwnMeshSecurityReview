@@ -485,6 +485,31 @@ jobs:
             v4_f5_e_a_successor_promoted_inside_the_retirement_window_survives_it \
             v4_f5_f_a_successor_promoted_inside_the_reliable_retirement_window_survives_it
 
+          # Review 4923134324: construct pending RPC effects only after their
+          # exact session funded them, and derive the stored class from the
+          # sealed constructor that builds the effect. These ordinary controls
+          # deliberately have no `v4_f3_` prefix: that older family has an
+          # independently frozen count of three, so exact singleton selectors
+          # keep both rename contracts honest.
+          run_exact_control a_refused_filing_never_builds_its_effect
+          run_exact_control a_filed_operation_is_stored_as_the_class_it_was_funded_as
+
+          # Review 4923134324: only best-effort channel traffic may disappear
+          # under local pressure. The bounded leading-tag policy is ordinary;
+          # the three end-to-end session controls open native WebRTC objects
+          # and therefore run explicitly from the isolated ignored lane.
+          run_exact_control only_the_best_effort_channel_frame_is_droppable
+          run_exact_control channel_backpressure_keeps_the_exact_session_it_refused --ignored
+          run_exact_control a_stream_chunk_this_side_cannot_carry_ends_the_producers_session --ignored
+          run_exact_control receiver_chunk_pressure_ends_the_remote_producer --ignored
+
+          # Review 4923134324: handler revocation encloses the first invocation
+          # poll and every reply/chunk/terminal send. Both controls exercise a
+          # local WebRTC object and are intentionally ignored outside this
+          # serialized transport-lab gate.
+          run_exact_control revocation_before_the_first_poll_never_reaches_the_embedder --ignored
+          run_exact_control revocation_at_the_send_boundary_ends_the_task_with_no_reply --ignored
+
           # Exact realtime flow-handle authority. Its own family because it is
           # about what a *handle* names rather than about session-owned
           # retention, and because both are `#[ignore]`d -- folding them into
@@ -514,7 +539,7 @@ jobs:
           # it in would make the group select 8 and fail.
           run_exact_control v4_f15_a_refused_reliable_delivery_acknowledges_nothing --ignored
 
-      - name: Review 4920920317 daemon controls
+      - name: Reviews 4920920317 and 4923134324 daemon controls
         run: |
           set -euo pipefail
 
@@ -545,8 +570,9 @@ jobs:
 
           run_exact_daemon_control() {
             name="$1"
+            shift
             log="$(mktemp)"
-            cargo test -p myownmesh --lib "$name" -- --test-threads=1 | tee "$log"
+            cargo test -p myownmesh --lib "$name" -- --test-threads=1 "$@" | tee "$log"
             grep -qx 'running 1 test' "$log" || {
               echo "non-vacuity failure: '$name' did not select exactly one test" >&2
               exit 1
@@ -561,6 +587,30 @@ jobs:
             }
           }
 
+          # Review 4923134324: accepted connection tasks stay in an exactly
+          # funded list until their JoinHandles have actually been awaited.
+          # The second control fixes the completion/finalization edge so a
+          # quiet listener cannot retain a finished task forever.
+          run_named_set control::accepted_task_tests:: \
+            v4_r2_daemon_a_finished_connection_task_is_joined_rather_than_discarded \
+            v4_r2_daemon_a_completion_reaps_its_node_even_before_the_handle_is_finalized
+
+          # Runtime closure reaches quiet streams and writes already parked at
+          # an exact AsyncWrite boundary. The fairness control keeps both event
+          # sources ready and pins their deterministic alternation; the blocked
+          # writer owns its readiness rather than inferring it from capacity.
+          run_named_set control::stream_cancellation_tests:: \
+            v4_r2_daemon_a_ready_client_mailbox_cannot_starve_a_mesh_event \
+            v4_r2_daemon_a_quiet_trace_stream_ends_when_the_runtime_closes \
+            v4_r2_daemon_a_blocked_write_still_ends_when_the_runtime_closes
+
+          # Review 4923134324: every daemon cleanup collection owns one funded
+          # allocation per element. Splitting moves those funded nodes rather
+          # than copying them into an unfunded snapshot.
+          run_named_set ipc::leased::tests:: \
+            v4_r2_daemon_every_removal_holds_a_node_lease_until_its_node_is_gone \
+            v4_r2_daemon_a_split_moves_matching_nodes_without_touching_the_others
+
           # Framing admission and decoded-request transfer. Running the module
           # once avoids eight compile/link cycles while each exact name remains
           # independently load-bearing.
@@ -572,7 +622,9 @@ jobs:
             structural_parse_pressure_refuses_before_the_request_is_allocated \
             the_reader_refuses_a_chunk_before_reserving_room_for_it \
             a_malformed_line_is_reported_as_malformed_and_not_as_pressure \
-            the_decoded_request_carries_its_own_funding_past_the_line
+            the_decoded_request_carries_its_own_funding_past_the_line \
+            v4_r2_daemon_a_padded_decode_releases_its_parse_work_and_keeps_its_retention \
+            v4_r2_daemon_encoded_output_pressure_builds_no_buffer_and_returns_to_baseline
 
           # Daemon registry accounting, exact channel-route ownership, atomic
           # method registration and the terminal lifecycle.
@@ -593,12 +645,40 @@ jobs:
             the_task_join_resolves_only_once_the_last_task_is_gone \
             a_task_ending_during_the_wait_still_wakes_it \
             closed_is_never_published_early \
-            the_closing_signal_resolves_for_a_task_that_arrives_after_it
+            the_closing_signal_resolves_for_a_task_that_arrives_after_it \
+            v4_r2_daemon_a_pending_call_cannot_be_filed_in_a_class_it_was_not_funded_for \
+            v4_r2_daemon_pending_ipc_pressure_refuses_before_the_call_is_built \
+            v4_r2_daemon_a_fanout_cursor_skips_removed_members_and_never_repeats_one \
+            v4_r2_daemon_a_replaced_route_answers_gone_to_its_predecessors_pump
 
           # The bridge control crosses the real core PreparedRegistration /
           # OwnedMethodRegistration seam, so keep it as its own exact gate
           # rather than letting the registry-module run stand in for it.
           run_exact_daemon_control v4_f3_daemon_an_in_flight_call_cannot_follow_the_method_to_its_new_owner
+
+          # The borrowed frame measurement and the constructed mailbox item
+          # must agree byte-for-byte and claim-for-claim.
+          run_exact_daemon_control v4_r2_daemon_a_measured_inbound_frame_matches_the_frame_it_becomes
+
+          # A production channel pump parks after subscriber selection and
+          # before building its peer-sized frame; registry mutations must still
+          # complete while it is held at that exact boundary.
+          run_exact_daemon_control v4_r2_daemon_a_large_channel_frame_does_not_hold_the_registry_while_it_fans_out
+
+          # This control reads the daemon test binary's shared resource ledger,
+          # so it is intentionally ignored and selected alone on Ubuntu.
+          run_exact_daemon_control \
+            v4_r2_daemon_a_padded_events_subscribe_holds_no_parse_capacity_once_live \
+            --ignored
+
+          # Ordinary terminal case: a subscribed client keeps its socket open,
+          # Closing ends and joins the task, and the registry reaches Closed
+          # with no residue.
+          run_exact_daemon_control v4_r2_daemon_a_live_events_subscriber_ends_with_the_runtime
+
+          # Embedded shutdown retains and awaits the real control listener and
+          # a live EventsSubscribe connection before services are torn down.
+          run_exact_daemon_control v4_r2_daemon_embedded_shutdown_waits_for_its_control_surface
 
           # This production-path control is Unix-only: it binds a real local
           # control socket and pauses EventsSubscribe immediately before its

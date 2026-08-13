@@ -233,15 +233,22 @@ fn unregister_drops_claims_and_subscriptions() {
     assert!(reg.handler_owner(&method_key).is_none());
     assert!(!reg.for_each_subscriber(&channel_key, |_| {}));
     assert!(reg.client(a.id).is_none());
+    // Popped rather than iterated: the cleanup collections are funded lists now,
+    // one allocation per entry, and taking an entry out is what releases that
+    // entry's node. The assertion is the same one and is made stronger by it --
+    // the list is exhausted afterwards, so this names every method the
+    // disconnect forgot rather than the first of them.
+    let mut forget = removed.forget;
+    let forgotten = forget.pop().expect("the disconnect forgot one method");
     assert_eq!(
-        removed
-            .forget
-            .iter()
-            .map(|forgotten| forgotten.key.clone())
-            .collect::<Vec<_>>(),
-        vec![method_key],
+        forgotten.key, method_key,
         "a disconnect is the last unclaim too, and it carries out the registration that \
          removes the handler"
+    );
+    drop(forgotten);
+    assert!(
+        forget.is_empty(),
+        "and exactly one: nothing else was claimed"
     );
 }
 
@@ -664,6 +671,386 @@ fn v4_f3_daemon_a_refused_claim_leaves_the_incumbent_generation_and_class_exact(
         a.method_claims.holds(&key),
         "and the incumbent's own record of the claim is intact"
     );
+}
+
+/// The fan-out cursor skips a member that left, excludes one that arrived, and
+/// never names the same subscriber twice.
+///
+/// The lock-scope claim is not this control's: that belongs to
+/// `v4_r2_daemon_a_large_channel_frame_does_not_hold_the_registry_while_it_fans_out`
+/// in `bridge`, which parks the production pump. What is here is the cursor's
+/// own contract, and each clause of it is a way a positional walk goes wrong:
+///
+/// 1. **A member that left is skipped.** The cursor resumes by client identity,
+///    so a subscriber removed mid-frame is passed over rather than re-resolved
+///    into whoever came after it — which is what a positional resume does, and
+///    it delivers one client's frame to another.
+/// 2. **A member that arrived is excluded.** The ceiling is fixed at the first
+///    step, so subscriptions taken during a frame belong to the next one.
+///    Without it, a client subscribing faster than the fan-out advances extends
+///    one frame indefinitely, and the pump never returns to its receiver.
+/// 3. **Nobody is named twice.** The two rules above are both about *which*
+///    subscribers a frame reaches; a cursor that went backwards would satisfy
+///    neither and could still pass a membership check.
+#[tokio::test]
+async fn v4_r2_daemon_a_fanout_cursor_skips_removed_members_and_never_repeats_one() {
+    let reg = ClientRegistry::default();
+    let (a, _ra) = fresh_client(&reg);
+    let (b, _rb) = fresh_client(&reg);
+    let (c, _rc) = fresh_client(&reg);
+    let key = ("net".to_string(), "catalog".to_string());
+
+    let ChannelJoin::Install(installing) = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the daemon test grant funds one channel subscription")
+    else {
+        panic!("the first subscriber owns the install")
+    };
+    for member in [b.id, c.id] {
+        reg.subscribe_channel(key.clone(), member)
+            .expect("the daemon test grant funds a further subscription");
+    }
+    assert!(
+        reg.finish_channel_install(&key, &installing, Some(fixture_pump(&reg)))
+            .is_none(),
+        "the installer publishes into its own route"
+    );
+    assert!(
+        installing.wait().await,
+        "and its followers are told it worked"
+    );
+
+    let mut position = crate::ipc::ChannelFanout::frame();
+    let mut delivered = Vec::new();
+    let crate::ipc::ChannelFanoutStep::Next { client, .. } =
+        reg.subscriber_after(&key, crate::ipc::RouteOwner::Any, &mut position)
+    else {
+        panic!("non-vacuity: a route with three members answers a first step")
+    };
+    delivered.push(client.id);
+
+    // Mid-frame: one member leaves and one arrives. The arrival is given a
+    // larger id than anything the ceiling saw, which is the case the ceiling
+    // exists for.
+    reg.unregister(b.id)
+        .expect("a disconnect is recorded mid-frame");
+    let (late, _rlate) = fresh_client(&reg);
+    assert!(
+        late.id > c.id,
+        "non-vacuity: the late subscriber sorts after every member this frame \
+         started with, so excluding it is the ceiling's doing and not the walk \
+         simply having passed it"
+    );
+    reg.subscribe_channel(key.clone(), late.id)
+        .expect("the daemon test grant funds a late subscription");
+
+    while let crate::ipc::ChannelFanoutStep::Next { client, .. } =
+        reg.subscriber_after(&key, crate::ipc::RouteOwner::Any, &mut position)
+    {
+        delivered.push(client.id);
+    }
+
+    assert!(
+        !delivered.contains(&b.id),
+        "the member that left mid-frame was skipped, not resolved into its \
+         successor: {delivered:?}"
+    );
+    assert!(
+        !delivered.contains(&late.id),
+        "the member that arrived mid-frame belongs to the next frame: \
+         {delivered:?}"
+    );
+    let mut unique = delivered.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        delivered.len(),
+        "and no subscriber was named twice: {delivered:?}"
+    );
+    assert_eq!(
+        unique,
+        vec![a.id, c.id],
+        "which leaves exactly the members that were subscribed for the whole \
+         frame: {delivered:?}"
+    );
+}
+
+/// A route that was replaced answers `Gone` to its predecessor's pump, and the
+/// predecessor cannot reach the successor's members.
+///
+/// The window is real: a pump is cancelled and joined by the route that owns it,
+/// but a frame already in flight inside that pump can ask for its next
+/// subscriber after the route it belonged to has been removed and a new one
+/// installed under the same name. Answering by *name* would hand the old pump
+/// the successor's subscriber set — one channel's fan-out delivering into
+/// another's, under a key that looks identical.
+///
+/// The identity is the route's own cancellation `Arc`, not a generation counter
+/// or a ledger: it is the thing the pump was handed and the thing the route
+/// holds, so "is this my route" is a pointer comparison that cannot go stale.
+///
+/// Non-vacuity is the second half: the *current* pump's own identity is answered
+/// `Next` against the same key and the same members, so `Gone` above is about
+/// identity and not about the route being empty or unusable.
+#[tokio::test]
+async fn v4_r2_daemon_a_replaced_route_answers_gone_to_its_predecessors_pump() {
+    let reg = ClientRegistry::default();
+    let (a, _ra) = fresh_client(&reg);
+    let (b, _rb) = fresh_client(&reg);
+    let key = ("net".to_string(), "catalog".to_string());
+
+    // Generation one, live, with a pump of its own.
+    let ChannelJoin::Install(first) = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the daemon test grant funds one channel subscription")
+    else {
+        panic!("the first subscriber owns the install")
+    };
+    let (first_cancel, first_join) = fixture_pump(&reg);
+    let predecessor = Arc::clone(&first_cancel);
+    assert!(reg
+        .finish_channel_install(&key, &first, Some((first_cancel, first_join)))
+        .is_none());
+    assert!(first.wait().await);
+
+    // Its last member leaves, so the route is retired and its pump joined.
+    reg.unsubscribe_channel(&key, a.id)
+        .expect("the last member retires the route")
+        .retire()
+        .await;
+
+    // Generation two, under the same name, with a different member and a
+    // different pump.
+    let ChannelJoin::Install(second) = reg
+        .subscribe_channel(key.clone(), b.id)
+        .expect("the daemon test grant funds a second subscription")
+    else {
+        panic!("the route was removed, so this installs a new one")
+    };
+    let (second_cancel, second_join) = fixture_pump(&reg);
+    let successor = Arc::clone(&second_cancel);
+    assert!(reg
+        .finish_channel_install(&key, &second, Some((second_cancel, second_join)))
+        .is_none());
+    assert!(second.wait().await);
+    assert!(
+        !Arc::ptr_eq(&predecessor, &successor),
+        "non-vacuity: these are different route identities"
+    );
+
+    // The predecessor's in-flight frame asks for its next subscriber.
+    let mut position = crate::ipc::ChannelFanout::frame();
+    assert!(
+        matches!(
+            reg.subscriber_after(
+                &key,
+                crate::ipc::RouteOwner::Pump(&predecessor),
+                &mut position
+            ),
+            crate::ipc::ChannelFanoutStep::Gone
+        ),
+        "the old pump is told its route is gone rather than being handed the \
+         successor's members"
+    );
+
+    // And the successor's own frame reaches its own member.
+    let mut position = crate::ipc::ChannelFanout::frame();
+    let crate::ipc::ChannelFanoutStep::Next { client, .. } = reg.subscriber_after(
+        &key,
+        crate::ipc::RouteOwner::Pump(&successor),
+        &mut position,
+    ) else {
+        panic!("non-vacuity: the live route answers its own pump")
+    };
+    assert_eq!(
+        client.id, b.id,
+        "with the member that subscribed to it, and no other"
+    );
+
+    reg.unsubscribe_channel(&key, b.id)
+        .expect("the last member retires the route")
+        .retire()
+        .await;
+}
+
+/// Exact capacity for a live client and a chosen number of pending calls.
+///
+/// Unlike [`registry_fixture_claim`], this intentionally carries no unrelated
+/// table or cleanup headroom. Each term is one reservation production makes:
+/// the client record and its index node, then the pending table node, the
+/// pending value's off-node retention, and its cleanup-list node. The provider
+/// prices every reservation and the registry scope itself, so the positive half
+/// of the control below proves this exact composite is sufficient.
+fn pending_fixture_claim(
+    clients: u64,
+    pending: u64,
+    network: &str,
+    method: &str,
+    remote_peer: &str,
+    remote_request_id: &str,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let planned = |claim| {
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("a fixture reservation charge is representable")
+    };
+    let client = planned(client_record_claim()?)
+        .checked_add(planned(
+            LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?,
+        ))?;
+    let pending_entry = planned(LeasedMap::<PendingKey, PendingRecord>::entry_claim()?)
+        .checked_add(planned(pending_retained_for(
+            network,
+            method,
+            remote_peer,
+            remote_request_id,
+        )?))?
+        .checked_add(planned(
+            crate::ipc::LeasedList::<PendingRecord>::node_claim()?,
+        ))?;
+    myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+        .checked_add(client.checked_scale(clients)?)?
+        .checked_add(pending_entry.checked_scale(pending)?)
+}
+
+/// A pending inbound call under pressure is refused before any of it is built.
+///
+/// The finding this pins is an ordering, not a number. What a refusal used to
+/// arrive after was: four copies of peer-chosen coordinates in a `PendingKey`,
+/// the channel that would have carried the answer back, and — one layer up, in
+/// the bridge — a clone of the peer's own payload. A remote peer chooses how
+/// many inbound calls there are, so a daemon that allocated all of that in order
+/// to say no was a daemon whose refusal path was the expensive one.
+///
+/// Three observations, and the second is the one a "did it refuse" control
+/// misses. The refusal is a typed admission failure rather than a collision, so
+/// a peer is not told to fix coordinates that were fine; the ledger is exactly
+/// where it was before the call, so nothing was taken and returned either; and
+/// no pending record exists, so nothing was half-filed.
+///
+/// The fourth thing the review names — the payload clone — is not here on
+/// purpose. It belongs to the outbound frame, which is admitted by the client's
+/// writer mailbox from a borrowed measurement, and is the subject of
+/// `v4_r2_daemon_a_measured_inbound_frame_matches_the_frame_it_becomes` in
+/// `bridge`. Folding the two together would make one control that fails for two
+/// unrelated reasons.
+#[tokio::test]
+async fn v4_r2_daemon_pending_ipc_pressure_refuses_before_the_call_is_built() {
+    let key: ClaimKey = ("n".to_string(), "m".to_string());
+    // One exact client and no pending-call capacity: the live owner is funded,
+    // while all three reservations the pending call needs are absent.
+    let starved = ClientRegistry::over_grant(
+        pending_fixture_claim(1, 0, &key.0, &key.1, "peer", "req")
+            .expect("the starved fixture claim is representable"),
+    );
+    let (a, _) = fresh_client(&starved);
+
+    let baseline = starved
+        .in_use()
+        .expect("a fixture registry over its own grant answers its ledger");
+    let refusal =
+        match starved.prepare_exact_pending(&key, "peer", "req", HandlerMode::Single, a.id) {
+            Ok(_) => panic!("a registry with no entry funding cannot admit a pending call"),
+            Err(refusal) => refusal,
+        };
+    assert!(
+        matches!(refusal, PendingRefusal::Admission(_)),
+        "refused as pressure, not as a collision or a departed owner: {refusal}"
+    );
+    assert_eq!(
+        starved.in_use(),
+        Some(baseline),
+        "and the refusal left the ledger exactly where it found it -- nothing was \
+         taken on the way to being declined"
+    );
+    assert_eq!(starved.residue().pending_inbound, 0, "and filed nothing");
+
+    // Non-vacuity: the same call and coordinates, with exactly one composite
+    // pending-call charge and no unrelated table or cleanup capacity.
+    let funded = ClientRegistry::over_grant(
+        pending_fixture_claim(1, 1, &key.0, &key.1, "peer", "req")
+            .expect("the funded fixture claim is representable"),
+    );
+    let (b, _) = fresh_client(&funded);
+    let baseline = funded
+        .in_use()
+        .expect("a fixture registry over its own grant answers its ledger");
+    let prepared = funded
+        .prepare_exact_pending(&key, "peer", "req", HandlerMode::Single, b.id)
+        .expect("a funded registry admits the same call");
+    assert_ne!(
+        funded.in_use(),
+        Some(baseline),
+        "non-vacuity: admitting it really does cost something, so the starved \
+         half above was refusing a real acquisition"
+    );
+    let (ticket, _rx) = funded
+        .commit_exact_single_pending(prepared, "peer", "req")
+        .expect("and it files");
+    assert_eq!(funded.residue().pending_inbound, 1);
+    drop(ticket);
+}
+
+/// A prepared call cannot be filed in a class it was not funded for.
+///
+/// The two-phase filing measures a pending call from borrowed coordinates and
+/// then builds it, and the class is fixed in the first half: it is part of the
+/// key the record is stored under and part of what a later `RpcRespond` or
+/// `RpcStreamChunk` is matched against. Production cannot get this wrong --
+/// `commit_exact_single_pending` and `commit_exact_stream_pending` each pass a
+/// constant that matches the preparation they accept, and there is no other way
+/// in from outside this module. That is exactly why the check underneath them is
+/// worth a control: an invariant kept only by "nobody calls it that way" is one
+/// nothing would notice becoming false.
+///
+/// What it would cost is a stream's sender filed under a single-shot's funding
+/// and a single-shot's key: chunks the peer sends would find a record whose
+/// class says to resolve it once and finish, and the daemon would answer a
+/// streaming call in a shape the peer never asked for.
+///
+/// Driven against the shared body directly, which is the only way to produce the
+/// disagreement at all.
+#[tokio::test]
+async fn v4_r2_daemon_a_pending_call_cannot_be_filed_in_a_class_it_was_not_funded_for() {
+    let reg = ClientRegistry::default();
+    let (a, _) = fresh_client(&reg);
+    let key: ClaimKey = ("n".to_string(), "m".to_string());
+
+    let prepared = reg
+        .prepare_exact_pending(&key, "peer", "req", HandlerMode::Single, a.id)
+        .expect("a fresh registry funds one pending call");
+    let mut built = false;
+    let refusal =
+        match reg.commit_exact_pending_as(prepared, "peer", "req", HandlerMode::Stream, || {
+            built = true;
+            let (tx, rx) = oneshot::channel();
+            (PendingInbound::Single(tx), rx)
+        }) {
+            Ok(_) => panic!("a single-shot preparation cannot be filed as a stream"),
+            Err(refusal) => refusal,
+        };
+    assert!(
+        matches!(refusal, PendingRefusal::ClassMismatch),
+        "and it says which invariant it kept, not that the coordinates collided: {refusal}"
+    );
+    assert!(
+        !built,
+        "and it refused before the effect was built, like every other refusal on \
+         this path"
+    );
+
+    // Non-vacuity, and the proof that the refusal filed nothing: the same
+    // coordinates, in the class they were funded for, are accepted. Had the
+    // mismatched commit inserted a record, this would be refused as a duplicate
+    // -- so one assertion covers both "the good path still works" and "the bad
+    // path left no trace".
+    let prepared = reg
+        .prepare_exact_pending(&key, "peer", "req", HandlerMode::Single, a.id)
+        .expect("a fresh registry funds one pending call");
+    let (ticket, _rx) = reg
+        .commit_exact_single_pending(prepared, "peer", "req")
+        .expect("the same coordinates are still vacant, and the matching class files");
+    drop(ticket);
 }
 
 #[tokio::test]
@@ -1246,12 +1633,11 @@ fn an_unrepresentable_coordinate_is_refused_rather_than_truncated() {
 /// A grant that funds one client record and one entry in every table, priced at
 /// `coordinate` bytes of client-chosen name.
 ///
-/// Deliberately generous everywhere except the one term under test. It pays for
-/// an entry in each of the eight tables and eight copies of the widest retained
-/// key shape, so nodes, records and provider bookkeeping are all comfortable;
-/// what it does *not* leave slack in is name bytes at `coordinate`. That is the
-/// only byte-sensitive term, which is what makes a refusal below attributable to
-/// name length rather than to a fixture that was tight in some other dimension.
+/// Deliberately generous: it pays for an entry in each of the eight tables and
+/// eight copies of the widest retained key shape, with every reservation and the
+/// registry scope priced by the provider's own planners. The control below sizes
+/// its refused coordinate from this grant's total byte budget, so name bytes
+/// alone exceed the whole budget regardless of how the node shapes change.
 fn registry_granting_coordinate(coordinate: usize) -> ClientRegistry {
     let grant = registry_fixture_claim(1, 1, coordinate)
         .expect("the control grant is representable")
@@ -1272,9 +1658,10 @@ fn registry_granting_coordinate(coordinate: usize) -> ClientRegistry {
 /// node would admit both, because the node is the same size either way, and
 /// that equality is the defect.
 ///
-/// The grant is sized from the same function the daemon's own test grant uses,
-/// so the byte-sensitive term is fixed at `SHORT` while every other term stays
-/// generous. The long case exceeds the grant by name bytes alone.
+/// The grant is sized from the same function the daemon's own test grant uses.
+/// The long case is derived from that grant's complete accounted-memory budget,
+/// so its name bytes alone exceed the whole grant rather than relying on a fixed
+/// multiplier that can drift when a node shape changes.
 ///
 /// The release half matters as much as the refusal, and it is asserted rather
 /// than inferred. A registry that charged for a name and never gave it back
@@ -1300,8 +1687,14 @@ fn a_long_coordinate_is_refused_where_a_short_one_is_admitted() {
         "non-vacuity: filing a claim really does consume from the grant"
     );
 
-    // Same shape, same client, same tables -- only the name is longer.
-    let long: ClaimKey = ("n".repeat(SHORT * 64), "m".repeat(SHORT * 64));
+    // Same shape, same client, same tables -- only the name is longer. Size it
+    // from the grant rather than a multiplier: nodes and names share the byte
+    // dimension, so a fixed multiple would be refused only by coincidence.
+    let budget = registry_fixture_claim(1, 1, SHORT)
+        .expect("the control grant is representable")
+        .amount(ResourceClass::AccountedMemoryBytes);
+    let long_len = usize::try_from(budget).expect("the grant's byte budget is a length") + 1;
+    let long: ClaimKey = ("n".repeat(long_len), "m".repeat(long_len));
     assert!(
         matches!(
             reg.claim_method(long.clone(), client.id, HandlerMode::Single),
@@ -1309,7 +1702,7 @@ fn a_long_coordinate_is_refused_where_a_short_one_is_admitted() {
                 _
             )))
         ),
-        "a name sixty-four times longer costs more than the grant has left"
+        "the name alone costs more accounted memory than the whole grant holds"
     );
     // And nothing of the refused claim was installed.
     assert!(reg.handler_owner(&long).is_none());
@@ -1332,9 +1725,9 @@ fn a_long_coordinate_is_refused_where_a_short_one_is_admitted() {
         "release returns the filing's delta exactly: not part of it, and not more"
     );
 
-    // A name this long still does not fit: one short entry's worth of funding
-    // is not sixty-four short entries' worth. The refusal is the same one, so
-    // the release above did not silently hand back more than it took.
+    // A name whose bytes alone exceed the whole grant still does not fit. The
+    // refusal is the same one, so the release above did not silently hand back
+    // more than it took.
     assert!(
         matches!(
             reg.claim_method(long.clone(), client.id, HandlerMode::Single),
