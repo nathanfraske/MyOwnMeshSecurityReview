@@ -606,6 +606,28 @@ impl ReliableState {
         .expect("an infallible delivery cannot refuse")
     }
 
+    /// This session's receive-side state: the stream it is bound to, if any,
+    /// and the contiguous mark it would acknowledge.
+    ///
+    /// Controls need the mark itself, not a proxy for it. "Nothing was
+    /// delivered" is observable from outside — the subscriber stays empty — but
+    /// "nothing was *acknowledged*" is not, and the two come apart exactly where
+    /// it matters: a delivery refusal that advanced the mark anyway would make
+    /// the sender's retransmit look like a duplicate and be answered as one, so
+    /// the sender would stop retransmitting a payload nobody ever received. That
+    /// is the failure the biconditional in [`Self::try_receive`] exists to
+    /// prevent, and this is the only way to watch it hold.
+    ///
+    /// Gated to the harness that can reach it. The only controls that read a
+    /// mark are the two reliable-lane ones, and both stand on a genuinely
+    /// linked connector pair — which only `transport-lab` builds. Under a plain
+    /// `cargo test` this has no callers at all, and a seam kept alive there
+    /// would be one only an `allow` could justify.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn inbound_mark_for_test(&self) -> (Option<u64>, u64) {
+        (self.inbound.stream, self.inbound.last_seq)
+    }
+
     /// This session's send-side stream id.
     ///
     /// Controls need it to build an acknowledgement this record would actually

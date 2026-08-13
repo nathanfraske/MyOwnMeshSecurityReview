@@ -25,8 +25,10 @@
 //! which a recycled id could reproduce exactly. Nothing inbound is
 //! ever matched against it.
 
+use std::alloc::Layout;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
@@ -36,9 +38,10 @@ use crate::engine::state::NetworkState;
 use crate::identity::DeviceId;
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
-    mailbox_measure_serialized, mailbox_retained_claim, strings_measure, LeasedMap,
-    LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
-    ResourceLease, ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxReceiver,
+    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
+    LeasedMap, LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError,
+    ResourceClass, ResourceLease, ResourceMailboxItem, ResourceMailboxItemError,
+    ResourceMailboxReceiver,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -143,7 +146,45 @@ impl RpcResponse {
 pub type RpcHandlerFuture =
     Pin<Box<dyn Future<Output = Result<RpcResponse, String>> + Send + 'static>>;
 
-pub type RpcHandler = Arc<dyn Fn(RpcCall) -> RpcHandlerFuture + Send + Sync + 'static>;
+/// One registered single-shot handler and the registration funding that keeps
+/// it alive, in one allocation.
+///
+/// The lease lives **inside** this value rather than beside it in
+/// [`HandlerEntry`], and that placement is the whole point. Dispatch clones the
+/// callable out of the registry and invokes it after the registry lock is gone,
+/// so a lease held by the map entry would be released the instant that entry
+/// was replaced or forgotten — while the clone was still running. The charge
+/// would then have funded the registration for less than the lifetime of the
+/// thing it was charged for. Held here, every clone carries the charge, and the
+/// charge is returned when the last clone drops.
+/// One allocation, and that is load-bearing rather than tidy: the callable is
+/// the trailing **unsized** field, so `Arc<FundedRpcHandler<F>>` coerces to
+/// `Arc<FundedRpcHandler>` without boxing the closure separately. A
+/// `Box<dyn Fn>` beside the counts would be a second allocation that the
+/// registration charge would have to name, and an accounting formula that has
+/// to remember a representation detail is one that drifts from it.
+pub struct FundedRpcHandler<C: ?Sized = dyn Fn(RpcCall) -> RpcHandlerFuture + Send + Sync + 'static>
+{
+    /// Which registration installed this handler. Compared, never displayed:
+    /// it exists so a cleanup handle can remove the exact handler it installed
+    /// and refuse to remove a successor that legitimately took the name.
+    registration: RegistrationIdentity,
+    _retention: ResourceLease,
+    /// Last, because a struct may only be unsized in its final field.
+    call: C,
+}
+
+impl FundedRpcHandler {
+    pub fn invoke(&self, call: RpcCall) -> RpcHandlerFuture {
+        (self.call)(call)
+    }
+
+    pub(crate) fn registration(&self) -> RegistrationIdentity {
+        self.registration
+    }
+}
+
+pub type RpcHandler = Arc<FundedRpcHandler>;
 
 /// Streaming-handler item. Every successful handler must explicitly terminate;
 /// disappearance without `End` is a failed stream, never clean success.
@@ -172,7 +213,39 @@ pub type RpcStreamHandlerFuture = Pin<
     >,
 >;
 
-pub type RpcStreamHandler = Arc<dyn Fn(RpcCall) -> RpcStreamHandlerFuture + Send + Sync + 'static>;
+/// The streaming twin of [`FundedRpcHandler`], on the same rule and for the
+/// same reason: the funding and the callable are one allocation, so an
+/// invocation clone cannot outlive the charge that paid for it.
+pub struct FundedRpcStreamHandler<
+    C: ?Sized = dyn Fn(RpcCall) -> RpcStreamHandlerFuture + Send + Sync + 'static,
+> {
+    registration: RegistrationIdentity,
+    _retention: ResourceLease,
+    call: C,
+}
+
+impl FundedRpcStreamHandler {
+    pub fn invoke(&self, call: RpcCall) -> RpcStreamHandlerFuture {
+        (self.call)(call)
+    }
+
+    pub(crate) fn registration(&self) -> RegistrationIdentity {
+        self.registration
+    }
+}
+
+pub type RpcStreamHandler = Arc<FundedRpcStreamHandler>;
+
+/// Names one installation of one handler, so a cleanup handle can act on
+/// exactly the registration it made.
+///
+/// Removal by method name alone is what this exists to replace: a late cleanup
+/// for a handler that has since been legitimately displaced would otherwise
+/// tear down its successor. Drawn from a per-dispatcher counter, so two
+/// registrations of the same method are never equal and a comparison is a fact
+/// rather than a guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RegistrationIdentity(u64);
 
 /// RPC dispatcher. One per joined network; cheap to clone.
 #[derive(Clone)]
@@ -190,6 +263,10 @@ pub struct RpcInner {
     pub(crate) network: Weak<NetworkState>,
     pub(crate) handlers: Mutex<LeasedMap<String, HandlerEntry>>,
     handler_resources: LocalApplicationResourceScope,
+    /// Seeds [`RegistrationIdentity`]. Monotonic and never reused within one
+    /// dispatcher, which is what makes "is this still my registration?" a
+    /// comparison rather than an inference from the method name.
+    next_registration: std::sync::atomic::AtomicU64,
     _allocation: ResourceLease,
 }
 
@@ -227,7 +304,8 @@ impl Drop for SessionRpcState {
         // than a search.
         self.pending.any_value(|op| {
             if let PendingEntry::Stream(stream) = &op.effect {
-                stream.finish(Some("RPC session retired".to_string()));
+                // Borrowed, not allocated: see `RpcStreamInbox::finish`.
+                stream.finish_borrowed(Some("RPC session retired"));
             }
             false
         });
@@ -236,30 +314,70 @@ impl Drop for SessionRpcState {
 
 /// What one pending operation retains, off the map node.
 ///
-/// The node is **not** here: [`crate::resource::LeasedMap::entry_claim`] adds
-/// it, from a `size_of` only the map can take. This used to carry a residual of
-/// 2 — "hash-map node plus the channel allocation retained by its sender" — and
-/// the first of those two was an inference about someone else's representation.
-/// One term is left, and it is the one this module can actually see: the oneshot
-/// or inbox allocation the effect holds.
+/// The map node is **not** here: [`crate::resource::LeasedMap::entry_claim`]
+/// adds it, from a `size_of` only the map can take. Everything else a filed
+/// operation keeps alive is, and it is more than the entry in the map, because
+/// filing one hands the caller a second half that outlives nothing but is
+/// funded by nobody else:
+///
+/// - **The request id, twice.** The map owns one `String` buffer as its key;
+///   [`LocalRequest`] owns another, which [`PendingCancellation`] then holds so
+///   a dropped caller can withdraw the exact entry it filed. Two buffers, two
+///   allocations, both live for the operation's whole life. Charging one was
+///   funding half of what is retained.
+/// - **The peer name.** [`PendingCancellation`] copies it, because withdrawal
+///   has to name the peer after the borrow that filed the entry is gone.
+/// - **The identity allocation.** [`PendingOpId`] is identity *over an
+///   allocation*, and that same allocation holds the operation's lease. One
+///   allocation however many clones exist, so it is charged once.
+/// - **The cancellation state itself**, inline in the future or [`RpcStream`]
+///   the caller holds.
+/// - **The effect.** A stream's inbox is an `Arc` whose size this module can
+///   take; a unary oneshot's inner allocation is opaque, so it is a residual
+///   and is named as one rather than guessed at in bytes.
+///
+/// `peer_bytes` and `class` are parameters rather than constants because the
+/// first is not knowable here and the second changes what is retained.
 fn pending_operation_claim(
     request_id_bytes: usize,
+    peer_bytes: usize,
+    class: PendingClass,
 ) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
     use crate::resource::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass};
-    let inline = std::mem::size_of::<PendingOp>()
-        .checked_add(request_id_bytes)
+    let overflow = || ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    };
+    // The identity's one allocation, shared by the map's clone and the caller's.
+    let identity = arc_allocation_bytes(Layout::new::<PendingOpFunding>())?;
+    // The effect's own allocation. Only one of the two is measurable from here.
+    let effect = match class {
+        PendingClass::Stream => arc_allocation_bytes(Layout::new::<RpcStreamInbox>())?,
+        PendingClass::Single => 0,
+    };
+    let bytes = std::mem::size_of::<PendingOp>()
+        .checked_add(std::mem::size_of::<PendingCancellation>())
+        .and_then(|bytes| bytes.checked_add(identity))
+        .and_then(|bytes| bytes.checked_add(effect))
+        .and_then(|bytes| bytes.checked_add(peer_bytes))
+        // Twice: the map's key and the cancellation's copy.
+        .and_then(|bytes| request_id_bytes.checked_mul(2)?.checked_add(bytes))
+        .ok_or_else(overflow)?;
+    // Two request-id buffers when the id is named at all, one peer buffer when
+    // the peer is, the identity allocation, and the effect's — the last always
+    // one, whether or not its bytes above were measurable.
+    let allocations = u64::from(request_id_bytes > 0)
+        .checked_mul(2)
+        .and_then(|ids| ids.checked_add(u64::from(peer_bytes > 0)))
+        .and_then(|named| named.checked_add(2))
         .ok_or(ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::AccountedMemoryBytes,
+            dimension: ResourceClass::OpaqueDependencyResidual,
         })?;
     ResourceClaim::try_from_entries([
         (
             ResourceClass::AccountedMemoryBytes,
-            u64::try_from(inline).map_err(|_| ResourceClaimArithmeticError::Overflow {
-                dimension: ResourceClass::AccountedMemoryBytes,
-            })?,
+            u64::try_from(bytes).map_err(|_| overflow())?,
         ),
-        // The channel allocation retained by the effect's sender.
-        (ResourceClass::OpaqueDependencyResidual, 1),
+        (ResourceClass::OpaqueDependencyResidual, allocations),
     ])
 }
 
@@ -287,48 +405,107 @@ pub(crate) enum RpcRegistrationRefusal {
     Unrepresentable,
 }
 
-pub(crate) fn handler_task_claim(
-    call: &RpcCall,
+/// What running one handler task retains, measured from the request's own
+/// fields rather than from a copy of them.
+///
+/// **Borrowed, and counted rather than encoded.** The caller charges *before* it
+/// builds the `RpcCall` and the `String`s inside it, so a request too large for
+/// the session to fund is refused without this node having allocated the copy —
+/// which is the whole point of admitting work: a peer must not be able to make
+/// this side allocate in proportion to what it sent and only then discover it
+/// cannot pay for it. `mailbox_measure_serialized` serializes into a writer that
+/// only adds up lengths, so the measurement itself allocates nothing either;
+/// `serde_json::to_vec` would have built the entire encoding first, which is the
+/// same defect one layer down.
+///
+/// **Why the payload's *retained* figure and not its encoded length.** What the
+/// task keeps alive is a `serde_json::Value` tree, not a byte string. A
+/// two-character `[]` repeated is two bytes of encoding per element and a whole
+/// `Value` plus its node overhead per element in memory, and the ratio is chosen
+/// by whoever sent the frame. Charging encoded bytes would let an adversary pick
+/// the shape that maximises the gap. The retained figure is core's existing
+/// conservative structural bound for exactly this — the same one the mailbox
+/// charges — and its per-fragment allocation count is used for the same reason:
+/// one residual cannot honestly stand for an allocation count the sender picks.
+///
+/// **The request id is charged twice, because two are retained.** A run that is
+/// admitted keeps one inside the `RpcCall` the handler is given, and a second
+/// for addressing the terminal frame — the call is moved into the handler and
+/// is gone by the time the reply is sent, so the reply path cannot borrow from
+/// it. Charging one funded half of what success holds, and the id is peer-chosen
+/// like every other field here, so the gap was a peer-selected one.
+///
+/// `WorkerOrTask` stays its own dimension: the spawned task is one task whatever
+/// the payload looks like. One residual is added on top of the measured tree's
+/// for the task's own future allocation.
+///
+/// `RpcCall::streaming` is not a parameter, because it retains nothing: it is a
+/// `bool` inside the `size_of::<RpcCall>()` already counted, and taking it here
+/// only to ignore it would suggest the class changes the price. It does not —
+/// the class decides which terminal frame is sent, not what the run holds.
+pub(crate) fn handler_task_claim_for(
+    from: &str,
+    request_id: &str,
+    method: &str,
+    payload: &serde_json::Value,
 ) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
     use crate::resource::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass};
-    let encoded = serde_json::to_vec(&(
-        &call.from,
-        &call.request_id,
-        &call.method,
-        &call.payload,
-        call.streaming,
-    ))
-    .map_err(|_| ResourceClaimArithmeticError::Overflow {
+    let overflow = || ResourceClaimArithmeticError::Overflow {
         dimension: ResourceClass::AccountedMemoryBytes,
-    })?
-    .len();
-    let bytes = std::mem::size_of::<RpcCall>().checked_add(encoded).ok_or(
-        ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::AccountedMemoryBytes,
-        },
-    )?;
+    };
+    // `request_id` twice: two buffers, two allocations. Passed as two entries
+    // rather than doubled afterwards so the residual count doubles with it.
+    let measure = strings_measure([from, request_id, request_id, method])
+        .and_then(|strings| checked_measure_add(strings, mailbox_measure_serialized(payload)?))
+        .map_err(|_| overflow())?;
+    let bytes = std::mem::size_of::<RpcCall>()
+        .checked_add(measure.0)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(overflow)?;
+    // The four string buffers — the peer name, the request id twice, and the
+    // method — and every fragment of the payload tree, plus one for the spawned
+    // task's own future.
+    let allocations = u64::try_from(measure.2)
+        .ok()
+        .and_then(|tree| tree.checked_add(1))
+        .ok_or(ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::OpaqueDependencyResidual,
+        })?;
     ResourceClaim::try_from_entries([
-        (
-            ResourceClass::AccountedMemoryBytes,
-            u64::try_from(bytes).map_err(|_| ResourceClaimArithmeticError::Overflow {
-                dimension: ResourceClass::AccountedMemoryBytes,
-            })?,
-        ),
-        // Boxed handler future plus the executor task record.
-        (ResourceClass::OpaqueDependencyResidual, 2),
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::WorkerOrTask, 1),
+        (ResourceClass::OpaqueDependencyResidual, allocations),
     ])
 }
 
-#[allow(clippy::large_enum_variant)]
+/// [`handler_task_claim_for`] against a call that already exists.
+#[cfg(test)]
+pub(crate) fn handler_task_claim(
+    call: &RpcCall,
+) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    handler_task_claim_for(&call.from, &call.request_id, &call.method, &call.payload)
+}
+
+/// Which of the two handler shapes a method is registered under.
+///
+/// Neither variant carries a retention lease any more: the registration charge
+/// lives inside [`FundedRpcHandler`] / [`FundedRpcStreamHandler`], so it
+/// travels with every invocation clone rather than being released the moment
+/// this entry is replaced. What this entry still owns is its position in the
+/// map, funded by the node lease the map holds.
 pub enum HandlerEntry {
-    Single {
-        handler: RpcHandler,
-        _retention: ResourceLease,
-    },
-    Stream {
-        handler: RpcStreamHandler,
-        _retention: ResourceLease,
-    },
+    Single { handler: RpcHandler },
+    Stream { handler: RpcStreamHandler },
+}
+
+impl HandlerEntry {
+    /// Which registration installed this entry.
+    pub(crate) fn registration(&self) -> RegistrationIdentity {
+        match self {
+            Self::Single { handler } => handler.registration(),
+            Self::Stream { handler } => handler.registration(),
+        }
+    }
 }
 
 fn rpc_inner_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
@@ -344,24 +521,240 @@ fn rpc_inner_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     ])
 }
 
-fn handler_retention_claim<F>(method: &str) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+/// The bytes one `Arc<T>` allocation actually occupies.
+///
+/// Composed with [`Layout`] rather than summed from field sizes, because a sum
+/// silently drops padding. `Arc` lays the two counts down first and then the
+/// value at *its* alignment: a value needing 16-byte alignment on a 64-bit
+/// target forces padding after the counts that no `size_of` term names, and
+/// `pad_to_align` adds the tail the allocator is also handed. Both are real
+/// bytes, and a funding figure that omits them is short — the one direction it
+/// must never be.
+fn arc_allocation_bytes(value: Layout) -> Result<usize, ResourceClaimArithmeticError> {
+    Layout::new::<(AtomicUsize, AtomicUsize)>()
+        .extend(value)
+        .map(|(whole, _)| whole.pad_to_align().size())
+        .map_err(|_| ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })
+}
+
+/// The layout of what an `Arc<FundedRpcHandler<C>>` holds, with `C` inferred
+/// from the closure itself: the type is anonymous and cannot be written down,
+/// but it can be pointed at.
+fn funded_handler_layout<C>(_probe: &C) -> Layout {
+    Layout::new::<FundedRpcHandler<C>>()
+}
+
+/// [`funded_handler_layout`] for the streaming twin.
+fn funded_stream_handler_layout<C>(_probe: &C) -> Layout {
+    Layout::new::<FundedRpcStreamHandler<C>>()
+}
+
+/// What is known about what a handler closure reaches past its own inline
+/// storage — which is either something the caller stated, or nothing at all.
+///
+/// These are not two spellings of the same thing, and the distinction is the
+/// whole point of the type. `Declared(ZERO)` is a caller *asserting* that the
+/// closure allocates nothing behind it. `Opaque` is an admission that nobody
+/// asked, and it is funded as one residual standing for the entire unseen set.
+/// Collapsing them would let the honest assertion and the unanswered question
+/// price identically, which is exactly the conflation this exists to prevent.
+enum CaptureFunding {
+    Declared(ResourceClaim),
+    Opaque,
+}
+
+/// What the installed entry retains, stated in the parts that are knowable in
+/// different places.
+///
+/// **What this function can see, and charges:** the map key's buffer, the one
+/// `Arc` allocation that carries the identity, the lease, and the closure
+/// inline in its trailing field, and one residual per distinct allocation among
+/// them. The allocation is taken from its [`Layout`], so the padding a
+/// high-alignment closure forces after the reference counts is included; what
+/// is *not* modelled is the allocator's own rounding to a size class, which can
+/// only make the real figure larger. So this is a floor that names its terms,
+/// not a measurement of resident bytes.
+///
+/// **What it cannot see, and therefore does not pretend to contain:**
+/// `size_of::<F>()` is the closure struct, not its reach. A handler that
+/// captured an `Arc<T>` measures one pointer here however large `T` is; one
+/// that captured a `String` measures the 24-byte header and none of its buffer.
+/// Only the caller who wrote the closure knows what it holds, so `captures` is
+/// where that is said — declared and added (not maxed: the inline storage and
+/// the heap behind it are both retained), or [`CaptureFunding::Opaque`] and
+/// named as its own residual, distinct from the registration allocation's.
+///
+/// This charges the key buffer only. The cleanup handle's copy of the name is a
+/// *separate owner* with a separate lifetime and is funded by
+/// [`cleanup_handle_claim`]; see there for why the two must not share a lease.
+fn entry_retention_claim(
+    method: &str,
+    captures: CaptureFunding,
+    handler: Layout,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let registration_allocation = arc_allocation_bytes(handler)?;
     let bytes = method
         .len()
-        .checked_add(std::mem::size_of::<F>())
-        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+        .checked_add(registration_allocation)
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(ResourceClaimArithmeticError::Overflow {
             dimension: ResourceClass::AccountedMemoryBytes,
         })?;
+    // The key buffer when the method is named at all, plus exactly one for the
+    // registration itself — one, because the callable is the `Arc`'s trailing
+    // field rather than a `Box` beside it.
     let allocations = u64::from(!method.is_empty()).checked_add(1).ok_or(
         ResourceClaimArithmeticError::Overflow {
             dimension: ResourceClass::OpaqueDependencyResidual,
         },
     )?;
-    ResourceClaim::try_from_entries([
+    let known = ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
         (ResourceClass::OpaqueDependencyResidual, allocations),
+    ])?;
+    match captures {
+        CaptureFunding::Declared(claim) => known.checked_add(claim),
+        // One residual for the whole capture set, and it is deliberately not
+        // folded into `allocations` above: that count is a statement about
+        // allocations this function measured, and this one is a statement that
+        // there is something here it did not.
+        CaptureFunding::Opaque => known.checked_add(ResourceClaim::try_from_entries([(
+            ResourceClass::OpaqueDependencyResidual,
+            1,
+        )])?),
+    }
+}
+
+/// What the cleanup handle retains, funded on its own lease.
+///
+/// The handle owns an `Arc<str>` of the method name so it can name what it must
+/// remove after the key has been moved into the map. That buffer outlives the
+/// entry it refers to: a successor displaces the entry, the old handler's `Arc`
+/// drops with its lease, and a still-held [`OwnedMethodRegistration`] keeps
+/// naming a method it no longer owns for as long as its holder keeps it. Funding
+/// the handle from the entry's lease would leave that retention uncharged from
+/// displacement until handle drop — an interval with no bound, since the holder
+/// chooses it. So the handle carries its own lease and releases it in its own
+/// `Drop`, and no drop-order relationship between the two owners is assumed.
+fn cleanup_handle_claim(method: &str) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    // `Arc<str>`: the two counts, then the bytes, in one allocation. `str` is
+    // align-1, so the name contributes its length and no padding.
+    let name = Layout::from_size_align(method.len(), 1).map_err(|_| {
+        ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    let bytes = u64::try_from(arc_allocation_bytes(name)?).map_err(|_| {
+        ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
+}
+
+/// An isolated, finitely-granted scope for handlers a test never registers.
+///
+/// Isolated per call: a control that wants to observe a handler's charge wants
+/// it alone in the ledger, not summed with every other test in the binary.
+#[cfg(test)]
+fn test_handler_scope() -> LocalApplicationResourceScope {
+    test_handler_scope_with_provider().2
+}
+
+/// The isolated handler scope together with the provider a pressure control
+/// must observe and the grant that provider owns.
+///
+/// Most handler fixtures need only the scope, so [`test_handler_scope`] keeps
+/// the narrower answer. A ledger control needs all three values: the provider
+/// is the authority for exact live use, and the grant is what lets the control
+/// seal every unrelated unit without restating any of this scope's charges.
+#[cfg(test)]
+fn test_handler_scope_with_provider() -> (
+    crate::resource::FiniteResourceProvider,
+    ResourceClaim,
+    LocalApplicationResourceScope,
+) {
+    let grant =
+        ResourceClaim::try_from_entries(ResourceClass::ALL.map(|dimension| (dimension, 1_000_000)))
+            .expect("test grant is representable");
+    let finite = crate::resource::FiniteResourceProvider::new(grant);
+    let provider = crate::resource::ResourceProviderPort::new(finite.clone())
+        .expect("test grant funds process bookkeeping");
+    let root = crate::resource::ProcessResourceRoot::isolated();
+    root.install_local_application_provider(provider)
+        .expect("isolated root accepts its provider");
+    let scope = root
+        .issue_local_application_scope()
+        .expect("test local-application scope");
+    (finite, grant, scope)
+}
+
+/// What a handler that is never registered costs: the one `Arc` allocation and
+/// nothing else.
+///
+/// Deliberately the *production* formula with the registration-only terms
+/// dropped out by their own arithmetic rather than a second formula that could
+/// drift from it — an empty method contributes no key bytes and no key
+/// allocation, and no map node or cleanup handle exists to fund. `Opaque` is
+/// the honest reading of an arbitrary test closure: nobody declared its reach.
+#[cfg(test)]
+fn unregistered_handler_claim(handler: Layout) -> ResourceClaim {
+    entry_retention_claim("", CaptureFunding::Opaque, handler)
+        .expect("one handler allocation is representable")
+}
+
+#[cfg(test)]
+impl FundedRpcHandler {
+    /// Wrap `call` as a genuinely funded single-shot handler, unregistered.
+    ///
+    /// The lease is acquired against the layout of the very callable stored
+    /// below, so a control using this measures the same allocation a live
+    /// registration would — not a synthetic zero that would hide it.
+    pub(crate) fn for_test<F, Fut>(call: F) -> RpcHandler
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
+    {
+        let call = move |request: RpcCall| -> RpcHandlerFuture { Box::pin(call(request)) };
+        let _retention = test_handler_scope()
+            .acquire(unregistered_handler_claim(funded_handler_layout(&call)))
+            .expect("the isolated test grant funds one handler allocation");
+        Arc::new(FundedRpcHandler {
+            registration: RegistrationIdentity(0),
+            _retention,
+            call,
+        })
+    }
+}
+
+#[cfg(test)]
+impl FundedRpcStreamHandler {
+    /// [`FundedRpcHandler::for_test`] for the streaming twin, funded the same
+    /// way against the streaming callable's own layout.
+    pub(crate) fn for_test<F, Fut>(call: F) -> RpcStreamHandler
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
+    {
+        let call = move |request: RpcCall| -> RpcStreamHandlerFuture { Box::pin(call(request)) };
+        let _retention = test_handler_scope()
+            .acquire(unregistered_handler_claim(funded_stream_handler_layout(
+                &call,
+            )))
+            .expect("the isolated test grant funds one handler allocation");
+        Arc::new(FundedRpcStreamHandler {
+            registration: RegistrationIdentity(0),
+            _retention,
+            call,
+        })
+    }
 }
 
 /// The response class a pending operation will accept.
@@ -382,13 +775,39 @@ pub(crate) enum PendingClass {
 /// orthogonal to the binding rule and is left where downstream
 /// found it.
 pub(crate) enum PendingEntry {
-    Single(oneshot::Sender<Result<RpcResponse, String>>),
+    Single(oneshot::Sender<FundedRpcResult>),
     Stream(Arc<RpcStreamInbox>),
+}
+
+/// A settled stream's reason, with the funding for it when it owns bytes.
+///
+/// `None` retention is not "unfunded" — it is "nothing variable to fund": every
+/// borrowed reason is a `&'static str` this module wrote.
+struct StreamTerminal {
+    reason: Option<std::borrow::Cow<'static, str>>,
+    _retention: Option<ResourceLease>,
+}
+
+/// What a stream's owned terminal reason retains: its buffer, and the one
+/// allocation holding it.
+fn terminal_claim(bytes: usize) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    ResourceClaim::try_from_entries([
+        (
+            ResourceClass::AccountedMemoryBytes,
+            u64::try_from(bytes).map_err(|_| ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::AccountedMemoryBytes,
+            })?,
+        ),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            u64::from(bytes > 0),
+        ),
+    ])
 }
 
 pub(crate) struct RpcStreamInbox {
     mailbox: Mutex<crate::application_gateway::GatewayMailbox<serde_json::Value>>,
-    terminal: Mutex<Option<Option<String>>>,
+    terminal: Mutex<Option<StreamTerminal>>,
     ready: tokio::sync::Notify,
     finished: std::sync::atomic::AtomicBool,
 }
@@ -426,15 +845,25 @@ impl RpcStreamInbox {
     ) -> Result<(), crate::application_gateway::GatewayRefusal> {
         use crate::application_gateway::{GatewayMailbox, GatewayRefusal};
 
-        let encoded_len = serde_json::to_vec(&payload)
-            .map_err(|_| GatewayRefusal::Malformed)?
-            .len();
+        // Counted, not encoded: `mailbox_measure_serialized` serializes into a
+        // length-counting writer, so a chunk this side may be about to refuse
+        // costs no allocation to measure. `serde_json::to_vec` built the whole
+        // encoding first — a peer-sized allocation taken before admission, which
+        // is the defect admission exists to prevent.
+        //
+        // All three figures, because for a `Value` they are three different
+        // things and the sender picks the ratio between them: the tree's
+        // retained size, the queued encoding's size, and the number of separate
+        // fragments. One residual could not honestly stand for the last of
+        // those.
+        let (retained, queued, allocations) =
+            mailbox_measure_serialized(&payload).map_err(|_| GatewayRefusal::Malformed)?;
         // Measured, then funded, then retained — the order every admission in
         // this crate takes, so nothing is held that the provider never got to
         // refuse.
         let retention = session
             .reserve_retained(
-                GatewayMailbox::<serde_json::Value>::retention_claim(encoded_len, 1)
+                GatewayMailbox::<serde_json::Value>::retention_claim(retained, queued, allocations)
                     .map_err(|_| GatewayRefusal::Malformed)?,
             )
             .map_err(GatewayRefusal::Pressure)?;
@@ -449,14 +878,81 @@ impl RpcStreamInbox {
         Ok(())
     }
 
-    pub(crate) fn finish(&self, error: Option<String>) {
+    /// Settle the stream with a reason this module wrote, once.
+    ///
+    /// Borrowed, so it costs nothing to state and cannot fail. That matters most
+    /// at teardown: `SessionRpcState::drop` finishes every stream it still
+    /// holds, and allocating once per stream at the moment a session is being
+    /// torn down is allocation-heavy cleanup at the worst possible time.
+    ///
+    /// Every reason reachable this way is a fixed sentence chosen here, so there
+    /// is nothing variable to fund and no way for this to refuse.
+    pub(crate) fn finish_borrowed(&self, error: Option<&'static str>) {
+        self.settle(error.map(std::borrow::Cow::Borrowed), None);
+    }
+
+    /// Settle the stream with a reason that came from somewhere else, funding
+    /// the bytes before retaining them.
+    ///
+    /// The distinction from [`Self::finish_borrowed`] is ownership, and it is
+    /// the point. A peer's stream-end error text and a refusal message assembled
+    /// at runtime are both `String`s whose length this side did not choose, and
+    /// storing one here retains it until the local caller happens to call
+    /// `recv` — an interval the caller controls and may never end. The frame
+    /// that carried the peer's text is released as soon as its dispatch
+    /// finishes, and the pending operation's claim prices coordinates rather
+    /// than terminal text, so neither of them was ever paying for this.
+    ///
+    /// So the bytes are charged to the session that delivered them, and the
+    /// lease is stored beside the reason and released when the terminal is
+    /// taken.
+    ///
+    /// **A refusal still terminates the stream.** If the owner will not fund the
+    /// text, the stream settles with a fixed borrowed sentence instead of
+    /// staying open: a caller left awaiting a terminal that never comes is a
+    /// worse outcome than a caller told less than the peer said, and dropping
+    /// the reason is the one part of this that is safe to drop.
+    pub(crate) fn finish_owned(
+        &self,
+        session: &crate::runtime::session_broker::SessionCapability,
+        error: String,
+    ) {
+        let funded = terminal_claim(error.len())
+            .ok()
+            .and_then(|claim| session.reserve_retained(claim).ok());
+        match funded {
+            Some(lease) => self.settle(Some(std::borrow::Cow::Owned(error)), Some(lease)),
+            None => self.finish_borrowed(Some(
+                "RPC stream terminated; its reason could not be funded",
+            )),
+        }
+    }
+
+    fn settle(
+        &self,
+        error: Option<std::borrow::Cow<'static, str>>,
+        retention: Option<ResourceLease>,
+    ) {
         let mut terminal = self.terminal.lock();
         if terminal.is_none() {
-            *terminal = Some(error);
+            *terminal = Some(StreamTerminal {
+                reason: error,
+                _retention: retention,
+            });
             self.finished
                 .store(true, std::sync::atomic::Ordering::Release);
             self.ready.notify_waiters();
         }
+    }
+
+    /// Whether this stream has been settled.
+    ///
+    /// Test-only. Controls that prove a retirement finishes the streams it was
+    /// carrying need to see the terminal without consuming it — `recv` would
+    /// take it and then be indistinguishable from a stream that simply ended.
+    #[cfg(test)]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn recv(&self) -> Option<Result<RpcStreamChunk, String>> {
@@ -479,7 +975,9 @@ impl RpcStreamInbox {
                 }));
             }
             if let Some(terminal) = self.terminal.lock().take() {
-                return terminal.map(Err);
+                // The lease leaves with the terminal and is released here, which
+                // is the moment the retained text stops being retained.
+                return terminal.reason.map(|reason| Err(reason.into_owned()));
             }
             if self.finished.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
@@ -516,47 +1014,47 @@ impl PendingEntry {
     }
 }
 
-/// One in-flight local request, bound to the exact remote that may
-/// settle it and the exact response class it will accept.
+/// One in-flight local request, owned by the exact session that filed it.
 ///
-/// **The rule.** A request id identifies an operation; it does not
-/// authorize settling one. Before this binding, `pending` was keyed
-/// on the id alone and every inbound response arm looked an entry
-/// up by the id the *frame* carried, so any authenticated peer that
-/// learned or guessed another peer's in-flight id could complete
-/// that call: resolve someone else's oneshot with a body of its
-/// choosing, inject chunks into someone else's stream, or end it
-/// early. The admitted dispatch already knew which peer actually
-/// sent the frame, and the handlers simply ignored it.
+/// **The rule.** A request id identifies an operation; it does not authorize
+/// settling one. Before ownership moved here, `pending` was a network-global
+/// map keyed on the id alone, and every inbound response arm looked an entry up
+/// by the id the *frame* carried — so any authenticated peer that learned or
+/// guessed another peer's in-flight id could complete that call: resolve
+/// someone else's oneshot with a body of its choosing, inject chunks into
+/// someone else's stream, or end it early.
 ///
-/// **Why a device and not an installation.** `expect_from` is the
-/// canonical registry device id, which is the same value the
-/// admission owner token reports, so the comparison is exact rather
-/// than a normalization guess. It is deliberately *not* the
-/// installation: a peer that drops and re-authenticates mid-call
-/// arrives on a fresh connector under the same device id, and that
-/// is a legitimate completion of a still-pending operation. The
-/// selected rule is therefore: the same canonical device over a
-/// freshly authenticated replacement connector **may** complete a
-/// pending operation; a different device **never** may. This is the
-/// one place the RPC response path diverges from `on_rpc_request`,
-/// which binds to the installation because it authorizes a handler
-/// run rather than resolving a call the local caller is waiting on.
+/// **What replaced the binding.** This record used to carry an `expect_from`
+/// device id, and settling compared it against the admitted dispatch's owner.
+/// It no longer does, because it no longer can be wrong: this value lives in a
+/// [`SessionRpcState`], which is a field of one `PeerSessionState`. Reaching it
+/// at all requires the capability of that exact session, so an operation filed
+/// by one session is unreachable from any other — including a later session
+/// with the same peer over a freshly authenticated connector.
 ///
-/// **Identity is not the binding.** `id` names *this* entry among
-/// every entry this process ever filed; `expect_from` and `effect`
-/// say who may settle it and with what. They answer different
-/// questions and are never substituted for one another: inbound
-/// settling matches the binding and never the identity, because a
-/// frame cannot know an identity and must not have to; local
-/// withdrawal matches the identity and never the binding, because
-/// the binding names a class of operations and a caller abandoning
-/// its own send failure must reach exactly one.
+/// That last case is the substantive change, not a restatement. The device
+/// binding deliberately *admitted* it: the same canonical device returning on a
+/// replacement connector was treated as a legitimate completion of a still-
+/// pending call. Session ownership does not, and must not — the replacement is
+/// a different session, its predecessor's pending operations were resolved when
+/// that session was retired, and there is nothing left for it to settle. Prose
+/// describing the old permission survived the change and is removed here rather
+/// than softened, because a comment that says a closed path is open is worse
+/// than no comment.
+///
+/// **Identity is not ownership.** `id` names *this* entry among every entry
+/// this process ever filed, and `effect` says what class of response it takes.
+/// Inbound settling matches the class, because a frame cannot know an identity
+/// and must not have to; local withdrawal matches the identity, because a
+/// caller abandoning its own send failure must reach exactly one entry and not
+/// whichever entry currently holds the id.
 struct PendingOp {
+    /// Also the operation's funding — see [`PendingOpFunding`]. There is no
+    /// separate lease field here, deliberately: one that dropped with this
+    /// entry would defund an effect already extracted for a send.
     id: PendingOpId,
     effect: PendingEntry,
     next_stream_seq: u64,
-    _lease: crate::resource::ResourceLease,
 }
 
 impl PendingOp {
@@ -584,39 +1082,73 @@ impl PendingOp {
 ///
 /// **Not an authority, not a credential, not a generation.** There
 /// is no counter to advance and nothing ordered to compare; the
-/// marker is a zero-sized private type no other module can name or
-/// construct; and it is never serialized, sent, advertised, or
-/// derived from anything a remote supplies. No inbound path reads
-/// it. It grants nothing to anyone shown it — nobody outside this
-/// module can be. Its single job is to let the local caller that
-/// filed an entry name *that* entry again later, so a withdrawal
-/// reaches one operation instead of every operation that happens to
-/// look like it.
-///
-/// Deliberately **not** [`PartialEq`]. A derived one would compare
-/// pointees, and the pointee is zero-sized, so every identity would
-/// equal every other and a withdrawal would match any entry under
-/// the key — the exact defect this type exists to close.
-#[derive(Clone, Debug)]
-struct PendingOpId(Arc<PendingOpMarker>);
-
-/// The allocation [`PendingOpId`] is identity over. Zero-sized and
-/// private: it carries nothing, so there is nothing in it to read,
-/// compare or serialize, and nothing outside this module can name
+/// pointee is a private type no other module can name or construct;
+/// and it is never serialized, sent, advertised, or derived from
+/// anything a remote supplies. No inbound path reads it. It grants
+/// nothing to anyone shown it — nobody outside this module can be.
+/// Its single job is to let the local caller that filed an entry
+/// name *that* entry again later, so a withdrawal reaches one
+/// operation instead of every operation that happens to look like
 /// it.
+///
+/// Deliberately **not** [`PartialEq`], and the reason is unchanged by the
+/// pointee now holding a lease rather than being empty. A derived one would
+/// compare pointees, and the pointee is the operation's *funding* — two
+/// unrelated operations whose leases happened to compare equal would then name
+/// each other, and a withdrawal would remove a stranger's entry. Comparing what
+/// an identity contains is the wrong question in either shape; [`Self::names`]
+/// asks the right one, which is whether it is the same allocation.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingOpId(Arc<PendingOpFunding>);
+
+/// The allocation [`PendingOpId`] is identity over, and the operation's lease.
+///
+/// These are one thing rather than two on purpose. The identity has to be an
+/// allocation anyway — that is what makes `ptr_eq` a fact — so putting the lease
+/// inside it costs nothing and buys the property that matters: **the funding
+/// lives exactly as long as any half of the operation does.** The map's entry,
+/// the caller's [`LocalRequest`], and an effect extracted for a send in flight
+/// all hold clones, so removing the map entry no longer releases the lease
+/// while an extracted sender is still on its way to being used.
+///
+/// A separate zero-sized marker beside a lease in the `PendingOp` would leave
+/// that window open, and would pay for a second allocation to do it.
 #[derive(Debug)]
-struct PendingOpMarker;
+pub(crate) struct PendingOpFunding {
+    _lease: crate::resource::ResourceLease,
+}
 
 impl PendingOpId {
-    /// Mint a fresh identity, distinct from every other live one.
-    fn fresh() -> Self {
-        Self(Arc::new(PendingOpMarker))
+    /// Mint a fresh identity around the lease that funds its operation.
+    fn funded(lease: crate::resource::ResourceLease) -> Self {
+        Self(Arc::new(PendingOpFunding { _lease: lease }))
     }
 
     /// Whether `other` is this same identity — the same allocation,
     /// not merely a value that compares equal to it.
     fn names(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Something taken out of the pending map, with the funding that outlives the
+/// entry it came from.
+///
+/// Extraction and use are two steps: the map's guard is released, and only then
+/// does the caller send on what it extracted. Between them the entry no longer
+/// exists, so whatever paid for the effect's allocation must be held by the
+/// value in flight rather than by the map. That is what the identity clone
+/// here is for; it is never read.
+pub(crate) struct Extracted<T> {
+    value: T,
+    _funding: PendingOpId,
+}
+
+impl<T> Extracted<T> {
+    /// Take the effect and its funding apart. Bind the second half to a live
+    /// name — dropping it is what releases the operation's lease.
+    pub(crate) fn into_parts(self) -> (T, PendingOpId) {
+        (self.value, self._funding)
     }
 }
 
@@ -672,6 +1204,81 @@ pub struct RpcStream {
     _cancellation: PendingCancellation,
 }
 
+/// One settled single-shot result, with the funding for whatever it carries.
+///
+/// **Internal, and deliberately so.** [`RpcResponse`] is public and stays
+/// exactly as it is: no new field, no lost `Clone`, no broken struct literal.
+/// The lease only has to span the part of the journey core owns — from the
+/// inbound frame that produced the body to the moment [`Rpc::call`] hands it
+/// out — because at that boundary the value becomes application-owned, which is
+/// the same line [`RpcStreamChunk::into_value`] draws for a chunk.
+///
+/// What it closes: a response body is a `serde_json::Value` tree and an error is
+/// a `String`, both sized by the peer, and both used to travel through the
+/// oneshot after the decoded frame that funded them had already been released.
+/// Between the send and the caller's `await` — an interval the caller controls —
+/// they were retained by nobody.
+pub(crate) struct FundedRpcResult {
+    result: Result<RpcResponse, String>,
+    _retention: ResourceLease,
+}
+
+impl FundedRpcResult {
+    pub(crate) fn new(result: Result<RpcResponse, String>, retention: ResourceLease) -> Self {
+        Self {
+            result,
+            _retention: retention,
+        }
+    }
+
+    /// Hand the result to the application and release its funding.
+    ///
+    /// The release is the point of the boundary: past here the value is the
+    /// embedder's, held for as long as the embedder likes, and core is no longer
+    /// the party that should be charged for it.
+    pub(crate) fn into_result(self) -> Result<RpcResponse, String> {
+        self.result
+    }
+}
+
+/// What one settled single-shot result retains: the response body's tree, or
+/// the error text, and the allocations behind whichever it is.
+///
+/// Measured from the inbound frame's own fields, before anything is copied out
+/// of them, on the same contract as [`handler_task_claim_for`].
+pub(crate) fn single_response_claim(
+    body: Option<&serde_json::Value>,
+    error: Option<&str>,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let overflow = || ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    };
+    let measure = strings_measure(error)
+        .and_then(|text| match body {
+            Some(body) => checked_measure_add(text, mailbox_measure_serialized(body)?),
+            // A response with no body retains no tree. `Value::Null` is not the
+            // same thing and is measured like any other value.
+            None => Ok(text),
+        })
+        .map_err(|_| overflow())?;
+    // The payload the oneshot carries is the whole `FundedRpcResult` — the
+    // `Result` discriminant, the response or the error, and the lease travelling
+    // with them — not just the `RpcResponse` inside it.
+    let bytes = std::mem::size_of::<FundedRpcResult>()
+        .checked_add(measure.0)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(overflow)?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            u64::try_from(measure.2).map_err(|_| ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::OpaqueDependencyResidual,
+            })?,
+        ),
+    ])
+}
+
 /// One popped stream value with its off-node retention lease. The queue node
 /// is released at pop; the value remains funded until this wrapper is dropped.
 pub struct RpcStreamChunk {
@@ -703,27 +1310,33 @@ impl RpcStream {
     }
 }
 
-/// The bound pending-operation surface.
+/// The pending-operation surface.
 ///
-/// These are the only ways to reach the `pending` map, and none of
-/// them takes a request id on its own: every one additionally
-/// requires the canonical device the inbound frame was
-/// *authenticated* as, taken by the caller from the admitted
-/// dispatch's owner token.
+/// These are the only ways to reach the `pending` map, and they take a request
+/// id and a class — nothing more. They used to additionally take the canonical
+/// device the frame was authenticated as, and compare it against a device bound
+/// onto each entry, because the map was network-global and a request id alone
+/// was therefore an authority: any authenticated peer that learned another's
+/// in-flight id could settle that peer's call.
+///
+/// **That check is gone because what it defended is now structural.** This map
+/// is a field of one `PeerSessionState`, reached only through the capability of
+/// that exact promoted session, so an operation filed by one session is not
+/// merely refused to another — it is unreachable from it. There is no argument
+/// a caller could pass that would widen the set of entries these methods can
+/// see, which is a stronger statement than any comparison, and one that cannot
+/// be got wrong by a caller passing the wrong device.
 ///
 /// **Guard discipline.** The containing session record gives each operation
 /// exclusive access to the leased map. It decides and extracts there, then
-/// returns the sender to its caller. None of them sends, awaits, or invokes a
-/// callback while
-/// a guard is live — the engine performs the send after the
-/// operation has returned and the guard is gone.
+/// returns what it extracted to its caller. None of them sends, awaits, or
+/// invokes a callback while a guard is live — the engine performs the send after
+/// the operation has returned and the guard is gone.
 ///
-/// **Non-destructive refusal.** A wrong source or a wrong class is
-/// not a settle attempt that fails; it is not a settle at all. The
-/// predicate and the removal are the same exclusive step, so a
-/// refused frame performs zero action, zero removal and zero
-/// mutation, and the rightful owner's operation is left exactly as
-/// it was.
+/// **Non-destructive refusal.** A wrong class is not a settle attempt that
+/// fails; it is not a settle at all. The predicate and the removal are the same
+/// exclusive step, so a refused frame performs zero action, zero removal and
+/// zero mutation, and the operation under that id is left exactly as it was.
 impl SessionRpcState {
     /// Claim `request_id` for one locally-originated operation.
     ///
@@ -742,6 +1355,7 @@ impl SessionRpcState {
     fn claim_request_id(
         &mut self,
         request_id: String,
+        peer: &str,
         session: &crate::runtime::session_broker::SessionCapability,
         effect: PendingEntry,
     ) -> Result<LocalRequest, (PendingEntry, RpcRegistrationRefusal)> {
@@ -753,17 +1367,23 @@ impl SessionRpcState {
         if self.pending.contains_key(request_id.as_str()) {
             return Err((effect, RpcRegistrationRefusal::RequestIdCollision));
         }
-        let op_id = PendingOpId::fresh();
         // Measured, then funded, then filed. Two reservations because two things
-        // are retained and each is released by its own owner: the value's, held
-        // by the `PendingOp`, and the node's, held by the map entry.
-        let Ok(claim) = pending_operation_claim(request_id.len()) else {
+        // are retained and each is released by its own owner: the operation's,
+        // held by the identity every half of it clones, and the node's, held by
+        // the map entry.
+        // The class comes from the effect itself rather than from a caller's
+        // word for it, so what is funded is what is about to be stored.
+        let Ok(claim) = pending_operation_claim(request_id.len(), peer.len(), effect.class())
+        else {
             return Err((effect, RpcRegistrationRefusal::Unrepresentable));
         };
         let lease = match session.reserve_retained(claim) {
             Ok(lease) => lease,
             Err(e) => return Err((effect, RpcRegistrationRefusal::ResourceUnavailable(e))),
         };
+        // The identity is minted around the lease, so no state exists between
+        // "funded" and "named" in which one could be dropped without the other.
+        let op_id = PendingOpId::funded(lease);
         let Ok(node_claim) = crate::resource::LeasedMap::<String, PendingOp>::entry_claim() else {
             return Err((effect, RpcRegistrationRefusal::Unrepresentable));
         };
@@ -778,7 +1398,6 @@ impl SessionRpcState {
                     id: op_id.clone(),
                     effect,
                     next_stream_seq: 1,
-                    _lease: lease,
                 },
                 node,
             )
@@ -816,10 +1435,11 @@ impl SessionRpcState {
     /// capacity" is not.
     pub(crate) fn register_local_request(
         &mut self,
+        peer: &str,
         session: &crate::runtime::session_broker::SessionCapability,
         effect: PendingEntry,
     ) -> Result<LocalRequest, RpcRegistrationRefusal> {
-        self.claim_request_id(new_request_id(), session, effect)
+        self.claim_request_id(new_request_id(), peer, session, effect)
             .map_err(|(_effect, reason)| reason)
     }
 
@@ -830,12 +1450,11 @@ impl SessionRpcState {
     /// Used when the outbound send fails: the call will never be
     /// answered, so its entry must not linger.
     ///
-    /// The condition is the identity, not the binding. Matching the
-    /// bound device and class instead was the gap: they describe a
-    /// *class* of operations rather than one, so if this caller's
-    /// own entry had already left the map — settled by a response
-    /// that raced the failing send, say — and the id had since been
-    /// redrawn by a fresh call to the same device in the same class,
+    /// The condition is the identity, not the coordinates. Matching the peer
+    /// and class instead was the gap: they describe a *class* of operations
+    /// rather than one, so if this caller's own entry had already left the map —
+    /// settled by a response that raced the failing send, say — and this same
+    /// session had since redrawn the id for a fresh call in the same class,
     /// every coordinate the predicate looked at matched the newcomer
     /// exactly. The stale abandonment then removed a live operation,
     /// and its caller waited on a oneshot no inbound frame could
@@ -850,28 +1469,75 @@ impl SessionRpcState {
         {
             if let Some(op) = self.pending.remove(filed.request_id.as_str()) {
                 if let PendingEntry::Stream(stream) = op.effect {
-                    stream.finish(Some("RPC caller cancelled".to_string()));
+                    stream.finish_borrowed(Some("RPC caller cancelled"));
                 }
             }
         }
+    }
+
+    /// Whether an operation of `class` is pending under `request_id`, without
+    /// removing or otherwise touching it.
+    ///
+    /// Asked *before* the inbound path measures or funds a response, so a peer
+    /// sending an enormous body under a request id nobody is waiting on cannot
+    /// force this side to take a reservation for it — even a transient one that
+    /// is released a line later. The frame is refused by having nothing to
+    /// settle rather than by being unaffordable, which is both cheaper and the
+    /// truthful reason.
+    /// How many operations this session currently has pending.
+    ///
+    /// Test-only, and narrow on purpose. The F5 controls have to distinguish
+    /// "the predecessor's callers were resolved" from "the replacement's were
+    /// resolved too", and the two are only distinguishable by looking at each
+    /// session's own map. A count is the smallest thing that does that; it
+    /// exposes no effect, no identity and no way to reach an entry, so it
+    /// cannot become a settling path by accident.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether this session still holds the exact operation `filed` names.
+    ///
+    /// Identity, not the id — the same discrimination `abandon_local_request`
+    /// makes, for the same reason: a control that asked by id alone would be
+    /// satisfied by a successor that had merely reused the coordinate.
+    #[cfg(test)]
+    pub(crate) fn still_holds(&self, filed: &LocalRequest) -> bool {
+        self.pending
+            .get(filed.request_id.as_str())
+            .is_some_and(|op| op.id.names(&filed.op_id))
+    }
+
+    pub(crate) fn accepts(&self, request_id: &str, class: PendingClass) -> bool {
+        self.pending
+            .get(request_id)
+            .is_some_and(|op| op.accepts(class))
     }
 
     /// Take the single-response sender for `request_id`, but only
     /// if `from` is the bound device and the operation is a
     /// single-response one.
     ///
-    /// Removes on success — a single response settles the call.
-    /// A wrong source or a streaming operation removes nothing.
+    /// Removes on success — a single response settles the call. A wrong source
+    /// or a streaming operation removes nothing. The operation's funding leaves
+    /// with the sender rather than with the entry, so nothing is defunded while
+    /// the response is still in flight.
     pub(crate) fn take_single_response(
         &mut self,
         request_id: &str,
-    ) -> Option<oneshot::Sender<Result<RpcResponse, String>>> {
+    ) -> Option<Extracted<oneshot::Sender<FundedRpcResult>>> {
         if !self.pending.get(request_id)?.accepts(PendingClass::Single) {
             return None;
         }
         let op = self.pending.remove(request_id)?;
         match op.effect {
-            PendingEntry::Single(tx) => Some(tx),
+            // The identity leaves with the sender, so the operation stays
+            // funded across the gap between this removal and the send.
+            PendingEntry::Single(tx) => Some(Extracted {
+                value: tx,
+                _funding: op.id,
+            }),
             // Unreachable: the predicate above admitted only
             // `Single`, and the class is derived from this very
             // variant. Answering `None` rather than panicking keeps
@@ -915,10 +1581,14 @@ impl SessionRpcState {
     /// Take the stream sender for `request_id`, but only if `from`
     /// is the bound device and the operation is a streaming one.
     ///
-    /// Removes on success — an end frame closes the stream. A wrong
-    /// source or a single-response operation removes nothing, so a
-    /// foreign peer cannot cut another peer's stream short.
-    pub(crate) fn take_stream_end(&mut self, request_id: &str) -> Option<Arc<RpcStreamInbox>> {
+    /// Removes on success — an end frame closes the stream. A wrong source or a
+    /// single-response operation removes nothing, so a foreign peer cannot cut
+    /// another peer's stream short. The funding leaves with the inbox, exactly
+    /// as in [`Self::take_single_response`].
+    pub(crate) fn take_stream_end(
+        &mut self,
+        request_id: &str,
+    ) -> Option<Extracted<Arc<RpcStreamInbox>>> {
         if !self.pending.get(request_id)?.accepts(PendingClass::Stream) {
             return None;
         }
@@ -927,17 +1597,62 @@ impl SessionRpcState {
             // Unreachable for the same reason as in
             // `take_single_response`, and refused the same way.
             PendingEntry::Single(_) => None,
-            PendingEntry::Stream(tx) => Some(tx),
+            PendingEntry::Stream(tx) => Some(Extracted {
+                value: tx,
+                _funding: op.id,
+            }),
         }
     }
 }
 
 impl RpcInner {
-    fn install_handler(
+    /// Draw the next never-before-used registration identity.
+    ///
+    /// Checked rather than wrapping, and that is the whole reason this is
+    /// fallible. Exact cleanup rests on "no two registrations of one dispatcher
+    /// compare equal"; a counter that wrapped would hand out `0` a second time
+    /// and a stale handle would then remove a live successor — the precise
+    /// defect the identity exists to prevent, reappearing at the far end of the
+    /// range. Saturating is no better: every identity past the ceiling would be
+    /// equal to every other. So exhaustion refuses instead, which is a state no
+    /// process reaches — `u64` registrations at one per nanosecond is roughly
+    /// six hundred years — but is refused rather than assumed away.
+    ///
+    /// `Malformed` is the truthful refusal: the registration cannot be given a
+    /// distinct identity, so it cannot be represented. It is the one reason
+    /// this path returns it that is not about a resource claim.
+    fn mint_registration(
         &self,
+    ) -> Result<RegistrationIdentity, crate::application_gateway::GatewayRefusal> {
+        self.next_registration
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map(RegistrationIdentity)
+            .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)
+    }
+
+    /// Acquire everything a registration will need, and publish nothing.
+    ///
+    /// Every way installing a handler can fail lives here: the network is gone,
+    /// the gateway is closed, the entry is not representable, the owner will
+    /// not fund it. The handlers map is not touched on any of those paths — not
+    /// even read — so a refused registration leaves the incumbent exactly as it
+    /// was, including when the refusal is a `Single`↔`Stream` displacement that
+    /// got as far as building its replacement.
+    ///
+    /// That is a stronger guarantee than a rollback, and deliberately so. A
+    /// remove-then-restore has to re-acquire a node lease to put the incumbent
+    /// back, and that re-acquisition fails under exactly the pressure that made
+    /// the displacement fail in the first place — so the one path that must
+    /// never fail would be the one most likely to.
+    fn prepare_entry(
+        self: &Arc<Self>,
         method: &str,
         entry: HandlerEntry,
-    ) -> Result<(), crate::application_gateway::GatewayRefusal> {
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal> {
         let network = self
             .network
             .upgrade()
@@ -952,14 +1667,403 @@ impl RpcInner {
                     .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
             )
             .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
-        let mut handlers = self.handlers.lock();
-        if network.application_gateway.is_closed() {
-            return Err(crate::application_gateway::GatewayRefusal::Revoked);
+        // The cleanup handle's own lease, acquired here with everything else
+        // fallible, and carried by the handle itself rather than by the entry.
+        let handle = self
+            .handler_resources
+            .acquire(
+                cleanup_handle_claim(method)
+                    .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
+            )
+            .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
+        Ok(PreparedRegistration {
+            inner: Arc::clone(self),
+            key: method.to_string(),
+            name: Arc::from(method),
+            entry,
+            node,
+            handle,
+        })
+    }
+}
+
+/// The synchronous outcome of publishing a prepared registration.
+///
+/// A refusal deliberately remains inline: it owns the complete funded
+/// [`PreparedRegistration`] so the caller can retry or release it without an
+/// allocation on the refusal path. This dedicated, move-only wrapper states
+/// that tradeoff directly instead of inviting `Result`'s usual suggestion to
+/// box a large error after admission has already finished.
+#[must_use = "a refused commit still owns the prepared registration's funding"]
+pub struct CommitOutcome<T, E> {
+    disposition: CommitDisposition<T, E>,
+}
+
+enum CommitDisposition<T, E> {
+    Committed(T),
+    Refused(E),
+}
+
+impl<T, E> CommitOutcome<T, E> {
+    fn committed(value: T) -> Self {
+        Self {
+            disposition: CommitDisposition::Committed(value),
         }
-        handlers.remove(method);
-        handlers
-            .insert(method.to_string(), entry, node)
-            .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)
+    }
+
+    fn refused(error: E) -> Self {
+        Self {
+            disposition: CommitDisposition::Refused(error),
+        }
+    }
+
+    /// Recover the familiar two-way result once the caller is ready to handle
+    /// both ownership paths.
+    pub fn into_result(self) -> Result<T, E> {
+        match self.disposition {
+            CommitDisposition::Committed(value) => Ok(value),
+            CommitDisposition::Refused(error) => Err(error),
+        }
+    }
+}
+
+/// A registration that is fully funded and not yet published.
+///
+/// Move-only and `#[must_use]`: dropping one without committing returns every
+/// resource it holds and leaves the registry untouched, which is the correct
+/// outcome for a caller whose own half of a transaction refused.
+#[must_use = "a prepared registration publishes nothing until it is committed"]
+pub struct PreparedRegistration {
+    inner: Arc<RpcInner>,
+    /// The map's key. Consumed by `insert` on the vacant path.
+    key: String,
+    /// The cleanup handle's copy of the same name, so `commit` needs no
+    /// allocation once the key has been handed to the map.
+    name: Arc<str>,
+    entry: HandlerEntry,
+    node: ResourceLease,
+    /// The cleanup handle's own funding, separate from the entry's for the
+    /// reason [`cleanup_handle_claim`] gives: the two have different lifetimes
+    /// and different owners, and one displacing the other must not silently
+    /// defund what the survivor still holds.
+    handle: ResourceLease,
+}
+
+impl PreparedRegistration {
+    pub fn method(&self) -> &str {
+        &self.name
+    }
+
+    /// Publish this registration.
+    ///
+    /// **Acquires nothing.** Every fallible acquisition already happened in
+    /// prepare, so this cannot fail for want of a resource, and a caller's own
+    /// half refusing between the two phases leaves the incumbent untouched.
+    ///
+    /// It is nonetheless fallible, for exactly one reason: the gateway may have
+    /// closed while this was held. Nothing bounds how long a caller keeps a
+    /// prepared registration, so prepare's closed check cannot speak for the
+    /// moment of publication, and publishing a funded handler into a revoked
+    /// gateway's registry is precisely the thing the close latch exists to
+    /// prevent. The refusal returns this value intact rather than consuming it,
+    /// so nothing is lost either way — drop it and every lease is released.
+    ///
+    /// **Why the latch is airtight here**, rather than merely narrow. Gateway
+    /// close stores `closed` with `Release` *before* it takes this same
+    /// handlers mutex to clear the map. Two interleavings, no third:
+    ///
+    /// - Close locks first. Its unlock synchronizes-with the lock below, and
+    ///   the `Release` store is sequenced before that unlock, so the `Acquire`
+    ///   load below is guaranteed to observe `true`. Refused; nothing published.
+    /// - This locks first and publishes. Close then takes the map wholesale, so
+    ///   the entry just published is dropped with its funding by the close that
+    ///   followed it.
+    ///
+    /// There is no interleaving in which the load misses a store that a
+    /// completed clear implies, because the mutex handoff orders them.
+    ///
+    /// Occupied and vacant are separated because only one of them needs the
+    /// node. Replacing in place consumes no map capacity, so the node acquired
+    /// for the absent case is released; inserting does, so it is spent. The
+    /// displaced entry leaves with its own funding — releasing, never
+    /// acquiring.
+    pub fn commit(self) -> CommitOutcome<OwnedMethodRegistration, RegistrationRefused> {
+        match self
+            .commit_with(|| Ok::<(), std::convert::Infallible>(()))
+            .into_result()
+        {
+            Ok((registration, ())) => CommitOutcome::committed(registration),
+            Err(refused) => match refused.into_parts() {
+                (prepared, CommitRefusal::Revoked) => CommitOutcome::refused(RegistrationRefused {
+                    refusal: crate::application_gateway::GatewayRefusal::Revoked,
+                    prepared,
+                }),
+                // Uninhabited: the callback above is the one that cannot fail,
+                // which is exactly what makes this the ordinary commit.
+                (_, CommitRefusal::Caller(never)) => match never {},
+            },
+        }
+    }
+
+    /// Publish this registration **and** a caller's own half of the same
+    /// transaction, under one lock, all-or-nothing.
+    ///
+    /// This is [`Self::commit`] with the caller given a turn inside the critical
+    /// section. The sequence is fixed and the order is the whole design:
+    ///
+    /// 1. Take the handlers lock.
+    /// 2. Recheck the gateway. Closed → refuse; nothing is published and
+    ///    `under_lock` is **never called**.
+    /// 3. Call `under_lock`, still holding the lock. If it refuses → refuse;
+    ///    nothing is published and this value comes back intact alongside the
+    ///    caller's own error.
+    /// 4. Only now publish, which cannot fail: every acquisition happened in
+    ///    prepare, and step 3 already succeeded.
+    ///
+    /// **Why a callback rather than two commits.** A caller with tables of its
+    /// own — a daemon registry that must agree this method is claimed — cannot
+    /// get atomicity by ordering two separate commits. Commit-then-claim
+    /// publishes a handler the caller may then refuse; claim-then-commit takes a
+    /// claim the gateway may then refuse. Either way the incumbent under this
+    /// method name is already gone and the transaction is half applied. Giving
+    /// the caller its step *inside* this lock removes the interval in which that
+    /// is observable: core's close blocks on the handlers lock, the caller's own
+    /// shutdown blocks on the caller's lock, and neither side publishes anything
+    /// if either refuses.
+    ///
+    /// The incumbent survives every refusal here for the same reason it survives
+    /// a refused prepare — nothing touches the map until step 4.
+    ///
+    /// **`under_lock` runs under a lock and must behave like one.** It must not
+    /// await, block, or re-enter this dispatcher: [`Rpc::serve`],
+    /// [`Rpc::forget`], another commit, or anything else that reaches the
+    /// handlers map will deadlock, because the lock is held and is not
+    /// reentrant. Take your own lock, decide, return. It is synchronous by type
+    /// — no future is accepted — and that is deliberate rather than incidental.
+    ///
+    /// `T` comes back with the registration, so a caller can carry its own
+    /// receipt out of the critical section instead of re-deriving it afterwards.
+    pub fn commit_with<T, E>(
+        self,
+        under_lock: impl FnOnce() -> Result<T, E>,
+    ) -> CommitOutcome<(OwnedMethodRegistration, T), CommitRefused<E>> {
+        let Self {
+            inner,
+            key,
+            name,
+            entry,
+            node,
+            handle,
+        } = self;
+        let registration = entry.registration();
+        let mut handlers = inner.handlers.lock();
+        // Under the lock, so the answer cannot go stale before it is used.
+        let live = inner
+            .network
+            .upgrade()
+            .is_some_and(|network| !network.application_gateway.is_closed());
+        if !live {
+            drop(handlers);
+            return CommitOutcome::refused(CommitRefused {
+                prepared: PreparedRegistration {
+                    inner,
+                    key,
+                    name,
+                    entry,
+                    node,
+                    handle,
+                },
+                refusal: CommitRefusal::Revoked,
+            });
+        }
+        // The caller's half: before anything of ours is published, and while the
+        // lock a close would have to take is still held here.
+        let value = match under_lock() {
+            Ok(value) => value,
+            Err(error) => {
+                drop(handlers);
+                return CommitOutcome::refused(CommitRefused {
+                    prepared: PreparedRegistration {
+                        inner,
+                        key,
+                        name,
+                        entry,
+                        node,
+                        handle,
+                    },
+                    refusal: CommitRefusal::Caller(error),
+                });
+            }
+        };
+        let displaced = if handlers.contains_key(&key) {
+            let slot = handlers
+                .get_mut(&key)
+                .expect("the entry was present under this same lock a line above");
+            Some(std::mem::replace(slot, entry))
+        } else {
+            handlers
+                .insert(key, entry, node)
+                .expect("the key was absent under this lock and its node was acquired before it");
+            None
+        };
+        // Outside the registry lock: releasing a displaced handler's funding
+        // runs its `Drop`, and nothing in a resource release needs this map.
+        drop(handlers);
+        drop(displaced);
+        CommitOutcome::committed((
+            OwnedMethodRegistration {
+                inner: Arc::downgrade(&inner),
+                name,
+                registration,
+                _retention: handle,
+                detached: false,
+            },
+            value,
+        ))
+    }
+}
+
+/// Why a [`PreparedRegistration::commit_with`] published nothing.
+pub enum CommitRefusal<E> {
+    /// The gateway closed between prepare and commit. The caller's `under_lock`
+    /// was not called at all — so there is no half-applied transaction to undo,
+    /// because the caller's half never ran.
+    Revoked,
+    /// The caller's own half refused, and so this one did too.
+    Caller(E),
+}
+
+/// A refused two-sided commit, with everything it was given.
+///
+/// The prepared registration comes back rather than being dropped, so a caller
+/// that can retry may, and one that cannot drops this and releases every lease.
+/// Either way nothing was published and the incumbent is untouched.
+#[must_use = "this still holds the prepared registration's funding"]
+pub struct CommitRefused<E> {
+    prepared: PreparedRegistration,
+    refusal: CommitRefusal<E>,
+}
+
+impl<E> CommitRefused<E> {
+    pub fn refusal(&self) -> &CommitRefusal<E> {
+        &self.refusal
+    }
+
+    /// Take the prepared registration back, unpublished and still funded.
+    pub fn into_prepared(self) -> PreparedRegistration {
+        self.prepared
+    }
+
+    pub fn into_parts(self) -> (PreparedRegistration, CommitRefusal<E>) {
+        (self.prepared, self.refusal)
+    }
+}
+
+impl<E: std::fmt::Debug> std::fmt::Debug for CommitRefused<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("CommitRefused");
+        out.field("method", &self.prepared.method());
+        match &self.refusal {
+            CommitRefusal::Revoked => out.field("refusal", &"Revoked"),
+            CommitRefusal::Caller(error) => out.field("refusal", error),
+        };
+        out.finish()
+    }
+}
+
+/// A commit that found the gateway closed, with everything it was given.
+///
+/// The prepared registration is returned rather than dropped so the refusal
+/// loses nothing: a caller may inspect the reason and drop this — releasing
+/// every lease — or take the prepared value back out. It is never partially
+/// applied; a refused commit published nothing.
+#[must_use = "this still holds the prepared registration's funding"]
+pub struct RegistrationRefused {
+    refusal: crate::application_gateway::GatewayRefusal,
+    prepared: PreparedRegistration,
+}
+
+impl RegistrationRefused {
+    pub fn refusal(&self) -> &crate::application_gateway::GatewayRefusal {
+        &self.refusal
+    }
+
+    /// Take the refusal and release the registration's funding with it.
+    pub fn into_refusal(self) -> crate::application_gateway::GatewayRefusal {
+        self.refusal
+    }
+
+    /// Take the prepared registration back, unpublished and still funded.
+    pub fn into_prepared(self) -> PreparedRegistration {
+        self.prepared
+    }
+}
+
+impl std::fmt::Debug for RegistrationRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistrationRefused")
+            .field("method", &self.prepared.method())
+            .field("refusal", &self.refusal)
+            .finish()
+    }
+}
+
+/// The live registration a committed handler answers to.
+///
+/// Move-only and `#[must_use]`. Dropping it removes **exactly** the handler it
+/// installed: the stored identity is compared against whatever currently holds
+/// the name, so a cleanup that runs after the method was legitimately taken
+/// over removes nothing. Removal by name alone cannot express that, which is
+/// why the identity exists.
+#[must_use = "dropping this immediately removes the handler it registered"]
+pub struct OwnedMethodRegistration {
+    /// Weak: a registration outliving its dispatcher must not keep the
+    /// dispatcher, its handlers, or their funding alive.
+    inner: Weak<RpcInner>,
+    name: Arc<str>,
+    registration: RegistrationIdentity,
+    /// This handle's own funding, covering the `Arc<str>` above. Held here
+    /// rather than by the entry because this outlives the entry whenever a
+    /// successor displaces it, and released by this value's own `Drop` — no
+    /// drop-order relationship between two separate owners is relied on.
+    _retention: ResourceLease,
+    detached: bool,
+}
+
+impl OwnedMethodRegistration {
+    pub fn method(&self) -> &str {
+        &self.name
+    }
+
+    /// Give up the cleanup half and leave the handler installed.
+    ///
+    /// This is what [`Rpc::serve`] has always meant: register and walk away,
+    /// with removal left to [`Rpc::forget`] by name or to the gateway's close.
+    /// Named rather than implicit, because "nobody owns this handler's
+    /// removal" is a decision and not a default.
+    pub fn detach(mut self) {
+        self.detached = true;
+    }
+}
+
+impl Drop for OwnedMethodRegistration {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut handlers = inner.handlers.lock();
+        // The identity, not the name, is what authorizes the removal. A
+        // successor that legitimately took this method has a different one, and
+        // is left alone.
+        let ours = handlers
+            .get(&*self.name)
+            .is_some_and(|entry| entry.registration() == self.registration);
+        if ours {
+            handlers.remove(&*self.name);
+        }
     }
 }
 
@@ -994,6 +2098,7 @@ impl Rpc {
             network: Arc::downgrade(network),
             handlers: Mutex::new(LeasedMap::new()),
             handler_resources,
+            next_registration: std::sync::atomic::AtomicU64::new(0),
             _allocation: allocation,
         });
         let inner = network.application_gateway.install_rpc(candidate)?;
@@ -1002,6 +2107,21 @@ impl Rpc {
 
     /// Register a single-shot handler under `method`. Replaces any
     /// previous handler for the same name.
+    ///
+    /// **What this funds.** The method name, the closure's *inline* storage,
+    /// the allocation that carries them — and one residual naming, but not
+    /// containing, whatever the closure captured. `size_of::<F>()` measures the
+    /// closure struct: a handler holding an `Arc<T>` is one pointer here
+    /// however large `T` is. The residual is the honest statement that
+    /// something unmeasured is retained; it is not a bound on it. If yours
+    /// retains heap the owner should know about, state it with
+    /// [`Rpc::serve_with_retention_claim`] rather than leaving this to imply a
+    /// containment it cannot provide.
+    ///
+    /// Removal is by name, through [`Rpc::forget`] or the gateway's close.
+    /// A caller that needs to remove *its own* registration and not whichever
+    /// one currently holds the name wants [`Rpc::prepare_serve`] and the
+    /// cleanup handle its commit returns.
     pub fn serve<F, Fut>(
         &self,
         method: &str,
@@ -1011,37 +2131,122 @@ impl Rpc {
         F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
     {
-        let network = self
-            .inner
-            .network
-            .upgrade()
-            .ok_or(crate::application_gateway::GatewayRefusal::Revoked)?;
-        if network.application_gateway.is_closed() {
-            return Err(crate::application_gateway::GatewayRefusal::Revoked);
-        }
+        self.prepare_serve_funded(method, CaptureFunding::Opaque, handler)?
+            .commit()
+            .into_result()
+            .map_err(RegistrationRefused::into_refusal)?
+            .detach();
+        Ok(())
+    }
+
+    /// [`Rpc::serve`], with the closure's retained captures stated exactly.
+    ///
+    /// `captures` is everything the handler transitively owns and keeps alive
+    /// for as long as it is registered: the buffers behind its `String`s and
+    /// `Vec`s, the payloads behind its `Arc`s, and one
+    /// `OpaqueDependencyResidual` per distinct allocation among them. Do **not**
+    /// include `size_of::<F>()`, the method name, or the registration's own
+    /// allocation — those are added here, and counting them twice charges the
+    /// owner for capacity nobody holds.
+    ///
+    /// Passing [`ResourceClaim::ZERO`] is an assertion, not a shortcut: it says
+    /// this closure allocates nothing behind its inline storage. That is why it
+    /// costs *less* than [`Rpc::serve`], which cannot say that and pays a
+    /// residual for the unknown. Assert it only when it is true.
+    pub fn serve_with_retention_claim<F, Fut>(
+        &self,
+        method: &str,
+        captures: ResourceClaim,
+        handler: F,
+    ) -> Result<(), crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
+    {
+        self.prepare_serve_funded(method, CaptureFunding::Declared(captures), handler)?
+            .commit()
+            .into_result()
+            .map_err(RegistrationRefused::into_refusal)?
+            .detach();
+        Ok(())
+    }
+
+    /// Fund a single-shot registration without publishing it.
+    ///
+    /// The first half of a two-phase registration, for a caller whose own
+    /// bookkeeping can also refuse. Every *acquisition* happens here, so the
+    /// returned value's `commit` cannot fail for want of a resource; the one
+    /// thing it still checks is whether the gateway closed in the meantime,
+    /// which no earlier check can answer for it (see
+    /// [`PreparedRegistration::commit`]). So a caller may prepare, run its own
+    /// fallible half, and only then commit — and if either half refuses, it
+    /// drops this and the incumbent handler was never touched.
+    ///
+    /// Funds the closure's captures as an opaque residual, on the same terms as
+    /// [`Rpc::serve`].
+    pub fn prepare_serve<F, Fut>(
+        &self,
+        method: &str,
+        handler: F,
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
+    {
+        self.prepare_serve_funded(method, CaptureFunding::Opaque, handler)
+    }
+
+    /// [`Rpc::prepare_serve`] with the closure's retained captures stated
+    /// exactly, on the same contract as [`Rpc::serve_with_retention_claim`].
+    pub fn prepare_serve_with_retention_claim<F, Fut>(
+        &self,
+        method: &str,
+        captures: ResourceClaim,
+        handler: F,
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
+    {
+        self.prepare_serve_funded(method, CaptureFunding::Declared(captures), handler)
+    }
+
+    fn prepare_serve_funded<F, Fut>(
+        &self,
+        method: &str,
+        captures: CaptureFunding,
+        handler: F,
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RpcResponse, String>> + Send + 'static,
+    {
+        let registration = self.inner.mint_registration()?;
+        // Build the callable first: its layout is what the registration
+        // allocation will actually be, and it cannot be named any other way.
+        let call = move |call: RpcCall| -> RpcHandlerFuture { Box::pin(handler(call)) };
         let retention = self
             .inner
             .handler_resources
             .acquire(
-                handler_retention_claim::<F>(method)
+                entry_retention_claim(method, captures, funded_handler_layout(&call))
                     .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
             )
             .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
-        let h: RpcHandler = Arc::new(move |call| {
-            let fut = handler(call);
-            Box::pin(fut)
+        let handler: RpcHandler = Arc::new(FundedRpcHandler {
+            registration,
+            _retention: retention,
+            call,
         });
-        self.inner.install_handler(
-            method,
-            HandlerEntry::Single {
-                handler: h,
-                _retention: retention,
-            },
-        )
+        self.inner
+            .prepare_entry(method, HandlerEntry::Single { handler })
     }
 
     /// Register a streaming handler under `method`. Chunks map to wire chunks;
     /// `End` maps exactly to the terminal frame. Bare receiver closure is error.
+    ///
+    /// Funds the closure's captures as an opaque residual, on the same terms as
+    /// [`Rpc::serve`].
     pub fn serve_stream<F, Fut>(
         &self,
         method: &str,
@@ -1053,33 +2258,100 @@ impl Rpc {
             + Send
             + 'static,
     {
-        let network = self
-            .inner
-            .network
-            .upgrade()
-            .ok_or(crate::application_gateway::GatewayRefusal::Revoked)?;
-        if network.application_gateway.is_closed() {
-            return Err(crate::application_gateway::GatewayRefusal::Revoked);
-        }
+        self.prepare_serve_stream_funded(method, CaptureFunding::Opaque, handler)?
+            .commit()
+            .into_result()
+            .map_err(RegistrationRefused::into_refusal)?
+            .detach();
+        Ok(())
+    }
+
+    /// [`Rpc::serve_stream`], with the closure's retained captures stated
+    /// exactly, on the same contract as [`Rpc::serve_with_retention_claim`].
+    pub fn serve_stream_with_retention_claim<F, Fut>(
+        &self,
+        method: &str,
+        captures: ResourceClaim,
+        handler: F,
+    ) -> Result<(), crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
+    {
+        self.prepare_serve_stream_funded(method, CaptureFunding::Declared(captures), handler)?
+            .commit()
+            .into_result()
+            .map_err(RegistrationRefused::into_refusal)?
+            .detach();
+        Ok(())
+    }
+
+    /// Fund a streaming registration without publishing it. The streaming twin
+    /// of [`Rpc::prepare_serve`], on the same two-phase contract.
+    pub fn prepare_serve_stream<F, Fut>(
+        &self,
+        method: &str,
+        handler: F,
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
+    {
+        self.prepare_serve_stream_funded(method, CaptureFunding::Opaque, handler)
+    }
+
+    /// [`Rpc::prepare_serve_stream`] with the closure's retained captures
+    /// stated exactly.
+    pub fn prepare_serve_stream_with_retention_claim<F, Fut>(
+        &self,
+        method: &str,
+        captures: ResourceClaim,
+        handler: F,
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
+    {
+        self.prepare_serve_stream_funded(method, CaptureFunding::Declared(captures), handler)
+    }
+
+    fn prepare_serve_stream_funded<F, Fut>(
+        &self,
+        method: &str,
+        captures: CaptureFunding,
+        handler: F,
+    ) -> Result<PreparedRegistration, crate::application_gateway::GatewayRefusal>
+    where
+        F: Fn(RpcCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResourceMailboxReceiver<RpcStreamItem>, String>>
+            + Send
+            + 'static,
+    {
+        let registration = self.inner.mint_registration()?;
+        // Built first for the same reason as the single-shot twin: the layout
+        // of the anonymous callable is the allocation being funded.
+        let call = move |call: RpcCall| -> RpcStreamHandlerFuture { Box::pin(handler(call)) };
         let retention = self
             .inner
             .handler_resources
             .acquire(
-                handler_retention_claim::<F>(method)
+                entry_retention_claim(method, captures, funded_stream_handler_layout(&call))
                     .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
             )
             .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
-        let h: RpcStreamHandler = Arc::new(move |call| {
-            let fut = handler(call);
-            Box::pin(fut)
+        let handler: RpcStreamHandler = Arc::new(FundedRpcStreamHandler {
+            registration,
+            _retention: retention,
+            call,
         });
-        self.inner.install_handler(
-            method,
-            HandlerEntry::Stream {
-                handler: h,
-                _retention: retention,
-            },
-        )
+        self.inner
+            .prepare_entry(method, HandlerEntry::Stream { handler })
     }
 
     /// Drop the handler registered under `method`. Idempotent —
@@ -1121,9 +2393,14 @@ impl Rpc {
             .send_rpc_request(&network, peer, frame)
             .await
             .map_err(map_engine_err)?;
+        // The application boundary. `into_result` releases the retention core
+        // held on the peer's body or error text; from here the value is the
+        // embedder's and core is no longer the party charged for it.
         match rx.await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(msg)) => Err(RpcError::Remote(msg)),
+            Ok(funded) => match funded.into_result() {
+                Ok(resp) => Ok(resp),
+                Err(msg) => Err(RpcError::Remote(msg)),
+            },
             Err(_) => Err(RpcError::NetworkDown),
         }
     }
@@ -1185,10 +2462,12 @@ impl Rpc {
     /// An advertisement that did not take is not a slow advertisement.
     ///
     /// `Ok` means the value is stored and is what a later session will be sent.
-    /// The fan-out to peers already holding one is still a spawn, still
-    /// discarded, and still not part of this answer: it reports how many peers
-    /// were reached, which is a fact about the mesh at one instant rather than
-    /// about whether this call did its job.
+    /// The fan-out to peers already holding one is a funded command queued for
+    /// the driver, and it is deliberately not part of this answer: how many
+    /// peers were reachable at one instant is a fact about the mesh, not about
+    /// whether this call did its job. A fan-out the mailbox refuses is warned
+    /// about and does not change the answer, because the value is stored either
+    /// way and every later session is sent it.
     pub fn advertise(&self, caps: CapabilityAdvert) -> Result<(), RpcError> {
         let Some(net) = self.inner.network.upgrade() else {
             return Err(RpcError::NetworkDown);
@@ -1204,19 +2483,40 @@ impl Rpc {
                 }
             })?;
         // The stored value is what a session established later is sent, and it
-        // is in place before this returns. The fan-out to peers already holding
-        // one is a command the driver runs on its next turn; the spawn is only
-        // what keeps this call from waiting on it, and the discarded result is
-        // the number of peers reached.
-        tokio::spawn(async move {
-            if let Err(error) = net
-                .application_gateway
-                .broadcast_capabilities(&net, caps)
-                .await
-            {
-                tracing::warn!(%error, "capability fan-out was refused after local commit");
-            }
-        });
+        // is in place before this returns — which is this call's whole documented
+        // answer. The fan-out to peers already holding a session is a command the
+        // driver runs on its next turn.
+        //
+        // A command rather than a spawned task, and that is the point. A detached
+        // task was scheduled work no resource owner had funded and no shutdown
+        // could wait for: it outlived this call with a strong `Arc` to the
+        // network and its own future's allocation, both invisible to the ledger.
+        // The mailbox funds the payload, its node, and the scheduled work, and
+        // the driver's lifecycle owns the running of it.
+        //
+        // A refused admission is warned about and *not* returned, because the
+        // local commit above already succeeded and this function's answer is
+        // about that commit. Turning a fan-out refusal into an error here would
+        // tell the embedder its advertisement was not stored, which is false —
+        // and every session established afterwards is sent the stored value
+        // regardless, so the refusal costs reachable peers a push, not the
+        // advertisement.
+        if let Err(error) = net
+            .cmd_tx
+            .send(crate::engine::state::NetworkCmd::FanoutCapabilities { caps })
+        {
+            // Converted before it is logged. The send error still owns the
+            // command it refused, and it has no `Display` of its own precisely
+            // because rendering it would mean rendering that payload;
+            // `into_admission_error` drops it and answers with the typed reason
+            // alone, which is all this line has to say. The advert itself is
+            // already committed locally and is not lost by being dropped here.
+            let error = error.into_admission_error();
+            tracing::warn!(
+                %error,
+                "capability fan-out was not admitted after local commit"
+            );
+        }
         Ok(())
     }
 
@@ -1286,6 +2586,459 @@ fn map_engine_err(e: crate::error::Error) -> RpcError {
 mod tests {
     use super::*;
 
+    /// Settle a unary operation the way the inbound path does: the body funded
+    /// against the same session, and the funding travelling with it.
+    pub(super) fn settle_funded(
+        tx: oneshot::Sender<FundedRpcResult>,
+        session: &crate::runtime::session_broker::SessionCapability,
+        body: serde_json::Value,
+    ) -> bool {
+        let retention = session
+            .reserve_retained(
+                single_response_claim(Some(&body), None).expect("a small body is representable"),
+            )
+            .expect("the fixture session funds one small response body");
+        tx.send(FundedRpcResult::new(
+            Ok(RpcResponse::from_value(body)),
+            retention,
+        ))
+        .is_ok()
+    }
+
+    fn accounted_bytes(claim: crate::resource::ResourceClaim) -> u64 {
+        claim.amount(ResourceClass::AccountedMemoryBytes)
+    }
+
+    /// Removing the registry entry cannot release the charge carried by a
+    /// dispatch clone; dropping the last clone releases exactly that charge.
+    ///
+    /// The engine integration control exercises forget, replacement and
+    /// gateway close and proves the clone remains callable after each. This
+    /// supplies its accounting discriminator over the exact stored
+    /// `HandlerEntry`, production entry-retention claim and real `LeasedMap`
+    /// node. After removal, the dispatch clone is the sole possible owner of
+    /// the reservation being observed.
+    #[tokio::test]
+    async fn v4_f4_c_live_invocation_clone_retains_the_handler_entry_charge_until_drop() {
+        let (provider, grant, scope) = test_handler_scope_with_provider();
+        let baseline = provider.in_use();
+        let method = "funded-clone";
+        let call = |_call: RpcCall| -> RpcHandlerFuture {
+            Box::pin(async { Ok(RpcResponse::from_value(serde_json::json!("predecessor"))) })
+        };
+        let retention_claim = entry_retention_claim(
+            method,
+            CaptureFunding::Declared(ResourceClaim::ZERO),
+            funded_handler_layout(&call),
+        )
+        .expect("the production handler-entry claim is representable");
+        let retention_charge =
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(retention_claim)
+                .expect("the production handler-entry reservation charge is representable");
+        let retention = scope
+            .acquire(retention_claim)
+            .expect("the isolated scope funds the predecessor handler");
+        let handler: RpcHandler = Arc::new(FundedRpcHandler {
+            registration: RegistrationIdentity(7),
+            _retention: retention,
+            call,
+        });
+        let node = scope
+            .acquire(
+                LeasedMap::<String, HandlerEntry>::entry_claim()
+                    .expect("the production handler-map node is representable"),
+            )
+            .expect("the isolated scope funds the handler-map node");
+        let mut handlers = LeasedMap::new();
+        handlers
+            .insert(method.to_string(), HandlerEntry::Single { handler }, node)
+            .expect("the fresh handler name is vacant");
+
+        let clone = match handlers
+            .get(method)
+            .expect("the predecessor is installed before dispatch clones it")
+        {
+            HandlerEntry::Single { handler } => handler.clone(),
+            HandlerEntry::Stream { .. } => panic!("the predecessor is single-shot"),
+        };
+        handlers.remove(method);
+        assert_eq!(handlers.len(), 0, "the registry no longer owns the handler");
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(retention_charge)
+                .expect("the baseline and one handler charge are representable"),
+            "after removal the dispatch clone solely owns the handler-entry charge"
+        );
+
+        // Consume every unrelated unit. The seal itself needs one provider
+        // reservation record, which is left before the seal is acquired.
+        let record = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+            ResourceClaim::ZERO,
+        )
+        .expect("the provider reservation record is representable");
+        let unused = grant
+            .checked_sub(provider.in_use())
+            .expect("the provider cannot use more than its grant");
+        let seal_claim = unused
+            .checked_sub(record)
+            .expect("the isolated grant funds the seal's own record");
+        let seal = scope
+            .acquire(seal_claim)
+            .expect("all capacity unrelated to the live clone is sealed");
+        let full = provider.in_use();
+        assert_eq!(full, grant, "the seal leaves no unowned provider slack");
+        assert!(
+            matches!(
+                scope.acquire(retention_claim),
+                Err(crate::resource::ResourceUnavailable::Pressure(_))
+            ),
+            "a second identical charge meets provider pressure while the clone owns the first"
+        );
+        assert_eq!(
+            provider.in_use(),
+            full,
+            "the refused probe retains no fragment of a second handler charge"
+        );
+
+        let response = clone
+            .invoke(RpcCall {
+                from: "peer".into(),
+                request_id: "rid".into(),
+                method: method.into(),
+                payload: serde_json::Value::Null,
+                streaming: false,
+            })
+            .await
+            .expect("the funded predecessor clone remains callable");
+        assert_eq!(response.body, serde_json::json!("predecessor"));
+
+        drop(clone);
+        let after_clone = full
+            .checked_sub(retention_charge)
+            .expect("the full provider use contains the handler charge");
+        assert_eq!(
+            provider.in_use(),
+            after_clone,
+            "dropping the last clone releases exactly its production charge"
+        );
+        let probe = scope
+            .acquire(retention_claim)
+            .expect("the same charge is admitted after the last clone drops");
+        assert_eq!(
+            provider.in_use(),
+            full,
+            "the probe consumes exactly the charge the clone released"
+        );
+        drop(probe);
+        assert_eq!(provider.in_use(), after_clone);
+        drop(seal);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the control releases every handler and sealing reservation"
+        );
+    }
+
+    /// A longer name costs what the longer name actually retains — twice for
+    /// the request id, once for the peer.
+    ///
+    /// This is the arithmetic the finding was about. The claim used to take a
+    /// single `request_id_bytes` and charge it once, while a filed operation
+    /// keeps *two* buffers of it alive — the map's key and the copy the caller's
+    /// cancellation holds so it can withdraw the exact entry it filed. It also
+    /// charged nothing at all for the peer name that same cancellation copies.
+    /// So a caller could grow both without the session's owner ever seeing it.
+    ///
+    /// Stated as deltas rather than as absolute figures on purpose: an absolute
+    /// assertion would have to restate the formula, and would then pass for any
+    /// formula that restated itself the same wrong way. A delta says only that
+    /// growing an input grows the charge by the amount that input retains, which
+    /// is the property, and it stays true as other terms are added.
+    #[test]
+    fn v4_f1_a_pending_claim_covers_both_request_id_copies_and_the_peer_name() {
+        let base = pending_operation_claim(0, 0, PendingClass::Single)
+            .expect("the empty pending claim is representable");
+        let longer_id = pending_operation_claim(64, 0, PendingClass::Single)
+            .expect("a 64-byte request id is representable");
+        let longer_peer = pending_operation_claim(0, 64, PendingClass::Single)
+            .expect("a 64-byte peer name is representable");
+
+        assert_eq!(
+            accounted_bytes(longer_id) - accounted_bytes(base),
+            128,
+            "a request id is retained twice — the map's key and the cancellation's copy"
+        );
+        assert_eq!(
+            accounted_bytes(longer_peer) - accounted_bytes(base),
+            64,
+            "the peer name the cancellation copies is retained once"
+        );
+
+        // And the two string allocations are named as residuals, not only sized.
+        assert_eq!(
+            longer_id.amount(ResourceClass::OpaqueDependencyResidual)
+                - base.amount(ResourceClass::OpaqueDependencyResidual),
+            2,
+            "two request-id buffers are two allocations"
+        );
+
+        let stream = pending_operation_claim(0, 0, PendingClass::Stream)
+            .expect("the streaming pending claim is representable");
+        assert!(
+            accounted_bytes(stream) > accounted_bytes(base),
+            "a stream additionally retains its inbox allocation, whose size this \
+             module can take — unlike a oneshot's, which stays a residual"
+        );
+    }
+
+    /// One short request id per operation, every id the same width.
+    ///
+    /// The claim charges the request id *twice*, so an id one byte longer costs
+    /// two bytes more. Any control that fills a session with ids of one width
+    /// and then probes it with another is measuring the difference between the
+    /// two widths as much as the release it meant to measure — a shorter probe
+    /// can slip into capacity a longer one could not. Every key below comes from
+    /// here, so the only variable is the number of operations.
+    fn fixed_width_id(index: u32) -> String {
+        format!("id-{index:010}")
+    }
+
+    /// A request id that is deliberately longer, and nothing else different.
+    ///
+    /// The extra width is a parameter rather than a constant here because the
+    /// margin this control needs is a property of what the session has left at
+    /// the moment it probes, not of the id. It is measured at the call site;
+    /// see [`accounted_bytes_free`] and the comment where it is used.
+    fn wide_id(index: u32, extra: usize) -> String {
+        format!("{}{}", fixed_width_id(index), "x".repeat(extra))
+    }
+
+    /// How much accounted memory this session can still hand out.
+    ///
+    /// Asked of the provider by requesting something it cannot give: the answer
+    /// wanted is not a lease but the pressure report, which names the dimension
+    /// that bound and the exact numbers it bound on. The provider accounts one
+    /// flat `in_use` against one flat grant, so `capacity - in_use` in a
+    /// dimension is that dimension's free amount and not an upper bound on it.
+    fn accounted_bytes_free(session: &crate::runtime::session_broker::SessionCapability) -> u64 {
+        use crate::resource::{ResourceClaim, ResourceUnavailable};
+
+        match session.reserve_retained(ResourceClaim::single(
+            ResourceClass::AccountedMemoryBytes,
+            u64::MAX,
+        )) {
+            Ok(_) => panic!("a claim of u64::MAX accounted bytes cannot be satisfied"),
+            Err(ResourceUnavailable::Pressure(pressure)) => {
+                assert_eq!(
+                    pressure.dimension,
+                    ResourceClass::AccountedMemoryBytes,
+                    "the probe asks for one byte of every other dimension at most, \
+                     so anything but accounted memory refusing it means the session \
+                     is out of something this control is not measuring"
+                );
+                pressure.capacity.checked_sub(pressure.in_use).expect(
+                    "a provider reports no more accounted memory in use than it has \
+                     capacity for",
+                )
+            }
+            Err(other) => panic!("the probe was refused for an unusable reason: {other:?}"),
+        }
+    }
+
+    /// What one short pending operation costs this session in accounted memory.
+    ///
+    /// Both of them: `claim_request_id` takes two reservations, one for the
+    /// operation's own retention and one for the map node, and each carries the
+    /// provider's bookkeeping record. Adding them here rather than measuring
+    /// the operation alone is what makes the slack below the *whole* difference
+    /// between the free amount and one more filing.
+    fn short_operation_accounted_bytes() -> u64 {
+        use crate::resource::FiniteResourceProvider;
+
+        let operation = FiniteResourceProvider::reservation_planning_charge(
+            pending_operation_claim(
+                fixed_width_id(0).len(),
+                "peer-under-test".len(),
+                PendingClass::Single,
+            )
+            .expect("one ordinary pending operation is representable"),
+        )
+        .expect("one ordinary reservation is representable");
+        let node = FiniteResourceProvider::reservation_planning_charge(
+            crate::resource::LeasedMap::<String, PendingOp>::entry_claim()
+                .expect("one map node is representable"),
+        )
+        .expect("one node reservation is representable");
+        operation
+            .amount(ResourceClass::AccountedMemoryBytes)
+            .checked_add(node.amount(ResourceClass::AccountedMemoryBytes))
+            .expect("two fixture reservations are representable together")
+    }
+
+    /// Settling one operation frees exactly one operation's worth of capacity,
+    /// and a longer coordinate does not fit in what a shorter one released.
+    ///
+    /// Deliberately not written as "the report returns to its previous value":
+    /// there is no report to read, and a control asserting one would be
+    /// asserting about the accountant rather than about this module. What is
+    /// observable is admission, so admission is what is measured.
+    ///
+    /// Three probes after the release, in this order, and each rules out a
+    /// different failure:
+    ///
+    /// 1. **A wide id is refused.** How much wider is measured from the session
+    ///    itself, so that one copy of the extra width fits in what is left and
+    ///    two do not. If the request id were charged once instead of twice — or
+    ///    not charged at all past the map key — the wide id would fit here, and
+    ///    this is the assertion that catches that. It is the long-vs-short
+    ///    admission pair, run against the production claim through the
+    ///    production filing path rather than against the formula in isolation.
+    /// 2. **A short id is admitted.** So the release happened at all, and the
+    ///    refusal above was about the width and not about an empty session.
+    /// 3. **A second short id is refused.** So the release was *one* operation's
+    ///    worth and not more — a leak returning capacity nobody had charged
+    ///    would pass (2) on its own.
+    #[tokio::test]
+    async fn v4_f1_b_settling_one_pending_operation_releases_exactly_one_short_operation() {
+        let session =
+            crate::runtime::session_broker::session_for_test(crate::runtime::runtime_for_test());
+        let mut pending = SessionRpcState::new();
+        let peer = "peer-under-test";
+
+        let mut filed = Vec::new();
+        // Bounded so a fixture that funded everything fails as an assertion
+        // rather than as a test that never returns.
+        for index in 0..4096u32 {
+            let (tx, _rx) = oneshot::channel();
+            match pending.claim_request_id(
+                fixed_width_id(index),
+                peer,
+                &session,
+                PendingEntry::Single(tx),
+            ) {
+                Ok(request) => filed.push(request),
+                Err((_effect, _refusal)) => break,
+            }
+        }
+        assert!(
+            !filed.is_empty(),
+            "the fixture session funds at least one pending operation"
+        );
+        assert!(
+            filed.len() < 4096,
+            "the fixture session's grant is finite, so filling it must end in a refusal"
+        );
+
+        // Settle exactly one, releasing its node and its own retention.
+        let settled = filed.pop().expect("at least one was filed");
+        drop(
+            pending
+                .take_single_response(&settled.request_id)
+                .expect("the operation this control filed is still pending"),
+        );
+        drop(settled);
+
+        // (1) The wider coordinate does not fit in what a short one released.
+        //
+        // How much wider is measured here rather than fixed, and the earlier
+        // fixed width is why. The fill loop above stops at its *first* refusal,
+        // in whichever dimension binds first — which need not be accounted
+        // memory at all. When it is not, the accounted bytes left over are
+        // unrelated to one operation's size and can exceed it by any amount, so
+        // a width chosen from the operation's own cost was simply paid for out
+        // of the leftovers and admitted.
+        //
+        // So the boundary is read off the session instead. `slack` is exactly
+        // what remains after one more short filing, and the extra width is set
+        // so that the *second* copy of the id is what does not fit:
+        //
+        // - charged twice, as production charges it, the wide filing costs
+        //   `2 × extra` more than a short one, and `2 × (slack / 2 + 1) > slack`
+        //   for every `slack`, so it is refused;
+        // - charged once, which is the regression this control exists to catch,
+        //   it costs `extra` more, and `slack / 2 + 1 ≤ slack` whenever
+        //   `slack ≥ 2`, so it would be admitted and this assertion would fail.
+        //
+        // Both arms compare against the same measured numbers, so the boundary
+        // moves with the accounting rather than restating a version of it.
+        let free = accounted_bytes_free(&session);
+        let short = short_operation_accounted_bytes();
+        let slack = free.checked_sub(short).expect(
+            "settling one short operation leaves room for exactly one more, so the \
+             free accounted bytes cover one short filing",
+        );
+        assert!(
+            slack >= 2,
+            "non-vacuity: the width below discriminates one copy from two only \
+             when at least two accounted bytes separate the free amount from one \
+             short filing, and {slack} do not"
+        );
+        let extra = usize::try_from(slack / 2 + 1).expect("a fixture slack fits a usize");
+
+        let (tx, _rx) = oneshot::channel();
+        // Matched rather than `is_err`: which dimension refused is the whole
+        // claim. A refusal on residual allocations would be a different fact
+        // about a session that had run out of something else — the wide and
+        // short ids allocate identically, two id buffers and one peer buffer
+        // each, so the only dimension their costs differ in is this one.
+        let (_returned, refusal) = match pending.claim_request_id(
+            wide_id(9000, extra),
+            peer,
+            &session,
+            PendingEntry::Single(tx),
+        ) {
+            Ok(_) => panic!(
+                "one short operation's retention does not fund a longer request id — \
+                 which it would appear to if the id were charged once rather than for \
+                 both the map key and the caller's cancellation copy"
+            ),
+            Err(refused) => refused,
+        };
+        assert!(
+            matches!(
+                refusal,
+                RpcRegistrationRefusal::ResourceUnavailable(
+                    crate::resource::ResourceUnavailable::Pressure(pressure)
+                ) if pressure.dimension == ResourceClass::AccountedMemoryBytes
+            ),
+            "the wider id is refused for the accounted bytes its second copy needs"
+        );
+
+        // (2) The same-width coordinate does.
+        let (tx, _rx) = oneshot::channel();
+        // Matched rather than `expect`: the refusal hands back the
+        // `PendingEntry` it could not file, which owns the caller's oneshot, and
+        // giving that a `Debug` so a test can print one is production surface
+        // added for a test's benefit.
+        let readmitted = match pending.claim_request_id(
+            fixed_width_id(9001),
+            peer,
+            &session,
+            PendingEntry::Single(tx),
+        ) {
+            Ok(readmitted) => readmitted,
+            Err(_) => {
+                panic!("settling one short operation funds exactly one short operation")
+            }
+        };
+
+        // (3) And only one.
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            pending
+                .claim_request_id(
+                    fixed_width_id(9002),
+                    peer,
+                    &session,
+                    PendingEntry::Single(tx)
+                )
+                .is_err(),
+            "settling one operation released one operation's retention, not more"
+        );
+        drop(readmitted);
+    }
+
     /// Local insertion never displaces an existing pending owner.
     ///
     /// The unsafe shape this rules out is `pending.insert(id, ..)`,
@@ -1307,7 +3060,11 @@ mod tests {
         // The incumbent: one pending single-response call bound to A.
         let (incumbent_tx, incumbent_rx) = oneshot::channel();
         let request_id = pending
-            .register_local_request(&session, PendingEntry::Single(incumbent_tx))
+            .register_local_request(
+                "peer-under-test",
+                &session,
+                PendingEntry::Single(incumbent_tx),
+            )
             .expect("the session funds the incumbent")
             .request_id;
 
@@ -1316,6 +3073,7 @@ mod tests {
         let returned = pending
             .claim_request_id(
                 request_id.clone(),
+                "peer-under-test",
                 &session,
                 PendingEntry::Stream(Arc::clone(&challenger)),
             )
@@ -1334,14 +3092,20 @@ mod tests {
 
         // The incumbent still owns the id, under its original
         // binding and class.
-        let settle = pending
+        let (settle, _funding) = pending
             .take_single_response(&request_id)
-            .expect("the incumbent was not displaced by the collision");
-        assert!(settle
-            .send(Ok(RpcResponse::from_value(serde_json::json!("mine"))))
-            .is_ok());
-        assert!(
-            matches!(incumbent_rx.await, Ok(Ok(response)) if response.body == serde_json::json!("mine")),
+            .expect("the incumbent was not displaced by the collision")
+            .into_parts();
+        assert!(settle_funded(settle, &session, serde_json::json!("mine")));
+        // Bound rather than guarded: `into_result` consumes the funded
+        // payload, and a match guard may not move out of its binding.
+        let funded = incumbent_rx
+            .await
+            .expect("the incumbent's caller is still waiting");
+        let response = funded.into_result().expect("a body, not an error");
+        assert_eq!(
+            response.body,
+            serde_json::json!("mine"),
             "and its own caller receives its own response"
         );
         assert!(
@@ -1361,13 +3125,18 @@ mod tests {
 
         let (incumbent_tx, _incumbent_rx) = oneshot::channel();
         let request_id = pending
-            .register_local_request(&session, PendingEntry::Single(incumbent_tx))
+            .register_local_request(
+                "peer-under-test",
+                &session,
+                PendingEntry::Single(incumbent_tx),
+            )
             .expect("the session funds the incumbent")
             .request_id;
 
         let (challenger_tx, _challenger_rx) = oneshot::channel();
         let _ = pending.claim_request_id(
             request_id.clone(),
+            "peer-under-test",
             &session,
             PendingEntry::Single(challenger_tx),
         );
@@ -1451,9 +3220,12 @@ mod tests {
         // that is a live oneshot or mpsc sender, not something with
         // a `Debug` rendering to print.
         let (stale_tx, stale_rx) = oneshot::channel();
-        let Ok(stale) =
-            pending.claim_request_id(request_id.clone(), &session, PendingEntry::Single(stale_tx))
-        else {
+        let Ok(stale) = pending.claim_request_id(
+            request_id.clone(),
+            "peer-under-test",
+            &session,
+            PendingEntry::Single(stale_tx),
+        ) else {
             panic!("the id starts free");
         };
 
@@ -1472,9 +3244,12 @@ mod tests {
         // C: a fresh call redraws the same id, to the same device,
         // in the same class.
         let (fresh_tx, fresh_rx) = oneshot::channel();
-        let Ok(reinstalled) =
-            pending.claim_request_id(request_id.clone(), &session, PendingEntry::Single(fresh_tx))
-        else {
+        let Ok(reinstalled) = pending.claim_request_id(
+            request_id.clone(),
+            "peer-under-test",
+            &session,
+            PendingEntry::Single(fresh_tx),
+        ) else {
             panic!("the recycled id is free again");
         };
         assert!(
@@ -1488,14 +3263,16 @@ mod tests {
         pending.abandon_local_request(&stale);
 
         // C survives it, still bound as it was filed, and settles.
-        let settle = pending
+        let (settle, _funding) = pending
             .take_single_response(&request_id)
-            .expect("C is still pending: the stale abandonment named A's entry, not C's");
-        assert!(settle
-            .send(Ok(RpcResponse::from_value(serde_json::json!("mine"))))
-            .is_ok());
-        assert!(
-            matches!(fresh_rx.await, Ok(Ok(response)) if response.body == serde_json::json!("mine")),
+            .expect("C is still pending: the stale abandonment named A's entry, not C's")
+            .into_parts();
+        assert!(settle_funded(settle, &session, serde_json::json!("mine")));
+        let funded = fresh_rx.await.expect("C's caller is still waiting");
+        let response = funded.into_result().expect("a body, not an error");
+        assert_eq!(
+            response.body,
+            serde_json::json!("mine"),
             "and C's own caller receives C's own response"
         );
     }
@@ -1514,7 +3291,7 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         let filed = pending
-            .register_local_request(&session, PendingEntry::Single(tx))
+            .register_local_request("peer-under-test", &session, PendingEntry::Single(tx))
             .expect("the call is filed");
 
         pending.abandon_local_request(&filed);
@@ -1540,14 +3317,19 @@ mod session_ownership_tests {
         let mut pending = SessionRpcState::new();
         let (tx, rx) = oneshot::channel();
         let filed = pending
-            .register_local_request(&session, PendingEntry::Single(tx))
+            .register_local_request("peer-under-test", &session, PendingEntry::Single(tx))
             .expect("the session funds one pending unary");
-        pending
+        let (settle, _funding) = pending
             .take_single_response(&filed.request_id)
             .expect("the exact session owns the response")
-            .send(Ok(RpcResponse::from_value(serde_json::json!(7))))
-            .expect("caller is live");
-        assert!(matches!(rx.await, Ok(Ok(response)) if response.body == serde_json::json!(7)));
+            .into_parts();
+        assert!(
+            super::tests::settle_funded(settle, &session, serde_json::json!(7)),
+            "the caller is still live to receive it"
+        );
+        let funded = rx.await.expect("the caller is still waiting");
+        let response = funded.into_result().expect("a body, not an error");
+        assert_eq!(response.body, serde_json::json!(7));
     }
 
     #[tokio::test]
@@ -1556,7 +3338,7 @@ mod session_ownership_tests {
         let (tx, rx) = oneshot::channel();
         let mut pending = SessionRpcState::new();
         pending
-            .register_local_request(&session, PendingEntry::Single(tx))
+            .register_local_request("peer-under-test", &session, PendingEntry::Single(tx))
             .expect("the session funds one pending unary");
         drop(pending);
         assert!(rx.await.is_err(), "retirement drops the exact sender");
@@ -1568,7 +3350,7 @@ mod session_ownership_tests {
         let (tx, rx) = oneshot::channel();
         let mut pending = SessionRpcState::new();
         let filed = pending
-            .register_local_request(&session, PendingEntry::Single(tx))
+            .register_local_request("peer-under-test", &session, PendingEntry::Single(tx))
             .expect("the session funds one pending unary");
         let request_id = filed.request_id.clone();
         pending.abandon_local_request(&filed);
@@ -1582,7 +3364,11 @@ mod session_ownership_tests {
         let inbox = Arc::new(RpcStreamInbox::new());
         let mut pending = SessionRpcState::new();
         let filed = pending
-            .register_local_request(&session, PendingEntry::Stream(Arc::clone(&inbox)))
+            .register_local_request(
+                "peer-under-test",
+                &session,
+                PendingEntry::Stream(Arc::clone(&inbox)),
+            )
             .expect("the session funds one pending stream");
         let first = pending
             .stream_chunk_sender(&filed.request_id, 1)
@@ -1604,7 +3390,7 @@ mod session_ownership_tests {
         let terminal = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             inbox.recv_with_before_wait(move || {
-                finisher.finish(Some("terminal in the wait window".to_string()));
+                finisher.finish_borrowed(Some("terminal in the wait window"));
             }),
         )
         .await

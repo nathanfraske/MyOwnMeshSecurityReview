@@ -11,10 +11,12 @@
 //!      session exists, so a blob here would be attacker-controlled
 //!      application metadata arriving ahead of the boundary that
 //!      admits application payload. See [`handshake::HelloMessage`].
-//!   2. `auth_response` — each side returns the other's nonce signed
-//!      with its own private key. Receiving a valid signature
-//!      authenticates that the sender owns the keypair matching its
-//!      claimed Device ID.
+//!   2. `auth_response` — each side returns its proof over the one
+//!      domain-separated endpoint-auth transcript. That transcript binds the
+//!      mesh context and profile, signer role, both Device IDs, both fresh
+//!      contributions, and both certificate fingerprints. Receiving a valid
+//!      proof authenticates the peer's key while binding it to this exact
+//!      endpoint-auth context; a nonce-only signature is not accepted.
 //!
 //! After mutual auth verification, the receiver side either
 //! auto-accepts (peer is in the roster) or queues the request for

@@ -271,34 +271,77 @@ pub(super) async fn on_channel_seq_admitted(
     // Gateway acceptance is a resource-backed fan-out: it never blocks on a
     // subscriber and never re-enters the registry, so it is safe under the
     // mutation lock.
-    let Some(outcome) = dispatch.with_captured_session_state(&state.peers, |session, record| {
-        record.try_receive(stream, seq, payload, |payload| {
-            state
-                .application_gateway
-                .accept_channel(
-                    session,
-                    claim,
-                    retention,
-                    &channel,
-                    owner.device_id(),
-                    payload,
-                )
-                .map(|_accepted| ())
+    let Some((outcome, witness)) =
+        dispatch.with_captured_session_state(&state.peers, |session, record| {
+            // Taken here, inside the capture, so a refusal below names the session
+            // that actually refused rather than whichever one holds the device id
+            // by the time the retirement runs.
+            let witness = session.validity_witness();
+            let outcome = record.try_receive(stream, seq, payload, |payload| {
+                state
+                    .application_gateway
+                    .accept_channel(
+                        session,
+                        claim,
+                        retention,
+                        &channel,
+                        owner.device_id(),
+                        payload,
+                    )
+                    .map(|_accepted| ())
+            });
+            (outcome, witness)
         })
-    }) else {
+    else {
         // Superseded installation, or one holding no live session: the frame
         // moved nothing and reached nobody, so there is nothing to acknowledge
         // either. Acknowledging here would tell the sender a payload had been
         // received that no subscriber ever saw.
         return;
     };
-    let Ok(outcome) = outcome else {
-        trace!(
-            peer = %super::short_peer(owner.device_id()),
-            channel,
-            "reliable frame refused by Application Gateway"
-        );
-        return;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            // The same two refusals that end a session on the unreliable path,
+            // for the same reason: they are facts about this session that will
+            // hold for the next frame too. `NoReceiver` is not one of them —
+            // nobody having subscribed yet is an ordinary state of a healthy
+            // session. Nothing is acknowledged on any of these arms, so a
+            // refused frame is never reported to the sender as received.
+            let terminal = match refusal {
+                crate::application_gateway::GatewayRefusal::Pressure(_) => {
+                    Some("would not fund the reliable frame it delivered")
+                }
+                crate::application_gateway::GatewayRefusal::Malformed => {
+                    Some("delivered a reliable frame that is not representable")
+                }
+                _ => None,
+            };
+            // Reached only on the arms that are about to retire, and only after
+            // the witness above has named the session they will retire: this is
+            // the window in which a control can promote a replacement and prove
+            // the identity check refuses to end it. Nothing in a production
+            // build.
+            if terminal.is_some() {
+                state.reach_exact_retirement_barrier();
+            }
+            match terminal {
+                Some(reason) if state.peers.retire_exact_session(owner, &witness) => {
+                    trace!(
+                        peer = %super::short_peer(owner.device_id()),
+                        channel,
+                        %reason,
+                        "retiring a session whose reliable frame could not be admitted"
+                    );
+                }
+                _ => trace!(
+                    peer = %super::short_peer(owner.device_id()),
+                    channel,
+                    "reliable frame refused by Application Gateway"
+                ),
+            }
+            return;
+        }
     };
     let Some(ack_up_to) = outcome.acknowledge() else {
         // A stream this session is not bound to. Answering would put a mark on

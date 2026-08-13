@@ -123,20 +123,45 @@ impl ApplicationGateway {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(GatewayRefusal::Revoked);
         }
-        if channels.get(name).is_none() {
-            let name_claim = GatewayMailbox::<()>::retention_claim(name.len(), 1)
-                .map_err(|_| GatewayRefusal::Malformed)?;
-            let name_lease = self
-                .resources
-                .acquire(name_claim)
-                .map_err(GatewayRefusal::Pressure)?;
-            let node = self
-                .resources
-                .acquire(
-                    LeasedMap::<String, GatewayChannel>::entry_claim()
-                        .map_err(|_| GatewayRefusal::Malformed)?,
-                )
-                .map_err(GatewayRefusal::Pressure)?;
+        // Everything this subscription needs is acquired before any of it is
+        // written, and the writes below cannot fail.
+        //
+        // The previous order inserted the channel entry first and only then
+        // acquired the subscriber's queue node. A refusal at that second
+        // acquisition left the channel installed with an empty subscriber
+        // queue — a route the caller was told it did not get, holding a name
+        // lease and a map node, removed by nothing, because the only thing that
+        // removes an empty channel is the last subscriber leaving and there had
+        // never been a first one.
+        let subscriber_node = self
+            .resources
+            .acquire(
+                LeasedQueue::<std::sync::Weak<ChannelSubscriber>>::entry_claim()
+                    .map_err(|_| GatewayRefusal::Malformed)?,
+            )
+            .map_err(GatewayRefusal::Pressure)?;
+        let fresh_channel = match channels.get(name) {
+            Some(_) => None,
+            None => {
+                let name_claim = GatewayMailbox::<()>::retention_claim(name.len(), name.len(), 1)
+                    .map_err(|_| GatewayRefusal::Malformed)?;
+                let name_lease = self
+                    .resources
+                    .acquire(name_claim)
+                    .map_err(GatewayRefusal::Pressure)?;
+                let node = self
+                    .resources
+                    .acquire(
+                        LeasedMap::<String, GatewayChannel>::entry_claim()
+                            .map_err(|_| GatewayRefusal::Malformed)?,
+                    )
+                    .map_err(GatewayRefusal::Pressure)?;
+                Some((name_lease, node))
+            }
+        };
+        // Past every refusal. A return between here and the end of the function
+        // would be the defect this ordering removes.
+        if let Some((name_lease, node)) = fresh_channel {
             channels
                 .insert(
                     name.to_string(),
@@ -146,15 +171,8 @@ impl ApplicationGateway {
                     },
                     node,
                 )
-                .map_err(|_| GatewayRefusal::Malformed)?;
+                .expect("absence was established under this same acquisition");
         }
-        let subscriber_node = self
-            .resources
-            .acquire(
-                LeasedQueue::<std::sync::Weak<ChannelSubscriber>>::entry_claim()
-                    .map_err(|_| GatewayRefusal::Malformed)?,
-            )
-            .map_err(GatewayRefusal::Pressure)?;
         channels
             .get_mut(name)
             .expect("the channel entry was installed under this lock")
@@ -253,6 +271,7 @@ impl ApplicationGateway {
             .map_err(|_| GatewayRefusal::Malformed)?;
         let from_claim = GatewayMailbox::<GatewayChannelFrame>::retention_claim(
             from.len(),
+            from.len(),
             usize::from(!from.is_empty()),
         )
         .map_err(|_| GatewayRefusal::Malformed)?;
@@ -303,6 +322,17 @@ impl ApplicationGateway {
         Ok(GatewayAccepted)
     }
 
+    /// How many channel records exist.
+    ///
+    /// Controls only, and distinct from the subscriber count on purpose: an
+    /// empty channel record and an absent one are the same to
+    /// [`Self::channel_subscriber_count_for_test`], and the difference between
+    /// them is exactly the residue an all-or-nothing subscribe must not leave.
+    #[cfg(test)]
+    pub(crate) fn channel_count_for_test(&self) -> usize {
+        self.channels.lock().len()
+    }
+
     #[cfg(test)]
     pub(crate) fn channel_subscriber_count_for_test(&self, name: &str) -> usize {
         self.channels
@@ -316,7 +346,9 @@ impl ApplicationGateway {
 mod tests {
     use super::*;
 
-    fn subscriber_fixture() -> (ApplicationGateway, std::sync::Arc<ChannelSubscriber>) {
+    /// A gateway over a provider the control keeps, so it can read the ledger
+    /// this crate charges against rather than inferring pressure from behaviour.
+    fn gateway_fixture() -> (crate::resource::FiniteResourceProvider, ApplicationGateway) {
         let grant = ResourceClaim::try_from_entries(
             ResourceClass::ALL
                 .into_iter()
@@ -324,7 +356,7 @@ mod tests {
         )
         .expect("the broad control grant is representable");
         let provider = crate::resource::FiniteResourceProvider::new(grant);
-        let port = crate::resource::ResourceProviderPort::new(provider)
+        let port = crate::resource::ResourceProviderPort::new(provider.clone())
             .expect("the control grant funds its process scope");
         let process = crate::resource::ProcessResourceRoot::isolated();
         process
@@ -333,11 +365,126 @@ mod tests {
         let resources = process
             .issue_local_application_scope()
             .expect("the control issues a local-application scope");
-        let gateway = ApplicationGateway::new(resources);
+        (provider, ApplicationGateway::new(resources))
+    }
+
+    fn subscriber_fixture() -> (ApplicationGateway, std::sync::Arc<ChannelSubscriber>) {
+        let (_provider, gateway) = gateway_fixture();
         let subscriber = gateway
             .subscribe_channel("wake-control")
             .expect("the control funds one subscriber");
         (gateway, subscriber)
+    }
+
+    /// What a subscription is supposed to leave behind when it succeeds.
+    ///
+    /// The companion to the refusal control below, and not a formality: an
+    /// assertion that a refusal leaves nothing proves nothing on its own if a
+    /// success also leaves nothing, because then the control would pass against
+    /// a `subscribe_channel` that had stopped working entirely.
+    #[test]
+    fn v4_f2_core_a_subscribe_installs_exactly_one_channel_and_one_subscriber() {
+        let (provider, gateway) = gateway_fixture();
+        let baseline = provider.in_use();
+
+        let first = gateway
+            .subscribe_channel("alpha")
+            .expect("the control grant funds one subscription");
+
+        assert_eq!(gateway.channel_count_for_test(), 1);
+        assert_eq!(gateway.channel_subscriber_count_for_test("alpha"), 1);
+        assert_ne!(
+            provider.in_use(),
+            baseline,
+            "a live subscription is charged for"
+        );
+
+        // A second subscriber joins the channel that already exists, so exactly
+        // one more subscriber and no second channel record.
+        let second = gateway
+            .subscribe_channel("alpha")
+            .expect("the control grant funds a second subscription");
+        assert_eq!(gateway.channel_count_for_test(), 1);
+        assert_eq!(gateway.channel_subscriber_count_for_test("alpha"), 2);
+
+        gateway.unsubscribe_channel("alpha", &first);
+        gateway.unsubscribe_channel("alpha", &second);
+        drop((first, second));
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "and everything it was charged for comes back when it leaves"
+        );
+    }
+
+    /// A subscription refused part-way through leaves the gateway exactly as it
+    /// found it.
+    ///
+    /// The defect this control exists for was an ordering, not a leak: the
+    /// channel record was inserted first and the subscriber's queue node was
+    /// acquired second. A refusal at that second acquisition left a channel
+    /// installed with an empty subscriber queue — holding a name lease and a map
+    /// node, reported to the caller as a failure, and removed by nothing,
+    /// because the only thing that retires an empty channel is its last
+    /// subscriber leaving and there had never been a first one.
+    ///
+    /// The refusal is forced at the *name lease*, which is the third of the four
+    /// acquisitions and the only one that touches `QueuedBytes`. That choice is
+    /// what makes this control discriminating rather than merely negative: the
+    /// subscriber allocation and the subscriber's queue node have both already
+    /// been acquired when it fires, so a path that installed anything before its
+    /// last acquisition — or that failed to release the two it already held —
+    /// shows up as a ledger that does not return to the baseline.
+    #[test]
+    fn v4_f2_core_a_refused_subscribe_leaves_no_channel_no_subscriber_and_no_lease() {
+        let (provider, gateway) = gateway_fixture();
+        let held = gateway
+            .subscribe_channel("alpha")
+            .expect("the control grant funds one subscription");
+        // The baseline is taken with a live subscription in place, so the
+        // assertion below is "nothing changed", not "nothing exists" — a
+        // gateway that tore down the wrong channel fails it too.
+        let baseline = provider.in_use();
+
+        provider.script_pressure(ResourceClass::QueuedBytes);
+        let refusal = gateway.subscribe_channel("beta");
+        assert!(
+            matches!(refusal, Err(GatewayRefusal::Pressure(_))),
+            "the scripted shortage is reported as pressure, not swallowed"
+        );
+
+        assert_eq!(
+            gateway.channel_count_for_test(),
+            1,
+            "no channel record survives a refused subscription"
+        );
+        assert_eq!(
+            gateway.channel_subscriber_count_for_test("beta"),
+            0,
+            "and no subscriber is queued against the name that was refused"
+        );
+        assert_eq!(
+            gateway.channel_subscriber_count_for_test("alpha"),
+            1,
+            "the subscription that already existed is untouched"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "and the two acquisitions the refusal ran past are released exactly"
+        );
+
+        // The scripted shortage was consumed by that one refusal, so the same
+        // subscription now succeeds. Nothing the failed attempt left behind is
+        // in the way of it — which is the other half of all-or-nothing, and the
+        // half a control that only asserts emptiness would miss.
+        let beta = gateway
+            .subscribe_channel("beta")
+            .expect("the retry is admitted once the shortage passes");
+        assert_eq!(gateway.channel_count_for_test(), 2);
+        assert_eq!(gateway.channel_subscriber_count_for_test("beta"), 1);
+        gateway.unsubscribe_channel("beta", &beta);
+        drop((beta, held));
     }
 
     #[tokio::test]

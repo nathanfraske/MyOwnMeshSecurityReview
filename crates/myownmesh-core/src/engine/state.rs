@@ -223,10 +223,20 @@ pub enum NetworkCmd {
         reply: oneshot::Sender<Result<()>>,
     },
     /// Push a new capabilities advert to every active peer.
-    BroadcastCapabilities {
-        caps: CapabilityAdvert,
-        reply: oneshot::Sender<usize>,
-    },
+    ///
+    /// Fire-and-forget, and deliberately so: it replaced a variant that carried
+    /// a `oneshot::Sender<usize>` for the caller to wait on. A oneshot nobody
+    /// reads is still an allocation the command retains and the mailbox funds,
+    /// and `Rpc::advertise`'s documented answer is its local commit rather than
+    /// how many peers the push reached — so the reply channel was charged for on
+    /// every advertisement and read on none.
+    ///
+    /// Fire-and-forget, but not unaccounted: the resource mailbox funds the
+    /// payload, its node, and the scheduled work, and the driver's own lifecycle
+    /// owns the running of it. That is the difference between this and the
+    /// detached task it replaces, which was scheduled work no owner had funded
+    /// and no shutdown could wait for.
+    FanoutCapabilities { caps: CapabilityAdvert },
     // ---- governance (closed networks) ----
     /// Float a new signed transition. The engine signs with the
     /// local identity, persists the proposal to the governance
@@ -331,7 +341,7 @@ impl ResourceMailboxItem for NetworkCmd {
                 strings_measure([peer.as_str()])?,
                 mailbox_measure_serialized(request)?,
             )?,
-            Self::BroadcastCapabilities { caps, .. } => mailbox_measure_serialized(caps)?,
+            Self::FanoutCapabilities { caps } => mailbox_measure_serialized(caps)?,
             Self::ProposeTransition {
                 variant, mfa_code, ..
             } => checked_measure_add(
@@ -354,7 +364,9 @@ impl ResourceMailboxItem for NetworkCmd {
         // sockets or handles. The payload walk above counts its own allocations;
         // this adds only allocations retained by reply/cancellation effects.
         let effect_allocations = match self {
-            Self::ReplayCapabilities { .. } => 0,
+            // No reply, no cancellation, no channel: nothing to fund past the
+            // payload the walk above already measured.
+            Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
             Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
             Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
             Self::ApproveRoster { .. }
@@ -363,7 +375,6 @@ impl ResourceMailboxItem for NetworkCmd {
             | Self::SendChannelFrame { .. }
             | Self::BroadcastChannelFrame { .. }
             | Self::SendRpcRequest { .. }
-            | Self::BroadcastCapabilities { .. }
             | Self::ProposeTransition { .. }
             | Self::SignProposal { .. }
             | Self::DenyProposal { .. }
@@ -654,6 +665,34 @@ pub struct NetworkState {
     #[cfg(test)]
     pub(crate) channel_ack_attempts: std::sync::atomic::AtomicU64,
 
+    /// Controls only: one action to run at the instant every exact-session
+    /// retirement site has captured its `(owner, witness)` and has not yet
+    /// retired anything.
+    ///
+    /// It exists for one property, which cannot be observed from outside the
+    /// engine at all: that retirement names the session that failed rather than
+    /// whichever session holds the device id when it runs. Driving a refusal and
+    /// then replacing the session afterwards does not test that — a retirement
+    /// keyed by device id passes it too. The replacement has to land *inside*
+    /// the window, and this is the only point at which a control can put it
+    /// there without a race of its own.
+    ///
+    /// One shot: it is taken before it is run, so a staged action fires for the
+    /// first refusal that reaches a barrier and never for a later one. A control
+    /// that stages it and observes it did not fire has learned that its refusal
+    /// never reached the retirement it was aimed at, which is worth as much as
+    /// the positive observation.
+    ///
+    /// Constraints on what may be staged, both of which every use below honours:
+    /// it runs on the engine's own thread with no registry lock held, so it may
+    /// promote or file state through the ordinary registry entry points; and it
+    /// may not await, because these sites are not all async.
+    ///
+    /// Test observation and staging only. Nothing admits, accounts, retains or
+    /// refuses on it, and it does not exist in a production build.
+    #[cfg(test)]
+    pub(crate) exact_retirement_barrier: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+
     /// Force-reconnect handle for the signaling driver, stashed by
     /// [`crate::engine::signaling_bridge::attach_nostr`] once the
     /// Nostr driver is up. Bumping the generation makes every relay
@@ -868,6 +907,8 @@ impl NetworkState {
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
             #[cfg(test)]
             channel_ack_attempts: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            exact_retirement_barrier: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
@@ -892,6 +933,46 @@ impl NetworkState {
 
     pub(crate) fn local_application_resource_scope(&self) -> Result<LocalApplicationResourceScope> {
         Ok(self.local_resources.child()?)
+    }
+
+    /// Reached by every exact-session retirement site, after it has captured the
+    /// owner and witness it will retire under and before it retires anything.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist. Under test it runs whatever a control staged with
+    /// [`stage_exact_retirement_barrier`](Self::stage_exact_retirement_barrier),
+    /// once, and never re-enters: the action is taken out from under the lock
+    /// before it is called, so an action that itself reached a retirement site
+    /// would find the barrier already empty rather than recurse.
+    pub(crate) fn reach_exact_retirement_barrier(&self) {
+        #[cfg(test)]
+        {
+            let staged = self.exact_retirement_barrier.lock().take();
+            if let Some(staged) = staged {
+                staged();
+            }
+        }
+    }
+
+    /// Stage the one action the next retirement site will run in its capture →
+    /// retire window. See [`exact_retirement_barrier`](Self::exact_retirement_barrier).
+    #[cfg(test)]
+    pub(crate) fn stage_exact_retirement_barrier(&self, staged: impl FnOnce() + Send + 'static) {
+        let displaced = self
+            .exact_retirement_barrier
+            .lock()
+            .replace(Box::new(staged));
+        assert!(
+            displaced.is_none(),
+            "a control staged a second retirement barrier over one that never fired"
+        );
+    }
+
+    /// Whether the staged action is still waiting, i.e. no retirement site has
+    /// been reached since it was staged.
+    #[cfg(test)]
+    pub(crate) fn exact_retirement_barrier_pending(&self) -> bool {
+        self.exact_retirement_barrier.lock().is_some()
     }
 
     /// Read observations for this live joined network instance.

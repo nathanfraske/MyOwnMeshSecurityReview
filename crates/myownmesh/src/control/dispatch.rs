@@ -265,7 +265,12 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             // flow — the second finds nothing — and a client cannot send on a
             // flow it has asked to close, because there is no longer an entry
             // for its pipe to borrow.
-            let Some((network, flow)) = owner.take_realtime_flow(&flow_capability) else {
+            // `_flow_funding` is bound, not discarded. It pays for `network`
+            // below, which is read past the lookup, past the await, and into
+            // the response — so it has to outlive all of them and is dropped at
+            // the end of this arm with the string it funds.
+            let Some((network, flow, _flow_funding)) = owner.take_realtime_flow(&flow_capability)
+            else {
                 return Response::err(
                     "unknown flow_capability: it was never issued to this client, or the \
                      flow it named has already been closed",
@@ -541,24 +546,39 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
                 crate::ipc::clients::HandlerMode::Single
             };
             let key = (network.clone(), method.clone());
-            // Installed before the claim is recorded, and the order is
-            // deliberate. If the install is refused, nothing has been claimed
-            // and the client is told why. If it succeeds and the claim is then
-            // refused, what is left behind is a handler owned by nobody, which
-            // answers "no claim" truthfully and is removed by the next
-            // successful claim-and-release cycle. The reverse order leaves a
-            // recorded claim with no handler under it, which is a client told it
-            // is serving a method that can never reach it.
-            if let Err(refusal) = crate::ipc::bridge::install_handler_for_mode(
-                &net,
-                network.clone(),
-                method.clone(),
+            // One transaction, not two steps. The generation is minted first
+            // because the handler closure captures it; the closure is then
+            // funded without being published; and the daemon's claim runs inside
+            // core's commit, under core's handlers lock, so the handler and the
+            // claim appear together or neither does.
+            //
+            // Neither ordering of two separate steps is correct, which is why
+            // this is not one. Installing first and claiming second leaves a
+            // handler owned by nobody when the claim is refused; claiming first
+            // and installing second leaves a client told it serves a method no
+            // handler can reach. Both were observable, and both took the
+            // incumbent's method away to get there.
+            let generation = match state.clients.next_handler_generation() {
+                Ok(generation) => generation,
+                Err(refusal) => return Response::err(format!("rpc register refused: {refusal}")),
+            };
+            let prepared = match crate::ipc::bridge::prepare_handler_for_mode(
+                &net.rpc(),
+                key.clone(),
+                generation,
                 mode,
-                state.clients.clone(),
+                &state.clients,
             ) {
-                return Response::err(format!("rpc register refused: {refusal}"));
-            }
-            let prev = match state.clients.claim_method(key.clone(), client_id, mode) {
+                Ok(prepared) => prepared,
+                Err(refusal) => return Response::err(format!("rpc register refused: {refusal}")),
+            };
+            let prev = match state.clients.claim_method_committing(
+                key.clone(),
+                client_id,
+                mode,
+                generation,
+                prepared,
+            ) {
                 Ok(prev) => prev,
                 Err(refusal) => return Response::err(format!("rpc register refused: {refusal}")),
             };
@@ -589,20 +609,20 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             }
             let key = (network, method);
             let release = state.clients.release_method(&key, client_id);
-            // The last claim on a method leaves its synthetic handler serving
-            // nobody while still holding the retention the engine funded for it.
-            // Forgetting it needs the network, which is why the registry answers
-            // the question rather than acting on it.
+            let released = release.released;
+            // Dropping the release is what forgets the handler: it carries the
+            // core registration out of the registry, and releasing that removes
+            // exactly the handler this claim installed -- not a successor's that
+            // happens to answer to the same name. Explicit rather than implicit
+            // because it is the operation, not a side effect of the value going
+            // out of scope, and because it must happen here, where no registry
+            // lock is held.
             //
-            // An unknown network does not make the release untrue — the claim is
-            // gone either way — so it is not reported as a failure. There is
-            // simply no dispatcher left to forget anything from.
-            if release.forget {
-                if let Some(net) = state.registry.get(&key.0) {
-                    crate::ipc::bridge::forget_handler(&net, &key.1);
-                }
-            }
-            Response::ok(serde_json::json!({ "released": release.released }))
+            // No network lookup: the registration knows its own dispatcher, so
+            // a release no longer depends on this daemon still having the
+            // network in its map.
+            drop(release);
+            Response::ok(serde_json::json!({ "released": released }))
         }
 
         // ---- inbound-RPC responses (from IPC handler back to daemon)
@@ -751,7 +771,15 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             // open on the peer with nothing on this side reading it — the peer
             // would keep producing into a queue that never empties. Refusing
             // first means the only thing that did not happen is the call.
-            let task = match state.clients.lease_task() {
+            //
+            // The claim covers the task *and* the copy of `request_id` the task
+            // keeps: the id is re-sent on every chunk and on the terminal frame,
+            // so the clone below lives exactly as long as the task does. A bare
+            // task claim would have called that string free, and its length is
+            // not fixed — it is a decimal counter that grows with the number of
+            // streams this daemon has opened, so it is charged rather than
+            // waved through as small.
+            let task = match state.clients.lease_task_retaining(request_id.len()) {
                 Ok(task) => task,
                 Err(refusal) => {
                     return Response::err(format!("rpc call stream refused: {refusal}"))
@@ -763,6 +791,7 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             };
             let writer_tx = client.writer_tx.clone();
             let stream_owner = client.clone();
+            // Past the admission above, so the bytes are funded before they exist.
             let req_id_for_task = request_id.clone();
             tokio::spawn(async move {
                 // Moved in, so the lease is released exactly when this task
@@ -842,28 +871,67 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
             // client's own record of holding it. A refusal is answered here
             // rather than absorbed, because a client told it is subscribed when
             // nothing was recorded waits for frames that will never come.
-            let first = match state.clients.subscribe_channel(key.clone(), client_id) {
-                Ok(first) => first,
+            // Membership is recorded first and the role comes back with it, so
+            // this client is a member of the route whatever happens next. What
+            // it must not do is *tell its client* it is subscribed before the
+            // route can deliver.
+            let join = match state.clients.subscribe_channel(key.clone(), client_id) {
+                Ok(join) => join,
                 Err(refusal) => {
                     return Response::err(format!("channel subscribe refused: {refusal}"))
                 }
             };
-            if first {
-                // The gateway subscription behind this pump is a resource
-                // admission and may be refused, or the network may already be
-                // closed. Either way there is no pump, so the registry entry
-                // just recorded would be a subscription this daemon does not
-                // hold: the client would be told it is subscribed and then
-                // never receive a frame. Undo it and report the refusal.
-                if let Err(error) = crate::ipc::bridge::spawn_channel_pump(
-                    &net,
-                    network,
-                    channel,
-                    state.clients.clone(),
-                ) {
-                    state.clients.unsubscribe_channel(&key, client_id);
-                    return Response::err(format!("channel subscribe refused: {error}"));
+            match join {
+                crate::ipc::ChannelJoin::Install(ready) => {
+                    // The gateway subscription behind this pump is a resource
+                    // admission and may be refused, or the network may already
+                    // be closed. Either way there is no pump, and the route --
+                    // including every follower that joined while this ran -- is
+                    // torn down by `finish_channel_install` rather than only
+                    // this client's own membership. Answering the refusal to
+                    // the followers is `finish_channel_install`'s job; this
+                    // caller answers its own.
+                    let pump = crate::ipc::bridge::spawn_channel_pump(
+                        &net,
+                        network,
+                        channel,
+                        state.clients.clone(),
+                    );
+                    // `ready` and not just `key`: the route this installer was
+                    // handed can be removed and recreated under the same name
+                    // while the spawn above runs, and only the readiness
+                    // identifies which generation this result belongs to. A
+                    // finish that lands on a successor hands back whatever it
+                    // built, and that has to be retired here rather than
+                    // dropped -- dropping a `JoinHandle` detaches the task.
+                    let orphan = match pump {
+                        Ok(pump) => state
+                            .clients
+                            .finish_channel_install(&key, &ready, Some(pump)),
+                        Err(error) => {
+                            if let Some(orphan) =
+                                state.clients.finish_channel_install(&key, &ready, None)
+                            {
+                                orphan.retire().await;
+                            }
+                            return Response::err(format!("channel subscribe refused: {error}"));
+                        }
+                    };
+                    if let Some(orphan) = orphan {
+                        orphan.retire().await;
+                    }
                 }
+                crate::ipc::ChannelJoin::Pending(ready) => {
+                    // Someone else is installing. Waiting here is the point:
+                    // reporting success now is what left a follower subscribed
+                    // to a route that never became deliverable.
+                    if !ready.wait().await {
+                        return Response::err(
+                            "channel subscribe refused: the route this subscription joined could not be installed",
+                        );
+                    }
+                }
+                crate::ipc::ChannelJoin::Live => {}
             }
             Response::ok(serde_json::json!({ "subscribed": true }))
         }
@@ -882,11 +950,14 @@ pub(super) async fn dispatch(state: &Arc<ControlState>, req: Request) -> Respons
                 return Response::err("invalid local client authority");
             }
             let key = (network, channel);
-            state.clients.unsubscribe_channel(&key, client_id);
-            // We don't actively tear the pump down — it exits
-            // on its next iteration when it sees an empty
-            // subscriber list. Keeps the unsubscribe synchronous
-            // and free of cross-task signaling.
+            // The last unsubscribe removes the route and hands back what it
+            // still owes. Retired here, so this response means the pump has
+            // actually stopped rather than that it will notice eventually --
+            // which on a quiet channel it never would, because its only other
+            // wake is a frame nobody is sending.
+            if let Some(route) = state.clients.unsubscribe_channel(&key, client_id) {
+                route.retire().await;
+            }
             Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
 

@@ -43,7 +43,7 @@
 //! above stays exactly as private as it was. A sibling module or an outside
 //! caller still reaches none of it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -64,19 +64,116 @@ use super::wire::ServerOut;
 /// exists — the record has to be funded before anything is put in it.
 const CLIENT_CAPABILITY_BYTES: usize = 43;
 
+/// Encoded width of a minted [`RealtimeFlowCapability`].
+///
+/// The same 32-byte mint in the same encoding, named separately because the two
+/// authorities are free to diverge and a shared constant would silently make one
+/// of them wrong if either did.
+const REALTIME_CAPABILITY_BYTES: usize = 43;
+
 /// Why one thing this registry owns could not be admitted — a client record,
 /// or a task the daemon would have to keep running.
 ///
-/// Two arms because they are two different events, exactly as core separates
-/// them for a mailbox: the claim being unrepresentable is a defect in this
-/// crate's arithmetic, while a refusal is the process owner's envelope being
-/// full. Flattening them would report a bug here as ordinary back-pressure.
+/// Three arms because they are three different events, and a caller that could
+/// not tell them apart would misreport two of them. `Claim` is a defect in this
+/// crate's arithmetic; `Resources` is the process owner's envelope being full,
+/// which is ordinary back-pressure and may pass later; `Closing` is the runtime
+/// shutting down, which will never pass and is not a shortage of anything.
+/// Flattening any pair of them would report a bug, or a shutdown, as capacity.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcAdmissionError {
     #[error("IPC claim is not representable: {0}")]
     Claim(ResourceClaimArithmeticError),
     #[error("IPC admission was refused by the resource provider: {0:?}")]
     Resources(ResourceUnavailable),
+    /// The control runtime has begun closing, so nothing further is admitted.
+    ///
+    /// An admission answer rather than a separate error type because it is the
+    /// same question with a third reason: a caller asked the registry to take
+    /// on something new, and it will not. Callers already branch on refusal
+    /// here, and the shape they need — install nothing, tell the client, do not
+    /// retry — is identical for all three arms.
+    #[error("the control runtime is closing and admits nothing further")]
+    Closing,
+}
+
+/// Everything one registry is still holding, at one instant.
+///
+/// `PartialEq` and a `Default` of all zeroes so a control can say what it means
+/// — `assert_eq!(residue, RegistryResidue::empty(Lifecycle::Closed))` — rather
+/// than a column of individually-passing field assertions that between them
+/// still permit a leftover nobody thought to check.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryResidue {
+    pub lifecycle: Lifecycle,
+    pub live_tasks: u64,
+    pub clients: u64,
+    pub realtime_flows: u64,
+    pub handler_claims: u64,
+    pub installed_handlers: u64,
+    pub channel_subs: u64,
+    /// Routes, not members. A route with no members should not exist, so a
+    /// nonzero count here beside a zero `channel_subs` is a leaked route — the
+    /// exact residue a member-only count cannot see.
+    pub channel_routes: u64,
+    /// Routes still in `Installing`. A terminal registry with one of these has
+    /// an install that never published its outcome, and a follower somewhere is
+    /// still waiting on it.
+    pub installing_routes: u64,
+    pub pending_inbound: u64,
+}
+
+#[cfg(test)]
+impl RegistryResidue {
+    /// The same, with `live_tasks` set.
+    ///
+    /// Separate from [`Self::empty`] because a live accepted task is not a
+    /// leftover -- it is the thing `serve` is waiting for -- and a control
+    /// asserting mid-shutdown has to be able to say "the tables are empty and
+    /// exactly one task is still running" as one value rather than as an empty
+    /// comparison it then has to except a field from.
+    pub fn with_tasks(mut self, live_tasks: u64) -> Self {
+        self.live_tasks = live_tasks;
+        self
+    }
+
+    /// Holding nothing, in the named state.
+    pub fn empty(lifecycle: Lifecycle) -> Self {
+        Self {
+            lifecycle,
+            live_tasks: 0,
+            clients: 0,
+            realtime_flows: 0,
+            handler_claims: 0,
+            installed_handlers: 0,
+            channel_subs: 0,
+            channel_routes: 0,
+            installing_routes: 0,
+            pending_inbound: 0,
+        }
+    }
+}
+
+/// Where the control runtime is in its life.
+///
+/// Three states and one direction. `Running` admits; `Closing` refuses every
+/// new admission while the drain runs and the tasks already accepted finish;
+/// `Closed` is reached only once no accepted task is still live, which is what
+/// makes `control::serve` returning mean the daemon's control surface is
+/// actually over rather than merely no longer accepting.
+///
+/// It lives *inside* [`RegistryTables`], under the same mutex as the routing
+/// tables, deliberately. A separate `AtomicBool` beside the tables would let a
+/// registration read `Running`, be preempted, and install itself into tables the
+/// drain had already walked — an orphan the shutdown path has no second pass to
+/// find. Sharing the one acquisition means "is the runtime still admitting" and
+/// "what is in the tables" are answered by the same lock at the same instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    Running,
+    Closing,
+    Closed,
 }
 
 /// Why one registration a client asked for could not be installed.
@@ -92,6 +189,16 @@ pub enum IpcAdmissionError {
 pub enum RegistrationError {
     #[error("the local client disconnected before its registration was installed")]
     ClientGone,
+    /// The network's application gateway closed between funding this
+    /// registration and publishing it. Distinct from [`Self::ClientGone`]
+    /// because the client is fine and there is nothing for it to retry against.
+    #[error("the network's gateway closed before the registration was published")]
+    GatewayRevoked,
+    /// This daemon has issued every handler generation a `u64` can express.
+    /// Unreachable in practice and refused rather than wrapped, because a
+    /// wrapped counter reuses generations that are still installed.
+    #[error("this daemon has no unused handler generations left")]
+    GenerationExhausted,
     #[error(transparent)]
     Admission(#[from] IpcAdmissionError),
 }
@@ -106,29 +213,94 @@ pub struct RealtimeFlowRejected {
     pub reason: RegistrationError,
 }
 
-/// What a released method claim leaves behind for a caller with networks.
+/// What a released method claim leaves behind.
+///
+/// `#[must_use]` because dropping this is the act that removes the handler: the
+/// registration inside is what tells core to forget it, and a caller that
+/// discards this value without meaning to has silently done the removal anyway.
+#[must_use = "dropping this removes the synthetic handler the claim installed"]
 pub struct MethodRelease {
     /// `true` only if this caller really owned the claim it released. A client
     /// releasing a method a later claimant has since taken gets `false` and
     /// changes nothing.
     pub released: bool,
-    /// Set when this was the *last* claim on the method, so the synthetic
-    /// handler the bridge installed on the engine now belongs to nobody.
+    /// The core registration this release retired, if it retired one.
     ///
-    /// It has to be answered rather than acted on here: forgetting a handler
-    /// needs the `JoinedNetwork` it was installed on, and this module holds
-    /// client state, not networks.
-    pub forget: bool,
+    /// Carried out rather than dropped in place, and this is the whole reason
+    /// the type exists. Dropping an [`OwnedMethodRegistration`] takes core's
+    /// handlers lock; the registry holds its own tables lock while it removes
+    /// the record. Dropping it there would be daemon-lock → core-lock, the one
+    /// direction this daemon never takes. Out here the tables lock is already
+    /// gone.
+    ///
+    /// [`OwnedMethodRegistration`]: myownmesh_core::rpc::OwnedMethodRegistration
+    _retired: Option<InstalledHandler>,
+}
+
+impl MethodRelease {
+    /// Whether this release took an installed handler out with it.
+    ///
+    /// Controls only. Production does not branch on it: dropping this value is
+    /// the removal, so there is nothing for a caller to decide.
+    #[cfg(test)]
+    pub fn retired(&self) -> bool {
+        self._retired.is_some()
+    }
 }
 
 /// One removed client, and what removing it left for a caller with networks.
 pub struct UnregisteredClient {
     pub handle: Arc<ClientHandle>,
-    /// Methods this client was the last claimant of. Each still has a synthetic
-    /// handler installed on its network, which now answers every inbound call
-    /// with "no claim" — true, but a handler retained for nobody. The caller
-    /// forgets them; see [`MethodRelease::forget`] for why not here.
-    pub forget: Vec<ClaimKey>,
+    /// Methods this client was the last claimant of, each carrying the core
+    /// registration that removes its synthetic handler.
+    ///
+    /// Handed out rather than dropped in place for the same reason
+    /// [`MethodRelease`] is: `unregister` is holding the tables lock, and
+    /// releasing a registration takes core's handlers lock. Dropping this
+    /// vector is what forgets the handlers, and it happens where no daemon lock
+    /// is held.
+    ///
+    /// Each entry also carries the funding for its own name, so the names in
+    /// this vector are accounted for as long as the caller holds them and are
+    /// released when it drops them — not when they left the table.
+    pub forget: Vec<ForgottenMethod>,
+    /// Routes this client was the last subscriber of.
+    ///
+    /// Returned rather than finished in `unregister`, for the same reason
+    /// `forget` is: retiring a route means awaiting a task, and that method is
+    /// synchronous and holding a lock. The caller retires each one before it
+    /// reports the client released — and it must, because `serve` will not
+    /// return while any of these pumps is still counted alive.
+    ///
+    /// One vector, not one per outcome: a route that was live and a route that
+    /// was still installing are the same obligation at different stages, and
+    /// splitting them would be a second unfunded allocation to say so. Each slot
+    /// was pre-paid by the channel subscription that will occupy it, through the
+    /// same cleanup term that funds `forget`.
+    pub(crate) routes: Vec<RetiredRoute>,
+}
+
+/// One method a disconnect retired: its name, still funded, and the core
+/// registration that removes its handler.
+#[must_use = "dropping this removes the synthetic handler the claim installed"]
+pub struct ForgottenMethod {
+    pub key: ClaimKey,
+    /// Declared after the key, so a reader of `key` above cannot be looking at
+    /// a name whose handler has already gone.
+    _retired: Option<InstalledHandler>,
+    /// Declared last so the name's buffers are released after everything that
+    /// reads them.
+    _funding: ResourceLease,
+}
+
+impl ForgottenMethod {
+    fn new(key: ClaimKey, retired: Option<InstalledHandler>, funding: ResourceLease) -> Self {
+        Self {
+            key,
+            _retired: retired,
+            _funding: funding,
+        }
+    }
 }
 
 /// An inbound call that could not be tracked, handed back with why.
@@ -149,6 +321,60 @@ pub enum PendingRefusal {
     Admission(#[from] IpcAdmissionError),
 }
 
+/// One accepted task's funding and its place in the join count.
+///
+/// Two things that must end at the same moment, so they are one value. The
+/// lease releases the task's share of the grant; the count is what
+/// [`ClientRegistry::wait_for_tasks`] is waiting on. Separating them would let a
+/// task's resources be returned while `serve` still believed it was live, or —
+/// worse in the other order — let `serve` return while a task it had stopped
+/// counting was still running.
+///
+/// Move it into the spawned future. Dropping it anywhere else decrements for a
+/// task that has not finished.
+#[must_use = "the task's funding and its place in the shutdown join both end when this is dropped"]
+pub struct TaskAdmission {
+    _lease: ResourceLease,
+    /// Declared after the lease so the count is decremented last: a waiter woken
+    /// by the decrement then finds the resources already released, rather than
+    /// observing zero live tasks over a grant still holding one task's share.
+    _gate: TaskGate,
+}
+
+impl TaskAdmission {
+    fn new(lease: ResourceLease, inner: Arc<RegistryInner>) -> Self {
+        Self {
+            _lease: lease,
+            _gate: TaskGate { inner },
+        }
+    }
+}
+
+/// The decrement half of [`TaskAdmission`], as its own drop.
+struct TaskGate {
+    inner: Arc<RegistryInner>,
+}
+
+impl Drop for TaskGate {
+    fn drop(&mut self) {
+        // Waking only on the transition to zero, rather than on every task end,
+        // keeps a busy daemon from repeatedly waking a drain that is not
+        // running. The wake is outside the lock: waking under it would put the
+        // woken drain straight into a method that takes the same lock.
+        let last = {
+            let mut tables = self.inner.tables.lock();
+            tables.live_tasks = tables
+                .live_tasks
+                .checked_sub(1)
+                .expect("every decrement pairs with an increment taken under this same lock");
+            tables.live_tasks == 0
+        };
+        if last {
+            self.inner.idle.notify_waiters();
+        }
+    }
+}
+
 /// Exact claim for one IPC task this daemon keeps alive.
 ///
 /// Two dimensions and no byte term. A spawned future's size is not knowable
@@ -161,6 +387,30 @@ fn task_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     ResourceClaim::try_from_entries([
         (ResourceClass::WorkerOrTask, 1),
         (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+}
+
+/// [`task_claim`] plus the heap a task's captured state holds for its lifetime.
+///
+/// Additive rather than a second claim so the task and the state it carries are
+/// admitted or refused together: a task admitted whose captures were then
+/// refused would have to be aborted after it had already been spawned, and a
+/// capture admitted whose task was refused would be funding nothing.
+///
+/// `retained` is bytes the *caller* can state exactly -- a `String` it is about
+/// to clone into the future, whose length it holds. It is not a guess at
+/// `size_of` the generated future, which [`task_claim`] explains is unknowable
+/// from here. The extra residual is the allocation those bytes live in, whose
+/// real size the allocator picks: `String::clone` reserves at least the length
+/// and may round up, exactly as the control reader's buffers do.
+fn task_claim_retaining(retained: usize) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let retained = u64::try_from(retained).map_err(|_| ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::WorkerOrTask, 1),
+        (ResourceClass::OpaqueDependencyResidual, 2),
+        (ResourceClass::AccountedMemoryBytes, retained),
     ])
 }
 
@@ -198,16 +448,226 @@ fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> 
         (ResourceClass::AccountedMemoryBytes, bytes),
         // The `Arc` allocation and the capability string's own buffer.
         (ResourceClass::OpaqueDependencyResidual, 2),
+    ])?
+    // The slot this client occupies in the id vector `shutdown` builds before
+    // it unregisters anyone. That vector is sized by how many clients are
+    // connected, so it is pre-paid per client for the same reason every other
+    // sweep slot is: a shutdown path that had to acquire before it could
+    // proceed would have no honest answer to a refusal.
+    .checked_add(cleanup_slot_claim::<ClientId>()?)
+}
+
+/// What one table entry retains *beyond* the node the map funds.
+///
+/// [`LeasedMap::entry_claim`] funds the node and says so: it explicitly excludes
+/// anything the key or value owns off-node, because the map cannot know what
+/// that is. For this registry that exclusion is the whole exposure — almost
+/// every table here is keyed by a string a local client chose, and the node is a
+/// fixed size no matter how long that string is. A client subscribing to one
+/// channel with a megabyte-long name was charged the same as one with a
+/// one-byte name, and the difference was heap the daemon held and nothing had
+/// admitted.
+///
+/// `bytes` is what the caller can state exactly: the lengths of the buffers the
+/// entry will own. `allocations` is how many separate allocations those bytes
+/// live in, as an opaque residual — because `String` reserves *at least* its
+/// length and the excess an allocator adds is not a number this code can know.
+/// Neither half alone would be true, on the same pattern as the control
+/// reader's buffers.
+fn retained_claim(
+    bytes: usize,
+    allocations: u64,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let bytes = u64::try_from(bytes).map_err(|_| ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::OpaqueDependencyResidual, allocations),
     ])
+}
+
+/// The sum of several buffer lengths, or the typed refusal if it is not
+/// representable.
+///
+/// `checked_add` and not `saturating_add`, and the difference is the whole
+/// point: every length here is chosen by a local client or comes off the wire,
+/// so the sum is attacker-influenced. Saturating turns an unrepresentable total
+/// into `usize::MAX` -- which fits in a `u64` on a 64-bit target and is
+/// therefore *accepted* as a claim, silently charging less than the truth for
+/// the one input shaped to overflow. Refusing is the only honest answer to a
+/// length this code cannot represent.
+fn total_len(
+    lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, ResourceClaimArithmeticError> {
+    lengths
+        .into_iter()
+        .try_fold(0usize, |total, len| total.checked_add(len))
+        .ok_or(ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })
+}
+
+/// The heap a [`ClaimKey`] owns: two client-chosen strings.
+fn claim_key_retained(key: &ClaimKey) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    retained_claim(total_len([key.0.len(), key.1.len()])?, 2)
+}
+
+/// The heap a [`PendingKey`] owns: four client- or peer-chosen strings.
+///
+/// `class` is a `Copy` discriminant and lives in the node, so it is not counted
+/// here. The four that are counted include `remote_peer` and
+/// `remote_request_id`, which come off the wire rather than from the local
+/// client — a remote peer's contribution to what this daemon retains, funded
+/// from the same grant because the memory is just as real.
+fn pending_key_retained(key: &PendingKey) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let bytes = total_len([
+        key.network.len(),
+        key.method.len(),
+        key.remote_peer.len(),
+        key.remote_request_id.len(),
+    ])?;
+    retained_claim(bytes, 4)
+}
+
+/// The heap one `Arc<T>` allocation occupies.
+///
+/// `Arc` stores a strong count, a weak count and the value in one allocation, so
+/// the pointee is `2 * size_of::<usize>()` of counts plus the value — with
+/// padding, since the value's alignment may exceed a `usize`'s. `align_of::<T>()`
+/// is added rather than computed exactly: the true padding is at most that, so
+/// this over-states by less than one alignment and never under-states, which is
+/// the direction an accounting error has to fall in.
+///
+/// Named because an `Arc` field looks free from the outside. `size_of` on a
+/// struct holding one counts a pointer; the allocation it points at is off-node
+/// and is exactly the kind of retention `entry_claim` excludes.
+fn arc_allocation_bytes<T>() -> Result<usize, ResourceClaimArithmeticError> {
+    total_len([
+        std::mem::size_of::<T>(),
+        2 * std::mem::size_of::<usize>(),
+        std::mem::align_of::<T>(),
+    ])
+}
+
+/// Everything one accepted pending call retains beyond its table node.
+///
+/// **Two** copies of the four coordinate strings, not one. The map holds one and
+/// the [`PendingTicket`] clones a second, and neither is a borrow of the other,
+/// so the pair is what is really retained for as long as the call is live.
+///
+/// It was three until the sweep stopped needing a transient clone.
+/// `pop_first_where` detaches only the first matching node and leaves the
+/// rejected ones where they are, so a predicate-selected sweep no longer has to
+/// snapshot keys to know what to remove — the third copy is gone rather than
+/// funded, and so are the two vectors it used to drive.
+///
+/// Then the two `Arc` pointees — this `PendingFunding` and the shared
+/// `PendingCancellation` — priced in **bytes**, not merely named as residuals.
+/// Both are this crate's own types, so their layouts are known here; charging
+/// only a residual for an allocation whose size is available would be
+/// understating it. An `Arc` field is the easiest retention to miss precisely
+/// because `size_of` on the struct holding it counts a pointer.
+///
+/// The `PendingInbound` effect's channel state stays an opaque residual: it is a
+/// library allocation whose size is not this crate's to state, and a number
+/// invented for it would be a guess wearing a measurement's clothes.
+///
+/// One sweep slot, not two, and only for one of the three sweeps. Disconnect and
+/// shutdown settle a record at a time straight out of the table and allocate
+/// nothing — a stronger guarantee than pre-payment, since an allocation that
+/// does not happen cannot be refused. Claim displacement still collects, because
+/// it must detach the previous owner's calls under the same acquisition that
+/// moves the claim, and it is that vector's slot this pays for.
+///
+/// The multiplicity is the part a node-shaped charge misses entirely.
+/// `entry_claim` prices one node; every copy above lives somewhere the map never
+/// sees.
+fn pending_retained(key: &PendingKey) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let key_retention = pending_key_retained(key)?;
+    // The two `Arc` pointees, in bytes and not merely as residuals. Both sizes
+    // are known here — they are this crate's own types — so naming them as
+    // opaque would be understating a figure that is available.
+    let shared = retained_claim(
+        total_len([
+            arc_allocation_bytes::<PendingFunding>()?,
+            arc_allocation_bytes::<PendingCancellation>()?,
+        ])?,
+        2,
+    )?;
+    key_retention
+        .checked_scale(2)?
+        .checked_add(shared)?
+        // The effect's channel state is a library allocation whose size is not
+        // this crate's to state, so it stays an honestly named residual rather
+        // than a guess dressed as a measurement.
+        .checked_add(retained_claim(0, 1)?)?
+        // One slot, for the one sweep that still builds a vector: displacing a
+        // method claim must detach the previous owner's in-flight calls under
+        // the same acquisition that moves the claim, so it cannot settle as it
+        // goes. The disconnect and shutdown sweeps allocate nothing at all.
+        .checked_add(cleanup_slot_claim::<PendingRecord>()?)
+}
+
+/// Everything one installed realtime flow retains beyond its table node.
+///
+/// The capability string this table is keyed by, the network name the value
+/// holds, and the slot the pair occupies when a disconnect sweeps them out.
+/// Two allocations: one buffer each.
+///
+/// The capability is a fixed 32-byte mint rather than a client-chosen name, so
+/// it is not the attacker-sized term here — the network name is, and it is the
+/// reason this cannot be a constant.
+fn realtime_flow_retained(
+    capability: usize,
+    network: &str,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    retained_claim(total_len([capability, network.len()])?, 2)?.checked_add(cleanup_slot_claim::<(
+        String,
+        myownmesh_core::realtime::RealtimeFlowHandle,
+        ResourceLease,
+    )>()?)
+}
+
+/// One slot in the cleanup vector this entry will one day be swept into, funded
+/// now.
+///
+/// Cleanup allocates: `unregister` builds a `Vec` of the names it has to forget
+/// through the engine, `shutdown` builds one of every client id, and claim
+/// displacement builds one of the calls it is cancelling. Every one of those is
+/// sized by a count a local client chose, and none of them was funded.
+///
+/// Funding them *at cleanup time* is not the fix, and this is the reason the
+/// charge is here instead. A cleanup claim can be refused, and a disconnect path
+/// that cannot allocate has no honest answer left — it cannot decline to clean
+/// up, so it would either leak or panic on the very path that exists to stop
+/// leaks. Charging the slot when the entry is installed makes the client pay in
+/// advance for its own removal, so the sweep is allocation-work the daemon has
+/// already been paid for and cannot be refused.
+fn cleanup_slot_claim<T>() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    // One allocation per entry over-counts a `Vec` that holds several: the
+    // residual names "an allocation exists that this entry may cause", and a
+    // vector of ten entries is charged ten rather than one. Over-funding by a
+    // constant in the safe direction, and the alternative -- charging the first
+    // entry for a vector every entry shares -- would make the charge depend on
+    // insertion order.
+    retained_claim(std::mem::size_of::<T>(), 1)
 }
 
 /// Everything this registry's fixtures acquire, priced from the real APIs.
 ///
 /// `clients` funds that many client records; `entries` funds that many entries
-/// *in each* of the registry's tables. Summing the eight node shapes rather than
-/// picking the widest is deliberate over-funding, and it is the right kind: a
-/// fixture grant that is generous fails only by hiding headroom, while one that
-/// is tight fails by refusing a control for reasons the control is not about.
+/// *in each* of the registry's tables, at `coordinate` bytes of client-chosen
+/// name per entry. Summing the eight node shapes rather than picking the widest
+/// is deliberate over-funding, and it is the right kind: a fixture grant that is
+/// generous fails only by hiding headroom, while one that is tight fails by
+/// refusing a control for reasons the control is not about.
+///
+/// `coordinate` is not decoration. Entries now cost node *plus* the heap their
+/// keys own, so a grant derived from node size alone would refuse ordinary
+/// controls the moment their fixture names got longer than nothing — and the
+/// refusal would look like a pressure finding rather than a fixture that had
+/// forgotten to pay for its own strings.
 ///
 /// It lives here rather than beside the grant it feeds because the node types
 /// are private to this module. A grant written elsewhere would have to restate
@@ -220,16 +680,32 @@ fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> 
 pub(crate) fn registry_fixture_claim(
     clients: u64,
     entries: u64,
+    coordinate: usize,
 ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     let records = client_record_claim()?.checked_scale(clients)?;
     let entry = LeasedMap::<ClientId, Arc<ClientHandle>>::entry_claim()?
-        .checked_add(LeasedMap::<ClaimKey, ClientId>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClaimKey, HandlerMode>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClaimKey, LeasedMap<ClientId, ()>>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, Funded<ClientId>>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, InstalledHandler>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, ChannelRoute>::entry_claim()?)?
         .checked_add(LeasedMap::<ClientId, ()>::entry_claim()?)?
         .checked_add(LeasedMap::<PendingKey, PendingRecord>::entry_claim()?)?
-        .checked_add(LeasedMap::<ClaimKey, ()>::entry_claim()?)?
+        .checked_add(LeasedMap::<ClaimKey, ResourceLease>::entry_claim()?)?
         .checked_add(LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?)?;
+    // The off-node half, priced from the same helpers the registry charges
+    // with. A `PendingKey` carries four coordinates and a `ClaimKey` two, and
+    // the realtime table's key is one -- so a fixture naming everything
+    // `coordinate` bytes long pays for the worst of them at every entry rather
+    // than for an average nothing actually charges.
+    let widest_key = pending_key_retained(&PendingKey {
+        network: "x".repeat(coordinate),
+        method: "x".repeat(coordinate),
+        remote_peer: "x".repeat(coordinate),
+        remote_request_id: "x".repeat(coordinate),
+        class: HandlerMode::Single,
+    })?;
+    let entry = entry
+        .checked_add(widest_key.checked_scale(8)?)?
+        .checked_add(cleanup_slot_claim::<PendingKey>()?.checked_scale(8)?)?;
     records.checked_add(entry.checked_scale(entries)?)
 }
 
@@ -246,6 +722,11 @@ pub use identity::{ClaimKey, ClientCapability, ClientId, RealtimeFlowCapability}
 /// to close *through*, and asking the client which network its own flow is on
 /// would be taking a routing decision from the party being authorized.
 struct OwnedRealtimeFlow {
+    /// The capability key's bytes and this network name's, funded together and
+    /// released when this value drops — which, taken out through
+    /// `pop_first_entry`, is after the owned key has gone wherever it is going.
+    /// The node lease cannot carry this: it ends inside the removal call.
+    _retained: ResourceLease,
     network: String,
     flow: myownmesh_core::realtime::RealtimeFlowHandle,
 }
@@ -264,6 +745,25 @@ struct PendingRecord {
     operation_id: u64,
     effect: PendingInbound,
     cancelled: Arc<PendingCancellation>,
+    /// See [`PendingFunding`]. Shared with the ticket, so the record leaving the
+    /// table releases nothing while the ticket is still alive. Held, never read.
+    _funding: Arc<PendingFunding>,
+}
+
+/// Everything one pending call retains, funded once and released last.
+///
+/// A pending call is owned twice from the moment it is accepted: the table holds
+/// the key and the record, and the [`PendingTicket`] holds a second copy of the
+/// same four coordinate strings plus a share of the cancellation. The two do not
+/// end together — a ticket can outlive the record's removal, which is the whole
+/// reason it exists — so funding attached to the record alone would be released
+/// while the ticket was still holding an identical set of buffers.
+///
+/// Behind an `Arc` shared by both, so the charge is taken once and returned when
+/// the *last* of the two goes. That is the general rule this registry now
+/// follows: funding follows the last live copy, not the table node.
+struct PendingFunding {
+    _retained: ResourceLease,
 }
 
 struct PendingCancellation {
@@ -310,6 +810,9 @@ pub struct PendingTicket {
     key: PendingKey,
     operation_id: u64,
     cancelled: Arc<PendingCancellation>,
+    /// The other half of the shared charge. Declared last so this ticket's copy
+    /// of the key is dropped before the funding that paid for it.
+    _funding: Arc<PendingFunding>,
 }
 
 impl PendingTicket {
@@ -431,7 +934,14 @@ pub struct ClientHandle {
 /// what makes the two orders consistent by construction rather than by
 /// convention.
 #[derive(Default)]
-struct HeldNames(Mutex<LeasedMap<ClaimKey, ()>>);
+/// The names one client holds, each with the funding for its own buffers.
+///
+/// The value is the lease rather than `()`, so [`Self::drain`] can hand back
+/// owned names that are still funded while the caller holds them. The previous
+/// shape cloned every key into a fresh vector on disconnect: the clones were
+/// unfunded, the vector was unfunded, and both were sized by how many names the
+/// client had chosen to claim.
+struct HeldNames(Mutex<LeasedMap<ClaimKey, ResourceLease>>);
 
 impl HeldNames {
     fn holds(&self, key: &ClaimKey) -> bool {
@@ -445,28 +955,44 @@ impl HeldNames {
     /// corrected rather than charged twice. Every caller in this module checks
     /// [`Self::holds`] first under the registry's table lock, so the refusal
     /// path is a backstop and not the ordinary case.
-    fn hold(&self, key: ClaimKey, entry: ResourceLease) {
-        let _ = self.0.lock().insert(key, (), entry);
+    fn hold(&self, key: ClaimKey, node: ResourceLease, retained: ResourceLease) {
+        let _ = self.0.lock().insert(key, retained, node);
     }
 
     fn release(&self, key: &ClaimKey) {
         self.0.lock().remove(key);
     }
 
-    /// Owned copies of every name held, for a caller that has to release them
-    /// through tables this one does not reach.
+    /// Take one name out, still carrying the funding that pays for it.
     ///
-    /// Allocates deliberately: the alternative is calling back into the registry
-    /// while this lock is held, which is the one lock order this module does not
-    /// take.
-    fn snapshot(&self) -> Vec<ClaimKey> {
-        let mut names = Vec::new();
-        self.0.lock().for_each(|key, ()| names.push(key.clone()));
-        names
+    /// One at a time, and not a `drain` returning every name at once, because
+    /// two vectors would then be alive together: the drained pairs *and* the
+    /// output the caller builds while walking them. Only one output slot per
+    /// name is funded — a [`ForgottenMethod`] for methods, a [`RetiredRoute`]
+    /// for channels — so a snapshot vector beside it is retention nobody paid
+    /// for, sized by how many names the client chose to claim.
+    ///
+    /// `pop_first_entry` also means no key is ever cloned: the name is *moved*
+    /// out with its lease, so the funding follows the last live copy instead of
+    /// being released while a copy is still in use.
+    fn pop_first(&self) -> Option<(ClaimKey, ResourceLease)> {
+        self.0.lock().pop_first_entry()
     }
 }
 
 impl ClientHandle {
+    /// Whether this client currently holds a claim on `key`.
+    ///
+    /// Controls only, and narrow on purpose: what a control wants to know is
+    /// whether a displaced client still records a claim it no longer has, and
+    /// the alternative -- widening `method_claims` so a sibling module can read
+    /// the table directly -- would expose the leases inside it to anything in
+    /// the crate. This answers the question without handing over the thing.
+    #[cfg(test)]
+    pub(crate) fn holds_method_for_test(&self, key: &ClaimKey) -> bool {
+        self.method_claims.holds(key)
+    }
+
     /// Take ownership of one open flow and answer the capability naming it.
     ///
     /// The capability is minted here rather than supplied, so a client cannot
@@ -481,13 +1007,18 @@ impl ClientHandle {
         network: String,
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
         entry: ResourceLease,
+        retained: ResourceLease,
     ) -> RealtimeFlowCapability {
         let capability = RealtimeFlowCapability::mint();
         self.realtime_flows
             .lock()
             .insert(
                 capability.expose().to_string(),
-                OwnedRealtimeFlow { network, flow },
+                OwnedRealtimeFlow {
+                    _retained: retained,
+                    network,
+                    flow,
+                },
                 entry,
             )
             // 32 bytes of OS randomness, minted one line above and never
@@ -529,12 +1060,25 @@ impl ClientHandle {
     /// Removal and the close are separate steps and the removal comes first, so
     /// two concurrent closes cannot both reach core with the same flow: the
     /// second finds nothing.
+    /// Take one flow out by capability, with the funding for its own strings.
+    ///
+    /// The lease is returned rather than dropped here, for the same reason
+    /// [`Self::drain_realtime_flows`] returns one. It pays for the `network`
+    /// string handed back alongside it, and the caller reads that string —
+    /// looks the network up, closes through it, builds a response — well after
+    /// this function has returned. Dropping it on the way out would unfund a
+    /// buffer still in use, which is the defect this whole shape exists to
+    /// prevent and is easy to reintroduce by destructuring the value here.
     pub fn take_realtime_flow(
         &self,
         capability: &str,
-    ) -> Option<(String, myownmesh_core::realtime::RealtimeFlowHandle)> {
+    ) -> Option<(
+        String,
+        myownmesh_core::realtime::RealtimeFlowHandle,
+        ResourceLease,
+    )> {
         let owned = self.realtime_flows.lock().remove(capability)?;
-        Some((owned.network, owned.flow))
+        Some((owned.network, owned.flow, owned._retained))
     }
 
     /// Take every flow this client still owns.
@@ -546,17 +1090,31 @@ impl ClientHandle {
     /// Taken under one acquisition of the table, unlike the two-phase walk this
     /// replaces: a flow opened between the old snapshot and the old removal
     /// survived the drain and was never closed.
+    /// Take every flow out, one detached node at a time.
+    ///
+    /// `pop_first_entry` rather than collect-the-keys-then-remove. The previous
+    /// shape cloned every capability string into a second vector purely to hand
+    /// each one straight back to `remove`: unfunded clones in an unfunded
+    /// vector, both sized by how many flows the client had opened. Detaching the
+    /// first node repeatedly needs no key at all, so that allocation is gone
+    /// rather than merely paid for.
+    ///
+    /// Each value carries its own retained lease, so the network names in the
+    /// returned vector stay funded for as long as the caller holds them — and
+    /// the slot each one occupies was pre-paid when the flow was installed.
     pub fn drain_realtime_flows(
         &self,
-    ) -> Vec<(String, myownmesh_core::realtime::RealtimeFlowHandle)> {
+    ) -> Vec<(
+        String,
+        myownmesh_core::realtime::RealtimeFlowHandle,
+        ResourceLease,
+    )> {
         let mut flows = self.realtime_flows.lock();
-        let mut capabilities = Vec::new();
-        flows.for_each(|capability, _| capabilities.push(capability.clone()));
-        capabilities
-            .into_iter()
-            .filter_map(|capability| flows.remove(&capability))
-            .map(|owned| (owned.network, owned.flow))
-            .collect()
+        let mut taken = Vec::new();
+        while let Some((_capability, owned)) = flows.pop_first_entry() {
+            taken.push((owned.network, owned.flow, owned._retained));
+        }
+        taken
     }
 
     /// Queue one frame for this client's writer task.
@@ -616,10 +1174,32 @@ struct RegistryInner {
     /// from. It is supplied rather than reached for: the registry has no
     /// authority of its own, and a daemon that could mint some here would be
     /// able to admit clients the process owner never granted capacity for.
-    resources: LocalApplicationResourceScope,
+    resources: RegistryResources,
+    /// Woken when the live task count reaches zero.
+    ///
+    /// `notify_waiters` rather than `notify_one`, so that a second waiter is not
+    /// left holding a permit nobody will ever consume; the drain re-checks the
+    /// count after each wake, which is what makes a missed or spurious wake
+    /// harmless rather than a hang.
+    idle: tokio::sync::Notify,
+    /// Woken once, for everything, when the runtime enters `Closing`.
+    ///
+    /// The signal half of the shutdown: tasks parked on a socket read or a pump
+    /// receive learn about it here rather than by polling the lifecycle. The
+    /// lifecycle under the tables lock remains the authority — this only tells
+    /// an awaiting task when to go and look.
+    closing: tokio::sync::Notify,
     next_id: AtomicU64,
     next_call_stream_id: AtomicU64,
     next_operation_id: AtomicU64,
+    /// Which installation of a method name a handler belongs to.
+    ///
+    /// Monotonic and never reused, so "is this still the handler I installed?"
+    /// has an answer that a method name alone cannot give. A name can be
+    /// claimed, released and claimed again while a closure cloned from the
+    /// first installation is still in flight, and the two installations are
+    /// indistinguishable by name.
+    next_handler_generation: AtomicU64,
 }
 
 /// The registry's five routing tables, which are only ever reached together.
@@ -628,8 +1208,25 @@ struct RegistryInner {
 /// released when it is removed — including when this whole struct is dropped
 /// with entries still in it, which is the daemon-shutdown case.
 struct RegistryTables {
+    /// See [`Lifecycle`] for why this is in here rather than beside the mutex.
+    lifecycle: Lifecycle,
+    /// How many accepted tasks are alive right now.
+    ///
+    /// Not a statistic. `control::serve` may not return while this is nonzero:
+    /// a connection task outliving the function that accepted it would keep
+    /// using a registry, a mesh handle and a socket that the caller of `serve`
+    /// is entitled to believe are finished with.
+    ///
+    /// In here, beside `lifecycle`, and not an atomic beside the mutex. The two
+    /// have to move together or not at all: with them apart, `begin_closing`
+    /// could publish `Closing`, read zero, and return while an admission that
+    /// had already passed its lifecycle check was still on its way to
+    /// incrementing — a task spawned into a runtime that had finished waiting
+    /// for tasks. One lock over both means an admission either happens entirely
+    /// before the transition or is refused by it.
+    live_tasks: u64,
     clients: LeasedMap<ClientId, Arc<ClientHandle>>,
-    handler_claims: LeasedMap<ClaimKey, ClientId>,
+    handler_claims: LeasedMap<ClaimKey, Funded<ClientId>>,
     /// Subscribers per (network, channel), as a funded set of funded members.
     ///
     /// Nested rather than a `Vec`, because both counts are chosen by local
@@ -638,13 +1235,13 @@ struct RegistryTables {
     /// second. The outer entry appears with its first member and is removed with
     /// its last, so an unsubscribed channel costs nothing — the previous shape
     /// left an empty subscriber list behind forever.
-    channel_subs: LeasedMap<ClaimKey, LeasedMap<ClientId, ()>>,
+    channel_subs: LeasedMap<ClaimKey, ChannelRoute>,
     exact_pending_inbound: LeasedMap<PendingKey, PendingRecord>,
     /// Which shape of synthetic handler the bridge has installed on the engine
     /// for each claim. Kept so a re-claim of the same method does not have to
     /// ask the engine what it already holds, and so the last unclaim knows there
     /// is a handler to forget.
-    installed_handlers: LeasedMap<ClaimKey, HandlerMode>,
+    installed_handlers: LeasedMap<ClaimKey, InstalledHandler>,
 }
 
 impl RegistryTables {
@@ -666,9 +1263,444 @@ impl RegistryInner {
     /// calibration point, and an owner that wrote a node size itself would be
     /// stating a number the map is free to change.
     fn lease_entry<K, V>(&self) -> Result<ResourceLease, IpcAdmissionError> {
+        self.lease_entry_retaining::<K, V>(ResourceClaim::ZERO)
+    }
+
+    /// The node lease and the retained-heap lease, as two values.
+    ///
+    /// Two rather than the combined one, because they have to be *stored* in
+    /// two places: the node lease goes to the map, and the retained lease goes
+    /// inside the value so it survives `remove_entry`. Both are acquired before
+    /// either is stored, so a refusal of the second still leaves nothing
+    /// written — the atomicity that matters is at the caller's insert, not in
+    /// the number of leases.
+    fn lease_entry_pair<K, V>(
+        &self,
+        retained: ResourceClaim,
+    ) -> Result<(ResourceLease, ResourceLease), IpcAdmissionError> {
+        let node = self.lease_entry::<K, V>()?;
+        let retained = self
+            .resources
+            .acquire(retained)
+            .map_err(IpcAdmissionError::Resources)?;
+        Ok((node, retained))
+    }
+
+    /// The node, plus what the entry retains off it, as one lease.
+    ///
+    /// One lease and not two because they are released at the same instant —
+    /// the entry leaves the table and its key's buffers go with it — and two
+    /// leases would be two chances to get that pairing wrong. It also means a
+    /// refusal is a refusal of the whole entry: there is no state in which the
+    /// node was funded and the name it holds was not.
+    fn lease_entry_retaining<K, V>(
+        &self,
+        retained: ResourceClaim,
+    ) -> Result<ResourceLease, IpcAdmissionError> {
+        let claim = LeasedMap::<K, V>::entry_claim()
+            .and_then(|node| node.checked_add(retained))
+            .map_err(IpcAdmissionError::Claim)?;
         self.resources
-            .acquire(LeasedMap::<K, V>::entry_claim().map_err(IpcAdmissionError::Claim)?)
+            .acquire(claim)
             .map_err(IpcAdmissionError::Resources)
+    }
+}
+
+/// Where this registry's admissions are funded from.
+///
+/// Production has exactly one answer: the local-application scope the daemon
+/// issued it. The second arm exists so a control can own a provider small enough
+/// to refuse — which the production arm cannot give it, because the daemon test
+/// binary installs one process-global provider by design and a control that
+/// cornered it would starve every other test drawing on the same pool.
+///
+/// A wrapper rather than a core change, because `RegistryInner` only ever
+/// *acquires* through this and issues children off it. `FiniteResourceProvider`,
+/// `ResourceProviderPort` and `ResourceScope` are all public, so a locally
+/// constructed provider needs nothing widened; the same shape already funds the
+/// control connection's framing.
+enum RegistryResources {
+    Application(LocalApplicationResourceScope),
+    /// A provider this test owns outright. The provider and port are held, not
+    /// merely used to mint the scope: dropping either would take the grant with
+    /// it and every later acquisition would refuse for a reason the control is
+    /// not about.
+    #[cfg(test)]
+    Isolated {
+        _provider: myownmesh_core::FiniteResourceProvider,
+        port: myownmesh_core::ResourceProviderPort,
+        scope: myownmesh_core::ResourceScope,
+    },
+}
+
+impl RegistryResources {
+    fn acquire(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
+        match self {
+            Self::Application(scope) => scope.acquire(claim),
+            #[cfg(test)]
+            Self::Isolated { port, scope, .. } => port.acquire(
+                scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                claim,
+            ),
+        }
+    }
+
+    /// One acquisition subtree under this registry.
+    ///
+    /// What this registry's provider is currently holding, when the provider is
+    /// one a control owns.
+    ///
+    /// `None` for the production arm, and not as an oversight: a
+    /// `LocalApplicationResourceScope` is one of many drawing on a process-wide
+    /// provider, so a figure read there would include every other scope's usage
+    /// and would say nothing about this registry. The isolated arm has the whole
+    /// grant to itself, which is exactly what makes the number mean something.
+    #[cfg(test)]
+    fn in_use(&self) -> Option<ResourceClaim> {
+        match self {
+            Self::Application(_) => None,
+            Self::Isolated { _provider, .. } => Some(_provider.in_use()),
+        }
+    }
+
+    /// The isolated arm has no subtree to issue, and says so as a refusal
+    /// rather than a panic.
+    ///
+    /// A `LocalApplicationResourceScope` is a child of the *installed*
+    /// process-wide provider, and the whole point of the isolated arm is that it
+    /// is installed nowhere. A control that needs a real inbound-stream subtree
+    /// is testing core's scope tree rather than this registry and should use the
+    /// production arm; one that merely files registry entries never calls this.
+    ///
+    /// Refusing rather than panicking because a control that stumbles onto this
+    /// path should fail on its own assertion about admission, which is legible,
+    /// rather than on an abort from inside a helper.
+    fn child(&self) -> Result<LocalApplicationResourceScope, ResourceUnavailable> {
+        match self {
+            Self::Application(scope) => scope.child(),
+            #[cfg(test)]
+            Self::Isolated { scope, .. } => Err(ResourceUnavailable::Pressure(
+                myownmesh_core::ResourcePressure {
+                    scope_id: scope.id(),
+                    authority: myownmesh_core::ResourceAuthorityClass::Admitted,
+                    dimension: ResourceClass::OpaqueDependencyResidual,
+                    requested: 1,
+                    in_use: 0,
+                    capacity: 0,
+                },
+            )),
+        }
+    }
+}
+
+/// A table value carrying the funding for what its *entry* retains off-node.
+///
+/// The node's own lease is the map's and is released the instant the node
+/// leaves the tree — which is before the caller has done anything with the
+/// owned key it just got back. Anything the key's buffers pay for therefore
+/// cannot live in the node lease: it has to live in the **value**, because the
+/// value comes out of [`LeasedMap::remove_entry`] alongside the owned key and
+/// travels wherever that key travels.
+///
+/// That is the whole reason this wrapper exists rather than a wider node claim.
+/// A cleanup sweep moves keys into a temporary vector; with the funding in the
+/// node, the vector's storage and the strings in it would be unfunded for
+/// exactly as long as they were in use, which is the window that matters.
+struct Funded<T> {
+    value: T,
+    /// The key's off-node bytes plus the cleanup slot the entry pre-paid for.
+    /// Declared last so it is released after the value it accounts for.
+    _retained: ResourceLease,
+}
+
+/// One channel's fan-out route, and the single owner of its lifecycle.
+///
+/// Membership and liveness used to be two answers. `channel_subs` held a bare
+/// subscriber set, and whether a pump existed for it was implied by whoever
+/// happened to have been first — so a second client subscribing while the first
+/// was still installing was told it had succeeded, and if that install then
+/// failed the first client unwound only *its own* membership. The second was
+/// left subscribed to a route that would never deliver a frame and that nothing
+/// would ever tear down.
+///
+/// One value under the tables lock, so "who is subscribed" and "is there a pump"
+/// cannot disagree.
+pub(crate) struct ChannelRoute {
+    state: RouteState,
+    members: LeasedMap<ClientId, ()>,
+    /// The channel key's own buffers and this route's share of cleanup.
+    /// Declared last so it outlives the members it accounts for.
+    _retained: ResourceLease,
+}
+
+enum RouteState {
+    /// One subscriber is off building the pump. Nobody may be told they are
+    /// subscribed yet — not even the installer, which reports only after it
+    /// has finished.
+    Installing(Arc<RouteReady>),
+    /// The pump exists, and this is what will stop it.
+    Live(PumpOwner),
+}
+
+/// What a follower waits on while the installer works.
+///
+/// A `Notify` alone would say "something happened" and not "it worked". The
+/// outcome has to be carried, because a follower that woke on a failed install
+/// and reported success would be exactly the bug the route exists to remove.
+pub(crate) struct RouteReady {
+    outcome: AtomicU8,
+    woken: tokio::sync::Notify,
+    /// This value's own `Arc` allocation, funded before that allocation exists.
+    ///
+    /// Not folded into [`ChannelRoute`]'s lease, deliberately. Clones of this
+    /// readiness outlive the route by design — a failed install removes the
+    /// route and *then* its waiters observe `FAILED` through their own clones —
+    /// so funding tied to the route would be returned while the thing it paid
+    /// for was still being read. Funding follows the last live copy, which for
+    /// an `Arc` means the `Arc` itself.
+    _retained: ResourceLease,
+}
+
+impl RouteReady {
+    const INSTALLING: u8 = 0;
+    const LIVE: u8 = 1;
+    const FAILED: u8 = 2;
+
+    fn new(retained: ResourceLease) -> Self {
+        Self {
+            outcome: AtomicU8::new(Self::INSTALLING),
+            woken: tokio::sync::Notify::new(),
+            _retained: retained,
+        }
+    }
+
+    /// Publish failure. Named because three call sites reach it and two of them
+    /// are settling a generation they do not own the route for.
+    fn settle_failed(&self) {
+        self.settle(Self::FAILED);
+    }
+
+    /// Publish the outcome once and wake everyone waiting on it.
+    ///
+    /// First writer wins, enforced rather than documented. A plain store would
+    /// let a second settle overwrite the first, and there is a real path to one:
+    /// a stale installer settles its own generation `FAILED` after finding the
+    /// route replaced, and if it were ever handed a readiness that had already
+    /// gone `LIVE` it would demote it under the waiters' feet. `compare_exchange`
+    /// from `INSTALLING` makes that a no-op instead of a lie, so the type
+    /// enforces the "published once" contract this doc claims.
+    ///
+    /// `notify_waiters` after the exchange, and the order matters: a follower
+    /// woken before the outcome was visible would read `INSTALLING` and go back
+    /// to sleep on a notification that is never sent twice. It runs on the
+    /// losing path too — nothing is waiting on the loser's behalf, and waking a
+    /// waiter that then re-reads a settled outcome is free.
+    fn settle(&self, outcome: u8) {
+        let _ = self.outcome.compare_exchange(
+            Self::INSTALLING,
+            outcome,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        self.woken.notify_waiters();
+    }
+
+    /// Wait until the install finishes, and answer whether it worked.
+    ///
+    /// Subscribed before the state is read, for the same reason every other
+    /// waiter in this crate is: `notify_waiters` reaches whoever is listening at
+    /// that instant and nobody else, and this notification is sent exactly once.
+    /// A check-then-subscribe would let an install that finished in between wake
+    /// nothing, and the follower would wait for a second wake that never comes.
+    pub(crate) async fn wait(&self) -> bool {
+        loop {
+            let woken = self.woken.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            match self.outcome.load(Ordering::Acquire) {
+                Self::LIVE => return true,
+                Self::FAILED => return false,
+                _ => {}
+            }
+            woken.await;
+        }
+    }
+}
+
+/// How a pump is stopped, and how its end is observed.
+///
+/// Both halves, because either alone is a lie. Cancelling without joining says
+/// "stop" and returns before the task has; joining without cancelling waits for
+/// something that has not been asked to finish.
+///
+/// The cancellation is a [`PendingCancellation`] — a flag *and* a notification —
+/// and not a bare `Notify`. A bare `Notify` delivers to whoever is listening at
+/// that instant and to nobody else, and this signal is sent exactly once. The
+/// last unsubscribe can easily beat the spawned pump to its first `notified()`,
+/// and then the only wake there will ever be has already been spent: the pump
+/// waits on a channel nobody publishes to, and the join that follows never
+/// returns. The flag is what a late-arriving waiter reads instead.
+struct PumpOwner {
+    cancel: Arc<RouteCancellation>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+/// The pump's stop signal: a flag, a notification, and the funding for its own
+/// allocation.
+///
+/// The flag is what makes the signal survivable. A bare `Notify` reaches
+/// whoever is listening at that instant and nobody else, and this signal is sent
+/// exactly once — so a last unsubscribe that beats the spawned pump to its first
+/// `notified()` spends the only wake there will ever be, and the join that
+/// follows waits forever on a channel nobody publishes to. A late waiter reads
+/// the flag instead.
+///
+/// The lease is here rather than in [`ChannelRoute`] for the same reason
+/// [`RouteReady`]'s is: the pump holds a clone and is still using it while it
+/// unwinds, after the route that created it is gone.
+pub(crate) struct RouteCancellation {
+    cancelled: AtomicBool,
+    woken: tokio::sync::Notify,
+    _retained: ResourceLease,
+}
+
+impl RouteCancellation {
+    fn new(retained: ResourceLease) -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            woken: tokio::sync::Notify::new(),
+            _retained: retained,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.woken.notify_waiters();
+    }
+
+    /// Resolve once cancelled, immediately if it already has been.
+    ///
+    /// Subscribe, then read: a check-then-subscribe would let a cancellation
+    /// landing in between wake nothing, which is the whole failure this type
+    /// exists to prevent.
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let woken = self.woken.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            woken.await;
+        }
+    }
+}
+
+/// One `Arc<RouteReady>` pointee, funded before it exists.
+///
+/// Its own lease and not the route's, because waiters read this after the route
+/// is gone. [`RouteCancellation`] is funded separately by
+/// [`ClientRegistry::route_cancellation`] for the mirrored reason: the pump
+/// holds a clone while it unwinds. Two allocations with two different last
+/// owners get two leases; folding either into the route would return funding
+/// while the thing it paid for was still in use.
+fn route_ready_retained() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    retained_claim(arc_allocation_bytes::<RouteReady>()?, 1)
+}
+
+/// One `Arc<RouteCancellation>` pointee, funded before it exists.
+fn route_cancellation_retained() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    retained_claim(arc_allocation_bytes::<RouteCancellation>()?, 1)
+}
+
+/// What one subscriber must do next, decided under the tables lock.
+///
+/// Returned instead of the old bare `bool`. `true` meant "you are first, install
+/// a pump" and `false` meant "you are done" — and that second answer was wrong
+/// whenever a route was still installing, because the client was told it had
+/// subscribed before anything could deliver to it.
+pub(crate) enum ChannelJoin {
+    /// This caller owns the install. Report to its client only after calling
+    /// [`ClientRegistry::finish_channel_install`].
+    Install(Arc<RouteReady>),
+    /// Someone else is installing. Await this before reporting anything.
+    Pending(Arc<RouteReady>),
+    /// The pump is already running.
+    Live,
+}
+
+impl ChannelRoute {
+    /// Only [`RegistryResidue`] asks, and only under `cfg(test)`: production
+    /// never branches on this, because every caller that cares about liveness
+    /// is already holding a [`ChannelJoin`] that told it.
+    #[cfg(test)]
+    fn is_installing(&self) -> bool {
+        matches!(self.state, RouteState::Installing(_))
+    }
+}
+
+/// A route that is gone, handed to a caller that can await what it left behind.
+///
+/// One type for both stages a route can be removed in, because they are one
+/// obligation: something is still owed to somebody. A live route owes its pump a
+/// stop and a join; an installing route owes its followers an answer. Splitting
+/// them would mean two vectors on the disconnect path to say the same thing.
+///
+/// The field is private and the type is `#[must_use]` for the same reason. A
+/// bare `JoinHandle` returned from `unsubscribe_channel` would be dropped by an
+/// inattentive caller, and dropping a `JoinHandle` **detaches** the task rather
+/// than stopping it — the pump would keep running against a channel with no
+/// subscribers, which is the exact failure the route lifecycle exists to end.
+#[must_use = "a removed route still owes its pump a join or its followers an answer"]
+pub(crate) struct RetiredRoute(Retired);
+
+/// What a removed route left behind. Private: the stage is this module's
+/// business, and every caller's obligation is the same either way.
+enum Retired {
+    Pump(PumpOwner),
+    /// The install never finished. Its installer will find the route gone and
+    /// settle only its own generation, so these followers are nobody else's to
+    /// answer.
+    Installing(Arc<RouteReady>),
+}
+
+impl RetiredRoute {
+    fn from_state(state: RouteState) -> Self {
+        Self(match state {
+            RouteState::Live(pump) => Retired::Pump(pump),
+            RouteState::Installing(ready) => Retired::Installing(ready),
+        })
+    }
+
+    /// A pump that was built for a route that no longer wants it.
+    fn orphaned_pump(cancel: Arc<RouteCancellation>, join: tokio::task::JoinHandle<()>) -> Self {
+        Self(Retired::Pump(PumpOwner { cancel, join }))
+    }
+
+    /// Settle what this route owes: signal the pump and wait for it to actually
+    /// stop, or tell the followers the install they were waiting on is over.
+    ///
+    /// For a pump, both halves in that order, and the await is the part that
+    /// matters. Cancelling alone returns while the task is still running, so a
+    /// caller that then reported the channel torn down would be wrong — and
+    /// `serve`, which waits on the accepted-task count, would be waiting for a
+    /// task nobody had finished asking to stop.
+    ///
+    /// A join error means the pump panicked or was aborted. There is nothing to
+    /// do about it here and nothing to report to: the route is gone either way,
+    /// and the point of this call is that the task is no longer running.
+    pub(crate) async fn retire(self) {
+        match self.0 {
+            Retired::Pump(pump) => {
+                pump.cancel.cancel();
+                // Reads as a no-op and is not: `cancel` stores the flag *and*
+                // notifies, so a pump that has not yet parked still sees the
+                // flag when it does.
+                let _ = pump.join.await;
+            }
+            Retired::Installing(ready) => ready.settle_failed(),
+        }
     }
 }
 
@@ -677,6 +1709,120 @@ impl RegistryInner {
 pub enum HandlerMode {
     Single,
     Stream,
+}
+
+/// Which installation of a method name something belongs to.
+///
+/// Minted before the handler closure is built, so the closure can carry its own
+/// and ask this registry whether it is still the current one. Comparing names
+/// cannot answer that: a client may release a method and another may claim it
+/// while a clone of the first closure is still awaiting a response, and both
+/// closures answer to the same name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HandlerGeneration(u64);
+
+/// One installed synthetic handler.
+///
+/// The mode lives here beside the registration rather than being inferred from
+/// the claim, because they are one fact: the shape a call is dispatched as and
+/// the closure that dispatches it were installed together and are replaced
+/// together.
+struct InstalledHandler {
+    generation: HandlerGeneration,
+    mode: HandlerMode,
+    token: HandlerToken,
+    /// This record's copy of the method name.
+    _retained: ResourceLease,
+}
+
+/// The core registration behind an installed handler.
+enum HandlerToken {
+    /// Core has published the handler, and this registry does not hold its
+    /// registration yet — the few instructions between `commit_with` returning
+    /// and the finalize below it.
+    ///
+    /// Still routable, and that is safe rather than convenient. Routing is
+    /// decided by generation and class, not by this state: before core
+    /// publishes, the only closure that can run is the incumbent's and its
+    /// generation does not match this record; after core publishes — which
+    /// cannot fail, every acquisition having happened in prepare — the new
+    /// closure's generation does match. There is no instant at which a stale
+    /// closure maps onto this record, so refusing calls here would refuse
+    /// correct ones for nothing.
+    Installing,
+    /// Dropping this removes exactly the handler it installed. Core compares
+    /// the stored identity against whatever currently holds the name, so a
+    /// registration released after a successor legitimately took the method
+    /// removes nothing.
+    ///
+    /// Named and underscored because it is held rather than read: nothing in
+    /// this crate ever looks inside it, and its whole contribution is what
+    /// happens when this variant drops. Spelling that out beats a blanket
+    /// allowance, which would also silence a field that had genuinely stopped
+    /// being used.
+    Live {
+        _registration: myownmesh_core::rpc::OwnedMethodRegistration,
+    },
+    /// A control's stand-in for a published registration.
+    ///
+    /// Holds nothing and removes nothing when it drops, because there is no
+    /// dispatcher behind it. It exists for the same reason
+    /// `install_if_live` is generic over its value: a real registration can
+    /// only be minted by core against a live network, and the ordering rules
+    /// this registry has to get right must be drivable by a control that has
+    /// neither a network nor an engine.
+    #[cfg(test)]
+    LiveWithoutCore,
+}
+
+/// What one committed claim leaves for the caller to finish outside the locks.
+///
+/// Everything in here is something that cannot be dealt with where it was
+/// produced: the daemon's half of the transaction runs under core's handlers
+/// lock *and* this registry's tables lock, and releasing a registration or
+/// settling a pending call reaches code that must not run under either.
+pub struct ClaimCommitted {
+    /// The client this claim took the method from, if it took it from anyone.
+    displaced: Option<ClientId>,
+    /// The core registration this claim replaced in an existing record.
+    ///
+    /// The token alone and not the whole record: a re-claim writes over the
+    /// value in a node that already exists, so the node and the lease funding
+    /// its key stay exactly where they are. Taking the record out would release
+    /// the funding for a key the table is still holding.
+    retired: Option<HandlerToken>,
+    /// Everything the displaced owner had in flight on this exact method,
+    /// detached under the same acquisition that moved the claim so no call can
+    /// be admitted to an owner that has just stopped being one.
+    settled: Vec<PendingRecord>,
+}
+
+/// A registry reference that does not keep the registry alive.
+///
+/// Every synthetic handler closure holds one of these, and it has to be weak.
+/// A live network owns its handler entries, and an entry owns the closure — so
+/// a strong clone in the closure would make the *network* an owner of this
+/// registry. The control runtime dropping its registry would then free nothing:
+/// every client record, every held name and all of their funding would stay
+/// alive until the handler was forgotten or the gateway closed, which is a
+/// different lifetime entirely and not one the daemon controls.
+///
+/// Not a reference cycle — an [`OwnedMethodRegistration`] holds only a `Weak`
+/// to the dispatcher and keeps nothing alive — but the retention is just as
+/// real, and it is the daemon's own state being retained.
+///
+/// [`OwnedMethodRegistration`]: myownmesh_core::rpc::OwnedMethodRegistration
+#[derive(Clone)]
+pub struct WeakClientRegistry {
+    inner: std::sync::Weak<RegistryInner>,
+}
+
+impl WeakClientRegistry {
+    /// The registry, if it is still alive. `None` means the daemon is gone and
+    /// the caller has nothing left to route to.
+    pub fn upgrade(&self) -> Option<ClientRegistry> {
+        self.inner.upgrade().map(|inner| ClientRegistry { inner })
+    }
 }
 
 /// Every operation this registry performs on the tables declared above.

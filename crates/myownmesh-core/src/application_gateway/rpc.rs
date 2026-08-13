@@ -49,7 +49,7 @@ impl ApplicationGateway {
                 &owner,
                 state.session_broker.as_ref(),
                 &state.network_id,
-                |session, app| app.rpc_mut().register_local_request(session, effect),
+                |session, app| app.rpc_mut().register_local_request(peer, session, effect),
             )
             .ok_or(crate::rpc::RpcRegistrationRefusal::SessionNotCurrent)?
     }
@@ -88,20 +88,5 @@ impl ApplicationGateway {
             .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| crate::error::Error::Network("engine dropped reply".into()))?
-    }
-
-    pub(crate) async fn broadcast_capabilities(
-        &self,
-        state: &crate::engine::state::NetworkState,
-        caps: crate::protocol::CapabilityAdvert,
-    ) -> crate::error::Result<usize> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        state
-            .cmd_tx
-            .send(crate::engine::state::NetworkCmd::BroadcastCapabilities { caps, reply })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await.map_err(|_| {
-            crate::error::Error::Network("engine dropped capability broadcast reply".into())
-        })
     }
 }

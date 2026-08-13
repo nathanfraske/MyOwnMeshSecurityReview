@@ -41,8 +41,24 @@ pub mod bridge;
 pub mod clients;
 pub mod wire;
 
+#[cfg(test)]
+pub use clients::RegistryResidue;
+/// Channel-route lifecycle machinery, which is this daemon's own and not an
+/// embedder's authority.
+///
+/// Crate-visible rather than public, and the distinction is real: an embedder
+/// that could name a [`clients::RouteReady`] could wait on an install it does
+/// not own, and one that could name a [`clients::RouteCancellation`] could stop
+/// a pump the daemon is accounting for. Nothing outside this crate has a reason
+/// to hold either. Their owners -- [`clients::ChannelJoin`] and
+/// [`clients::RetiredRoute`] -- travel with them for the same reason and to keep
+/// their effective visibility matched, which is what stops a public signature
+/// naming a crate-private type.
+#[allow(unused_imports)]
+pub(crate) use clients::{ChannelJoin, RetiredRoute, RouteCancellation, RouteReady};
 #[allow(unused_imports)]
 pub use clients::{
-    ClientHandle, ClientId, ClientRegistry, RealtimeFlowCapability, UnregisteredClient,
+    ClientHandle, ClientId, ClientRegistry, ForgottenMethod, HandlerGeneration, Lifecycle,
+    MethodRelease, RealtimeFlowCapability, TaskAdmission, UnregisteredClient, WeakClientRegistry,
 };
 pub use wire::ServerOut;

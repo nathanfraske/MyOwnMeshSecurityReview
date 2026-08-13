@@ -66,8 +66,9 @@ fn disconnect_winner_returns_completed_install_to_its_sole_cleanup_owner() {
         .install_if_live(
             &owner,
             LeasedMap::<ClaimKey, ()>::entry_claim(),
+            Ok(ResourceClaim::ZERO),
             Completed(drops.clone()),
-            move |completed, _entry| {
+            move |completed, _entry, _retained| {
                 installed_probe.store(true, Ordering::Release);
                 completed
             },
@@ -102,8 +103,9 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
     reg.install_if_live(
         &owner,
         LeasedMap::<ClaimKey, ()>::entry_claim(),
+        Ok(ResourceClaim::ZERO),
         7_u32,
-        move |value, _entry| landed.lock().push(value),
+        move |value, _entry, _retained| landed.lock().push(value),
     )
     .expect("a registered, connected owner admits the install");
     assert_eq!(&*table.lock(), &[7], "the install ran");
@@ -126,8 +128,9 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
         reg.install_if_live(
             &owner,
             LeasedMap::<ClaimKey, ()>::entry_claim(),
+            Ok(ResourceClaim::ZERO),
             9_u32,
-            move |value, _entry| refused.lock().push(value)
+            move |value, _entry, _retained| refused.lock().push(value)
         )
         .is_err(),
         "the same owner admits nothing once it has disconnected"
@@ -181,7 +184,7 @@ fn release_method_only_succeeds_for_current_owner() {
     let foreign = reg.release_method(&key, b.id);
     assert!(!foreign.released);
     assert!(
-        !foreign.forget,
+        !foreign.retired(),
         "a release that changed nothing cannot orphan the handler it left alone"
     );
     assert_eq!(reg.handler_owner(&key), Some(a.id));
@@ -190,7 +193,7 @@ fn release_method_only_succeeds_for_current_owner() {
     let owned = reg.release_method(&key, a.id);
     assert!(owned.released);
     assert!(
-        owned.forget,
+        owned.retired(),
         "the last claim on a method leaves its synthetic handler serving nobody"
     );
     assert!(reg.handler_owner(&key).is_none());
@@ -203,7 +206,7 @@ fn release_method_only_succeeds_for_current_owner() {
     let again = reg.release_method(&key, a.id);
     assert!(!again.released);
     assert!(
-        !again.forget,
+        !again.retired(),
         "forgetting is answered once; a second release has no handler to orphan"
     );
 }
@@ -221,18 +224,24 @@ fn unregister_drops_claims_and_subscriptions() {
         .expect("the daemon test grant funds one channel subscription");
 
     assert_eq!(reg.handler_owner(&method_key), Some(a.id));
-    assert_eq!(reg.channel_subscribers(&channel_key), vec![a.id]);
+    let mut members = Vec::new();
+    assert!(reg.for_each_subscriber(&channel_key, |client| members.push(client.id)));
+    assert_eq!(members, vec![a.id]);
 
     let removed = reg.unregister(a.id).expect("registered client");
 
     assert!(reg.handler_owner(&method_key).is_none());
-    assert!(reg.channel_subscribers(&channel_key).is_empty());
+    assert!(!reg.for_each_subscriber(&channel_key, |_| {}));
     assert!(reg.client(a.id).is_none());
     assert_eq!(
-        removed.forget,
+        removed
+            .forget
+            .iter()
+            .map(|forgotten| forgotten.key.clone())
+            .collect::<Vec<_>>(),
         vec![method_key],
-        "a disconnect is the last unclaim too, and it names the handler the \
-         caller has to forget through its network"
+        "a disconnect is the last unclaim too, and it carries out the registration that \
+         removes the handler"
     );
 }
 
@@ -258,36 +267,402 @@ fn unregister_doesnt_collateral_drop_a_displacing_claim() {
     );
 }
 
+/// The first subscriber installs; everyone after it waits or is already live.
+///
+/// Renamed from a control about a `bool` flag, because the flag was the defect.
+/// `false` used to mean "you are done" and was returned to a follower that had
+/// joined a route still being installed — so the follower's client was told it
+/// was subscribed before anything existed to deliver to it.
 #[test]
-fn channel_subscribe_first_subscriber_flag() {
+fn v4_f2_daemon_only_the_first_subscriber_owns_the_install() {
     let reg = ClientRegistry::default();
     let (a, _) = fresh_client(&reg);
     let (b, _) = fresh_client(&reg);
     let key = ("net".to_string(), "catalog".to_string());
 
+    let a_join = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the daemon test grant funds one channel subscription");
     assert!(
-        reg.subscribe_channel(key.clone(), a.id)
-            .expect("the daemon test grant funds one channel subscription"),
-        "first sub"
+        matches!(a_join, ChannelJoin::Install(_)),
+        "the first subscriber owns the install"
     );
     assert!(
-        !reg.subscribe_channel(key.clone(), b.id)
-            .expect("the daemon test grant funds a second member"),
-        "second sub"
+        matches!(
+            reg.subscribe_channel(key.clone(), b.id)
+                .expect("the daemon test grant funds a second member"),
+            ChannelJoin::Pending(_)
+        ),
+        "a follower arriving mid-install must wait, not be told it succeeded"
     );
     assert!(
-        !reg.subscribe_channel(key.clone(), b.id)
-            .expect("re-subscribing funds no second member"),
-        "a repeat subscription is not a first one"
+        matches!(
+            reg.subscribe_channel(key.clone(), b.id)
+                .expect("re-subscribing funds no second member"),
+            ChannelJoin::Pending(_)
+        ),
+        "and a repeat subscription is still not an install"
     );
-    assert_eq!(reg.channel_subscribers(&key), vec![a.id, b.id]);
 
-    assert!(!reg.unsubscribe_channel(&key, b.id));
-    assert!(reg.unsubscribe_channel(&key, a.id));
+    // Both are members already, which is what makes the wait correct rather
+    // than merely cautious: they are subscribed, and the route is what is not
+    // yet deliverable.
+    let mut seen = Vec::new();
+    assert!(reg.for_each_subscriber(&key, |client| seen.push(client.id)));
+    assert_eq!(seen, vec![a.id, b.id]);
+}
+
+/// A failed install refuses every member, not just the installer.
+///
+/// The old shape unwound only the caller that discovered the failure, because
+/// it was the only one it knew about. A follower that had joined in the
+/// meantime kept its membership, its client had already been told it was
+/// subscribed, and no pump existed to ever notice.
+#[tokio::test]
+async fn v4_f2_daemon_a_failed_install_unwinds_every_member() {
+    let reg = ClientRegistry::default();
+    let (a, _) = fresh_client(&reg);
+    let (b, _) = fresh_client(&reg);
+    let key = ("net".to_string(), "catalog".to_string());
+
+    let ChannelJoin::Install(installing) = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the daemon test grant funds one channel subscription")
+    else {
+        panic!("the first subscriber owns the install")
+    };
+    let ChannelJoin::Pending(waiting) = reg
+        .subscribe_channel(key.clone(), b.id)
+        .expect("the daemon test grant funds a second member")
+    else {
+        panic!("the second subscriber is a follower")
+    };
+
+    // The install fails. No pump was built.
     assert!(
-        reg.unsubscribe_channel(&key, a.id),
-        "an emptied channel is removed with its last member, and an unknown \
-         channel has no subscribers either"
+        reg.finish_channel_install(&key, &installing, None)
+            .is_none(),
+        "a failure that built no pump has nothing to hand back"
+    );
+
+    assert!(
+        !waiting.wait().await,
+        "the follower is told the install failed rather than that it succeeded"
+    );
+    assert!(
+        !reg.for_each_subscriber(&key, |_| {}),
+        "and the route is gone, with both members, not just the installer"
+    );
+    assert_eq!(
+        reg.residue().channel_routes,
+        0,
+        "no route survives a failed install"
+    );
+    // The central tables are only half of it. Each client keeps its own copy of
+    // the name, with the lease that funds it, and an unwind that left those
+    // installed would be stale ownership: a later retry would skip funding the
+    // name because the client "already holds" it, and a disconnect would release
+    // a subscription that no longer exists.
+    assert!(
+        !a.channel_subs.holds(&key),
+        "the installer's own held name is released"
+    );
+    assert!(
+        !b.channel_subs.holds(&key),
+        "and so is the follower's, which the old unwind never knew about"
+    );
+    assert_eq!(
+        reg.residue().channel_subs,
+        0,
+        "no client is left holding a name for a route that does not exist"
+    );
+}
+
+/// A finish that lands on a route it did not install changes nothing.
+///
+/// The window is real: a route can be emptied by its last unsubscribe and
+/// recreated by a new subscriber while the first installer's gateway
+/// subscription is still being built. Both routes answer to the same
+/// `(network, channel)` key, so a finish that matched on the key alone would
+/// publish the first installer's pump into the second installer's route — which
+/// then owns two pumps and joins one — or, on failure, delete a route that was
+/// perfectly healthy and strand its followers.
+#[tokio::test]
+async fn v4_f2_daemon_a_stale_installer_cannot_touch_the_route_that_replaced_it() {
+    let reg = ClientRegistry::default();
+    let (a, _) = fresh_client(&reg);
+    let (b, _) = fresh_client(&reg);
+    let key = ("net".to_string(), "catalog".to_string());
+
+    let ChannelJoin::Install(first) = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the daemon test grant funds one channel subscription")
+    else {
+        panic!("the first subscriber owns the install")
+    };
+    // A leaves before its install finishes, so the route is removed and its
+    // followers -- none, here -- are owed an answer.
+    reg.unsubscribe_channel(&key, a.id)
+        .expect("the last member takes the route with it")
+        .retire()
+        .await;
+    // B arrives and creates a second route under the same name.
+    let ChannelJoin::Install(second) = reg
+        .subscribe_channel(key.clone(), b.id)
+        .expect("the daemon test grant funds a second subscription")
+    else {
+        panic!("the route was removed, so B installs a new one")
+    };
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the fixture is only meaningful if these are different generations"
+    );
+
+    // Now A's install finishes, late, with a pump.
+    let orphan = reg
+        .finish_channel_install(&key, &first, Some(fixture_pump(&reg)))
+        .expect("a pump published into no route comes back rather than being dropped");
+    orphan.retire().await;
+
+    assert_eq!(
+        reg.residue().installing_routes,
+        1,
+        "B's route is untouched -- still installing, not live and not deleted"
+    );
+    assert!(
+        !first.wait().await,
+        "A's own generation is told it failed, because for A it did"
+    );
+
+    // And B can still finish its own install, which is the proof that nothing
+    // was consumed on its behalf.
+    assert!(
+        reg.finish_channel_install(&key, &second, Some(fixture_pump(&reg)))
+            .is_none(),
+        "the current installer publishes into its own route"
+    );
+    assert!(second.wait().await, "and its followers are told it worked");
+    assert_eq!(reg.residue().installing_routes, 0);
+    assert_eq!(reg.residue().channel_routes, 1);
+    reg.unsubscribe_channel(&key, b.id)
+        .expect("the last member retires the route")
+        .retire()
+        .await;
+}
+
+/// The last unsubscribe retires the route and hands back its pump.
+///
+/// A route that emptied used to leave its task to notice on the next frame.
+/// On a channel nobody is publishing to there is no next frame, so the pump
+/// was immortal in exactly the case where it was useless. The handle comes
+/// back so the caller can cancel and join it — and it is `#[must_use]`,
+/// because dropping a `JoinHandle` detaches a task rather than stopping it.
+#[test]
+fn v4_f2_daemon_the_last_unsubscribe_retires_the_route() {
+    let reg = ClientRegistry::default();
+    let (a, _) = fresh_client(&reg);
+    let (b, _) = fresh_client(&reg);
+    let key = ("net".to_string(), "catalog".to_string());
+
+    let ChannelJoin::Install(installing) = reg
+        .subscribe_channel(key.clone(), a.id)
+        .expect("the daemon test grant funds one channel subscription")
+    else {
+        panic!("the first subscriber owns the install")
+    };
+    reg.subscribe_channel(key.clone(), b.id)
+        .expect("the daemon test grant funds a second member");
+    // A pump the control owns, so retirement has something real to hand back.
+    //
+    // The runtime is built but deliberately never driven until the retirement
+    // below, which is what makes this control discriminating rather than
+    // merely descriptive: the spawned task has provably not reached its first
+    // poll, so the cancellation arrives strictly *before* anything is listening
+    // for it. A bare `Notify` would deliver that wake to nobody -- it reaches
+    // whoever is subscribed at that instant and this signal is sent exactly
+    // once -- and the task would then park forever on a notification that has
+    // already been spent. The flag is what a late waiter reads instead.
+    let cancel = reg
+        .route_cancellation()
+        .expect("the daemon test grant funds one pump cancellation");
+    let waiting = Arc::clone(&cancel);
+    let pump = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the fixture pump");
+    let join = pump.spawn(async move { waiting.cancelled().await });
+    assert!(
+        reg.finish_channel_install(&key, &installing, Some((cancel, join)))
+            .is_none(),
+        "the current installer publishes into its own route"
+    );
+
+    assert!(
+        reg.unsubscribe_channel(&key, b.id).is_none(),
+        "a route with members left is not retired"
+    );
+    assert_eq!(reg.residue().channel_routes, 1);
+    let retired = reg
+        .unsubscribe_channel(&key, a.id)
+        .expect("the last member retires the route and yields its pump");
+    assert_eq!(
+        reg.residue().channel_routes,
+        0,
+        "the route goes with its last member"
+    );
+    assert!(
+        reg.unsubscribe_channel(&key, a.id).is_none(),
+        "and an unknown channel retires nothing"
+    );
+    // The join is the assertion. The timeout is a failure detector and not the
+    // authority for success: a pump that lost its only wake never returns from
+    // this, and without a bound that regression would hang the control rather
+    // than fail it.
+    pump.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), retired.retire())
+            .await
+            .expect("the pump observes a cancellation that arrived before it was listening");
+    });
+}
+
+/// A pump the controls own, spawned on a runtime they drive.
+///
+/// The cancellation comes from the registry rather than being constructed here,
+/// so these fixtures exercise the same funded allocation production does.
+fn fixture_pump(
+    registry: &ClientRegistry,
+) -> (
+    Arc<crate::ipc::RouteCancellation>,
+    tokio::task::JoinHandle<()>,
+) {
+    let cancel = registry
+        .route_cancellation()
+        .expect("the daemon test grant funds one pump cancellation");
+    let waiting = Arc::clone(&cancel);
+    let join = tokio::spawn(async move { waiting.cancelled().await });
+    (cancel, join)
+}
+
+/// A closure from an earlier installation cannot route to the client that
+/// displaced it.
+///
+/// The window is real and unavoidable: a synthetic handler's closure is cloned
+/// per call and may still be awaiting a response when another client claims the
+/// same method. Asking "who owns this name?" would hand that in-flight clone
+/// the *newcomer* -- dispatching a call that arrived under one client's class to
+/// another client that never agreed to serve it, and filing a pending entry
+/// under a coordinate the new owner will never answer.
+///
+/// So the question is not "who owns this name" but "am I still the installation
+/// that was published?", and both halves have to match: the generation, because
+/// a name outlives its installations, and the class, because a client that
+/// re-claims its own method as a stream is a different installation from the
+/// single-shot one it replaced.
+#[test]
+fn v4_f3_daemon_a_stale_closure_cannot_route_to_the_client_that_displaced_it() {
+    let reg = ClientRegistry::default();
+    let (a, _) = fresh_client(&reg);
+    let (b, _) = fresh_client(&reg);
+    let key = ("net".to_string(), "infer".to_string());
+
+    let (first, displaced) = reg
+        .claim_method_generation(key.clone(), a.id, HandlerMode::Single)
+        .expect("the daemon test grant funds one method claim");
+    assert!(displaced.is_none(), "there was no incumbent to displace");
+    assert_eq!(
+        reg.handler_owner_for(&key, first, HandlerMode::Single),
+        Some(a.id),
+        "the installation that was published routes to the client that made it"
+    );
+    assert_eq!(
+        reg.handler_owner_for(&key, first, HandlerMode::Stream),
+        None,
+        "and only in the shape it was installed as"
+    );
+
+    let (second, displaced) = reg
+        .claim_method_generation(key.clone(), b.id, HandlerMode::Stream)
+        .expect("the daemon test grant funds the displacing claim");
+    assert_eq!(displaced, Some(a.id));
+    assert_ne!(
+        first, second,
+        "the fixture is only meaningful if these are different installations"
+    );
+
+    assert_eq!(
+        reg.handler_owner_for(&key, first, HandlerMode::Single),
+        None,
+        "A's closure is told nobody holds the method, which for A's own installation is true"
+    );
+    assert_eq!(
+        reg.handler_owner_for(&key, first, HandlerMode::Stream),
+        None,
+        "and it cannot reach B by guessing the new class either"
+    );
+    assert_eq!(
+        reg.handler_owner_for(&key, second, HandlerMode::Stream),
+        Some(b.id),
+        "while the installation that is actually published routes normally"
+    );
+    assert_eq!(
+        reg.handler_owner(&key),
+        Some(b.id),
+        "the claim itself moved: it is the routing question that is exact, not the ownership record"
+    );
+}
+
+/// A claim the daemon refuses leaves the incumbent installation untouched.
+///
+/// Refusal is the ordinary case, not the exceptional one: a client that
+/// disconnects between funding a registration and committing it, a runtime
+/// entering shutdown, a grant with nothing left. Under the old two-step order
+/// the incumbent's handler had already been overwritten by the time any of
+/// those was discovered, so a refused claim still took the method away from a
+/// client that was serving it.
+///
+/// Every field of the incumbent is checked, because "unchanged" has three parts
+/// here and only one of them is the owner: a refusal that left the generation
+/// or the class moved would silently stop the incumbent's own closure routing
+/// while telling it nothing.
+#[test]
+fn v4_f3_daemon_a_refused_claim_leaves_the_incumbent_generation_and_class_exact() {
+    let reg = ClientRegistry::default();
+    let (a, _) = fresh_client(&reg);
+    let (b, _) = fresh_client(&reg);
+    let key = ("net".to_string(), "infer".to_string());
+
+    let (incumbent, _) = reg
+        .claim_method_generation(key.clone(), a.id, HandlerMode::Single)
+        .expect("the daemon test grant funds one method claim");
+
+    // B goes away between funding its registration and committing it. Core
+    // would have published nothing, because the daemon's half refuses first.
+    let gone = b.id;
+    drop(reg.unregister(gone).expect("registered client"));
+    let refusal = reg.claim_method_generation(key.clone(), gone, HandlerMode::Stream);
+    assert!(
+        matches!(refusal, Err(RegistrationError::ClientGone)),
+        "the refusal names the real cause"
+    );
+
+    assert_eq!(
+        reg.handler_owner(&key),
+        Some(a.id),
+        "the incumbent still owns the method it was serving"
+    );
+    assert_eq!(
+        reg.handler_mode(&key),
+        Some(HandlerMode::Single),
+        "in the shape it claimed it, not the one that was refused"
+    );
+    assert_eq!(
+        reg.handler_owner_for(&key, incumbent, HandlerMode::Single),
+        Some(a.id),
+        "and its own closure still routes -- the generation did not move under it"
+    );
+    assert!(
+        a.method_claims.holds(&key),
+        "and the incumbent's own record of the claim is intact"
     );
 }
 
@@ -576,5 +951,479 @@ async fn wrong_response_class_retains_same_operation_identity() {
         Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
             serde_json::json!("same-op")
         ))
+    );
+}
+
+// ---- shutdown lifecycle -------------------------------------------------
+//
+// The daemon's control surface is terminal: once it starts closing it admits
+// nothing further, and `control::serve` does not return while a task it accepted
+// is still running. These controls are about the two ways that goes wrong --
+// something slipping in after the transition, and something outliving the
+// function that started it.
+
+/// A registration barriered at the instant before it commits loses to `Closing`.
+///
+/// This is the race the lifecycle's placement exists for, and it is arranged
+/// rather than hoped for. `register` funds the record and mints the capability
+/// with the lock released, and this control begins the drain in exactly that
+/// window by driving both halves from one thread in a fixed order: the funding
+/// is done, the client is not in the table, and then `begin_closing` runs.
+///
+/// A version that checked the lifecycle only on the way in would pass its check,
+/// be refused nothing, and insert into a table the drain had already walked --
+/// an `EventsSubscribe` that answered success to a client the shutdown will
+/// never clean up, holding a writer mailbox nothing will ever drain.
+#[test]
+fn a_registration_that_reaches_the_commit_after_closing_is_refused() {
+    let reg = ClientRegistry::default();
+    let (tx, _rx) = myownmesh_core::resource_mailbox(crate::test_application_scope())
+        .expect("the daemon test grant funds one client writer mailbox");
+
+    assert!(reg.begin_closing(), "the first caller owns the drain");
+    let refusal = match reg.register(tx) {
+        Ok(_) => panic!("a closing registry admits no client"),
+        Err(refusal) => refusal,
+    };
+    assert!(
+        matches!(refusal, IpcAdmissionError::Closing),
+        "refused for closing, not for capacity: {refusal}"
+    );
+    assert_eq!(reg.lifecycle(), Lifecycle::Closing);
+}
+
+/// Every admitting path refuses once closing, not just registration.
+///
+/// Listed one by one rather than asserted over "the registry" as a whole,
+/// because each is a separate lock acquisition with its own early returns, and a
+/// guard omitted from one of them is invisible from any of the others. A client
+/// is registered *before* the transition so that each refusal below is the
+/// lifecycle's doing and not `ClientGone`.
+#[test]
+fn a_closing_registry_admits_no_new_work_on_any_path() {
+    let reg = ClientRegistry::default();
+    let (client, _rx) = fresh_client(&reg);
+    let key: ClaimKey = ("net".to_string(), "method".to_string());
+
+    assert!(reg.begin_closing());
+
+    assert!(
+        matches!(
+            reg.claim_method(key.clone(), client.id, HandlerMode::Single),
+            Err(RegistrationError::Admission(IpcAdmissionError::Closing))
+        ),
+        "a method claim is refused"
+    );
+    assert!(
+        matches!(
+            reg.subscribe_channel(key.clone(), client.id),
+            Err(RegistrationError::Admission(IpcAdmissionError::Closing))
+        ),
+        "a channel subscription is refused"
+    );
+    assert!(
+        matches!(reg.lease_task(), Err(IpcAdmissionError::Closing)),
+        "a task is refused"
+    );
+    assert!(
+        matches!(
+            reg.lease_task_retaining(16),
+            Err(IpcAdmissionError::Closing)
+        ),
+        "a task retaining captures is refused"
+    );
+    // And nothing was installed by any of them.
+    assert!(reg.handler_owner(&key).is_none());
+    assert!(!reg.for_each_subscriber(&key, |_| {}));
+}
+
+/// The drain runs once, whoever asks.
+///
+/// A second drain would close realtime flows already closed and forget handlers
+/// already forgotten, through networks that have already been told. Two shutdown
+/// signals, a supervisor racing a broadcast, or a second `serve` over the same
+/// registry all reduce to this.
+#[test]
+fn only_the_first_caller_owns_the_drain() {
+    let reg = ClientRegistry::default();
+    assert!(reg.begin_closing(), "the first caller drains");
+    assert!(!reg.begin_closing(), "the second does not");
+    assert!(!reg.begin_closing(), "and neither does the third");
+    assert_eq!(reg.lifecycle(), Lifecycle::Closing);
+}
+
+/// `serve` waits: the join does not resolve while an accepted task is live.
+///
+/// Both halves, because either alone is satisfiable by a bug. A `wait_for_tasks`
+/// that always resolved would pass the second half; one that never resolved
+/// would pass the first. The admission is dropped between them, which is exactly
+/// what a finishing task does.
+#[tokio::test]
+async fn the_task_join_resolves_only_once_the_last_task_is_gone() {
+    let reg = ClientRegistry::default();
+    let task = reg
+        .lease_task()
+        .expect("the daemon test grant funds one task");
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), reg.wait_for_tasks())
+            .await
+            .is_err(),
+        "the join must not resolve while a task it accepted is still live"
+    );
+    // Closing does not release the wait either: the point of waiting is that the
+    // accepted work finishes rather than being cut short.
+    assert!(reg.begin_closing());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), reg.wait_for_tasks())
+            .await
+            .is_err(),
+        "closing refuses new tasks; it does not abandon accepted ones"
+    );
+
+    drop(task);
+    tokio::time::timeout(std::time::Duration::from_millis(500), reg.wait_for_tasks())
+        .await
+        .expect("the join resolves once the last accepted task ends");
+}
+
+/// A task dropped after the wait began still wakes it.
+///
+/// The subscription-before-check ordering in `wait_for_tasks` is what this is
+/// about. With the check first, a task ending in the window between the read and
+/// the first poll of the notification would send a wake nobody was listening for
+/// -- and since the count only reaches zero once, no second wake would ever
+/// come and `serve` would never return.
+#[tokio::test]
+async fn a_task_ending_during_the_wait_still_wakes_it() {
+    let reg = ClientRegistry::default();
+    let task = reg
+        .lease_task()
+        .expect("the daemon test grant funds one task");
+    let waiting = reg.clone();
+    let joined = tokio::spawn(async move { waiting.wait_for_tasks().await });
+    // Long enough for the wait to be parked rather than merely constructed.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    drop(task);
+    tokio::time::timeout(std::time::Duration::from_millis(500), joined)
+        .await
+        .expect("the wait is woken by the drop")
+        .expect("the waiting task did not panic");
+}
+
+/// `Closed` is published only when it is true.
+///
+/// Three attempts, and only the last one is entitled to succeed: from `Running`
+/// nothing has drained, from `Closing` with a live task nothing has finished,
+/// and only with both conditions met is the claim a fact. `finish_closed`
+/// answers the state rather than asserting one, so a caller that has not earned
+/// `Closed` learns that instead of publishing it.
+#[test]
+fn closed_is_never_published_early() {
+    let reg = ClientRegistry::default();
+    assert_eq!(
+        reg.finish_closed(),
+        Lifecycle::Running,
+        "a runtime that never began closing is not closed"
+    );
+
+    let task = reg
+        .lease_task()
+        .expect("the daemon test grant funds one task");
+    assert!(reg.begin_closing());
+    assert_eq!(
+        reg.finish_closed(),
+        Lifecycle::Closing,
+        "a live accepted task means the control surface is not over"
+    );
+
+    drop(task);
+    assert_eq!(reg.finish_closed(), Lifecycle::Closed);
+    assert_eq!(reg.lifecycle(), Lifecycle::Closed);
+    // And a closed runtime still admits nothing, which is not the same statement
+    // as `Closing` refusing: this one has to survive the state having moved on.
+    assert!(matches!(reg.lease_task(), Err(IpcAdmissionError::Closing)));
+}
+
+/// The closing signal is already-signalled for a task that arrives late.
+///
+/// A connection accepted microseconds before the drain, or a pump whose select
+/// first runs after the transition, has no second signal coming -- `Notify`
+/// delivers `notify_waiters` to whoever is listening at that moment and to
+/// nobody else. Resolving immediately when the state has already left `Running`
+/// is what stops such a task from parking forever on a signal already sent, with
+/// `serve` waiting on it.
+#[tokio::test]
+async fn the_closing_signal_resolves_for_a_task_that_arrives_after_it() {
+    let reg = ClientRegistry::default();
+    assert!(reg.begin_closing(), "signalled with nobody listening");
+    tokio::time::timeout(std::time::Duration::from_millis(500), reg.closing())
+        .await
+        .expect("a late arrival sees the state, not the missed wake");
+}
+
+// ---- off-node retention -------------------------------------------------
+
+/// A long coordinate costs more than a short one, at every record shape.
+///
+/// The claim helpers are the thing under test, not a proxy for it: they are what
+/// `claim_method`, `subscribe_channel` and the pending table actually charge, so
+/// a shape that went back to funding only the node would fail here by producing
+/// equal claims for a one-byte name and a megabyte one. That equality is exactly
+/// the defect — `LeasedMap::entry_claim` funds a fixed-size node no matter how
+/// long the key is, and every table in this registry is keyed by a name a local
+/// client chose.
+///
+/// Strict inequality on the claim, not a threshold: what matters is that cost
+/// *tracks* the name, and any constant would be a number this control invented.
+#[test]
+fn a_longer_coordinate_costs_strictly_more_to_retain() {
+    let short: ClaimKey = ("n".to_string(), "m".to_string());
+    let long: ClaimKey = ("n".repeat(4096), "m".repeat(4096));
+    let short_claim = claim_key_retained(&short).expect("a short claim key is representable");
+    let long_claim = claim_key_retained(&long).expect("a long claim key is representable");
+    assert!(
+        long_claim.amount(ResourceClass::AccountedMemoryBytes)
+            > short_claim.amount(ResourceClass::AccountedMemoryBytes),
+        "a client that picks an eight-kilobyte name is charged for one"
+    );
+    assert_eq!(
+        long_claim.amount(ResourceClass::OpaqueDependencyResidual),
+        short_claim.amount(ResourceClass::OpaqueDependencyResidual),
+        "both are two allocations; only the bytes in them differ"
+    );
+
+    let pending = |len: usize| PendingKey {
+        network: "n".repeat(len),
+        method: "m".repeat(len),
+        remote_peer: "p".repeat(len),
+        remote_request_id: "r".repeat(len),
+        class: HandlerMode::Single,
+    };
+    assert!(
+        pending_key_retained(&pending(4096))
+            .expect("representable")
+            .amount(ResourceClass::AccountedMemoryBytes)
+            > pending_key_retained(&pending(1))
+                .expect("representable")
+                .amount(ResourceClass::AccountedMemoryBytes),
+        "and the same holds for the four coordinates of a pending call"
+    );
+}
+
+/// A length sum this code cannot represent is refused, not silently reduced.
+///
+/// The failure this rules out is specific. `saturating_add` on the four
+/// attacker-influenced lengths of a `PendingKey` turns an unrepresentable total
+/// into `usize::MAX`, which fits in a `u64` and is therefore *accepted* as a
+/// claim — so the single input crafted to overflow would be charged less than
+/// the truth rather than being turned away. Refusal is the only honest answer.
+///
+/// Built from capacities rather than real bytes: allocating two half-address-
+/// space strings is not something a control can do, and the arithmetic is the
+/// subject either way.
+#[test]
+fn an_unrepresentable_coordinate_is_refused_rather_than_truncated() {
+    let huge = usize::MAX / 2;
+    assert!(
+        total_len([huge, huge, huge]).is_err(),
+        "three half-usize lengths do not fit in a usize"
+    );
+    assert!(
+        matches!(
+            total_len([usize::MAX, 1]),
+            Err(ResourceClaimArithmeticError::Overflow { .. })
+        ),
+        "and the refusal is the typed arithmetic one, not a saturated number"
+    );
+    assert_eq!(
+        total_len([1, 2, 3]).expect("a representable sum"),
+        6,
+        "non-vacuity: ordinary sums still add"
+    );
+}
+
+/// A grant that funds one client record and one entry in every table, priced at
+/// `coordinate` bytes of client-chosen name.
+///
+/// Deliberately generous everywhere except the one term under test. It pays for
+/// an entry in each of the eight tables and eight copies of the widest retained
+/// key shape, so nodes, records and provider bookkeeping are all comfortable;
+/// what it does *not* leave slack in is name bytes at `coordinate`. That is the
+/// only byte-sensitive term, which is what makes a refusal below attributable to
+/// name length rather than to a fixture that was tight in some other dimension.
+fn registry_granting_coordinate(coordinate: usize) -> ClientRegistry {
+    let grant = registry_fixture_claim(1, 1, coordinate)
+        .expect("the control grant is representable")
+        .checked_add(
+            ResourceClaim::try_from_entries([(ResourceClass::OpaqueDependencyResidual, 1 << 20)])
+                .expect("the bookkeeping headroom is representable"),
+        )
+        .expect("the control grant is representable");
+    ClientRegistry::over_grant(grant)
+}
+
+/// The same filing, admitted with a short coordinate and refused with a long
+/// one.
+///
+/// This is the production path, not the claim helpers: `claim_method` is what a
+/// client reaches through `RpcServe`, and the two calls below differ in exactly
+/// one thing — the number of bytes in the name. A registry that funded only the
+/// node would admit both, because the node is the same size either way, and
+/// that equality is the defect.
+///
+/// The grant is sized from the same function the daemon's own test grant uses,
+/// so the byte-sensitive term is fixed at `SHORT` while every other term stays
+/// generous. The long case exceeds the grant by name bytes alone.
+///
+/// The release half matters as much as the refusal, and it is asserted rather
+/// than inferred. A registry that charged for a name and never gave it back
+/// would pass a refusal assertion and still leak, so this reads the provider's
+/// in-use figure directly: the delta the filing added must be exactly the delta
+/// the release returns. Inferring it from a later admission would prove only
+/// that *enough* came back, and "enough" is what a partial release also looks
+/// like.
+#[test]
+fn a_long_coordinate_is_refused_where_a_short_one_is_admitted() {
+    const SHORT: usize = 8;
+    let reg = registry_granting_coordinate(SHORT);
+    let (client, _rx) = fresh_client(&reg);
+
+    let baseline = reg.in_use().expect("this registry owns its provider");
+
+    let short: ClaimKey = ("n".repeat(SHORT), "m".repeat(SHORT));
+    reg.claim_method(short.clone(), client.id, HandlerMode::Single)
+        .expect("one entry at the granted coordinate is funded");
+    let filed = reg.in_use().expect("this registry owns its provider");
+    assert_ne!(
+        filed, baseline,
+        "non-vacuity: filing a claim really does consume from the grant"
+    );
+
+    // Same shape, same client, same tables -- only the name is longer.
+    let long: ClaimKey = ("n".repeat(SHORT * 64), "m".repeat(SHORT * 64));
+    assert!(
+        matches!(
+            reg.claim_method(long.clone(), client.id, HandlerMode::Single),
+            Err(RegistrationError::Admission(IpcAdmissionError::Resources(
+                _
+            )))
+        ),
+        "a name sixty-four times longer costs more than the grant has left"
+    );
+    // And nothing of the refused claim was installed.
+    assert!(reg.handler_owner(&long).is_none());
+    assert_eq!(reg.handler_owner(&short), Some(client.id));
+
+    // Releasing the short claim returns its name's funding, not just its node,
+    // and returns exactly what it took -- read off the provider rather than
+    // inferred from what is admissible afterwards.
+    let release = reg.release_method(&short, client.id);
+    assert!(release.released);
+    assert!(reg.handler_owner(&short).is_none());
+    // The release carries the installed record out, and that record still holds
+    // the lease funding its own copy of the name. The ledger returns to the
+    // baseline when the caller drops it, which is the point: the funding
+    // follows the last live copy rather than the moment the entry left a table.
+    drop(release);
+    assert_eq!(
+        reg.in_use().expect("this registry owns its provider"),
+        baseline,
+        "release returns the filing's delta exactly: not part of it, and not more"
+    );
+
+    // A name this long still does not fit: one short entry's worth of funding
+    // is not sixty-four short entries' worth. The refusal is the same one, so
+    // the release above did not silently hand back more than it took.
+    assert!(
+        matches!(
+            reg.claim_method(long.clone(), client.id, HandlerMode::Single),
+            Err(RegistrationError::Admission(IpcAdmissionError::Resources(
+                _
+            )))
+        ),
+        "release returns what was taken, not more"
+    );
+    // But the short one is admissible again, which is what proves the release
+    // was real rather than the refusal above being permanent.
+    reg.claim_method(short.clone(), client.id, HandlerMode::Single)
+        .expect("the released funding is available again");
+    assert_eq!(reg.handler_owner(&short), Some(client.id));
+}
+
+/// A pending call's funding survives the record and goes with the ticket.
+///
+/// The defect this rules out is a lease stored beside the map record alone. A
+/// `PendingTicket` holds its own clone of all four coordinate strings and can
+/// outlive the record's removal — that is the entire reason it exists, since it
+/// is what lets a late cleanup identify one exact operation. Funding tied to the
+/// record would therefore be returned while an identical set of buffers was
+/// still live in the ticket.
+///
+/// Read off the provider rather than inferred. Three points: nothing pending,
+/// pending with both halves alive, and pending removed with only the ticket
+/// alive. The middle-to-third step is the assertion — usage must *not* fall back
+/// to baseline while the ticket lives, and must return to it exactly once the
+/// ticket drops too.
+#[test]
+fn a_pending_calls_funding_outlives_its_record_and_ends_with_its_ticket() {
+    let reg = registry_granting_coordinate(64);
+    // Before the client exists, deliberately. `unregister` below releases the
+    // client's own record as well as its pending call, so a baseline taken
+    // after registration would be a figure the final assertion could never
+    // return to.
+    let baseline = reg.in_use().expect("this registry owns its provider");
+    let (client, _rx) = fresh_client(&reg);
+
+    let key = PendingKey {
+        network: "n".repeat(64),
+        method: "m".repeat(64),
+        remote_peer: "p".repeat(64),
+        remote_request_id: "r".repeat(64),
+        class: HandlerMode::Single,
+    };
+    let (tx, _rx) = oneshot::channel();
+    let Ok(ticket) = reg.insert_exact_pending(key.clone(), client.id, PendingInbound::Single(tx))
+    else {
+        panic!("the granted coordinate funds one pending call")
+    };
+    let accepted = reg.in_use().expect("this registry owns its provider");
+    assert_ne!(
+        accepted, baseline,
+        "non-vacuity: accepting a pending call really does consume from the grant"
+    );
+
+    // Take the record out from under the ticket, exactly as a disconnect does.
+    // The ticket is still alive and still holds four coordinate strings.
+    //
+    // Through `unregister` rather than a direct removal, so this is the path a
+    // real disconnect takes: it sweeps the client's pending calls out of the
+    // table and settles them, and the ticket outliving that sweep is the
+    // ordinary case rather than a contrived one.
+    reg.unregister(client.id).expect("a registered client");
+    // The registry's reference to the client, and then this control's own.
+    //
+    // `unregister` removes the *table's* copy of the handle; it does not and
+    // must not release the record, because the funding for a client record
+    // follows the last live `Arc<ClientHandle>` rather than the table entry. A
+    // real disconnect has several of those in flight -- the read loop, the
+    // writer task, the released registrations -- and releasing the record when
+    // the table entry went would unfund a handle those are still reading.
+    //
+    // This control held one of those copies. Dropping it here is what makes the
+    // question below the ticket's alone: past this point the ticket is the only
+    // thing left holding anything from this registry's grant.
+    drop(client);
+    assert_ne!(
+        reg.in_use().expect("this registry owns its provider"),
+        baseline,
+        "the ticket alone still holds a full copy of the coordinates"
+    );
+
+    drop(ticket);
+    assert_eq!(
+        reg.in_use().expect("this registry owns its provider"),
+        baseline,
+        "and it is returned in full once the last copy is gone"
     );
 }

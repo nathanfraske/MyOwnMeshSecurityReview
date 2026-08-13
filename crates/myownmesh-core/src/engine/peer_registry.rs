@@ -390,6 +390,59 @@ impl PeerRegistry {
         }))
     }
 
+    /// End **exactly** the session `witness` names, and nothing else.
+    ///
+    /// For the two ways an admitted frame dies after its session has already
+    /// been proved current: the owner refuses to fund it, and it does not
+    /// decode. Both mean this side is holding a session it cannot use — the
+    /// first because the peer's traffic costs more than the owner will pay for,
+    /// the second because what arrived over an authenticated channel was not a
+    /// message at all — and in both the honest answer is to stop having that
+    /// session rather than to drop the frame and wait for the next one.
+    ///
+    /// **Exactly, and the exactness is the whole design.** Three things are
+    /// checked under the mutation lock before anything is torn down: the peer is
+    /// still installed under this device id, its installation is still the one
+    /// the captured owner names, and its live session is the very one the
+    /// witness was minted from. A replacement that promoted while the frame was
+    /// being decoded fails the third and is left completely alone — it did not
+    /// send this frame, it did not refuse to fund it, and it is not the session
+    /// being ended. Removing by device id would have taken it; that is the
+    /// device-only removal this deliberately is not.
+    ///
+    /// **What ending it does.** Only the session slot is cleared. That is
+    /// sufficient because of what the session owns: dropping it resolves the
+    /// `SessionRpcState` it holds — every pending local call settles, every open
+    /// stream is finished — and releases its reliable pending state, all through
+    /// `Drop` rather than through a sweep this function would have to perform.
+    /// And it cannot come back: promotion **moved** the authenticated channel
+    /// into the session, so the slot it came from is already spent and a
+    /// re-promotion has nothing to promote until the peer authenticates again.
+    ///
+    /// No timer, no grace period, no retry. The session either is the one that
+    /// failed or is not.
+    pub(super) fn retire_exact_session(
+        &self,
+        owner: &PeerOwnerToken,
+        witness: &crate::runtime::session_broker::SessionValidityWitness,
+    ) -> bool {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return false;
+        }
+        let peer = &current.value().peer;
+        // Identity, not liveness. "This peer has *a* live session" would retire
+        // a successor for its predecessor's failure.
+        if peer.with_live_session(|session| witness.witnesses(session)) != Some(true) {
+            return false;
+        }
+        peer.revoke_promoted_session();
+        true
+    }
+
     /// Mint one owned authority for an application operation that will cross an
     /// await, **gated on a live promoted session**.
     ///

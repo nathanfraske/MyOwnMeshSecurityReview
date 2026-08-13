@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use interprocess::local_socket::tokio::prelude::*;
 use myownmesh_core::MeshHandle;
 use parking_lot::Mutex;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -57,8 +57,93 @@ pub use framing::{
     RealtimeSendUnit, MAX_REALTIME_FLOW_LABEL_BYTES,
 };
 use framing::{
-    optional_nonzero_bytes, read_bounded_json_line, FrameAdmission, REALTIME_FRAME_HEADER,
+    optional_nonzero_bytes, read_bounded_json_line, AdmittedReader, DecodeRefusal, FrameAdmission,
+    REALTIME_FRAME_HEADER,
 };
+
+/// Places a control can reach into `serve` without production having a branch.
+///
+/// Empty outside `cfg(test)`, so in a release build this is a zero-sized value
+/// threaded through one call and compiled away. The alternative shapes were both
+/// worse: a process-global barrier races every other control in the binary, and
+/// a `cfg(test)`-only parameter on `serve` makes the public signature depend on
+/// the profile.
+#[derive(Default)]
+pub(crate) struct ControlHooks {
+    /// Pauses one connection task at the instant before `EventsSubscribe`
+    /// commits its client to the registry.
+    ///
+    /// This exact instant, because it is the one the shutdown has to beat. The
+    /// mailbox is already funded and the scope already issued; the client is not
+    /// yet in any table. A registration that got past here after the drain began
+    /// would be an `EventsSubscribe` answered with success to a client nothing
+    /// will ever clean up.
+    #[cfg(test)]
+    before_events_subscribe_commit: Option<Arc<DispatchBarrier>>,
+    /// Hands the control the registry `serve` built for itself.
+    ///
+    /// `serve` constructs its own `ClientRegistry` from the mesh handle, so
+    /// there is otherwise no way to ask it, after the fact, whether anything was
+    /// left behind. Fired once, immediately after construction.
+    #[cfg(test)]
+    registry: Option<tokio::sync::oneshot::Sender<crate::ipc::ClientRegistry>>,
+}
+
+/// A one-shot pause, for controls that need a task stopped at an exact line.
+///
+/// One connection and one only: both halves are `take`n on first use, so a
+/// second connection reaching the same line runs straight through. That is what
+/// makes it usable in a `serve` that is still accepting — the control pauses the
+/// connection it cares about without freezing the listener.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DispatchBarrier {
+    arrived: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl DispatchBarrier {
+    /// The barrier and the two ends a control drives it by.
+    ///
+    /// Gated to match its one caller. The terminal-shutdown control that drives
+    /// this needs a real accepted connection over a Unix socket, so it does not
+    /// exist on Windows -- and neither, therefore, does anything that builds a
+    /// barrier for it. The type itself stays available to both, because
+    /// `ControlHooks` names it on every platform.
+    #[cfg(unix)]
+    fn paired() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                arrived: Mutex::new(Some(arrived_tx)),
+                release: Mutex::new(Some(release_rx)),
+            }),
+            arrived_rx,
+            release_tx,
+        )
+    }
+
+    /// Announce arrival, then wait to be let go.
+    ///
+    /// Both sends are allowed to fail: a control that has dropped its end has
+    /// stopped caring, and the connection should carry on rather than hang.
+    async fn pass(&self) {
+        let arrived = self.arrived.lock().take();
+        let release = self.release.lock().take();
+        if let Some(arrived) = arrived {
+            let _ = arrived.send(());
+        }
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+    }
+}
 
 /// Start the control socket listener. Returns when the shutdown
 /// broadcast fires.
@@ -68,12 +153,35 @@ pub async fn serve(
     services: Arc<ServiceManager>,
     custom: Option<PathBuf>,
     realtime: RealtimeAdvert,
-    mut shutdown: broadcast::Receiver<()>,
+    shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    // Both are optional, and absence is not absence of a bound. Every inbound
-    // byte the daemon buffers is acquired from the process owner's grant at the
-    // size actually read, so a daemon started with neither of these set is
-    // bounded by what its owner granted it — measured, rather than by a number
+    serve_with_hooks(
+        mesh,
+        registry,
+        services,
+        custom,
+        realtime,
+        shutdown,
+        ControlHooks::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_with_hooks(
+    mesh: MeshHandle,
+    registry: Arc<NetworkRegistry>,
+    services: Arc<ServiceManager>,
+    custom: Option<PathBuf>,
+    realtime: RealtimeAdvert,
+    mut shutdown: broadcast::Receiver<()>,
+    hooks: ControlHooks,
+) -> Result<()> {
+    // Both are optional, and absence is not absence of a bound. Nothing a
+    // connection retains is held without a lease -- a frame's growth funded per
+    // step at the capacity that step requests, the fixed read window funded in
+    // full before a byte is read -- so a daemon started with neither of these
+    // set is bounded by what its owner granted it, rather than by a number
     // someone had to invent at startup. An explicit value is an additional,
     // stricter policy layered on top; see [`FrameAdmission`].
     //
@@ -95,6 +203,14 @@ pub async fn serve(
         mesh.local_application_resource_scope()
             .context("issue the IPC registry's local application resource scope")?,
     );
+    #[cfg(test)]
+    let hooks = {
+        let mut hooks = hooks;
+        if let Some(publish) = hooks.registry.take() {
+            let _ = publish.send(clients.clone());
+        }
+        hooks
+    };
     let target = resolve_socket(custom)?;
     let listener = bind_listener(&target)?;
     info!(?target, "control socket listening");
@@ -106,7 +222,11 @@ pub async fn serve(
         json_line_bytes,
         realtime_frame_bytes,
         realtime,
+        #[cfg(test)]
+        before_events_subscribe_commit: hooks.before_events_subscribe_commit,
     });
+    #[cfg(not(test))]
+    let _ = hooks;
 
     loop {
         tokio::select! {
@@ -125,6 +245,12 @@ pub async fn serve(
                         // and then never spoke. Spawning first and discovering
                         // the refusal inside the task would already have taken
                         // the worker the refusal is about.
+                        // Refused for either reason — no capacity, or the
+                        // runtime is closing — the connection is closed here by
+                        // dropping its stream. Accepting into a closing runtime
+                        // would spawn a task the drain has already decided not
+                        // to wait for work from, and that `serve` would then
+                        // have to wait for anyway.
                         let task = match state.clients.lease_task() {
                             Ok(task) => task,
                             Err(refusal) => {
@@ -152,14 +278,56 @@ pub async fn serve(
         }
     }
 
-    // Every client's flows are closed and every handler it was the last
-    // claimant of is forgotten, through their own networks, before this
-    // returns. Dropping the handles would release nothing — a flow handle owns
-    // no part of the flow — so a daemon that shut down without this would leave
-    // native transceivers and senders behind for as long as their sessions
-    // lived.
-    for removed in state.clients.shutdown() {
-        release_owned_registrations(&state, &removed).await;
+    // Terminal from here. The order below is the whole of the shutdown contract
+    // and each step depends on the one before it.
+    //
+    // 1. `begin_closing` moves the runtime out of `Running` under the same lock
+    //    the routing tables live under, and answers `true` to exactly one
+    //    caller. From this instant every admitting path in the registry refuses
+    //    — a client cannot register, claim a method, subscribe to a channel,
+    //    install a realtime flow or file a pending operation into tables the
+    //    drain is about to walk. `false` means someone else is already draining
+    //    this registry, and a second drain would try to close flows that are
+    //    already closed.
+    //
+    // 2. The connection tasks already accepted are told, and they stop reading.
+    //    Told rather than aborted: a task cancelled mid-dispatch would drop a
+    //    half-applied request, and the point of waiting is that it does not have
+    //    to be.
+    //
+    // 3. The drain itself. Every client's flows are closed and every handler it
+    //    was the last claimant of is forgotten, through their own networks.
+    //    Dropping the handles would release nothing — a flow handle owns no part
+    //    of the flow — so a daemon that shut down without this would leave
+    //    native transceivers and senders behind for as long as their sessions
+    //    lived.
+    //
+    // 4. And only then does this return. `serve` returning is a claim that the
+    //    control surface is over, and it was not true before: a connection task
+    //    outliving it would still be holding a registry, a mesh handle and a
+    //    socket that this function's caller is entitled to treat as finished
+    //    with. Waiting for the count to reach zero is what makes the claim true.
+    if state.clients.begin_closing() {
+        // One client at a time, released before the next is taken. The registry
+        // hands back ids rather than records for exactly this reason: a record
+        // carries the client's retired routes and forgotten names, and
+        // collecting every one of them first would hold every client's cleanup
+        // state at once instead of one client's.
+        for client in state.clients.shutdown_ids() {
+            if let Some(removed) = state.clients.unregister(client) {
+                release_owned_registrations(&state, removed).await;
+            }
+        }
+        state.clients.shutdown_settle_pending();
+    }
+    state.clients.wait_for_tasks().await;
+    // Answers the state rather than asserting one, so a second `serve` over the
+    // same registry — which drained nothing — cannot publish `Closed` on the
+    // strength of having waited. Logged rather than panicked: a daemon on its
+    // way out should say what it found, not abort on it.
+    match state.clients.finish_closed() {
+        crate::ipc::Lifecycle::Closed => info!("control surface closed"),
+        other => warn!(?other, "control surface did not reach Closed"),
     }
 
     Ok(())
@@ -173,6 +341,8 @@ struct ControlState {
     realtime: RealtimeAdvert,
     json_line_bytes: Option<usize>,
     realtime_frame_bytes: Option<usize>,
+    #[cfg(test)]
+    before_events_subscribe_commit: Option<Arc<DispatchBarrier>>,
 }
 
 // The daemon keeps no realtime flow state of its own, and deliberately holds
@@ -196,23 +366,61 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
     let json_lines = FrameAdmission::new(inbound.clone(), state.json_line_bytes);
     let realtime_frames = FrameAdmission::new(inbound, state.realtime_frame_bytes);
     let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
-    while let Some(line) = read_bounded_json_line(&mut reader, &json_lines).await? {
-        let request: Request = match serde_json::from_str(line.as_str()) {
-            Ok(r) => r,
-            Err(e) => {
+    // The reader's own buffer, funded before it exists. `fill_buf` copies bytes
+    // into this allocation before any admission code can see them, so it is the
+    // one inbound allocation that cannot be charged at the moment it is used --
+    // a claim taken then would be funding storage that already existed. The
+    // acquire-then-construct order, and the leases that outlive the buffer, are
+    // `AdmittedReader`'s so that a control can reach the same sequence this
+    // connection runs.
+    let mut reader = AdmittedReader::admit(reader, &json_lines)
+        .context("control connection read buffer was not admitted")?;
+    // The read is raced against the shutdown signal, and the signal wins ties.
+    //
+    // Without this a connection sitting idle on a socket nobody is writing to
+    // would hold the whole daemon open: `serve` waits for every accepted task,
+    // and this task's only other way to finish is a client that may never send
+    // another byte. Selecting here means the task ends at the shutdown rather
+    // than at the client's convenience.
+    //
+    // Requests already being dispatched are not interrupted — the select is at
+    // the top of the loop, not around the dispatch — so shutting down cannot
+    // leave a request half-applied. It costs one more round trip at worst.
+    loop {
+        let line = tokio::select! {
+            biased;
+            () = state.clients.closing() => break,
+            line = read_bounded_json_line(reader.frames(), &json_lines) => match line? {
+                Some(line) => line,
+                None => break,
+            },
+        };
+        // Funded before the parse runs, and the lease outlives the decoded value
+        // it accounts for: `(lease, request)` drops `request` first, because
+        // bindings from one pattern drop in reverse. The parsed `Request` owns
+        // dynamically allocated strings and payload that live for as long as the
+        // dispatch below, which may be the connection's whole life -- an earlier
+        // comment here said the line's bytes were the only thing worth
+        // accounting past this point and dropped the funding outright, leaving
+        // that decoded state charged to nobody.
+        let (_decoded, request) = match line.decode_request(&json_lines) {
+            Ok(decoded) => decoded,
+            Err(DecodeRefusal::Malformed(e)) => {
                 let resp = Response::err(format!("parse: {e}"));
                 let error = serde_json::to_string(&resp)? + "\n";
                 writer.write_all(error.as_bytes()).await?;
                 continue;
             }
+            Err(refusal @ DecodeRefusal::Admission(_)) => {
+                let resp = Response::err(refusal.to_string());
+                let error = serde_json::to_string(&resp)? + "\n";
+                writer.write_all(error.as_bytes()).await?;
+                continue;
+            }
         };
-        // Released here, and this is the whole point of the wrapper: the parsed
-        // `Request` owns its own copy of everything it needed, so from this
-        // moment the line's bytes are dead weight — and the funding that has
-        // been holding them goes at the same instant they do. Anything below
-        // this line may run for the connection's whole life; a line kept alive
-        // through that would be accounted for all of it.
+        // The raw line's bytes are dead weight from here -- the decoded request
+        // owns its own copies -- so the byte leases go now while the structural
+        // lease above stays with what it funds.
         drop(line);
         // EventsSubscribe converts the connection into a server-
         // push channel: the daemon writes mesh events plus any
@@ -237,6 +445,14 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             // connection rather than raised: the socket is healthy and the
             // client is entitled to know why it was not subscribed, whereas
             // returning would drop the connection and leave it guessing.
+            // The seam is here and not a line earlier or later. Above it the
+            // mailbox is funded and the scope issued but nothing is filed;
+            // below it the client is in the table. A control that paused
+            // anywhere else would be asserting about a different race.
+            #[cfg(test)]
+            if let Some(barrier) = &state.before_events_subscribe_commit {
+                barrier.pass().await;
+            }
             let client = match state.clients.register(tx) {
                 Ok(client) => client,
                 Err(refusal) => {
@@ -271,7 +487,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             // something else is the shutdown sweep, which does the same release
             // with the same handle. Doing nothing here is not skipping the work.
             if let Some(removed) = state.clients.unregister(client_id) {
-                release_owned_registrations(&state, &removed).await;
+                release_owned_registrations(&state, removed).await;
             }
             result?;
             break;
@@ -456,7 +672,14 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                             &pipe_owner,
                             flow_capability,
                             network,
-                            reader,
+                            // The frames, not the admitted reader. Handing the
+                            // wrapper over would move it, and its leases fund
+                            // the buffer these bytes arrive in -- the pipe would
+                            // be reading from an allocation whose funding had
+                            // travelled with a value it does not know it owns.
+                            // Borrowing leaves the owner here, alive for exactly
+                            // as long as the pipe runs.
+                            reader.frames(),
                             &realtime_frames,
                         )
                         .await
@@ -466,7 +689,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                             &net,
                             peer,
                             &stream,
-                            reader,
+                            reader.frames(),
                             &mut writer,
                             &realtime_frames,
                         )
@@ -765,5 +988,195 @@ mod request_wire_tests {
         assert_eq!(value["peer"], "peerpubkey");
         let back: Request = serde_json::from_value(value).expect("re-decode");
         assert!(matches!(back, Request::NetworkConnectPeer { .. }));
+    }
+}
+
+/// The control surface's shutdown, driven end to end over a real socket.
+///
+/// Unix-only because it needs a socket at a path this control chooses.
+/// `resolve_socket` honours a custom path on Unix and ignores it elsewhere,
+/// falling back to a process-wide namespaced name — which two controls running
+/// concurrently in one test binary would fight over.
+#[cfg(all(test, unix))]
+mod terminal_shutdown_tests {
+    use interprocess::local_socket::{GenericFilePath, ToFsName};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+
+    /// Long enough that a loaded machine will not trip it, short enough that a
+    /// genuine hang is reported as a failure rather than as the whole suite
+    /// timing out. Nothing below asserts *because* of this bound: every claim is
+    /// made against an event already observed. It exists so that a regression
+    /// which hangs says which step hung.
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn guarded<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        match tokio::time::timeout(HANG_GUARD, future).await {
+            Ok(value) => value,
+            Err(_) => panic!("hang guard: {what}"),
+        }
+    }
+
+    /// A mesh with an ephemeral identity over the daemon test grant.
+    ///
+    /// `Identity::ephemeral` rather than `load_or_create`, so nothing here reads
+    /// or writes the on-disk anchor. Provider installation is idempotent by
+    /// identity, so this shares the one provider the rest of the daemon test
+    /// binary uses rather than opening a second grant over the same process.
+    async fn test_mesh() -> MeshHandle {
+        myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            myownmesh_core::MeshConfig::default(),
+            Arc::new(myownmesh_core::Identity::ephemeral()),
+            crate::test_resource_provider(),
+        )
+        .await
+        .expect("the daemon test grant opens an infrastructure-only mesh")
+    }
+
+    /// A shutdown arriving while an `EventsSubscribe` is mid-commit loses
+    /// nothing and leaves nothing.
+    ///
+    /// The production path end to end: a real listener, a real accepted
+    /// connection holding its own `TaskAdmission`, a real client socket, and a
+    /// real `EventsSubscribe` paused at the instant before it would commit to
+    /// the registry. Every assertion is made against an event already observed
+    /// rather than after a sleep — arrival is a `oneshot`, the transition is the
+    /// registry's own `closing()` signal, and the refusal is a line read off the
+    /// socket.
+    ///
+    /// Four claims, and the middle two are what a registry-level control cannot
+    /// reach:
+    ///
+    /// 1. the drain begins while the connection task is paused;
+    /// 2. `serve` has *not* returned at that moment, because a task it accepted
+    ///    is still alive — the whole of the "terminal" claim, and a `serve` that
+    ///    returned on the shutdown signal alone fails here;
+    /// 3. the paused request, once released, is answered *truthfully*: the
+    ///    client is told its subscription was refused and why, rather than being
+    ///    left to infer it from a dropped socket, and rather than being told it
+    ///    succeeded;
+    /// 4. and when `serve` does return, the registry is `Closed` and holds
+    ///    nothing — no client, flow, handler claim, installed handler, channel
+    ///    subscription, pending call or task lease.
+    #[tokio::test]
+    async fn a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing() {
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let socket = directory.path().join("control.sock");
+        let (barrier, arrived, release) = DispatchBarrier::paired();
+        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let mesh = test_mesh().await;
+        let networks = NetworkRegistry::new();
+        let services = ServiceManager::new(mesh.clone(), networks.clone());
+        let serving = tokio::spawn(serve_with_hooks(
+            mesh,
+            networks,
+            services,
+            Some(socket.clone()),
+            RealtimeAdvert {
+                supported: false,
+                encodings: Vec::new(),
+                flow_ceiling: None,
+            },
+            shutdown_rx,
+            ControlHooks {
+                before_events_subscribe_commit: Some(barrier),
+                registry: Some(registry_tx),
+            },
+        ));
+        let clients = guarded("serve publishes its registry", registry_rx)
+            .await
+            .expect("serve publishes the registry it built");
+
+        // A real client, over the socket `serve` is really listening on.
+        let name = socket
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the control socket path is a valid fs name");
+        let stream = guarded("client connects", async {
+            loop {
+                // The listener binds inside the spawned `serve`, so the first
+                // connect can lose the race with it. Retrying is not a timing
+                // assumption — the hang guard is what fails if the listener
+                // never appears at all.
+                match LocalSocketStream::connect(name.clone()).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        let (client_reader, mut client_writer) = stream.split();
+        let mut client_reader = BufReader::new(client_reader);
+        client_writer
+            .write_all(b"{\"op\":\"events_subscribe\"}\n")
+            .await
+            .expect("the client sends its subscribe");
+
+        // (1) The connection task is parked at the commit, holding an accepted
+        // `TaskAdmission`, with nothing filed in any table.
+        guarded("the subscribe reaches its commit", arrived)
+            .await
+            .expect("the connection task reached the barrier");
+        assert_eq!(
+            clients.residue(),
+            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Running).with_tasks(1),
+            "nothing is filed yet, but the connection carrying the paused              subscribe is itself an accepted task and is counted as one"
+        );
+
+        shutdown_tx
+            .send(())
+            .expect("the shutdown broadcast is live");
+        // Observed, not waited out: this resolves on the registry's own signal,
+        // which `begin_closing` publishes from inside `serve`'s terminal path.
+        // Past this line the drain has provably started.
+        guarded("serve begins closing", clients.closing()).await;
+
+        // (2) And `serve` has not returned, because a task it accepted is still
+        // alive.
+        assert!(
+            !serving.is_finished(),
+            "serve returned while a connection task it accepted was still live"
+        );
+        assert_eq!(clients.lifecycle(), crate::ipc::Lifecycle::Closing);
+
+        // (3) Released, the paused request is answered truthfully.
+        release.send(()).expect("the paused task is still waiting");
+        let mut answer = String::new();
+        guarded(
+            "the client is answered",
+            client_reader.read_line(&mut answer),
+        )
+        .await
+        .expect("the daemon answers on the still-open socket");
+        let answer: Response =
+            serde_json::from_str(answer.trim()).expect("the answer is a control response");
+        assert!(
+            !answer.ok,
+            "a subscription refused by the drain is not reported as one that succeeded"
+        );
+        assert!(
+            answer
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("closing")),
+            "and the client is told why: {:?}",
+            answer.error
+        );
+
+        // (4) Only now does `serve` return, and it leaves nothing behind.
+        drop(client_writer);
+        drop(client_reader);
+        guarded("serve returns", serving)
+            .await
+            .expect("the serve task did not panic")
+            .expect("serve returns without error");
+        assert_eq!(
+            clients.residue(),
+            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+            "no client, flow, handler, subscription, pending call or task lease remains"
+        );
     }
 }

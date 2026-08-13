@@ -264,21 +264,39 @@ where
 ///
 /// Refusals are ignored rather than reported: there is nobody left to report to,
 /// and every refusal this can produce means the thing was already gone.
+/// Taken by value, not borrowed: the retired routes have to be *consumed* to be
+/// retired — a pump is joined and an unfinished install is answered, and both
+/// move out of the record. Everything else here is read through the record while
+/// it is still alive, so its leases outlive the buffers they fund.
 pub(super) async fn release_owned_registrations(
     state: &ControlState,
-    removed: &crate::ipc::UnregisteredClient,
+    removed: crate::ipc::UnregisteredClient,
 ) {
-    for (network, flow) in removed.handle.drain_realtime_flows() {
+    // The lease is bound rather than discarded: it funds this flow's capability
+    // and network-name buffers, and dropping it at the top of the body would
+    // unfund the very `network` string the lookup below reads. It goes at the
+    // end of the iteration, with the strings it paid for.
+    for (network, flow, funding) in removed.handle.drain_realtime_flows() {
         let Some(net) = state.registry.get(&network) else {
             continue;
         };
         let _ = net.close_realtime(flow).await;
+        drop((network, funding));
     }
-    for (network, method) in &removed.forget {
-        let Some(net) = state.registry.get(network) else {
-            continue;
-        };
-        crate::ipc::bridge::forget_handler(&net, method);
+    // Methods need no loop at all any more. Each `ForgottenMethod` carries the
+    // core registration that removes its own handler, so dropping `removed` at
+    // the end of this function forgets every one of them -- from the dispatcher
+    // it was installed on, whether or not this daemon still has that network in
+    // its map, and only if a successor has not legitimately taken the name in
+    // the meantime.
+    //
+    // Last, and awaited. Each of these is either a pump that has not been told
+    // to stop yet or an install whose followers have not been answered, and
+    // `serve` counts the pumps among the tasks it will not return without. A
+    // disconnect that skipped this would leave a fan-out task delivering into a
+    // channel whose only subscriber is gone.
+    for route in removed.routes {
+        route.retire().await;
     }
 }
 

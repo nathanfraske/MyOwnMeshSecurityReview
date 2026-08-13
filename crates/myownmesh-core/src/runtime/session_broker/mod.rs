@@ -689,8 +689,12 @@ fn fixture_stream_retention_claim() -> ResourceClaim {
     use crate::resource::FiniteResourceProvider;
 
     let payload = FiniteResourceProvider::reservation_charge_for_test(
-        GatewayMailbox::<serde_json::Value>::retention_claim(FIXTURE_STREAM_PAYLOAD_BYTES, 1)
-            .expect("one retained stream payload claim is representable"),
+        GatewayMailbox::<serde_json::Value>::retention_claim(
+            FIXTURE_STREAM_PAYLOAD_BYTES,
+            FIXTURE_STREAM_PAYLOAD_BYTES,
+            1,
+        )
+        .expect("one retained stream payload claim is representable"),
     )
     .expect("the retained payload claim plus its provider record is representable");
     let node = FiniteResourceProvider::reservation_charge_for_test(

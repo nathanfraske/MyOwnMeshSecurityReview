@@ -109,6 +109,17 @@ const TEST_IPC_FRAME_BYTES: usize = 4 * 1024;
 #[cfg(test)]
 const TEST_IPC_REGISTRY_ENTRIES: u64 = 512;
 
+/// How long a client-chosen coordinate a fixture entry may carry, in bytes.
+///
+/// Entries cost node *plus* the heap their keys own, so the grant has to name a
+/// name length or every control would be refused the moment its fixture used a
+/// string. Generous on purpose: a control that means to prove pressure builds
+/// its own tight provider and says so, while a control that merely needs a
+/// registry should never be refused for calling a channel `"telemetry"` rather
+/// than `"t"`.
+#[cfg(test)]
+const TEST_IPC_REGISTRY_COORDINATE_BYTES: usize = 256;
+
 /// Inbound control frames this binary's fixtures buffer at once.
 ///
 /// The control reader funds every byte it buffers, which is what lets the
@@ -235,6 +246,7 @@ pub(crate) fn test_resource_provider() -> myownmesh_core::ResourceProviderPort {
             let ipc_registry = crate::ipc::clients::registry_fixture_claim(
                 TEST_IPC_CLIENT_MAILBOXES,
                 TEST_IPC_REGISTRY_ENTRIES,
+                TEST_IPC_REGISTRY_COORDINATE_BYTES,
             )
             .expect("daemon test IPC registry grant is representable");
             // Inbound control frames, buffered and funded as they are read.

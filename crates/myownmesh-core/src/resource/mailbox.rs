@@ -433,6 +433,15 @@ impl<T: ResourceMailboxItem> ResourceMailboxSender<T> {
             .expect("fixture mailbox accepted-item charge is representable")
     }
 
+    /// Reserve from the exact owner this sender uses, for pressure controls.
+    #[cfg(test)]
+    pub(crate) fn reserve_for_test(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.inner.owner.acquire(claim)
+    }
+
     /// Measure and admit one value. Refusal returns the exact value and never
     /// leaves a node, retained allocation, or scheduled-work charge behind.
     pub fn send(&self, value: T) -> Result<(), ResourceMailboxSendError<T>> {

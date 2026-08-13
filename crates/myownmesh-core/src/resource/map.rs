@@ -448,8 +448,12 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
         self.remove_entry(key).map(|(_, value)| value)
     }
 
-    /// Remove one entry and hand back both halves, releasing that entry's
-    /// funding as the node drops.
+    /// Remove one entry and hand back both halves, releasing the map node's
+    /// funding before the returned tuple is observed by the caller.
+    ///
+    /// The node lease funds only the container node. A caller that keeps the
+    /// owned key or value after removal must make that retained storage carry
+    /// its own lease; returning the two values does not extend the node lease.
     pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
@@ -467,7 +471,49 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             key, value, _entry, ..
         } = *node;
         // `_entry` is released here, after the key and value it funded have
-        // been handed back and are no longer this map's to account for.
+        // been detached and are no longer this map's to account for.
+        Some((key, value))
+    }
+
+    /// Remove and return the first ordered entry without cloning a key.
+    ///
+    /// Teardown paths use this to drain attacker-sized maps one owned record at
+    /// a time. Building a key snapshot first would allocate and duplicate every
+    /// retained key precisely while the table is being torn down. As with
+    /// [`Self::remove_entry`], the map-node lease ends inside this call; any
+    /// storage the returned key or value retains must carry its own funding.
+    pub fn pop_first_entry(&mut self) -> Option<(K, V)> {
+        let node = Self::remove_first_node(&mut self.root)?;
+        self.len = self
+            .len
+            .checked_sub(1)
+            .expect("an entry was removed, so the count was not zero");
+        let LeasedMapNode {
+            key, value, _entry, ..
+        } = *node;
+        Some((key, value))
+    }
+
+    /// Remove and return the first ordered entry accepted by `predicate`.
+    ///
+    /// Conditional teardown cannot use [`Self::pop_first_entry`] without also
+    /// removing entries it does not own. Pushing those entries back would need
+    /// fresh node leases, which would put a fallible acquisition on the cleanup
+    /// path. This instead searches the live tree in order and detaches only a
+    /// matching node: no key is cloned, no snapshot is allocated, and no node
+    /// is reinserted or reacquired.
+    ///
+    /// As with the other removal methods, the returned key and value must carry
+    /// any funding their off-node retention needs after the map-node lease ends.
+    pub fn pop_first_where(&mut self, mut predicate: impl FnMut(&K, &V) -> bool) -> Option<(K, V)> {
+        let node = Self::remove_first_where_node(&mut self.root, &mut predicate)?;
+        self.len = self
+            .len
+            .checked_sub(1)
+            .expect("an entry was removed, so the count was not zero");
+        let LeasedMapNode {
+            key, value, _entry, ..
+        } = *node;
         Some((key, value))
     }
 
@@ -524,6 +570,50 @@ impl<K: Ord + Hash, V> LeasedMap<K, V> {
             Ordering::Less => Self::remove_node(&mut current.left, key),
             Ordering::Greater => Self::remove_node(&mut current.right, key),
         };
+        *slot = Some(current);
+        removed
+    }
+
+    /// Detach the first ordered node without first borrowing or cloning its
+    /// key. The detached node has no children, so dropping its box cannot
+    /// recurse through the remaining tree.
+    fn remove_first_node(
+        slot: &mut Option<Box<LeasedMapNode<K, V>>>,
+    ) -> Option<Box<LeasedMapNode<K, V>>> {
+        let mut current = slot.take()?;
+        if current.left.is_some() {
+            let removed = Self::remove_first_node(&mut current.left)
+                .expect("a present left subtree has a first node");
+            *slot = Some(current);
+            return Some(removed);
+        }
+        *slot = current.right.take();
+        Some(current)
+    }
+
+    /// Detach the first in-order node accepted by `predicate`.
+    ///
+    /// A rejected node is restored in the same allocation before the search
+    /// continues. A selected node is joined out exactly as in [`Self::remove_node`],
+    /// so the returned box has no children and dropping it cannot recurse into
+    /// the live tree.
+    fn remove_first_where_node(
+        slot: &mut Option<Box<LeasedMapNode<K, V>>>,
+        predicate: &mut impl FnMut(&K, &V) -> bool,
+    ) -> Option<Box<LeasedMapNode<K, V>>> {
+        let mut current = slot.take()?;
+
+        if let Some(removed) = Self::remove_first_where_node(&mut current.left, predicate) {
+            *slot = Some(current);
+            return Some(removed);
+        }
+
+        if predicate(&current.key, &current.value) {
+            *slot = Self::merge(current.left.take(), current.right.take());
+            return Some(current);
+        }
+
+        let removed = Self::remove_first_where_node(&mut current.right, predicate);
         *slot = Some(current);
         removed
     }
@@ -743,6 +833,136 @@ mod tests {
                 control_lease(&port, &scope),
             )
             .is_ok());
+    }
+
+    /// A teardown can take every owned record without first allocating a key
+    /// snapshot, and the returned value keeps its independent retention alive
+    /// after the map node has gone.
+    #[test]
+    fn v4_f1_c_pop_first_drains_owned_records_without_a_key_snapshot() {
+        let dropped = drop_log();
+        let (provider, port, scope) = control_provider(3);
+        let mut map = LeasedMap::new();
+        for key in [30_u32, 10, 20] {
+            assert!(map
+                .insert(
+                    key,
+                    control_value(key, &dropped, &port, &scope),
+                    control_lease(&port, &scope),
+                )
+                .is_ok());
+        }
+
+        let full = provider.in_use();
+        let node_charge =
+            FiniteResourceProvider::reservation_charge_for_test(control_entry_claim())
+                .expect("the production reservation charge is representable");
+        let retention_charge =
+            FiniteResourceProvider::reservation_charge_for_test(control_retention())
+                .expect("the production reservation charge is representable");
+
+        for (index, expected_key) in [10_u32, 20, 30].into_iter().enumerate() {
+            let (key, value) = map
+                .pop_first_entry()
+                .expect("one owned record remains to drain");
+            assert_eq!(key, expected_key, "the ordered first record is removed");
+            assert_eq!(value.key, expected_key);
+            assert_eq!(map.len(), 2 - index);
+
+            let released_nodes = node_charge
+                .checked_scale((index + 1) as u64)
+                .expect("the node release total is representable");
+            let previously_released_values = retention_charge
+                .checked_scale(index as u64)
+                .expect("the prior retention release total is representable");
+            assert_eq!(
+                provider.in_use(),
+                full.checked_sub(released_nodes)
+                    .and_then(|use_| use_.checked_sub(previously_released_values))
+                    .expect("the live use contains the previously released charges"),
+                "the map node is gone while the returned value's retention is still funded"
+            );
+            drop(value);
+
+            let released_values = retention_charge
+                .checked_scale((index + 1) as u64)
+                .expect("the retention release total is representable");
+            assert_eq!(
+                provider.in_use(),
+                full.checked_sub(released_nodes)
+                    .and_then(|use_| use_.checked_sub(released_values))
+                    .expect("the live use contains the removed record charges"),
+                "dropping the owned value releases exactly its independent retention"
+            );
+        }
+        assert!(map.pop_first_entry().is_none());
+    }
+
+    /// A conditional cleanup detaches only matching entries, without cloning a
+    /// key or reacquiring nodes for the entries it must leave behind.
+    #[test]
+    fn v4_f1_d_pop_first_where_preserves_every_unmatched_funded_record() {
+        let dropped = drop_log();
+        let (provider, port, scope) = control_provider(5);
+        let mut map = LeasedMap::new();
+        for key in [5_u32, 2, 4, 1, 3] {
+            assert!(map
+                .insert(
+                    key,
+                    control_value(key, &dropped, &port, &scope),
+                    control_lease(&port, &scope),
+                )
+                .is_ok());
+        }
+        let full = provider.in_use();
+        // The first matching entry is determined by key order, not insertion
+        // order. Holding the returned value proves its independent retention
+        // survives the node removal.
+        let (key, value) = map
+            .pop_first_where(|key, _| *key % 2 == 0)
+            .expect("one even entry exists");
+        assert_eq!(key, 2);
+        assert_eq!(value.key, 2);
+        assert_eq!(map.len(), 4);
+        assert!(map.contains_key(&1));
+        assert!(map.contains_key(&3));
+        assert!(map.contains_key(&4));
+        assert!(map.contains_key(&5));
+
+        // The node and value are independent reservations, so compute their
+        // release separately rather than pretending one combined reservation
+        // has the same provider bookkeeping.
+        let node_charge =
+            FiniteResourceProvider::reservation_charge_for_test(control_entry_claim())
+                .expect("the node charge is representable");
+        assert_eq!(
+            provider.in_use(),
+            full.checked_sub(node_charge)
+                .expect("the full use contains one node charge"),
+            "the matching node is gone while its returned value stays funded"
+        );
+        drop(value);
+        let retention_charge =
+            FiniteResourceProvider::reservation_charge_for_test(control_retention())
+                .expect("the retention charge is representable");
+        assert_eq!(
+            provider.in_use(),
+            full.checked_sub(node_charge)
+                .and_then(|use_| use_.checked_sub(retention_charge))
+                .expect("the full use contains the removed record's two charges"),
+            "dropping the returned value releases only its own retention"
+        );
+
+        let (key, value) = map
+            .pop_first_where(|key, _| *key % 2 == 0)
+            .expect("the second even entry exists");
+        assert_eq!(key, 4);
+        drop(value);
+        assert!(map.pop_first_where(|key, _| *key % 2 == 0).is_none());
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&1).map(|value| value.key), Some(1));
+        assert_eq!(map.get(&3).map(|value| value.key), Some(3));
+        assert_eq!(map.get(&5).map(|value| value.key), Some(5));
     }
 
     /// Dropping the map drops every entry and releases every entry's funding.

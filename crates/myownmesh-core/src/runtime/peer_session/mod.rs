@@ -185,6 +185,16 @@ impl PeerSessionState {
         self.reliable.receive(stream, seq, payload, deliver)
     }
 
+    /// This session's receive-side stream binding and contiguous mark.
+    ///
+    /// Gated with the state it delegates to: its only callers are the two
+    /// reliable-lane controls, which need a real link and so build only under
+    /// `transport-lab`.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn inbound_mark_for_test(&self) -> (Option<u64>, u64) {
+        self.reliable.inbound_mark_for_test()
+    }
+
     /// This session's send-side stream id.
     #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) fn stream_for_test(&self) -> u64 {

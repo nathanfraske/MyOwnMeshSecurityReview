@@ -5,8 +5,12 @@
 //! line-delimited JSON until it becomes a `realtime_pipe`, after which it speaks
 //! `[u32 len][body]` and nothing else — so a connection uses one or the other,
 //! never both at once, and the thing they share is the only interesting part:
-//! every inbound byte is acquired from the process owner's grant before it is
-//! buffered. Splitting them would have put one admission rule in two files.
+//! every inbound byte is acquired from the process owner's grant before this
+//! module buffers it. The one allocation that rule cannot reach is the reader's
+//! own window, which the runtime has already filled before any code here runs;
+//! it is funded once by the caller, before the reader exists, and named as such
+//! rather than folded into this sentence. Splitting the two framings would have
+//! put one admission rule in two files.
 //!
 //! Nothing here knows what a request means, what a network is, or which client
 //! is asking. It reads bytes, refuses the ones nobody funded, and hands the rest
@@ -42,11 +46,19 @@ pub(super) fn optional_nonzero_bytes(name: &str) -> Result<Option<usize>> {
 /// What bounds the inbound frames of one control connection.
 ///
 /// Two independent bounds, and only one of them is optional. The resource bound
-/// always applies: every inbound byte this daemon buffers is acquired from the
-/// process owner's grant at the size actually read, so an absent ceiling means
-/// *measured and admitted*, never *unbounded*. An explicit ceiling is an
-/// additional owner policy layered on top, and it can only refuse more — a
+/// always applies: nothing this connection retains is held without a lease, so
+/// an absent ceiling means *admitted*, never *unbounded*. An explicit ceiling is
+/// an additional owner policy layered on top, and it can only refuse more — a
 /// number here can never admit something the provider would not.
+///
+/// "Admitted" is not one rule, because the inbound bytes are not one kind of
+/// allocation. A *frame's* growth is funded per step at the capacity that step
+/// is about to request, which tracks what the sender actually sent; the
+/// connection's fixed read window is funded once, in full, before a single byte
+/// has been read, because `fill_buf` copies into it before any code here can see
+/// them. See [`AdmittedReader`] for the second, and [`read_bounded_json_line`]
+/// for the first. Both pair their byte claim with an opaque residual, since
+/// neither can state what an allocator will really reserve.
 ///
 /// This replaces two mandatory `usize` ceilings, and the change is not merely
 /// that they became optional. Requiring them made the daemon refuse to start
@@ -57,8 +69,30 @@ pub(super) fn optional_nonzero_bytes(name: &str) -> Result<Option<usize>> {
 /// check.
 #[derive(Clone)]
 pub(super) struct FrameAdmission {
-    resources: myownmesh_core::LocalApplicationResourceScope,
+    owner: FrameOwner,
     ceiling: Option<usize>,
+}
+
+/// Where one connection's inbound funding comes from.
+///
+/// Production has exactly one answer: the local-application scope the daemon
+/// issued for this connection. The second arm exists so a control can own a
+/// provider small enough to refuse, which the production arm cannot give it --
+/// the daemon test binary installs one process-global provider by design, so a
+/// test that cornered it would starve every other test drawing on the same pool.
+/// A locally constructed provider races nothing and is installed nowhere.
+#[derive(Clone)]
+enum FrameOwner {
+    Application(myownmesh_core::LocalApplicationResourceScope),
+    /// A provider this control owns outright. `Arc` because [`FrameAdmission`]
+    /// is cloned per connection and neither half of the pair needs to be.
+    #[cfg(test)]
+    Direct(
+        std::sync::Arc<(
+            myownmesh_core::ResourceProviderPort,
+            myownmesh_core::ResourceScope,
+        )>,
+    ),
 }
 
 /// Why one inbound frame was not admitted.
@@ -83,7 +117,27 @@ impl FrameAdmission {
         resources: myownmesh_core::LocalApplicationResourceScope,
         ceiling: Option<usize>,
     ) -> Self {
-        Self { resources, ceiling }
+        Self {
+            owner: FrameOwner::Application(resources),
+            ceiling,
+        }
+    }
+
+    /// A connection funded by a provider this control owns.
+    ///
+    /// `grant` is the whole budget: sizing it just above or just below the claim
+    /// under test is what makes a refusal attributable to that claim rather than
+    /// to slack the fixture happened to have.
+    #[cfg(test)]
+    pub(super) fn over_grant(grant: myownmesh_core::ResourceClaim, ceiling: Option<usize>) -> Self {
+        let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+        let port = myownmesh_core::ResourceProviderPort::new(provider)
+            .expect("the control grant funds its own process scope");
+        let scope = port.process_scope();
+        Self {
+            owner: FrameOwner::Direct(std::sync::Arc::new((port, scope))),
+            ceiling,
+        }
     }
 
     /// Admit one whole frame of `bytes` and answer the funding that holds it.
@@ -126,9 +180,105 @@ impl FrameAdmission {
             more,
         )])
         .map_err(FrameRefusal::Claim)?;
-        self.resources
-            .acquire(claim)
-            .map_err(FrameRefusal::Resources)
+        self.acquire_claim(claim)
+    }
+
+    /// Admit one growth step of a line under construction.
+    ///
+    /// Two quantities, deliberately not the same one. The **ceiling** is checked
+    /// against `frame`, the logical length the line will have, because that is
+    /// what an owner bounds. The **claim** is taken for `capacity`, the growth
+    /// the caller is about to *request*, because that is what it is about to ask
+    /// the allocator for. [`Self::admit_growth`] charges the logical length
+    /// instead, which ignores the lease vector growing beside the line and says
+    /// nothing about capacity at all.
+    ///
+    /// It does not claim to know what the allocator will really reserve; that is
+    /// [`Self::admit_allocator_residual`]'s job, and keeping the two apart is
+    /// what stops this one from inflating a byte count with a guess.
+    pub(super) fn admit_buffer_growth(
+        &self,
+        frame: usize,
+        capacity: usize,
+    ) -> std::result::Result<myownmesh_core::ResourceLease, FrameRefusal> {
+        if let Some(ceiling) = self.ceiling {
+            if frame > ceiling {
+                return Err(FrameRefusal::Ceiling { frame, ceiling });
+            }
+        }
+        self.admit_allocation(capacity)
+    }
+
+    /// Fund one allocation this connection is about to make, with no ceiling.
+    ///
+    /// The owner's ceiling bounds a *frame*; it is not a statement about the
+    /// substrate a connection needs in order to read one. Applying it here would
+    /// mean a 1 KiB owner ceiling refused an 8 KiB socket read buffer, which is
+    /// an operator setting one number and changing a different thing.
+    ///
+    /// Zero is admitted as a real, free lease rather than special-cased away:
+    /// the caller then holds one lease per growth step unconditionally and has
+    /// no branch in which funding is skipped.
+    pub(super) fn admit_allocation(
+        &self,
+        bytes: usize,
+    ) -> std::result::Result<myownmesh_core::ResourceLease, FrameRefusal> {
+        let bytes = u64::try_from(bytes).map_err(|_| {
+            FrameRefusal::Claim(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            })
+        })?;
+        let claim = myownmesh_core::ResourceClaim::try_from_entries([(
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            bytes,
+        )])
+        .map_err(FrameRefusal::Claim)?;
+        self.acquire_claim(claim)
+    }
+
+    /// Fund `allocations` live allocations whose exact size the allocator picks.
+    ///
+    /// Deliberately not a byte claim. The bytes a container is *asked* to hold
+    /// are funded as bytes, before it is asked; what this names is the separate
+    /// fact that an allocation exists at all and that its true size is not this
+    /// code's to state. `OpaqueDependencyResidual` is the class for exactly that
+    /// — a dependency the owner accounts for without claiming to have measured
+    /// it — and using it here is what keeps the byte claims honest instead of
+    /// inflating them with a guess at allocator behaviour.
+    pub(super) fn admit_allocator_residual(
+        &self,
+        allocations: u64,
+    ) -> std::result::Result<myownmesh_core::ResourceLease, FrameRefusal> {
+        let claim = myownmesh_core::ResourceClaim::try_from_entries([(
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            allocations,
+        )])
+        .map_err(FrameRefusal::Claim)?;
+        self.acquire_claim(claim)
+    }
+
+    /// Acquire one already-derived claim against this connection's scope.
+    ///
+    /// For funding whose shape is decided elsewhere — the structural parse claim
+    /// is core's derivation, not this module's — so the byte-only helpers above
+    /// stay the only place that builds a claim out of a length.
+    pub(super) fn acquire_claim(
+        &self,
+        claim: myownmesh_core::ResourceClaim,
+    ) -> std::result::Result<myownmesh_core::ResourceLease, FrameRefusal> {
+        match &self.owner {
+            FrameOwner::Application(scope) => scope.acquire(claim),
+            #[cfg(test)]
+            FrameOwner::Direct(owned) => {
+                let (port, scope) = owned.as_ref();
+                port.acquire(
+                    scope,
+                    myownmesh_core::ResourceAuthorityClass::Admitted,
+                    claim,
+                )
+            }
+        }
+        .map_err(FrameRefusal::Resources)
     }
 
     /// The widest frame this connection's framing may express.
@@ -139,6 +289,100 @@ impl FrameAdmission {
     /// is the wire's own `u32`, which the encoder checks separately and always.
     pub(super) fn framing_ceiling(&self) -> usize {
         self.ceiling.unwrap_or(usize::MAX)
+    }
+}
+
+/// The read window one control connection holds while it is reading.
+///
+/// **A substrate cost, not a policy ceiling and not tunable.** It is the
+/// capacity handed to the connection's `BufReader`, and it exists as a named
+/// constant for one reason: `fill_buf` copies bytes into that allocation before
+/// any admission code can see them, so it is the one inbound allocation that
+/// cannot honestly be charged at the moment it is used. Naming it here means the
+/// capacity is *requested* at a size this daemon chose and funded before the
+/// reader exists -- rather than being an unmeasured library allocation the
+/// daemon claims to have accounted for.
+///
+/// It is a request, not a measurement. `BufReader::with_capacity` reserves *at
+/// least* this much and the allocator may round up, so the byte claim is paired
+/// with one `OpaqueDependencyResidual` for the allocation itself, exactly as the
+/// line buffers are. Neither half alone would be true.
+///
+/// It bounds no request. A line longer than this is read in several passes, each
+/// funding the capacity it asks for; see [`read_bounded_json_line`].
+pub(super) const CONTROL_READ_BUFFER_BYTES: usize = 8 * 1024;
+
+/// The live allocations one control connection's reader holds: its single
+/// buffer. Named rather than spelled `1` at the construction site so the number
+/// and the thing it counts stay together, on the same pattern as the line
+/// reader's pair.
+const CONTROL_READ_ALLOCATIONS: u64 = 1;
+
+/// A `BufReader` that owns the funding for its own buffer.
+///
+/// This type exists so that the acquire-then-construct sequence has exactly one
+/// spelling. It was previously written inline in `handle_client`, which meant
+/// the ordering that matters -- both claims taken *before*
+/// `BufReader::with_capacity` runs -- was a property of one function body that
+/// no control could reach: every test built its own `BufReader` directly and so
+/// exercised a reader that had never been admitted at all. Refusal is now a
+/// return value of the same constructor production calls.
+///
+/// The two leases are separate because they fund two different things. The byte
+/// lease funds the capacity this daemon *asks* for; the residual names the
+/// allocation itself, whose real size `with_capacity` is free to round up and
+/// which no code here can measure. Both are declared after the reader, so the
+/// buffer is dropped before the funding that paid for it is released.
+pub(super) struct AdmittedReader<R> {
+    reader: tokio::io::BufReader<R>,
+    _bytes: myownmesh_core::ResourceLease,
+    _allocation: myownmesh_core::ResourceLease,
+}
+
+impl<R: tokio::io::AsyncRead> AdmittedReader<R> {
+    /// Fund the buffer, then build it.
+    ///
+    /// On refusal nothing is constructed and `reader` is dropped with the
+    /// error: the `?`s are above `with_capacity`, so a connection the daemon
+    /// cannot afford to read never gets an eight-kilobyte buffer allocated for
+    /// it and is never polled. That is the whole point of the ordering -- a
+    /// claim taken after the buffer existed would be funding storage that
+    /// already existed, which admission cannot refuse.
+    pub(super) fn admit(reader: R, admission: &FrameAdmission) -> Result<Self, FrameRefusal> {
+        Self::admit_building(reader, admission, |capacity, inner| {
+            tokio::io::BufReader::with_capacity(capacity, inner)
+        })
+    }
+
+    /// [`Self::admit`] with the buffer's construction passed in.
+    ///
+    /// `build` is not a hook placed near the allocation; it *is* the allocation.
+    /// A control can therefore count constructions and know the count is exact,
+    /// because there is no other expression in this function that could build a
+    /// buffer. A hook next to a `with_capacity` call would prove less: moving
+    /// the construction above the two `?`s would leave the hook where it was
+    /// and the count would stay honest-looking while the ordering had broken.
+    /// Moving *this* construction means moving the observation with it.
+    fn admit_building<B>(
+        reader: R,
+        admission: &FrameAdmission,
+        build: B,
+    ) -> Result<Self, FrameRefusal>
+    where
+        B: FnOnce(usize, R) -> tokio::io::BufReader<R>,
+    {
+        let bytes = admission.admit_allocation(CONTROL_READ_BUFFER_BYTES)?;
+        let allocation = admission.admit_allocator_residual(CONTROL_READ_ALLOCATIONS)?;
+        Ok(Self {
+            reader: build(CONTROL_READ_BUFFER_BYTES, reader),
+            _bytes: bytes,
+            _allocation: allocation,
+        })
+    }
+
+    /// The funded buffer, for [`read_bounded_json_line`] to read lines from.
+    pub(super) fn frames(&mut self) -> &mut tokio::io::BufReader<R> {
+        &mut self.reader
     }
 }
 
@@ -158,20 +402,115 @@ impl FrameAdmission {
 pub(super) struct AdmittedLine {
     line: String,
     _held: Vec<myownmesh_core::ResourceLease>,
+    /// The allocator residual for the buffers the line was assembled in, held
+    /// until the line itself goes. Separate from `_held` because it is not a
+    /// growth step: it was taken before either buffer existed and covers both
+    /// for their whole lives. Declared last so it is released last.
+    _residual: myownmesh_core::ResourceLease,
 }
 
+/// The live allocations one line read holds: the byte buffer and the vector of
+/// leases beside it. Two, named rather than spelled `2` at the call site, so the
+/// number and the thing it counts stay together.
+const LINE_READ_ALLOCATIONS: u64 = 2;
+
 impl AdmittedLine {
+    /// The bytes this line admitted, as text.
+    ///
+    /// Controls only, and gated rather than left open: production never reads
+    /// the line as a string. It decodes it through [`Self::decode_request`],
+    /// which is the one seam that funds what the parse retains. A reader that
+    /// could reach the text directly could parse it some other way, and that
+    /// parse would be unfunded.
+    #[cfg(test)]
     pub(super) fn as_str(&self) -> &str {
         &self.line
     }
+
+    /// Parse this line, funding what the parse will retain *before* it runs.
+    ///
+    /// The claim comes from [`myownmesh_core::application_gateway::json_input_work_claim`],
+    /// which is core's own derivation for exactly this question — the structural
+    /// cost of a JSON input of a given encoded length — so the daemon does not
+    /// restate a formula it does not own and the two cannot drift.
+    ///
+    /// It is acquired first and deliberately: a claim taken after
+    /// `serde_json::from_str` returned would be funding an allocation that
+    /// already exists, which is the thing this exists to stop.
+    ///
+    /// Returns the lease *before* the value, and that order is load-bearing.
+    /// Bindings from one destructuring pattern drop in reverse order, so
+    /// `let (lease, value) = ...` drops `value` first and the funding second —
+    /// the decoded state is gone before the lease that paid for it is returned.
+    /// The obvious `(value, lease)` spelling would release the funding while the
+    /// value it accounts for was still live, which is the defect one layer up.
+    ///
+    /// Concrete in `Request` on purpose, rather than generic over
+    /// `DeserializeOwned`. The claim bounds the cost of the *structure*
+    /// `serde_json` builds out of an input of this length; a `Deserialize` impl
+    /// is free to allocate anything it likes on the way past that — a short
+    /// numeric field can name a capacity, and a custom impl could reserve it —
+    /// so a generic seam would apply a bound derived for one representation to
+    /// deserializers that do not obey it. Production decodes exactly one type
+    /// here. Naming it is what makes the lease's promise true rather than
+    /// approximately true, and adding a second callee is then a deliberate act
+    /// with this paragraph attached to it.
+    pub(super) fn decode_request(
+        &self,
+        admission: &FrameAdmission,
+    ) -> std::result::Result<(myownmesh_core::ResourceLease, super::wire::Request), DecodeRefusal>
+    {
+        let claim = myownmesh_core::application_gateway::json_input_work_claim(self.line.len())
+            .map_err(|error| DecodeRefusal::Admission(FrameRefusal::Claim(error)))?;
+        let lease = admission
+            .acquire_claim(claim)
+            .map_err(DecodeRefusal::Admission)?;
+        let value = serde_json::from_str(&self.line).map_err(DecodeRefusal::Malformed)?;
+        Ok((lease, value))
+    }
 }
 
-/// Read one line of the control protocol, admitting its bytes as they arrive.
+/// Why one admitted line did not become a request.
 ///
-/// Every chunk taken off the reader is funded before it is buffered, so the
-/// daemon holds no unaccounted request bytes at any point — including a request
-/// that is still arriving. That is what an absent owner ceiling now means:
-/// bounded by the grant, at measured size, rather than unbounded.
+/// Two arms because the caller answers them differently and always has: a
+/// malformed line is the client's own error and is reported back on that same
+/// connection so it can try again, while a refused parse is the daemon at the
+/// edge of its grant and is not something the client can fix by resending.
+/// Collapsing them would tell a client its well-formed request was a parse
+/// error.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum DecodeRefusal {
+    #[error("control request parse was not admitted: {0}")]
+    Admission(#[from] FrameRefusal),
+    #[error("control request is not valid JSON: {0}")]
+    Malformed(serde_json::Error),
+}
+
+/// Read one line of the control protocol, admitting each growth step before it
+/// is allocated.
+///
+/// **What this does and does not claim.** Nothing here is funded after it
+/// exists. The capacity each growth step *requests* — the line buffer and the
+/// lease vector beside it — is acquired as bytes before the request is made, and
+/// the two allocations themselves are acquired as one opaque residual before
+/// either buffer has allocated at all. The two are separate on purpose:
+/// `reserve_exact` guarantees *at least* the capacity asked for, so the amount
+/// an allocator really reserves is not a number this code can state, and the
+/// residual says that rather than pretending to a byte count. An earlier version
+/// of this comment measured the excess after the growth and charged it then,
+/// which was the same defect one layer down — funding storage that already
+/// existed. It does not claim the same of the
+/// reader's own internal buffer: `fill_buf` has already copied bytes into that
+/// allocation by the time this sees them, so a claim taken here would be funding
+/// storage that already exists. That allocation is a fixed, connection-scoped
+/// substrate cost and is funded once, by the caller, before the reader is
+/// constructed — see `CONTROL_READ_BUFFER_BYTES` at the call site. An earlier
+/// version of this comment said every inbound byte was acquired before it was
+/// buffered, which was not true of that first copy.
+///
+/// The bound on a line is therefore the grant plus the reader's fixed window,
+/// not an owner ceiling; an absent ceiling means measured admission, not
+/// unbounded growth.
 ///
 /// The funding leaves with the line rather than with this function; see
 /// [`AdmittedLine`].
@@ -182,28 +521,71 @@ pub(super) async fn read_bounded_json_line<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let mut bytes = Vec::new();
+    // One opaque dependency per live `Vec` below, taken before either of them
+    // has allocated anything and held for as long as both do.
+    //
+    // This is the honest name for what a `Vec` costs beyond its contents. The
+    // capacity each growth step *requests* is funded as bytes, before the
+    // request; but `reserve_exact` promises only "at least", so the amount an
+    // allocator actually reserves is not a number this code can state. Charging
+    // a byte count for it would be inventing a measurement, and re-measuring
+    // after the growth would be funding storage that already exists. An opaque
+    // residual says what is true: there are two allocations here whose exact
+    // size is the allocator's to choose.
+    let residual = admission
+        .admit_allocator_residual(LINE_READ_ALLOCATIONS)
+        .context("control request buffer allocations were not admitted")?;
+    let mut bytes: Vec<u8> = Vec::new();
     // Accumulated beside the buffer and handed out with it. On the error paths
     // it is dropped here instead, together with the buffer it paid for — a line
     // that never became one funds nothing.
-    let mut held = Vec::new();
+    //
+    // This vector's own capacity is funded too, one slot per growth step,
+    // because its length is chosen by the sender: a client that trickles a line
+    // one byte per write makes one lease per byte, and a lease vector charged to
+    // nobody is the same unaccounted growth as an unfunded line.
+    let mut held: Vec<myownmesh_core::ResourceLease> = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
             if bytes.is_empty() {
                 return Ok(None);
             }
-            return admitted_line(bytes, held).map(Some);
+            return admitted_line(bytes, held, residual).map(Some);
         }
         let take = available
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |at| at + 1);
-        held.push(
-            admission
-                .admit_growth(bytes.len(), take)
-                .context("control request was not admitted")?,
-        );
+        // What the daemon will *hold* after this step, not what it will contain.
+        let frame = bytes
+            .len()
+            .checked_add(take)
+            .context("control request length overflowed")?;
+        let byte_capacity = frame.saturating_sub(bytes.capacity());
+        let lease_capacity = held
+            .len()
+            .checked_add(1)
+            .context("control request lease count overflowed")?
+            .saturating_sub(held.capacity())
+            .checked_mul(std::mem::size_of::<myownmesh_core::ResourceLease>())
+            .context("control request lease capacity overflowed")?;
+        let growth = byte_capacity
+            .checked_add(lease_capacity)
+            .context("control request buffer growth overflowed")?;
+        let lease = admission
+            .admit_buffer_growth(frame, growth)
+            .context("control request was not admitted")?;
+        // Past every refusal, so the capacity is funded before it is requested.
+        // `reserve_exact` guarantees *at least* what is asked for, so what these
+        // two calls do is request; the discretionary excess an allocator may add
+        // is not a byte count this code can know, and is named once as an opaque
+        // dependency by `residual` above rather than measured after the fact. A
+        // claim taken after growth would be funding an allocation that already
+        // exists, which is the whole defect this function was rewritten for.
+        bytes.reserve_exact(take);
+        held.reserve_exact(1);
+        held.push(lease);
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if bytes.last() == Some(&b'\n') {
@@ -211,7 +593,7 @@ where
             if bytes.last() == Some(&b'\r') {
                 bytes.pop();
             }
-            return admitted_line(bytes, held).map(Some);
+            return admitted_line(bytes, held, residual).map(Some);
         }
     }
 }
@@ -224,9 +606,17 @@ where
 /// re-acquiring the exact remainder would mean releasing funding and asking for
 /// it back — a window in which a concurrent connection could take it and this
 /// one would fail on bytes it already had.
-fn admitted_line(bytes: Vec<u8>, held: Vec<myownmesh_core::ResourceLease>) -> Result<AdmittedLine> {
+fn admitted_line(
+    bytes: Vec<u8>,
+    held: Vec<myownmesh_core::ResourceLease>,
+    residual: myownmesh_core::ResourceLease,
+) -> Result<AdmittedLine> {
     let line = String::from_utf8(bytes).context("control request is not UTF-8")?;
-    Ok(AdmittedLine { line, _held: held })
+    Ok(AdmittedLine {
+        line,
+        _held: held,
+        _residual: residual,
+    })
 }
 
 // ---- binary realtime pipe frame codec ---------------------------------------
@@ -918,23 +1308,30 @@ mod tests {
         assert_eq!(line.as_str(), "12345678");
     }
 
-    /// The funding leaves the reader with the line, not before it.
+    /// The funding leaves the reader with the line, and leaves with the line.
     ///
-    /// What this can check is that the line outlives the reader that produced it
-    /// and still carries its own storage — so nothing about it depends on the
-    /// connection buffer that is gone. What it cannot check is the release
-    /// *instant*, because observing that needs either a provider of this test's
-    /// own — which the binary's single-provider rule refuses, deliberately — or
-    /// a readout of outstanding usage, which no scope exposes. The ownership is
-    /// therefore enforced by [`AdmittedLine`]'s shape rather than asserted here,
-    /// and this control exists to say so where someone changing that shape will
-    /// read it.
+    /// Two things, against a provider this control owns so that both are
+    /// observable rather than argued from shape. First, the line outlives the
+    /// reader that produced it and still carries its own storage -- nothing
+    /// about it depends on the connection buffer that is gone. Second, that
+    /// storage is *charged* for exactly that long: while the line is alive a
+    /// further claim the remaining grant cannot cover is refused, and the same
+    /// claim succeeds once the line is dropped.
+    ///
+    /// The second half is the one that matters. A held lease that released
+    /// early would leave the line's bytes in memory funded by nobody, and no
+    /// assertion about the line's *contents* would notice.
     #[tokio::test]
     async fn an_admitted_line_carries_its_own_storage_past_its_reader() {
+        // The probe is sized so the arithmetic holds without this control
+        // knowing what a `ResourceLease` weighs: the line's fifteen bytes alone
+        // put the probe out of reach, and the whole grant covers it once the
+        // line is gone.
+        let admission = admission_granting_bytes(320);
         let input = b"{\"op\":\"status\"}\n";
         let line = {
             let mut reader = tokio::io::BufReader::new(&input[..]);
-            read_bounded_json_line(&mut reader, &granted_admission())
+            read_bounded_json_line(&mut reader, &admission)
                 .await
                 .unwrap()
                 .expect("a complete line")
@@ -942,6 +1339,15 @@ mod tests {
         assert_eq!(line.as_str(), "{\"op\":\"status\"}");
         let request: Request = serde_json::from_str(line.as_str()).expect("a status request");
         assert!(matches!(request, Request::Status));
+
+        admission
+            .admit_allocation(318)
+            .expect_err("the live line is still holding its share of the grant");
+        drop(line);
+        let probe = admission
+            .admit_allocation(318)
+            .expect("dropping the line returned its share");
+        drop(probe);
     }
 
     /// A ceiling bounds the frame, not one read of it.
@@ -969,5 +1375,339 @@ mod tests {
         let admission = admission_capped_at(8);
         assert!(admission.admit(8).is_ok());
         assert!(admission.admit(9).is_err());
+    }
+
+    /// The growth claim names the allocation, not the bytes that will sit in it.
+    ///
+    /// Load-bearing and easy to lose: `admit_growth` charges the logical length,
+    /// so a buffer that has rounded its capacity up is under-reported by exactly
+    /// the slack. This asserts the two helpers really do differ, which is the
+    /// only thing that makes the reader's switch to `admit_buffer_growth`
+    /// meaningful rather than a rename.
+    #[test]
+    fn buffer_growth_is_admitted_for_capacity_and_the_ceiling_for_the_frame() {
+        let admission = admission_capped_at(8);
+        // Frame within the ceiling, capacity larger than the frame: admitted,
+        // and the claim taken is the capacity one.
+        assert!(
+            admission.admit_buffer_growth(4, 64).is_ok(),
+            "a buffer may hold more than the frame it is carrying"
+        );
+        // Frame over the ceiling refuses regardless of how small the allocation
+        // is, because the ceiling is a statement about the frame.
+        let refusal = admission
+            .admit_buffer_growth(9, 0)
+            .expect_err("nine exceeds the ceiling of eight");
+        assert!(refusal.to_string().contains("owner-selected ceiling"));
+        // And the substrate path is deliberately outside the ceiling: a read
+        // window is not a frame, so an owner's frame bound must not refuse it.
+        assert!(
+            admission.admit_allocation(64).is_ok(),
+            "the read window is not bounded by the frame ceiling"
+        );
+    }
+
+    /// A provider this control owns, granting exactly `bytes` of accounted
+    /// memory and enough of everything else not to be the reason for a refusal.
+    ///
+    /// The point of the split is attribution. Byte capacity is the subject, so
+    /// it is tight; the provider's own bookkeeping records and the opaque
+    /// residuals every allocation carries are not, so they are generous. A
+    /// fixture that starved those too would refuse for a reason the control is
+    /// not about, and would still go green.
+    fn admission_granting_bytes(bytes: u64) -> FrameAdmission {
+        let grant = myownmesh_core::ResourceClaim::try_from_entries([
+            (myownmesh_core::ResourceClass::AccountedMemoryBytes, bytes),
+            (myownmesh_core::ResourceClass::ParsingOrCpuWork, 1 << 20),
+            (
+                myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+                1 << 20,
+            ),
+        ])
+        .expect("the control grant is representable");
+        FrameAdmission::over_grant(grant, None)
+    }
+
+    /// A reader that counts the times anything polled it.
+    ///
+    /// The count is the discriminator for the pair below: "was refused" and
+    /// "was refused before it read anything" are different claims, and only the
+    /// second one is what admission is for.
+    struct CountingReader {
+        remaining: &'static [u8],
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let take = self.remaining.len().min(buf.remaining());
+            let (head, tail) = self.remaining.split_at(take);
+            buf.put_slice(head);
+            self.remaining = tail;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The connection's read buffer is funded before it is constructed.
+    ///
+    /// Positive half of the pair, against a provider this control owns and
+    /// through the same sequence `handle_client` runs. The buffer is built
+    /// exactly once, and reading through it afterwards works normally -- the
+    /// second half is the non-vacuity, because a constructor that built nothing
+    /// would also report zero refusals.
+    #[tokio::test]
+    async fn a_funded_connection_reader_is_built_once() {
+        let admission = admission_granting_bytes(CONTROL_READ_BUFFER_BYTES as u64 + 512);
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = CountingReader {
+            remaining: b"{\"op\":\"status\"}\n",
+            polls: polls.clone(),
+        };
+        let counted = built.clone();
+        let mut admitted =
+            AdmittedReader::admit_building(reader, &admission, move |capacity, inner| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::io::BufReader::with_capacity(capacity, inner)
+            })
+            .expect("the grant covers one read buffer");
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the funded path builds the buffer exactly once"
+        );
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "and building it reads nothing"
+        );
+        let line = read_bounded_json_line(admitted.frames(), &admission)
+            .await
+            .unwrap()
+            .expect("a complete line");
+        assert_eq!(line.as_str(), "{\"op\":\"status\"}");
+        assert!(
+            polls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "non-vacuity: the funded reader really is the one being read"
+        );
+    }
+
+    /// A connection whose read buffer is refused never reads a byte.
+    ///
+    /// Negative half, and the construction count is the assertion that matters.
+    ///
+    /// "Returned an error" is cheap: a version that built the eight-kilobyte
+    /// buffer first and claimed afterwards would satisfy it, and would satisfy a
+    /// poll count too, because `BufReader::with_capacity` does not poll what it
+    /// wraps. What discriminates is that the buffer was never *built* -- and
+    /// since `admit_building` takes the construction itself rather than a hook
+    /// beside it, a zero count is that fact and not a proxy for it.
+    #[tokio::test]
+    async fn a_refused_connection_reader_is_never_built() {
+        // One byte short of the buffer this connection would ask for.
+        let admission = admission_granting_bytes(CONTROL_READ_BUFFER_BYTES as u64 - 1);
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = CountingReader {
+            remaining: b"{\"op\":\"status\"}\n",
+            polls: polls.clone(),
+        };
+        let counted = built.clone();
+        // Matched rather than `expect_err`, here and below: the success types
+        // carry a `ResourceLease` and an `AdmittedLine`, and giving
+        // resource-bearing types a `Debug` so that a test can print one is
+        // production surface added for a test's benefit.
+        let refusal =
+            match AdmittedReader::admit_building(reader, &admission, move |capacity, inner| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::io::BufReader::with_capacity(capacity, inner)
+            }) {
+                Ok(_) => panic!("the grant is one byte short of a read buffer"),
+                Err(refusal) => refusal,
+            };
+        assert!(
+            matches!(refusal, FrameRefusal::Resources(_)),
+            "refused by the provider: {refusal}"
+        );
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a connection the daemon cannot afford is given no buffer at all"
+        );
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "and is never read"
+        );
+    }
+
+    /// Buffer capacity is refused by the *provider*, before the line grows.
+    ///
+    /// Positive first, then negative, against a provider this control owns: the
+    /// same admission that funded a short line refuses a longer one for want of
+    /// accounted memory, with no owner ceiling involved anywhere. That is the
+    /// difference between this and the ceiling control below — a ceiling is the
+    /// owner's policy answering, and it would still pass if provider admission
+    /// were removed entirely.
+    #[tokio::test]
+    async fn provider_pressure_refuses_a_line_before_its_buffer_grows() {
+        // Comfortably funds the short line and its two buffer allocations.
+        let admission = admission_granting_bytes(512);
+        let short = b"{\"op\":\"status\"}\n";
+        let mut reader = tokio::io::BufReader::new(&short[..]);
+        let line = read_bounded_json_line(&mut reader, &admission)
+            .await
+            .expect("the short line is funded")
+            .expect("a complete line");
+        assert_eq!(line.as_str(), "{\"op\":\"status\"}");
+
+        // Same admission, now holding the short line's funding, and a line that
+        // does not fit in what is left.
+        let long = vec![b'x'; 4096];
+        let mut reader = tokio::io::BufReader::new(&long[..]);
+        let error = match read_bounded_json_line(&mut reader, &admission).await {
+            Ok(_) => panic!("four kilobytes do not fit in the remaining grant"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("refused by the resource provider"),
+            "refused by the provider rather than by an owner ceiling: {rendered}"
+        );
+        assert!(
+            !rendered.contains("owner-selected ceiling"),
+            "this admission has no ceiling at all: {rendered}"
+        );
+        drop(line);
+    }
+
+    /// The structural parse claim is refused before the `Request` is allocated.
+    ///
+    /// Positive then negative on one owned provider: a line whose structural
+    /// claim fits decodes, and a line whose structural claim does not is refused
+    /// as `Admission` — not as `Malformed`, which is what a decode that ran
+    /// anyway and then failed would look like. The line itself is well-formed
+    /// JSON in both halves, so shape is not what separates them.
+    #[tokio::test]
+    async fn structural_parse_pressure_refuses_before_the_request_is_allocated() {
+        let admission = admission_granting_bytes(1 << 16);
+        let input = b"{\"op\":\"status\"}\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let line = read_bounded_json_line(&mut reader, &admission)
+            .await
+            .expect("the line is funded")
+            .expect("a complete line");
+        let (lease, request) = line
+            .decode_request(&admission)
+            .expect("the structural claim fits this grant");
+        assert!(matches!(request, Request::Status));
+
+        // A second decode of the same line, against a provider whose accounted
+        // memory is now too small to carry another decoded tree. `json_input_work_claim`
+        // charges several bytes per input byte, so a grant this tight refuses.
+        let tight = admission_granting_bytes(8);
+        let refusal = line
+            .decode_request(&tight)
+            .expect_err("eight bytes cannot fund a decoded request");
+        assert!(
+            matches!(refusal, DecodeRefusal::Admission(_)),
+            "refused before the parse, not reported as malformed"
+        );
+        drop((lease, request, line));
+    }
+
+    /// Refusal happens before the line buffer grows.
+    ///
+    /// The reader must decide whether it may hold the next chunk *before* it
+    /// allocates room for it. This is the *ceiling* half of that: an owner's
+    /// bound refusing a line the connection is not allowed to hold. The
+    /// provider half is
+    /// [`provider_pressure_refuses_a_line_before_its_buffer_grows`], which does
+    /// the same thing under a grant too small rather than a policy too tight.
+    /// Both refusals leave `admit_buffer_growth` by the same `?`, ahead of the
+    /// same `reserve_exact`, so the two are the same ordering reached by the two
+    /// different reasons a chunk can be turned away.
+    #[tokio::test]
+    async fn the_reader_refuses_a_chunk_before_reserving_room_for_it() {
+        let input = b"123456789\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let error = match read_bounded_json_line(&mut reader, &admission_capped_at(8)).await {
+            Ok(_) => panic!("nine bytes exceed eight"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("owner-selected ceiling"),
+            "refused by the owner's bound rather than by the provider"
+        );
+    }
+
+    /// A malformed line is the client's error and stays distinguishable from a
+    /// refused one.
+    ///
+    /// The two arms of [`DecodeRefusal`] are answered differently on the wire —
+    /// one is reported back so the client can retry, the other is the daemon at
+    /// the edge of its grant — so collapsing them would tell a client its
+    /// well-formed request was a parse error.
+    ///
+    /// The second half also pins the acquire-*before*-parse ordering, which is
+    /// otherwise only a matter of which line of `decode` comes first. The very
+    /// same malformed line, offered to a provider too small to fund a decode,
+    /// comes back as `Admission` -- a parse that ran first would have reached
+    /// the syntax error and reported `Malformed` no matter how tight the grant
+    /// was, so the two arms swapping under pressure is the ordering.
+    #[tokio::test]
+    async fn a_malformed_line_is_reported_as_malformed_and_not_as_pressure() {
+        let input = b"{ this is not json
+";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let line = read_bounded_json_line(&mut reader, &granted_admission())
+            .await
+            .unwrap()
+            .expect("a complete line");
+        let refusal = line
+            .decode_request(&granted_admission())
+            .expect_err("the line is not a request");
+        assert!(matches!(refusal, DecodeRefusal::Malformed(_)));
+
+        let starved = admission_granting_bytes(8);
+        let refusal = line
+            .decode_request(&starved)
+            .expect_err("eight bytes cannot fund a decode");
+        assert!(
+            matches!(refusal, DecodeRefusal::Admission(_)),
+            "funding is taken before the parse, so pressure answers first"
+        );
+    }
+
+    /// The decoded request outlives the bytes it was parsed from, and its
+    /// funding outlives it.
+    ///
+    /// The raw line is dropped here exactly as `handle_client` drops it, while
+    /// the structural lease and the decoded value stay live — which is the
+    /// transfer the review found missing. The drop order is the other half and
+    /// is compile-visible rather than asserted: `(lease, request)` come from one
+    /// pattern, and bindings from one pattern drop in reverse, so the request is
+    /// destroyed before the lease that accounts for it.
+    #[tokio::test]
+    async fn the_decoded_request_carries_its_own_funding_past_the_line() {
+        let input = b"{\"op\":\"status\"}\n";
+        let admission = granted_admission();
+        let (_decoded, request) = {
+            let mut reader = tokio::io::BufReader::new(&input[..]);
+            let line = read_bounded_json_line(&mut reader, &admission)
+                .await
+                .unwrap()
+                .expect("a complete line");
+            let decoded = line.decode_request(&admission).expect("a status request");
+            drop(line);
+            decoded
+        };
+        assert!(matches!(request, Request::Status));
     }
 }

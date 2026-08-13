@@ -46,13 +46,29 @@ impl<T> GatewayMailbox<T> {
     /// Claim the producer-measured off-node representation retained by one
     /// value. Allocation count is explicit because a serialized byte block and
     /// a decoded tree are different representations and must not share a guess.
+    /// What one queued item retains, in the three figures that are genuinely
+    /// three different things.
+    ///
+    /// `retained_bytes` and `queued_bytes` used to be one argument used twice,
+    /// which is right only when the queued form and the retained form are the
+    /// same size. For a flat name or a byte string they are. For a
+    /// `serde_json::Value` they are not, and the ratio between them is chosen by
+    /// whoever sent it: `[[[[]]]]` is a handful of queued bytes and a chain of
+    /// separately allocated nodes in memory. A caller that has both figures
+    /// passes both; one whose item is flat passes the same number twice, which
+    /// is the old behaviour stated rather than assumed.
     pub(crate) fn retention_claim(
         retained_bytes: usize,
+        queued_bytes: usize,
         allocations: usize,
     ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         let retained_bytes =
             u64::try_from(retained_bytes).map_err(|_| ResourceClaimArithmeticError::Overflow {
                 dimension: ResourceClass::AccountedMemoryBytes,
+            })?;
+        let queued_bytes =
+            u64::try_from(queued_bytes).map_err(|_| ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::QueuedBytes,
             })?;
         let allocations =
             u64::try_from(allocations).map_err(|_| ResourceClaimArithmeticError::Overflow {
@@ -60,7 +76,7 @@ impl<T> GatewayMailbox<T> {
             })?;
         ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, retained_bytes),
-            (ResourceClass::QueuedBytes, retained_bytes),
+            (ResourceClass::QueuedBytes, queued_bytes),
             (ResourceClass::OpaqueDependencyResidual, allocations),
         ])
     }
@@ -130,7 +146,7 @@ mod tests {
     #[test]
     fn gateway_pop_releases_node_but_delivery_keeps_retention_funded() {
         let node = GatewayMailbox::<Bytes>::node_claim().expect("node claim is representable");
-        let retention = GatewayMailbox::<Bytes>::retention_claim(4, 1)
+        let retention = GatewayMailbox::<Bytes>::retention_claim(4, 4, 1)
             .expect("retention claim is representable");
         let (provider, port, scope) = mailbox_provider(node, retention);
         let baseline = provider.in_use();
