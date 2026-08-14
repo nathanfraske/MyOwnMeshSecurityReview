@@ -210,7 +210,7 @@ async fn receive_string(
             tokio::select! {
                 message = channel.recv() => {
                     if let Some(Ok(message)) = message {
-                        return (message.from, message.body);
+                        return (message.from().to_string(), message.body().clone());
                     }
                 }
                 event = events.recv(), if std::env::var_os("MYOWNMESH_ARC03_DEBUG_EVENTS").is_some() => {
