@@ -592,7 +592,7 @@ mod tests {
 
         let mut stream = bob_rpc
             .call_stream(
-                &alice_id.public_id(),
+                alice_id.public_id(),
                 "terminal_only",
                 serde_json::json!("go"),
             )
