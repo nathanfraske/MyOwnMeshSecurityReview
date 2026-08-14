@@ -1,3 +1,18 @@
+# Cap build width so a parallel debug build fits in RAM.
+#
+# Cargo defaults `jobs` to the CPU count, which on the workstation this was
+# measured on means 20 concurrent rustc processes and, at the tail of the
+# build, 13-16 concurrent MSVC `link.exe` processes — ~12.2 GiB resident
+# against 32 GiB of RAM, which pages. Linker peak is per-process and does not
+# shrink with a smaller `-j`; the *count* of simultaneous linkers is what this
+# bounds. Paired with `debug = "line-tables-only"` in the workspace
+# `[profile.dev]`, which shrinks each of those processes.
+#
+# An explicit `-j`/`--jobs` on the command line still overrides this, so a
+# machine with headroom is not locked to 8.
+[build]
+jobs = 8
+
 # Cross-compilation for the NanoKVM SoC (Sophgo SG2002 / T-Head C906, riscv64).
 #
 # The daemon ships as a fully static **rv64gc musl** binary, built with
@@ -19,9 +34,10 @@
 #   and on a dev box (no fragile musl-gcc download): `just build-risc` runs
 #   `cargo zigbuild`, and `just setup-risc` installs zig + cargo-zigbuild.
 #
-# This file is inert for normal host builds — it only applies to the
-# riscv64gc-unknown-linux-musl target. cargo-zigbuild injects the linker and
-# ring's C-compiler/AR via env, so nothing else needs configuring here.
+# This section is inert for normal host builds — it only applies to the
+# riscv64gc-unknown-linux-musl target (the `[build]` table above is the part of
+# this file that does apply to every build). cargo-zigbuild injects the linker
+# and ring's C-compiler/AR via env, so nothing else needs configuring here.
 # See docs/NANOKVM.md and .github/workflows/release.yml.
 
 [target.riscv64gc-unknown-linux-musl]
