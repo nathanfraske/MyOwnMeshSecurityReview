@@ -324,7 +324,7 @@ async fn run_area(n_spokes: usize) {
                 match next {
                     Ok(frame) => {
                         let _ = echo_state
-                            .send_channel_frame(&operator_id, CHANNEL, frame.body)
+                            .send_channel_frame(&operator_id, CHANNEL, frame.body().clone())
                             .await;
                     }
                     // Reported and survivable, which is the truthful shape here.
@@ -360,7 +360,7 @@ async fn run_area(n_spokes: usize) {
                     "echo from member-{i} seq {seq} never arrived"
                 );
                 match tokio::time::timeout(remaining, echo_rx.recv()).await {
-                    Ok(Some(Ok(frame))) if frame.body == payload => break,
+                    Ok(Some(Ok(frame))) if frame.body() == &payload => break,
                     Ok(Some(Ok(_))) => {} // stale/other frame — keep draining
                     // The old receiver reported both of these as "stream
                     // closed". They are different faults and only one of them

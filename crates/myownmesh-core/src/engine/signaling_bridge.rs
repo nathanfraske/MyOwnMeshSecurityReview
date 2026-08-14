@@ -43,6 +43,74 @@ use crate::transport::LocalIceCandidate;
 
 use super::state::{NetworkState, SignalingInbound, SignalingOutbound};
 
+/// What one signaling driver's outbound queue costs the engine, as a single
+/// standing residual rather than a charge per message.
+///
+/// **This is deliberately broader than exact accounting, and saying so is part
+/// of it.** An outbound pump does not forward the engine's own value — it
+/// translates it, building a driver-shaped message with a peer id, an offer id
+/// and a copy of the SDP or candidate the engine handed over. Those are new
+/// allocations that live in a plain `tokio::mpsc` queue inside a crate with no
+/// resource vocabulary, for as long as the driver takes to drain them.
+///
+/// The two honest ways to cover that were to make the driver queues themselves
+/// admitted — which means teaching `myownmesh-signaling` about the accountant,
+/// in a crate that is also used standalone — or to name the subsystem once and
+/// hold that name for as long as the queues can hold anything. This is the
+/// second. It does not claim to measure the traffic; it claims that the engine
+/// has acknowledged the queue exists and has kept something live for exactly as
+/// long as it does. What it replaces claimed neither.
+const SIGNALING_DRIVER_QUEUE_CLAIM: crate::resource::ResourceClaim =
+    crate::resource::ResourceClaim::single(
+        crate::resource::ResourceClass::OpaqueDependencyResidual,
+        1,
+    );
+
+/// Acquire the residual for one driver's outbound queue, before anything is
+/// translated into it.
+///
+/// `None` is a refusal, and the caller must not attach — a driver started
+/// without this would translate into a queue nothing accounts for, which is
+/// the state this exists to end.
+///
+/// The lease is returned by value and travels by value: the driver stores it
+/// inline in its own state, so nothing is allocated to carry it. That is not
+/// incidental tidiness. The obvious alternative, an erased
+/// `Box<dyn Send + Sync>`, allocates something the engine would then have to
+/// account for, and `Box` drops its payload before it frees its allocation —
+/// so a boxed lease would release this very claim and only then deallocate the
+/// box that claim was covering. A false release, produced by the mechanism
+/// meant to prevent one.
+fn acquire_driver_queue_owner(
+    state: &Arc<NetworkState>,
+    driver: &str,
+) -> Option<crate::resource::ResourceLease> {
+    let scope = match state.local_application_resource_scope() {
+        Ok(scope) => scope,
+        Err(error) => {
+            warn!(
+                network = %state.network_id,
+                driver,
+                %error,
+                "signaling driver not attached: no local application resource scope"
+            );
+            return None;
+        }
+    };
+    match scope.acquire(SIGNALING_DRIVER_QUEUE_CLAIM) {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            warn!(
+                network = %state.network_id,
+                driver,
+                ?error,
+                "signaling driver not attached: its outbound queue was not funded"
+            );
+            None
+        }
+    }
+}
+
 /// Attach an existing [`NetworkState`] to a [`LocalBroker`] room.
 /// Spawns two pump tasks (outbound engine → broker, inbound
 /// broker → engine) that live until either side closes its
@@ -53,14 +121,21 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
         &state.network_id,
     );
     let device_id = state.identity.public_id().to_string();
-    let (out_tx, mut in_rx) = broker.join(&room, &device_id);
 
-    // Outbound: engine → broker.
+    // Outbound: engine → broker. Claimed before anything else, so a second
+    // attach costs nothing: only one consumer is allowed, and a no-op attach
+    // must not join a room or acquire funding it will never use.
     let Some(mut outbound_rx) = state.take_signaling_outbound_rx() else {
-        // Only one consumer is allowed; if someone else already
-        // attached, the second attach is a no-op.
         return;
     };
+    // Then the queue owner, before the room exists — joining creates the queue
+    // this pays for, and the first thing the pump does is push an announce
+    // into it.
+    let Some(queue_owner) = acquire_driver_queue_owner(state, "local") else {
+        return;
+    };
+    let (out_tx, mut in_rx) = broker.join_with_queue_owner(&room, &device_id, queue_owner);
+
     let device_id_for_out = device_id.clone();
     tokio::spawn(async move {
         // Announce ourselves on join so peers learn we're here
@@ -69,8 +144,14 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
             device_id: device_id_for_out.clone(),
         });
         while let Some(delivery) = outbound_rx.recv().await {
-            let (outbound, _mailbox_entry) = delivery.into_parts();
-            let msg = match outbound {
+            // Read, not taken apart. What goes into the broker's queue is a
+            // *translation* — a different type, with a peer id and an offer id
+            // the engine never sent — so this was never a forward of the
+            // delivered value in the first place. The copies it makes are what
+            // the queue owner acquired above stands for; the delivery itself
+            // stays whole and is released at the end of the iteration, still
+            // holding its own funding.
+            let msg = match delivery.value() {
                 SignalingOutbound::Announce => LocalOutbound::Announce {
                     device_id: device_id_for_out.clone(),
                 },
@@ -78,32 +159,32 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     device_id: device_id_for_out.clone(),
                 },
                 SignalingOutbound::Offer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Offer {
                         peer_id: device_id_for_out.clone(),
                         offer_id: new_short_id(),
-                        sdp,
+                        sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Answer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Answer {
                         peer_id: device_id_for_out.clone(),
                         offer_id: String::new(),
-                        sdp,
+                        sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Candidate {
                     device_id: to,
                     candidate,
                 } => LocalOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Candidate {
                         peer_id: device_id_for_out.clone(),
-                        candidate: candidate.candidate,
-                        sdp_mid: candidate.sdp_mid,
+                        candidate: candidate.candidate.clone(),
+                        sdp_mid: candidate.sdp_mid.clone(),
                         sdp_mline_index: candidate.sdp_mline_index,
-                        username_fragment: candidate.username_fragment,
+                        username_fragment: candidate.username_fragment.clone(),
                     },
                 },
             };
@@ -340,7 +421,7 @@ fn translate_message(from: String, msg: SignalingMessage) -> SignalingInbound {
 pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
     let outbound_rx = state.take_signaling_outbound_rx()?;
     let gate = InboundGate::new(state.signaling_inbound_tx.clone());
-    Some(attach_nostr_with(state, outbound_rx, gate))
+    attach_nostr_with(state, outbound_rx, gate)
 }
 
 /// [`attach_nostr`] with an explicit outbound receiver + delivery
@@ -350,7 +431,11 @@ fn attach_nostr_with(
     state: &Arc<NetworkState>,
     mut outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     gate: Arc<InboundGate>,
-) -> NostrDriverHandle {
+) -> Option<NostrDriverHandle> {
+    // First, and before the channels exist: the pump below translates into a
+    // queue this pays for, and a refusal here has to stop the attach rather
+    // than proceed unfunded.
+    let queue_owner = acquire_driver_queue_owner(state, "nostr")?;
     let cfg = state.config.read();
     let nostr_cfg = NostrDriverConfig {
         app_id: resolve_app_id(),
@@ -394,37 +479,38 @@ fn attach_nostr_with(
         // → distinct sha256 id, so receiver-side dedup wouldn't
         // collapse it) — wasted relay bandwidth for no benefit.
         while let Some(delivery) = outbound_rx.recv().await {
-            let (outbound, _mailbox_entry) = delivery.into_parts();
-            let translated = match outbound {
+            // Read, not taken apart — see the local pump for why a translation
+            // was never a forward, and what the driver's queue owner covers.
+            let translated = match delivery.value() {
                 SignalingOutbound::Announce => NostrOutbound::Announce,
                 SignalingOutbound::Leave => NostrOutbound::Leave,
                 SignalingOutbound::Offer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Offer {
                         peer_id: device_id_for_out.clone(),
                         offer_id: new_short_id(),
-                        sdp,
+                        sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Answer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Answer {
                         peer_id: device_id_for_out.clone(),
                         offer_id: String::new(),
-                        sdp,
+                        sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Candidate {
                     device_id: to,
                     candidate,
                 } => NostrOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Candidate {
                         peer_id: device_id_for_out.clone(),
-                        candidate: candidate.candidate,
-                        sdp_mid: candidate.sdp_mid,
+                        candidate: candidate.candidate.clone(),
+                        sdp_mid: candidate.sdp_mid.clone(),
                         sdp_mline_index: candidate.sdp_mline_index,
-                        username_fragment: candidate.username_fragment,
+                        username_fragment: candidate.username_fragment.clone(),
                     },
                 },
             };
@@ -456,7 +542,7 @@ fn attach_nostr_with(
         trace!("nostr inbound pump exiting");
     });
 
-    let handle = nostr_driver::start(nostr_cfg, out_rx, in_tx);
+    let handle = nostr_driver::start_with_queue_owner(nostr_cfg, out_rx, in_tx, queue_owner);
     // Hand the engine the force-reconnect signal so resume-from-sleep
     // (and any other recovery path) can make every relay redial at
     // once instead of waiting out a zombie socket. See
@@ -466,7 +552,7 @@ fn attach_nostr_with(
     // wait for signaling to actually come back before it offers (see
     // `network_watch::on_network_change`).
     state.set_relay_connected_signal(handle.connected_signal());
-    handle
+    Some(handle)
 }
 
 /// Attach the engine to the LAN mDNS signaling driver. Returns the
@@ -491,6 +577,8 @@ fn attach_mdns_with(
     mut outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     gate: Arc<InboundGate>,
 ) -> Option<MdnsDriverHandle> {
+    // First, and before the channels exist — same reason as the Nostr path.
+    let queue_owner = acquire_driver_queue_owner(state, "mdns")?;
     let mdns_cfg = MdnsDriverConfig {
         app_id: resolve_app_id(),
         network_id: state.config.read().network_id.clone(),
@@ -504,7 +592,7 @@ fn attach_mdns_with(
     // Start the driver before consuming anything else — its setup is
     // synchronously fallible (mDNS daemon, TCP listener), unlike
     // Nostr's lazy socket dials.
-    let handle = match mdns_driver::start(mdns_cfg, out_rx, in_tx) {
+    let handle = match mdns_driver::start_with_queue_owner(mdns_cfg, out_rx, in_tx, queue_owner) {
         Ok(h) => h,
         Err(e) => {
             warn!(network = %state.network_id, "mdns signaling unavailable: {e}");
@@ -525,37 +613,38 @@ fn attach_mdns_with(
     // a cheap idempotent nudge.
     tokio::spawn(async move {
         while let Some(delivery) = outbound_rx.recv().await {
-            let (outbound, _mailbox_entry) = delivery.into_parts();
-            let translated = match outbound {
+            // Read, not taken apart — see the local pump for why a translation
+            // was never a forward, and what the driver's queue owner covers.
+            let translated = match delivery.value() {
                 SignalingOutbound::Announce => MdnsOutbound::Announce,
                 SignalingOutbound::Leave => MdnsOutbound::Leave,
                 SignalingOutbound::Offer { device_id: to, sdp } => MdnsOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Offer {
                         peer_id: device_id.clone(),
                         offer_id: new_short_id(),
-                        sdp,
+                        sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Answer { device_id: to, sdp } => MdnsOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Answer {
                         peer_id: device_id.clone(),
                         offer_id: String::new(),
-                        sdp,
+                        sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Candidate {
                     device_id: to,
                     candidate,
                 } => MdnsOutbound::DirectedToPeer {
-                    to,
+                    to: to.clone(),
                     msg: SignalingMessage::Candidate {
                         peer_id: device_id.clone(),
-                        candidate: candidate.candidate,
-                        sdp_mid: candidate.sdp_mid,
+                        candidate: candidate.candidate.clone(),
+                        sdp_mid: candidate.sdp_mid.clone(),
                         sdp_mline_index: candidate.sdp_mline_index,
-                        username_fragment: candidate.username_fragment,
+                        username_fragment: candidate.username_fragment.clone(),
                     },
                 },
             };
@@ -670,13 +759,13 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             let nostr = attach_nostr_with(state, nostr_rx, gate.clone());
             let mdns = attach_mdns_with(state, mdns_rx, gate);
             SignalingDrivers {
-                nostr: Some(nostr),
+                nostr,
                 mdns,
                 fanout: Some(fanout),
             }
         }
         (true, false) => SignalingDrivers {
-            nostr: Some(attach_nostr_with(state, outbound_rx, gate)),
+            nostr: attach_nostr_with(state, outbound_rx, gate),
             mdns: None,
             fanout: None,
         },
@@ -734,7 +823,11 @@ fn spawn_fanout(
     let mut last_evicted_probe: Option<std::time::Instant> = None;
     tokio::spawn(async move {
         while let Some(delivery) = outbound_rx.recv().await {
-            let (msg, _mailbox_entry) = delivery.into_parts();
+            // Read, never taken apart. Every driver copy below is separately
+            // admitted through its own `ResourceMailboxSender`, so this pump
+            // never owns a translated allocation of its own and has no reason
+            // to hold the delivered value away from what funds it.
+            let msg = delivery.value();
             // A stood-down engine stops advertising itself: an announce is
             // an invitation to dial us, and every member would answer it
             // with a denial. Directed signaling (offers/answers already in
@@ -755,7 +848,7 @@ fn spawn_fanout(
                 .traffic
                 .record_signaling_tx(matches!(msg, SignalingOutbound::Announce));
             for tx in &driver_txs {
-                let kind = match &msg {
+                let kind = match msg {
                     SignalingOutbound::Announce => "announce",
                     SignalingOutbound::Leave => "leave",
                     SignalingOutbound::Offer { .. } => "offer",

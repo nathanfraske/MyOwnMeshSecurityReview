@@ -159,7 +159,10 @@ pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 /// fixture exists: the controls that need it live in another crate.
 #[cfg(feature = "transport-lab")]
 pub use handle::TransportLabPromotedPeer;
-pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
+pub use handle::{
+    FundedGovernanceSnapshot, FundedRosterSnapshot, JoinedNetwork, Mesh, MeshHandle, PeerInfo,
+    PreparedGovernanceSnapshot, PreparedRosterSnapshot,
+};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
 pub use network_state::{
     NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,

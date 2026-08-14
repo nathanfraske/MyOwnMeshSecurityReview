@@ -36,6 +36,68 @@ use serde::{Deserialize, Serialize};
 /// subscription that drops the legacy catch-all filter once it does.
 pub const SIG_CAP_PTAG: &str = "ptag";
 
+/// A driver queue's receiver and whatever the caller says funds it, in that
+/// order.
+///
+/// # Why a driver takes an owner it never reads
+///
+/// The engine accounts for memory it hands to a driver, and a driver's outbound
+/// queue is memory the engine fills: it translates its own messages into the
+/// driver's types and pushes them in. Those translations are allocations that
+/// outlive the call that made them, and nothing owned them once they were in
+/// the queue.
+///
+/// This crate does not learn a resource vocabulary to fix that, and should not
+/// — it is used standalone, where there is no accountant to answer to. It takes
+/// an opaque `O` instead: it never reads it, never looks inside, never bounds
+/// it beyond thread-safety, and guarantees only *when* it is dropped. That
+/// guarantee is the whole contract.
+///
+/// # Why the order is the point
+///
+/// `rx` is declared first, so it is dropped first, and dropping it drops
+/// everything still sitting in the queue — only then is the owner released.
+/// Rust drops struct fields in declaration order, so this holds however the
+/// value dies: a clean shutdown, a task cancelled mid-`recv`, a panic unwinding
+/// through the driver. A pair of local `drop` calls at the end of a loop would
+/// have covered only the first of those, and *locals* drop in the reverse of
+/// the order they are declared, which is the opposite of what is wanted here
+/// and easy to write backwards.
+///
+/// # Why `O` is generic rather than `Box<dyn Send + Sync>`
+///
+/// A box would have been simpler to pass around and wrong twice over. It is an
+/// allocation of its own, which the engine would then have to account for; and
+/// worse, `Box<T>` drops its payload *before* it frees its allocation, so a
+/// boxed lease would release the claim and only then deallocate the box that
+/// claim was supposed to cover. That is a false-release interval — the exact
+/// defect this ordering exists to remove, reintroduced by the mechanism meant
+/// to remove it. Storing `O` inline has neither problem: nothing is allocated,
+/// and the owner is released after the values it stands for.
+///
+/// `O = ()` is the standalone case, costs nothing, and is what every
+/// pre-existing entry point passes.
+pub struct OwnedQueue<T, O> {
+    rx: tokio::sync::mpsc::UnboundedReceiver<T>,
+    _owner: O,
+}
+
+impl<T, O> OwnedQueue<T, O> {
+    /// Bind a receiver to its owner.
+    pub fn new(rx: tokio::sync::mpsc::UnboundedReceiver<T>, owner: O) -> Self {
+        Self { rx, _owner: owner }
+    }
+
+    /// Receive the next queued value, as [`tokio::sync::mpsc::UnboundedReceiver::recv`].
+    ///
+    /// Deliberately the only way in: there is no accessor that hands out the
+    /// receiver, because a caller holding the receiver alone could outlive the
+    /// owner, and that is the state this type exists to rule out.
+    pub async fn recv(&mut self) -> Option<T> {
+        self.rx.recv().await
+    }
+}
+
 /// One signaling message — either an offer/answer SDP exchange, an
 /// ICE candidate, or the periodic presence-announce. Each carries
 /// the sender's peer-id (Device ID) so receivers route correctly.

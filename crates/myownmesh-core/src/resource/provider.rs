@@ -1528,6 +1528,18 @@ impl<T: ?Sized> FundedWeak<T> {
             _shared: shared,
         })
     }
+
+    /// How many strong handles are left — `0` once the value is gone.
+    ///
+    /// For pruning a registry of weak links without the strong clone that
+    /// [`Self::upgrade`] would make just to drop it again. It observes and
+    /// hands out nothing, so it cannot be a route to an unfunded alias.
+    ///
+    /// Says nothing about the funding: this handle's own token keeps the
+    /// allocation paid for whether the count is zero or not.
+    pub fn strong_count(&self) -> usize {
+        std::sync::Weak::strong_count(&self.value)
+    }
 }
 
 impl<T: ?Sized> Clone for FundedWeak<T> {

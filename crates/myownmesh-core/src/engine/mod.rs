@@ -214,8 +214,14 @@ pub async fn run_driver(
 
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break "command channel closed" };
-                let (cmd, _entry_resources) = cmd.into_parts();
-                handle_command(&state, cmd).await;
+                // A command is handled, not read: fifteen `NetworkCmd` variants
+                // carry a `oneshot::Sender` that answering consumes, so this is
+                // the one path that cannot work from a borrow. The terminal
+                // effect releases the delivery's funding only after
+                // `handle_command` has finished, and can return nothing, so
+                // neither the command nor anything derived from it outlives the
+                // claim.
+                cmd.run_terminal_effect(|cmd| handle_command(&state, cmd)).await;
             }
 
             sig = signaling_inbound.recv() => {
@@ -223,8 +229,17 @@ pub async fn run_driver(
                     warn!(network = %state.network_id, "signaling channel closed");
                     break "signaling channel closed";
                 };
-                let (sig, _entry_resources) = sig.into_parts();
-                handle_signaling_inbound(&state, sig).await;
+                // Same shape as the command arm above, for the same reason:
+                // `SignalingInbound` is public and its payloads are consumed by
+                // value downstream — `apply_remote_sdp` takes an owned `String`
+                // and `add_remote_candidate_observed` takes an owned
+                // `LocalIceCandidate`. Handling from a borrow would mean
+                // cloning two multi-kilobyte SDP bodies and an ICE candidate
+                // outside the claim that funded them, so the whole delivery
+                // rides into the handler and its funding is released only after
+                // the handler has finished.
+                sig.run_terminal_effect(|sig| handle_signaling_inbound(&state, sig))
+                    .await;
             }
 
             _ = heartbeat.tick() => {
@@ -391,6 +406,19 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         }
         NetworkCmd::GovernanceSnapshot { reply } => {
             let _ = reply.send(governance::snapshot(state));
+        }
+        NetworkCmd::PrepareGovernanceSnapshot { reply } => {
+            let governance = state.governance_state.read();
+            let _ = reply.send(crate::handle::governance_snapshot_ceiling(&governance));
+        }
+        NetworkCmd::CommitGovernanceSnapshot {
+            ceiling,
+            lease,
+            reply,
+        } => {
+            let governance = state.governance_state.read();
+            let result = crate::handle::commit_governance_snapshot(&governance, ceiling, lease);
+            let _ = reply.send(result);
         }
     }
 }
@@ -697,7 +725,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     // pinned peer (a standing support session) redials on
                     // its announce, always as the offerer — the far side
                     // has no pin and would wait forever on lex-order.
-                    ensure_peer_session(state, device_id, Role::Offerer).await;
+                    ensure_peer_session(state, &device_id, Role::Offerer).await;
                 } else {
                     note_sighted_without_dialing(state, &device_id, "silent network");
                 }
@@ -719,7 +747,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 // — the far side has no pin and would wait on lex-order —
                 // same rule as the Silent branch and the prune exemption.
                 if state.is_sticky(&device_id) {
-                    ensure_peer_session(state, device_id, Role::Offerer).await;
+                    ensure_peer_session(state, &device_id, Role::Offerer).await;
                     return;
                 }
                 let dial = {
@@ -737,7 +765,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     }
                 };
                 if dial {
-                    ensure_peer_session(state, device_id, role).await;
+                    ensure_peer_session(state, &device_id, role).await;
                 } else {
                     note_sighted_without_dialing(state, &device_id, "no topology edge");
                 }
@@ -818,7 +846,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 );
                 drop_peer(state, &device_id, DropReason::IceFailed).await;
             }
-            ensure_peer_session(state, device_id.clone(), role).await;
+            ensure_peer_session(state, &device_id, role).await;
             apply_remote_sdp(state, &device_id, RTCSdpType::Offer, sdp).await;
             // Build the answer. Extract the session under the lock,
             // drop everything, then await — guards across awaits
@@ -1031,7 +1059,7 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
         return;
     }
     maybe_reactive_announce(state);
-    ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
+    ensure_peer_session(state, device_id, Role::Offerer).await;
 }
 
 /// Drive the renegotiations the transport flagged off the driver task.
@@ -1478,13 +1506,13 @@ async fn connect_peer(
             state.register_connect_waiter(device_id, reply);
         }
     }
-    ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
+    ensure_peer_session(state, device_id, Role::Offerer).await;
     // Nudge presence so the relays are warm and the remote sees us promptly;
     // globally rate-limited, so this can't add signaling load.
     maybe_reactive_announce(state);
 }
 
-async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
+async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: Role) {
     // Return only if we already hold a live *session* for this peer. A
     // session-less discovery placeholder — what a Silent network records for a
     // co-present peer it hasn't dialed (see `note_sighted_without_dialing`) —
@@ -1494,7 +1522,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // the previous `contains_key` guard.
     if state
         .peers
-        .get(&device_id)
+        .get(device_id)
         .is_some_and(|p| p.session.lock().is_some())
     {
         return;
@@ -1502,7 +1530,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // Per-peer negotiation stage, same reasoning as the webrtc.rs stage logs:
     // one line per peer per attempt is fine when connects are rare and a flood
     // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
-    debug!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
+    debug!(peer = %short_peer(device_id), ?role, "ensure_peer_session: opening transport session");
     let cfg = state.config.read().clone();
     let construction = tokio::time::timeout(
         Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
@@ -1520,7 +1548,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
             state.log_diag_with(
                 crate::events::DiagLevel::Error,
                 "transport",
-                format!("open_peer failed for {}: {e}", short_peer(&device_id)),
+                format!("open_peer failed for {}: {e}", short_peer(device_id)),
                 serde_json::json!({ "peer": device_id, "error": e.to_string() }),
             );
             warn!(peer = %device_id, "open_peer failed: {e}");
@@ -1532,7 +1560,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                 "transport",
                 format!(
                     "open_peer for {} did not complete within the existing {} ms connection-attempt window",
-                    short_peer(&device_id),
+                    short_peer(device_id),
                     scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS
                 ),
                 serde_json::json!({
@@ -1545,7 +1573,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     };
     let session = Arc::new(session);
     let peer = Arc::new(PeerConnection::new(
-        device_id.clone(),
+        device_id.to_string(),
         Some(session.clone()),
     ));
     // Start the connect-timeout clock the moment the session exists: if the
@@ -1557,12 +1585,12 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
 
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
         network_id: state.network_id.clone(),
-        device_id: device_id.clone(),
+        device_id: device_id.to_string(),
     }));
     state.log_diag_with(
         crate::events::DiagLevel::Info,
         "peer",
-        format!("{} connecting (we are {role:?})", short_peer(&device_id)),
+        format!("{} connecting (we are {role:?})", short_peer(device_id)),
         serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
     );
 
@@ -1573,7 +1601,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // the daemon sat with one worker spinning and the driver parked here
     // forever while the control socket timed out op after op. A stuck offer
     // now costs this one attempt (the watchdog rebuilds it), not the engine.
-    debug!(peer = %short_peer(&device_id), "ensure_peer_session: building offer");
+    debug!(peer = %short_peer(device_id), "ensure_peer_session: building offer");
     if role == Role::Offerer {
         let built = tokio::time::timeout(
             Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
@@ -1585,14 +1613,14 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                 state.log_diag_with(
                     crate::events::DiagLevel::Debug,
                     "signaling",
-                    format!("offer sent to {}", short_peer(&device_id)),
+                    format!("offer sent to {}", short_peer(device_id)),
                     serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
                 );
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                    device_id: device_id.clone(),
+                    device_id: device_id.to_string(),
                     sdp: desc.sdp,
                 });
-                if let Some(p) = state.peers.get(&device_id) {
+                if let Some(p) = state.peers.get(device_id) {
                     p.state.write().last_offer_sent_at = Some(Instant::now());
                 }
             }
@@ -1600,7 +1628,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                 state.log_diag_with(
                     crate::events::DiagLevel::Error,
                     "signaling",
-                    format!("create_offer failed for {}: {e}", short_peer(&device_id)),
+                    format!("create_offer failed for {}: {e}", short_peer(device_id)),
                     serde_json::json!({ "peer": device_id, "error": e.to_string() }),
                 );
                 warn!(peer = %device_id, "create_offer failed: {e}");
@@ -1611,7 +1639,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                     "signaling",
                     format!(
                         "create_offer for {} did not complete within {} ms — abandoning this attempt (the connect watchdog will rebuild it)",
-                        short_peer(&device_id),
+                        short_peer(device_id),
                         scheduler::OFFER_BUILD_TIMEOUT_MS
                     ),
                     serde_json::json!({ "peer": device_id }),
@@ -1626,7 +1654,9 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // general command queue. The receiver stamps each value with the exact
     // connector worker identity that owns its callback source.
     let connector_state = Arc::clone(state);
-    let peer_id_for_pump = device_id.clone();
+    // Owned, because the pump outlives this call: it is spawned, so it cannot
+    // borrow the caller's id.
+    let peer_id_for_pump = device_id.to_string();
     let task_observation = session.observe_owned_task();
     tokio::spawn(async move {
         let _task_observation = task_observation;
@@ -1839,7 +1869,7 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
         },
         // Peer gone (or session-less) — rebuild as offerer; that path
         // sends a fresh offer as part of setup.
-        None => ensure_peer_session(state, device_id.to_string(), Role::Offerer).await,
+        None => ensure_peer_session(state, device_id, Role::Offerer).await,
     }
 }
 
@@ -3705,40 +3735,45 @@ async fn on_rpc_request(
                     // handler's side of the stream too, and no terminal frame is
                     // sent — the session it would have been owner-bound to no longer
                     // exists.
+                    let mut terminal = false;
                     loop {
                         let Some(delivery) = rx.recv().await else {
                             break;
                         };
-                        let (item, _retention) = delivery.into_parts();
-                        let payload = match item {
-                            crate::rpc::RpcStreamItem::Chunk(payload) => payload,
+                        // Nothing is taken out of the delivery and nothing is
+                        // built from it: the frame borrows the delivered
+                        // payload and the task's own request id, so it is the
+                        // borrow checker, not a convention, that keeps the
+                        // delivery — and the retention inside it — alive across
+                        // the send `.await` below. The frame owns no bytes of
+                        // its own, so there is nothing here for a claim to have
+                        // missed.
+                        let frame = match delivery.value() {
+                            crate::rpc::RpcStreamItem::Chunk(payload) => {
+                                seq += 1;
+                                OutboundStreamFrame::RpcStreamChunk {
+                                    request_id: &request_id,
+                                    seq,
+                                    payload,
+                                }
+                            }
                             crate::rpc::RpcStreamItem::End(result) => {
-                                let _ = send_to_peer_owner(
-                                    &state,
-                                    &owner,
-                                    &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
-                                        request_id,
-                                        error: result.err(),
-                                    }),
-                                )
-                                .await;
-                                return;
+                                terminal = true;
+                                OutboundStreamFrame::RpcStreamEnd {
+                                    request_id: &request_id,
+                                    error: result.as_ref().err().map(String::as_str),
+                                }
                             }
                         };
-                        seq += 1;
-                        // The chunk half of the same boundary. Inert unless a
-                        // control has armed it.
-                        state.reach_rpc_send_boundary().await;
-                        let _ = send_to_peer_owner(
-                            &state,
-                            &owner,
-                            &MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
-                                request_id: request_id.clone(),
-                                seq,
-                                payload,
-                            }),
-                        )
-                        .await;
+                        if !terminal {
+                            // The chunk half of the same boundary. Inert unless
+                            // a control has armed it.
+                            state.reach_rpc_send_boundary().await;
+                        }
+                        let _ = send_stream_frame_to_peer_owner(&state, &owner, &frame).await;
+                        if terminal {
+                            return;
+                        }
                     }
                     let _ = send_to_peer_owner(
                         &state,
@@ -3866,12 +3901,6 @@ async fn on_rpc_response(
         let Some(extracted) = app.rpc_mut().take_single_response(&resp.request_id) else {
             return Settlement::Done;
         };
-        // `_funding` is bound rather than discarded: it holds the *operation's*
-        // lease through the send, which happens after its map entry is gone.
-        // `retention` is the separate, second thing — the funding for the body
-        // itself, which travels on with the result and is released when the
-        // application takes it.
-        let (tx, _funding) = extracted.into_parts();
         let result = if let Some(err) = resp.error {
             Err(err)
         } else {
@@ -3879,7 +3908,12 @@ async fn on_rpc_response(
                 body: resp.ok.unwrap_or(serde_json::Value::Null),
             })
         };
-        let _ = tx.send(crate::rpc::FundedRpcResult::new(result, retention));
+        // `answer` holds the *operation's* lease across the send, which happens
+        // after the map entry is gone, and releases it afterwards. `retention`
+        // is the separate, second thing — the funding for the body itself,
+        // which travels on with the result and is released when the application
+        // takes it.
+        extracted.answer(crate::rpc::FundedRpcResult::new(result, retention));
         Settlement::Done
     });
     if let Some(Settlement::Unsettleable(witness, reason)) = settlement {
@@ -3925,8 +3959,9 @@ async fn on_rpc_stream_chunk(
             // the arm the finding is about, and it is not a state this side's
             // own capacity can put a peer into.
             if let Some(extracted) = app.rpc_mut().take_stream_end(&chunk.request_id) {
-                let (stream, _funding) = extracted.into_parts();
-                stream.finish_borrowed(Some("RPC stream sequence violation"));
+                extracted
+                    .value()
+                    .finish_borrowed(Some("RPC stream sequence violation"));
             }
             return None;
         };
@@ -3948,11 +3983,12 @@ async fn on_rpc_stream_chunk(
             ),
         };
         if let Some(extracted) = app.rpc_mut().take_stream_end(&chunk.request_id) {
-            let (stream, _funding) = extracted.into_parts();
             // Assembled here, so its length is this side's and not the peer's —
             // but still owned, still retained until the caller reads it, and so
-            // still funded by the session that delivered the chunk.
-            stream.finish_owned(session, refusal);
+            // still funded by the session that delivered the chunk. The
+            // extracted inbox stays whole across the call and its operation
+            // funding is released after it.
+            extracted.value().finish_owned(session, refusal);
         }
         // Terminal for this exact session, and this is the half that was
         // missing. Finishing the inbox answers the *local* caller and nothing
@@ -3999,11 +4035,11 @@ async fn on_rpc_stream_end(
         let Some(extracted) = app.rpc_mut().take_stream_end(&end.request_id) else {
             return;
         };
-        // `_funding` bound, not discarded — see `on_rpc_response`.
-        let (stream, _funding) = extracted.into_parts();
+        // The extracted inbox is read through, never taken apart — the
+        // operation's funding outlives the finish either way.
         match end.error {
-            Some(reason) => stream.finish_owned(session, reason),
-            None => stream.finish_borrowed(None),
+            Some(reason) => extracted.value().finish_owned(session, reason),
+            None => extracted.value().finish_borrowed(None),
         }
     });
 }
@@ -4201,6 +4237,57 @@ pub(crate) async fn send_to_peer_owner(
 /// write: the witness is minted under the registry fence, and both the write and
 /// its accounting go through the exact worker and peer that witness captured.
 /// Pre-encoding moves where the bytes came from, not what admits them.
+/// One outbound RPC stream frame, borrowed from whatever already owns its
+/// parts.
+///
+/// Exists so the stream sender never has to build a `MeshMessage`. Building one
+/// means owning a `String` request id and an owned payload, and the payload is
+/// the delivered value — taking it out of the delivery is what separates it
+/// from the retention that funds it, and cloning the request id per frame
+/// allocates outside any claim. Borrowing both costs neither.
+///
+/// **This is a second spelling of a wire shape that is defined elsewhere**, and
+/// that is the price. `v4_r3_core_f7_the_borrowed_stream_frame_is_the_wire_shape_it_replaces`
+/// serializes this and the `MeshMessage` variants it stands in for and asserts
+/// the bytes are equal, so a field added to one and not the other fails rather
+/// than silently changing what peers receive. Keep the tag, the renaming and
+/// the field order matching [`MeshMessage`] and its `protocol::rpc` structs.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OutboundStreamFrame<'a> {
+    RpcStreamChunk {
+        request_id: &'a str,
+        seq: u64,
+        payload: &'a serde_json::Value,
+    },
+    RpcStreamEnd {
+        request_id: &'a str,
+        error: Option<&'a str>,
+    },
+}
+
+/// Send one borrowed RPC stream frame to the exact current owner.
+///
+/// The serialize-and-send half of [`send_to_peer_owner`] for a frame that is
+/// never assembled. Both stream kinds are `FrameClass::App` and
+/// `Admission::Application`, so neither `class_of` nor `message_admission` has
+/// anything to decide here — the two constants are named directly rather than
+/// derived from a message this path deliberately does not have.
+async fn send_stream_frame_to_peer_owner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    frame: &OutboundStreamFrame<'_>,
+) -> Result<()> {
+    let serialized = serde_json::to_vec(frame).map_err(Error::Serde)?;
+    send_application_bytes(
+        state,
+        owner,
+        Bytes::from(serialized),
+        traffic::FrameClass::App,
+    )
+    .await
+}
+
 pub(crate) async fn send_application_bytes(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
@@ -5438,8 +5525,9 @@ pub(crate) fn build_test_state_with_command_driver(
     let command_state = Arc::clone(&state);
     let command_driver = tokio::spawn(async move {
         while let Some(command) = cmd_rx.recv().await {
-            let (command, _entry_resources) = command.into_parts();
-            handle_command(&command_state, command).await;
+            command
+                .run_terminal_effect(|command| handle_command(&command_state, command))
+                .await;
         }
     });
     (state, command_driver)
@@ -5862,6 +5950,60 @@ mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
     use std::time::{Duration, Instant};
+
+    /// The borrowed stream frame exists so the sender never owns what it sends.
+    /// The cost is a second spelling of a wire shape, and the risk is that the
+    /// two drift — a field added to `RpcStreamChunkMessage` and not to
+    /// `OutboundStreamFrame` would silently stop being sent, which no type
+    /// checks. So the two are serialized here and compared as bytes.
+    ///
+    /// Both `End` arms are covered because `error` is the one field where the
+    /// borrowed side changed representation (`Option<String>` to
+    /// `Option<&str>`), and `#[serde(default)]` on the owned side affects only
+    /// deserialization — `None` must still be written as an explicit null.
+    #[test]
+    fn v4_r3_core_f7_the_borrowed_stream_frame_is_the_wire_shape_it_replaces() {
+        let request_id = "wzqx4m7k2ptv9nd3bcfh";
+        let payload = serde_json::json!({
+            "nested": {"a": [1, 2, 3], "b": null},
+            "s": "text",
+        });
+
+        let borrowed = serde_json::to_vec(&OutboundStreamFrame::RpcStreamChunk {
+            request_id,
+            seq: 7,
+            payload: &payload,
+        })
+        .expect("the borrowed chunk frame serializes");
+        let owned = serde_json::to_vec(&MeshMessage::RpcStreamChunk(RpcStreamChunkMessage {
+            request_id: request_id.to_string(),
+            seq: 7,
+            payload: payload.clone(),
+        }))
+        .expect("the owned chunk frame serializes");
+        assert_eq!(
+            String::from_utf8(borrowed).expect("json is utf-8"),
+            String::from_utf8(owned).expect("json is utf-8"),
+            "a peer must not be able to tell which side of this repair sent it \
+             a chunk"
+        );
+
+        for error in [None, Some("the handler gave up")] {
+            let borrowed =
+                serde_json::to_vec(&OutboundStreamFrame::RpcStreamEnd { request_id, error })
+                    .expect("the borrowed end frame serializes");
+            let owned = serde_json::to_vec(&MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+                request_id: request_id.to_string(),
+                error: error.map(str::to_string),
+            }))
+            .expect("the owned end frame serializes");
+            assert_eq!(
+                String::from_utf8(borrowed).expect("json is utf-8"),
+                String::from_utf8(owned).expect("json is utf-8"),
+                "the terminal frame differs for error = {error:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn v4_f3_stale_channel_and_rpc_handles_cannot_repopulate_a_closed_gateway() {
@@ -9355,7 +9497,7 @@ mod tests {
             1,
             "the first successful promotion announces exactly once"
         );
-        let NetworkCmd::ReplayCapabilities { owner: announced } = &replays[0] else {
+        let NetworkCmd::ReplayCapabilities { owner: announced } = replays[0].value() else {
             panic!("collect_replay_commands yields only replay commands");
         };
         assert_eq!(
@@ -9489,7 +9631,7 @@ mod tests {
             1,
             "the mint announces exactly once, not per fence entry"
         );
-        let NetworkCmd::ReplayCapabilities { owner: announced } = &replays[0] else {
+        let NetworkCmd::ReplayCapabilities { owner: announced } = replays[0].value() else {
             panic!("collect_replay_commands yields only replay commands");
         };
         assert_eq!(
@@ -9506,8 +9648,15 @@ mod tests {
         // receive fixture.
         let frames_out_before = peer.state.read().diag.frames_out;
         let control_tx_before = state.traffic.snapshot().control_tx.frames;
+        // Through the same seam the driver uses, not around it. `handle_command`
+        // takes an owned `NetworkCmd`, and the only way to give it one without
+        // splitting the delivery is the terminal effect — which is also exactly
+        // what the driver loop does with a replay it drains, so this control
+        // exercises the production shape rather than a test-only unwrap.
         for command in replays {
-            handle_command(&state, command).await;
+            command
+                .run_terminal_effect(|command| handle_command(&state, command))
+                .await;
         }
         assert_eq!(
             peer.state.read().diag.frames_out,
@@ -9609,12 +9758,15 @@ mod tests {
     #[cfg(feature = "transport-lab")]
     fn collect_replay_commands(
         commands: &mut crate::resource::ResourceMailboxReceiver<NetworkCmd>,
-    ) -> Vec<NetworkCmd> {
+    ) -> Vec<crate::resource::ResourceMailboxDelivery<NetworkCmd>> {
         let mut replays = Vec::new();
         while let Some(delivery) = commands.try_recv() {
-            let (command, _retention) = delivery.into_parts();
-            if matches!(command, NetworkCmd::ReplayCapabilities { .. }) {
-                replays.push(command);
+            // The deliveries are kept whole rather than unwrapped: the command
+            // a caller reads through `value()` is funded for as long as this
+            // vector holds it, and the ones that do not match are dropped here
+            // with their funding, which is what draining is supposed to mean.
+            if matches!(delivery.value(), NetworkCmd::ReplayCapabilities { .. }) {
+                replays.push(delivery);
             }
         }
         replays
@@ -10498,10 +10650,7 @@ mod tests {
             .try_recv()
             .expect("the first promotion announces the session it minted");
         assert!(
-            matches!(
-                promotion.into_parts().0,
-                NetworkCmd::ReplayCapabilities { .. }
-            ),
+            matches!(promotion.value(), NetworkCmd::ReplayCapabilities { .. }),
             "the drained command is the first session's promotion announcement"
         );
 
@@ -10550,10 +10699,7 @@ mod tests {
             .try_recv()
             .expect("the replacement session announces its own promotion");
         assert!(
-            matches!(
-                promotion.into_parts().0,
-                NetworkCmd::ReplayCapabilities { .. }
-            ),
+            matches!(promotion.value(), NetworkCmd::ReplayCapabilities { .. }),
             "the second promotion is committed far enough to announce itself"
         );
         assert!(
@@ -13600,7 +13746,8 @@ mod tests {
             .expect("a delivered channel payload reaches its subscriber")
             .expect("the subscription is live")
             .expect("and carries a payload rather than a lag report")
-            .body
+            .body()
+            .clone()
     }
 
     /// Whether `device_id`'s current session is live **and** still holds the

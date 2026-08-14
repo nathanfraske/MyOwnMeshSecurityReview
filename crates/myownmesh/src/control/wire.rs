@@ -744,24 +744,6 @@ impl Response {
     }
 }
 
-/// Turn a connector refusal into the one error shape realtime control uses.
-///
-/// Both halves are carried: `code` is the stable machine-readable string from
-/// [`core_realtime::RealtimeRefusal::code`], and the human message goes in the
-/// usual `error` field. Clients dispatch on `code` and display `error` — the
-/// message is prose and is deliberately not parseable.
-///
-/// Note that `session_not_current` also covers an unknown or replaced peer, by
-/// design on core's side: distinguishing "no such peer" would report peer
-/// existence to a caller that has proved nothing about its right to know.
-pub(super) fn realtime_refused(refusal: core_realtime::RealtimeRefusal) -> Response {
-    Response {
-        ok: false,
-        error: Some(refusal.to_string()),
-        data: Some(serde_json::json!({ "code": refusal.code() })),
-    }
-}
-
 /// One encoding family this daemon has registered, as published to clients.
 ///
 /// A family, not a registration tuple. Deployed H.264 is several payload/fmtp

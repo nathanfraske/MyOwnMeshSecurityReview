@@ -99,7 +99,7 @@ async fn main() {
         .await
         .unwrap();
     let msg = bob_sub.recv().await.unwrap().unwrap();
-    println!("BOB ◀── {}", msg.body.text);
+    println!("BOB ◀── {}", msg.body().text);
 
     // Bob replies.
     bob_chan
@@ -112,7 +112,7 @@ async fn main() {
         .await
         .unwrap();
     let msg = alice_sub.recv().await.unwrap().unwrap();
-    println!("ALICE ◀── {}", msg.body.text);
+    println!("ALICE ◀── {}", msg.body().text);
 
     // Give the broker a moment to settle before we tear down.
     tokio::time::sleep(Duration::from_millis(100)).await;

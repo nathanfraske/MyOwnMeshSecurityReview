@@ -14,7 +14,10 @@ use tracing::{info, warn};
 
 use crate::registry::RemoveResult;
 
-use super::super::{ControlState, Response};
+use super::super::ControlState;
+use crate::control::framing::{
+    FundedVariableReply, NetworkLifecycleSummary, OperationReplyData, VariableOperationPlan,
+};
 
 /// Join a fresh network through the live mesh, attach signaling,
 /// register the result, and persist the new config to disk. Each
@@ -22,37 +25,42 @@ use super::super::{ControlState, Response};
 /// last point we touch the on-disk config — config.json is updated
 /// after the join + attach succeeds so a failed join leaves the
 /// saved config untouched.
-pub(super) async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Response {
+pub(in crate::control) async fn network_add(
+    state: &Arc<ControlState>,
+    config: NetworkConfig,
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
     // Reject duplicates against the running registry. We rely on
     // the registry's two-key indexing — checking both the local
     // config id and the wire-level network id covers the user
     // trying to add the same network twice (under any alias).
     if state.registry.contains(&config.id) {
-        return Response::err(format!("config id '{}' already in use", config.id));
+        return plan.finish(Err(format!("config id '{}' already in use", config.id)));
     }
     if state.registry.contains(&config.network_id) {
-        return Response::err(format!(
+        return plan.finish(Err(format!(
             "network id '{}' already joined under a different config",
             config.network_id
-        ));
+        )));
     }
 
     // Join the live mesh first — if the engine refuses (bad
     // network id, etc.) we want to know before we touch disk.
     let joined = match state.mesh.join(config.clone()).await {
         Ok(j) => j,
-        Err(e) => return Response::err(format!("join: {e}")),
+        Err(e) => return plan.finish(Err(format!("join: {e}"))),
     };
 
     // Take a summary BEFORE handing ownership to the registry so we
     // can return it in the response payload without re-locking.
-    let summary = serde_json::json!({
-        "config_id": joined.config_id(),
-        "network_id": joined.network_id(),
-        "label": joined.label(),
-        "phase": joined.current_phase(),
-        "topology": joined.current_topology(),
-    });
+    let summary = NetworkLifecycleSummary {
+        config_id: joined.config_id().to_owned(),
+        network_id: joined.network_id().to_owned(),
+        label: joined.label().to_owned(),
+        phase: joined.current_phase(),
+        topology: joined.current_topology(),
+        restarted: false,
+    };
 
     // Attach the signaling driver(s) the network's config selects
     // (Nostr and/or mDNS).
@@ -69,7 +77,7 @@ pub(super) async fn network_add(state: &Arc<ControlState>, config: NetworkConfig
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
-                return Response::err(format!("signaling attach failed: {error}"));
+                return plan.finish(Err(format!("signaling attach failed: {error}")));
             }
         }
     };
@@ -83,9 +91,9 @@ pub(super) async fn network_add(state: &Arc<ControlState>, config: NetworkConfig
         let refusal_state = refused.state;
         drop(refused.drivers);
         let _ = refused.joined.shutdown().await;
-        return Response::err(format!(
+        return plan.finish(Err(format!(
             "network id is held by a runtime in {refusal_state:?} state"
-        ));
+        )));
     }
 
     // Refresh the service-role advert so the new network advertises what
@@ -99,10 +107,12 @@ pub(super) async fn network_add(state: &Arc<ControlState>, config: NetworkConfig
     // but won't re-join on next daemon restart. Surface the disk
     // error to the caller so the GUI can show it.
     if let Err(e) = persist_network_add(&config) {
-        return Response::err(format!("network joined but config.json save failed: {e}"));
+        return plan.finish(Err(format!(
+            "network joined but config.json save failed: {e}"
+        )));
     }
 
-    Response::ok(serde_json::json!({ "added": summary }))
+    plan.finish(Ok(OperationReplyData::Added(summary)))
 }
 
 /// Leave a live network and remove it from the on-disk config. The registry
@@ -121,7 +131,22 @@ fn purge_network_state(network_id: &str) {
     }
 }
 
-pub(super) async fn network_remove(state: &Arc<ControlState>, key: &str, purge: bool) -> Response {
+pub(in crate::control) async fn network_remove(
+    state: &Arc<ControlState>,
+    key: &str,
+    purge: bool,
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
+    let result = network_remove_result(state, key, purge, &plan).await;
+    plan.finish(result.map(OperationReplyData::Removed))
+}
+
+async fn network_remove_result(
+    state: &Arc<ControlState>,
+    key: &str,
+    purge: bool,
+    _funding: &VariableOperationPlan,
+) -> std::result::Result<String, String> {
     let key_owned = key.to_string();
     let ids = if let Some(joined) = state.registry.get(key) {
         let ids = (
@@ -139,22 +164,22 @@ pub(super) async fn network_remove(state: &Arc<ControlState>, key: &str, purge: 
                 ids.unwrap_or_else(|| (key_owned.clone(), key_owned.clone()));
             state.services.on_network_removed(&config_id).await;
             if let Err(e) = persist_network_remove(&config_id, &network_id) {
-                return Response::err(format!("network left but config.json save failed: {e}"));
+                return Err(format!("network left but config.json save failed: {e}"));
             }
             if purge {
                 purge_network_state(&network_id);
             }
             match outcome {
-                Ok(()) => Response::ok(serde_json::json!({ "removed": config_id })),
-                Err(error) => Response::err(format!(
+                Ok(()) => Ok(config_id),
+                Err(error) => Err(format!(
                     "network removed but runtime teardown reported failure: {error}"
                 )),
             }
         }
-        RemoveResult::AlreadyClosing(runtime) => Response::err(format!(
+        RemoveResult::AlreadyClosing(runtime) => Err(format!(
             "network teardown already in progress ({runtime:?})"
         )),
-        RemoveResult::NotFound => Response::err(format!("unknown network: {key_owned}")),
+        RemoveResult::NotFound => Err(format!("unknown network: {key_owned}")),
     }
 }
 
@@ -163,15 +188,18 @@ pub(super) async fn network_remove(state: &Arc<ControlState>, key: &str, purge: 
 /// disk; the device identity is kept. Snapshots the set first so removing as we
 /// go can't skip an entry. Schedules a daemon exit ([`schedule_daemon_exit`]) so
 /// every layer reloads clean around the wipe.
-pub(super) async fn forget_all_networks(state: &Arc<ControlState>) -> Response {
+pub(in crate::control) async fn forget_all_networks(
+    state: &Arc<ControlState>,
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
     let mut forgotten = Vec::new();
     for n in state.registry.summaries() {
         // `network_remove` resolves either alias; the config id is stable.
-        let _ = network_remove(state, &n.config_id, true).await;
+        let _ = network_remove_result(state, &n.config_id, true, &plan).await;
         forgotten.push(n.config_id);
     }
     schedule_daemon_exit();
-    Response::ok(serde_json::json!({ "forgotten": forgotten, "restarting": true }))
+    plan.finish(Ok(OperationReplyData::Forgotten(forgotten)))
 }
 
 /// Factory reset — return this device to a brand-new state. First quiesce every
@@ -183,11 +211,14 @@ pub(super) async fn forget_all_networks(state: &Arc<ControlState>) -> Response {
 /// the daemon back. Best-effort per step — we always schedule the exit so a
 /// partial failure still ends in a clean restart rather than a half-wiped daemon
 /// re-persisting stale caches.
-pub(super) async fn factory_reset(state: &Arc<ControlState>) -> Response {
+pub(in crate::control) async fn factory_reset(
+    state: &Arc<ControlState>,
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
     // Quiesce writers first: tearing each network down stops its engine driver
     // from writing a roster/state file back out while we're deleting the tree.
     for n in state.registry.summaries() {
-        let _ = network_remove(state, &n.config_id, true).await;
+        let _ = network_remove_result(state, &n.config_id, true, &plan).await;
     }
     let dir = match myownmesh_core::dirs::data_dir() {
         Ok(d) => d,
@@ -195,7 +226,7 @@ pub(super) async fn factory_reset(state: &Arc<ControlState>) -> Response {
             // Can't find the dir to wipe — still restart so we don't leave the
             // caller hanging on a half-done reset.
             schedule_daemon_exit();
-            return Response::err(format!("factory reset: resolve state dir: {e}"));
+            return plan.finish(Err(format!("factory reset: resolve state dir: {e}")));
         }
     };
     if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -206,7 +237,7 @@ pub(super) async fn factory_reset(state: &Arc<ControlState>) -> Response {
         }
     }
     schedule_daemon_exit();
-    Response::ok(serde_json::json!({ "reset": true, "restarting": true }))
+    plan.finish(Ok(OperationReplyData::Reset))
 }
 
 /// Exit the daemon shortly after the current response flushes, so a fresh
@@ -231,17 +262,18 @@ fn schedule_daemon_exit() {
 /// reconnects every peer; `peer` set reconnects just that one (a per-node
 /// refresh). Fire-and-forget — the engine driver runs the reconnect, so this
 /// returns as soon as the request is queued.
-pub(super) fn network_reconnect(
+pub(in crate::control) fn network_reconnect(
     state: &Arc<ControlState>,
     key: &str,
     peer: Option<String>,
-) -> Response {
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
     match state.registry.get(key) {
         Some(joined) => {
             joined.reconnect(peer);
-            Response::ok(serde_json::json!({ "reconnecting": key }))
+            plan.finish(Ok(OperationReplyData::Reconnecting(key.to_owned())))
         }
-        None => Response::err(format!("unknown network: {key}")),
+        None => plan.finish(Err(format!("unknown network: {key}"))),
     }
 }
 
@@ -250,15 +282,16 @@ pub(super) fn network_reconnect(
 /// the offerer-side dial on the engine and returns at once (the outcome rides
 /// the event stream), so a daemon client on a `Silent` network can open exactly
 /// one connection after matching a peer's Support ID.
-pub(super) async fn network_connect_peer(
+pub(in crate::control) async fn network_connect_peer(
     state: &Arc<ControlState>,
     key: &str,
     peer: &str,
     pin: bool,
     wait_ms: u64,
-) -> Response {
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
     let Some(joined) = state.registry.get(key) else {
-        return Response::err(format!("unknown network: {key}"));
+        return plan.finish(Err(format!("unknown network: {key}")));
     };
     let result = if pin || wait_ms > 0 {
         // Waited/pinned dial: resolves on ACTIVE (or the deadline). A
@@ -283,15 +316,15 @@ pub(super) async fn network_connect_peer(
     } else {
         joined.connect_peer(peer).await.map(|_| false)
     };
-    match result {
-        Ok(active) => Response::ok(serde_json::json!({
-            "connecting": peer,
-            "network": key,
-            "pinned": pin,
-            "active": active,
-        })),
-        Err(e) => Response::err(e.to_string()),
-    }
+    plan.finish(match result {
+        Ok(active) => Ok(OperationReplyData::Connecting {
+            peer: peer.to_owned(),
+            network: key.to_owned(),
+            pinned: pin,
+            active,
+        }),
+        Err(e) => Err(e.to_string()),
+    })
 }
 
 /// Update an already-joined network in place. Hot-reloadable edits
@@ -302,7 +335,11 @@ pub(super) async fn network_connect_peer(
 /// when it's created — there's no way to retrofit a new TURN server
 /// onto an existing connection. Either way config.json is rewritten so
 /// the change survives a daemon restart.
-pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Response {
+pub(in crate::control) async fn network_update(
+    state: &Arc<ControlState>,
+    config: NetworkConfig,
+    plan: VariableOperationPlan,
+) -> FundedVariableReply {
     // This is update, not add: the network must already be joined.
     let joined = match state
         .registry
@@ -311,10 +348,10 @@ pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkCon
     {
         Some(j) => j,
         None => {
-            return Response::err(format!(
+            return plan.finish(Err(format!(
                 "unknown network '{}' — join it with network_add first",
                 config.id
-            ))
+            )));
         }
     };
 
@@ -347,14 +384,19 @@ pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkCon
         // connect, so a credential rotation reaches new connections without
         // tearing down the live ones (see `reconcile::apply_hot`).
         if let Err(e) = myownmesh_core::engine::reconcile::apply_hot(&net_state, config.clone()) {
-            return Response::err(format!("apply config: {e}"));
+            return plan.finish(Err(format!("apply config: {e}")));
         }
         drop(net_state);
         drop(joined);
         if let Err(e) = persist_network_update(&config) {
-            return Response::err(format!("config applied but config.json save failed: {e}"));
+            return plan.finish(Err(format!(
+                "config applied but config.json save failed: {e}"
+            )));
         }
-        return Response::ok(serde_json::json!({ "updated": config.id, "restarted": false }));
+        return plan.finish(Ok(OperationReplyData::UpdatedId {
+            id: config.id,
+            restarted: false,
+        }));
     }
 
     // Transport restart path. Snapshot the live config FIRST so that if
@@ -377,18 +419,18 @@ pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkCon
     match state.registry.remove(&config.id).await {
         RemoveResult::Removed(Ok(())) => {}
         RemoveResult::Removed(Err(error)) => {
-            return Response::err(format!("old runtime teardown failed: {error}"));
+            return plan.finish(Err(format!("old runtime teardown failed: {error}")));
         }
         RemoveResult::AlreadyClosing(runtime) => {
-            return Response::err(format!(
+            return plan.finish(Err(format!(
                 "network update refused while teardown is already in progress ({runtime:?})"
-            ));
+            )));
         }
         RemoveResult::NotFound => {
             if let Some(runtime) = state.registry.state(&config.id) {
-                return Response::err(format!(
+                return plan.finish(Err(format!(
                     "network update refused while prior runtime is {runtime:?}"
-                ));
+                )));
             }
         }
     }
@@ -437,23 +479,26 @@ pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkCon
                     " — AND rollback failed; re-add it from the Networks tab".to_string()
                 }
             };
-            return Response::err(format!("rejoin with new config: {e}{rollback}"));
+            return plan.finish(Err(format!("rejoin with new config: {e}{rollback}")));
         }
     };
-    let summary = serde_json::json!({
-        "config_id": joined.config_id(),
-        "network_id": joined.network_id(),
-        "label": joined.label(),
-        "phase": joined.current_phase(),
-        "topology": joined.current_topology(),
-    });
+    let summary = NetworkLifecycleSummary {
+        config_id: joined.config_id().to_owned(),
+        network_id: joined.network_id().to_owned(),
+        label: joined.label().to_owned(),
+        phase: joined.current_phase(),
+        topology: joined.current_topology(),
+        restarted: true,
+    };
     let drivers = {
         let net_state = joined.state();
         match myownmesh_core::engine::attach_signaling(&net_state) {
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
-                return Response::err(format!("signaling attach failed after update: {error}"));
+                return plan.finish(Err(format!(
+                    "signaling attach failed after update: {error}"
+                )));
             }
         }
     };
@@ -468,9 +513,9 @@ pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkCon
         let refusal_state = refused.state;
         drop(refused.drivers);
         let _ = refused.joined.shutdown().await;
-        return Response::err(format!(
+        return plan.finish(Err(format!(
             "replacement runtime refused while predecessor is {refusal_state:?}"
-        ));
+        )));
     }
 
     // The old network was torn down and a fresh one registered under the
@@ -479,9 +524,11 @@ pub(super) async fn network_update(state: &Arc<ControlState>, config: NetworkCon
     state.services.on_network_added(&config.id).await;
 
     if let Err(e) = persist_network_update(&config) {
-        return Response::err(format!("network updated but config.json save failed: {e}"));
+        return plan.finish(Err(format!(
+            "network updated but config.json save failed: {e}"
+        )));
     }
-    Response::ok(serde_json::json!({ "updated": summary, "restarted": true }))
+    plan.finish(Ok(OperationReplyData::Updated(summary)))
 }
 
 fn persist_network_add(net: &NetworkConfig) -> Result<()> {
@@ -530,7 +577,7 @@ fn persist_network_update(net: &NetworkConfig) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn parse_topology(
+pub(in crate::control) fn parse_topology(
     name: &str,
     hub: Option<&str>,
 ) -> std::result::Result<TopologyMode, String> {

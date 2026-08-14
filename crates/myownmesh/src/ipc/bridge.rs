@@ -131,6 +131,19 @@ impl HandlerContext {
 /// is at its accounted concurrency. Collapsing them into one string would make
 /// a capacity problem look like a channel problem.
 #[derive(Debug, thiserror::Error)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "`Subscribe` is large only because it carries core's `ChannelError` \
+              inline, and that type's size is `ChannelError::Decode` structurally \
+              owning the `GatewayDelivery` and subscriber handle which fund the \
+              frame it describes. Boxing this arm would put an allocation on a \
+              refusal path -- the one moment the daemon has just been told it \
+              cannot have the resource it asked for -- and no admission has \
+              priced that allocation. Converting the inner error to something \
+              smaller at this seam would drop exactly the owners core keeps it \
+              large to hold. The size is the funding, so it stays inline and is \
+              stated here rather than removed"
+)]
 pub enum ChannelPumpError {
     #[error("channel subscription was refused: {0}")]
     Subscribe(myownmesh_core::ChannelError),
@@ -520,6 +533,16 @@ async fn stream_handler_call(
 /// rather than starts a pump that would never receive anything. The caller
 /// answers the requesting client with the refusal instead of recording a
 /// subscription the daemon does not actually hold.
+#[expect(
+    clippy::result_large_err,
+    reason = "the `Err` is `ChannelPumpError`, sized by the `ChannelError` its \
+              `Subscribe` arm carries inline for the funding reason stated on \
+              that enum. Boxing the error here would charge an allocation to the \
+              path taken when an admission has just been refused, and the \
+              success path -- which returns the cancellation handle and the join \
+              handle -- would pay the wider `Result` for nothing. This function \
+              is called once per channel install, not per frame"
+)]
 pub(crate) fn spawn_channel_pump(
     network: &JoinedNetwork,
     key: &ClaimKey,
@@ -669,11 +692,18 @@ async fn run_channel_pump(
                             #[cfg(test)]
                             registry.pass_fanout_barrier().await;
                             let client_id = client.id;
+                            // Read through the accessors: `msg` is a funded
+                            // owner and stays whole for the entire fan-out, so
+                            // every subscriber's frame is copied *from* it
+                            // rather than assembled out of its parts. Both
+                            // copies are required — a `ServerOut` owns what it
+                            // carries, and one per subscriber is the frame that
+                            // subscriber will be sent.
                             let frame = ServerOut::ChannelInbound {
                                 network: key.0.clone(),
-                                from: msg.from.clone(),
+                                from: msg.from().to_string(),
                                 channel: key.1.clone(),
-                                payload: msg.body.clone(),
+                                payload: msg.body().clone(),
                             };
                             // Fan-out has nobody to answer: the frame came
                             // off a broadcast and no peer is waiting on this
@@ -1079,11 +1109,9 @@ mod tests {
         let inbound = a_rx
             .recv()
             .await
-            .expect("A is given the inbound call it owns")
-            .into_parts()
-            .0;
+            .expect("A is given the inbound call it owns");
         assert!(
-            matches!(inbound, ServerOut::RpcInbound { ref request_id, .. } if request_id == "req-one"),
+            matches!(inbound.value(), ServerOut::RpcInbound { request_id, .. } if request_id == "req-one"),
             "and it is the call this control started"
         );
 
@@ -1138,17 +1166,15 @@ mod tests {
         let inbound = b_rx
             .recv()
             .await
-            .expect("B is given the streaming call it owns")
-            .into_parts()
-            .0;
-        match inbound {
+            .expect("B is given the streaming call it owns");
+        match inbound.value() {
             ServerOut::RpcInbound {
                 request_id,
                 streaming,
                 ..
             } => {
                 assert_eq!(request_id, "req-three");
-                assert!(streaming, "and in the stream shape B claimed it as");
+                assert!(*streaming, "and in the stream shape B claimed it as");
             }
             other => panic!("B was given something other than its inbound call: {other:?}"),
         }
@@ -1472,10 +1498,11 @@ mod tests {
         let inbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("inbound timeout")
-            .expect("inbound recv")
-            .into_parts()
-            .0;
-        let (network, from, request_id, operation_id, method, payload) = match inbound {
+            .expect("inbound recv");
+        // The delivery is held whole for the rest of this control, and the
+        // frame is read through it. The coordinates the registry needs are
+        // owned copies of borrowed fields, not the frame taken apart.
+        let (pending_key, operation_id) = match inbound.value() {
             ServerOut::RpcInbound {
                 network,
                 from,
@@ -1486,19 +1513,20 @@ mod tests {
                 ..
             } => {
                 assert_eq!(method, "echo");
-                (network, from, request_id, operation_id, method, payload)
+                assert_eq!(payload, &serde_json::json!({"n": 7}));
+                (
+                    // Respond via the registry (same path dispatch takes).
+                    PendingKey {
+                        network: network.clone(),
+                        method: method.clone(),
+                        remote_peer: from.clone(),
+                        remote_request_id: request_id.clone(),
+                        class: HandlerMode::Single,
+                    },
+                    *operation_id,
+                )
             }
             other => panic!("expected RpcInbound, got {other:?}"),
-        };
-        assert_eq!(payload, serde_json::json!({"n": 7}));
-
-        // Respond via the registry (same path dispatch takes).
-        let pending_key = PendingKey {
-            network,
-            method,
-            remote_peer: from,
-            remote_request_id: request_id,
-            class: HandlerMode::Single,
         };
         let resolved = registry.resolve_exact_single(
             &pending_key,
@@ -1617,10 +1645,10 @@ mod tests {
         let inbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("inbound timeout")
-            .expect("inbound recv")
-            .into_parts()
-            .0;
-        let (network, from, request_id, operation_id, method) = match inbound {
+            .expect("inbound recv");
+        // Same shape as the single-shot control: the delivery stays whole and
+        // the pending coordinates are copied out of the borrowed frame.
+        let (pending_key, operation_id) = match inbound.value() {
             ServerOut::RpcInbound {
                 network,
                 from,
@@ -1628,17 +1656,18 @@ mod tests {
                 operation_id,
                 method,
                 ..
-            } => (network, from, request_id, operation_id, method),
+            } => (
+                // Push three chunks then close.
+                PendingKey {
+                    network: network.clone(),
+                    method: method.clone(),
+                    remote_peer: from.clone(),
+                    remote_request_id: request_id.clone(),
+                    class: HandlerMode::Stream,
+                },
+                *operation_id,
+            ),
             other => panic!("expected RpcInbound, got {other:?}"),
-        };
-
-        // Push three chunks then close.
-        let pending_key = PendingKey {
-            network,
-            method,
-            remote_peer: from,
-            remote_request_id: request_id,
-            class: HandlerMode::Stream,
         };
         for n in 1..=3 {
             assert!(
@@ -1733,17 +1762,23 @@ mod tests {
                 let Ok(msg) = next else {
                     continue;
                 };
-                let frame = ServerOut::ChannelInbound {
-                    network: key_for_pump.0.clone(),
-                    from: msg.from,
-                    channel: key_for_pump.1.clone(),
-                    payload: msg.body,
-                };
                 // The assertion this fixture exists for is on the frame
                 // arriving, so a refusal here is left to fail as the receive
                 // timeout it causes rather than being reported twice.
+                //
+                // Mirrors production: `msg` is the funded owner and stays
+                // whole across the fan-out, and each subscriber's frame is
+                // built here from borrows of it. A `ServerOut` owns what it
+                // carries, so one per subscriber is what a fan-out costs --
+                // but it is copied out of the live owner rather than out of a
+                // frame that was assembled once and cloned.
                 let live = registry_for_pump.for_each_subscriber(&key_for_pump, |c| {
-                    let _ = c.send(frame.clone());
+                    let _ = c.send(ServerOut::ChannelInbound {
+                        network: key_for_pump.0.clone(),
+                        from: msg.from().to_string(),
+                        channel: key_for_pump.1.clone(),
+                        payload: msg.body().clone(),
+                    });
                 });
                 if !live {
                     break;
@@ -1765,20 +1800,18 @@ mod tests {
         let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("inbound timeout")
-            .expect("inbound recv")
-            .into_parts()
-            .0;
-        match frame {
+            .expect("inbound recv");
+        match frame.value() {
             ServerOut::ChannelInbound {
                 network,
                 from,
                 channel,
                 payload,
             } => {
-                assert_eq!(network, net_key);
-                assert_eq!(channel, chan_key);
+                assert_eq!(network, &net_key);
+                assert_eq!(channel, &chan_key);
                 assert_eq!(from, bob_id.public_id());
-                assert_eq!(payload, serde_json::json!({"hello": "from bob"}));
+                assert_eq!(payload, &serde_json::json!({"hello": "from bob"}));
             }
             other => panic!("expected ChannelInbound, got {other:?}"),
         }
@@ -1913,19 +1946,20 @@ mod tests {
         let frame = tokio::time::timeout(Duration::from_secs(10), first_rx.recv())
             .await
             .expect("hang guard: the parked frame is delivered")
-            .expect("the remaining subscriber is delivered to")
-            .into_parts()
-            .0;
-        match frame {
+            .expect("the remaining subscriber is delivered to");
+        match frame.value() {
             ServerOut::ChannelInbound {
                 network,
                 channel,
                 payload: delivered,
                 ..
             } => {
-                assert_eq!(network, net_key);
-                assert_eq!(channel, chan_key);
-                assert_eq!(delivered, payload, "and it is the frame that was published");
+                assert_eq!(network, &net_key);
+                assert_eq!(channel, &chan_key);
+                assert_eq!(
+                    delivered, &payload,
+                    "and it is the frame that was published"
+                );
             }
             other => panic!("expected the parked ChannelInbound, got {other:?}"),
         }

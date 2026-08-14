@@ -63,7 +63,6 @@ use listener::{bind_listener, resolve_socket, verify_local_peer};
 /// have to agree on, and it is the part a client reimplements.
 mod wire;
 
-use wire::realtime_refused;
 pub use wire::{
     RealtimeAdvert, RealtimeEncoding, RealtimeFlowCeiling, RealtimePipeDirection, Request, Response,
 };
@@ -77,8 +76,10 @@ mod framing;
 use framing::{
     config_reply_line_ceiling, events_subscribed_line_ceiling, network_id_reply_line_ceiling,
     optional_nonzero_bytes, prepare_reply_then, prepare_typed_and_line_building,
-    read_bounded_json_line, AdmittedLineOut, AdmittedReader, ControlOut, DecodeRefusal,
-    FrameAdmission, PreparedReply, PreparedText, REALTIME_FRAME_HEADER,
+    read_bounded_json_line, variable_data_reply_line_ceiling, variable_operation_claim,
+    AdmittedLineOut, AdmittedReader, ControlOut, DecodeRefusal, FrameAdmission,
+    FundedVariableReply, OperationReplyData, PreparedReply, PreparedText, VariableReplySource,
+    REALTIME_FRAME_HEADER,
 };
 pub use framing::{
     decode_realtime_send_unit, encode_realtime_recv_unit_with_ceiling, RealtimeRecvUnit,
@@ -1475,6 +1476,82 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
+            request @ (Request::IdentityShow | Request::IdentitySetLabel { .. }) => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("identity response was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("identity operation lease did not match"))?;
+                let result = match request {
+                    Request::IdentityShow => Ok(OperationReplyData::Identity {
+                        device_id: state.mesh.identity().display_id(),
+                        pubkey: state.mesh.identity().public_id().to_owned(),
+                        label: state.mesh.identity().label().to_owned(),
+                    }),
+                    Request::IdentitySetLabel { label } => {
+                        match myownmesh_core::identity::set_label(&label) {
+                            Err(error) => Err(error.to_string()),
+                            Ok(()) => {
+                                state.mesh.identity().set_label(&label);
+                                Ok(OperationReplyData::Identity {
+                                    device_id: state.mesh.identity().display_id(),
+                                    pubkey: state.mesh.identity().public_id().to_owned(),
+                                    label: state.mesh.identity().label().to_owned(),
+                                })
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                let variable = plan.finish(result);
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("identity response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("identity response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            request @ (Request::RealtimeFlowOpen { .. } | Request::RealtimeFlowClose { .. }) => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("realtime operation result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("realtime operation lease did not match"))?;
+                let variable = dispatch::dispatch_realtime_funded(&state, request, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("realtime response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("realtime response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            request @ Request::RpcCallStream { .. } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("RPC stream setup result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("RPC stream setup lease did not match"))?;
+                let variable =
+                    dispatch::dispatch_rpc_stream_funded(&state, &cancel, request, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("RPC stream setup response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("RPC stream setup response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
             Request::PeersList { network } => {
                 let Some(joined) = state.registry.get(&network) else {
                     let text = PreparedText::unknown_network(&network, &json_lines)
@@ -1525,6 +1602,564 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .context("PeersList changed while its funded snapshot was built")?;
                 let line = AdmittedLineOut::encode_peers(peers, output)
                     .context("PeersList response exceeded its measured ceiling")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::RosterList { network } => {
+                let Some(joined) = state.registry.get(&network) else {
+                    let text = PreparedText::unknown_network(&network, &json_lines)
+                        .context("RosterList lookup refusal text was not admitted")?;
+                    let reply = PreparedReply::Error(text);
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Prepared(&reply),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                let source = VariableReplySource::roster(
+                    joined
+                        .prepare_roster_snapshot()
+                        .context("RosterList snapshot was not representable")?,
+                );
+                let typed = json_lines
+                    .acquire_claim(source.typed_claim())
+                    .context("RosterList typed snapshot was not admitted")?;
+                let line_ceiling = variable_data_reply_line_ceiling(source.data_ceiling()?)?;
+                let output = AdmittedLineOut::prepare_capacity(line_ceiling, &json_lines)
+                    .context("RosterList response line was not admitted")?;
+                let roster = source.commit(typed).await?;
+                let reply = PreparedReply::Variable(roster);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("RosterList response exceeded its measured ceiling")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceState { network } => {
+                let Some(joined) = state.registry.get(&network) else {
+                    let text = PreparedText::unknown_network(&network, &json_lines)
+                        .context("GovernanceState lookup refusal text was not admitted")?;
+                    let reply = PreparedReply::Error(text);
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Prepared(&reply),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                let source = VariableReplySource::governance(
+                    joined
+                        .prepare_governance_snapshot()
+                        .await
+                        .context("GovernanceState capacity could not be measured")?,
+                );
+                let typed = json_lines
+                    .acquire_claim(source.typed_claim())
+                    .context("GovernanceState typed snapshot was not admitted")?;
+                let line_ceiling = variable_data_reply_line_ceiling(source.data_ceiling()?)?;
+                let output = AdmittedLineOut::prepare_capacity(line_ceiling, &json_lines)
+                    .context("GovernanceState response line was not admitted")?;
+                let governance = source.commit(typed).await?;
+                let reply = PreparedReply::Variable(governance);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("GovernanceState response exceeded its measured ceiling")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            request @ (Request::RosterApprove { .. }
+            | Request::RosterRemove { .. }
+            | Request::TopologySet { .. }
+            | Request::GovernanceProposeKindChange { .. }
+            | Request::GovernanceProposeRoleGrant { .. }
+            | Request::GovernanceProposeRoleRevoke { .. }
+            | Request::GovernanceProposeEvict { .. }
+            | Request::GovernanceProposeTopology { .. }
+            | Request::GovernanceSign { .. }
+            | Request::GovernanceDeny { .. }
+            | Request::GovernanceWithdraw { .. }
+            | Request::GovernanceSpawnSplit { .. }) => {
+                let operation = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("governance/network operation result was not admitted")?;
+                let result: std::result::Result<OperationReplyData, String> = match request {
+                    Request::RosterApprove {
+                        network,
+                        device_id,
+                        label,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .roster_approve(&device_id, label.as_deref().unwrap_or(""))
+                            .await
+                            .map(|_| OperationReplyData::Approved(device_id))
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::RosterRemove { network, device_id } => {
+                        match state.registry.get(&network) {
+                            Some(net) => net
+                                .roster_remove(&device_id)
+                                .await
+                                .map(|_| OperationReplyData::Removed(device_id))
+                                .map_err(|error| error.to_string()),
+                            None => Err(format!("unknown network: {network}")),
+                        }
+                    }
+                    Request::TopologySet {
+                        network,
+                        topology,
+                        hub,
+                    } => match dispatch::network::parse_topology(&topology, hub.as_deref()) {
+                        Err(error) => Err(error),
+                        Ok(mode) => match state.registry.get(&network) {
+                            None => Err(format!("unknown network: {network}")),
+                            Some(net) => {
+                                if net
+                                    .governance_state()
+                                    .await
+                                    .is_ok_and(|governance| governance.topology.is_some())
+                                {
+                                    Err("this network's topology is governed by a signed owner transition — propose a change instead (`networks topology-propose` / GovernanceProposeTopology)".to_owned())
+                                } else {
+                                    net.set_topology(mode)
+                                        .await
+                                        .map(|_| OperationReplyData::Topology(topology))
+                                        .map_err(|error| error.to_string())
+                                }
+                            }
+                        },
+                    },
+                    Request::GovernanceProposeKindChange {
+                        network,
+                        to,
+                        mfa_code,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .propose_transition(
+                                myownmesh_core::TransitionVariant::KindChange { to },
+                                mfa_code,
+                            )
+                            .await
+                            .map(OperationReplyData::ProposalId)
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceProposeRoleGrant {
+                        network,
+                        target,
+                        role,
+                        mfa_code,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .propose_transition(
+                                myownmesh_core::TransitionVariant::RoleGrant { target, role },
+                                mfa_code,
+                            )
+                            .await
+                            .map(OperationReplyData::ProposalId)
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceProposeRoleRevoke {
+                        network,
+                        target,
+                        mfa_code,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .propose_transition(
+                                myownmesh_core::TransitionVariant::RoleRevoke { target },
+                                mfa_code,
+                            )
+                            .await
+                            .map(OperationReplyData::ProposalId)
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceProposeEvict {
+                        network,
+                        target,
+                        mfa_code,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .propose_transition(
+                                myownmesh_core::TransitionVariant::Evict { target },
+                                mfa_code,
+                            )
+                            .await
+                            .map(OperationReplyData::ProposalId)
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceProposeTopology {
+                        network,
+                        topology,
+                        hub,
+                        mfa_code,
+                    } => match dispatch::network::parse_topology(&topology, hub.as_deref()) {
+                        Err(error) => Err(error),
+                        Ok(mode) => match state.registry.get(&network) {
+                            Some(net) => net
+                                .propose_transition(
+                                    myownmesh_core::TransitionVariant::TopologyChange { to: mode },
+                                    mfa_code,
+                                )
+                                .await
+                                .map(OperationReplyData::ProposalId)
+                                .map_err(|error| error.to_string()),
+                            None => Err(format!("unknown network: {network}")),
+                        },
+                    },
+                    Request::GovernanceSign {
+                        network,
+                        proposal_id,
+                        mfa_code,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .sign_proposal(&proposal_id, mfa_code)
+                            .await
+                            .map(|_| OperationReplyData::Signed(proposal_id))
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceDeny {
+                        network,
+                        proposal_id,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .deny_proposal(&proposal_id)
+                            .await
+                            .map(|_| OperationReplyData::Denied(proposal_id))
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceWithdraw {
+                        network,
+                        proposal_id,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .withdraw_proposal(&proposal_id)
+                            .await
+                            .map(|_| OperationReplyData::Withdrawn(proposal_id))
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    Request::GovernanceSpawnSplit {
+                        network,
+                        proposal_id,
+                    } => match state.registry.get(&network) {
+                        Some(net) => net
+                            .spawn_split(&proposal_id)
+                            .await
+                            .map(OperationReplyData::NewNetworkId)
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("unknown network: {network}")),
+                    },
+                    _ => unreachable!("grouped governance/network operation"),
+                };
+                let variable = FundedVariableReply::operation(result, operation).map_err(|_| {
+                    anyhow::anyhow!("governance/network operation lease did not match")
+                })?;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("governance/network response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkReconnect { network, peer } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network reconnect result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable = dispatch::network::network_reconnect(&state, &network, peer, plan);
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network reconnect response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network reconnect response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkAdd { config } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network add result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable = dispatch::network::network_add(&state, config, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network add response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network add response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkRemove { network, purge } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network remove result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable =
+                    dispatch::network::network_remove(&state, &network, purge, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network remove response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network remove response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkUpdate { config } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network update result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable = dispatch::network::network_update(&state, config, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network update response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network update response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            request @ (Request::ForgetAllNetworks | Request::FactoryReset) => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network reset result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable = match request {
+                    Request::ForgetAllNetworks => {
+                        dispatch::network::forget_all_networks(&state, plan).await
+                    }
+                    Request::FactoryReset => dispatch::network::factory_reset(&state, plan).await,
+                    _ => unreachable!(),
+                };
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network reset response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network reset response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkConnectPeer {
+                network,
+                peer,
+                pin,
+                wait_ms,
+            } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network connect result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    result = dispatch::network::network_connect_peer(&state, &network, &peer, pin, wait_ms, plan) => result,
+                };
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network connect response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network connect response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::UpdateStatus => {
+                let plan = myownmesh_updater::prepare_operation();
+                let lease = json_lines
+                    .acquire_claim(plan.claim())
+                    .context("updater status operation was not admitted")?;
+                let funded = plan.run(lease, myownmesh_updater::status).map_err(|_| {
+                    anyhow::anyhow!("updater operation lease did not match its plan")
+                })?;
+                let variable = FundedVariableReply::updater_status(funded);
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("updater status response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("updater status response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::UpdateApply => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("updater apply result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("updater apply lease did not match"))?;
+                let variable = plan.finish(match myownmesh_updater::apply_now() {
+                    Ok(applied) => Ok(OperationReplyData::Applied(applied)),
+                    Err(error) => Err(error.to_string()),
+                });
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("updater apply response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("updater apply response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::RpcCall {
+                network,
+                peer,
+                method,
+                payload,
+            } => {
+                let Some(joined) = state.registry.get(&network) else {
+                    let text = PreparedText::unknown_network(&network, &json_lines)
+                        .context("RpcCall lookup refusal text was not admitted")?;
+                    let reply = PreparedReply::Error(text);
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Prepared(&reply),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                let operation = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("RpcCall result operation was not admitted")?;
+                let rpc = joined.rpc();
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    result = rpc.call_funded(&peer, &method, payload) => result,
+                };
+                let variable = FundedVariableReply::rpc_call(result, operation)
+                    .map_err(|_| anyhow::anyhow!("RpcCall operation lease did not match"))?;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("RpcCall response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("RpcCall response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::UpdateCheck => {
+                let plan = myownmesh_updater::prepare_operation();
+                let lease = json_lines
+                    .acquire_claim(plan.claim())
+                    .context("updater check operation was not admitted")?;
+                let funded = plan
+                    .run_async(lease, myownmesh_updater::check_now(true))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("updater operation lease did not match its plan")
+                    })?;
+                let variable = FundedVariableReply::updater_check(funded);
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("updater check response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("updater check response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::UpdateSetPrefs { prefs } => {
+                let plan = myownmesh_updater::prepare_operation();
+                let lease = json_lines
+                    .acquire_claim(plan.claim())
+                    .context("updater preferences operation was not admitted")?;
+                let funded = plan
+                    .run(lease, || {
+                        let prefs = serde_json::from_value::<myownmesh_updater::UpdatePrefs>(prefs)
+                            .map_err(|error| {
+                                myownmesh_updater::Error::Other(format!(
+                                    "bad update prefs: {error}"
+                                ))
+                            })?;
+                        myownmesh_updater::set_prefs(prefs)
+                    })
+                    .map_err(|_| {
+                        anyhow::anyhow!("updater operation lease did not match its plan")
+                    })?;
+                let variable = FundedVariableReply::updater_status(funded);
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("updater preferences response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("updater preferences response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaEnroll { network } => {
+                let operation = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("MFA enrollment operation was not admitted")?;
+                let result = myownmesh_core::custody::enroll(&network, &network);
+                let variable = FundedVariableReply::mfa_enrollment(result, operation)
+                    .map_err(|_| anyhow::anyhow!("MFA operation lease did not match"))?;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("MFA enrollment response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA enrollment response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -1664,6 +2299,24 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 let reply = PreparedReply::ServicesStatus(funded);
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("services-status response exceeded its measured ceiling")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ServicesSet { services } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("services-set result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("services-set lease did not match"))?;
+                let variable = dispatch::services::services_set(&state, services, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("services-set response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("services-set response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -2461,25 +3114,15 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                         }
                     }
                 };
-                let line_ceiling = config_reply_line_ceiling(plan.encoding_ceiling())
-                    .context("ConfigShow response ceiling is not representable")?;
                 let work = json_lines
                     .acquire_claim(plan.load_work_claim())
                     .context("ConfigShow load work was not admitted")?;
-                let (committed, output) = prepare_typed_and_line_building(
-                    plan.typed_retention_claim(),
-                    line_ceiling,
-                    &json_lines,
-                    |typed| plan.commit(typed, work),
-                )
-                .context("ConfigShow typed value or response line was not admitted")?;
-                let config = match committed {
+                let loader_residual = json_lines
+                    .acquire_claim(plan.loader_residual_claim())
+                    .context("ConfigShow loader residual was not admitted")?;
+                let config = match plan.commit(loader_residual, work) {
                     Ok(config) => config,
                     Err(error) => {
-                        // The config-shaped output reservation cannot fund an
-                        // error string. Return it first, then admit the closed
-                        // error response independently.
-                        drop(output);
                         let text = PreparedText::core_error(&error, &json_lines)
                             .context("config load refusal text was not admitted")?;
                         let reply = PreparedReply::Error(text);
@@ -2496,6 +3139,14 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                         }
                     }
                 };
+                let line_ceiling = config_reply_line_ceiling(
+                    config
+                        .compact_encoded_len()
+                        .context("ConfigShow compact width was not representable")?,
+                )
+                .context("ConfigShow response width was not representable")?;
+                let output = AdmittedLineOut::prepare_capacity(line_ceiling, &json_lines)
+                    .context("ConfigShow response line was not admitted")?;
                 let reply = PreparedReply::Config(config);
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("ConfigShow exceeded its core encoding ceiling")?;
@@ -2761,8 +3412,13 @@ where
                             let Some(delivery) = maybe_frame else {
                                 return Ok(false);
                             };
-                            let (frame, _retention) = delivery.into_parts();
-                            emit(writer, frames, cancel, &frame).await
+                            // The delivery stays whole across the write: its
+                            // funding is released when it is dropped at the end
+                            // of this arm, which is after `emit` has returned.
+                            // Taking the frame out first made the retention a
+                            // separate local, free to fall before the bytes it
+                            // paid for had finished being serialized.
+                            emit(writer, frames, cancel, delivery.value()).await
                         }
                     }
                 } else {
@@ -2773,8 +3429,13 @@ where
                             let Some(delivery) = maybe_frame else {
                                 return Ok(false);
                             };
-                            let (frame, _retention) = delivery.into_parts();
-                            emit(writer, frames, cancel, &frame).await
+                            // The delivery stays whole across the write: its
+                            // funding is released when it is dropped at the end
+                            // of this arm, which is after `emit` has returned.
+                            // Taking the frame out first made the retention a
+                            // separate local, free to fall before the bytes it
+                            // paid for had finished being serialized.
+                            emit(writer, frames, cancel, delivery.value()).await
                         }
                         recv = mesh_rx.recv() => {
                             mesh_first = false;
@@ -4265,6 +4926,146 @@ mod terminal_shutdown_tests {
             clients.residue(),
             crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
             "no client, flow, handler, subscription, pending call or task lease remains"
+        );
+    }
+}
+
+/// The variable state reply uses the same real governance engine on both
+/// sides of its admission gap. No semantic snapshot crosses that gap: pass
+/// zero quotes capacity, while commit remeasures the then-current state and
+/// either builds it once or refuses before cloning it.
+#[cfg(test)]
+mod variable_state_reply_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    fn connector_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
+        let capacity = NonZeroUsize::new(16).expect("fixture capacity is nonzero");
+        let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
+            myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
+            myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
+            myownmesh_core::RealtimeConnectorPolicy::Disabled,
+        )
+        .expect("fixture callback policy is consistent");
+        let profile = myownmesh_core::WebRtcConnectorProfile::new(
+            callbacks,
+            myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
+        );
+        myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), profile)
+    }
+
+    fn network_config() -> myownmesh_core::NetworkConfig {
+        myownmesh_core::NetworkConfig {
+            id: "variable-state-control".to_owned(),
+            network_id: "variable-state-control".to_owned(),
+            label: "variable-state-control".to_owned(),
+            kind: Default::default(),
+            topology: myownmesh_core::TopologyMode::FullMesh,
+            signaling: Default::default(),
+            stun_servers: Vec::new(),
+            turn_servers: Vec::new(),
+            roster_path: None,
+            pinned_peers: Vec::new(),
+            auto_approve: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_r4_daemon_nonempty_governance_snapshot_pressure_and_drift_refuse_before_build() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
+            myownmesh_core::MeshConfig::default(),
+            Arc::new(myownmesh_core::Identity::ephemeral()),
+            connector_policy(),
+        )
+        .await
+        .expect("the real daemon mesh opens");
+        let scope = mesh
+            .local_application_resource_scope()
+            .expect("the daemon mesh exposes its application scope");
+        let joined = mesh
+            .join(network_config())
+            .await
+            .expect("the real network joins");
+
+        joined
+            .propose_transition(
+                myownmesh_core::TransitionVariant::RoleGrant {
+                    target: "first-absent-member".to_owned(),
+                    role: myownmesh_core::Role::Member,
+                },
+                None,
+            )
+            .await
+            .expect("an open network accepts a meaningful Member grant");
+
+        let plan = joined
+            .prepare_governance_snapshot()
+            .await
+            .expect("the nonempty state is measurable");
+        let builds_before = joined.governance_snapshot_build_count_for_test();
+        let typed = scope
+            .acquire(plan.typed_retention_claim())
+            .expect("the quoted typed owner is funded");
+        let funded = plan
+            .commit(typed)
+            .await
+            .expect("an unchanged nonempty state commits");
+        assert_eq!(
+            joined.governance_snapshot_build_count_for_test(),
+            builds_before + 1,
+            "the authoritative funded snapshot is built exactly once"
+        );
+        assert!(
+            !funded.state().member_log.is_empty(),
+            "non-vacuity: the funded snapshot contains the real Member grant"
+        );
+        let variable = FundedVariableReply::Governance(funded);
+        let exact = variable
+            .exact_line_len()
+            .expect("the full wire is measurable");
+        let admission = FrameAdmission::new(scope.clone(), None);
+        let output = AdmittedLineOut::prepare_capacity(exact, &admission)
+            .expect("the full response line is admitted");
+        let reply = PreparedReply::Variable(variable);
+        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+            .expect("the nonempty compact wire matches its measurement");
+        assert_eq!(line.bytes().len(), exact);
+        let wire: serde_json::Value = serde_json::from_slice(&line.bytes()[..exact - 1])
+            .expect("the legacy compact response is valid JSON");
+        assert_eq!(wire["ok"], true);
+        assert!(!wire["data"]["state"]["member_log"]
+            .as_array()
+            .expect("member_log remains an array")
+            .is_empty());
+        drop((line, reply));
+
+        let stale = joined
+            .prepare_governance_snapshot()
+            .await
+            .expect("the predecessor state is measurable");
+        let builds_before_refusal = joined.governance_snapshot_build_count_for_test();
+        let stale_lease = scope
+            .acquire(stale.typed_retention_claim())
+            .expect("the predecessor typed owner is funded");
+        joined
+            .propose_transition(
+                myownmesh_core::TransitionVariant::RoleGrant {
+                    target: format!("second-absent-member-{}", "z".repeat(4096)),
+                    role: myownmesh_core::Role::Member,
+                },
+                None,
+            )
+            .await
+            .expect("the second longer Member grant mutates authoritative state");
+        assert!(
+            stale.commit(stale_lease).await.is_err(),
+            "pass one refuses growth before cloning a successor into the stale grant"
+        );
+        assert_eq!(
+            joined.governance_snapshot_build_count_for_test(),
+            builds_before_refusal,
+            "stale growth refuses before the production snapshot builder"
         );
     }
 }

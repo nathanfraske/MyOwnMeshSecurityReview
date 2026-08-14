@@ -26,7 +26,7 @@ pub use frame::json_input_work_claim;
 pub use principal::LocalPrincipalCapability;
 
 pub(crate) use capabilities::{CapabilityReplaceRefusal, LocalCapabilityState};
-pub(crate) use channels::ChannelSubscriber;
+pub(crate) use channels::{ChannelSubscriber, GatewayChannelFrame};
 pub(crate) use frame::{structural_json_claim, AdmittedApplicationFrame, DecodedApplicationFrame};
 pub(crate) use mailbox::{GatewayAccepted, GatewayDelivery, GatewayMailbox};
 
@@ -38,7 +38,7 @@ use channels::GatewayChannel;
 pub(crate) struct ApplicationGateway {
     channels: parking_lot::Mutex<LeasedMap<String, GatewayChannel>>,
     capabilities: LocalCapabilityState,
-    rpc: parking_lot::RwLock<Option<std::sync::Arc<crate::rpc::RpcInner>>>,
+    rpc: parking_lot::RwLock<Option<crate::resource::FundedArc<crate::rpc::RpcInner>>>,
     closed: std::sync::atomic::AtomicBool,
     resources: LocalApplicationResourceScope,
 }

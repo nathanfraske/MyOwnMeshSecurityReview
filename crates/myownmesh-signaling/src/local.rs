@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::SignalingMessage;
+use crate::{OwnedQueue, SignalingMessage};
 
 /// Engine-side outbound message — the engine emits these for the
 /// signaling driver to deliver.
@@ -75,7 +75,26 @@ impl LocalBroker {
         mpsc::UnboundedSender<LocalOutbound>,
         mpsc::UnboundedReceiver<LocalInbound>,
     ) {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        self.join_with_queue_owner(room, device_id, ())
+    }
+
+    /// [`Self::join`], with an opaque owner for the outbound queue.
+    ///
+    /// The broker's forwarding task holds `queue_owner` inside an
+    /// [`OwnedQueue`] alongside the receiver, so it is released only after the
+    /// receiver and everything the caller left queued in it. See [`OwnedQueue`]
+    /// for why the broker takes something it never reads.
+    pub fn join_with_queue_owner<O: Send + 'static>(
+        &self,
+        room: &str,
+        device_id: &str,
+        queue_owner: O,
+    ) -> (
+        mpsc::UnboundedSender<LocalOutbound>,
+        mpsc::UnboundedReceiver<LocalInbound>,
+    ) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        let mut out_rx = OwnedQueue::new(out_rx, queue_owner);
         let (in_tx, in_rx) = mpsc::unbounded_channel::<LocalInbound>();
 
         // Register and announce to existing peers.

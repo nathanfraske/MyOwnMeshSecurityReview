@@ -19,16 +19,34 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::engine::state::NetworkState;
-use crate::identity::DeviceId;
 
 #[derive(thiserror::Error, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "`Decode` is large because it structurally owns what funds it: the \
+              `GatewayDelivery` the undecodable frame arrived in, and the \
+              subscriber handle carrying the residual named for that frame. \
+              Boxing the variant would put an allocation on the one path that \
+              exists because something already went wrong, and nothing has \
+              priced it; splitting the owners out would let a `serde_json::Error` \
+              built from an admitted frame outlive the retention that paid for \
+              the bytes it quotes. The size difference is the funding, so it \
+              stays inline and is stated here rather than removed"
+)]
 pub enum ChannelError {
     #[error("network has been torn down")]
     NetworkDown,
     #[error("peer {0} not found in active set")]
     PeerNotFound(String),
+    /// An outbound body could not be turned into JSON.
+    ///
+    /// Outbound only. Nothing has been admitted at this point and there is no
+    /// delivery to account against, which is why this one can carry a bare
+    /// error where [`Self::Decode`] cannot.
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("decode: {0}")]
+    Decode(ChannelDecodeError),
     #[error("transport: {0}")]
     Transport(String),
     #[error("application gateway lagged by {0} accepted messages")]
@@ -39,12 +57,94 @@ pub enum ChannelError {
     Admission(String),
 }
 
+/// A delivered frame that would not decode into `T`, holding the funding for
+/// the bytes that describe why.
+///
+/// The error is not bare. `serde_json::Error` carries an owned message built
+/// from the frame this failed on, so handing it back on its own would be the
+/// same escape [`ChannelMessage`] closes for a successful decode: the
+/// application keeps the error, drops the [`ChannelSubscription`], and an
+/// allocation derived from an admitted frame outlives everything that paid for
+/// it. It keeps the same two owners a decoded message keeps, and exposes the
+/// error only by reference.
+pub struct ChannelDecodeError {
+    error: serde_json::Error,
+    _delivery: crate::application_gateway::GatewayDelivery<
+        crate::application_gateway::GatewayChannelFrame,
+    >,
+    _subscriber: crate::resource::FundedArc<crate::application_gateway::ChannelSubscriber>,
+}
+
+impl ChannelDecodeError {
+    /// Why the frame would not decode.
+    pub fn error(&self) -> &serde_json::Error {
+        &self.error
+    }
+}
+
+impl std::fmt::Display for ChannelDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::fmt::Debug for ChannelDecodeError {
+    /// The error and nothing else — the two owners have nothing a reader wants
+    /// and printing them would suggest they are inspectable.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ChannelDecodeError")
+            .field(&self.error)
+            .finish()
+    }
+}
+
+impl std::error::Error for ChannelDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// One inbound message on a channel, paired with the peer that
 /// sent it.
+///
+/// **Both fields are borrowed, never handed over.** They used to be `pub`, and
+/// a public field is a way out: `std::mem::replace(&mut message.body, ..)`
+/// takes the decoded value while leaving the funding behind in a husk the
+/// application is free to drop, and no `Drop` impl can stop it — `Drop` runs
+/// after the move, on whatever is left. [`Self::from`] and [`Self::body`]
+/// borrow, so the value cannot outlive the two owners below.
+///
+/// Those owners are two because they pay for two different things. The
+/// delivery pays for the frame this was decoded from; the subscriber handle
+/// carries the residual named for the decoded graph itself, and holding it is
+/// what stops dropping the [`ChannelSubscription`] from releasing that residual
+/// while a `T` derived from it is still alive.
+///
+/// **The whole delivery is kept, not just its lease**, and that costs the raw
+/// JSON body for as long as the message is held. It buys the thing the split
+/// could not have: the retention funds a frame that is genuinely still there,
+/// rather than being quietly re-pointed at a decoded value of a size this layer
+/// never measured. `from` is read straight out of that frame, so it is not
+/// copied either.
 pub struct ChannelMessage<T> {
-    pub from: DeviceId,
-    pub body: T,
-    _gateway_retention: crate::resource::ResourceLease,
+    body: T,
+    delivery: crate::application_gateway::GatewayDelivery<
+        crate::application_gateway::GatewayChannelFrame,
+    >,
+    _subscriber: crate::resource::FundedArc<crate::application_gateway::ChannelSubscriber>,
+}
+
+impl<T> ChannelMessage<T> {
+    /// The peer that sent this.
+    pub fn from(&self) -> &str {
+        &self.delivery.value().from
+    }
+
+    /// The decoded body.
+    pub fn body(&self) -> &T {
+        &self.body
+    }
 }
 
 /// Typed handle to a named channel. Cheap to clone — multiple
@@ -169,6 +269,16 @@ where
     /// Subscribe to inbound messages on this channel. The returned receiver
     /// owns a distinct resource-backed mailbox; pressure and loss are surfaced
     /// rather than hidden behind a shared ring.
+    #[expect(
+        clippy::result_large_err,
+        reason = "one error type serves the whole channel surface, and its size \
+                  comes entirely from `ChannelError::Decode`, which must keep \
+                  owning the delivery and subscriber handle that fund the frame \
+                  it describes. Boxing the `Err` here would charge an allocation \
+                  to a path that never builds that variant and never allocates, \
+                  and a second error type would let the funded one be converted \
+                  away at the seam"
+    )]
     pub fn subscribe(&self) -> Result<ChannelSubscription<T>, ChannelError> {
         let subscriber = self
             .network
@@ -192,7 +302,7 @@ where
 
 /// Inbound side of one resource-backed Application Gateway mailbox.
 pub struct ChannelSubscription<T> {
-    subscriber: Arc<crate::application_gateway::ChannelSubscriber>,
+    subscriber: crate::resource::FundedArc<crate::application_gateway::ChannelSubscriber>,
     name: Arc<String>,
     network: Arc<NetworkState>,
     _phantom: PhantomData<T>,
@@ -222,15 +332,23 @@ where
             }
             Err(other) => return Some(Err(ChannelError::Transport(format!("{other:?}")))),
         };
-        let (frame, retention) = delivery.into_parts();
-        let body = match serde_json::from_value::<T>(frame.payload) {
-            Ok(value) => value,
-            Err(error) => return Some(Err(ChannelError::Serialize(error))),
-        };
-        Some(Ok(ChannelMessage {
-            from: frame.from,
-            body,
-            _gateway_retention: retention,
-        }))
+        // Decoded from a borrow, so the delivery is never taken apart: `T` is
+        // built *beside* the frame rather than out of it, and the whole
+        // delivery — frame and the retention that funds it — then moves into
+        // whichever value is handed back. Both outcomes carry the same two
+        // owners, so neither a decoded body nor the error explaining why there
+        // isn't one can outlive what paid for the bytes it came from.
+        match T::deserialize(&delivery.value().payload) {
+            Ok(body) => Some(Ok(ChannelMessage {
+                body,
+                delivery,
+                _subscriber: crate::resource::FundedArc::clone(&self.subscriber),
+            })),
+            Err(error) => Some(Err(ChannelError::Decode(ChannelDecodeError {
+                error,
+                _delivery: delivery,
+                _subscriber: crate::resource::FundedArc::clone(&self.subscriber),
+            }))),
+        }
     }
 }

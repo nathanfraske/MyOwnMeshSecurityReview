@@ -512,6 +512,39 @@ pub(crate) fn session_funding_for_test(
     session_in_scope_for_test(runtime, scope_for_grant(grant))
 }
 
+/// [`session_funding_for_test`], plus a handle on the provider behind it.
+///
+/// For the controls whose subject *is* the ledger — where the question is not
+/// "did this succeed" but "was the claim still out at this exact moment". Every
+/// other fixture deliberately hides the provider, because a control that can
+/// read the ledger can also assert on a number that happens to be right for the
+/// wrong reason. This one exists for the cases where the timing of a release is
+/// the property under test and nothing else can see it.
+#[cfg(test)]
+pub(crate) fn session_and_provider_for_test(
+    runtime: RuntimeIncarnation,
+    extra: ResourceClaim,
+) -> (SessionCapability, crate::resource::FiniteResourceProvider) {
+    use crate::resource::{FiniteResourceProvider, ProcessResourceRoot, ResourceProviderPort};
+
+    let extra = FiniteResourceProvider::reservation_charge_for_test(extra)
+        .expect("the extra retention plus its provider record is representable");
+    let grant = fixture_grant(1)
+        .checked_add(fixture_stream_retention_claim())
+        .and_then(|grant| grant.checked_add(extra))
+        .expect("the baseline grant and one control's extra retention compose");
+    let provider = FiniteResourceProvider::new(grant);
+    let observed = provider.clone();
+    let port = ResourceProviderPort::new(provider)
+        .expect("fixture provider accounts for its own process scope");
+    let scope = ProcessResourceRoot::isolated()
+        .install_resource_provider(port)
+        .expect("fresh isolated root has no installed provider")
+        .issue_mesh_scope()
+        .expect("installed provider issues one mesh scope");
+    (session_in_scope_for_test(runtime, scope), observed)
+}
+
 #[cfg(test)]
 fn session_in_scope_for_test(
     runtime: RuntimeIncarnation,

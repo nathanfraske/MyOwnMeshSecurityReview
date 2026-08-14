@@ -6,14 +6,14 @@ use crate::resource::LocalApplicationResourceScope;
 use super::{ApplicationGateway, GatewayRefusal};
 
 impl ApplicationGateway {
-    pub(crate) fn rpc(&self) -> Option<std::sync::Arc<crate::rpc::RpcInner>> {
+    pub(crate) fn rpc(&self) -> Option<crate::resource::FundedArc<crate::rpc::RpcInner>> {
         self.rpc.read().clone()
     }
 
     pub(crate) fn install_rpc(
         &self,
-        candidate: std::sync::Arc<crate::rpc::RpcInner>,
-    ) -> Result<std::sync::Arc<crate::rpc::RpcInner>, GatewayRefusal> {
+        candidate: crate::resource::FundedArc<crate::rpc::RpcInner>,
+    ) -> Result<crate::resource::FundedArc<crate::rpc::RpcInner>, GatewayRefusal> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(GatewayRefusal::Revoked);
         }
@@ -21,7 +21,7 @@ impl ApplicationGateway {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(GatewayRefusal::Revoked);
         }
-        Ok(std::sync::Arc::clone(installed.get_or_insert(candidate)))
+        Ok(installed.get_or_insert(candidate).clone())
     }
 
     pub(crate) fn rpc_resource_scope(

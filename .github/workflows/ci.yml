@@ -460,17 +460,18 @@ jobs:
           # shared-allocation funding controls. Qualify the shared
           # `v4_r3_core_` prefix by module so the two ignored handler-start
           # controls do not enter these ordinary counts.
-          run_exact_ordinary_group config::tests::v4_r3_core_ 4 \
-            v4_r3_core_the_planning_floor_covers_a_defaulted_config \
-            v4_r3_core_an_empty_object_is_priced_for_what_it_becomes \
-            v4_r3_core_the_plan_covers_many_minimally_specified_networks \
-            v4_r3_core_the_plan_covers_every_populated_repeatable_family
           run_exact_ordinary_group resource::map::tests::v4_r3_core_ 2 \
             v4_r3_core_the_ordered_cursor_answers_the_exact_lower_bound \
             v4_r3_core_an_ordered_pass_walks_one_descent_per_step
           run_exact_ordinary_group resource::provider::tests::v4_r3_core_ 2 \
             v4_r3_core_one_claim_funds_a_shared_allocation_until_its_last_handle \
             v4_r3_core_a_speculative_lease_is_refused_for_sharing_and_keeps_its_funding
+          # Audit G1: exact funded-delivery ownership and the closed terminal
+          # effect caller census. Keep these qualified because the names state
+          # both the behavior and the production module whose seam they bind.
+          run_exact_control resource::mailbox::tests::v4_r3_core_f1_a_delivered_value_is_still_funded_while_it_is_destroyed
+          run_exact_control rpc::session_ownership_tests::v4_r3_core_f1_an_extracted_effect_stays_funded_until_it_is_answered_or_dropped
+          run_exact_control resource::mailbox::tests::the_terminal_effect_seam_has_exactly_its_documented_callers
           run_exact_ordinary_group identity::tests::v4_r3_core_f7_ 6 \
             v4_r3_core_f7_a_refused_network_id_plan_builds_nothing \
             v4_r3_core_f7_a_funded_network_id_commit_spends_exactly_its_plan \
@@ -484,8 +485,8 @@ jobs:
             v4_r3_core_f7_a_same_size_replacement_voids_the_whole_snapshot \
             v4_r3_core_f7_a_changed_peer_voids_the_whole_snapshot \
             v4_r3_core_f7_a_raw_advert_copy_keeps_its_bytes_and_its_capacity \
+            v4_r3_core_f7_the_fixed_row_arithmetic_matches_the_closed_serializer \
             v4_r3_core_f7_the_funded_peer_row_is_the_unfunded_one_on_the_wire \
-            v4_r3_core_f7_the_row_ceiling_covers_the_widest_fixed_row \
             v4_r3_core_f7_a_line_wider_than_admitted_is_refused_before_publication
           run_exact_control borrowed_channel_seq_encodes_exactly_like_the_variant
           run_exact_control v4_arc03f_realtime_bytes_follow_the_payload_owner_through_downstream_queues
@@ -713,6 +714,11 @@ jobs:
           run_exact_daemon_control v4_r3_daemon_the_networks_work_ceiling_covers_every_fixed_field
           run_exact_daemon_control v4_r3_daemon_networks_drift_refuses_before_overbudget_build_and_rolls_back
           run_exact_daemon_control v4_r3_daemon_the_prepared_network_rows_are_the_legacy_rows_on_the_wire
+
+          # Audit G1: variable replies must refuse before constructing their
+          # funded source and must reject a drifted authoritative snapshot.
+          run_exact_daemon_control control::framing::tests::v4_r4_daemon_large_funded_rpc_pressure_precedes_reply_construction
+          run_exact_daemon_control control::variable_state_reply_tests::v4_r4_daemon_nonempty_governance_snapshot_pressure_and_drift_refuse_before_build
 
           # A production channel pump parks after subscriber selection and
           # before building its peer-sized frame; registry mutations must still

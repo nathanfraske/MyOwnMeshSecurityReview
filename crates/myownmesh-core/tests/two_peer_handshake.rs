@@ -92,8 +92,8 @@ async fn two_peers_handshake_and_exchange_channel_message() {
             break msg;
         }
     };
-    assert_eq!(msg.from, alice_id.public_id());
-    assert_eq!(msg.body, "hello from alice");
+    assert_eq!(msg.from(), alice_id.public_id());
+    assert_eq!(msg.body(), &"hello from alice");
 
     // Reverse direction.
     let mut alice_sub = alice_chan.subscribe().expect("alice subscription admitted");
@@ -112,8 +112,8 @@ async fn two_peers_handshake_and_exchange_channel_message() {
             break msg;
         }
     };
-    assert_eq!(msg.from, bob_id.public_id());
-    assert_eq!(msg.body, "hi back");
+    assert_eq!(msg.from(), bob_id.public_id());
+    assert_eq!(msg.body(), &"hi back");
 }
 
 async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>, peer_id: &str) {

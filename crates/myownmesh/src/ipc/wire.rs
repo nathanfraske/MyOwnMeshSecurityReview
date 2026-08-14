@@ -36,7 +36,7 @@ use myownmesh_core::{ResourceClaim, ResourceMailboxItemError};
 /// `EventsSubscribe` the connection stops being
 /// request/response, so every server-initiated line is a tagged
 /// `ServerOut` JSON object.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerOut {
     /// Live mesh event (peer state, phase, diag).
@@ -66,7 +66,11 @@ pub enum ServerOut {
     /// Chunk of a streaming response to an outbound RPC call
     /// the client made via `RpcCallStream`. Multiple chunks may
     /// arrive before `RpcCallStreamEnd`.
-    RpcCallStreamChunk { request_id: String, payload: Value },
+    RpcCallStreamChunk {
+        request_id: String,
+        #[serde(serialize_with = "serialize_rpc_stream_chunk")]
+        payload: myownmesh_core::rpc::RpcStreamChunk,
+    },
     /// End-of-stream marker for an outbound `RpcCallStream`.
     /// `error` is set if the peer terminated the stream with
     /// an error rather than a clean close.
@@ -96,6 +100,13 @@ pub enum ServerOut {
         /// daemon does not surface socket addresses.
         by: String,
     },
+}
+
+fn serialize_rpc_stream_chunk<S: serde::Serializer>(
+    chunk: &myownmesh_core::rpc::RpcStreamChunk,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    chunk.value().serialize(serializer)
 }
 
 /// A borrowed mirror of [`ServerOut::RpcInbound`], for measuring a frame that

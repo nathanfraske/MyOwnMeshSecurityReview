@@ -2082,6 +2082,11 @@ struct InstalledHandler {
 }
 
 /// The core registration behind an installed handler.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the live arm is the move-only exact registration and cleanup owner; boxing it \
+              would add an unaccounted allocation and separate ownership from its drop effect"
+)]
 enum HandlerToken {
     /// Core has published the handler, and this registry does not hold its
     /// registration yet — the few instructions between `commit_with` returning

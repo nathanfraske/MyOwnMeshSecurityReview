@@ -1320,10 +1320,34 @@ fn stream_key(request_id: &str) -> PendingKey {
     }
 }
 
-fn next_item(
+/// Assert the next delivery carries `expected`, reading it through the
+/// delivery rather than taking it out.
+///
+/// The comparison happens while the delivery is still whole and its funding is
+/// still held; the delivery is dropped when this returns. The helper asserts
+/// rather than returning the item because it cannot return one: a delivered
+/// value is only reachable by borrow, and a borrow of the temporary this is
+/// handed could not outlive the call.
+fn assert_next_item(
     delivery: Option<myownmesh_core::ResourceMailboxDelivery<myownmesh_core::rpc::RpcStreamItem>>,
-) -> Option<myownmesh_core::rpc::RpcStreamItem> {
-    delivery.map(|delivery| delivery.into_parts().0)
+    expected: myownmesh_core::rpc::RpcStreamItem,
+    context: &str,
+) {
+    assert_eq!(
+        delivery
+            .as_ref()
+            .map(myownmesh_core::ResourceMailboxDelivery::value),
+        Some(&expected),
+        "{context}"
+    );
+}
+
+/// Assert the stream has nothing further to deliver.
+fn assert_no_next_item(
+    delivery: Option<myownmesh_core::ResourceMailboxDelivery<myownmesh_core::rpc::RpcStreamItem>>,
+    context: &str,
+) {
+    assert!(delivery.is_none(), "{context}");
 }
 
 /// The terminal item is delivered behind a chunk already resident in the
@@ -1347,17 +1371,15 @@ async fn a_terminal_item_is_delivered_behind_a_resident_chunk() {
     let operation_id = ticket.operation_id();
     assert!(reg.push_exact_stream(&key, a.id, operation_id, serde_json::json!(1)));
     assert!(reg.close_exact_stream(&key, a.id, operation_id, None));
-    assert_eq!(
-        next_item(rx.recv().await),
-        Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-            serde_json::json!(1)
-        )),
-        "the resident chunk is delivered first"
+    assert_next_item(
+        rx.recv().await,
+        myownmesh_core::rpc::RpcStreamItem::Chunk(serde_json::json!(1)),
+        "the resident chunk is delivered first",
     );
-    assert_eq!(
-        next_item(rx.recv().await),
-        Some(myownmesh_core::rpc::RpcStreamItem::End(Ok(()))),
-        "the terminal item follows it rather than overtaking it"
+    assert_next_item(
+        rx.recv().await,
+        myownmesh_core::rpc::RpcStreamItem::End(Ok(())),
+        "the terminal item follows it rather than overtaking it",
     );
 }
 
@@ -1387,20 +1409,17 @@ async fn a_chunk_cannot_be_written_after_terminal_settlement() {
         !reg.push_exact_stream(&key, owner_id, operation_id, serde_json::json!(2)),
         "a chunk offered after settlement is refused rather than queued"
     );
-    assert_eq!(
-        next_item(rx.recv().await),
-        Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-            serde_json::json!(1)
-        ))
+    assert_next_item(
+        rx.recv().await,
+        myownmesh_core::rpc::RpcStreamItem::Chunk(serde_json::json!(1)),
+        "the resident chunk is still delivered",
     );
-    assert_eq!(
-        next_item(rx.recv().await),
-        Some(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
+    assert_next_item(
+        rx.recv().await,
+        myownmesh_core::rpc::RpcStreamItem::End(Ok(())),
+        "and the terminal item after it",
     );
-    assert!(
-        next_item(rx.recv().await).is_none(),
-        "nothing follows the terminal item"
-    );
+    assert_no_next_item(rx.recv().await, "nothing follows the terminal item");
 }
 
 #[tokio::test]
@@ -1419,11 +1438,10 @@ async fn stream_terminal_error_is_preserved_exactly() {
         panic!("stream claim")
     };
     assert!(reg.close_exact_stream(&key, a.id, ticket.operation_id(), Some("denied".into())));
-    assert_eq!(
-        next_item(rx.recv().await),
-        Some(myownmesh_core::rpc::RpcStreamItem::End(
-            Err("denied".into())
-        ))
+    assert_next_item(
+        rx.recv().await,
+        myownmesh_core::rpc::RpcStreamItem::End(Err("denied".into())),
+        "the terminal error is preserved exactly",
     );
 }
 
@@ -1454,11 +1472,10 @@ async fn wrong_response_class_retains_same_operation_identity() {
         ticket.operation_id(),
         serde_json::json!("same-op")
     ));
-    assert_eq!(
-        next_item(rx.recv().await),
-        Some(myownmesh_core::rpc::RpcStreamItem::Chunk(
-            serde_json::json!("same-op")
-        ))
+    assert_next_item(
+        rx.recv().await,
+        myownmesh_core::rpc::RpcStreamItem::Chunk(serde_json::json!("same-op")),
+        "the chunk for the live operation is delivered",
     );
 }
 

@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use parking_lot::Mutex;
 
 use super::{
-    LeasedQueue, LocalApplicationResourceScope, ResourceClaim, ResourceClaimArithmeticError,
-    ResourceClass, ResourceLease, ResourceUnavailable,
+    FundedArc, LeasedQueue, LocalApplicationResourceScope, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceUnavailable,
 };
 
 struct MailboxEntry<T> {
@@ -12,6 +10,15 @@ struct MailboxEntry<T> {
     retention: ResourceLease,
 }
 
+/// The shared mailbox state, as it sits inside the funded allocation.
+///
+/// The root lease is deliberately **not** a field here. `root_claim()` prices
+/// the shared allocation itself, and a lease living in the pointee is destroyed
+/// with the pointee — which happens on the final *strong* drop, while the
+/// allocation survives for as long as any weak handle does. The provider would
+/// be told that storage was free while it still existed. The claim therefore
+/// rides in [`FundedArc`], which releases it only once every handle of either
+/// kind is gone.
 struct MailboxInner<T> {
     queue: Mutex<LeasedQueue<MailboxEntry<T>>>,
     ready: tokio::sync::Notify,
@@ -19,7 +26,6 @@ struct MailboxInner<T> {
     closed: std::sync::atomic::AtomicBool,
     senders: std::sync::atomic::AtomicUsize,
     owner: LocalApplicationResourceScope,
-    _root: ResourceLease,
 }
 
 /// Measured off-node retention owned by one mailbox value.
@@ -311,7 +317,7 @@ impl<T> ResourceMailboxSendError<T> {
 /// mailbox never guesses an item count or acquires authority on the caller's
 /// behalf.
 pub struct ResourceMailboxSender<T> {
-    inner: Arc<MailboxInner<T>>,
+    inner: FundedArc<MailboxInner<T>>,
 }
 
 impl<T> Clone for ResourceMailboxSender<T> {
@@ -323,16 +329,18 @@ impl<T> Clone for ResourceMailboxSender<T> {
                 std::sync::atomic::Ordering::Relaxed,
                 |senders| senders.checked_add(1),
             )
-            .expect("a live Arc bounds the number of mailbox senders");
+            .expect("a live handle bounds the number of mailbox senders");
+        // Cloning the funded handle adds a holder to the one reservation that
+        // already funds this allocation; it does not take out a second one.
         Self {
-            inner: Arc::clone(&self.inner),
+            inner: self.inner.clone(),
         }
     }
 }
 
 /// Single consumer for a resource-backed mailbox.
 pub struct ResourceMailboxReceiver<T> {
-    inner: Arc<MailboxInner<T>>,
+    inner: FundedArc<MailboxInner<T>>,
 }
 
 /// A mailbox whose shared allocation is funded but not constructed.
@@ -356,33 +364,159 @@ impl<T> PreparedResourceMailbox<T> {
     /// commit section after its last refusal.
     pub fn commit(self) -> (ResourceMailboxSender<T>, ResourceMailboxReceiver<T>) {
         let Self { owner, root, .. } = self;
-        let inner = Arc::new(MailboxInner {
-            queue: Mutex::new(LeasedQueue::new()),
-            ready: tokio::sync::Notify::new(),
-            closed_ready: tokio::sync::Notify::new(),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            senders: std::sync::atomic::AtomicUsize::new(1),
-            owner,
-            _root: root,
-        });
+        let inner = FundedArc::new(
+            MailboxInner {
+                queue: Mutex::new(LeasedQueue::new()),
+                ready: tokio::sync::Notify::new(),
+                closed_ready: tokio::sync::Notify::new(),
+                closed: std::sync::atomic::AtomicBool::new(false),
+                senders: std::sync::atomic::AtomicUsize::new(1),
+                owner,
+            },
+            root,
+        )
+        // Unreachable rather than merely unlikely: `FundedArc::new` refuses one
+        // thing, a speculative lease, and the only way to reach this line is
+        // through `prepare_resource_mailbox`, whose acquisition goes through
+        // `LocalApplicationResourceScope::acquire` — which names
+        // `ResourceAuthorityClass::Admitted` itself and takes no authority from
+        // the caller. There is no spelling of a prepared mailbox holding a
+        // speculative root, so this preserves the documented infallibility of
+        // the commit rather than quietly adding a refusal to it.
+        .expect("a prepared mailbox root is admitted, never speculative");
         (
             ResourceMailboxSender {
-                inner: Arc::clone(&inner),
+                inner: inner.clone(),
             },
             ResourceMailboxReceiver { inner },
         )
     }
 }
 
-/// One delivered value. Its off-node retention stays funded until this value
-/// is consumed or dropped; the queue-node lease is released by the pop.
+/// One delivered value and the funding for its off-node retention, as a single
+/// move-only owner. The queue-node lease is released by the pop; this is what
+/// remains.
+///
+/// **The two halves are one value on purpose.** `value` is declared before
+/// `retention`, and struct fields are destroyed in declaration order, so the
+/// value dies first and its funding is released second. The ordering is a
+/// property of this layout rather than of what each call site remembers to do.
+///
+/// Handing the pair out as a tuple put that order back in the caller's hands,
+/// and the shape it invited — `let (frame, _retention) = ...;` — is precisely
+/// the failure: two locals whose relative drop order is whatever the rest of
+/// the function body happens to imply, with the funding free to go first while
+/// the frame is still being serialized and written. Worse, the value could be
+/// moved onward into another queue while the retention stayed behind and was
+/// released at the end of the block, so the provider was told those bytes were
+/// free while they were still very much alive somewhere else.
+///
+/// **The public surface is therefore an immutable borrow and nothing else.**
+/// [`Self::value`] is the whole of it: a serializer reads through it, a writer
+/// awaits with it, and the delivery is dropped afterwards, so the funding
+/// outlives the write by construction rather than by convention. Anything that
+/// needs the value to keep living moves the delivery itself.
+///
+/// Three shapes that look reasonable are deliberately absent, each because it
+/// would hand the separation back under a friendlier name:
+///
+/// - a `&mut` accessor — `mem::replace` and `mem::take` move the value straight
+///   out through one, so it is not the weaker capability it appears to be;
+/// - a general `map(FnOnce(T) -> U)` carrying this claim onto the output —
+///   nothing in that signature stops a small funded `T` becoming a large `U`,
+///   so it could *underfund* its result while the ledger read unchanged;
+/// - a `consume(FnOnce(T) -> R) -> R` that drops the funding after the closure
+///   returns — `R` can be `T`, or an error containing `T`, so the value walks
+///   out having outlived its claim by exactly the margin the type promised it
+///   could not.
+///
+/// There is no in-crate exception either — no seam handing the two halves to a
+/// closure, and no wrapper around the lease for a destination to hold. Both
+/// were tried, and both are the same split with better manners: a closure
+/// receiving `(T, ResourceLease)` can return the bare value, return the pair,
+/// or build something larger than the claim, and a wrapper is still a second
+/// value that can be dropped before the first. An owner that needs this value
+/// to keep living stores *this type*, whole.
 pub struct ResourceMailboxDelivery<T> {
     value: T,
     retention: ResourceLease,
 }
 
 impl<T> ResourceMailboxDelivery<T> {
-    pub fn into_parts(self) -> (T, ResourceLease) {
+    /// The delivered value, borrowed. The funding outlives the borrow.
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Run one terminal effect over the delivered value, releasing the funding
+    /// only once that effect has finished.
+    ///
+    /// **The single consuming seam in the crate, and it exists for one shape of
+    /// caller: a public message enum whose payload is consumed by value
+    /// downstream.** A command handler is not a reader — `NetworkCmd` carries
+    /// `oneshot::Sender`s in fifteen of its variants, and `Sender::send`
+    /// consumes, so the command genuinely cannot be handled from a borrow.
+    /// `SignalingInbound` is the same shape for a different reason: its payloads
+    /// land in `apply_remote_sdp`, which takes an owned `String`, and
+    /// `add_remote_candidate_observed`, which takes an owned
+    /// `LocalIceCandidate`. In both cases the alternative was worse — rebuild
+    /// the public enum around interior mutability across every variant and
+    /// construction site, or clone multi-kilobyte SDP bodies outside the claim
+    /// that funded them. This is the narrower answer.
+    ///
+    /// **`Output = ()` closes the return path, and only that.** The consuming
+    /// form rejected earlier was `FnOnce(T) -> R`, where `R` could be `T` or an
+    /// error containing `T`, so the value walked out through the signature
+    /// itself. Nothing returns here, and `retention` is dropped after the
+    /// future has *completed* rather than after it has been built.
+    ///
+    /// That is not a structural impossibility and must not be read as one: an
+    /// effect is free to `spawn` the value onto another task, push it into a
+    /// queue, or park it in a global and still return `()`. Any of those would
+    /// outlive this claim exactly as the returned value would have.
+    ///
+    /// So the load-bearing rule is the census, not the type. The seam is
+    /// crate-private and has exactly three callers, all listed below; each hands
+    /// the message to a terminal handler that consumes it locally — the command
+    /// handlers move only a `oneshot::Sender` out in order to answer, and the
+    /// signaling handler hands its payload to a transport call that finishes
+    /// within the awaited future. **A caller that stored the message onward, or
+    /// spawned it, would break this and the signature would not stop it** —
+    /// which is why the caller list is part of the contract and any addition to
+    /// it needs the same scrutiny the seam itself got.
+    ///
+    /// **Not for serialization, writes, or fan-out.** Those keep the delivery
+    /// whole and read through [`Self::value`]; a writer has somewhere for the
+    /// bytes to go and so does not need this. The callers are exactly the two
+    /// `NetworkCmd` dispatch sites in `engine/mod.rs` — the driver loop and the
+    /// test command driver — plus the driver loop's `SignalingInbound` arm, and
+    /// that census is the point of the seam being `pub(crate)` and named for
+    /// what it is. `the_terminal_effect_seam_has_exactly_its_documented_callers`
+    /// fails if the number moves.
+    pub(crate) async fn run_terminal_effect<F>(self, effect: impl FnOnce(T) -> F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let Self { value, retention } = self;
+        effect(value).await;
+        drop(retention);
+    }
+
+    /// Split the delivery into its two halves. **This module's controls only.**
+    ///
+    /// Private, and `#[cfg(test)]` rather than feature-gated. A feature is a
+    /// buildable production surface — any consumer that turned it on would get
+    /// a real, callable tuple API, and the invariant that a delivery cannot
+    /// separate its value from its retention would simply be false for them.
+    /// The audience is the handful of controls in this file that assert on the
+    /// funding itself: that a live retention is still charged while the value
+    /// exists, that dropping the value releases exactly it. Those have to hold
+    /// both halves at once to observe it at all, and they are the one caller
+    /// for which caller-controlled drop order is the subject rather than the
+    /// hazard. Every other test, in this crate and outside it, reads through
+    /// [`Self::value`] or moves the delivery whole.
+    #[cfg(test)]
+    fn into_parts(self) -> (T, ResourceLease) {
         (self.value, self.retention)
     }
 }
@@ -439,7 +573,16 @@ impl<T> ResourceMailboxSender<T> {
     /// The refusal is deliberately stored inline: boxing it would add a fresh
     /// allocation to the mailbox's closed path, where no new resource should
     /// be required merely to hand ownership back to the caller.
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the closed path must hand `T` and both leases back by value — \
+                  that is what makes the refusal lossless, and it is the whole \
+                  reason this signature exists. Boxing the `Err` would demand a \
+                  fresh allocation at the one moment the mailbox has just been \
+                  found closed, purely to return ownership the caller already \
+                  had. The success arm carries nothing, so the wide `Result` \
+                  costs the accepting path only its size"
+    )]
     pub(crate) fn accept(
         &self,
         value: T,
@@ -658,7 +801,7 @@ impl<T> ResourceMailboxReceiver<T> {
 
     pub async fn recv(&mut self) -> Option<ResourceMailboxDelivery<T>> {
         loop {
-            let inner = std::sync::Arc::clone(&self.inner);
+            let inner = self.inner.clone();
             let notified = inner.ready.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -715,17 +858,29 @@ mod tests {
         ResourceMailboxReceiver<TestItem>,
         super::super::FiniteResourceProvider,
     ) {
+        fixture_for(item)
+    }
+
+    fn fixture_for<T: ResourceMailboxItem>(
+        item: Option<&T>,
+    ) -> (
+        ResourceMailboxSender<T>,
+        ResourceMailboxReceiver<T>,
+        super::super::FiniteResourceProvider,
+    ) {
         let scopes = super::super::FiniteResourceProvider::scope_record_charge_for_test()
             .checked_scale(2)
             .expect("process and local-application scope records fit");
         let root = super::super::FiniteResourceProvider::reservation_charge_for_test(
-            ResourceMailboxSender::<TestItem>::root_claim().expect("mailbox root claim fits"),
+            ResourceMailboxSender::<T>::root_claim().expect("mailbox root claim fits"),
         )
         .expect("mailbox root reservation fits");
         let mut grant = scopes.checked_add(root).expect("fixture root grant fits");
         if let Some(item) = item {
             grant = grant
-                .checked_add(ResourceMailboxSender::<TestItem>::accepted_item_charge_for_test(item))
+                .checked_add(ResourceMailboxSender::<T>::accepted_item_charge_for_test(
+                    item,
+                ))
                 .expect("fixture item grant fits");
         }
         let provider = super::super::FiniteResourceProvider::new(grant);
@@ -867,5 +1022,213 @@ mod tests {
             tx.send(TestItem(vec![1])),
             Err(ResourceMailboxSendError::Closed(_))
         ));
+    }
+
+    /// A delivered value that reports what the provider still showed at the
+    /// moment it was destroyed.
+    ///
+    /// The retention is the thing under test, so it must not be observable by
+    /// asking the delivery — a control that read the lease would prove only
+    /// that the field existed. This reads the *provider*, from inside the
+    /// value's own `Drop`, which is the one instant that distinguishes a
+    /// retention released before the value from one released after it.
+    struct FundingWitness {
+        bytes: Vec<u8>,
+        provider: super::super::FiniteResourceProvider,
+        at_drop: std::sync::Arc<parking_lot::Mutex<Option<ResourceClaim>>>,
+    }
+
+    impl ResourceMailboxItem for FundingWitness {
+        fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+            let bytes = u64::try_from(self.bytes.len()).map_err(|_| {
+                ResourceClaimArithmeticError::Overflow {
+                    dimension: ResourceClass::AccountedMemoryBytes,
+                }
+            })?;
+            Ok(ResourceClaim::try_from_entries([
+                (ResourceClass::AccountedMemoryBytes, bytes),
+                (ResourceClass::QueuedBytes, bytes),
+                (ResourceClass::OpaqueDependencyResidual, 1),
+            ])?)
+        }
+    }
+
+    impl Drop for FundingWitness {
+        fn drop(&mut self) {
+            *self.at_drop.lock() = Some(self.provider.in_use());
+        }
+    }
+
+    /// **Review control 1 of 4.** The value is destroyed while its retention is
+    /// still live, not after.
+    ///
+    /// This is the whole delivery invariant stated as an observation: a
+    /// `ResourceMailboxDelivery` declares `value` before `retention`, so the
+    /// value goes first and the funding is returned only once it is gone.
+    /// Swapping those two fields — which is the entire defect, and which no
+    /// type checks — leaves the provider showing the item's charge already
+    /// returned by the time the bytes are being freed.
+    #[test]
+    fn v4_r3_core_f1_a_delivered_value_is_still_funded_while_it_is_destroyed() {
+        let at_drop = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let (tx, mut rx, provider) = {
+            // Sized against a throwaway that reports into its own slot: this one
+            // is destroyed as the block ends, and writing that into `at_drop`
+            // would answer the question before the control has asked it.
+            let probe = FundingWitness {
+                bytes: vec![3; 48],
+                provider: super::super::FiniteResourceProvider::new(ResourceClaim::ZERO),
+                at_drop: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            };
+            fixture_for(Some(&probe))
+        };
+        let baseline = provider.in_use();
+        // Matched rather than unwrapped. A refusal hands the witness back
+        // inside the error, so `expect` would need `ResourceMailboxSendError<
+        // FundingWitness>: Debug` and therefore `FundingWitness: Debug` — a
+        // derive this fixture must not have, because the witness holds the very
+        // provider it reads in its `Drop` and printing one would print the
+        // other. The arm below still fails the control on a refused send, so
+        // nothing is weakened to get there.
+        match tx.send(FundingWitness {
+            bytes: vec![3; 48],
+            provider: provider.clone(),
+            at_drop: std::sync::Arc::clone(&at_drop),
+        }) {
+            Ok(()) => {}
+            Err(_) => panic!("the fixture funds exactly one witness"),
+        }
+        let admitted = provider.in_use();
+        assert_ne!(
+            admitted, baseline,
+            "the send must actually have charged something, or this control \
+             observes nothing"
+        );
+
+        let delivery = rx
+            .try_recv()
+            .expect("the accepted witness is delivered whole");
+        assert!(
+            at_drop.lock().is_none(),
+            "the witness is still alive — nothing has been destroyed yet"
+        );
+
+        // What the delivery actually holds, which is not what the send charged.
+        // `admitted` includes the queue node, and `try_recv` gave that node back
+        // as it removed the entry — so the reading to compare the value's own
+        // destruction against is this one, taken while the delivery is alive and
+        // holding exactly its off-node retention. Comparing against `admitted`
+        // would be asserting that a delivery still owns a node the mailbox no
+        // longer has, which is a different and false claim.
+        let delivered_live = provider.in_use();
+        assert_ne!(
+            delivered_live, baseline,
+            "non-vacuity: the delivery still holds its retention, so there is \
+             something for the observation below to be about"
+        );
+        assert_ne!(
+            delivered_live, admitted,
+            "non-vacuity: and the pop really did return the queue node, so this \
+             reading is the retention alone rather than the send's total"
+        );
+        drop(delivery);
+
+        let observed = at_drop
+            .lock()
+            .expect("the delivered value was destroyed exactly once");
+        assert_eq!(
+            observed, delivered_live,
+            "the retention was already released while the value it funds was \
+             still being destroyed"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "and once both are gone the charge is returned in full"
+        );
+    }
+
+    /// The terminal-effect seam has exactly the callers its contract names.
+    ///
+    /// `run_terminal_effect` is safe because of *who calls it*, not because of
+    /// its signature: an effect can spawn the value onto another task and still
+    /// return `()`, which would outlive the claim just as a returned value
+    /// would. The doc therefore names its callers, and a claim about a caller
+    /// list is worth exactly as much as something that checks it.
+    ///
+    /// **Counted over the production prefix only.** The engine's own test
+    /// module reaches the seam as well, and legitimately: handing
+    /// `handle_command` an owned command is what the seam is for, and no other
+    /// route out of a delivery is public. But a caller under `mod tests` must
+    /// not be able to raise the number this census exists to hold down, so the
+    /// file is cut at its test module and three are counted before it — the
+    /// driver loop's `NetworkCmd` arm, the `#[cfg(test)]` command driver that
+    /// mirrors it, and the driver loop's `SignalingInbound` arm. Test coverage
+    /// of the seam is then asserted separately, as coverage rather than as
+    /// census.
+    ///
+    /// A real check with two stated limits. It cannot see a call added in some
+    /// *other* module, so it catches the likely drift — a fourth command path
+    /// growing inside the engine — and not the unlikely one. And the cut is at
+    /// the test module, not at every `#[cfg(test)]` item, so a helper gated
+    /// outside that module still counts: that is why the production number is
+    /// three and not two.
+    #[test]
+    fn the_terminal_effect_seam_has_exactly_its_documented_callers() {
+        const ENGINE: &str = include_str!("../engine/mod.rs");
+        const SEAM: &str = ".run_terminal_effect(";
+
+        // Fail closed. A census taken over the wrong slice reads exactly like a
+        // passing one while measuring nothing, so an absent or repeated
+        // boundary is the failure itself rather than a reason to fall back to
+        // the whole file. Matched line by line so a checkout with CRLF endings
+        // cuts in the same place as one without.
+        let lines: Vec<&str> = ENGINE.lines().collect();
+        let boundaries: Vec<usize> = lines
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0].trim() == "#[cfg(test)]" && pair[1].trim() == "mod tests {")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            boundaries.len(),
+            1,
+            "the census cuts engine/mod.rs at its `#[cfg(test)] mod tests` \
+             boundary and found {} of them. None means the marker moved and \
+             this control is counting an unknown slice; more than one means the \
+             cut is ambiguous. Either way the counts below would mean nothing, \
+             so it fails here instead of reporting a number it cannot justify",
+            boundaries.len()
+        );
+        let boundary = boundaries[0];
+
+        let production: usize = lines[..boundary]
+            .iter()
+            .map(|line| line.matches(SEAM).count())
+            .sum();
+        assert_eq!(
+            production, 3,
+            "the seam's contract names three call sites ahead of the engine's \
+             test module: the driver loop's `NetworkCmd` arm, the `#[cfg(test)]` \
+             command driver, and the driver loop's `SignalingInbound` arm. A \
+             fourth is not automatically wrong, but it is a new place a \
+             delivered message can be consumed, and `Output = ()` does not stop \
+             it being spawned or stored, so it needs the same read the first \
+             three got before this number moves"
+        );
+
+        let under_test: usize = lines[boundary..]
+            .iter()
+            .map(|line| line.matches(SEAM).count())
+            .sum();
+        assert!(
+            under_test >= 1,
+            "the engine's test module reaches the seam too, and that is the \
+             point: a control that replays a command has to consume a delivery \
+             the way production does. If this reaches zero, either the control \
+             is gone or it found a way to take a delivery apart without the \
+             seam — and the second would be the defect the seam exists to \
+             prevent, arriving through the door marked `test`"
+        );
     }
 }

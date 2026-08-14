@@ -290,12 +290,28 @@ pub enum NetworkCmd {
     GovernanceSnapshot {
         reply: oneshot::Sender<crate::network_state::NetworkState>,
     },
+    PrepareGovernanceSnapshot {
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    CommitGovernanceSnapshot {
+        ceiling: usize,
+        lease: crate::resource::ResourceLease,
+        reply: oneshot::Sender<
+            std::result::Result<
+                crate::handle::FundedGovernanceSnapshot,
+                crate::resource::ResourceLease,
+            >,
+        >,
+    },
 }
 
 impl ResourceMailboxItem for NetworkCmd {
     fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
         let measure = match self {
-            Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
+            Self::ReplayCapabilities { .. }
+            | Self::GovernanceSnapshot { .. }
+            | Self::PrepareGovernanceSnapshot { .. }
+            | Self::CommitGovernanceSnapshot { .. } => (0, 0, 0),
             Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
             Self::ApproveRoster {
                 device_id, label, ..
@@ -380,7 +396,9 @@ impl ResourceMailboxItem for NetworkCmd {
             | Self::DenyProposal { .. }
             | Self::WithdrawProposal { .. }
             | Self::SpawnSplit { .. }
-            | Self::GovernanceSnapshot { .. } => 1,
+            | Self::GovernanceSnapshot { .. }
+            | Self::PrepareGovernanceSnapshot { .. }
+            | Self::CommitGovernanceSnapshot { .. } => 1,
         };
         let allocations = measure.2.checked_add(effect_allocations).ok_or(
             ResourceClaimArithmeticError::Overflow {

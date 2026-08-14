@@ -25,8 +25,8 @@ use crate::events::{DropReason, MeshEvent, MeshPhase};
 use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
-    LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
-    ResourceProviderPort, ResourceReport,
+    LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot, ResourceClaim,
+    ResourceClass, ResourceLease, ResourceProviderPort, ResourceReport,
 };
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
@@ -41,6 +41,222 @@ use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 /// driver. Long enough for one WebSocket frame on a live socket, short
 /// enough to be imperceptible on a user-initiated reconnect.
 const LEAVE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn roster_encoded_len(peers: &[AuthorizedPeer]) -> Result<usize> {
+    struct Count {
+        len: usize,
+    }
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.len = self.len.checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "roster width overflow")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = Count { len: 0 };
+    serde_json::to_writer(&mut output, peers)?;
+    Ok(output.len)
+}
+
+const ROSTER_SNAPSHOT_CLAIM: ResourceClaim =
+    ResourceClaim::single(ResourceClass::OpaqueDependencyResidual, 1);
+
+#[must_use = "a roster plan must be funded and committed or dropped"]
+pub struct PreparedRosterSnapshot<'a> {
+    state: &'a NetworkState,
+    encoded_ceiling: usize,
+}
+
+impl PreparedRosterSnapshot<'_> {
+    /// One broader residual for the final boxed roster graph and the transient
+    /// collection used to build it. This deliberately makes no exact AMB or
+    /// allocator-count claim about `String`/`Vec` cloning.
+    pub const fn typed_retention_claim(&self) -> ResourceClaim {
+        ROSTER_SNAPSHOT_CLAIM
+    }
+
+    pub const fn encoding_ceiling(&self) -> usize {
+        self.encoded_ceiling
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "returning the exact lease on drift is allocation-free; boxing it would allocate on refusal"
+    )]
+    pub fn commit(
+        self,
+        typed_lease: ResourceLease,
+    ) -> std::result::Result<FundedRosterSnapshot, ResourceLease> {
+        if typed_lease.claim() != ROSTER_SNAPSHOT_CLAIM {
+            return Err(typed_lease);
+        }
+        let roster = self.state.roster.read();
+        let Ok(current_len) = roster_encoded_len(&roster.authorized_devices) else {
+            return Err(typed_lease);
+        };
+        if current_len > self.encoded_ceiling {
+            return Err(typed_lease);
+        }
+        let peers = roster
+            .authorized_devices
+            .iter()
+            .cloned()
+            .collect::<Box<[_]>>();
+        drop(roster);
+        Ok(FundedRosterSnapshot {
+            peers,
+            _retention: typed_lease,
+        })
+    }
+}
+
+pub struct FundedRosterSnapshot {
+    peers: Box<[AuthorizedPeer]>,
+    _retention: ResourceLease,
+}
+
+impl FundedRosterSnapshot {
+    pub fn get(&self) -> &[AuthorizedPeer] {
+        &self.peers
+    }
+}
+
+const GOVERNANCE_SNAPSHOT_CLAIM: ResourceClaim =
+    ResourceClaim::single(ResourceClass::OpaqueDependencyResidual, 1);
+
+fn serialized_len(value: &impl Serialize, what: &'static str) -> Result<usize> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "serialized width overflow")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value)
+        .map_err(|error| Error::Network(format!("measure {what}: {error}")))?;
+    Ok(count.0)
+}
+
+pub(crate) fn governance_snapshot_ceiling(
+    state: &crate::network_state::NetworkState,
+) -> Result<usize> {
+    const PREFIX: usize = "{\"state\":".len();
+    const MIDDLE: usize = ",\"evicted\":".len();
+    const SUFFIX: usize = "}".len();
+    let state_len = serialized_len(state, "governance state")?;
+    let candidates = state.member_log.len();
+    let evicted = if candidates == 0 {
+        2
+    } else {
+        2usize
+            .checked_add(
+                state_len
+                    .checked_mul(candidates)
+                    .ok_or_else(|| Error::Network("governance ceiling overflow".into()))?,
+            )
+            .and_then(|value| value.checked_add(candidates - 1))
+            .ok_or_else(|| Error::Network("governance ceiling overflow".into()))?
+    };
+    PREFIX
+        .checked_add(state_len)
+        .and_then(|value| value.checked_add(MIDDLE))
+        .and_then(|value| value.checked_add(evicted))
+        .and_then(|value| value.checked_add(SUFFIX))
+        .ok_or_else(|| Error::Network("governance ceiling overflow".into()))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "refusal must return the caller's exact lease by value; boxing would allocate on the accounting refusal path"
+)]
+pub(crate) fn commit_governance_snapshot(
+    state: &crate::network_state::NetworkState,
+    ceiling: usize,
+    lease: ResourceLease,
+) -> std::result::Result<FundedGovernanceSnapshot, ResourceLease> {
+    if lease.claim() != GOVERNANCE_SNAPSHOT_CLAIM {
+        return Err(lease);
+    }
+    let Ok(current) = governance_snapshot_ceiling(state) else {
+        return Err(lease);
+    };
+    if current > ceiling {
+        return Err(lease);
+    }
+    #[cfg(any(test, feature = "transport-lab"))]
+    GOVERNANCE_SNAPSHOT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let evicted =
+        crate::network_state::member_log_removed(state, &state.member_log, &state.network_id)
+            .into_iter()
+            .collect();
+    Ok(FundedGovernanceSnapshot {
+        state: state.clone(),
+        evicted,
+        _retention: lease,
+    })
+}
+
+#[cfg(any(test, feature = "transport-lab"))]
+static GOVERNANCE_SNAPSHOT_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[must_use = "a governance plan must be funded and committed or dropped"]
+pub struct PreparedGovernanceSnapshot<'a> {
+    state: &'a NetworkState,
+    ceiling: usize,
+}
+
+impl PreparedGovernanceSnapshot<'_> {
+    pub const fn typed_retention_claim(&self) -> ResourceClaim {
+        GOVERNANCE_SNAPSHOT_CLAIM
+    }
+
+    pub const fn encoding_ceiling(&self) -> usize {
+        self.ceiling
+    }
+
+    pub async fn commit(self, lease: ResourceLease) -> Result<FundedGovernanceSnapshot> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::CommitGovernanceSnapshot {
+                ceiling: self.ceiling,
+                lease,
+                reply,
+            })
+            .map_err(|error| error.into_admission_error())?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped governance snapshot commit".into()))?
+            .map_err(|_| Error::Network("governance snapshot grew before commit".into()))
+    }
+}
+
+pub struct FundedGovernanceSnapshot {
+    state: crate::network_state::NetworkState,
+    evicted: Vec<String>,
+    _retention: ResourceLease,
+}
+
+impl FundedGovernanceSnapshot {
+    pub fn state(&self) -> &crate::network_state::NetworkState {
+        &self.state
+    }
+
+    pub fn evicted(&self) -> &[String] {
+        &self.evicted
+    }
+}
 
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
@@ -522,6 +738,24 @@ impl JoinedNetwork {
         Ok(self.state.roster.read().authorized_devices.clone())
     }
 
+    /// Measure the authoritative roster without constructing its owned reply.
+    ///
+    /// This allocation-free pass-zero walk is part of observing the already
+    /// live roster subsystem; it creates no reply-owned representation. The
+    /// returned residual begins only at admission and covers pass one's final
+    /// graph plus its builder transient.
+    ///
+    /// The read guard is released before this returns. [`PreparedRosterSnapshot::commit`]
+    /// reacquires it, refuses before allocation if the current encoding no
+    /// longer fits, and otherwise builds the authoritative current roster once.
+    pub fn prepare_roster_snapshot(&self) -> Result<PreparedRosterSnapshot<'_>> {
+        let encoded_ceiling = roster_encoded_len(&self.state.roster.read().authorized_devices)?;
+        Ok(PreparedRosterSnapshot {
+            state: self.state.as_ref(),
+            encoded_ceiling,
+        })
+    }
+
     /// Approve a peer into the roster (and send the on-the-wire
     /// `approve` if a session is currently open).
     pub async fn roster_approve(&self, device_id: &str, label: &str) -> Result<()> {
@@ -594,6 +828,30 @@ impl JoinedNetwork {
             .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped snapshot reply".into()))
+    }
+
+    /// Quote capacity for a governance snapshot without constructing it.
+    pub async fn prepare_governance_snapshot(&self) -> Result<PreparedGovernanceSnapshot<'_>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::PrepareGovernanceSnapshot { reply })
+            .map_err(|error| error.into_admission_error())?;
+        let ceiling = rx
+            .await
+            .map_err(|_| Error::Network("engine dropped governance snapshot plan".into()))??;
+        Ok(PreparedGovernanceSnapshot {
+            state: self.state.as_ref(),
+            ceiling,
+        })
+    }
+
+    /// Number of authoritative funded governance snapshots constructed by the
+    /// production commit path. Refused stale plans do not advance it.
+    #[cfg(any(test, feature = "transport-lab"))]
+    #[doc(hidden)]
+    pub fn governance_snapshot_build_count_for_test(&self) -> usize {
+        GOVERNANCE_SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Float a new signed transition. Returns the new proposal id

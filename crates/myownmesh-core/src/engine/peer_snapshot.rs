@@ -196,13 +196,38 @@ const JSON_ESCAPE_CEILING: usize = 6;
 /// objects at `u32::MAX`, the skew at `i64::MIN`, every `bool` at `false`, the
 /// selected pair present, and every string field at its *empty or absent* form.
 ///
-/// A bound, not an exact figure, and deliberately slack. It is proven rather
-/// than asserted: `v4_r3_core_f7_the_row_ceiling_covers_the_widest_fixed_row`
-/// builds the widest such row and measures it. The variable string and
-/// advertisement terms are added *on top* of this, so each of them is counted
-/// once more than it needs to be — which is the safe direction for a ceiling
-/// and the reason this composition needs no per-field bookkeeping.
-const PEER_ROW_FIXED_CEILING: usize = 1024;
+/// The arithmetic below names each closed-schema component rather than copying
+/// one example row. A control serializes the actual row type with every fixed
+/// component at its widest representation, so a field/tag change must update
+/// both the schema and this theorem. Variable strings and advertisements are
+/// added separately by [`PeerRowLengths::encoded_ceiling`].
+const PEER_ROW_FIELD_SYNTAX: usize = br#"{"device_id":,"status":,"tier":,"rtt_ms":,"clock_skew_ms":,"label":,"capabilities":,"local_shelved":,"remote_shelved":,"authenticated":,"device_suffix":,"verification_code_received":,"verification_code_sent":,"local_approve_sent":,"remote_approve_seen":,"needs_turn":,"local_candidates":,"remote_candidates":,"selected_pair":}"#.len();
+const EMPTY_JSON_STRING: usize = 2;
+const JSON_NULL: usize = 4;
+const JSON_FALSE: usize = 5;
+const U32_MAX_JSON: usize = 10;
+const I64_MIN_JSON: usize = 20;
+const WIDEST_STATUS_JSON: usize = br#""pending_approval""#.len();
+const WIDEST_TIER_JSON: usize = br#"{"kind":"ice_watchdog"}"#.len();
+const DISPLAY_SUFFIX_JSON: usize = DISPLAY_SUFFIX_CHARS + 2;
+const CANDIDATE_FIELD_SYNTAX: usize =
+    br#"{"host":,"server_reflexive":,"peer_reflexive":,"relay":,"unknown":}"#.len();
+const WIDEST_CANDIDATES_JSON: usize = CANDIDATE_FIELD_SYNTAX + 5 * U32_MAX_JSON;
+const SELECTED_PAIR_FIELD_SYNTAX: usize = br#"{"local":,"remote":}"#.len();
+const WIDEST_CANDIDATE_KIND_JSON: usize = br#""server_reflexive""#.len();
+const WIDEST_SELECTED_PAIR_JSON: usize =
+    SELECTED_PAIR_FIELD_SYNTAX + 2 * WIDEST_CANDIDATE_KIND_JSON;
+const PEER_ROW_FIXED_CEILING: usize = PEER_ROW_FIELD_SYNTAX
+    + 2 * EMPTY_JSON_STRING
+    + WIDEST_STATUS_JSON
+    + WIDEST_TIER_JSON
+    + U32_MAX_JSON
+    + I64_MIN_JSON
+    + 3 * JSON_NULL
+    + 6 * JSON_FALSE
+    + DISPLAY_SUFFIX_JSON
+    + 2 * WIDEST_CANDIDATES_JSON
+    + WIDEST_SELECTED_PAIR_JSON;
 
 /// A peer's display tag, inline.
 ///
@@ -1537,6 +1562,59 @@ mod peers_snapshot_controls {
     }
 
     #[test]
+    fn v4_r3_core_f7_the_fixed_row_arithmetic_matches_the_closed_serializer() {
+        let tier: ConnectionTier = serde_json::from_str(r#"{"kind":"ice_watchdog"}"#)
+            .expect("the widest tier tag is a real tier");
+        assert_eq!(
+            serde_json::to_string(&tier)
+                .expect("the tier serializes")
+                .len(),
+            WIDEST_TIER_JSON,
+            "the named widest tier term must track the real enum serializer"
+        );
+
+        let max_candidates = IceCandidateStats {
+            host: u32::MAX,
+            server_reflexive: u32::MAX,
+            peer_reflexive: u32::MAX,
+            relay: u32::MAX,
+            unknown: u32::MAX,
+        };
+        let row = PublishedPeer {
+            device_id: Box::from(""),
+            status: PeerStatus::PendingApproval,
+            tier,
+            rtt_ms: Some(u32::MAX),
+            clock_skew_ms: Some(i64::MIN),
+            label: Box::from(""),
+            capabilities: None,
+            local_shelved: false,
+            remote_shelved: false,
+            authenticated: false,
+            device_suffix: DisplaySuffix(*b"FFFFF"),
+            verification_code_received: None,
+            verification_code_sent: None,
+            local_approve_sent: false,
+            remote_approve_seen: false,
+            needs_turn: false,
+            local_candidates: max_candidates.clone(),
+            remote_candidates: max_candidates,
+            selected_pair: Some(SelectedCandidatePair {
+                local: crate::transport::IceCandidateKind::ServerReflexive,
+                remote: crate::transport::IceCandidateKind::ServerReflexive,
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&row)
+                .expect("the mechanically widest fixed row serializes")
+                .len(),
+            PEER_ROW_FIXED_CEILING,
+            "the closed-schema arithmetic must equal the actual widest fixed row"
+        );
+    }
+
+    #[test]
     fn v4_r3_core_f7_the_funded_peer_row_is_the_unfunded_one_on_the_wire() {
         // Named apart from the `advert()` helper deliberately: the two sides of
         // this comparison are built by two independent calls to it, so the
@@ -1633,90 +1711,6 @@ mod peers_snapshot_controls {
         assert!(
             absent.contains("\"capabilities\":null"),
             "an absent advertisement is published as null, not omitted"
-        );
-    }
-
-    #[test]
-    fn v4_r3_core_f7_the_row_ceiling_covers_the_widest_fixed_row() {
-        // Every non-string field at its widest: the longest status and tier
-        // tags, `false` rather than `true` on every bool, saturated candidate
-        // counters, the extreme skew and round-trip, and a present selected
-        // pair. Every string field at its narrowest, because the ceiling adds
-        // those terms separately.
-        let widest = PublishedPeer {
-            device_id: Box::from(""),
-            status: PeerStatus::PendingApproval,
-            tier: ConnectionTier::IceWatchdog {
-                since: std::time::Instant::now(),
-            },
-            rtt_ms: Some(u32::MAX),
-            clock_skew_ms: Some(i64::MIN),
-            label: Box::from(""),
-            capabilities: None,
-            local_shelved: false,
-            remote_shelved: false,
-            authenticated: false,
-            device_suffix: DisplaySuffix([b'F'; DISPLAY_SUFFIX_CHARS]),
-            verification_code_received: None,
-            verification_code_sent: None,
-            local_approve_sent: false,
-            remote_approve_seen: false,
-            needs_turn: false,
-            local_candidates: IceCandidateStats {
-                host: u32::MAX,
-                server_reflexive: u32::MAX,
-                peer_reflexive: u32::MAX,
-                relay: u32::MAX,
-                unknown: u32::MAX,
-            },
-            remote_candidates: IceCandidateStats {
-                host: u32::MAX,
-                server_reflexive: u32::MAX,
-                peer_reflexive: u32::MAX,
-                relay: u32::MAX,
-                unknown: u32::MAX,
-            },
-            selected_pair: Some(SelectedCandidatePair {
-                local: crate::transport::IceCandidateKind::ServerReflexive,
-                remote: crate::transport::IceCandidateKind::ServerReflexive,
-            }),
-        };
-        let measured = serde_json::to_string(&widest).expect("the widest fixed row serializes");
-        assert!(
-            measured.len() <= PEER_ROW_FIXED_CEILING,
-            "the fixed ceiling must cover the widest fixed row, which measured \
-             {} bytes against a ceiling of {PEER_ROW_FIXED_CEILING}",
-            measured.len()
-        );
-
-        // And the composed ceiling covers a row with real strings in it. The
-        // lengths below are what `PeerRowLengths::measure` would have recorded
-        // for this row.
-        let escaping = "\u{1}\u{2}\"\\\u{7f}";
-        let awkward = PublishedPeer {
-            device_id: Box::from(escaping),
-            label: Box::from(escaping),
-            verification_code_received: Some(Box::from(escaping)),
-            ..widest
-        };
-        let lengths = PeerRowLengths {
-            device_id: escaping.len(),
-            label: escaping.len(),
-            verification_code_received: Some(escaping.len()),
-            verification_code_sent: None,
-            capabilities: None,
-        };
-        let encoded = serde_json::to_string(&awkward).expect("an awkward row serializes");
-        assert!(
-            encoded.len() > measured.len(),
-            "non-vacuity: those characters really do expand under escaping"
-        );
-        assert!(
-            encoded.len()
-                <= lengths
-                    .encoded_ceiling()
-                    .expect("the ceiling is representable"),
-            "the composed ceiling covers a row whose every string needs escaping"
         );
     }
 

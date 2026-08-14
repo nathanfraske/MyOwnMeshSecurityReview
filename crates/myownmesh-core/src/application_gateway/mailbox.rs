@@ -15,12 +15,39 @@ struct GatewayEntry<T> {
 
 /// One accepted delivery after its mailbox node has been released. The value's
 /// off-node retention remains funded until this wrapper is consumed or dropped.
+///
+/// The gateway sibling of [`crate::resource::ResourceMailboxDelivery`], and it
+/// keeps the same rule for the same reason: the value is declared before the
+/// lease, fields are destroyed in declaration order, so the funding is released
+/// after the bytes it pays for are gone. Handing the two out as a tuple made
+/// that order the caller's to get right, and a caller that bound the lease to a
+/// throwaway name could release it while the value was still being deserialized
+/// into a longer-lived owner.
+///
+/// The lease carries an underscore because it is never *read* in a production
+/// build — it is held, and its `Drop` at the end of this struct's is the entire
+/// job. Reading it would mean handing it somewhere, which is the split this
+/// type exists to prevent. Same spelling and same reason as
+/// `GatewayEntry::_retention` above; the name is what keeps `dead_code` honest
+/// rather than silenced by an allow.
 pub(crate) struct GatewayDelivery<T> {
     value: T,
     _retention: ResourceLease,
 }
 
 impl<T> GatewayDelivery<T> {
+    /// The delivered value, borrowed. The funding outlives the borrow.
+    ///
+    /// The whole read surface. An owner that needs the value to keep living —
+    /// an `RpcStreamChunk` — stores this delivery itself and reads through
+    /// here, rather than taking the value out and the funding beside it.
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Split the delivery into its two halves. **Controls only** — a control
+    /// that asserts on the funding has to hold both at once to see it.
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (T, ResourceLease) {
         (self.value, self._retention)
     }

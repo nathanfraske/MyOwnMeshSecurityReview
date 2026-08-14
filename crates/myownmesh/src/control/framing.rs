@@ -627,6 +627,7 @@ pub(super) enum PreparedReply {
     NetworkId(myownmesh_core::identity::FundedNetworkId),
     Status(crate::registry::FundedStatus),
     Networks(crate::registry::FundedNetworksList),
+    Variable(FundedVariableReply),
 }
 
 /// One owned response string and the funding that outlives its buffer.
@@ -685,7 +686,7 @@ impl PreparedText {
         let claim = match myownmesh_core::mailbox_retained_claim::<String>(bytes, 0, 1) {
             Ok(claim) => claim,
             Err(myownmesh_core::ResourceMailboxItemError::Claim(error)) => {
-                return Err(FrameRefusal::Claim(error).into())
+                return Err(FrameRefusal::Claim(error).into());
             }
             Err(myownmesh_core::ResourceMailboxItemError::Measurement(_)) => {
                 unreachable!("a claim built from scalar counts performs no measurement")
@@ -722,7 +723,7 @@ impl PreparedText {
         let claim = match myownmesh_core::mailbox_retained_claim::<String>(count.0, 0, 1) {
             Ok(claim) => claim,
             Err(myownmesh_core::ResourceMailboxItemError::Claim(error)) => {
-                return Err(FrameRefusal::Claim(error).into())
+                return Err(FrameRefusal::Claim(error).into());
             }
             Err(myownmesh_core::ResourceMailboxItemError::Measurement(_)) => {
                 unreachable!("a claim built from scalar counts performs no measurement")
@@ -1040,8 +1041,628 @@ impl serde::Serialize for PreparedReply {
                 response.serialize_field("data", networks)?;
                 response.end()
             }
+            Self::Variable(variable) => variable.serialize(serializer),
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct RosterData<'a> {
+    roster: &'a [myownmesh_core::AuthorizedPeer],
+}
+
+pub(super) enum VariableReplySource<'a> {
+    Roster(myownmesh_core::PreparedRosterSnapshot<'a>),
+    Governance(myownmesh_core::PreparedGovernanceSnapshot<'a>),
+}
+
+impl<'a> VariableReplySource<'a> {
+    pub(super) fn roster(plan: myownmesh_core::PreparedRosterSnapshot<'a>) -> Self {
+        Self::Roster(plan)
+    }
+
+    pub(super) fn governance(plan: myownmesh_core::PreparedGovernanceSnapshot<'a>) -> Self {
+        Self::Governance(plan)
+    }
+
+    pub(super) fn typed_claim(&self) -> myownmesh_core::ResourceClaim {
+        match self {
+            Self::Roster(plan) => plan.typed_retention_claim(),
+            Self::Governance(plan) => plan.typed_retention_claim(),
+        }
+    }
+
+    pub(super) fn data_ceiling(&self) -> std::result::Result<usize, FrameRefusal> {
+        match self {
+            Self::Roster(plan) => "{\"roster\":"
+                .len()
+                .checked_add(plan.encoding_ceiling())
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or(FrameRefusal::Claim(
+                    myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                        dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                    },
+                )),
+            Self::Governance(plan) => Ok(plan.encoding_ceiling()),
+        }
+    }
+
+    pub(super) async fn commit(
+        self,
+        lease: myownmesh_core::ResourceLease,
+    ) -> anyhow::Result<FundedVariableReply> {
+        match self {
+            Self::Roster(plan) => plan
+                .commit(lease)
+                .map(FundedVariableReply::Roster)
+                .map_err(|_| anyhow::anyhow!("RosterList grew before commit")),
+            Self::Governance(plan) => plan
+                .commit(lease)
+                .await
+                .map(FundedVariableReply::Governance)
+                .map_err(anyhow::Error::from),
+        }
+    }
+}
+
+pub(super) enum FundedVariableReply {
+    Roster(myownmesh_core::FundedRosterSnapshot),
+    Governance(myownmesh_core::FundedGovernanceSnapshot),
+    UpdaterStatus(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::UpdateStatus>),
+    UpdaterCheck(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::CheckOutcome>),
+    RpcCall(FundedRpcCallOutcome),
+    MfaEnrollment(FundedMfaEnrollment),
+    Operation(FundedOperationReply),
+}
+
+pub(super) enum OperationReplyData {
+    Approved(String),
+    Removed(String),
+    Topology(String),
+    ProposalId(String),
+    Signed(String),
+    Denied(String),
+    Withdrawn(String),
+    NewNetworkId(String),
+    Reconnecting(String),
+    Connecting {
+        peer: String,
+        network: String,
+        pinned: bool,
+        active: bool,
+    },
+    Forgotten(Vec<String>),
+    Reset,
+    UpdatedId {
+        id: String,
+        restarted: bool,
+    },
+    Added(NetworkLifecycleSummary),
+    Updated(NetworkLifecycleSummary),
+    Identity {
+        device_id: String,
+        pubkey: String,
+        label: String,
+    },
+    Applied(Option<String>),
+    RealtimeOpened {
+        flow_label: String,
+        capability: String,
+    },
+    Closed,
+    RpcStreamStarted(String),
+    ServicesStatus(crate::services::ServicesReport),
+    RealtimeRefused {
+        error: String,
+        code: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct NetworkLifecycleSummary {
+    pub(super) config_id: String,
+    pub(super) network_id: String,
+    pub(super) label: String,
+    pub(super) phase: myownmesh_core::MeshPhase,
+    pub(super) topology: myownmesh_core::TopologyMode,
+    #[serde(skip)]
+    pub(super) restarted: bool,
+}
+
+pub(super) struct VariableOperationPlan {
+    operation: myownmesh_core::ResourceLease,
+}
+
+pub(super) struct FundedOperationReply {
+    result: std::result::Result<OperationReplyData, String>,
+    _operation: myownmesh_core::ResourceLease,
+}
+
+const VARIABLE_OPERATION_CLAIM: myownmesh_core::ResourceClaim =
+    myownmesh_core::ResourceClaim::single(
+        myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        1,
+    );
+
+pub(super) const fn variable_operation_claim() -> myownmesh_core::ResourceClaim {
+    VARIABLE_OPERATION_CLAIM
+}
+
+pub(super) struct FundedRpcCallOutcome {
+    result: std::result::Result<
+        myownmesh_core::rpc::FundedRpcCallResult,
+        myownmesh_core::rpc::RpcError,
+    >,
+    _operation: myownmesh_core::ResourceLease,
+}
+
+#[cfg(test)]
+static RPC_CALL_REPLY_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn rpc_call_reply_builds() -> usize {
+    RPC_CALL_REPLY_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(super) struct FundedMfaEnrollment {
+    result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
+    _operation: myownmesh_core::ResourceLease,
+}
+
+impl FundedVariableReply {
+    #[expect(
+        clippy::result_large_err,
+        reason = "a mismatched admitted lease must be returned intact without allocating"
+    )]
+    pub(super) fn begin_operation(
+        operation: myownmesh_core::ResourceLease,
+    ) -> std::result::Result<VariableOperationPlan, myownmesh_core::ResourceLease> {
+        if operation.claim() != VARIABLE_OPERATION_CLAIM {
+            return Err(operation);
+        }
+        Ok(VariableOperationPlan { operation })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "a mismatched admitted lease must be returned intact without allocating"
+    )]
+    pub(super) fn operation(
+        result: std::result::Result<OperationReplyData, String>,
+        operation: myownmesh_core::ResourceLease,
+    ) -> std::result::Result<Self, myownmesh_core::ResourceLease> {
+        if operation.claim() != VARIABLE_OPERATION_CLAIM {
+            return Err(operation);
+        }
+        Ok(Self::Operation(FundedOperationReply {
+            result,
+            _operation: operation,
+        }))
+    }
+
+    pub(super) fn updater_status(
+        value: myownmesh_updater::FundedUpdaterResult<myownmesh_updater::UpdateStatus>,
+    ) -> Self {
+        Self::UpdaterStatus(value)
+    }
+
+    pub(super) fn updater_check(
+        value: myownmesh_updater::FundedUpdaterResult<myownmesh_updater::CheckOutcome>,
+    ) -> Self {
+        Self::UpdaterCheck(value)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "a mismatched admitted lease is returned intact; boxing adds an unpriced allocation on the accounting refusal path"
+    )]
+    pub(super) fn rpc_call(
+        result: std::result::Result<
+            myownmesh_core::rpc::FundedRpcCallResult,
+            myownmesh_core::rpc::RpcError,
+        >,
+        operation: myownmesh_core::ResourceLease,
+    ) -> std::result::Result<Self, myownmesh_core::ResourceLease> {
+        if operation.claim() != VARIABLE_OPERATION_CLAIM {
+            return Err(operation);
+        }
+        #[cfg(test)]
+        RPC_CALL_REPLY_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self::RpcCall(FundedRpcCallOutcome {
+            result,
+            _operation: operation,
+        }))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "a mismatched admitted lease is returned intact; boxing adds an unpriced allocation on the accounting refusal path"
+    )]
+    pub(super) fn mfa_enrollment(
+        result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
+        operation: myownmesh_core::ResourceLease,
+    ) -> std::result::Result<Self, myownmesh_core::ResourceLease> {
+        if operation.claim() != VARIABLE_OPERATION_CLAIM {
+            return Err(operation);
+        }
+        Ok(Self::MfaEnrollment(FundedMfaEnrollment {
+            result,
+            _operation: operation,
+        }))
+    }
+
+    pub(super) fn exact_line_len(&self) -> std::result::Result<usize, FrameRefusal> {
+        let mut count = CountingSink::default();
+        serde_json::to_writer(&mut count, self).map_err(|_| {
+            FrameRefusal::Claim(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            })
+        })?;
+        count.bytes.checked_add(1).ok_or(FrameRefusal::Claim(
+            myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            },
+        ))
+    }
+}
+
+impl VariableOperationPlan {
+    pub(super) fn finish(
+        self,
+        result: std::result::Result<OperationReplyData, String>,
+    ) -> FundedVariableReply {
+        FundedVariableReply::Operation(FundedOperationReply {
+            result,
+            _operation: self.operation,
+        })
+    }
+}
+
+impl serde::Serialize for FundedVariableReply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        match self {
+            Self::Roster(roster) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &RosterData {
+                        roster: roster.get(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::Governance(governance) => {
+                #[derive(serde::Serialize)]
+                struct GovernanceData<'a> {
+                    state: &'a myownmesh_core::NetworkState,
+                    evicted: &'a [String],
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &GovernanceData {
+                        state: governance.state(),
+                        evicted: governance.evicted(),
+                    },
+                )?;
+                response.end()
+            }
+            Self::UpdaterStatus(value) => serialize_updater_result(serializer, value),
+            Self::UpdaterCheck(value) => serialize_updater_result(serializer, value),
+            Self::RpcCall(value) => serialize_rpc_call(serializer, value),
+            Self::MfaEnrollment(value) => serialize_mfa_enrollment(serializer, value),
+            Self::Operation(value) => serialize_operation_reply(serializer, value),
+        }
+    }
+}
+
+fn serialize_operation_reply<S: serde::Serializer>(
+    serializer: S,
+    value: &FundedOperationReply,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct as _;
+    match &value.result {
+        Ok(OperationReplyData::RealtimeRefused { error, code }) => {
+            #[derive(serde::Serialize)]
+            struct RefusalData<'a> {
+                code: &'a str,
+            }
+            let mut response = serializer.serialize_struct("Response", 3)?;
+            response.serialize_field("ok", &false)?;
+            response.serialize_field("error", error)?;
+            response.serialize_field("data", &RefusalData { code })?;
+            response.end()
+        }
+        Ok(data) => {
+            #[derive(serde::Serialize)]
+            #[serde(untagged)]
+            enum OperationField<'a> {
+                Approved {
+                    approved: &'a str,
+                },
+                Removed {
+                    removed: &'a str,
+                },
+                Topology {
+                    topology: &'a str,
+                },
+                ProposalId {
+                    proposal_id: &'a str,
+                },
+                Signed {
+                    signed: &'a str,
+                },
+                Denied {
+                    denied: &'a str,
+                },
+                Withdrawn {
+                    withdrawn: &'a str,
+                },
+                NewNetworkId {
+                    new_network_id: &'a str,
+                },
+                Reconnecting {
+                    reconnecting: &'a str,
+                },
+                Connecting {
+                    connecting: &'a str,
+                    network: &'a str,
+                    pinned: bool,
+                    active: bool,
+                },
+                Forgotten {
+                    forgotten: &'a [String],
+                    restarting: bool,
+                },
+                Reset {
+                    reset: bool,
+                    restarting: bool,
+                },
+                UpdatedId {
+                    updated: &'a str,
+                    restarted: bool,
+                },
+                Added {
+                    added: &'a NetworkLifecycleSummary,
+                },
+                Updated {
+                    updated: &'a NetworkLifecycleSummary,
+                    restarted: bool,
+                },
+                Identity {
+                    device_id: &'a str,
+                    pubkey: &'a str,
+                    label: &'a str,
+                },
+                Applied {
+                    applied: &'a Option<String>,
+                },
+                RealtimeOpened {
+                    flow_label: &'a str,
+                    flow_capability: &'a str,
+                },
+                Closed {
+                    closed: bool,
+                },
+                RpcStreamStarted {
+                    request_id: &'a str,
+                },
+                ServicesStatus {
+                    status: &'a crate::services::ServicesReport,
+                },
+            }
+            let field = match data {
+                OperationReplyData::Approved(value) => OperationField::Approved { approved: value },
+                OperationReplyData::Removed(value) => OperationField::Removed { removed: value },
+                OperationReplyData::Topology(value) => OperationField::Topology { topology: value },
+                OperationReplyData::ProposalId(value) => {
+                    OperationField::ProposalId { proposal_id: value }
+                }
+                OperationReplyData::Signed(value) => OperationField::Signed { signed: value },
+                OperationReplyData::Denied(value) => OperationField::Denied { denied: value },
+                OperationReplyData::Withdrawn(value) => {
+                    OperationField::Withdrawn { withdrawn: value }
+                }
+                OperationReplyData::NewNetworkId(value) => OperationField::NewNetworkId {
+                    new_network_id: value,
+                },
+                OperationReplyData::Reconnecting(value) => OperationField::Reconnecting {
+                    reconnecting: value,
+                },
+                OperationReplyData::Connecting {
+                    peer,
+                    network,
+                    pinned,
+                    active,
+                } => OperationField::Connecting {
+                    connecting: peer,
+                    network,
+                    pinned: *pinned,
+                    active: *active,
+                },
+                OperationReplyData::Forgotten(values) => OperationField::Forgotten {
+                    forgotten: values,
+                    restarting: true,
+                },
+                OperationReplyData::Reset => OperationField::Reset {
+                    reset: true,
+                    restarting: true,
+                },
+                OperationReplyData::UpdatedId { id, restarted } => OperationField::UpdatedId {
+                    updated: id,
+                    restarted: *restarted,
+                },
+                OperationReplyData::Added(summary) => OperationField::Added { added: summary },
+                OperationReplyData::Updated(summary) => OperationField::Updated {
+                    updated: summary,
+                    restarted: summary.restarted,
+                },
+                OperationReplyData::Identity {
+                    device_id,
+                    pubkey,
+                    label,
+                } => OperationField::Identity {
+                    device_id,
+                    pubkey,
+                    label,
+                },
+                OperationReplyData::Applied(applied) => OperationField::Applied { applied },
+                OperationReplyData::RealtimeOpened {
+                    flow_label,
+                    capability,
+                } => OperationField::RealtimeOpened {
+                    flow_label,
+                    flow_capability: capability,
+                },
+                OperationReplyData::Closed => OperationField::Closed { closed: true },
+                OperationReplyData::RpcStreamStarted(request_id) => {
+                    OperationField::RpcStreamStarted { request_id }
+                }
+                OperationReplyData::ServicesStatus(status) => {
+                    OperationField::ServicesStatus { status }
+                }
+                OperationReplyData::RealtimeRefused { .. } => unreachable!("handled above"),
+            };
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &true)?;
+            response.serialize_field("data", &field)?;
+            response.end()
+        }
+        Err(error) => {
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &false)?;
+            response.serialize_field("error", error)?;
+            response.end()
+        }
+    }
+}
+
+fn serialize_mfa_enrollment<S: serde::Serializer>(
+    serializer: S,
+    value: &FundedMfaEnrollment,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct as _;
+    struct DisplayRef<'a, T>(&'a T);
+    impl<T: std::fmt::Display> serde::Serialize for DisplayRef<'_, T> {
+        fn serialize<R: serde::Serializer>(&self, serializer: R) -> Result<R::Ok, R::Error> {
+            serializer.collect_str(self.0)
+        }
+    }
+    match &value.result {
+        Ok(enrollment) => {
+            #[derive(serde::Serialize)]
+            struct EnrollmentData<'a> {
+                secret: &'a str,
+                otpauth_uri: &'a str,
+                recovery_codes: &'a [String],
+            }
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &true)?;
+            response.serialize_field(
+                "data",
+                &EnrollmentData {
+                    secret: &enrollment.secret_b32,
+                    otpauth_uri: &enrollment.otpauth_uri,
+                    recovery_codes: &enrollment.recovery_codes,
+                },
+            )?;
+            response.end()
+        }
+        Err(error) => {
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &false)?;
+            response.serialize_field("error", &DisplayRef(error))?;
+            response.end()
+        }
+    }
+}
+
+fn serialize_rpc_call<S: serde::Serializer>(
+    serializer: S,
+    value: &FundedRpcCallOutcome,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct as _;
+    struct DisplayRef<'a, T>(&'a T);
+    impl<T: std::fmt::Display> serde::Serialize for DisplayRef<'_, T> {
+        fn serialize<R: serde::Serializer>(&self, serializer: R) -> Result<R::Ok, R::Error> {
+            serializer.collect_str(self.0)
+        }
+    }
+    match &value.result {
+        Ok(funded) => match (funded.body(), funded.error()) {
+            (Some(body), None) => {
+                #[derive(serde::Serialize)]
+                struct RpcData<'a> {
+                    response: &'a serde_json::Value,
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field("data", &RpcData { response: body })?;
+                response.end()
+            }
+            (None, Some(error)) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &false)?;
+                response.serialize_field("error", error)?;
+                response.end()
+            }
+            _ => Err(serde::ser::Error::custom(
+                "funded RPC result had neither or both body and error",
+            )),
+        },
+        Err(error) => {
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &false)?;
+            response.serialize_field("error", &DisplayRef(error))?;
+            response.end()
+        }
+    }
+}
+
+fn serialize_updater_result<S: serde::Serializer, T: serde::Serialize>(
+    serializer: S,
+    value: &myownmesh_updater::FundedUpdaterResult<T>,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct as _;
+    struct DisplayRef<'a, T>(&'a T);
+    impl<T: std::fmt::Display> serde::Serialize for DisplayRef<'_, T> {
+        fn serialize<R: serde::Serializer>(&self, serializer: R) -> Result<R::Ok, R::Error> {
+            serializer.collect_str(self.0)
+        }
+    }
+    match value.get() {
+        Ok(success) => {
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &true)?;
+            response.serialize_field("data", success)?;
+            response.end()
+        }
+        Err(error) => {
+            let mut response = serializer.serialize_struct("Response", 2)?;
+            response.serialize_field("ok", &false)?;
+            response.serialize_field("error", &DisplayRef(error))?;
+            response.end()
+        }
+    }
+}
+
+pub(super) fn variable_data_reply_line_ceiling(
+    encoded_data: usize,
+) -> std::result::Result<usize, FrameRefusal> {
+    const PREFIX: usize = "{\"ok\":true,\"data\":".len();
+    const SUFFIX: usize = "}\n".len();
+    PREFIX
+        .checked_add(encoded_data)
+        .and_then(|bytes| bytes.checked_add(SUFFIX))
+        .ok_or(FrameRefusal::Claim(
+            myownmesh_core::ResourceClaimArithmeticError::Overflow {
+                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+            },
+        ))
 }
 
 const NETWORK_ID_REPLY_PREFIX: &str = "{\"ok\":true,\"data\":{\"network_id\":";
@@ -3738,5 +4359,83 @@ mod tests {
             decoded
         };
         assert!(matches!(admitted.request, Request::Status));
+    }
+
+    /// A large unary RPC body stays funded by core while daemon output
+    /// pressure answers, and the daemon does not build a response buffer until
+    /// the exact line has been admitted.
+    #[test]
+    fn v4_r4_daemon_large_funded_rpc_pressure_precedes_reply_construction() {
+        let scope = crate::test_application_scope();
+        let body = serde_json::json!({ "payload": "x".repeat(32 * 1024) });
+        let funded = myownmesh_core::rpc::FundedRpcCallResult::transport_lab_funded(
+            &scope,
+            Ok(myownmesh_core::rpc::RpcResponse::from_value(body)),
+        )
+        .expect("the real RPC settlement claim funds the large fixture");
+
+        let (typed_starved, provider) = FrameAdmission::over_grant_probed(
+            myownmesh_core::FiniteResourceProvider::scope_planning_charge(),
+            None,
+        );
+        let baseline = provider.in_use();
+        let built_before = rpc_call_reply_builds();
+        let refusal = match typed_starved.acquire_claim(variable_operation_claim()) {
+            Ok(_) => panic!("the daemon provider has no operation residual"),
+            Err(refusal) => refusal,
+        };
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
+        assert_eq!(
+            rpc_call_reply_builds(),
+            built_before,
+            "typed pressure never reaches the funded envelope builder"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "a refused typed acquisition returns the exact daemon ledger baseline"
+        );
+        assert!(
+            funded.body().is_some(),
+            "the independently funded upstream body remains live after daemon refusal"
+        );
+
+        let operation = scope
+            .acquire(variable_operation_claim())
+            .expect("the daemon operation residual is funded");
+        let variable = FundedVariableReply::rpc_call(Ok(funded), operation)
+            .unwrap_or_else(|_| panic!("the exact operation lease is accepted"));
+        assert_eq!(
+            rpc_call_reply_builds(),
+            built_before + 1,
+            "the admitted funded envelope is built exactly once"
+        );
+        let line_len = variable.exact_line_len().expect("the line is measurable");
+
+        let starved = admission_granting_bytes((line_len - 1) as u64);
+        assert!(
+            matches!(
+                AdmittedLineOut::prepare_capacity(line_len, &starved),
+                Err(FrameRefusal::Resources(_))
+            ),
+            "one byte short refuses before a response Vec exists"
+        );
+
+        let output = AdmittedLineOut::prepare_capacity(line_len, &granted_admission())
+            .expect("the ordinary application grant funds the exact line");
+        let reply = PreparedReply::Variable(variable);
+        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+            .expect("the funded body encodes without changing width");
+        assert_eq!(line.bytes().len(), line_len);
+        let parsed: serde_json::Value = serde_json::from_slice(&line.bytes()[..line_len - 1])
+            .expect("the compact wire is JSON");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(
+            parsed["data"]["response"]["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            32 * 1024
+        );
     }
 }

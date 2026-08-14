@@ -1,7 +1,9 @@
 //! Named application channels: the subscriber queues and the gateway
 //! operations that install, retire, and deliver into them.
 
-use crate::resource::{LeasedMap, LeasedQueue, ResourceClaim, ResourceClass, ResourceLease};
+use crate::resource::{
+    FundedArc, FundedWeak, LeasedMap, LeasedQueue, ResourceClaim, ResourceClass, ResourceLease,
+};
 use crate::runtime::session_broker::SessionCapability;
 
 use super::{ApplicationGateway, GatewayAccepted, GatewayDelivery, GatewayMailbox, GatewayRefusal};
@@ -11,22 +13,31 @@ pub(crate) struct GatewayChannelFrame {
     pub(crate) payload: serde_json::Value,
 }
 
+/// One subscriber's queue, shared between the subscription that owns it, the
+/// channel registry that routes to it, and any decoded message still in the
+/// application's hands.
+///
+/// **The funding rides in the handles, not in here.** It used to be an
+/// `_allocation: ResourceLease` field, which meant the lease was destroyed on
+/// the last *strong* drop while the allocation itself survived for as long as
+/// any weak registry link did — the provider told its storage was free while
+/// that storage was still there to be upgraded through. [`FundedArc`] and
+/// [`FundedWeak`] release the claim when every handle of either kind is gone,
+/// which is the only moment the allocation is actually returned.
 pub(crate) struct ChannelSubscriber {
     mailbox: parking_lot::Mutex<GatewayMailbox<GatewayChannelFrame>>,
     ready: tokio::sync::Notify,
     closed: std::sync::atomic::AtomicBool,
     pressure: std::sync::atomic::AtomicU64,
-    _allocation: ResourceLease,
 }
 
 impl ChannelSubscriber {
-    fn new(allocation: ResourceLease) -> Self {
+    fn new() -> Self {
         Self {
             mailbox: parking_lot::Mutex::new(GatewayMailbox::new()),
             ready: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             pressure: std::sync::atomic::AtomicU64::new(0),
-            _allocation: allocation,
         }
     }
 
@@ -83,7 +94,7 @@ impl ChannelSubscriber {
 }
 
 pub(super) struct GatewayChannel {
-    subscribers: LeasedQueue<std::sync::Weak<ChannelSubscriber>>,
+    subscribers: LeasedQueue<FundedWeak<ChannelSubscriber>>,
     _name: ResourceLease,
 }
 
@@ -101,7 +112,7 @@ impl ApplicationGateway {
     pub(crate) fn subscribe_channel(
         &self,
         name: &str,
-    ) -> Result<std::sync::Arc<ChannelSubscriber>, GatewayRefusal> {
+    ) -> Result<FundedArc<ChannelSubscriber>, GatewayRefusal> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(GatewayRefusal::Revoked);
         }
@@ -109,16 +120,36 @@ impl ApplicationGateway {
             .checked_add(2 * std::mem::size_of::<usize>())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(GatewayRefusal::Malformed)?;
+        // Two residuals, and the difference between them is the point.
+        //
+        // The first is the shared allocation itself — the `ChannelSubscriber`
+        // and the strong/weak control block counted in `subscriber_bytes`
+        // above. That is what a `FundedArc` handle is for, and it is released
+        // when the last handle of either kind goes.
+        //
+        // The second is named for something else entirely: the decoded value
+        // graph an application holds after `ChannelSubscription::recv` turns a
+        // JSON frame into a `T`. The frame's own retention pays for the frame;
+        // nothing paid for the shape the application decodes it into, whose
+        // size this layer cannot see and does not try to. A `ChannelMessage`
+        // therefore keeps a strong handle on this subscriber, which keeps this
+        // term live for exactly as long as any decoded body derived from it.
+        //
+        // One term used to stand in both places, which is to say the decoded
+        // graph was covered by whatever was left over from the allocation
+        // charge. Two terms, so that neither is silently paying the other's
+        // bill.
         let subscriber_claim = ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, subscriber_bytes),
-            (ResourceClass::OpaqueDependencyResidual, 1),
+            (ResourceClass::OpaqueDependencyResidual, 2),
         ])
         .map_err(|_| GatewayRefusal::Malformed)?;
-        let subscriber = std::sync::Arc::new(ChannelSubscriber::new(
-            self.resources
-                .acquire(subscriber_claim)
-                .map_err(GatewayRefusal::Pressure)?,
-        ));
+        let subscriber_allocation = self
+            .resources
+            .acquire(subscriber_claim)
+            .map_err(GatewayRefusal::Pressure)?;
+        let subscriber = FundedArc::new(ChannelSubscriber::new(), subscriber_allocation)
+            .expect("a gateway subscriber allocation is admitted, never speculative");
         let mut channels = self.channels.lock();
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(GatewayRefusal::Revoked);
@@ -136,7 +167,7 @@ impl ApplicationGateway {
         let subscriber_node = self
             .resources
             .acquire(
-                LeasedQueue::<std::sync::Weak<ChannelSubscriber>>::entry_claim()
+                LeasedQueue::<FundedWeak<ChannelSubscriber>>::entry_claim()
                     .map_err(|_| GatewayRefusal::Malformed)?,
             )
             .map_err(GatewayRefusal::Pressure)?;
@@ -177,21 +208,21 @@ impl ApplicationGateway {
             .get_mut(name)
             .expect("the channel entry was installed under this lock")
             .subscribers
-            .push(std::sync::Arc::downgrade(&subscriber), subscriber_node);
+            .push(subscriber.downgrade(), subscriber_node);
         Ok(subscriber)
     }
 
     pub(crate) fn unsubscribe_channel(
         &self,
         name: &str,
-        subscriber: &std::sync::Arc<ChannelSubscriber>,
+        subscriber: &FundedArc<ChannelSubscriber>,
     ) {
         let mut registry = self.channels.lock();
         if let Some(channel) = registry.get_mut(name) {
             channel.subscribers.retain(|candidate| {
                 candidate
                     .upgrade()
-                    .is_some_and(|candidate| !std::sync::Arc::ptr_eq(&candidate, subscriber))
+                    .is_some_and(|candidate| !FundedArc::ptr_eq(&candidate, subscriber))
             });
             if channel.subscribers.is_empty() {
                 registry.remove_entry(name);
@@ -222,12 +253,12 @@ impl ApplicationGateway {
         // buffers have been consumed below.
         let scratch_count =
             u64::try_from(candidate_count).map_err(|_| GatewayRefusal::Malformed)?;
-        let live_bytes = u64::try_from(std::mem::size_of::<std::sync::Arc<ChannelSubscriber>>())
+        let live_bytes = u64::try_from(std::mem::size_of::<FundedArc<ChannelSubscriber>>())
             .map_err(|_| GatewayRefusal::Malformed)?
             .checked_mul(scratch_count)
             .ok_or(GatewayRefusal::Malformed)?;
         let prepared_bytes = u64::try_from(std::mem::size_of::<(
-            std::sync::Arc<ChannelSubscriber>,
+            FundedArc<ChannelSubscriber>,
             ResourceLease,
             ResourceLease,
             serde_json::Value,
@@ -253,12 +284,7 @@ impl ApplicationGateway {
                 return Err(GatewayRefusal::NoReceiver);
             };
             let mut live = Vec::with_capacity(candidate_count);
-            live.extend(
-                channel
-                    .subscribers
-                    .iter()
-                    .filter_map(std::sync::Weak::upgrade),
-            );
+            live.extend(channel.subscribers.iter().filter_map(FundedWeak::upgrade));
             channel
                 .subscribers
                 .retain(|subscriber| subscriber.strong_count() != 0);
@@ -305,7 +331,7 @@ impl ApplicationGateway {
             } else {
                 original_payload.as_ref().expect("payload remains").clone()
             };
-            prepared.push((std::sync::Arc::clone(subscriber), retention, node, payload));
+            prepared.push((FundedArc::clone(subscriber), retention, node, payload));
         }
         for (subscriber, retention, node, payload) in prepared {
             subscriber.accept(
@@ -368,7 +394,7 @@ mod tests {
         (provider, ApplicationGateway::new(resources))
     }
 
-    fn subscriber_fixture() -> (ApplicationGateway, std::sync::Arc<ChannelSubscriber>) {
+    fn subscriber_fixture() -> (ApplicationGateway, FundedArc<ChannelSubscriber>) {
         let (_provider, gateway) = gateway_fixture();
         let subscriber = gateway
             .subscribe_channel("wake-control")
@@ -490,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn close_in_the_check_to_wait_window_cannot_be_lost() {
         let (_gateway, subscriber) = subscriber_fixture();
-        let closer = std::sync::Arc::clone(&subscriber);
+        let closer = FundedArc::clone(&subscriber);
         let refusal = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             subscriber.recv_with_before_wait(move || closer.close()),

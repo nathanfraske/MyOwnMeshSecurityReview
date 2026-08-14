@@ -1997,6 +1997,11 @@ impl ClientRegistry {
     /// kept for the controls that drive the table directly and have no inbound
     /// call to borrow coordinates from.
     #[cfg(test)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the Err returns the exact pending effect by value so its caller can settle or \
+                  drop it; boxing would allocate on the refusal path and change ownership"
+    )]
     pub fn insert_exact_pending(
         &self,
         key: PendingKey,
