@@ -1108,14 +1108,14 @@ impl RpcStreamInbox {
         self.finished.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    async fn recv(&self) -> Option<Result<RpcStreamChunk, String>> {
-        self.recv_with_before_wait(|| {}).await
+    async fn recv_funded(&self) -> Option<Result<RpcStreamChunk, RpcStreamTerminal>> {
+        self.recv_funded_with_before_wait(|| {}).await
     }
 
-    async fn recv_with_before_wait(
+    async fn recv_funded_with_before_wait(
         &self,
         mut before_wait: impl FnMut(),
-    ) -> Option<Result<RpcStreamChunk, String>> {
+    ) -> Option<Result<RpcStreamChunk, RpcStreamTerminal>> {
         loop {
             let notified = self.ready.notified();
             tokio::pin!(notified);
@@ -1125,10 +1125,19 @@ impl RpcStreamInbox {
                 // funding for it; the two never become separate locals here.
                 return Some(Ok(RpcStreamChunk { delivery }));
             }
-            if let Some(terminal) = self.terminal.lock().take() {
-                // The lease leaves with the terminal and is released here, which
-                // is the moment the retained text stops being retained.
-                return terminal.reason.map(|reason| Err(reason.into_owned()));
+            if let Some(StreamTerminal { reason, _retention }) = self.terminal.lock().take() {
+                // The lease leaves *with* the reason rather than being dropped
+                // here. This used to be the release point — `into_owned()` and
+                // the lease's destruction in one expression — which meant every
+                // caller past this line held peer-sized text that nothing was
+                // paying for, including the forwarder that had yet to measure it
+                // for a writer mailbox. Whoever receives this now decides when
+                // the funding ends, and an application that wants an ordinary
+                // `String` says so through `RpcStreamTerminal::into_reason`.
+                //
+                // A clean end carries no reason and no lease, and the `map`
+                // below drops both without constructing anything.
+                return reason.map(|reason| Err(RpcStreamTerminal { reason, _retention }));
             }
             if self.finished.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
@@ -1434,7 +1443,7 @@ pub struct RpcStream {
 /// The lease only has to span the part of the journey core owns — from the
 /// inbound frame that produced the body to the moment [`Rpc::call`] hands it
 /// out — because at that boundary the value becomes application-owned, which is
-/// the same line [`RpcStreamChunk::into_value`] draws for a chunk.
+/// the same line [`RpcStreamChunk::value`] draws for a chunk.
 ///
 /// What it closes: a response body is a `serde_json::Value` tree and an error is
 /// a `String`, both sized by the peer, and both used to travel through the
@@ -1613,11 +1622,221 @@ impl RpcStreamChunk {
     pub fn value(&self) -> &serde_json::Value {
         self.delivery.value()
     }
+
+    /// The claim already funding this chunk's payload.
+    ///
+    /// For a forwarder that queues this chunk onward. The payload graph is
+    /// *moved* into the outer frame, not copied, so an outer mailbox that
+    /// measures the whole frame and charges all of it bills the process grant
+    /// twice for one live tree — once here, where the claim is still held, and
+    /// again for bytes no second allocation exists for. Netting this out with
+    /// [`ResourceClaim::checked_sub`] leaves the outer owner paying for what is
+    /// genuinely new: its own routing state, its queue node, its scheduled work.
+    ///
+    /// Recomputed rather than stored, and that is what makes it trustworthy: it
+    /// is the same measurement `RpcStreamInbox::push` funded this payload with,
+    /// derived from the same value by the same function. A stored copy would be
+    /// a second source of truth that could disagree with the reservation it
+    /// claims to describe, which is the drift this crate keeps removing.
+    ///
+    /// **Bare, and deliberately.** This is the payload's own claim, not what the
+    /// provider's ledger moved when it took the reservation — that additionally
+    /// carries a per-reservation bookkeeping residual which exists because a
+    /// reservation exists, not because the payload does. A subtracting caller
+    /// wants the bare form: its outer claim contains this payload, so that is
+    /// the double charge to remove, and it does not contain a record of a
+    /// reservation it never took.
+    pub fn funded_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+        let (retained, queued, allocations) = mailbox_measure_serialized(self.value())?;
+        type ChunkMailbox = crate::application_gateway::GatewayMailbox<serde_json::Value>;
+        Ok(ChunkMailbox::retention_claim(
+            retained,
+            queued,
+            allocations,
+        )?)
+    }
+}
+
+/// A settled stream's reason, still funded.
+///
+/// The streaming twin of [`FundedRpcResult`], and it exists for the same reason
+/// on a longer path. A stream-end error is text the *peer* chose the length of.
+/// [`RpcStreamInbox`] funds it on arrival and holds it, but taking the terminal
+/// used to convert it to an owned `String` and drop the lease in the same
+/// expression — so from that instant the text was live in a forwarding task
+/// with no owner, and the writer mailbox that would eventually pay for it did
+/// not measure until after the allocation already existed.
+///
+/// This keeps the two together. The reason is readable by borrow for as long as
+/// core or a forwarder owns the value, so it can be measured, admitted and
+/// encoded while still funded, and the claim goes back when this wrapper does.
+///
+/// **Converting out is still allowed, and is the public boundary.** An
+/// application receiving an error wants a `String`, not a resource wrapper it
+/// must hold forever; [`Self::into_reason`] is that conversion and
+/// [`RpcStream::recv`] performs it. What changed is that the conversion now
+/// happens where the value becomes the application's, rather than several
+/// owners earlier — a forwarder is not at that boundary until it has forwarded.
+pub struct RpcStreamTerminal {
+    reason: std::borrow::Cow<'static, str>,
+    /// Held, never read. `None` is not "unfunded" — it is "nothing variable to
+    /// fund", which is every reason this module wrote as a `&'static str`.
+    _retention: Option<ResourceLease>,
+}
+
+impl std::fmt::Debug for RpcStreamTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RpcStreamTerminal")
+            .field(&self.reason())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for RpcStreamTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl RpcStreamTerminal {
+    /// The reason, borrowed. The funding outlives the borrow.
+    ///
+    /// The whole read surface. A forwarder measures and encodes through here
+    /// while this value is alive, which is exactly the interval the claim
+    /// covers.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Take the reason as an ordinary application-owned `String`, releasing the
+    /// funding.
+    ///
+    /// The declared end of MyOwnMesh's ownership: past here the text is the
+    /// caller's, held for as long as the caller likes, and core is no longer the
+    /// party that should be charged for it. Same line [`FundedRpcResult`] draws
+    /// for a unary result.
+    ///
+    /// The order inside is the usual one and is not incidental. The `String`
+    /// exists before the lease is dropped, so there is no instant at which the
+    /// provider has been told these bytes are free while they are still being
+    /// produced. For the owned case that is a move rather than a copy; the
+    /// borrowed case allocates, and carries no lease to release because a
+    /// `&'static str` this module wrote was never charged.
+    pub fn into_reason(self) -> String {
+        let Self { reason, _retention } = self;
+        let owned = reason.into_owned();
+        drop(_retention);
+        owned
+    }
+}
+
+/// A real stream inbox, for another crate's controls.
+///
+/// **There is deliberately no constructor for [`RpcStreamTerminal`].** One would
+/// hand a fixture a value whose entire meaning is "this text is paid for and
+/// still is" without it having travelled the path that funds it, and a daemon
+/// control forwarding it would prove its forwarding worked on a terminal core
+/// never produced. What a control needs is not a terminal but a *stream that
+/// ends*, so that is what this is: a genuine [`RpcStreamInbox`], settled by the
+/// production `settle` under the production [`terminal_claim`] measurement, and
+/// drained by the production `recv_funded`. The value that comes out is the
+/// value production makes, funded by a lease a real provider really issued and
+/// really refuses when it cannot.
+///
+/// The one thing that differs from `RpcStreamInbox::finish_owned` is where the
+/// lease comes from — a caller-supplied application scope rather than a
+/// `SessionCapability`, which another crate cannot hold — and that difference is
+/// visible in the signature rather than hidden. The claim, the settle and the
+/// take are all production's.
+#[cfg(feature = "transport-lab")]
+#[doc(hidden)]
+pub struct TransportLabStreamInbox {
+    inbox: RpcStreamInbox,
+}
+
+#[cfg(feature = "transport-lab")]
+impl TransportLabStreamInbox {
+    pub fn new() -> Self {
+        Self {
+            inbox: RpcStreamInbox::new(),
+        }
+    }
+
+    /// Settle the stream with peer-supplied text, funded before it is retained.
+    ///
+    /// Refuses rather than degrading. Production's `finish_owned` falls back to
+    /// a fixed borrowed sentence when the owner will not fund the text, because
+    /// a caller left awaiting a terminal that never comes is worse than a caller
+    /// told less than the peer said. That fallback is right there and wrong
+    /// here: a control that silently received a borrowed reason would observe no
+    /// lease at all and pass while proving nothing. So a fixture too small to
+    /// fund its own terminal is told so.
+    pub fn finish_owned(
+        &self,
+        scope: &crate::resource::LocalApplicationResourceScope,
+        error: String,
+    ) -> Result<(), crate::resource::ResourceUnavailable> {
+        let claim =
+            terminal_claim(error.len()).expect("text that exists has a representable claim");
+        let retention = scope.acquire(claim)?;
+        self.inbox
+            .settle(Some(std::borrow::Cow::Owned(error)), Some(retention));
+        Ok(())
+    }
+
+    /// Admit one chunk through the production admission path.
+    pub fn push(
+        &self,
+        scope: &crate::resource::LocalApplicationResourceScope,
+        payload: serde_json::Value,
+    ) -> Result<(), crate::resource::ResourceUnavailable> {
+        type ChunkMailbox = crate::application_gateway::GatewayMailbox<serde_json::Value>;
+        let (retained, queued, allocations) =
+            mailbox_measure_serialized(&payload).expect("a payload that exists is measurable");
+        let retention = scope.acquire(
+            ChunkMailbox::retention_claim(retained, queued, allocations)
+                .expect("a measured payload has a representable claim"),
+        )?;
+        let node = scope
+            .acquire(ChunkMailbox::node_claim().expect("a queue node has a representable claim"))?;
+        self.inbox.mailbox.lock().accept(payload, retention, node);
+        self.inbox.ready.notify_one();
+        Ok(())
+    }
+
+    /// Take through the production path, funded.
+    pub async fn recv_funded(&self) -> Option<Result<RpcStreamChunk, RpcStreamTerminal>> {
+        self.inbox.recv_funded().await
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+impl Default for TransportLabStreamInbox {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RpcStream {
+    /// The ordinary receive. The terminal arrives as an application-owned
+    /// `String`, its funding released at the boundary where the value becomes
+    /// the application's.
     pub async fn recv(&mut self) -> Option<Result<RpcStreamChunk, String>> {
-        self.inbox.recv().await
+        self.recv_funded()
+            .await
+            .map(|item| item.map_err(RpcStreamTerminal::into_reason))
+    }
+
+    /// The receive for a caller that is not the final owner.
+    ///
+    /// A forwarder — the daemon writing `RpcCallStreamEnd` to a client socket —
+    /// still has to measure, admit and encode the peer's text after receiving
+    /// it. Through [`Self::recv`] that text arrives already converted and
+    /// already released, so every one of those steps happens on an allocation
+    /// nothing is paying for. Here it arrives funded, and stays funded until the
+    /// forwarder drops it, which it does after the write-side owner exists.
+    pub async fn recv_funded(&mut self) -> Option<Result<RpcStreamChunk, RpcStreamTerminal>> {
+        self.inbox.recv_funded().await
     }
 }
 
@@ -4201,6 +4420,183 @@ mod session_ownership_tests {
         }
     }
 
+    /// A stream terminal is still funded after the inbox has handed it over, and
+    /// stops being funded exactly where its owner says so.
+    ///
+    /// The blocker this closes is an interval, not a leak. `finish_owned` funds
+    /// peer-chosen text and stores it; taking the terminal used to call
+    /// `into_owned()` and drop the lease in one expression, so from that instant
+    /// the text was live in whatever task had received it — a daemon about to
+    /// forward it — with no owner at all. The writer mailbox that would
+    /// eventually pay for it does not measure until later, so the unfunded
+    /// window was exactly the forwarding path.
+    ///
+    /// Both halves are asserted because only together do they say the boundary
+    /// moved rather than disappeared: the charge survives the pop, and the
+    /// documented public conversion still ends it. A wrapper that never released
+    /// would pass the first and fail the second, and is not the shape the review
+    /// asked for — applications are not required to hold a resource wrapper
+    /// forever.
+    #[tokio::test]
+    async fn v4_r4_core_f3_a_stream_terminal_stays_funded_until_its_owner_releases_it() {
+        for convert in [true, false] {
+            let (session, provider) = crate::runtime::session_broker::session_and_provider_for_test(
+                crate::runtime::runtime_for_test(),
+                ResourceClaim::ZERO,
+            );
+            let inbox = RpcStreamInbox::new();
+            let idle = provider.in_use();
+
+            // Owned, and long enough to be worth funding: a borrowed reason this
+            // module wrote carries no lease, and a control built on one would
+            // observe nothing.
+            let reason = "the peer ended this stream with a reason it chose the length of";
+            inbox.finish_owned(&session, reason.to_string());
+            let funded = provider.in_use();
+            assert_ne!(
+                funded, idle,
+                "non-vacuity: the terminal text must actually have been charged, \
+                 or the fixture funded nothing and every assertion below is \
+                 about a lease that does not exist"
+            );
+
+            let terminal = inbox
+                .recv_funded()
+                .await
+                .expect("a settled stream yields its terminal")
+                .expect_err("and the terminal is the error half, not a chunk");
+            assert_eq!(
+                provider.in_use(),
+                funded,
+                "the pop did not release the charge — this is the interval the \
+                 forwarding path lives in, and the wrapper is what holds it now"
+            );
+            assert_eq!(
+                terminal.reason(),
+                reason,
+                "and the reason is readable by borrow while it is still funded, \
+                 which is what lets a forwarder measure and encode it"
+            );
+
+            if convert {
+                let owned = terminal.into_reason();
+                assert_eq!(
+                    owned, reason,
+                    "the application-owned conversion yields the same text"
+                );
+                assert_eq!(
+                    provider.in_use(),
+                    idle,
+                    "and that conversion is the declared end of core's ownership"
+                );
+            } else {
+                drop(terminal);
+                assert_eq!(
+                    provider.in_use(),
+                    idle,
+                    "a terminal dropped unconverted returns exactly what it held"
+                );
+            }
+        }
+    }
+
+    /// What a chunk reports as already funded is what the provider is already
+    /// holding for it.
+    ///
+    /// The work-conservation half. A forwarder queues an admitted chunk onward
+    /// inside a larger frame, and the payload graph is *moved* into that frame
+    /// rather than copied — so an outer mailbox that measures the whole frame
+    /// and charges all of it bills the process grant twice for one live tree.
+    /// `funded_claim` is what the outer owner subtracts, and it is only safe to
+    /// subtract if it is exactly the reservation still outstanding.
+    ///
+    /// Measured against the provider rather than against a restatement of the
+    /// formula: comparing `funded_claim` to a second copy of the same arithmetic
+    /// would pass however wrong both were. The node is deliberately not in the
+    /// comparison — `pop` already returned it — so this reads the retention
+    /// alone, which is the part that is still live and therefore the part a
+    /// second charge would duplicate.
+    #[tokio::test]
+    async fn v4_r4_core_f3_a_chunks_funded_claim_is_what_the_provider_still_holds() {
+        // The payload exists before the grant that funds it, and the grant is
+        // measured from that exact payload by the exact path `push` measures it
+        // with. Sizing it any other way would be sizing the fixture to the
+        // assertion: a guessed margin makes the control pass whether or not
+        // `funded_claim` agrees with what was reserved, which is the one thing
+        // it is here to check.
+        //
+        // The retention alone, and no node. `session_and_provider_for_test`
+        // already composes `fixture_stream_retention_claim()` into its baseline,
+        // so the queue node is funded; the payload's own retention was the
+        // reservation the provider refused. It is passed bare because that
+        // helper wraps it in `reservation_charge_for_test` itself, so adding the
+        // provider record here would charge it twice.
+        let payload = serde_json::json!({"chunk": [1, 2, 3]});
+        type ChunkMailbox = crate::application_gateway::GatewayMailbox<serde_json::Value>;
+        let (retained, queued, allocations) =
+            mailbox_measure_serialized(&payload).expect("a payload that exists is measurable");
+        let payload_retention = ChunkMailbox::retention_claim(retained, queued, allocations)
+            .expect("a measured payload has a representable claim");
+        let (session, provider) = crate::runtime::session_broker::session_and_provider_for_test(
+            crate::runtime::runtime_for_test(),
+            payload_retention,
+        );
+        let inbox = RpcStreamInbox::new();
+        let idle = provider.in_use();
+        inbox
+            .push(&session, payload)
+            .expect("the fixture session funds one stream chunk");
+
+        let chunk = inbox
+            .recv_funded()
+            .await
+            .expect("the pushed chunk is delivered")
+            .expect("and it is a chunk, not a terminal");
+        let held = provider.in_use();
+        assert_ne!(
+            held, idle,
+            "non-vacuity: the delivered chunk is still funded, so there is a \
+             reservation for the outer owner to avoid charging twice"
+        );
+        // Two different quantities, and the difference between them is the
+        // point rather than an inconvenience. `funded_claim` is the *bare*
+        // payload claim — what a second owner would duplicate if it charged the
+        // tree again — while the provider's ledger also carries its own
+        // per-reservation bookkeeping record, one `OpaqueDependencyResidual`
+        // that exists because a reservation exists and not because the payload
+        // does. So the comparison is against the canonical charge for that bare
+        // claim, computed by the provider's own function rather than by adding a
+        // constant here.
+        //
+        // The bare form is the one the seam must expose. A forwarder subtracts
+        // `funded_claim` from its outer claim, and the outer claim contains the
+        // payload it is about to stop double-charging — it does not contain this
+        // provider's reservation record, which belongs to a reservation the
+        // forwarder never took. Subtracting the charged form there would remove
+        // a residual nothing in the outer claim ever added.
+        let bare = chunk
+            .funded_claim()
+            .expect("a delivered chunk's payload is measurable");
+        let charged = crate::resource::FiniteResourceProvider::reservation_charge_for_test(bare)
+            .expect("one reservation of a measured payload is representable");
+        assert_eq!(
+            held.checked_sub(idle)
+                .expect("the outstanding charge is the difference from idle"),
+            charged,
+            "what a forwarder must not charge again is exactly what is still \
+             outstanding for this chunk, once the provider's own record of \
+             holding it is accounted for"
+        );
+
+        drop(chunk);
+        assert_eq!(
+            provider.in_use(),
+            idle,
+            "and it was the chunk holding it: the amount it reported is the \
+             amount that goes back"
+        );
+    }
+
     #[tokio::test]
     async fn pending_unary_settles_only_from_its_session_record() {
         let session = session();
@@ -4267,7 +4663,7 @@ mod session_ownership_tests {
             pending.stream_chunk_sender(&filed.request_id, 3).is_none(),
             "a gap is not delivered as ordinary data"
         );
-        let delivery = inbox.recv().await.expect("one item").expect("chunk");
+        let delivery = inbox.recv_funded().await.expect("one item").expect("chunk");
         assert_eq!(delivery, serde_json::json!("one"));
         drop(delivery);
     }
@@ -4278,7 +4674,7 @@ mod session_ownership_tests {
         let finisher = &inbox;
         let terminal = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            inbox.recv_with_before_wait(move || {
+            inbox.recv_funded_with_before_wait(move || {
                 finisher.finish_borrowed(Some("terminal in the wait window"));
             }),
         )
@@ -4286,7 +4682,7 @@ mod session_ownership_tests {
         .expect("the registered stream waiter observes terminal state");
         assert!(matches!(
             terminal,
-            Some(Err(error)) if error == "terminal in the wait window"
+            Some(Err(ref terminal)) if terminal.reason() == "terminal in the wait window"
         ));
     }
 

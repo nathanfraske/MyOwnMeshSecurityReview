@@ -290,11 +290,37 @@ pub enum NetworkCmd {
     GovernanceSnapshot {
         reply: oneshot::Sender<crate::network_state::NetworkState>,
     },
+    /// Quote the governance snapshot's width, walking authoritative state.
+    ///
+    /// `work` is the admitted planning lease and it travels *with the
+    /// command*, not alongside it in the caller's future. The walk happens
+    /// here, on the engine, at an unbounded delay after the send; a caller
+    /// that is cancelled between the two would otherwise drop the lease and
+    /// leave the engine traversing state nothing was funding.
+    ///
+    /// It comes back in the reply so the caller can hold it for the rest of
+    /// the plan's life. If the caller is gone, `send` hands the whole tuple
+    /// back as an error and the lease is released there — after the traversal
+    /// it paid for, never before.
     PrepareGovernanceSnapshot {
-        reply: oneshot::Sender<Result<usize>>,
+        work: crate::resource::ResourceLease,
+        reply: oneshot::Sender<(Result<usize>, crate::resource::ResourceLease)>,
     },
+    /// Revalidate the quoted width and build the snapshot.
+    ///
+    /// Two leases, and they are not interchangeable. `work` is the *same*
+    /// planning residual [`Self::PrepareGovernanceSnapshot`] returned: this
+    /// command walks authoritative state a second time to check the quote is
+    /// still good, and that walk is part of what the one admitted planning
+    /// operation bought. `lease` is the typed retention for the snapshot that
+    /// outlives the walk, and it is the one handed back on refusal.
+    ///
+    /// `work` travels on the command for the reason it does on Prepare: the
+    /// caller's future is cancellable at its await, and the revalidation walk
+    /// happens here regardless.
     CommitGovernanceSnapshot {
         ceiling: usize,
+        work: crate::resource::ResourceLease,
         lease: crate::resource::ResourceLease,
         reply: oneshot::Sender<
             std::result::Result<

@@ -7,11 +7,16 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use myownmesh_core::{MeshConfig, ServicesConfig};
 
 use super::super::ControlState;
-use crate::control::framing::{FundedVariableReply, OperationReplyData, VariableOperationPlan};
+use super::{funded, Answer};
+use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
+use crate::control::reply::{
+    config_reply_line_ceiling, FundedVariableReply, OperationReplyData, PreparedReply,
+    PreparedText, VariableOperationPlan,
+};
 
 /// Replace the device services config: persist it, then reconcile the
 /// running services. Persist first so a daemon restart re-applies the
@@ -43,4 +48,66 @@ fn persist_services(services: &ServicesConfig) -> Result<()> {
     cfg.services = services.clone();
     cfg.save().map_err(anyhow::Error::msg)?;
     Ok(())
+}
+
+/// What the device services are doing right now.
+pub(in crate::control) async fn status(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+) -> Result<Answer> {
+    let source = state.services.status_source().await;
+    let typed_claim = source
+        .typed_claim()
+        .context("services-status typed claim was not representable")?;
+    let line_ceiling = source
+        .line_ceiling()
+        .context("services-status line ceiling was not representable")?;
+    let (committed, output) =
+        prepare_typed_and_line_building(typed_claim, line_ceiling, admission, |typed| {
+            source.commit(typed)
+        })
+        .context("services-status typed snapshot or response line was not admitted")?;
+    let committed =
+        committed.map_err(|_| anyhow!("services-status typed claim changed before commit"))?;
+    Ok((PreparedReply::ServicesStatus(committed), output))
+}
+
+/// Read the on-disk mesh config.
+///
+/// Three admissions, in the order the load actually spends them: the parse
+/// work, what the loader holds while it parses, and the line the result
+/// encodes into - the last measured from the committed config's own compact
+/// width rather than a guess.
+pub(in crate::control) fn config_show(admission: &FrameAdmission) -> Result<Answer> {
+    let plan = match myownmesh_core::MeshConfig::prepare_load() {
+        Ok(plan) => plan,
+        Err(error) => {
+            let text = PreparedText::core_error(&error, admission)
+                .context("config planning refusal text was not admitted")?;
+            return funded(PreparedReply::Error(text), admission);
+        }
+    };
+    let work = admission
+        .acquire_claim(plan.load_work_claim())
+        .context("ConfigShow load work was not admitted")?;
+    let loader_residual = admission
+        .acquire_claim(plan.loader_residual_claim())
+        .context("ConfigShow loader residual was not admitted")?;
+    let config = match plan.commit(loader_residual, work) {
+        Ok(config) => config,
+        Err(error) => {
+            let text = PreparedText::core_error(&error, admission)
+                .context("config load refusal text was not admitted")?;
+            return funded(PreparedReply::Error(text), admission);
+        }
+    };
+    let line_ceiling = config_reply_line_ceiling(
+        config
+            .compact_encoded_len()
+            .context("ConfigShow compact width was not representable")?,
+    )
+    .context("ConfigShow response width was not representable")?;
+    let output = AdmittedLineOut::prepare_capacity(line_ceiling, admission)
+        .context("ConfigShow response line was not admitted")?;
+    Ok((PreparedReply::Config(config), output))
 }

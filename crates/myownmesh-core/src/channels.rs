@@ -24,8 +24,8 @@ use crate::engine::state::NetworkState;
 #[expect(
     clippy::large_enum_variant,
     reason = "`Decode` is large because it structurally owns what funds it: the \
-              `GatewayDelivery` the undecodable frame arrived in, and the \
-              subscriber handle carrying the residual named for that frame. \
+              `GatewayDelivery` carrying the frame and its per-delivery decoded-result \
+              residual, plus the subscriber handle retaining the shared allocation. \
               Boxing the variant would put an allocation on the one path that \
               exists because something already went wrong, and nothing has \
               priced it; splitting the owners out would let a `serde_json::Error` \
@@ -65,8 +65,8 @@ pub enum ChannelError {
 /// same escape [`ChannelMessage`] closes for a successful decode: the
 /// application keeps the error, drops the [`ChannelSubscription`], and an
 /// allocation derived from an admitted frame outlives everything that paid for
-/// it. It keeps the same two owners a decoded message keeps, and exposes the
-/// error only by reference.
+/// it. It keeps the same delivery owner and subscriber-allocation owner a
+/// decoded message keeps, and exposes the error only by reference.
 pub struct ChannelDecodeError {
     error: serde_json::Error,
     _delivery: crate::application_gateway::GatewayDelivery<
@@ -116,10 +116,10 @@ impl std::error::Error for ChannelDecodeError {
 /// borrow, so the value cannot outlive the two owners below.
 ///
 /// Those owners are two because they pay for two different things. The
-/// delivery pays for the frame this was decoded from; the subscriber handle
-/// carries the residual named for the decoded graph itself, and holding it is
-/// what stops dropping the [`ChannelSubscription`] from releasing that residual
-/// while a `T` derived from it is still alive.
+/// delivery pays for the frame this was decoded from and carries this result's
+/// own opaque decoded-graph residual. The subscriber handle retains the shared
+/// queue allocation independently; cloning it never stands in for another
+/// decoded result reservation.
 ///
 /// **The whole delivery is kept, not just its lease**, and that costs the raw
 /// JSON body for as long as the message is held. It buys the thing the split

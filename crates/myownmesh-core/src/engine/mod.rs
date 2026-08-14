@@ -407,17 +407,37 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         NetworkCmd::GovernanceSnapshot { reply } => {
             let _ = reply.send(governance::snapshot(state));
         }
-        NetworkCmd::PrepareGovernanceSnapshot { reply } => {
-            let governance = state.governance_state.read();
-            let _ = reply.send(crate::handle::governance_snapshot_ceiling(&governance));
+        NetworkCmd::PrepareGovernanceSnapshot { work, reply } => {
+            let ceiling = {
+                let governance = state.governance_state.read();
+                crate::handle::governance_snapshot_ceiling(&governance)
+            };
+            // `work` was owned by this arm for the whole traversal above, which
+            // is the point of carrying it on the command: the caller may have
+            // been cancelled any time after the send, and the walk still has to
+            // be something this process was admitted to do.
+            //
+            // Sending hands it back to a live caller. A caller that is gone
+            // gets no reply and `send` returns the tuple as an error, dropped
+            // here — so the residual is released after the work it funded, and
+            // the ledger returns to where it was either way.
+            let _ = reply.send((ceiling, work));
         }
         NetworkCmd::CommitGovernanceSnapshot {
             ceiling,
+            work,
             lease,
             reply,
         } => {
-            let governance = state.governance_state.read();
-            let result = crate::handle::commit_governance_snapshot(&governance, ceiling, lease);
+            // `work` is handed to the commit rather than dropped after it. The
+            // revalidation walk lives inside that call, so passing the planning
+            // owner in is what makes the walk impossible to reach without it —
+            // a handler that bound `work` away would have nothing to pass and
+            // would not compile.
+            let result = {
+                let governance = state.governance_state.read();
+                crate::handle::commit_governance_snapshot(&governance, ceiling, work, lease)
+            };
             let _ = reply.send(result);
         }
     }
@@ -5246,6 +5266,265 @@ fn build_test_state_parts_metered(
     (state, cmd_rx, metered, grant)
 }
 
+/// A cancelled governance planner or commit leaves its planning owner on the
+/// queued command until the engine has completed the state-sized traversal.
+///
+/// The command receiver is deliberately undriven. Polling each caller once
+/// proves it has enqueued and parked; dropping it then creates the exact
+/// cancellation window without a timer, scheduler race or synthetic command.
+#[cfg(test)]
+async fn run_v4_r5_core_f4_governance_planning_cancellation_control() {
+    use std::future::Future as _;
+    use std::task::{Context, Poll};
+
+    let planning = crate::snapshot_planning_claim();
+    let planning_charge =
+        crate::resource::FiniteResourceProvider::reservation_charge_for_test(planning)
+            .expect("the planning reservation is representable");
+    let child_scope_charge =
+        crate::resource::FiniteResourceProvider::scope_record_charge_for_test();
+    let discovery_headroom = child_scope_charge
+        .checked_add(planning_charge)
+        .expect("the discovery scope and planning reservation are representable");
+    let (state, mut commands, provider, _grant) = build_test_state_parts_metered(
+        "r5-f4-governance-plan-discovery",
+        None,
+        FIXTURE_CONNECTOR_SLOTS,
+        Some(discovery_headroom),
+    );
+    let scope = state
+        .local_application_resource_scope()
+        .expect("the fixture retains its application scope");
+    let baseline = provider.in_use();
+
+    // Positive non-vacuity: the real prepare command produces the real plan,
+    // and that plan is the authority for the private typed-retention claim.
+    let work = scope
+        .acquire(planning)
+        .expect("the positive planning walk is funded");
+    assert_eq!(
+        provider.in_use().checked_sub(baseline),
+        Ok(planning_charge),
+        "the private ledger charges exactly one planning reservation"
+    );
+    let mut positive = Box::pin(crate::handle::prepare_governance_snapshot(
+        state.as_ref(),
+        work,
+    ));
+    {
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            positive.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    let traversals = crate::handle::governance_state_traversals_for_test();
+    tests::drive_one_governance_planning_command(&state, &mut commands).await;
+    let plan = positive.await.expect("the engine returns a real plan");
+    assert_eq!(
+        crate::handle::governance_state_traversals_for_test(),
+        traversals + 1,
+        "the positive prepare traverses authoritative state once"
+    );
+    let typed_claim = plan.typed_retention_claim();
+    let typed_charge =
+        crate::resource::FiniteResourceProvider::reservation_charge_for_test(typed_claim)
+            .expect("the typed reservation is representable");
+    let wrong_claim = crate::resource::ResourceClaim::single(
+        crate::resource::ResourceClass::AccountedMemoryBytes,
+        1,
+    );
+    let wrong_charge =
+        crate::resource::FiniteResourceProvider::reservation_charge_for_test(wrong_claim)
+            .expect("the wrong-claim reservation is representable");
+    drop(plan);
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "dropping the plan releases its work"
+    );
+    drop((scope, commands, state, provider));
+
+    // The cancellation fixture prices every extra owner it creates: the child
+    // application scope, one planning reservation, and the distinct typed
+    // snapshot reservation obtained from the real plan above.
+    let cancellation_headroom = child_scope_charge
+        .checked_add(planning_charge)
+        .and_then(|claim| claim.checked_add(typed_charge))
+        .and_then(|claim| claim.checked_add(wrong_charge))
+        .expect("the cancellation control's exact headroom is representable");
+    let (state, mut commands, provider, _grant) = build_test_state_parts_metered(
+        "r5-f4-governance-cancellation",
+        None,
+        FIXTURE_CONNECTOR_SLOTS,
+        Some(cancellation_headroom),
+    );
+    let scope = state
+        .local_application_resource_scope()
+        .expect("the explicitly priced application child scope is retained");
+    let baseline = provider.in_use();
+
+    // A different claim cannot buy entry to the queue or a traversal.
+    let wrong = scope
+        .acquire(wrong_claim)
+        .expect("the unrelated claim itself is fundable");
+    let before_wrong = crate::handle::governance_state_traversals_for_test();
+    assert!(
+        crate::handle::prepare_governance_snapshot(state.as_ref(), wrong)
+            .await
+            .is_err(),
+        "a wrong claim is refused"
+    );
+    assert_eq!(
+        crate::handle::governance_state_traversals_for_test(),
+        before_wrong,
+        "wrong-claim refusal precedes traversal"
+    );
+    assert!(
+        commands.try_recv().is_none(),
+        "wrong claim queues no command"
+    );
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "wrong-claim refusal releases exactly"
+    );
+
+    // Prepare cancellation: after the caller disappears, the command still
+    // owns the exact planning reservation and the traversal has not begun.
+    let work = scope.acquire(planning).expect("prepare work is funded");
+    assert_eq!(provider.in_use().checked_sub(baseline), Ok(planning_charge));
+    let mut cancelled_prepare = Box::pin(crate::handle::prepare_governance_snapshot(
+        state.as_ref(),
+        work,
+    ));
+    {
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            cancelled_prepare.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    let queued_prepare = provider.in_use();
+    let before_prepare = crate::handle::governance_state_traversals_for_test();
+    drop(cancelled_prepare);
+    assert_eq!(
+        provider.in_use(),
+        queued_prepare,
+        "caller drop releases no command owner"
+    );
+    assert!(
+        queued_prepare
+            .checked_sub(baseline)
+            .and_then(|delta| delta.checked_sub(planning_charge))
+            .is_ok(),
+        "the queued prepare still contains the exact planning reservation"
+    );
+    assert_eq!(
+        crate::handle::governance_state_traversals_for_test(),
+        before_prepare,
+        "the undriven command is a deterministic pre-traversal barrier"
+    );
+    tests::drive_one_governance_planning_command(&state, &mut commands).await;
+    assert!(
+        commands.try_recv().is_none(),
+        "only the prepare command was handled"
+    );
+    assert_eq!(
+        crate::handle::governance_state_traversals_for_test(),
+        before_prepare + 1,
+        "the funded queued prepare traverses exactly once"
+    );
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "prepare cancellation releases exactly"
+    );
+
+    // Commit cancellation starts from another real plan. Its planning owner
+    // and separately funded typed owner both move to the queued command.
+    let work = scope.acquire(planning).expect("commit plan work is funded");
+    let mut prepare_commit = Box::pin(crate::handle::prepare_governance_snapshot(
+        state.as_ref(),
+        work,
+    ));
+    {
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            prepare_commit.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    tests::drive_one_governance_planning_command(&state, &mut commands).await;
+    let plan = prepare_commit
+        .await
+        .expect("the commit starts from a real plan");
+    assert_eq!(plan.typed_retention_claim(), typed_claim);
+    assert_eq!(
+        provider.in_use().checked_sub(baseline),
+        Ok(planning_charge),
+        "the real plan retains exactly its planning reservation"
+    );
+    let typed = scope
+        .acquire(typed_claim)
+        .expect("typed snapshot is funded separately");
+    assert_eq!(
+        provider.in_use().checked_sub(baseline),
+        Ok(planning_charge
+            .checked_add(typed_charge)
+            .expect("the two reservations are representable together"),),
+        "planning and typed retention are distinct exact reservations"
+    );
+    let mut cancelled_commit = Box::pin(plan.commit(typed));
+    {
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            cancelled_commit.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    let queued_commit = provider.in_use();
+    let before_commit = crate::handle::governance_state_traversals_for_test();
+    drop(cancelled_commit);
+    assert_eq!(
+        provider.in_use(),
+        queued_commit,
+        "commit caller drop releases no owner"
+    );
+    assert!(
+        queued_commit
+            .checked_sub(baseline)
+            .and_then(|delta| delta.checked_sub(planning_charge))
+            .and_then(|delta| delta.checked_sub(typed_charge))
+            .is_ok(),
+        "the queued commit retains both exact reservations"
+    );
+    assert_eq!(
+        crate::handle::governance_state_traversals_for_test(),
+        before_commit,
+        "the undriven commit has not revalidated yet"
+    );
+    tests::drive_one_governance_planning_command(&state, &mut commands).await;
+    assert!(
+        commands.try_recv().is_none(),
+        "only the commit command was handled"
+    );
+    assert_eq!(
+        crate::handle::governance_state_traversals_for_test(),
+        before_commit + 1,
+        "the funded queued commit revalidates exactly once"
+    );
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "commit cancellation releases both owners"
+    );
+}
+
 /// The grant a fixture was built with, and a reader for what it has actually
 /// consumed, so a pressure control can make the provider's refusal exact.
 ///
@@ -5950,6 +6229,23 @@ mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
     use std::time::{Duration, Instant};
+
+    pub(super) async fn drive_one_governance_planning_command(
+        state: &Arc<NetworkState>,
+        commands: &mut crate::resource::ResourceMailboxReceiver<NetworkCmd>,
+    ) {
+        commands
+            .recv()
+            .await
+            .expect("one governance planning command is queued")
+            .run_terminal_effect(|command| handle_command(state, command))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn v4_r5_core_f4_governance_planning_survives_prepare_and_commit_cancellation() {
+        super::run_v4_r5_core_f4_governance_planning_cancellation_control().await;
+    }
 
     /// The borrowed stream frame exists so the sender never owns what it sends.
     /// The cost is a second spelling of a wire shape, and the risk is that the

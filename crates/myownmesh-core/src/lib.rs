@@ -160,8 +160,8 @@ pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 #[cfg(feature = "transport-lab")]
 pub use handle::TransportLabPromotedPeer;
 pub use handle::{
-    FundedGovernanceSnapshot, FundedRosterSnapshot, JoinedNetwork, Mesh, MeshHandle, PeerInfo,
-    PreparedGovernanceSnapshot, PreparedRosterSnapshot,
+    snapshot_planning_claim, FundedGovernanceSnapshot, FundedRosterSnapshot, JoinedNetwork, Mesh,
+    MeshHandle, PeerInfo, PreparedGovernanceSnapshot, PreparedRosterSnapshot,
 };
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
 pub use network_state::{

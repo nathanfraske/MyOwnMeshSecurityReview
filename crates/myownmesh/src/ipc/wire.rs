@@ -142,6 +142,94 @@ pub(crate) enum ServerOutView<'a> {
         method: &'a str,
         by: crate::ipc::clients::ClientId,
     },
+    /// The same mirror for a channel fan-out frame, and it exists for a sharper
+    /// reason than the RPC one: a fan-out multiplies one peer frame by the
+    /// local subscriber count, so the payload a remote chose the size of was
+    /// being deep-cloned once per subscriber before any of those subscribers'
+    /// mailboxes could refuse it.
+    ///
+    /// Same tag, same field names, same order, every field a borrow of the
+    /// funded delivery the pump is holding.
+    ChannelInbound {
+        network: &'a str,
+        from: &'a str,
+        channel: &'a str,
+        payload: &'a Value,
+    },
+    /// The mirror for a forwarded stream chunk. The payload is not copied into
+    /// this frame — it is *moved* out of the funded `RpcStreamChunk` — so the
+    /// reason this mirror exists is not to avoid a clone but to let the builder
+    /// subtract the reservation core is already holding for that same graph
+    /// before charging the outer queue for it a second time.
+    RpcCallStreamChunk {
+        request_id: &'a str,
+        payload: &'a Value,
+    },
+    /// The mirror for an end-of-stream marker.
+    ///
+    /// `error` is deliberately not `Option<&str>`. A remote terminal's text is
+    /// peer-sized and still funded by core's session lease, and a locally
+    /// generated one has no business being formatted into a `String` before the
+    /// writer mailbox has agreed to hold it. Both cases are therefore rendered
+    /// at serialization time from something that already exists.
+    RpcCallStreamEnd {
+        request_id: &'a str,
+        error: TerminalReasonView<'a>,
+    },
+}
+
+/// Why a forwarded stream ended, in a form that can be measured before the
+/// owned `Option<String>` it becomes exists.
+///
+/// **Serializes exactly as that `Option<String>` would.** `Clean` is `null`,
+/// and both other arms are the JSON string the built frame will carry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TerminalReasonView<'a> {
+    /// The stream ended without an error.
+    Clean,
+    /// Peer-selected text. Core still owns the funding; the daemon reads it by
+    /// borrow and holds the terminal until the write-side owner exists.
+    Remote(&'a myownmesh_core::rpc::RpcStreamTerminal),
+    /// A refusal this daemon generated. Held as its cause, not as a message:
+    /// the message is rendered straight into the serializer past admission.
+    LocalChunkRefusal(&'a myownmesh_core::ResourceMailboxAdmissionError),
+}
+
+/// The one place the local refusal text is spelled, so the measured width and
+/// the built frame cannot disagree about it.
+const LOCAL_CHUNK_REFUSAL: &str = "local stream chunk was refused";
+
+impl TerminalReasonView<'_> {
+    /// The owned field the mirrored frame carries. Called by the builder past
+    /// admission and by nothing else.
+    pub(crate) fn into_owned(self) -> Option<String> {
+        match self {
+            Self::Clean => None,
+            Self::Remote(terminal) => Some(terminal.reason().to_owned()),
+            Self::LocalChunkRefusal(error) => Some(format!("{LOCAL_CHUNK_REFUSAL}: {error}")),
+        }
+    }
+}
+
+impl Serialize for TerminalReasonView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Clean => serializer.serialize_none(),
+            Self::Remote(terminal) => serializer.serialize_some(terminal.reason()),
+            Self::LocalChunkRefusal(error) => serializer.serialize_some(&LocalRefusalText(error)),
+        }
+    }
+}
+
+/// Renders the local refusal message into the serializer without ever holding
+/// it as an owned `String`.
+#[derive(Debug)]
+struct LocalRefusalText<'a>(&'a myownmesh_core::ResourceMailboxAdmissionError);
+
+impl Serialize for LocalRefusalText<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{LOCAL_CHUNK_REFUSAL}: {}", self.0))
+    }
 }
 
 /// Off-node retention owned by one queued outbound frame.

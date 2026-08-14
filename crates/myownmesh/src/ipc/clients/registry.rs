@@ -194,6 +194,8 @@ impl ClientRegistry {
                 closing: tokio::sync::Notify::new(),
                 #[cfg(test)]
                 fanout_barrier: Mutex::new(None),
+                #[cfg(test)]
+                channel_frames_built: AtomicUsize::new(0),
                 tables: Mutex::new(RegistryTables {
                     lifecycle: Lifecycle::Running,
                     live_tasks: 0,
@@ -230,6 +232,29 @@ impl ClientRegistry {
         if let Some(barrier) = barrier {
             barrier.pass().await;
         }
+    }
+
+    /// The counter one channel pump's frame builder increments, borrowed.
+    ///
+    /// Handed to the builder rather than reached for by it: the builder is a row
+    /// of borrows with no way back to a registry, and giving it one would be a
+    /// coupling that exists only for the test.
+    #[cfg(test)]
+    pub(crate) fn channel_frame_build_counter(&self) -> &AtomicUsize {
+        &self.inner.channel_frames_built
+    }
+
+    /// How many `ChannelInbound` frames this registry's pumps have built.
+    ///
+    /// A total rather than a flag, and read before and after by whoever asks:
+    /// "zero more were built" and "exactly one more was built" are the two
+    /// statements a pressure control needs, and neither is expressible by a
+    /// boolean.
+    #[cfg(test)]
+    pub(crate) fn channel_frames_built(&self) -> usize {
+        self.inner
+            .channel_frames_built
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Issue one acquisition subtree under this registry's own port.

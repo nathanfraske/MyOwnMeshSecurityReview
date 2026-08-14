@@ -43,6 +43,8 @@
 //! above stays exactly as private as it was. A sibling module or an outside
 //! caller still reaches none of it.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -1512,6 +1514,17 @@ struct RegistryInner {
     /// so a control holding it there is holding nothing the registry needs.
     #[cfg(test)]
     fanout_barrier: Mutex<Option<Arc<FanoutBarrier>>>,
+    /// How many `ChannelInbound` frames this registry's pumps have actually
+    /// built.
+    ///
+    /// Incremented inside the builder's `build`, which is the one line past
+    /// every refusal, so a control can distinguish "the mailbox said no" from
+    /// "the mailbox said no after the copy". It lives here rather than in a
+    /// static for the same reason the barrier does: one registry is one
+    /// fan-out's worth of state, and a process-wide counter would be perturbed
+    /// by whatever other control happened to be running beside it.
+    #[cfg(test)]
+    channel_frames_built: AtomicUsize,
     /// The one acquisition port everything this registry admits is funded
     /// from. It is supplied rather than reached for: the registry has no
     /// authority of its own, and a daemon that could mint some here would be

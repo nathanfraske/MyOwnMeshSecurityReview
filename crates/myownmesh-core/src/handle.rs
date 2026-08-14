@@ -42,7 +42,12 @@ use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 /// enough to be imperceptible on a user-initiated reconnect.
 const LEAVE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// One state-sized roster walk. This is the seam the planning residual pays
+/// for, so it is also the seam that counts: a refusal that arrives before the
+/// count moves is a refusal that prevented the work, not one that reported it.
 fn roster_encoded_len(peers: &[AuthorizedPeer]) -> Result<usize> {
+    #[cfg(any(test, feature = "transport-lab"))]
+    ROSTER_STATE_TRAVERSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     struct Count {
         len: usize,
     }
@@ -66,10 +71,38 @@ fn roster_encoded_len(peers: &[AuthorizedPeer]) -> Result<usize> {
 const ROSTER_SNAPSHOT_CLAIM: ResourceClaim =
     ResourceClaim::single(ResourceClass::OpaqueDependencyResidual, 1);
 
+#[cfg(any(test, feature = "transport-lab"))]
+static ROSTER_STATE_TRAVERSALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The transient owner of one state-sized snapshot planning pass.
+///
+/// A snapshot plan cannot be asked for without one, which is the whole point:
+/// the cost of walking the authoritative state is not knowable before the walk,
+/// so the walk itself is what gets admitted. The residual is deliberately the
+/// same broad opaque unit the other variable operations already use rather than
+/// a guessed multiple of the state's size.
+///
+/// It funds only the planning pass. The snapshot that outlives that pass is
+/// funded separately by [`PreparedRosterSnapshot::typed_retention_claim`] or
+/// [`PreparedGovernanceSnapshot::typed_retention_claim`].
+const SNAPSHOT_PLANNING_CLAIM: ResourceClaim =
+    ResourceClaim::single(ResourceClass::OpaqueDependencyResidual, 1);
+
+/// The claim a caller must hold before either snapshot planner will traverse
+/// state. See [`SNAPSHOT_PLANNING_CLAIM`].
+#[must_use]
+pub const fn snapshot_planning_claim() -> ResourceClaim {
+    SNAPSHOT_PLANNING_CLAIM
+}
+
 #[must_use = "a roster plan must be funded and committed or dropped"]
 pub struct PreparedRosterSnapshot<'a> {
     state: &'a NetworkState,
     encoded_ceiling: usize,
+    /// Released when the plan is committed or dropped: the planning pass it
+    /// paid for is over by then, and the built snapshot carries its own owner.
+    _work: ResourceLease,
 }
 
 impl PreparedRosterSnapshot<'_> {
@@ -148,9 +181,14 @@ fn serialized_len(value: &impl Serialize, what: &'static str) -> Result<usize> {
     Ok(count.0)
 }
 
+/// One state-sized governance walk. Counted here for the same reason
+/// [`roster_encoded_len`] is: this is the work the planning residual buys, so
+/// this is where a refusal has to land to have prevented anything.
 pub(crate) fn governance_snapshot_ceiling(
     state: &crate::network_state::NetworkState,
 ) -> Result<usize> {
+    #[cfg(any(test, feature = "transport-lab"))]
+    GOVERNANCE_STATE_TRAVERSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     const PREFIX: usize = "{\"state\":".len();
     const MIDDLE: usize = ",\"evicted\":".len();
     const SUFFIX: usize = "}".len();
@@ -180,9 +218,14 @@ pub(crate) fn governance_snapshot_ceiling(
     clippy::result_large_err,
     reason = "refusal must return the caller's exact lease by value; boxing would allocate on the accounting refusal path"
 )]
+/// `work` is the planning residual from the plan being committed, taken by
+/// value so the revalidation traversal below cannot be reached without it. It
+/// is released when this returns: the planning operation ends here, and what
+/// survives is funded by `lease`.
 pub(crate) fn commit_governance_snapshot(
     state: &crate::network_state::NetworkState,
     ceiling: usize,
+    work: ResourceLease,
     lease: ResourceLease,
 ) -> std::result::Result<FundedGovernanceSnapshot, ResourceLease> {
     if lease.claim() != GOVERNANCE_SNAPSHOT_CLAIM {
@@ -191,6 +234,9 @@ pub(crate) fn commit_governance_snapshot(
     let Ok(current) = governance_snapshot_ceiling(state) else {
         return Err(lease);
     };
+    // Every path past the traversal is done with the planning residual, and
+    // every path before it returned without traversing.
+    drop(work);
     if current > ceiling {
         return Err(lease);
     }
@@ -211,10 +257,28 @@ pub(crate) fn commit_governance_snapshot(
 static GOVERNANCE_SNAPSHOT_BUILDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(any(test, feature = "transport-lab"))]
+static GOVERNANCE_STATE_TRAVERSALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The same figure [`JoinedNetwork::governance_state_traversal_count_for_test`]
+/// reports, reachable from a control that has an engine state rather than a
+/// joined network. Only ever meaningful as a delta.
+#[cfg(test)]
+pub(crate) fn governance_state_traversals_for_test() -> usize {
+    GOVERNANCE_STATE_TRAVERSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[must_use = "a governance plan must be funded and committed or dropped"]
 pub struct PreparedGovernanceSnapshot<'a> {
     state: &'a NetworkState,
     ceiling: usize,
+    /// Not `_work`, unlike [`PreparedRosterSnapshot`], and the difference is
+    /// real: the roster's planning pass is over by the time its plan exists,
+    /// so its lease is held only to be dropped. This one still has a walk to
+    /// pay for. Committing revalidates the quote against live state on the
+    /// engine, and this lease is moved onto that command to fund it.
+    work: ResourceLease,
 }
 
 impl PreparedGovernanceSnapshot<'_> {
@@ -226,12 +290,26 @@ impl PreparedGovernanceSnapshot<'_> {
         self.ceiling
     }
 
+    /// The planning lease goes with the command, for the same reason it did on
+    /// the way in: this future suspends on `rx`, the revalidation walk happens
+    /// on the engine, and a caller cancelled in between must not take the
+    /// funding for that walk away with it.
+    ///
+    /// The plan is consumed here, so there is nothing left to hold it — which
+    /// is why moving it out is not just safe but the only truthful place for
+    /// it to end up.
     pub async fn commit(self, lease: ResourceLease) -> Result<FundedGovernanceSnapshot> {
+        let Self {
+            state,
+            ceiling,
+            work,
+        } = self;
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
+        state
             .cmd_tx
             .send(NetworkCmd::CommitGovernanceSnapshot {
-                ceiling: self.ceiling,
+                ceiling,
+                work,
                 lease,
                 reply,
             })
@@ -240,6 +318,30 @@ impl PreparedGovernanceSnapshot<'_> {
             .map_err(|_| Error::Network("engine dropped governance snapshot commit".into()))?
             .map_err(|_| Error::Network("governance snapshot grew before commit".into()))
     }
+}
+
+pub(crate) async fn prepare_governance_snapshot(
+    state: &NetworkState,
+    work: ResourceLease,
+) -> Result<PreparedGovernanceSnapshot<'_>> {
+    if work.claim() != SNAPSHOT_PLANNING_CLAIM {
+        return Err(Error::Network(
+            "governance planning lease did not match the planning claim".into(),
+        ));
+    }
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    state
+        .cmd_tx
+        .send(NetworkCmd::PrepareGovernanceSnapshot { work, reply })
+        .map_err(|error| error.into_admission_error())?;
+    let (ceiling, work) = rx
+        .await
+        .map_err(|_| Error::Network("engine dropped governance snapshot plan".into()))?;
+    Ok(PreparedGovernanceSnapshot {
+        state,
+        ceiling: ceiling?,
+        work,
+    })
 }
 
 pub struct FundedGovernanceSnapshot {
@@ -748,12 +850,35 @@ impl JoinedNetwork {
     /// The read guard is released before this returns. [`PreparedRosterSnapshot::commit`]
     /// reacquires it, refuses before allocation if the current encoding no
     /// longer fits, and otherwise builds the authoritative current roster once.
-    pub fn prepare_roster_snapshot(&self) -> Result<PreparedRosterSnapshot<'_>> {
+    ///
+    /// `work` funds this walk and nothing else. Taking it by value is what
+    /// seals the residual: there is no way to reach the traversal without
+    /// having been admitted for it first, so a caller with no remaining
+    /// capacity is refused before the roster is read rather than after.
+    pub fn prepare_roster_snapshot(
+        &self,
+        work: ResourceLease,
+    ) -> Result<PreparedRosterSnapshot<'_>> {
+        if work.claim() != SNAPSHOT_PLANNING_CLAIM {
+            return Err(Error::Network(
+                "roster planning lease did not match the planning claim".into(),
+            ));
+        }
         let encoded_ceiling = roster_encoded_len(&self.state.roster.read().authorized_devices)?;
         Ok(PreparedRosterSnapshot {
             state: self.state.as_ref(),
             encoded_ceiling,
+            _work: work,
         })
+    }
+
+    /// Number of state-sized roster walks performed by this process, at the
+    /// real traversal seam. A refusal that keeps this unchanged is a refusal
+    /// that arrived before the work.
+    #[cfg(any(test, feature = "transport-lab"))]
+    #[doc(hidden)]
+    pub fn roster_state_traversal_count_for_test(&self) -> usize {
+        ROSTER_STATE_TRAVERSALS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Approve a peer into the roster (and send the on-the-wire
@@ -831,19 +956,35 @@ impl JoinedNetwork {
     }
 
     /// Quote capacity for a governance snapshot without constructing it.
-    pub async fn prepare_governance_snapshot(&self) -> Result<PreparedGovernanceSnapshot<'_>> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::PrepareGovernanceSnapshot { reply })
-            .map_err(|error| error.into_admission_error())?;
-        let ceiling = rx
-            .await
-            .map_err(|_| Error::Network("engine dropped governance snapshot plan".into()))??;
-        Ok(PreparedGovernanceSnapshot {
-            state: self.state.as_ref(),
-            ceiling,
-        })
+    ///
+    /// `work` funds the engine-side state walk this asks for, and is checked
+    /// before the command is even queued. See [`JoinedNetwork::prepare_roster_snapshot`]
+    /// for why the walk rather than its result is what gets admitted.
+    ///
+    /// Unlike the roster planner, the walk does not happen here. It happens on
+    /// the engine, at an unbounded delay, and this future is cancellable at the
+    /// `await` below — so `work` is **moved into the command** rather than held
+    /// across the await. A caller dropped after the send takes nothing with it
+    /// that the engine still needs; the lease is already the command's, and it
+    /// funds the traversal whether or not anyone is left to receive the answer.
+    ///
+    /// Holding it here instead is precisely the defect this shape removes: the
+    /// send would succeed, the caller would go away, the lease would be
+    /// released at the drop, and the engine would then walk authoritative state
+    /// with nothing accounting for it.
+    pub async fn prepare_governance_snapshot(
+        &self,
+        work: ResourceLease,
+    ) -> Result<PreparedGovernanceSnapshot<'_>> {
+        prepare_governance_snapshot(self.state.as_ref(), work).await
+    }
+
+    /// Number of state-sized governance walks performed by this process, at
+    /// the real traversal seam. See [`JoinedNetwork::roster_state_traversal_count_for_test`].
+    #[cfg(any(test, feature = "transport-lab"))]
+    #[doc(hidden)]
+    pub fn governance_state_traversal_count_for_test(&self) -> usize {
+        GOVERNANCE_STATE_TRAVERSALS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of authoritative funded governance snapshots constructed by the

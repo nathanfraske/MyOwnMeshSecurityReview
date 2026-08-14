@@ -74,16 +74,24 @@ pub use wire::{
 mod framing;
 
 use framing::{
-    config_reply_line_ceiling, events_subscribed_line_ceiling, network_id_reply_line_ceiling,
-    optional_nonzero_bytes, prepare_reply_then, prepare_typed_and_line_building,
-    read_bounded_json_line, variable_data_reply_line_ceiling, variable_operation_claim,
-    AdmittedLineOut, AdmittedReader, ControlOut, DecodeRefusal, FrameAdmission,
-    FundedVariableReply, OperationReplyData, PreparedReply, PreparedText, VariableReplySource,
-    REALTIME_FRAME_HEADER,
+    optional_nonzero_bytes, read_bounded_json_line, AdmittedLineOut, AdmittedReader, DecodeRefusal,
+    FrameAdmission, REALTIME_FRAME_HEADER,
 };
+
+/// What a reply *is*, as opposed to how many bytes it costs to write one: the
+/// sealed outbound envelope, the funded result shapes each domain answers with,
+/// and the exact line ceilings those shapes imply. Nothing in there performs an
+/// operation — the domain modules construct these values, and this module only
+/// says what one costs and how it encodes.
+mod reply;
+
 pub use framing::{
     decode_realtime_send_unit, encode_realtime_recv_unit_with_ceiling, RealtimeRecvUnit,
     RealtimeSendUnit, MAX_REALTIME_FLOW_LABEL_BYTES,
+};
+use reply::{
+    events_subscribed_line_ceiling, variable_operation_claim, ControlOut, FundedVariableReply,
+    PreparedReply, PreparedText,
 };
 
 /// Places a control can reach into `serve` without production having a branch.
@@ -976,22 +984,30 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
         // above stays with what it funds.
         drop(line);
         // This is the one closed consumption boundary for decoded control
-        // state. The retention is still a named owner after the request moves
-        // into the exhaustive matches below; connection-converting arms drop it
-        // explicitly after funding their successor, and the ordinary path keeps
-        // it through `dispatch` and the response write.
+        // state. `decoded` stays a named owner for as long as the request it
+        // funds is being served: the connection-converting arms release it
+        // explicitly once they have funded whichever fields outlive the
+        // request, and every other arm holds it to its own write.
         let AdmittedRequest {
             request,
             _retention: decoded,
         } = admitted;
-        // Taken by value, and the three connection-converting variants are
-        // handled here rather than through `dispatch`, because each of them
-        // starts something that outlives the request. Each releases `decoded`
-        // before its stream begins, having first funded the one or two fields it
-        // is actually keeping. Everything else falls through with its funding
-        // intact, which is correct: an ordinary request is still being processed
-        // for exactly as long as its decoded tree is alive.
-        let request = match request {
+        // One total match over `Request`, and deliberately no catch-all.
+        //
+        // This was a chain of three matches, each ending `other => other`, with
+        // an all-`unreachable!` router catching a remainder that was already
+        // empty. Every variant was handled here even then, but no single match
+        // could say so, so the compiler could not enforce it and a dead router
+        // stood in for the guarantee. A new operation is now a build failure at
+        // this match instead of a variant that compiles cleanly into reaching
+        // nothing.
+        //
+        // The totality belongs here and the work does not: an arm decides which
+        // owner serves the request, and the module named for that domain does
+        // the serving. Splitting `Request` itself into per-module sub-enums
+        // would put a `_ =>` back in whatever glued them together and give the
+        // guarantee away again.
+        match request {
             // EventsSubscribe converts the connection into a server-push
             // channel: the daemon writes mesh events plus any IPC-routed frames
             // (RpcInbound, ChannelInbound, ...) until the client disconnects. A
@@ -1414,32 +1430,8 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 result?;
                 break;
             }
-            other => other,
-        };
-        let request = match request {
             Request::Status => {
-                let (status, output) = {
-                    let source = state
-                        .registry
-                        .status_source(state.mesh.identity(), &state.realtime);
-                    let typed_claim = source
-                        .typed_claim()
-                        .context("status typed claim was not representable")?;
-                    let line_ceiling = source
-                        .line_ceiling()
-                        .context("status line ceiling was not representable")?;
-                    let (committed, output) = prepare_typed_and_line_building(
-                        typed_claim,
-                        line_ceiling,
-                        &json_lines,
-                        |typed| source.commit(typed),
-                    )
-                    .context("status snapshot or response line was not admitted")?;
-                    let status = committed
-                        .map_err(|_| anyhow::anyhow!("status typed claim changed before commit"))?;
-                    (status, output)
-                };
-                let reply = PreparedReply::Status(status);
+                let (reply, output) = dispatch::network::node_status(&state, &json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("status response exceeded its measured ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1448,27 +1440,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::NetworksList => {
-                let plan = state
-                    .registry
-                    .prepare_networks_list()
-                    .context("NetworksList capacity was not representable")?;
-                let typed = json_lines
-                    .acquire_claim(plan.typed_claim())
-                    .context("NetworksList typed snapshot was not admitted")?;
-                let work = json_lines
-                    .acquire_claim(plan.work_claim())
-                    .context("NetworksList snapshot work was not admitted")?;
-                let plan = plan
-                    .measure_line_ceiling(&work)
-                    .context("NetworksList line capacity was not representable")?;
-                let output = AdmittedLineOut::prepare_capacity(plan.line_ceiling(), &json_lines)
-                    .context("NetworksList response line was not admitted")?;
-                let networks = plan.commit(typed, work).map_err(|_| {
-                    anyhow::anyhow!(
-                        "NetworksList changed shape while its funded snapshot was built"
-                    )
-                })?;
-                let reply = PreparedReply::Networks(networks);
+                let (reply, output) = dispatch::network::networks_list(&state, &json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("NetworksList response exceeded its measured ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1476,38 +1448,8 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            request @ (Request::IdentityShow | Request::IdentitySetLabel { .. }) => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
-                    .context("identity response was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("identity operation lease did not match"))?;
-                let result = match request {
-                    Request::IdentityShow => Ok(OperationReplyData::Identity {
-                        device_id: state.mesh.identity().display_id(),
-                        pubkey: state.mesh.identity().public_id().to_owned(),
-                        label: state.mesh.identity().label().to_owned(),
-                    }),
-                    Request::IdentitySetLabel { label } => {
-                        match myownmesh_core::identity::set_label(&label) {
-                            Err(error) => Err(error.to_string()),
-                            Ok(()) => {
-                                state.mesh.identity().set_label(&label);
-                                Ok(OperationReplyData::Identity {
-                                    device_id: state.mesh.identity().display_id(),
-                                    pubkey: state.mesh.identity().public_id().to_owned(),
-                                    label: state.mesh.identity().label().to_owned(),
-                                })
-                            }
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-                let variable = plan.finish(result);
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("identity response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+            Request::IdentityShow => {
+                let (reply, output) = dispatch::identity::show(&state, &json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("identity response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1515,13 +1457,47 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            request @ (Request::RealtimeFlowOpen { .. } | Request::RealtimeFlowClose { .. }) => {
+            Request::IdentitySetLabel { label } => {
+                let (reply, output) = dispatch::identity::set_label(&state, &json_lines, label)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("identity response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::RealtimeFlowOpen {
+                network,
+                peer,
+                flow_label,
+                client_id,
+                client_capability,
+                direction,
+                rtp_kind,
+                mime,
+                clock_rate,
+                channels,
+            } => {
                 let lease = json_lines
                     .acquire_claim(variable_operation_claim())
                     .context("realtime operation result was not admitted")?;
                 let plan = FundedVariableReply::begin_operation(lease)
                     .map_err(|_| anyhow::anyhow!("realtime operation lease did not match"))?;
-                let variable = dispatch::dispatch_realtime_funded(&state, request, plan).await;
+                let variable = dispatch::realtime_flow_open(
+                    &state,
+                    plan,
+                    network,
+                    peer,
+                    flow_label,
+                    direction,
+                    rtp_kind,
+                    mime,
+                    clock_rate,
+                    channels,
+                    client_id,
+                    client_capability,
+                )
+                .await;
                 let output =
                     AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
                         .context("realtime response line was not admitted")?;
@@ -1533,14 +1509,60 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            request @ Request::RpcCallStream { .. } => {
+            Request::RealtimeFlowClose {
+                client_id,
+                client_capability,
+                flow_capability,
+            } => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("realtime operation result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("realtime operation lease did not match"))?;
+                let variable = dispatch::realtime_flow_close(
+                    &state,
+                    plan,
+                    client_id,
+                    client_capability,
+                    flow_capability,
+                )
+                .await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("realtime response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("realtime response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::RpcCallStream {
+                client_id,
+                client_capability,
+                network,
+                peer,
+                method,
+                payload,
+            } => {
                 let lease = json_lines
                     .acquire_claim(variable_operation_claim())
                     .context("RPC stream setup result was not admitted")?;
                 let plan = FundedVariableReply::begin_operation(lease)
                     .map_err(|_| anyhow::anyhow!("RPC stream setup lease did not match"))?;
-                let variable =
-                    dispatch::dispatch_rpc_stream_funded(&state, &cancel, request, plan).await;
+                let variable = dispatch::rpc_call_stream_funded(
+                    &state,
+                    &cancel,
+                    plan,
+                    client_id,
+                    client_capability,
+                    network,
+                    peer,
+                    method,
+                    payload,
+                )
+                .await;
                 let output =
                     AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
                         .context("RPC stream setup response line was not admitted")?;
@@ -1608,35 +1630,8 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::RosterList { network } => {
-                let Some(joined) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("RosterList lookup refusal text was not admitted")?;
-                    let reply = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&reply),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let source = VariableReplySource::roster(
-                    joined
-                        .prepare_roster_snapshot()
-                        .context("RosterList snapshot was not representable")?,
-                );
-                let typed = json_lines
-                    .acquire_claim(source.typed_claim())
-                    .context("RosterList typed snapshot was not admitted")?;
-                let line_ceiling = variable_data_reply_line_ceiling(source.data_ceiling()?)?;
-                let output = AdmittedLineOut::prepare_capacity(line_ceiling, &json_lines)
-                    .context("RosterList response line was not admitted")?;
-                let roster = source.commit(typed).await?;
-                let reply = PreparedReply::Variable(roster);
+                let (reply, output) =
+                    dispatch::governance::roster_list(&state, &json_lines, network).await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("RosterList response exceeded its measured ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1645,36 +1640,8 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::GovernanceState { network } => {
-                let Some(joined) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("GovernanceState lookup refusal text was not admitted")?;
-                    let reply = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&reply),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let source = VariableReplySource::governance(
-                    joined
-                        .prepare_governance_snapshot()
-                        .await
-                        .context("GovernanceState capacity could not be measured")?,
-                );
-                let typed = json_lines
-                    .acquire_claim(source.typed_claim())
-                    .context("GovernanceState typed snapshot was not admitted")?;
-                let line_ceiling = variable_data_reply_line_ceiling(source.data_ceiling()?)?;
-                let output = AdmittedLineOut::prepare_capacity(line_ceiling, &json_lines)
-                    .context("GovernanceState response line was not admitted")?;
-                let governance = source.commit(typed).await?;
-                let reply = PreparedReply::Variable(governance);
+                let (reply, output) =
+                    dispatch::governance::governance_state(&state, &json_lines, network).await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("GovernanceState response exceeded its measured ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1682,202 +1649,209 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            request @ (Request::RosterApprove { .. }
-            | Request::RosterRemove { .. }
-            | Request::TopologySet { .. }
-            | Request::GovernanceProposeKindChange { .. }
-            | Request::GovernanceProposeRoleGrant { .. }
-            | Request::GovernanceProposeRoleRevoke { .. }
-            | Request::GovernanceProposeEvict { .. }
-            | Request::GovernanceProposeTopology { .. }
-            | Request::GovernanceSign { .. }
-            | Request::GovernanceDeny { .. }
-            | Request::GovernanceWithdraw { .. }
-            | Request::GovernanceSpawnSplit { .. }) => {
-                let operation = json_lines
-                    .acquire_claim(variable_operation_claim())
-                    .context("governance/network operation result was not admitted")?;
-                let result: std::result::Result<OperationReplyData, String> = match request {
-                    Request::RosterApprove {
-                        network,
-                        device_id,
-                        label,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .roster_approve(&device_id, label.as_deref().unwrap_or(""))
-                            .await
-                            .map(|_| OperationReplyData::Approved(device_id))
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::RosterRemove { network, device_id } => {
-                        match state.registry.get(&network) {
-                            Some(net) => net
-                                .roster_remove(&device_id)
-                                .await
-                                .map(|_| OperationReplyData::Removed(device_id))
-                                .map_err(|error| error.to_string()),
-                            None => Err(format!("unknown network: {network}")),
-                        }
-                    }
-                    Request::TopologySet {
-                        network,
-                        topology,
-                        hub,
-                    } => match dispatch::network::parse_topology(&topology, hub.as_deref()) {
-                        Err(error) => Err(error),
-                        Ok(mode) => match state.registry.get(&network) {
-                            None => Err(format!("unknown network: {network}")),
-                            Some(net) => {
-                                if net
-                                    .governance_state()
-                                    .await
-                                    .is_ok_and(|governance| governance.topology.is_some())
-                                {
-                                    Err("this network's topology is governed by a signed owner transition — propose a change instead (`networks topology-propose` / GovernanceProposeTopology)".to_owned())
-                                } else {
-                                    net.set_topology(mode)
-                                        .await
-                                        .map(|_| OperationReplyData::Topology(topology))
-                                        .map_err(|error| error.to_string())
-                                }
-                            }
-                        },
-                    },
-                    Request::GovernanceProposeKindChange {
-                        network,
-                        to,
-                        mfa_code,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .propose_transition(
-                                myownmesh_core::TransitionVariant::KindChange { to },
-                                mfa_code,
-                            )
-                            .await
-                            .map(OperationReplyData::ProposalId)
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceProposeRoleGrant {
-                        network,
-                        target,
-                        role,
-                        mfa_code,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .propose_transition(
-                                myownmesh_core::TransitionVariant::RoleGrant { target, role },
-                                mfa_code,
-                            )
-                            .await
-                            .map(OperationReplyData::ProposalId)
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceProposeRoleRevoke {
-                        network,
-                        target,
-                        mfa_code,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .propose_transition(
-                                myownmesh_core::TransitionVariant::RoleRevoke { target },
-                                mfa_code,
-                            )
-                            .await
-                            .map(OperationReplyData::ProposalId)
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceProposeEvict {
-                        network,
-                        target,
-                        mfa_code,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .propose_transition(
-                                myownmesh_core::TransitionVariant::Evict { target },
-                                mfa_code,
-                            )
-                            .await
-                            .map(OperationReplyData::ProposalId)
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceProposeTopology {
-                        network,
-                        topology,
-                        hub,
-                        mfa_code,
-                    } => match dispatch::network::parse_topology(&topology, hub.as_deref()) {
-                        Err(error) => Err(error),
-                        Ok(mode) => match state.registry.get(&network) {
-                            Some(net) => net
-                                .propose_transition(
-                                    myownmesh_core::TransitionVariant::TopologyChange { to: mode },
-                                    mfa_code,
-                                )
-                                .await
-                                .map(OperationReplyData::ProposalId)
-                                .map_err(|error| error.to_string()),
-                            None => Err(format!("unknown network: {network}")),
-                        },
-                    },
-                    Request::GovernanceSign {
-                        network,
-                        proposal_id,
-                        mfa_code,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .sign_proposal(&proposal_id, mfa_code)
-                            .await
-                            .map(|_| OperationReplyData::Signed(proposal_id))
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceDeny {
-                        network,
-                        proposal_id,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .deny_proposal(&proposal_id)
-                            .await
-                            .map(|_| OperationReplyData::Denied(proposal_id))
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceWithdraw {
-                        network,
-                        proposal_id,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .withdraw_proposal(&proposal_id)
-                            .await
-                            .map(|_| OperationReplyData::Withdrawn(proposal_id))
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    Request::GovernanceSpawnSplit {
-                        network,
-                        proposal_id,
-                    } => match state.registry.get(&network) {
-                        Some(net) => net
-                            .spawn_split(&proposal_id)
-                            .await
-                            .map(OperationReplyData::NewNetworkId)
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown network: {network}")),
-                    },
-                    _ => unreachable!("grouped governance/network operation"),
-                };
-                let variable = FundedVariableReply::operation(result, operation).map_err(|_| {
-                    anyhow::anyhow!("governance/network operation lease did not match")
-                })?;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("governance/network response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+            // Twelve arms, not one arm that bound a whole `Request` and re-matched
+            // it. The grouped form needed a `_ => unreachable!()` underneath, so a
+            // thirteenth transition would have compiled into that panic instead of
+            // failing the build as a missing arm here.
+            Request::RosterApprove {
+                network,
+                device_id,
+                label,
+            } => {
+                let (reply, output) = dispatch::governance::roster_approve(
+                    &state,
+                    &json_lines,
+                    network,
+                    device_id,
+                    label,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::RosterRemove { network, device_id } => {
+                let (reply, output) =
+                    dispatch::governance::roster_remove(&state, &json_lines, network, device_id)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::TopologySet {
+                network,
+                topology,
+                hub,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::topology_set(&state, &json_lines, network, topology, hub)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceProposeKindChange {
+                network,
+                to,
+                mfa_code,
+            } => {
+                let (reply, output) = dispatch::governance::propose_kind_change(
+                    &state,
+                    &json_lines,
+                    network,
+                    to,
+                    mfa_code,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceProposeRoleGrant {
+                network,
+                target,
+                role,
+                mfa_code,
+            } => {
+                let (reply, output) = dispatch::governance::propose_role_grant(
+                    &state,
+                    &json_lines,
+                    network,
+                    target,
+                    role,
+                    mfa_code,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceProposeRoleRevoke {
+                network,
+                target,
+                mfa_code,
+            } => {
+                let (reply, output) = dispatch::governance::propose_role_revoke(
+                    &state,
+                    &json_lines,
+                    network,
+                    target,
+                    mfa_code,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceProposeEvict {
+                network,
+                target,
+                mfa_code,
+            } => {
+                let (reply, output) = dispatch::governance::propose_evict(
+                    &state,
+                    &json_lines,
+                    network,
+                    target,
+                    mfa_code,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceProposeTopology {
+                network,
+                topology,
+                hub,
+                mfa_code,
+            } => {
+                let (reply, output) = dispatch::governance::propose_topology(
+                    &state,
+                    &json_lines,
+                    network,
+                    topology,
+                    hub,
+                    mfa_code,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceSign {
+                network,
+                proposal_id,
+                mfa_code,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::sign(&state, &json_lines, network, proposal_id, mfa_code)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceDeny {
+                network,
+                proposal_id,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::deny(&state, &json_lines, network, proposal_id).await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceWithdraw {
+                network,
+                proposal_id,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::withdraw(&state, &json_lines, network, proposal_id)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("governance/network response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceSpawnSplit {
+                network,
+                proposal_id,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::spawn_split(&state, &json_lines, network, proposal_id)
+                        .await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("governance/network response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1958,19 +1932,31 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            request @ (Request::ForgetAllNetworks | Request::FactoryReset) => {
+            Request::ForgetAllNetworks => {
                 let lease = json_lines
                     .acquire_claim(variable_operation_claim())
                     .context("network reset result was not admitted")?;
                 let plan = FundedVariableReply::begin_operation(lease)
                     .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = match request {
-                    Request::ForgetAllNetworks => {
-                        dispatch::network::forget_all_networks(&state, plan).await
-                    }
-                    Request::FactoryReset => dispatch::network::factory_reset(&state, plan).await,
-                    _ => unreachable!(),
-                };
+                let variable = dispatch::network::forget_all_networks(&state, plan).await;
+                let output =
+                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
+                        .context("network reset response line was not admitted")?;
+                let reply = PreparedReply::Variable(variable);
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("network reset response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::FactoryReset => {
+                let lease = json_lines
+                    .acquire_claim(variable_operation_claim())
+                    .context("network reset result was not admitted")?;
+                let plan = FundedVariableReply::begin_operation(lease)
+                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
+                let variable = dispatch::network::factory_reset(&state, plan).await;
                 let output =
                     AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
                         .context("network reset response line was not admitted")?;
@@ -1988,20 +1974,21 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 pin,
                 wait_ms,
             } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
-                    .context("network connect result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => break,
-                    result = dispatch::network::network_connect_peer(&state, &network, &peer, pin, wait_ms, plan) => result,
+                // No reply when the socket drained mid-dial: the daemon never
+                // learned the outcome, so there is nothing to report.
+                let Some((reply, output)) = dispatch::network::connect_peer(
+                    &state,
+                    &json_lines,
+                    &cancel,
+                    network,
+                    peer,
+                    pin,
+                    wait_ms,
+                )
+                .await?
+                else {
+                    break;
                 };
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network connect response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("network connect response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2010,18 +1997,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::UpdateStatus => {
-                let plan = myownmesh_updater::prepare_operation();
-                let lease = json_lines
-                    .acquire_claim(plan.claim())
-                    .context("updater status operation was not admitted")?;
-                let funded = plan.run(lease, myownmesh_updater::status).map_err(|_| {
-                    anyhow::anyhow!("updater operation lease did not match its plan")
-                })?;
-                let variable = FundedVariableReply::updater_status(funded);
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("updater status response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+                let (reply, output) = dispatch::updater::status(&json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("updater status response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2030,19 +2006,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::UpdateApply => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
-                    .context("updater apply result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("updater apply lease did not match"))?;
-                let variable = plan.finish(match myownmesh_updater::apply_now() {
-                    Ok(applied) => Ok(OperationReplyData::Applied(applied)),
-                    Err(error) => Err(error.to_string()),
-                });
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("updater apply response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+                let (reply, output) = dispatch::updater::apply(&json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("updater apply response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2056,37 +2020,22 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 method,
                 payload,
             } => {
-                let Some(joined) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("RpcCall lookup refusal text was not admitted")?;
-                    let reply = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&reply),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
+                // The only operation that can answer with nothing: a call the
+                // connection's shutdown cancelled never produced a result to
+                // report, so there is no line to write and the loop ends.
+                let Some((reply, output)) = dispatch::rpc::call(
+                    &state,
+                    &json_lines,
+                    &cancel,
+                    network,
+                    peer,
+                    method,
+                    payload,
+                )
+                .await?
+                else {
+                    break;
                 };
-                let operation = json_lines
-                    .acquire_claim(variable_operation_claim())
-                    .context("RpcCall result operation was not admitted")?;
-                let rpc = joined.rpc();
-                let result = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => break,
-                    result = rpc.call_funded(&peer, &method, payload) => result,
-                };
-                let variable = FundedVariableReply::rpc_call(result, operation)
-                    .map_err(|_| anyhow::anyhow!("RpcCall operation lease did not match"))?;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("RpcCall response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("RpcCall response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2095,21 +2044,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::UpdateCheck => {
-                let plan = myownmesh_updater::prepare_operation();
-                let lease = json_lines
-                    .acquire_claim(plan.claim())
-                    .context("updater check operation was not admitted")?;
-                let funded = plan
-                    .run_async(lease, myownmesh_updater::check_now(true))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("updater operation lease did not match its plan")
-                    })?;
-                let variable = FundedVariableReply::updater_check(funded);
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("updater check response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+                let (reply, output) = dispatch::updater::check(&json_lines).await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("updater check response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2118,28 +2053,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::UpdateSetPrefs { prefs } => {
-                let plan = myownmesh_updater::prepare_operation();
-                let lease = json_lines
-                    .acquire_claim(plan.claim())
-                    .context("updater preferences operation was not admitted")?;
-                let funded = plan
-                    .run(lease, || {
-                        let prefs = serde_json::from_value::<myownmesh_updater::UpdatePrefs>(prefs)
-                            .map_err(|error| {
-                                myownmesh_updater::Error::Other(format!(
-                                    "bad update prefs: {error}"
-                                ))
-                            })?;
-                        myownmesh_updater::set_prefs(prefs)
-                    })
-                    .map_err(|_| {
-                        anyhow::anyhow!("updater operation lease did not match its plan")
-                    })?;
-                let variable = FundedVariableReply::updater_status(funded);
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("updater preferences response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+                let (reply, output) = dispatch::updater::set_prefs(&json_lines, prefs)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("updater preferences response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2148,16 +2062,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::GovernanceMfaEnroll { network } => {
-                let operation = json_lines
-                    .acquire_claim(variable_operation_claim())
-                    .context("MFA enrollment operation was not admitted")?;
-                let result = myownmesh_core::custody::enroll(&network, &network);
-                let variable = FundedVariableReply::mfa_enrollment(result, operation)
-                    .map_err(|_| anyhow::anyhow!("MFA operation lease did not match"))?;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("MFA enrollment response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
+                let (reply, output) = dispatch::governance::mfa_enroll(&json_lines, network)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("MFA enrollment response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2166,54 +2071,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::NetworkIdGenerate => {
-                let plan = match myownmesh_core::identity::prepare_generated_network_id() {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("network-id generation refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())?;
-                let (committed, output) = prepare_typed_and_line_building(
-                    plan.typed_retention_claim(),
-                    line_ceiling,
-                    &json_lines,
-                    |typed| plan.commit(typed),
-                )
-                .context("generated network id or response line was not admitted")?;
-                let network_id = match committed {
-                    Ok(network_id) => network_id,
-                    Err(error) => {
-                        drop(output);
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("network-id generation refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let reply = PreparedReply::NetworkId(network_id);
+                let (reply, output) = dispatch::identity::network_id_generate(&json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("generated network-id response exceeded its exact ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2222,55 +2080,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::NetworkIdNormalize { input } => {
-                let plan = match myownmesh_core::identity::prepare_normalized_network_id(&input) {
-                    Ok(plan) => plan,
-                    Err(refusal) => {
-                        let text = PreparedText::network_id_error(&refusal, &json_lines)
-                            .context("network-id validation refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())?;
-                let (committed, output) = prepare_typed_and_line_building(
-                    plan.typed_retention_claim(),
-                    line_ceiling,
-                    &json_lines,
-                    |typed| plan.commit(typed),
-                )
-                .context("normalized network id or response line was not admitted")?;
-                let network_id = match committed {
-                    Ok(network_id) => network_id,
-                    Err(error) => {
-                        drop(output);
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("network-id normalization refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                drop(input);
-                let reply = PreparedReply::NetworkId(network_id);
+                let (reply, output) = dispatch::identity::network_id_normalize(&json_lines, input)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("normalized network-id response exceeded its exact ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2279,24 +2089,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::ServicesStatus => {
-                let source = state.services.status_source().await;
-                let typed_claim = source
-                    .typed_claim()
-                    .context("services-status typed claim was not representable")?;
-                let line_ceiling = source
-                    .line_ceiling()
-                    .context("services-status line ceiling was not representable")?;
-                let (funded, output) = prepare_typed_and_line_building(
-                    typed_claim,
-                    line_ceiling,
-                    &json_lines,
-                    |typed| source.commit(typed),
-                )
-                .context("services-status typed snapshot or response line was not admitted")?;
-                let funded = funded.map_err(|_| {
-                    anyhow::anyhow!("services-status typed claim changed before commit")
-                })?;
-                let reply = PreparedReply::ServicesStatus(funded);
+                let (reply, output) = dispatch::services::status(&state, &json_lines).await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("services-status response exceeded its measured ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2323,185 +2116,40 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::GovernanceMfaStatus { network } => {
-                let reply = PreparedReply::Bool {
-                    key: "enrolled",
-                    value: myownmesh_core::custody::is_enrolled(&network),
-                };
-                match write_line(
-                    &mut writer,
-                    &json_lines,
-                    &cancel,
-                    ControlOut::Prepared(&reply),
-                )
-                .await?
-                {
+                let (reply, output) = dispatch::governance::mfa_status(&json_lines, network)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA status response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::GovernanceMfaDisable { network, code } => {
-                match myownmesh_core::custody::disable(&network, &code) {
-                    Ok(()) => {
-                        let reply = PreparedReply::Bool {
-                            key: "disabled",
-                            value: true,
-                        };
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                    Err(error) => {
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("MFA refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
+                let (reply, output) =
+                    dispatch::governance::mfa_disable(&json_lines, network, code)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA disable response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
                 }
             }
-            other => other,
-        };
-        let request = match request {
             Request::ChannelSubscribe {
                 client_id,
                 client_capability,
                 network,
                 channel,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
-                    let reply = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&reply),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let success = PreparedReply::Bool {
-                    key: "subscribed",
-                    value: true,
-                };
-                let output = AdmittedLineOut::prepare(&ControlOut::Prepared(&success), &json_lines)
-                    .context("channel-subscribe response capacity was not admitted")?;
-                let key = (network, channel);
-                let join = match state.clients.subscribe_channel_borrowed(&key, client_id) {
-                    Ok(join) => join,
-                    Err(refusal) => {
-                        drop(output);
-                        let text = PreparedText::channel_registration_error(&refusal, &json_lines)
-                            .context("channel-subscribe refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                match join {
-                    crate::ipc::ChannelJoin::Install(ready) => {
-                        let pump = crate::ipc::bridge::spawn_channel_pump(
-                            &net,
-                            &key,
-                            state.clients.clone(),
-                        );
-                        let orphan = match pump {
-                            Ok(pump) => {
-                                state
-                                    .clients
-                                    .finish_channel_install(&key, &ready, Some(pump))
-                            }
-                            Err(error) => {
-                                if let Some(orphan) =
-                                    state.clients.finish_channel_install(&key, &ready, None)
-                                {
-                                    orphan.retire().await;
-                                }
-                                drop(output);
-                                let text = PreparedText::channel_pump_error(&error, &json_lines)
-                                    .context("channel-pump refusal text was not admitted")?;
-                                let reply = PreparedReply::Error(text);
-                                match write_line(
-                                    &mut writer,
-                                    &json_lines,
-                                    &cancel,
-                                    ControlOut::Prepared(&reply),
-                                )
-                                .await?
-                                {
-                                    Wrote::Sent => continue,
-                                    Wrote::Ended => break,
-                                }
-                            }
-                        };
-                        if let Some(orphan) = orphan {
-                            orphan.retire().await;
-                        }
-                    }
-                    crate::ipc::ChannelJoin::Pending(ready) => {
-                        if !ready.wait().await {
-                            drop(output);
-                            match write_static_error(
-                                &mut writer,
-                                &json_lines,
-                                &cancel,
-                                "channel subscribe refused: the route this subscription joined could not be installed",
-                            ).await? {
-                                Wrote::Sent => continue,
-                                Wrote::Ended => break,
-                            }
-                        }
-                    }
-                    crate::ipc::ChannelJoin::Live => {}
-                }
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&success), output)
+                let (reply, output) = dispatch::channel::subscribe(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
+                    network,
+                    channel,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("channel-subscribe response changed after admission")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
@@ -2515,130 +2163,17 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 method,
                 streaming,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
-                    let refusal = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&refusal),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let success = PreparedReply::Bool {
-                    key: "registered",
-                    value: true,
-                };
-                let output = AdmittedLineOut::prepare(&ControlOut::Prepared(&success), &json_lines)
-                    .context("RPC-register response capacity was not admitted")?;
-                let mode = if streaming {
-                    crate::ipc::clients::HandlerMode::Stream
-                } else {
-                    crate::ipc::clients::HandlerMode::Single
-                };
-                let key = (network, method);
-                let generation = match state.clients.next_handler_generation() {
-                    Ok(generation) => generation,
-                    Err(refusal) => {
-                        drop(output);
-                        let text = PreparedText::rpc_registration_error(&refusal, &json_lines)
-                            .context("RPC-register refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let prepared = match crate::ipc::bridge::prepare_handler_for_mode(
-                    &net.rpc(),
-                    &key,
-                    generation,
-                    mode,
-                    &state.clients,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(refusal) => {
-                        drop(output);
-                        let text = PreparedText::rpc_gateway_error(&refusal, &json_lines)
-                            .context("RPC-register gateway refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let previous = match state
-                    .clients
-                    .claim_method_committing_with_key(key, client_id, mode, generation, prepared)
-                {
-                    Ok(previous) => previous,
-                    Err(refusal) => {
-                        drop(output);
-                        let text = PreparedText::rpc_registration_error(&refusal, &json_lines)
-                            .context("RPC-register commit refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                if let Some((previous, key)) = previous {
-                    crate::ipc::bridge::notify_displaced(
-                        &state.clients,
-                        previous,
-                        client_id,
-                        key.0,
-                        key.1,
-                    );
-                }
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&success), output)
+                let (reply, output) = dispatch::rpc::register(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
+                    network,
+                    method,
+                    streaming,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("RPC-register response changed after admission")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
@@ -2656,65 +2191,25 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 ok,
                 error,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let success = PreparedReply::Bool {
-                    key: "resolved",
-                    value: true,
-                };
-                let key = crate::ipc::clients::PendingKey {
+                let (reply, output) = dispatch::rpc::respond(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
                     network,
+                    peer,
                     method,
-                    remote_peer: peer,
-                    remote_request_id: request_id,
-                    class: crate::ipc::clients::HandlerMode::Single,
-                };
-                let result = error.map_or_else(|| Ok(ok.unwrap_or(serde_json::Value::Null)), Err);
-                let (resolved, output) = prepare_reply_then(&success, &json_lines, || {
-                    state
-                        .clients
-                        .resolve_exact_single(&key, client_id, operation_id, result)
-                })
-                .context("RPC-resolve response capacity was not admitted")?;
-                if resolved {
-                    let line =
-                        AdmittedLineOut::encode_prepared(ControlOut::Prepared(&success), output)
-                            .context("RPC-resolve response changed after admission")?;
-                    match write_admitted_line(&mut writer, &cancel, line).await? {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                } else {
-                    drop(output);
-                    let text = PreparedText::no_inflight_rpc(&key.remote_request_id, &json_lines)
-                        .context("RPC-resolve refusal text was not admitted")?;
-                    let refusal = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&refusal),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
+                    request_id,
+                    operation_id,
+                    ok,
+                    error,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("RPC-resolve response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
                 }
             }
             Request::RpcStreamChunk {
@@ -2727,65 +2222,24 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 operation_id,
                 payload,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let success = PreparedReply::Bool {
-                    key: "delivered",
-                    value: true,
-                };
-                let key = crate::ipc::clients::PendingKey {
+                let (reply, output) = dispatch::rpc::stream_chunk(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
                     network,
+                    peer,
                     method,
-                    remote_peer: peer,
-                    remote_request_id: request_id,
-                    class: crate::ipc::clients::HandlerMode::Stream,
-                };
-                let (accepted, output) = prepare_reply_then(&success, &json_lines, || {
-                    state
-                        .clients
-                        .push_exact_stream(&key, client_id, operation_id, payload)
-                })
-                .context("stream-chunk response capacity was not admitted")?;
-                if accepted {
-                    let line =
-                        AdmittedLineOut::encode_prepared(ControlOut::Prepared(&success), output)
-                            .context("stream-chunk response changed after admission")?;
-                    match write_admitted_line(&mut writer, &cancel, line).await? {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                } else {
-                    drop(output);
-                    let text =
-                        PreparedText::no_inflight_stream(&key.remote_request_id, &json_lines)
-                            .context("stream-chunk refusal text was not admitted")?;
-                    let refusal = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&refusal),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
+                    request_id,
+                    operation_id,
+                    payload,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("stream-chunk response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
                 }
             }
             Request::RpcStreamEnd {
@@ -2798,44 +2252,19 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 operation_id,
                 error,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let ceiling = PreparedReply::Bool {
-                    key: "closed",
-                    value: false,
-                };
-                let key = crate::ipc::clients::PendingKey {
+                let (reply, output) = dispatch::rpc::stream_end(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
                     network,
+                    peer,
                     method,
-                    remote_peer: peer,
-                    remote_request_id: request_id,
-                    class: crate::ipc::clients::HandlerMode::Stream,
-                };
-                let (closed, output) = prepare_reply_then(&ceiling, &json_lines, || {
-                    state
-                        .clients
-                        .close_exact_stream(&key, client_id, operation_id, error)
-                })
-                .context("stream-close response capacity was not admitted")?;
-                let reply = PreparedReply::Bool {
-                    key: "closed",
-                    value: closed,
-                };
+                    request_id,
+                    operation_id,
+                    error,
+                )
+                .await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("stream-close response exceeded its scalar ceiling")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -2849,57 +2278,20 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 peer,
                 payload,
             } => {
-                let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
-                    let refusal = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&refusal),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let reply = PreparedReply::Bool {
-                    key: "sent",
-                    value: true,
-                };
-                let channel = net.channel::<serde_json::Value>(&channel);
-                let (send, output) =
-                    prepare_reply_then(&reply, &json_lines, || channel.send_to(&peer, &payload))
-                        .context("channel-send response capacity was not admitted")?;
-                match send.await {
-                    Ok(()) => {
-                        let line =
-                            AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                                .context("channel-send response changed after admission")?;
-                        match write_admitted_line(&mut writer, &cancel, line).await? {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                    Err(error) => {
-                        drop(output);
-                        let text = PreparedText::channel_error(&error, &json_lines)
-                            .context("channel-send refusal text was not admitted")?;
-                        let refusal = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&refusal),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
+                let (reply, output) = dispatch::channel::send_to(
+                    &state,
+                    &json_lines,
+                    network,
+                    channel,
+                    peer,
+                    payload,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("channel-send response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
                 }
             }
             Request::ChannelSendAll {
@@ -2907,119 +2299,28 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 channel,
                 payload,
             } => {
-                let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
-                    let refusal = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&refusal),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let ceiling = PreparedReply::Usize {
-                    key: "dispatched_to",
-                    value: usize::MAX,
-                };
-                let channel = net.channel::<serde_json::Value>(&channel);
-                let (broadcast, output) =
-                    prepare_reply_then(&ceiling, &json_lines, || channel.broadcast(&payload))
-                        .context("channel-broadcast response capacity was not admitted")?;
-                match broadcast.await {
-                    Ok(count) => {
-                        let reply = PreparedReply::Usize {
-                            key: "dispatched_to",
-                            value: count,
-                        };
-                        let line =
-                            AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                                .context(
-                                    "channel-broadcast response exceeded its scalar ceiling",
-                                )?;
-                        match write_admitted_line(&mut writer, &cancel, line).await? {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                    Err(error) => {
-                        drop(output);
-                        let text = PreparedText::channel_error(&error, &json_lines)
-                            .context("channel-broadcast refusal text was not admitted")?;
-                        let refusal = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&refusal),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
+                let (reply, output) =
+                    dispatch::channel::send_all(&state, &json_lines, network, channel, payload)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("channel-broadcast response exceeded its scalar ceiling")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
                 }
             }
             Request::CapabilitiesSet {
                 network,
                 capabilities,
             } => {
-                let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
-                    let refusal = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&refusal),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let reply = PreparedReply::Bool {
-                    key: "advertised",
-                    value: true,
-                };
-                let (advertised, output) =
-                    prepare_reply_then(&reply, &json_lines, || net.advertise(capabilities))
-                        .context("capability-advert response capacity was not admitted")?;
-                match advertised {
-                    Ok(()) => {
-                        let line =
-                            AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                                .context("capability-advert response changed after admission")?;
-                        match write_admitted_line(&mut writer, &cancel, line).await? {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                    Err(error) => {
-                        drop(output);
-                        let text = PreparedText::rpc_advertise_error(&error, &json_lines)
-                            .context("capability-advert refusal text was not admitted")?;
-                        let refusal = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&refusal),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
+                let (reply, output) =
+                    dispatch::network::capabilities_set(&state, &json_lines, network, capabilities)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("capability-advert response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
                 }
             }
             Request::ChannelSendReliable {
@@ -3028,126 +2329,25 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 peer,
                 payload,
             } => {
-                let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
-                    let reply = PreparedReply::Error(text);
-                    match write_line(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        ControlOut::Prepared(&reply),
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                };
-                let reply = PreparedReply::Bool {
-                    key: "delivered",
-                    value: true,
-                };
-                let output = AdmittedLineOut::prepare(&ControlOut::Prepared(&reply), &json_lines)
-                    .context("reliable-send response capacity was not admitted")?;
-                let result = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        drop(output);
-                        match write_static_error(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            "control connection closing",
-                        ).await? {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                    result = net.send_reliable(&peer, &channel, payload) => result,
-                };
-                let line = match result {
-                    Ok(()) => {
-                        AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                            .context("reliable-send response changed after admission")?
-                    }
-                    Err(error) => {
-                        drop(output);
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("reliable-send refusal text was not admitted")?;
-                        let refusal = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&refusal),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
+                let (reply, output) = dispatch::channel::send_reliable(
+                    &state,
+                    &json_lines,
+                    &cancel,
+                    network,
+                    channel,
+                    peer,
+                    payload,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("reliable-send response changed after admission")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::ConfigShow => {
-                let plan = match myownmesh_core::MeshConfig::prepare_load() {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("config planning refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let work = json_lines
-                    .acquire_claim(plan.load_work_claim())
-                    .context("ConfigShow load work was not admitted")?;
-                let loader_residual = json_lines
-                    .acquire_claim(plan.loader_residual_claim())
-                    .context("ConfigShow loader residual was not admitted")?;
-                let config = match plan.commit(loader_residual, work) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        let text = PreparedText::core_error(&error, &json_lines)
-                            .context("config load refusal text was not admitted")?;
-                        let reply = PreparedReply::Error(text);
-                        match write_line(
-                            &mut writer,
-                            &json_lines,
-                            &cancel,
-                            ControlOut::Prepared(&reply),
-                        )
-                        .await?
-                        {
-                            Wrote::Sent => continue,
-                            Wrote::Ended => break,
-                        }
-                    }
-                };
-                let line_ceiling = config_reply_line_ceiling(
-                    config
-                        .compact_encoded_len()
-                        .context("ConfigShow compact width was not representable")?,
-                )
-                .context("ConfigShow response width was not representable")?;
-                let output = AdmittedLineOut::prepare_capacity(line_ceiling, &json_lines)
-                    .context("ConfigShow response line was not admitted")?;
-                let reply = PreparedReply::Config(config);
+                let (reply, output) = dispatch::services::config_show(&json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("ConfigShow exceeded its core encoding ceiling")?;
                 // `reply` owns the funded config and deliberately remains live
@@ -3165,40 +2365,15 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 network,
                 method,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let ceiling = PreparedReply::Bool {
-                    key: "released",
-                    value: false,
-                };
-                let output = AdmittedLineOut::prepare(&ControlOut::Prepared(&ceiling), &json_lines)
-                    .context("RpcUnregister response capacity was not admitted")?;
-                let key = (network, method);
-                let release = state.clients.release_method(&key, client_id);
-                let released = release.released;
-                // Releasing the core registration is the local commit. Output
-                // capacity is already held, and cancellation only races the
-                // later write.
-                drop(release);
-                let reply = PreparedReply::Bool {
-                    key: "released",
-                    value: released,
-                };
+                let (reply, output) = dispatch::rpc::unregister(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
+                    network,
+                    method,
+                )
+                .await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("RpcUnregister response changed after admission")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -3212,37 +2387,15 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 network,
                 channel,
             } => {
-                if state
-                    .clients
-                    .authenticate(client_id, &client_capability)
-                    .is_none()
-                {
-                    match write_static_error(
-                        &mut writer,
-                        &json_lines,
-                        &cancel,
-                        "invalid local client authority",
-                    )
-                    .await?
-                    {
-                        Wrote::Sent => continue,
-                        Wrote::Ended => break,
-                    }
-                }
-                let reply = PreparedReply::Bool {
-                    key: "unsubscribed",
-                    value: true,
-                };
-                let output = AdmittedLineOut::prepare(&ControlOut::Prepared(&reply), &json_lines)
-                    .context("ChannelUnsubscribe response capacity was not admitted")?;
-                let key = (network, channel);
-                // Route retirement is the local commit and intentionally is
-                // not cancelled with the socket. Success means the pump has
-                // stopped; only the subsequent pre-funded response write races
-                // connection shutdown.
-                if let Some(route) = state.clients.unsubscribe_channel(&key, client_id) {
-                    route.retire().await;
-                }
+                let (reply, output) = dispatch::channel::unsubscribe(
+                    &state,
+                    &json_lines,
+                    client_id,
+                    client_capability,
+                    network,
+                    channel,
+                )
+                .await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("ChannelUnsubscribe response changed after admission")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -3250,19 +2403,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            other => other,
-        };
-        let resp = dispatch(&state, &cancel, request).await;
-        match write_line(
-            &mut writer,
-            &json_lines,
-            &cancel,
-            ControlOut::Response(&resp),
-        )
-        .await?
-        {
-            Wrote::Sent => {}
-            Wrote::Ended => break,
         }
     }
     Ok(())
@@ -3281,13 +2421,11 @@ use realtime_pipe::{
     run_realtime_outbound_pipe, RealtimePipeBinding,
 };
 
-/// The per-request router and everything it calls to satisfy one `op`.
-/// One exhaustive match over [`Request`] lives there, so a new variant is a
-/// compile error rather than a silent fallthrough, and the work each arm does
-/// sits beside it in a module named for the domain it belongs to.
+/// The operations the request match delegates to, and the frame builders that
+/// forward an RPC stream. The exhaustive match itself stays in `handle_client`:
+/// totality is a property of one match over one enum, and moving arms into
+/// per-domain sub-enums would need a catch-all to glue them back together.
 mod dispatch;
-
-use dispatch::dispatch;
 
 /// Stream events to one connected subscriber. Drains two sources concurrently:
 ///
@@ -5000,7 +4138,11 @@ mod variable_state_reply_tests {
             .expect("an open network accepts a meaningful Member grant");
 
         let plan = joined
-            .prepare_governance_snapshot()
+            .prepare_governance_snapshot(
+                scope
+                    .acquire(myownmesh_core::snapshot_planning_claim())
+                    .expect("the planning walk is funded"),
+            )
             .await
             .expect("the nonempty state is measurable");
         let builds_before = joined.governance_snapshot_build_count_for_test();
@@ -5041,7 +4183,11 @@ mod variable_state_reply_tests {
         drop((line, reply));
 
         let stale = joined
-            .prepare_governance_snapshot()
+            .prepare_governance_snapshot(
+                scope
+                    .acquire(myownmesh_core::snapshot_planning_claim())
+                    .expect("the predecessor planning walk is funded"),
+            )
             .await
             .expect("the predecessor state is measurable");
         let builds_before_refusal = joined.governance_snapshot_build_count_for_test();
@@ -5067,5 +4213,119 @@ mod variable_state_reply_tests {
             builds_before_refusal,
             "stale growth refuses before the production snapshot builder"
         );
+    }
+
+    /// Roster and governance planning is admitted before it walks state.
+    ///
+    /// The counters read here sit at the real traversal seams, so a refusal
+    /// that leaves them unchanged is a refusal that prevented the work rather
+    /// than one that reported it afterwards. Both planners take the planning
+    /// lease by value, which is what makes the walk unreachable without it:
+    /// the mismatched-lease leg proves that seal holds at run time too, and
+    /// the closing legs prove the counters move when the work really happens.
+    #[tokio::test]
+    async fn v4_r5_daemon_roster_and_governance_planning_pressure_precedes_state_traversal() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
+            myownmesh_core::MeshConfig::default(),
+            Arc::new(myownmesh_core::Identity::ephemeral()),
+            connector_policy(),
+        )
+        .await
+        .expect("the real daemon mesh opens");
+        let scope = mesh
+            .local_application_resource_scope()
+            .expect("the daemon mesh exposes its application scope");
+        let joined = mesh
+            .join(network_config())
+            .await
+            .expect("the real network joins");
+
+        // Non-vacuity: give both subsystems state worth walking, so a walk
+        // that does not happen is skipping something real.
+        joined
+            .propose_transition(
+                myownmesh_core::TransitionVariant::RoleGrant {
+                    target: "planning-pressure-member".to_owned(),
+                    role: myownmesh_core::Role::Member,
+                },
+                None,
+            )
+            .await
+            .expect("an open network accepts a meaningful Member grant");
+
+        let roster_before = joined.roster_state_traversal_count_for_test();
+        let governance_before = joined.governance_state_traversal_count_for_test();
+
+        let (starved, provider) = FrameAdmission::over_grant_probed(
+            myownmesh_core::FiniteResourceProvider::scope_planning_charge(),
+            None,
+        );
+        let baseline = provider.in_use();
+        assert!(
+            matches!(
+                starved.acquire_claim(myownmesh_core::snapshot_planning_claim()),
+                Err(framing::FrameRefusal::Resources(_))
+            ),
+            "a starved control connection is refused the planning residual"
+        );
+        assert_eq!(
+            (
+                joined.roster_state_traversal_count_for_test(),
+                joined.governance_state_traversal_count_for_test()
+            ),
+            (roster_before, governance_before),
+            "planning pressure refuses before either subsystem is walked"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "a refused planning acquisition returns the exact daemon ledger baseline"
+        );
+
+        let mismatched = scope
+            .acquire(myownmesh_core::ResourceClaim::single(
+                myownmesh_core::ResourceClass::AccountedMemoryBytes,
+                1,
+            ))
+            .expect("an unrelated claim is funded");
+        assert!(
+            joined.prepare_roster_snapshot(mismatched).is_err(),
+            "a lease for some other claim does not buy a roster walk"
+        );
+        assert_eq!(
+            joined.roster_state_traversal_count_for_test(),
+            roster_before,
+            "the mismatched lease is rejected before the roster is read"
+        );
+
+        let roster_plan = joined
+            .prepare_roster_snapshot(
+                scope
+                    .acquire(myownmesh_core::snapshot_planning_claim())
+                    .expect("the roster planning walk is funded"),
+            )
+            .expect("the admitted roster plan measures the roster");
+        assert_eq!(
+            joined.roster_state_traversal_count_for_test(),
+            roster_before + 1,
+            "one admitted roster plan walks the roster exactly once"
+        );
+        drop(roster_plan);
+
+        let governance_plan = joined
+            .prepare_governance_snapshot(
+                scope
+                    .acquire(myownmesh_core::snapshot_planning_claim())
+                    .expect("the governance planning walk is funded"),
+            )
+            .await
+            .expect("the admitted governance plan measures the state");
+        assert_eq!(
+            joined.governance_state_traversal_count_for_test(),
+            governance_before + 1,
+            "one admitted governance plan walks the state exactly once"
+        );
+        drop(governance_plan);
     }
 }

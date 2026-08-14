@@ -120,28 +120,13 @@ impl ApplicationGateway {
             .checked_add(2 * std::mem::size_of::<usize>())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(GatewayRefusal::Malformed)?;
-        // Two residuals, and the difference between them is the point.
-        //
-        // The first is the shared allocation itself — the `ChannelSubscriber`
-        // and the strong/weak control block counted in `subscriber_bytes`
-        // above. That is what a `FundedArc` handle is for, and it is released
-        // when the last handle of either kind goes.
-        //
-        // The second is named for something else entirely: the decoded value
-        // graph an application holds after `ChannelSubscription::recv` turns a
-        // JSON frame into a `T`. The frame's own retention pays for the frame;
-        // nothing paid for the shape the application decodes it into, whose
-        // size this layer cannot see and does not try to. A `ChannelMessage`
-        // therefore keeps a strong handle on this subscriber, which keeps this
-        // term live for exactly as long as any decoded body derived from it.
-        //
-        // One term used to stand in both places, which is to say the decoded
-        // graph was covered by whatever was left over from the allocation
-        // charge. Two terms, so that neither is silently paying the other's
-        // bill.
+        // This residual belongs only to the shared allocation/control block.
+        // A decoded result is not a property of the subscription: applications
+        // may retain any number of distinct messages. Each accepted delivery
+        // therefore acquires its own decoded-result residual below.
         let subscriber_claim = ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, subscriber_bytes),
-            (ResourceClass::OpaqueDependencyResidual, 2),
+            (ResourceClass::OpaqueDependencyResidual, 1),
         ])
         .map_err(|_| GatewayRefusal::Malformed)?;
         let subscriber_allocation = self
@@ -295,20 +280,7 @@ impl ApplicationGateway {
         }
         let node_claim = GatewayMailbox::<GatewayChannelFrame>::node_claim()
             .map_err(|_| GatewayRefusal::Malformed)?;
-        let from_claim = GatewayMailbox::<GatewayChannelFrame>::retention_claim(
-            from.len(),
-            from.len(),
-            usize::from(!from.is_empty()),
-        )
-        .map_err(|_| GatewayRefusal::Malformed)?;
-        let queued_payload = ResourceClaim::single(
-            ResourceClass::QueuedBytes,
-            claim.amount(ResourceClass::AccountedMemoryBytes),
-        );
-        let entry_claim = claim
-            .checked_add(from_claim)
-            .and_then(|claim| claim.checked_add(queued_payload))
-            .map_err(|_| GatewayRefusal::Malformed)?;
+        let entry_claim = channel_delivery_claim(claim, from)?;
         let mut original_payload = Some(payload);
         let mut prepared = Vec::with_capacity(candidate_count);
         for (index, subscriber) in subscribers.iter().enumerate() {
@@ -368,9 +340,44 @@ impl ApplicationGateway {
     }
 }
 
+/// Everything retained by one accepted channel delivery, including one
+/// opaque owner for the application-selected decoded result derived from it.
+/// The residual is deliberately per delivery rather than part of the shared
+/// subscriber claim: retaining N decoded results retains N reservations.
+fn channel_delivery_claim(
+    payload_claim: ResourceClaim,
+    from: &str,
+) -> Result<ResourceClaim, GatewayRefusal> {
+    let from_claim = GatewayMailbox::<GatewayChannelFrame>::retention_claim(
+        from.len(),
+        from.len(),
+        usize::from(!from.is_empty()),
+    )
+    .map_err(|_| GatewayRefusal::Malformed)?;
+    let queued_payload = ResourceClaim::single(
+        ResourceClass::QueuedBytes,
+        payload_claim.amount(ResourceClass::AccountedMemoryBytes),
+    );
+    payload_claim
+        .checked_add(from_claim)
+        .and_then(|claim| claim.checked_add(queued_payload))
+        .and_then(|claim| {
+            claim.checked_add(ResourceClaim::single(
+                ResourceClass::OpaqueDependencyResidual,
+                1,
+            ))
+        })
+        .map_err(|_| GatewayRefusal::Malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    use crate::resource::{
+        FiniteResourceProvider, ResourceAuthorityClass, ResourceProviderPort, ResourceScope,
+    };
 
     /// A gateway over a provider the control keeps, so it can read the ledger
     /// this crate charges against rather than inferring pressure from behaviour.
@@ -400,6 +407,146 @@ mod tests {
             .subscribe_channel("wake-control")
             .expect("the control funds one subscriber");
         (gateway, subscriber)
+    }
+
+    fn one_delivery_subscriber(
+        node: ResourceClaim,
+        retention: ResourceClaim,
+    ) -> (
+        FiniteResourceProvider,
+        ResourceProviderPort,
+        ResourceScope,
+        ChannelSubscriber,
+    ) {
+        let grant = FiniteResourceProvider::scope_record_charge_for_test()
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(node)
+                    .expect("the node reservation is representable"),
+            )
+            .and_then(|grant| {
+                grant.checked_add(
+                    FiniteResourceProvider::reservation_charge_for_test(retention)
+                        .expect("the delivery reservation is representable"),
+                )
+            })
+            .expect("one delivery and its provider records compose");
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone())
+            .expect("the exact grant funds its process scope");
+        let scope = port.process_scope();
+        (provider, port, scope, ChannelSubscriber::new())
+    }
+
+    fn admit_test_delivery(
+        port: &ResourceProviderPort,
+        scope: &ResourceScope,
+        subscriber: &ChannelSubscriber,
+        retention: ResourceClaim,
+        node: ResourceClaim,
+        payload: serde_json::Value,
+    ) -> bool {
+        let Ok(retention) = port.acquire(scope, ResourceAuthorityClass::Admitted, retention) else {
+            return false;
+        };
+        let Ok(node) = port.acquire(scope, ResourceAuthorityClass::Admitted, node) else {
+            return false;
+        };
+        subscriber.accept(
+            GatewayChannelFrame {
+                from: String::new(),
+                payload,
+            },
+            retention,
+            node,
+        );
+        true
+    }
+
+    struct DecodedResult {
+        body: String,
+        _delivery: GatewayDelivery<GatewayChannelFrame>,
+    }
+
+    fn decode_one(
+        subscriber: &ChannelSubscriber,
+        decodes: &std::sync::atomic::AtomicUsize,
+    ) -> DecodedResult {
+        let delivery = subscriber
+            .try_recv()
+            .expect("one admitted delivery is queued");
+        decodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let body = String::deserialize(&delivery.value().payload)
+            .expect("the admitted test payload decodes as a string");
+        DecodedResult {
+            body,
+            _delivery: delivery,
+        }
+    }
+
+    /// One subscription is not permission to retain an unbounded number of
+    /// application-selected decoded graphs. The exact provider admits one
+    /// delivery (node plus off-node owner); once its node is popped, retaining
+    /// the decoded result still prevents the next delivery from completing.
+    /// Dropping that result returns the same capacity for a later delivery.
+    #[test]
+    fn v4_r5_core_f1_one_subscriber_cannot_retain_two_decoded_graphs_under_one_residual() {
+        let payload = serde_json::Value::String("decoded-result".to_owned());
+        let payload_claim = crate::resource::serialized_mailbox_item_claim(&payload)
+            .expect("the payload claim is measurable");
+        let retention = channel_delivery_claim(payload_claim, "")
+            .expect("the per-delivery claim is representable");
+        assert_eq!(
+            retention.amount(ResourceClass::OpaqueDependencyResidual),
+            payload_claim.amount(ResourceClass::OpaqueDependencyResidual) + 1,
+            "each delivery adds exactly one decoded-result residual"
+        );
+        let node = GatewayMailbox::<GatewayChannelFrame>::node_claim()
+            .expect("the mailbox node claim is representable");
+        let (provider, port, scope, subscriber) = one_delivery_subscriber(node, retention);
+        let baseline = provider.in_use();
+        let decodes = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(admit_test_delivery(
+            &port,
+            &scope,
+            &subscriber,
+            retention,
+            node,
+            payload.clone(),
+        ));
+        let first = decode_one(&subscriber, &decodes);
+        assert_eq!(first.body, "decoded-result");
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        assert!(
+            !admit_test_delivery(&port, &scope, &subscriber, retention, node, payload.clone(),),
+            "the first retained result consumes the only decoded-result capacity"
+        );
+        assert!(
+            subscriber.try_recv().is_none(),
+            "the refused delivery was not queued"
+        );
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a delivery refused by capacity is never decoded"
+        );
+
+        drop(first);
+        assert_eq!(provider.in_use(), baseline);
+        assert!(admit_test_delivery(
+            &port,
+            &scope,
+            &subscriber,
+            retention,
+            node,
+            payload,
+        ));
+        let later = decode_one(&subscriber, &decodes);
+        assert_eq!(later.body, "decoded-result");
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::Relaxed), 2);
+        drop(later);
+        assert_eq!(provider.in_use(), baseline);
     }
 
     /// What a subscription is supposed to leave behind when it succeeds.

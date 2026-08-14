@@ -219,6 +219,69 @@ impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for RpcInboundBuilder
     }
 }
 
+/// One subscriber's `ChannelInbound` frame, measured before it exists.
+///
+/// The fan-out is where build-before-admission costs the most: one inbound
+/// frame becomes one owned `ServerOut` per subscriber, and the payload is a
+/// JSON tree whose size a remote peer chose. Building each copy and *then*
+/// offering it to that subscriber's mailbox meant a full or disconnected
+/// subscriber refused an allocation that had already happened, once per
+/// subscriber, at whatever rate the peer sent.
+///
+/// Every field here is a borrow of the funded delivery the pump is holding, so
+/// [`Self::retained_claim`] can answer what the frame will cost without any of
+/// it existing yet, and [`Self::build`] runs only for a subscriber the mailbox
+/// has already admitted.
+struct ChannelInboundBuilder<'a> {
+    /// Borrowed from the pump's route key, which outlives the fan-out.
+    network: &'a str,
+    channel: &'a str,
+    /// Borrowed from the funded `ChannelMessage`, which stays whole for the
+    /// whole fan-out and is not taken apart to make these frames.
+    from: &'a str,
+    payload: &'a Value,
+    /// Incremented by [`Self::build`] and by nothing else, so a control can say
+    /// "a refused subscriber built none" and "an admitted one built exactly
+    /// one" about the production pump rather than about a fixture.
+    #[cfg(test)]
+    builds: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl ChannelInboundBuilder<'_> {
+    fn view(&self) -> crate::ipc::wire::ServerOutView<'_> {
+        crate::ipc::wire::ServerOutView::ChannelInbound {
+            network: self.network,
+            from: self.from,
+            channel: self.channel,
+            payload: self.payload,
+        }
+    }
+}
+
+impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for ChannelInboundBuilder<'_> {
+    fn retained_claim(&self) -> Result<ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+        // Measured over the mirror, priced as the `ServerOut` that will sit in
+        // the queue — the same split, and for the same reason, as
+        // [`RpcInboundBuilder`]: the mirror is a row of references and its own
+        // size would understate the buffers those references point at.
+        myownmesh_core::serialized_mailbox_item_claim_as::<ServerOut>(&self.view())
+    }
+
+    fn build(self) -> ServerOut {
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ServerOut::ChannelInbound {
+            // The four copies this fan-out makes for this subscriber, all of
+            // them past the admission that agreed to pay for them.
+            network: self.network.to_string(),
+            from: self.from.to_string(),
+            channel: self.channel.to_string(),
+            payload: self.payload.clone(),
+        }
+    }
+}
+
 /// Install (or re-install) a synthetic single-shot RPC handler
 /// for `(network_id, method)` on this network's `Rpc`
 /// dispatcher. The handler emits `RpcInbound` to whichever
@@ -695,15 +758,18 @@ async fn run_channel_pump(
                             // Read through the accessors: `msg` is a funded
                             // owner and stays whole for the entire fan-out, so
                             // every subscriber's frame is copied *from* it
-                            // rather than assembled out of its parts. Both
-                            // copies are required — a `ServerOut` owns what it
-                            // carries, and one per subscriber is the frame that
-                            // subscriber will be sent.
-                            let frame = ServerOut::ChannelInbound {
-                                network: key.0.clone(),
-                                from: msg.from().to_string(),
-                                channel: key.1.clone(),
-                                payload: msg.body().clone(),
+                            // rather than assembled out of its parts. Nothing
+                            // is copied here at all — this is a row of borrows
+                            // the subscriber's own mailbox will price, and the
+                            // copies happen inside `build`, past the admission
+                            // that agreed to them.
+                            let builder = ChannelInboundBuilder {
+                                network: &key.0,
+                                channel: &key.1,
+                                from: msg.from(),
+                                payload: msg.body(),
+                                #[cfg(test)]
+                                builds: registry.channel_frame_build_counter(),
                             };
                             // Fan-out has nobody to answer: the frame came
                             // off a broadcast and no peer is waiting on this
@@ -713,7 +779,7 @@ async fn run_channel_pump(
                             // missing a channel message is the failure this
                             // pump exists to make visible. `Closed` is the
                             // ordinary disconnect race and stays at debug.
-                            match client.send(frame) {
+                            match client.send_building(builder) {
                                 Ok(()) => {}
                                 Err(ResourceMailboxAdmissionError::Closed) => debug!(
                                     network = %key.0,
@@ -858,118 +924,28 @@ mod tests {
     // handler body core runs, not a copy of it.
     use super::{
         prepare_handler_for_mode, run_channel_pump, single_handler_call, stream_handler_call,
-        HandlerContext, HandlerDisplacedBuilder, RpcInboundBuilder,
+        ChannelInboundBuilder, HandlerContext, HandlerDisplacedBuilder, RpcInboundBuilder,
     };
     use crate::ipc::clients::{ClientRegistry, HandlerMode, PendingKey, RegistrationError};
     use crate::ipc::wire::ServerOut;
-    use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-    use myownmesh_core::engine::{attach_local, spawn_network};
-    use myownmesh_core::events::{MeshEvent, PeerEvent};
+    // The shared real link. It was defined here, and moved to the crate root
+    // unchanged when the control dispatcher's streaming controls needed the
+    // same one: two copies of a two-peer handshake are two things free to
+    // drift, and a control passing against a link its sibling no longer builds
+    // is exactly the failure that would hide. Everything below calls what this
+    // module used to define.
+    use crate::test_link::{fresh_network, test_transport, two_peer_rpc};
+    use myownmesh_core::engine::spawn_network;
     use myownmesh_core::identity::Identity;
-    use myownmesh_core::transport::Transport;
-    use myownmesh_core::{
-        ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-        ConnectorCallbackServiceWeights, PendingRemoteCandidatePolicy,
-        WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
-    };
-    use myownmesh_signaling::local::LocalBroker;
     use serde_json::Value;
-    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::time::Instant;
 
     // Serialization lives on `crate::exclusive_connector_fixture`, which every
     // connector-consuming family in this binary shares. A mutex local to this
     // module would only stop these three tests racing each other, which was
     // never the problem: they draw on one process-global connector budget that
     // `embedded` and `registry` draw on too.
-
-    struct BridgeTestDrivers {
-        alice: Arc<myownmesh_core::engine::NetworkState>,
-        bob: Arc<myownmesh_core::engine::NetworkState>,
-        drivers: Vec<tokio::task::JoinHandle<()>>,
-    }
-
-    impl BridgeTestDrivers {
-        async fn shutdown(mut self) {
-            // The owner-held coalesced signal, not a queued command: it sets the
-            // flag, wakes the waiters and closes both queues itself, so it
-            // cannot be dropped or outranked by payload traffic the way a
-            // command competing in the same mailbox could be.
-            self.alice.request_shutdown();
-            self.bob.request_shutdown();
-            while let Some(driver) = self.drivers.pop() {
-                let _ = driver.await;
-            }
-        }
-    }
-
-    impl Drop for BridgeTestDrivers {
-        fn drop(&mut self) {
-            // Idempotent by construction, so the explicit `shutdown` above and
-            // this backstop can both run: the flag is a store and the queue
-            // closes are already-closed no-ops on the second call.
-            self.alice.request_shutdown();
-            self.bob.request_shutdown();
-        }
-    }
-
-    fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
-        NetworkConfig {
-            id: id.to_string(),
-            network_id: wire_id.to_string(),
-            label: id.to_string(),
-            kind: Default::default(),
-            topology: TopologyMode::FullMesh,
-            signaling: SignalingConfig::default(),
-            stun_servers: Vec::new(),
-            turn_servers: Vec::new(),
-            roster_path: None,
-            pinned_peers: Vec::new(),
-            auto_approve: true,
-        }
-    }
-
-    fn test_transport() -> Transport {
-        let callback_capacity =
-            NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
-            ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
-            myownmesh_core::RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("test data-only callback policy is valid");
-        let webrtc_profile =
-            WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
-        let policy =
-            WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), webrtc_profile);
-        Transport::new()
-            .expect("transport")
-            .with_connector_resource_policy(policy)
-            .expect("test process connector policy is consistent")
-    }
-
-    async fn wait_for_approval(
-        rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
-        peer_id: &str,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if Instant::now() > deadline {
-                panic!("never saw PeerApproved for {peer_id}");
-            }
-            let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
-            match next {
-                Ok(Ok(MeshEvent::Peer(PeerEvent::Approved { device_id, .. })))
-                    if device_id == peer_id =>
-                {
-                    return;
-                }
-                _ => continue,
-            }
-        }
-    }
 
     /// One engine and its real dispatcher, for the controls that need core to
     /// actually publish something rather than a stand-in.
@@ -1222,6 +1198,62 @@ mod tests {
     /// flat frame of empty strings encodes the same under most ways of getting
     /// it wrong.
     ///
+    /// The same question for the fan-out mirror, and it has to be asked
+    /// separately.
+    ///
+    /// A hand-written mirror is only as good as the check that it still matches,
+    /// and there are now two of them beside one enum. The RPC control proves
+    /// nothing about this variant: they share a tag style and nothing else, and
+    /// a field reordered or renamed here would encode differently while the RPC
+    /// control stayed green. Measured against the encoded bytes rather than the
+    /// fields, because equal fields that encode differently is the failure a
+    /// mirror actually has.
+    #[test]
+    fn v4_r3_daemon_a_measured_channel_frame_matches_the_frame_it_becomes() {
+        use myownmesh_core::{ResourceMailboxItem, ResourceMailboxItemBuilder};
+
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let payload = serde_json::json!({
+            "text": "a body a peer chose the size of",
+            "meta": { "seq": 7, "tags": ["a", "b"] },
+        });
+        let builder = ChannelInboundBuilder {
+            network: "solo/mesh",
+            channel: "transcripts",
+            from: "peer-with-a-name",
+            payload: &payload,
+            builds: &builds,
+        };
+        let measured_bytes = serde_json::to_vec(&builder.view()).expect("the mirror encodes");
+        let measured_claim = builder
+            .retained_claim()
+            .expect("the mirror's claim is representable");
+
+        let built = builder.build();
+        let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
+        let built_claim = built
+            .retained_claim()
+            .expect("the frame's claim is representable");
+
+        assert_eq!(
+            String::from_utf8(measured_bytes).expect("JSON is UTF-8"),
+            String::from_utf8(built_bytes).expect("JSON is UTF-8"),
+            "the mirror must encode byte-for-byte as the frame it prices, or the \
+             admission was taken for a different value than the one queued"
+        );
+        assert_eq!(
+            measured_claim, built_claim,
+            "and the claim answered before the frame existed is the claim the \
+             frame itself answers"
+        );
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "non-vacuity: the counter this control's pressure sibling reads moves \
+             exactly once per built frame, and it moved here"
+        );
+    }
+
     /// [`ServerOutView`]: crate::ipc::wire::ServerOutView
     #[test]
     fn v4_r2_daemon_a_measured_inbound_frame_matches_the_frame_it_becomes() {
@@ -1323,74 +1355,6 @@ mod tests {
             .register(tx)
             .expect("the daemon test grant funds one client record");
         (handle, rx)
-    }
-
-    /// Build two engines and an RPC dispatcher pair sharing one LocalBroker.
-    /// The returned driver owner performs a real shutdown so one process-global
-    /// connector budget is reusable by the next test.
-    #[allow(clippy::type_complexity)]
-    async fn two_peer_rpc(
-        wire_id: &str,
-    ) -> (
-        Arc<myownmesh_core::engine::NetworkState>,
-        Arc<myownmesh_core::engine::NetworkState>,
-        Arc<myownmesh_core::rpc::Rpc>,
-        Arc<myownmesh_core::rpc::Rpc>,
-        Arc<Identity>,
-        Arc<Identity>,
-        BridgeTestDrivers,
-    ) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("MYOWNMESH_HOME", tmp.path());
-        std::mem::forget(tmp); // leak — test scope only
-
-        let broker = LocalBroker::new();
-        let transport = test_transport();
-
-        let alice_id = Arc::new(Identity::ephemeral());
-        let bob_id = Arc::new(Identity::ephemeral());
-
-        let alice_cfg = fresh_network("alice", wire_id);
-        let bob_cfg = fresh_network("bob", wire_id);
-
-        let (alice_state, alice_driver) =
-            spawn_network(alice_cfg, alice_id.clone(), transport.clone())
-                .await
-                .expect("alice engine");
-        let (bob_state, bob_driver) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
-            .await
-            .expect("bob engine");
-        let alice_rpc = Arc::new(
-            myownmesh_core::rpc::Rpc::attach(&alice_state)
-                .expect("Alice's live gateway admits its RPC owner"),
-        );
-        let bob_rpc = Arc::new(
-            myownmesh_core::rpc::Rpc::attach(&bob_state)
-                .expect("Bob's live gateway admits its RPC owner"),
-        );
-
-        let mut alice_events = alice_state.events_tx.subscribe();
-        let mut bob_events = bob_state.events_tx.subscribe();
-        attach_local(&alice_state, &broker);
-        attach_local(&bob_state, &broker);
-
-        wait_for_approval(&mut alice_events, bob_id.public_id()).await;
-        wait_for_approval(&mut bob_events, alice_id.public_id()).await;
-
-        let drivers = BridgeTestDrivers {
-            alice: Arc::clone(&alice_state),
-            bob: Arc::clone(&bob_state),
-            drivers: vec![alice_driver, bob_driver],
-        };
-        (
-            alice_state,
-            bob_state,
-            alice_rpc,
-            bob_rpc,
-            alice_id,
-            bob_id,
-            drivers,
-        )
     }
 
     /// Single-shot RPC routed via the IPC bridge. Alice's
@@ -1841,6 +1805,252 @@ mod tests {
     /// mailbox. The payload is large so that the interval being asserted across
     /// is a real clone and a real serialized measurement -- which is what the
     /// old shape did with the tables held.
+    /// **Review control, blocker 2.** A subscriber whose writer mailbox refuses
+    /// costs no copy of the peer's payload; an admitted one costs exactly one.
+    ///
+    /// The defect this holds down is multiplication. One inbound frame becomes
+    /// one owned `ServerOut` per subscriber, and the payload is a JSON tree a
+    /// remote peer chose the size of, so building each copy before offering it
+    /// meant a full or disconnected subscriber refused an allocation that had
+    /// already been made — once per subscriber, at the peer's chosen rate.
+    /// Moving the fan-out off the registry lock fixed contention and did
+    /// nothing about this.
+    ///
+    /// Driven through the real pump rather than by calling the builder, because
+    /// the property is about *where in the pump* the copy happens. A control
+    /// that invoked `build` itself would be asserting something about its own
+    /// call.
+    ///
+    /// **Two arms, positive first.** The positive is what stops the negative
+    /// passing vacuously: a pump that had stopped delivering entirely would
+    /// satisfy "the refused subscriber built nothing" perfectly. The second
+    /// fan-out is the discriminating one — one pressured subscriber and one
+    /// healthy one, in a single walk, so the healthy subscriber's frame
+    /// arriving is itself the proof that the pump reached and passed the
+    /// pressured one. No sleep and no deadline is doing any work here.
+    #[tokio::test]
+    async fn v4_r3_daemon_a_refused_channel_subscriber_costs_no_copy_of_the_payload() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let (alice_state, bob_state, _alice_rpc, _bob_rpc, _alice_id, bob_id, drivers) =
+            two_peer_rpc("ipc-bridge-refused-fanout").await;
+
+        let registry = ClientRegistry::default();
+        let net_key = "alice".to_string();
+        let chan_key = "catalog".to_string();
+        let key = (net_key.clone(), chan_key.clone());
+        let payload = serde_json::json!({ "entries": "x".repeat(4096) });
+
+        // **The pressured subscriber is funded privately, and it subscribes
+        // first.** Both halves of that are load-bearing.
+        //
+        // Privately, because the first version of this control filled a mailbox
+        // on `test_application_scope()` — the grant the whole daemon test binary
+        // shares, and the one the real publisher below draws on. The fill
+        // starved `send_to` itself, which was refused for
+        // `CallbackOrScheduledWork` before the fan-out ran, so the walk this
+        // control is about never happened and the discriminating assertion
+        // never executed.
+        //
+        // First, because `subscriber_after` resumes by ascending membership id.
+        // If the healthy member held the lower id, its frame arriving would
+        // prove only that the walk started — not that it had reached the
+        // pressured member at all, which is the entire claim. Do not reorder
+        // these subscriptions for tidiness: the order *is* the proof.
+        let sizing_builds = std::sync::atomic::AtomicUsize::new(0);
+        let sizing = ChannelInboundBuilder {
+            network: &net_key,
+            channel: &chan_key,
+            from: bob_id.public_id(),
+            payload: &payload,
+            builds: &sizing_builds,
+        };
+        // Every term production's own, and exactly the terms this mailbox will
+        // spend: the port's process scope and the lab child issued under it,
+        // the mailbox root's reservation, and one frame of the size the
+        // positive arm is about to deliver. No slack, so "one item fits and the
+        // next does not" is arithmetic rather than a guessed bound.
+        let grant = myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+            .checked_scale(2)
+            .expect("two scope planning charges compose")
+            .checked_add(
+                myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                    myownmesh_core::ResourceMailboxSender::<ServerOut>::root_claim()
+                        .expect("the writer mailbox root claim is representable"),
+                )
+                .expect("the mailbox root's reservation is representable"),
+            )
+            .expect("the root joins the scope charges")
+            .checked_add(
+                myownmesh_core::ResourceMailboxSender::<ServerOut>::building_item_planning_charge(
+                    &sizing,
+                )
+                .expect("one planned channel frame is representable"),
+            )
+            .expect("the private writer grant composes");
+        assert_eq!(
+            sizing_builds.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "non-vacuity: planning the grant costs no built frame, so the \
+             counter this control reads still starts at zero"
+        );
+
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(grant),
+        )
+        .expect("the private grant accounts for its own process scope");
+        let pressured_scope =
+            myownmesh_core::LocalApplicationResourceScope::transport_lab_child_of(&port)
+                .expect("the private grant issues one local application scope");
+        let (pressured_tx, mut first_rx) =
+            myownmesh_core::resource_mailbox::<ServerOut>(pressured_scope)
+                .expect("the private grant funds exactly one writer mailbox");
+        let first = registry
+            .register(pressured_tx)
+            .expect("the daemon test grant funds one client record");
+
+        let crate::ipc::ChannelJoin::Install(installing) = registry
+            .subscribe_channel(key.clone(), first.id)
+            .expect("the daemon test grant funds this fixture's subscription")
+        else {
+            panic!("the first subscriber owns the install")
+        };
+
+        let channel: myownmesh_core::Channel<Value> =
+            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+        let sub = channel
+            .subscribe()
+            .expect("the fixture's channel admits a subscription");
+        let cancel = registry
+            .route_cancellation()
+            .expect("the daemon test grant funds one pump cancellation");
+        let task = registry
+            .lease_task()
+            .expect("the daemon test grant funds one pump task");
+        let pump = tokio::spawn(run_channel_pump(
+            sub,
+            key.clone(),
+            registry.clone(),
+            cancel.clone(),
+            task,
+        ));
+        assert!(
+            registry
+                .finish_channel_install(&key, &installing, Some((cancel, pump)))
+                .is_none(),
+            "the installer publishes its own pump into its own route"
+        );
+        assert!(
+            installing.wait().await,
+            "and its followers are told it worked"
+        );
+
+        let bob_channel: myownmesh_core::Channel<Value> =
+            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+
+        // Positive. The isolated subscriber is the only member, its grant funds
+        // exactly this frame, and one publish costs exactly one build.
+        let built_before = registry.channel_frames_built();
+        bob_channel
+            .send_to(_alice_id_arg(&alice_state), &payload)
+            .await
+            .expect("bob publishes on the channel");
+        let frame = tokio::time::timeout(Duration::from_secs(10), first_rx.recv())
+            .await
+            .expect("hang guard: an admitted subscriber is delivered to")
+            .expect("the subscriber's mailbox is live");
+        assert!(
+            matches!(frame.value(), ServerOut::ChannelInbound { .. }),
+            "the admitted subscriber receives the channel frame it subscribed for"
+        );
+        assert_eq!(
+            registry.channel_frames_built(),
+            built_before + 1,
+            "non-vacuity: an admitted subscriber costs exactly one built frame, \
+             so the counter the negative arm reads is one that genuinely moves"
+        );
+
+        // Hand the item charge back, so the private grant is once again worth
+        // exactly one frame and the fill below has somewhere to start.
+        drop(frame);
+
+        // Fill that same isolated writer, with the one frame whose charge the
+        // grant was sized from. Two sends, no loop and no constant: the grant is
+        // exactly one such item wide, so the first must be admitted and the
+        // second must not, and both directions are arithmetic rather than a
+        // search.
+        //
+        // Deliberately this frame rather than a small `Lagged` one. A filler of
+        // a different size class would make "how many fit" depend on which
+        // dimension binds first, which is the guessed bound this control had
+        // once and should not have again. Sending it directly costs no build:
+        // the counter lives inside the builder, and nothing here goes through
+        // one.
+        let filler = || ServerOut::ChannelInbound {
+            network: net_key.clone(),
+            from: bob_id.public_id().to_string(),
+            channel: chan_key.clone(),
+            payload: payload.clone(),
+        };
+        first.send(filler()).expect(
+            "the grant was sized for exactly one frame of this shape, so the \
+             first one fits — if it does not, the sizing above is wrong and \
+             every assertion after it would be measuring the wrong mailbox",
+        );
+        assert!(
+            first.send(filler()).is_err(),
+            "and the second does not, so the mailbox the fan-out is about to \
+             reach is genuinely full rather than merely small"
+        );
+
+        // Only now the healthy member, which therefore takes the higher
+        // membership id and is reached second.
+        let (second, mut second_rx) = fresh_ipc_client(&registry);
+        registry
+            .subscribe_channel(key.clone(), second.id)
+            .expect("the daemon test grant funds a second subscription");
+
+        let built_before = registry.channel_frames_built();
+        bob_channel
+            .send_to(_alice_id_arg(&alice_state), &payload)
+            .await
+            .expect("bob publishes a second frame on the channel");
+        let frame = tokio::time::timeout(Duration::from_secs(10), second_rx.recv())
+            .await
+            .expect("hang guard: the healthy subscriber is still delivered to")
+            .expect("the healthy subscriber's mailbox is live");
+        assert!(
+            matches!(frame.value(), ServerOut::ChannelInbound { .. }),
+            "a subscriber the walk reaches after a refused one is still served"
+        );
+        assert_eq!(
+            registry.channel_frames_built(),
+            built_before + 1,
+            "and that whole fan-out built exactly one frame: the pressured \
+             subscriber was reached first, measured, and refused without the \
+             payload ever being copied for it, which is the allocation this \
+             control exists to forbid"
+        );
+
+        // Shut the pump down before returning, cooperatively, rather than
+        // dropping it and hoping.
+        //
+        // The pump holds a `WorkerOrTask` lease drawn from the binary-wide
+        // daemon grant for as long as it is alive, and that grant is nine tasks
+        // wide for the whole test binary. A control that returns while its pump
+        // is still running therefore lends that lease to whatever runs next —
+        // which is exactly how this control made the neighbouring fan-out
+        // control fail at nine of nine, for `WorkerOrTask` rather than for
+        // anything to do with fan-out. `begin_closing` is the pump's own
+        // cooperative exit, the same one production uses, and the driver
+        // shutdown is awaited the way the neighbouring control awaits its own.
+        registry.begin_closing();
+        drivers.shutdown().await;
+        // Last, and after the shutdown: the private provider funds the
+        // pressured mailbox, so releasing it any earlier would release the
+        // pressure the assertions above depend on.
+        drop(port);
+    }
+
     #[tokio::test]
     async fn v4_r2_daemon_a_large_channel_frame_does_not_hold_the_registry_while_it_fans_out() {
         let _fixture = crate::exclusive_connector_fixture().await;

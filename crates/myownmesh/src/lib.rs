@@ -20,6 +20,15 @@ pub mod ipc;
 pub mod registry;
 pub mod services;
 
+/// One real two-peer link, shared by the families whose controls need one.
+///
+/// Test-only and crate-private: it compiles into no production build and is
+/// nameable from no production path. It sits beside the fixtures below for the
+/// same reason they do — more than one family needs it, so no single family can
+/// own it without the others copying it.
+#[cfg(test)]
+pub(crate) mod test_link;
+
 #[cfg(test)]
 pub(crate) const TEST_PROCESS_CONNECTOR_CAPACITY: usize = 4;
 /// The largest single payload this binary's fixtures fund, per callback class.

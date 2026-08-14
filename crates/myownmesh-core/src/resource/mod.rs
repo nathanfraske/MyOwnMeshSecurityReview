@@ -483,6 +483,39 @@ impl LocalApplicationResourceScope {
         })
     }
 
+    /// One application scope under an explicitly supplied port, for another
+    /// crate's controls.
+    ///
+    /// **A private owner, not a wider door.** A daemon control that wants to
+    /// watch a charge appear and go away needs a provider whose whole grant it
+    /// chose, and it cannot get one through the ordinary issuer: that reads the
+    /// installed process provider, so a control sized against it would either be
+    /// measuring a pool other tests share or be quietly starving
+    /// `ProcessResourceRoot`. Handing the port in makes the owner exactly as
+    /// private as the control's own `FiniteResourceProvider`.
+    ///
+    /// This is deliberately a *factory over the same two calls the production
+    /// issuer makes* — `create_scope` under the port's process scope — and not
+    /// raw construction from a port and a scope. Raw construction would let a
+    /// caller pair a port with a scope it does not own, which is a shape no
+    /// production path can produce, and controls built on it would be proving
+    /// something about an arrangement that cannot occur.
+    ///
+    /// Feature-gated and hidden because it exists for cross-crate controls. It
+    /// widens no authority: everything reachable through the returned scope is
+    /// bounded by the grant the caller already had.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn transport_lab_child_of(
+        provider: &ResourceProviderPort,
+    ) -> Result<Self, ResourceUnavailable> {
+        let scope = provider.create_scope(&provider.process_scope())?;
+        Ok(Self {
+            provider: provider.clone(),
+            scope,
+        })
+    }
+
     pub fn acquire(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
         self.provider
             .acquire(&self.scope, ResourceAuthorityClass::Admitted, claim)

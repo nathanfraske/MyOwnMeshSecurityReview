@@ -8,15 +8,18 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use myownmesh_core::{MeshConfig, NetworkConfig, TopologyMode};
 use tracing::{info, warn};
 
 use crate::registry::RemoveResult;
 
-use super::super::ControlState;
-use crate::control::framing::{
-    FundedVariableReply, NetworkLifecycleSummary, OperationReplyData, VariableOperationPlan,
+use super::super::{ConnectionCancel, ControlState};
+use super::{funded, unknown_network, Answer};
+use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
+use crate::control::reply::{
+    prepare_reply_then, variable_operation_claim, FundedVariableReply, NetworkLifecycleSummary,
+    OperationReplyData, PreparedReply, PreparedText, VariableOperationPlan,
 };
 
 /// Join a fresh network through the live mesh, attach signaling,
@@ -277,12 +280,48 @@ pub(in crate::control) fn network_reconnect(
     }
 }
 
-/// Deliberately dial one peer on a joined network — the control-socket wrapper
-/// around [`myownmesh_core::JoinedNetwork::connect_peer`]. Single-shot: queues
-/// the offerer-side dial on the engine and returns at once (the outcome rides
-/// the event stream), so a daemon client on a `Silent` network can open exactly
+/// Deliberately dial one peer on a joined network, and answer.
+///
+/// The `Option` is the truthful shape for an operation the connection can
+/// outlive: a dial cancelled by the socket draining produced no outcome, so
+/// there is nothing to say and the loop ends. Every other result — including
+/// a refused or timed-out dial — is a reply.
+///
+/// The residual the answer will occupy is admitted *before* the dial starts,
+/// which is why the lease and the plan are taken here rather than after the
+/// `select!`: a dial that succeeds must not then discover it has nowhere to
+/// report the success.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::control) async fn connect_peer(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    cancel: &ConnectionCancel,
+    network: String,
+    peer: String,
+    pin: bool,
+    wait_ms: u64,
+) -> Result<Option<Answer>> {
+    let lease = admission
+        .acquire_claim(variable_operation_claim())
+        .context("network connect result was not admitted")?;
+    let plan = FundedVariableReply::begin_operation(lease)
+        .map_err(|_| anyhow!("network operation lease did not match"))?;
+    let variable = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(None),
+        result = connect_peer_funded(state, &network, &peer, pin, wait_ms, plan) => result,
+    };
+    let output = AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, admission)
+        .context("network connect response line was not admitted")?;
+    Ok(Some((PreparedReply::Variable(variable), output)))
+}
+
+/// The dial itself — the control-socket wrapper around
+/// [`myownmesh_core::JoinedNetwork::connect_peer`]. Single-shot: queues the
+/// offerer-side dial on the engine and returns at once (the outcome rides the
+/// event stream), so a daemon client on a `Silent` network can open exactly
 /// one connection after matching a peer's Support ID.
-pub(in crate::control) async fn network_connect_peer(
+async fn connect_peer_funded(
     state: &Arc<ControlState>,
     key: &str,
     peer: &str,
@@ -620,5 +659,85 @@ pub(in crate::control) fn parse_topology(
         other => Err(format!(
             "unknown topology '{other}' — expected ring | star | hubs | full_mesh"
         )),
+    }
+}
+
+/// This node's overall status: identity, networks, realtime, all at once.
+///
+/// The snapshot is taken behind one admission rather than field by field, so
+/// the answer describes a single moment instead of a walk across several.
+pub(in crate::control) fn node_status(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+) -> Result<Answer> {
+    let source = state
+        .registry
+        .status_source(state.mesh.identity(), &state.realtime);
+    let typed_claim = source
+        .typed_claim()
+        .context("status typed claim was not representable")?;
+    let line_ceiling = source
+        .line_ceiling()
+        .context("status line ceiling was not representable")?;
+    let (committed, output) =
+        prepare_typed_and_line_building(typed_claim, line_ceiling, admission, |typed| {
+            source.commit(typed)
+        })
+        .context("status snapshot or response line was not admitted")?;
+    let status = committed.map_err(|_| anyhow!("status typed claim changed before commit"))?;
+    Ok((PreparedReply::Status(status), output))
+}
+
+/// Every network this device has joined.
+pub(in crate::control) fn networks_list(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+) -> Result<Answer> {
+    let plan = state
+        .registry
+        .prepare_networks_list()
+        .context("NetworksList capacity was not representable")?;
+    let typed = admission
+        .acquire_claim(plan.typed_claim())
+        .context("NetworksList typed snapshot was not admitted")?;
+    let work = admission
+        .acquire_claim(plan.work_claim())
+        .context("NetworksList snapshot work was not admitted")?;
+    let plan = plan
+        .measure_line_ceiling(&work)
+        .context("NetworksList line capacity was not representable")?;
+    let output = AdmittedLineOut::prepare_capacity(plan.line_ceiling(), admission)
+        .context("NetworksList response line was not admitted")?;
+    let networks = plan
+        .commit(typed, work)
+        .map_err(|_| anyhow!("NetworksList changed shape while its funded snapshot was built"))?;
+    Ok((PreparedReply::Networks(networks), output))
+}
+
+/// Advertise what this device can do on one network.
+pub(in crate::control) async fn capabilities_set(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+    capabilities: myownmesh_core::protocol::CapabilityAdvert,
+) -> Result<Answer> {
+    let Some(net) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let reply = PreparedReply::Bool {
+        key: "advertised",
+        value: true,
+    };
+    let (advertised, output) =
+        prepare_reply_then(&reply, admission, || net.advertise(capabilities))
+            .context("capability-advert response capacity was not admitted")?;
+    match advertised {
+        Ok(()) => Ok((reply, output)),
+        Err(error) => {
+            drop(output);
+            let text = PreparedText::rpc_advertise_error(&error, admission)
+                .context("capability-advert refusal text was not admitted")?;
+            funded(PreparedReply::Error(text), admission)
+        }
     }
 }
