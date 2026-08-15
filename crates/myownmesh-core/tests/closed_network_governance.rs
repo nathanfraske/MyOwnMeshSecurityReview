@@ -86,12 +86,16 @@ async fn cross_approve(
     // First prove local ratification. Keeping this barrier separate from Bob's
     // adoption makes a failure identify the exact side of the boundary instead
     // of timing out on a combined predicate that says neither.
-    wait_for(Duration::from_secs(10), || {
-        member_granted(
-            &alice.governance_state.read().member_log,
-            bob_id.public_id(),
-        )
-    })
+    wait_for(
+        "alice's member log grants bob",
+        Duration::from_secs(10),
+        || {
+            member_granted(
+                &alice.governance_state.read().member_log,
+                bob_id.public_id(),
+            )
+        },
+    )
     .await;
 
     // Separately prove that production anti-entropy delivered the exact signed
@@ -100,9 +104,11 @@ async fn cross_approve(
     // member tiers together, and a Bob without this seed would project himself
     // as absent and synchronously revoke the link needed for later convergence.
     // This wait performs no replay, broadcast, sleep, or local mutation.
-    wait_for(Duration::from_secs(10), || {
-        member_granted(&bob.governance_state.read().member_log, bob_id.public_id())
-    })
+    wait_for(
+        "bob's member log grants bob",
+        Duration::from_secs(10),
+        || member_granted(&bob.governance_state.read().member_log, bob_id.public_id()),
+    )
     .await;
 }
 
@@ -193,10 +199,14 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
     .expect("propose");
 
     // Wait until both sides see the ratified transition.
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
 
     // Founder election: Alice (the sole signer) is Owner; Bob, already present
@@ -325,10 +335,14 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     )
     .await
     .expect("propose close");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
 
     // Alice (Owner) admits Carol with a single signed `RoleGrant` — the quorum
@@ -346,18 +360,22 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     .expect("propose member grant");
 
     // Carol lands in the OWNER's roster immediately (ratified + mirrored locally).
-    wait_for(Duration::from_secs(10), || {
-        rostered(&alice_state, carol_id.public_id())
-    })
+    wait_for(
+        "alice's roster carries carol",
+        Duration::from_secs(10),
+        || rostered(&alice_state, carol_id.public_id()),
+    )
     .await;
 
     // The whole point: Carol converges into BOB's roster too — derived from
     // Alice's verified signed log — even though Carol is offline and only the
     // owner ever signed her in. Before signed membership, Bob could learn a
     // co-member only from live owner gossip; now the log carries it, complete.
-    wait_for(Duration::from_secs(10), || {
-        rostered(&bob_state, carol_id.public_id())
-    })
+    wait_for(
+        "bob's roster carries carol",
+        Duration::from_secs(10),
+        || rostered(&bob_state, carol_id.public_id()),
+    )
     .await;
     assert_eq!(
         bob_state
@@ -421,10 +439,14 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
     )
     .await
     .expect("propose close");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
     myownmesh_core::engine::governance::propose(
         &alice_state,
@@ -439,9 +461,11 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
 
     // Carol converges into Bob's roster via the signed log — Bob only ever
     // learns her through gossip, never a direct connection.
-    wait_for(Duration::from_secs(10), || {
-        rostered(&bob_state, carol_id.public_id())
-    })
+    wait_for(
+        "bob's roster carries carol",
+        Duration::from_secs(10),
+        || rostered(&bob_state, carol_id.public_id()),
+    )
     .await;
 
     // Alice evicts Carol (the propagating lost-device kick).
@@ -456,12 +480,14 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
     .expect("evict carol");
 
     // Gone on the owner (local ratify path already removed her)...
-    wait_for(Duration::from_secs(10), || {
-        !rostered(&alice_state, carol_id.public_id())
-    })
+    wait_for(
+        "carol leaves alice's roster",
+        Duration::from_secs(10),
+        || !rostered(&alice_state, carol_id.public_id()),
+    )
     .await;
     // ...and — the fix — gone on Bob too, who learned the evict only via gossip.
-    wait_for(Duration::from_secs(10), || {
+    wait_for("carol leaves bob's roster", Duration::from_secs(10), || {
         !rostered(&bob_state, carol_id.public_id())
     })
     .await;
@@ -529,10 +555,14 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     )
     .await
     .expect("propose close");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
 
     // Alice promotes Bob to manager (Controller) — owner-only authority. This
@@ -547,13 +577,17 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     )
     .await
     .expect("grant controller");
-    wait_for(Duration::from_secs(10), || {
-        bob_state
-            .governance_state
-            .read()
-            .role_of(bob_id.public_id())
-            == Role::Controller
-    })
+    wait_for(
+        "bob's governance view makes bob a controller",
+        Duration::from_secs(10),
+        || {
+            bob_state
+                .governance_state
+                .read()
+                .role_of(bob_id.public_id())
+                == Role::Controller
+        },
+    )
     .await;
 
     // Bob — now a manager — admits Dave. Authority for a member grant is ≥1
@@ -569,7 +603,7 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     )
     .await
     .expect("manager admits dave");
-    wait_for(Duration::from_secs(10), || {
+    wait_for("bob's roster carries dave", Duration::from_secs(10), || {
         rostered(&bob_state, dave_id.public_id())
     })
     .await;
@@ -595,9 +629,11 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
 
     // And it converges to the OWNER by union-merge: Alice never signed Dave, yet
     // recognises Bob's manager-authored admission and surfaces Dave as a member.
-    wait_for(Duration::from_secs(10), || {
-        rostered(&alice_state, dave_id.public_id())
-    })
+    wait_for(
+        "alice's roster carries dave",
+        Duration::from_secs(10),
+        || rostered(&alice_state, dave_id.public_id()),
+    )
     .await;
     assert_eq!(
         alice_state
@@ -656,10 +692,14 @@ async fn deny_invalidates_proposal_on_both_sides() {
     )
     .await
     .expect("propose close");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
 
     // Bob is a member, so he has no authority to admit anyone — but a member
@@ -688,14 +728,18 @@ async fn deny_invalidates_proposal_on_both_sides() {
     );
 
     // It reaches Alice as a pending decision.
-    wait_for(Duration::from_secs(10), || {
-        alice_state
-            .governance_state
-            .read()
-            .pending
-            .iter()
-            .any(|p| p.id == proposal_id)
-    })
+    wait_for(
+        "alice holds the pending proposal",
+        Duration::from_secs(10),
+        || {
+            alice_state
+                .governance_state
+                .read()
+                .pending
+                .iter()
+                .any(|p| p.id == proposal_id)
+        },
+    )
     .await;
 
     // Alice denies. The proposal should disappear from both sides on the next
@@ -704,23 +748,31 @@ async fn deny_invalidates_proposal_on_both_sides() {
         .await
         .expect("alice deny");
 
-    wait_for(Duration::from_secs(10), || {
-        let a = alice_state.governance_state.read();
-        let b = bob_state.governance_state.read();
-        a.pending.is_empty() && b.pending.is_empty()
-    })
+    wait_for(
+        "both members clear their pending proposals",
+        Duration::from_secs(10),
+        || {
+            let a = alice_state.governance_state.read();
+            let b = bob_state.governance_state.read();
+            a.pending.is_empty() && b.pending.is_empty()
+        },
+    )
     .await;
 
     // Pending convergence can precede member-tier anti-entropy: Bob may
     // self-ratify the genesis and clear the proposal before Alice's signed Bob
     // grant has merged. Wait for that exact seed before using its presence to
     // make Carol's absence non-vacuous below.
-    wait_for(Duration::from_secs(10), || {
-        member_granted(
-            &bob_state.governance_state.read().member_log,
-            bob_id.public_id(),
-        )
-    })
+    wait_for(
+        "bob's member log grants bob after the denial",
+        Duration::from_secs(10),
+        || {
+            member_granted(
+                &bob_state.governance_state.read().member_log,
+                bob_id.public_id(),
+            )
+        },
+    )
     .await;
 
     assert!(
@@ -1006,9 +1058,11 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     .await
     .expect("promote bob");
     // The mirrored roster tag should read controller on the authoring device.
-    wait_for(Duration::from_secs(5), || {
-        roster_role(&alice_state, &bob_pk) == Some(Role::Controller)
-    })
+    wait_for(
+        "alice's roster tags bob a controller",
+        Duration::from_secs(5),
+        || roster_role(&alice_state, &bob_pk) == Some(Role::Controller),
+    )
     .await;
 
     // Withdraw Bob's role back to a plain member.
@@ -1103,10 +1157,14 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     )
     .await
     .expect("found");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
     propose(
         &alice_state,
@@ -1118,9 +1176,11 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     )
     .await
     .expect("admit carol");
-    wait_for(Duration::from_secs(10), || {
-        rostered(&bob_state, carol_id.public_id())
-    })
+    wait_for(
+        "bob's roster carries carol",
+        Duration::from_secs(10),
+        || rostered(&bob_state, carol_id.public_id()),
+    )
     .await;
     propose(
         &alice_state,
@@ -1131,9 +1191,14 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     )
     .await
     .expect("evict carol while she is offline");
-    wait_for(Duration::from_secs(10), || {
-        !rostered(&alice_state, carol_id.public_id()) && !rostered(&bob_state, carol_id.public_id())
-    })
+    wait_for(
+        "carol leaves both members' rosters",
+        Duration::from_secs(10),
+        || {
+            !rostered(&alice_state, carol_id.public_id())
+                && !rostered(&bob_state, carol_id.public_id())
+        },
+    )
     .await;
 
     // Carol comes back online, clueless, and redials the mesh.
@@ -1142,11 +1207,15 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     // She learns: some member's handshake denies her with the signed log,
     // she adopts it (strict extension over her empty log), and the
     // verified verdict stands her down.
-    wait_for(Duration::from_secs(20), || {
-        carol_state
-            .self_evicted
-            .load(std::sync::atomic::Ordering::SeqCst)
-    })
+    wait_for(
+        "carol adopts the proof and stands down",
+        Duration::from_secs(20),
+        || {
+            carol_state
+                .self_evicted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        },
+    )
     .await;
     assert!(
         carol_state
@@ -1233,10 +1302,14 @@ async fn two_owners_converge_their_rosters() {
     )
     .await
     .expect("found");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
     propose(
         &alice_state,
@@ -1251,18 +1324,22 @@ async fn two_owners_converge_their_rosters() {
 
     // Both sides must agree Bob is a *full* owner — not just on Alice's view.
     // (This is the "only one acts like the real owner" half of the symptom.)
-    wait_for(Duration::from_secs(10), || {
-        alice_state
-            .governance_state
-            .read()
-            .role_of(bob_id.public_id())
-            == Role::Owner
-            && bob_state
+    wait_for(
+        "both governance views make bob an owner",
+        Duration::from_secs(10),
+        || {
+            alice_state
                 .governance_state
                 .read()
                 .role_of(bob_id.public_id())
                 == Role::Owner
-    })
+                && bob_state
+                    .governance_state
+                    .read()
+                    .role_of(bob_id.public_id())
+                    == Role::Owner
+        },
+    )
     .await;
 
     // Each owner independently admits a different member (both offline).
@@ -1290,12 +1367,16 @@ async fn two_owners_converge_their_rosters() {
     // The union-merged member log must converge: BOTH owners end up holding BOTH
     // members. This is the "rosters never converge between the two owners"
     // symptom turned into a passing assertion.
-    wait_for(Duration::from_secs(15), || {
-        rostered(&alice_state, carol_id.public_id())
-            && rostered(&alice_state, dave_id.public_id())
-            && rostered(&bob_state, carol_id.public_id())
-            && rostered(&bob_state, dave_id.public_id())
-    })
+    wait_for(
+        "both rosters carry both offline members",
+        Duration::from_secs(15),
+        || {
+            rostered(&alice_state, carol_id.public_id())
+                && rostered(&alice_state, dave_id.public_id())
+                && rostered(&bob_state, carol_id.public_id())
+                && rostered(&bob_state, dave_id.public_id())
+        },
+    )
     .await;
     assert!(
         rostered(&alice_state, dave_id.public_id()),
@@ -1353,10 +1434,14 @@ async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
     )
     .await
     .expect("close proposal");
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().kind == NetworkKind::Closed
-            && bob_state.governance_state.read().kind == NetworkKind::Closed
-    })
+    wait_for(
+        "both members see the network closed",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().kind == NetworkKind::Closed
+                && bob_state.governance_state.read().kind == NetworkKind::Closed
+        },
+    )
     .await;
 
     // The owner designates herself the network's infra hub. One signed
@@ -1377,12 +1462,16 @@ async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
 
     // Both governance views AND both runtime selectors converge — Bob
     // never signs anything; adopting the extended log reshapes him.
-    wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().topology.as_ref() == Some(&governed)
-            && bob_state.governance_state.read().topology.as_ref() == Some(&governed)
-            && *alice_state.topology.read() == governed
-            && *bob_state.topology.read() == governed
-    })
+    wait_for(
+        "both views and both selectors take the topology",
+        Duration::from_secs(10),
+        || {
+            alice_state.governance_state.read().topology.as_ref() == Some(&governed)
+                && bob_state.governance_state.read().topology.as_ref() == Some(&governed)
+                && *alice_state.topology.read() == governed
+                && *bob_state.topology.read() == governed
+        },
+    )
     .await;
 
     // The governed log re-verifies from scratch — what a third node
@@ -1430,7 +1519,17 @@ async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
     }
 }
 
-async fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) {
+/// Poll `check` until it holds, or fail naming the step that never converged.
+///
+/// `what` is the whole reason this takes a label. The panic is raised here, so
+/// its location names this helper rather than the caller, and this file has
+/// twenty-eight waits — several of them the same predicate in different tests.
+/// A timeout was therefore unattributable to any one convergence step, which is
+/// exactly the position a Windows failure at this line left the diagnosis in.
+///
+/// Diagnostic only: the caller's timeout, the polling interval and every
+/// predicate are unchanged. This adds a name to a failure, not a behaviour.
+async fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if check() {
@@ -1438,7 +1537,7 @@ async fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("wait_for predicate never satisfied within {timeout:?}");
+    panic!("wait_for predicate never satisfied within {timeout:?}: {what}");
 }
 
 /// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
