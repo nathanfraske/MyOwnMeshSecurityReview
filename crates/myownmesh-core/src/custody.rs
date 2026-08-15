@@ -92,13 +92,70 @@ pub fn is_enrolled(network_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// One enrollment that exists but is not yet this device's lock.
+///
+/// Custody material is the one thing a caller cannot ask for twice: the secret
+/// and the recovery codes are shown exactly once and are never recoverable from
+/// disk. So the two halves are separable. Everything is generated here and
+/// nothing is written, which means a caller that could not hand the material to
+/// whoever asked for it leaves this device with **no** enrollment at all —
+/// rather than one whose secret nobody holds and which can only be removed by
+/// presenting a code nobody has.
+///
+/// Dropping this value is therefore a complete rollback: it never touched disk.
+#[must_use = "an enrollment that is neither committed nor deliberately dropped installs no lock"]
+pub struct PreparedEnrollment {
+    network_id: String,
+    enrolled: Enrolled,
+    record: Enrollment,
+}
+
+impl PreparedEnrollment {
+    /// The material the caller must show exactly once.
+    pub fn enrolled(&self) -> &Enrolled {
+        &self.enrolled
+    }
+
+    /// The network this would lock.
+    pub fn network_id(&self) -> &str {
+        &self.network_id
+    }
+
+    /// Make it this device's lock.
+    ///
+    /// The duplicate check runs again here, against the store as it is now: a
+    /// second enrollment that landed while this one was being handed off keeps
+    /// its own lock rather than being overwritten by an older preparation.
+    pub fn commit(self) -> Result<()> {
+        commit_enrollment_at(&store_path()?, self)
+    }
+
+    /// [`Self::commit`] against an explicit store, as every other operation
+    /// here has: the controls must not write to the real one.
+    #[cfg(test)]
+    fn commit_at(self, path: &Path) -> Result<()> {
+        commit_enrollment_at(path, self)
+    }
+}
+
 /// Enroll a fresh TOTP authenticator for `network_id` on this device.
 /// `account` is the human label shown in the authenticator app (e.g. the
 /// device label). Fails if an enrollment already exists — [`disable`] it
 /// first (which itself requires a valid code), so the lock can't be
 /// silently rotated away.
+///
+/// Prepares and commits in one step. A caller that must hand the material over
+/// before the lock exists uses [`prepare_enroll`] and commits once it has.
 pub fn enroll(network_id: &str, account: &str) -> Result<Enrolled> {
-    enroll_at(&store_path()?, network_id, account)
+    let prepared = prepare_enroll(network_id, account)?;
+    let enrolled = prepared.enrolled.clone();
+    prepared.commit()?;
+    Ok(enrolled)
+}
+
+/// Generate an enrollment without installing it. See [`PreparedEnrollment`].
+pub fn prepare_enroll(network_id: &str, account: &str) -> Result<PreparedEnrollment> {
+    prepare_enroll_at(&store_path()?, network_id, account)
 }
 
 /// The gate. `Ok(())` when the network has no enrollment on this device (the
@@ -121,8 +178,8 @@ pub fn disable(network_id: &str, code: &str) -> Result<()> {
 // Path-injectable core (so unit tests never touch the real secrets dir)
 // ---------------------------------------------------------------------------
 
-fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
-    let mut store = load_at(path)?;
+fn prepare_enroll_at(path: &Path, network_id: &str, account: &str) -> Result<PreparedEnrollment> {
+    let store = load_at(path)?;
     if store.networks.contains_key(network_id) {
         return Err(Error::Custody(format!(
             "network {network_id} already has MFA enrolled on this device; disable it first"
@@ -133,20 +190,39 @@ fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
     let recovery_codes = gen_recovery_codes();
     let recovery_hashes = recovery_codes.iter().map(|c| hash_code(c)).collect();
     let otpauth_uri = provisioning_uri(&secret_b32, account);
-    store.networks.insert(
-        network_id.to_string(),
-        Enrollment {
+    Ok(PreparedEnrollment {
+        network_id: network_id.to_string(),
+        enrolled: Enrolled {
             secret_b32: secret_b32.clone(),
+            otpauth_uri,
+            recovery_codes,
+        },
+        record: Enrollment {
+            secret_b32,
             recovery_hashes,
             created_at: now_unix(),
         },
-    );
-    save_at(path, &store)?;
-    Ok(Enrolled {
-        secret_b32,
-        otpauth_uri,
-        recovery_codes,
     })
+}
+
+fn commit_enrollment_at(path: &Path, prepared: PreparedEnrollment) -> Result<()> {
+    let mut store = load_at(path)?;
+    if store.networks.contains_key(&prepared.network_id) {
+        return Err(Error::Custody(format!(
+            "network {} already has MFA enrolled on this device; disable it first",
+            prepared.network_id
+        )));
+    }
+    store.networks.insert(prepared.network_id, prepared.record);
+    save_at(path, &store)
+}
+
+#[cfg(test)]
+fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
+    let prepared = prepare_enroll_at(path, network_id, account)?;
+    let enrolled = prepared.enrolled.clone();
+    commit_enrollment_at(path, prepared)?;
+    Ok(enrolled)
 }
 
 fn require_at(path: &Path, network_id: &str, code: Option<&str>) -> Result<()> {
@@ -460,6 +536,107 @@ mod tests {
 
         // Other networks are unaffected (per-network scope).
         assert!(require_at(&path, "some-mesh", None).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An enrollment whose material was never handed over installs no lock.
+    ///
+    /// The discriminating case for the daemon's MFA response: the secret and
+    /// the recovery codes are shown exactly once, so a lock written before the
+    /// caller has them is a lock nobody can satisfy and nobody can remove —
+    /// `disable` requires a valid code, which is precisely what would have been
+    /// lost. Dropping a prepared enrollment must therefore leave the store
+    /// exactly as it was.
+    ///
+    /// The store is read after the drop rather than merely re-asked through
+    /// `is_enrolled_at`: what is being proved is that nothing was written, so
+    /// the file that would carry it is the thing to look at. A store that never
+    /// existed and a store that exists with no entry are both "no lock", and
+    /// both are checked.
+    #[test]
+    fn a_prepared_enrollment_that_is_dropped_installs_no_lock() {
+        let path = tmp();
+        let net = "fleet-prepared";
+
+        let prepared = prepare_enroll_at(&path, net, "laptop").expect("prepare");
+        assert_eq!(
+            prepared.enrolled().recovery_codes.len(),
+            RECOVERY_CODES,
+            "the caller is given the whole of what it must show exactly once"
+        );
+        assert_eq!(prepared.network_id(), net);
+        assert!(
+            !path.exists(),
+            "preparing writes nothing at all — not an empty store, not a store \
+             with the entry pending"
+        );
+
+        // The rollback: the material never reached its caller, so the lock it
+        // would have installed is abandoned with it.
+        drop(prepared);
+        assert!(!is_enrolled_at(&path, net), "and no lock survives the drop");
+        assert!(
+            require_at(&path, net, None).is_ok(),
+            "so the gate is still a no-op and this device is not locked out"
+        );
+
+        // The recoverable direction, stated as an outcome: enrolling again
+        // works, because nothing is there to refuse it.
+        let second = prepare_enroll_at(&path, net, "laptop").expect("prepare again");
+        second.commit_at(&path).expect("commit");
+        assert!(is_enrolled_at(&path, net));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The positive twin: a committed preparation is the lock, and it is the
+    /// one whose material the caller was given.
+    ///
+    /// Without this the control above would be satisfied by a `prepare` that
+    /// generated nothing usable. The secret that came back is used the way an
+    /// authenticator app uses it, against the store the commit wrote.
+    #[test]
+    fn a_committed_preparation_is_the_lock_its_caller_holds() {
+        let path = tmp();
+        let net = "fleet-committed";
+
+        // **Both prepared before either commits**, which is the only ordering
+        // that reaches the window `commit`'s second duplicate check exists for.
+        // Preparing the loser afterwards would be refused by `prepare` itself —
+        // correctly, since the store already holds a lock by then — and would
+        // leave the commit-time check untested, which is precisely the check
+        // that separates "this device has one lock" from "whichever handoff
+        // finished last wins".
+        let prepared = prepare_enroll_at(&path, net, "phone").expect("prepare");
+        let concurrent = prepare_enroll_at(&path, net, "phone")
+            .expect("a second preparation, taken while no lock exists yet");
+        let enrolled = prepared.enrolled().clone();
+        prepared.commit_at(&path).expect("commit");
+
+        assert!(is_enrolled_at(&path, net));
+        let secret = BASE32_NOPAD.decode(enrolled.secret_b32.as_bytes()).unwrap();
+        let code = totp_at(&secret, now_unix());
+        assert!(
+            require_at(&path, net, Some(&code)).is_ok(),
+            "the committed lock is satisfied by the secret its caller was shown"
+        );
+        assert!(
+            require_at(&path, net, Some("000000")).is_err(),
+            "non-vacuity: the gate is really locked, not accepting everything"
+        );
+
+        // The loser of that race lands second and is refused, rather than
+        // overwriting a lock whose secret its own caller does not hold.
+        assert!(
+            concurrent.commit_at(&path).is_err(),
+            "a preparation committed after another already holds the network is \
+             refused rather than silently rotating the lock away"
+        );
+        assert!(
+            require_at(&path, net, Some(&code)).is_ok(),
+            "and the original secret still satisfies it"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

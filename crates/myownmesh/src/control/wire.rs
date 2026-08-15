@@ -134,10 +134,12 @@ pub enum Request {
     /// Forget **every** joined network at once — a `NetworkRemove{purge:true}`
     /// for all of them: tear each out of the registry, `leave()` its driver, and
     /// delete its signed governance state + roster from disk. Keeps this device's
-    /// identity. The daemon then exits (see [`schedule_daemon_exit`]) so every
-    /// layer reloads from the now-clean disk instead of a stale in-memory cache
-    /// that would re-persist ("resurrect") what was just removed; the GUI/service
-    /// brings a fresh daemon back up.
+    /// identity. Once the answer to this request has been attempted, the daemon
+    /// runtime is asked to shut down, so every layer reloads from the now-clean
+    /// disk instead of a stale in-memory cache that would re-persist
+    /// ("resurrect") what was just removed. A hosted daemon shuts its runtime
+    /// down and leaves the host process alive; a standalone one returns so its
+    /// service supervisor, or the GUI, brings a fresh daemon back up.
     ForgetAllNetworks,
     /// Factory reset — wipe this device's **entire** state directory
     /// (`~/.myownmesh`, honouring `MYOWNMESH_HOME`): identity, config, and every

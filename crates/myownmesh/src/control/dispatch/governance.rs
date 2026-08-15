@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 
 use super::{funded, refused_text, unknown_network, Answer};
 use crate::control::framing::FrameAdmission;
+use crate::control::handoff::ProvisionalHandoff;
 use crate::control::reply::{
     FundedDiagnostic, FundedVariableReply, GovernanceDiagnostic, OperationReplyData, PreparedReply,
     ResponseOwner,
@@ -377,18 +378,32 @@ pub(in crate::control) async fn spawn_split(
 }
 
 /// Enrol this device in local MFA custody for one network.
+/// The enrollment is generated but not installed.
+///
+/// Its secret and recovery codes are shown exactly once and cannot be recovered
+/// from disk, so the lock is only written once the connection loop reports the
+/// line carrying them was sent. Until then this device holds no enrollment at
+/// all, which is the recoverable direction: a caller can enroll again. See
+/// [`ProvisionalHandoff`].
 pub(in crate::control) fn mfa_enroll(
     admission: &FrameAdmission,
     network: String,
-) -> Result<Answer> {
+) -> Result<(Answer, ProvisionalHandoff)> {
     let owner =
         ResponseOwner::acquire(admission).context("MFA enrollment operation was not admitted")?;
-    let result = myownmesh_core::custody::enroll(&network, &network);
-    funded(
+    let (result, provisional) = match myownmesh_core::custody::prepare_enroll(&network, &network) {
+        Ok(prepared) => (
+            Ok(prepared.enrolled().clone()),
+            ProvisionalHandoff::MfaEnrollment(prepared),
+        ),
+        Err(error) => (Err(error), ProvisionalHandoff::None),
+    };
+    let answer = funded(
         PreparedReply::Variable(FundedVariableReply::mfa_enrollment(result, owner)),
         admission,
     )
-    .context("MFA enrollment response line was not admitted")
+    .context("MFA enrollment response line was not admitted")?;
+    Ok((answer, provisional))
 }
 
 /// Whether this device holds MFA custody for one network.

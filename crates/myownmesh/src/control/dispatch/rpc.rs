@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 
 use super::{funded, refused, refused_text, unknown_network, Answer};
 use crate::control::framing::{AdmittedLineOut, FrameAdmission};
+use crate::control::handoff::ProvisionalHandoff;
 use crate::control::reply::{
     prepare_reply_then, ControlOut, FundedVariableReply, OperationReplyData, PreparedReply,
     ResponseOwner,
@@ -456,11 +457,56 @@ impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for Strea
     }
 }
 
-/// Start a streaming RPC call and forward its chunks to the client's writer.
+/// End one forwarded stream: land the terminal, or disconnect the exact client.
+///
+/// A started stream owes its client exactly one ending. The writer mailbox can
+/// refuse the terminal — it is admitted like any other frame — and a refusal
+/// discarded here leaves the client registered, connected, and waiting on an
+/// operation that will never produce another frame.
+///
+/// So the refusal is not discarded. The exact client is unregistered through
+/// the same seam a disconnect uses, and that is what ends the operation: its
+/// `connected` flag falls, the connection's own cancellation observes it, the
+/// connection loop returns, and the socket reaches end of file. Nothing is
+/// retried, no capacity is reserved ahead for a terminal, and no duration is
+/// consulted.
+async fn end_stream(
+    state: &Arc<ControlState>,
+    client_id: crate::ipc::ClientId,
+    writer_tx: &myownmesh_core::ResourceMailboxSender<crate::ipc::ServerOut>,
+    request_id: &str,
+    reason: crate::ipc::wire::TerminalReasonView<'_>,
+) {
+    if writer_tx
+        .send_building(StreamEndBuilder { request_id, reason })
+        .is_ok()
+    {
+        return;
+    }
+    disconnect_exact(state, client_id).await;
+}
+
+/// Unregister exactly this client and settle everything it owned.
+///
+/// The exact id, never a successor: `unregister` answers `None` for an id the
+/// table no longer holds, so a client that has already gone — or one displaced
+/// by a reconnect under a new id — is not torn down by a late stream ending.
+async fn disconnect_exact(state: &Arc<ControlState>, client_id: crate::ipc::ClientId) {
+    if let Some(removed) = state.clients.unregister(client_id) {
+        crate::control::realtime_pipe::release_owned_registrations(state, removed).await;
+    }
+}
+
+/// Start a streaming RPC call and hand back the forwarding that has not begun.
 ///
 /// The call's coordinates arrive as [`StreamCall`] rather than as a `Request`,
 /// so the signature is the claim about who may call this, checked, rather than
 /// a runtime `unreachable!`.
+///
+/// Nothing is spawned here. The request id in the reply is the client's only
+/// handle on this stream, and only the connection loop knows whether the line
+/// carrying it was written, so the started stream travels back as a
+/// [`ProvisionalHandoff`] and begins forwarding — or is withdrawn — there.
 pub(in crate::control) async fn call_stream_funded(
     state: &Arc<ControlState>,
     cancel: &ConnectionCancel,
@@ -468,7 +514,7 @@ pub(in crate::control) async fn call_stream_funded(
     call: StreamCall,
     client_id: crate::ipc::ClientId,
     client_capability: String,
-) -> FundedVariableReply {
+) -> (FundedVariableReply, ProvisionalHandoff) {
     let StreamCall {
         network,
         peer,
@@ -476,79 +522,162 @@ pub(in crate::control) async fn call_stream_funded(
         payload,
     } = call;
     let Some(client) = state.clients.authenticate(client_id, &client_capability) else {
-        return owner.finish(Err("invalid local client authority".to_owned()));
+        return (
+            owner.finish(Err("invalid local client authority".to_owned())),
+            ProvisionalHandoff::None,
+        );
     };
     let Some(net) = state.registry.get(&network) else {
-        return owner.finish(Err(format!("unknown network: {network}")));
+        return (
+            owner.finish(Err(format!("unknown network: {network}"))),
+            ProvisionalHandoff::None,
+        );
     };
     let request_id = format!("ipc-stream-{}", state.clients.next_call_stream_id());
     let task = match state.clients.lease_task_retaining(request_id.len()) {
         Ok(task) => task,
-        Err(refusal) => return owner.finish(Err(format!("rpc call stream refused: {refusal}"))),
+        Err(refusal) => {
+            return (
+                owner.finish(Err(format!("rpc call stream refused: {refusal}"))),
+                ProvisionalHandoff::None,
+            )
+        }
     };
     let rpc = net.rpc();
     let started = tokio::select! {
         biased;
-        () = cancel.cancelled() => return owner.finish(Err("control connection closing".to_owned())),
+        () = cancel.cancelled() => {
+            return (
+                owner.finish(Err("control connection closing".to_owned())),
+                ProvisionalHandoff::None,
+            )
+        }
         result = rpc.call_stream(&peer, &method, payload) => result,
     };
-    let mut rx = match started {
+    let rx = match started {
         Ok(rx) => rx,
-        Err(error) => return owner.finish(Err(error.to_string())),
+        Err(error) => {
+            return (
+                owner.finish(Err(error.to_string())),
+                ProvisionalHandoff::None,
+            )
+        }
     };
-    let writer_tx = client.writer_tx.clone();
-    let stream_owner = client.clone();
-    let req_id_for_task = request_id.clone();
-    tokio::spawn(async move {
-        let _task = task;
-        loop {
-            // `recv_funded`, not `recv`: the ordinary public `recv` converts a
-            // terminal into an application-owned `String` and releases core's
-            // lease in the same expression. The daemon is not at that boundary
-            // until it has forwarded the value, so it takes the funded form and
-            // reads the text by borrow.
-            let chunk = tokio::select! {
-                () = stream_owner.wait_disconnected() => return,
-                chunk = rx.recv_funded() => chunk,
-            };
-            let Some(chunk) = chunk else { break };
-            match chunk {
-                Ok(payload) => {
-                    if let Err(refusal) = writer_tx.send_building(StreamChunkBuilder {
-                        request_id: &req_id_for_task,
-                        chunk: payload,
-                    }) {
-                        // Still only a cause. It becomes a message inside
-                        // `build`, past this second admission.
-                        let _ = writer_tx.send_building(StreamEndBuilder {
+    let pending = PendingStreamForward {
+        task,
+        rx,
+        writer_tx: client.writer_tx.clone(),
+        stream_owner: client.clone(),
+        request_id: request_id.clone(),
+        // The registry, for the one thing the forward may have to do to its own
+        // client: end it. Cloned rather than borrowed because the task outlives
+        // this call.
+        ending_state: Arc::clone(state),
+        client_id,
+    };
+    (
+        owner.finish(Ok(OperationReplyData::RpcStreamStarted(request_id))),
+        ProvisionalHandoff::RpcStream(pending),
+    )
+}
+
+/// One started remote stream and the forwarding that has not been spawned.
+///
+/// Everything the forwarding loop needs, held rather than running. Dropping it
+/// drops the receiver, which withdraws the filed stream at core's own seam, and
+/// releases the task admission the setup took — the whole rollback, with no
+/// cancellation to observe because nothing was started.
+///
+/// The exact client id and the exact client handle are both carried: the handle
+/// is what the loop waits on and forwards through, the id is what a terminal
+/// refusal unregisters. Neither is re-resolved later, so a client that
+/// reconnected under a new id is never mistaken for this one.
+pub(in crate::control) struct PendingStreamForward {
+    task: crate::ipc::TaskAdmission,
+    rx: myownmesh_core::rpc::RpcStream,
+    writer_tx: myownmesh_core::ResourceMailboxSender<crate::ipc::ServerOut>,
+    stream_owner: myownmesh_core::FundedArc<crate::ipc::ClientHandle>,
+    request_id: String,
+    ending_state: Arc<ControlState>,
+    client_id: crate::ipc::ClientId,
+}
+
+impl PendingStreamForward {
+    /// Begin forwarding, now that the client holds the request id that names
+    /// what will arrive.
+    pub(in crate::control) fn spawn(self) {
+        let Self {
+            task,
+            mut rx,
+            writer_tx,
+            stream_owner,
+            request_id: req_id_for_task,
+            ending_state,
+            client_id,
+        } = self;
+        tokio::spawn(async move {
+            let _task = task;
+            loop {
+                // `recv_funded`, not `recv`: the ordinary public `recv` converts a
+                // terminal into an application-owned `String` and releases core's
+                // lease in the same expression. The daemon is not at that boundary
+                // until it has forwarded the value, so it takes the funded form and
+                // reads the text by borrow.
+                let chunk = tokio::select! {
+                    () = stream_owner.wait_disconnected() => return,
+                    chunk = rx.recv_funded() => chunk,
+                };
+                let Some(chunk) = chunk else { break };
+                match chunk {
+                    Ok(payload) => {
+                        if let Err(refusal) = writer_tx.send_building(StreamChunkBuilder {
                             request_id: &req_id_for_task,
-                            reason: crate::ipc::wire::TerminalReasonView::LocalChunkRefusal(
-                                &refusal,
-                            ),
-                        });
+                            chunk: payload,
+                        }) {
+                            // Still only a cause. It becomes a message inside
+                            // `build`, past this second admission. One substitute
+                            // attempt is enough: if the writer will not take the
+                            // terminal either, the client is disconnected instead
+                            // of left holding a started operation.
+                            end_stream(
+                                &ending_state,
+                                client_id,
+                                &writer_tx,
+                                &req_id_for_task,
+                                crate::ipc::wire::TerminalReasonView::LocalChunkRefusal(&refusal),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    Err(terminal) => {
+                        // `terminal` is alive across measurement, admission and the
+                        // build, so core's session lease is paying for the
+                        // peer-sized text for the whole time the daemon is deciding
+                        // whether it may forward it. It is dropped only once the
+                        // write-side owner exists.
+                        end_stream(
+                            &ending_state,
+                            client_id,
+                            &writer_tx,
+                            &req_id_for_task,
+                            crate::ipc::wire::TerminalReasonView::Remote(&terminal),
+                        )
+                        .await;
                         return;
                     }
                 }
-                Err(terminal) => {
-                    // `terminal` is alive across measurement, admission and the
-                    // build, so core's session lease is paying for the
-                    // peer-sized text for the whole time the daemon is deciding
-                    // whether it may forward it. It is dropped only once the
-                    // write-side owner exists.
-                    let _ = writer_tx.send_building(StreamEndBuilder {
-                        request_id: &req_id_for_task,
-                        reason: crate::ipc::wire::TerminalReasonView::Remote(&terminal),
-                    });
-                    return;
-                }
             }
-        }
-        let _ = writer_tx.send_building(StreamEndBuilder {
-            request_id: &req_id_for_task,
-            reason: crate::ipc::wire::TerminalReasonView::Clean,
+            end_stream(
+                &ending_state,
+                client_id,
+                &writer_tx,
+                &req_id_for_task,
+                crate::ipc::wire::TerminalReasonView::Clean,
+            )
+            .await;
         });
-    });
-    owner.finish(Ok(OperationReplyData::RpcStreamStarted(request_id)))
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +739,274 @@ mod tests {
                 measured_claim, built_claim,
                 "the admitted claim must be the claim the queued frame retains"
             );
+        }
+    }
+
+    /// What opening one writer costs, plus what the frames a control queues
+    /// actually consume.
+    ///
+    /// **Both halves are priced by production, and neither is a list of
+    /// classes.** [`starved_grant`] is the mailbox's own opening charge, from
+    /// `root_claim` and the provider's planning prices. The addend is
+    /// `accepted_item_planning_charge`, which is the mailbox's own answer to
+    /// "what does accepting this value cost" — both reservations it makes per
+    /// item, and the provider's record of each.
+    ///
+    /// A hand-written list was wrong twice, in the same way each time, which is
+    /// why there is no list here any more. It named no `CallbackOrScheduledWork`
+    /// and the *open* was refused for one unit against zero; it then named no
+    /// [`QueuedBytes`](myownmesh_core::ResourceClass::QueuedBytes) and the first
+    /// *queued frame* was refused, because that is a dimension every accepted
+    /// item charges and no amount of generosity in the other three supplies it.
+    /// A fixture that enumerates dimensions is a second, silently drifting copy
+    /// of the admission shape; this one asks the shape.
+    ///
+    /// The representative frame is far wider than anything these controls
+    /// actually send — a 4 KiB terminal reason against real request ids of about
+    /// twenty bytes and a five-byte chunk payload — and it is scaled for several
+    /// frames, so the amounts are headroom while the dimensions are exact.
+    ///
+    /// Nothing here weakens the two pressure controls beside it: both still open
+    /// over `starved_grant` alone, so their refusal is still the first admission
+    /// after an open that consumed the whole grant.
+    fn unpressured_grant() -> myownmesh_core::ResourceClaim {
+        let representative = crate::ipc::ServerOut::RpcCallStreamEnd {
+            request_id: "ipc-stream-fixture".to_owned(),
+            error: Some("x".repeat(4096)),
+        };
+        let per_frame = myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::accepted_item_planning_charge(
+            &representative,
+        )
+        .expect("the representative frame is priceable");
+        starved_grant()
+            .checked_add(
+                per_frame
+                    .checked_scale(16)
+                    .expect("sixteen such frames are representable"),
+            )
+            .expect("the fixture grant is representable")
+    }
+
+    /// One started stream, held exactly as `call_stream_funded` hands it back.
+    ///
+    /// Built here rather than through `call_stream_funded` because that function
+    /// needs a joined network and a reachable peer to start a stream at all,
+    /// and what is under test is what happens to the stream *after* it started —
+    /// which is this value and the settle that consumes it.
+    fn pending_forward(
+        state: &Arc<ControlState>,
+        client: &myownmesh_core::FundedArc<crate::ipc::ClientHandle>,
+        writer_tx: &myownmesh_core::ResourceMailboxSender<crate::ipc::ServerOut>,
+        rx: myownmesh_core::rpc::RpcStream,
+        request_id: &str,
+    ) -> PendingStreamForward {
+        PendingStreamForward {
+            task: state
+                .clients
+                .lease_task_retaining(request_id.len())
+                .expect("the fixture registry funds one forwarding task"),
+            rx,
+            writer_tx: writer_tx.clone(),
+            stream_owner: client.clone(),
+            request_id: request_id.to_owned(),
+            ending_state: Arc::clone(state),
+            client_id: client.id,
+        }
+    }
+
+    /// A stream setup response that was never written forwards nothing, ever.
+    ///
+    /// The discriminating case for A1's RPC-stream arm. The request id in the
+    /// setup response is the client's only handle on the stream; if the line is
+    /// refused or the socket ends first, a forwarding task started before the
+    /// answer would be writing frames for an operation the client was never told
+    /// about. Nothing is spawned until the settle, so this is true by
+    /// construction rather than by cancelling a task afterwards — and the chunk
+    /// waiting in the stream is what makes the absence meaningful: there is
+    /// something to forward, and it is not forwarded.
+    ///
+    /// The stream is production's, over the fixture inbox's own real inbox; see
+    /// [`myownmesh_core::rpc::TransportLabStreamInbox::stream`]. Its
+    /// cancellation is inert, so what this proves is the forwarding half —
+    /// the gateway-side withdrawal a dropped receiver performs is core's and is
+    /// tested there.
+    #[tokio::test]
+    async fn v4_r6_daemon_a1_an_unhanded_stream_setup_forwards_nothing() {
+        let state = crate::control::joinless_control_state().await;
+        let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
+        let client = state
+            .clients
+            .register(tx.clone())
+            .expect("the fixture registry admits one client");
+
+        let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+        let scope = crate::test_application_scope();
+        inbox
+            .push(&scope, serde_json::json!("chunk"))
+            .expect("the fixture scope funds one chunk");
+        let pending = pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-unhanded");
+
+        ProvisionalHandoff::RpcStream(pending)
+            .settle(&state, false)
+            .await;
+
+        // Driven as far as the runtime will go. A task that had been spawned
+        // would have had every opportunity to run; the negative is that the
+        // writer is still empty after that, not that a duration elapsed.
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_none(),
+            "no frame was ever written for a stream the client was never told \
+             about"
+        );
+    }
+
+    /// The positive twin: a delivered setup response starts the forwarding.
+    ///
+    /// Without this the control above would be satisfied by a build that never
+    /// forwarded anything. The chunk that was waiting arrives, under the exact
+    /// request id the client was answered with.
+    #[tokio::test]
+    async fn v4_r6_daemon_a1_a_delivered_stream_setup_starts_forwarding() {
+        let state = crate::control::joinless_control_state().await;
+        let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
+        let client = state
+            .clients
+            .register(tx.clone())
+            .expect("the fixture registry admits one client");
+
+        let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+        let scope = crate::test_application_scope();
+        inbox
+            .push(&scope, serde_json::json!("chunk"))
+            .expect("the fixture scope funds one chunk");
+        let pending = pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-handed");
+
+        ProvisionalHandoff::RpcStream(pending)
+            .settle(&state, true)
+            .await;
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("hang guard: the forwarding task writes the waiting chunk")
+            .expect("the writer mailbox is open, so the chunk is delivered");
+        match delivered.value() {
+            crate::ipc::ServerOut::RpcCallStreamChunk { request_id, .. } => {
+                assert_eq!(request_id.as_str(), "ipc-stream-handed");
+            }
+            _ => panic!("the forwarded frame is this stream's chunk"),
+        }
+    }
+
+    /// A stream whose chunk *and* whose substitute terminal are both refused
+    /// ends its client, rather than leaving it holding a started operation.
+    ///
+    /// The discriminating case. A started stream owes its client exactly one
+    /// ending, and the writer mailbox can refuse that ending like any other
+    /// frame — a refusal discarded here left the client registered, connected,
+    /// and waiting on an operation that would never produce another frame. There
+    /// is no second attempt and no reserved capacity: the client is unregistered
+    /// through the same seam a disconnect uses, and that ending is what ends the
+    /// operation.
+    ///
+    /// The refusal is real capacity pressure over a private grant, and the
+    /// terminal is a peer-sized one from a stream that genuinely ended, so what
+    /// the writer refuses is a frame worth refusing.
+    #[tokio::test]
+    async fn v4_r6_daemon_a2_a_client_whose_terminal_is_refused_is_disconnected() {
+        let state = crate::control::joinless_control_state().await;
+        let scope = crate::test_application_scope();
+        let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+        inbox
+            .finish_owned(&scope, "z".repeat(32 * 1024))
+            .expect("the fixture scope funds one terminal of this width");
+        let terminal = match inbox.recv_funded().await {
+            Some(Err(terminal)) => terminal,
+            _ => panic!("the stream ends with the terminal it was finished with"),
+        };
+
+        let (tx, _rx, _provider, _port) = writer_over_grant(starved_grant());
+        let client = state
+            .clients
+            .register(tx.clone())
+            .expect("the fixture registry admits one client");
+        let client_id = client.id;
+        assert!(
+            state.clients.client(client_id).is_some(),
+            "non-vacuity: the client is registered before the ending"
+        );
+
+        // The chunk was already refused; this is the substitute terminal, and
+        // the writer will not take it either.
+        end_stream(
+            &state,
+            client_id,
+            &tx,
+            "ipc-stream-refused",
+            crate::ipc::wire::TerminalReasonView::Remote(&terminal),
+        )
+        .await;
+
+        assert!(
+            state.clients.client(client_id).is_none(),
+            "the exact client is unregistered, which is what ends its connection \
+             and with it the operation nothing could settle"
+        );
+        // Its own record says so too, which is what the connection loop observes
+        // on its way to end of file. The bound is a failure detector and nothing
+        // else: the wait returns because the record was marked disconnected, and
+        // a regression fails here by name rather than as a suite that timed out
+        // with nothing named.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.wait_disconnected(),
+        )
+        .await
+        .expect("the unregistered client's own record is marked disconnected");
+    }
+
+    /// The positive twin: a terminal the writer accepts ends the stream and
+    /// leaves the client exactly where it was.
+    ///
+    /// Without this the control above would be satisfied by a build that
+    /// disconnected on every ending, which is strictly worse than the discarded
+    /// refusal it replaces. The queued frame is read back, so this is also the
+    /// statement that the client was told *about this stream* rather than merely
+    /// left alone.
+    #[tokio::test]
+    async fn v4_r6_daemon_a2_a_client_whose_terminal_lands_stays_connected() {
+        let state = crate::control::joinless_control_state().await;
+        let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
+        let client = state
+            .clients
+            .register(tx.clone())
+            .expect("the fixture registry admits one client");
+        let client_id = client.id;
+
+        end_stream(
+            &state,
+            client_id,
+            &tx,
+            "ipc-stream-clean",
+            crate::ipc::wire::TerminalReasonView::Clean,
+        )
+        .await;
+
+        assert!(
+            state.clients.client(client_id).is_some(),
+            "a landed terminal disconnects nobody"
+        );
+        match rx.recv().await {
+            Some(item) => match item.value() {
+                crate::ipc::ServerOut::RpcCallStreamEnd { request_id, error } => {
+                    assert_eq!(request_id.as_str(), "ipc-stream-clean");
+                    assert!(error.is_none(), "a clean ending carries no error");
+                }
+                _ => panic!("the queued frame is this stream's ending"),
+            },
+            None => panic!("the terminal was admitted, so it is queued"),
         }
     }
 

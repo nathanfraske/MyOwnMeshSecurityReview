@@ -2051,8 +2051,8 @@ async fn handle_transport_event(
             // Every fact this task will ever authenticate under is fixed here,
             // once: the mesh, this endpoint's Device ID, the exact remote
             // Device ID already in scope, and the connector's binding. The
-            // profile is derived from that binding inside endpoint
-            // authentication; the engine selects no profile semantics.
+            // profile is fixed inside endpoint authentication; the engine
+            // selects no profile semantics.
             let remote_device_id = crate::signing::pubkey_part(&device_id).to_string();
             let Ok(context) = crate::endpoint_auth::EndpointAuthContext::new(
                 &state.network_id,
@@ -3145,15 +3145,110 @@ fn rpc_refusal_frame(request_id: String, streaming: bool, error: String) -> Mesh
     }
 }
 
-async fn refuse_rpc_request(
+/// What a failed peer-facing RPC send does, and the only thing it does.
+///
+/// Every frame in this family is the *settlement* of one remote operation: a
+/// refusal, a unary response, a stream's opening failure, a chunk, or a
+/// terminal. A caller is waiting on each of them, and nothing else is coming.
+/// So a discarded send result is not a lost frame — it is a remote operation
+/// that never settles, or, for a chunk that failed after taking its sequence
+/// position, a stream whose ordering can no longer be recovered.
+///
+/// The truthful settlement is the one already used when a session will not fund
+/// a response it delivered: retire that exact session. Its `SessionRpcState`
+/// drops with it, which closes every pending sender and finishes every open
+/// stream it filed, so the operations resolve through teardown instead of
+/// waiting.
+///
+/// The witness is the one minted for the operation, so this names the exact
+/// installation that owned it. A replacement that promoted under the same
+/// Device ID in the meantime fails `retire_exact_session`'s identity check and
+/// is left alone: it did not ask for this operation and must not be torn down
+/// by it.
+///
+/// There is no retry, no fragmentation, no acknowledgement and no timer here. A
+/// frame that does not fit is not made deliverable; the operation it would have
+/// settled is settled by the session ending.
+fn retire_after_failed_rpc_send(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
+    witness: &crate::runtime::session_broker::SessionValidityWitness,
+    what: &'static str,
+    error: &Error,
+) {
+    state.reach_exact_retirement_barrier();
+    if state.peers.retire_exact_session(owner, witness) {
+        trace!(
+            peer = %owner.device_id(),
+            %what,
+            err = %error,
+            "retiring the exact session whose RPC frame could not be sent"
+        );
+    }
+}
+
+/// Send one peer-facing RPC frame through the exact owner.
+///
+/// Answers whether it went out. `false` means the session that owned the
+/// operation has already been retired by [`retire_after_failed_rpc_send`], and
+/// the caller must not send another frame for it.
+async fn send_rpc_frame_or_retire(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    witness: &crate::runtime::session_broker::SessionValidityWitness,
+    msg: &MeshMessage,
+    what: &'static str,
+) -> bool {
+    match send_to_peer_owner(state, owner, msg).await {
+        Ok(()) => true,
+        Err(error) => {
+            retire_after_failed_rpc_send(state, owner, witness, what, &error);
+            false
+        }
+    }
+}
+
+/// The borrowed-stream-frame half of [`send_rpc_frame_or_retire`], with the
+/// same answer and the same failure policy.
+async fn send_rpc_stream_frame_or_retire(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    witness: &crate::runtime::session_broker::SessionValidityWitness,
+    frame: &OutboundStreamFrame<'_>,
+    what: &'static str,
+) -> bool {
+    match send_stream_frame_to_peer_owner(state, owner, frame).await {
+        Ok(()) => true,
+        Err(error) => {
+            retire_after_failed_rpc_send(state, owner, witness, what, &error);
+            false
+        }
+    }
+}
+
+/// Refuse one inbound RPC request in the terminal class the caller filed.
+///
+/// The witness is taken from the dispatch's own captured installation before
+/// the send, so a refusal that cannot be delivered retires the session that
+/// filed the request rather than whoever is installed by the time the transport
+/// answers. `None` means that installation is no longer current or has no live
+/// session: the refusal is application-class and had nobody to reach, and the
+/// session that filed the request has already resolved its own pending state by
+/// ending, so there is nothing to send and nothing to retire.
+async fn refuse_rpc_request(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
     request_id: String,
     streaming: bool,
     error: String,
 ) {
+    let Some(witness) = dispatch
+        .with_captured_session_state(&state.peers, |session, _app| session.validity_witness())
+    else {
+        return;
+    };
     let frame = rpc_refusal_frame(request_id, streaming, error);
-    let _ = send_to_peer_owner(state, owner, &frame).await;
+    send_rpc_frame_or_retire(state, dispatch.owner(), &witness, &frame, "RPC refusal").await;
 }
 
 #[cfg(test)]
@@ -3397,7 +3492,7 @@ async fn on_rpc_request(
         // No RPC bound yet — send the exact terminal class the caller filed.
         refuse_rpc_request(
             state,
-            owner,
+            dispatch,
             req.request_id,
             req.streaming,
             "rpc not bound".into(),
@@ -3423,7 +3518,7 @@ async fn on_rpc_request(
     let Some(prepared) = prepared else {
         refuse_rpc_request(
             state,
-            owner,
+            dispatch,
             req.request_id,
             req.streaming,
             format!("no handler for '{}'", req.method),
@@ -3434,7 +3529,7 @@ async fn on_rpc_request(
     let prepared = match validate_rpc_handler_class(prepared, &req.method, req.streaming) {
         Ok(prepared) => prepared,
         Err(error) => {
-            refuse_rpc_request(state, owner, req.request_id, req.streaming, error).await;
+            refuse_rpc_request(state, dispatch, req.request_id, req.streaming, error).await;
             return;
         }
     };
@@ -3475,7 +3570,7 @@ async fn on_rpc_request(
         Err(error) => {
             refuse_rpc_request(
                 state,
-                owner,
+                dispatch,
                 req.request_id,
                 req.streaming,
                 format!("RPC handler task is not representable: {error}"),
@@ -3528,7 +3623,7 @@ async fn on_rpc_request(
         Some(Err(request_id)) => {
             refuse_rpc_request(
                 state,
-                owner,
+                dispatch,
                 request_id,
                 streaming,
                 "RPC handler task was refused by the current session".into(),
@@ -3556,6 +3651,11 @@ async fn on_rpc_request(
     let state = state.clone();
     match handler {
         PreparedRpcHandler::Single(h) => {
+            // The witness the run sends against. Cloned rather than borrowed
+            // because `run` is one arm of the select below and the witness is
+            // the other: the same value names the session a send failure retires
+            // and the session whose revocation cancels the run.
+            let send_witness = witness.clone();
             tokio::spawn(async move {
                 // **Declared before the lease so it is dropped after it.**
                 // Locals unwind in reverse declaration order, which is what
@@ -3630,8 +3730,14 @@ async fn on_rpc_request(
                     // Inert unless a control has armed it; see
                     // `NetworkState::reach_rpc_send_boundary`.
                     state.reach_rpc_send_boundary().await;
-                    let _ =
-                        send_to_peer_owner(&state, &owner, &MeshMessage::RpcResponse(frame)).await;
+                    send_rpc_frame_or_retire(
+                        &state,
+                        &owner,
+                        &send_witness,
+                        &MeshMessage::RpcResponse(frame),
+                        "RPC response",
+                    )
+                    .await;
                 };
                 // No timer on either arm. A handler that never finishes is not a
                 // slow handler to be given a deadline — it is work whose
@@ -3654,6 +3760,8 @@ async fn on_rpc_request(
             });
         }
         PreparedRpcHandler::Stream(h) => {
+            // As in the unary arm.
+            let send_witness = witness.clone();
             tokio::spawn(async move {
                 // Before the lease, for the reason given in the unary arm.
                 #[cfg(test)]
@@ -3689,13 +3797,15 @@ async fn on_rpc_request(
                             // A terminal send, and so the same boundary as the
                             // chunk one below. Inert unless armed.
                             state.reach_rpc_send_boundary().await;
-                            let _ = send_to_peer_owner(
+                            send_rpc_frame_or_retire(
                                 &state,
                                 &owner,
+                                &send_witness,
                                 &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                                     request_id,
                                     error: Some(e),
                                 }),
+                                "RPC stream open failure",
                             )
                             .await;
                             return;
@@ -3745,20 +3855,41 @@ async fn on_rpc_request(
                             // a control has armed it.
                             state.reach_rpc_send_boundary().await;
                         }
-                        let _ = send_stream_frame_to_peer_owner(&state, &owner, &frame).await;
+                        // A chunk that fails has already taken its sequence
+                        // position, so continuing would leave the remote stream
+                        // with a gap it cannot recover from. The session that
+                        // owned it is retired by the send, and this loop stops
+                        // rather than sending into what it just ended.
+                        if !send_rpc_stream_frame_or_retire(
+                            &state,
+                            &owner,
+                            &send_witness,
+                            &frame,
+                            if terminal {
+                                "RPC stream terminal"
+                            } else {
+                                "RPC stream chunk"
+                            },
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         if terminal {
                             return;
                         }
                     }
-                    let _ = send_to_peer_owner(
+                    send_rpc_frame_or_retire(
                         &state,
                         &owner,
+                        &send_witness,
                         &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                             request_id,
                             error: Some(
                                 "RPC stream handler disappeared without terminal state".into(),
                             ),
                         }),
+                        "RPC stream handler-disappeared terminal",
                     )
                     .await;
                 };
@@ -14440,6 +14571,350 @@ mod tests {
             panic!("the authority carries the frame it admitted");
         };
         on_rpc_request(state, &dispatch, req).await;
+    }
+
+    /// One closed network whose signed member log has evicted `target`.
+    ///
+    /// Assembled with production's own pieces and committed through the
+    /// registry's own governance commit: the transitions are real
+    /// [`Transition`](crate::network_state::Transition)s over
+    /// `transition_payload`, signed by a key this fixture holds and granted
+    /// Owner in the same state, so `member_log_removed` verifies and authorises
+    /// them exactly as it does a log adopted from a peer.
+    ///
+    /// It builds the *state*; it does not make the decision. `deny_if_evicted`
+    /// still runs its own `log_evicted` projection — open-governance check,
+    /// owner/controller exemption, verified tombstone — against what this
+    /// committed. A fixture that flipped a "denied" flag would prove nothing
+    /// about the gate.
+    fn evict_by_signed_member_log(state: &Arc<NetworkState>, target: &str) {
+        use crate::network_state::{transition_payload, Transition, TransitionVariant};
+        let authority = crate::identity::Identity::ephemeral();
+        let authority_id = authority.public_id().to_string();
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(&state.network_id, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(authority.signing_key(), &payload)],
+                signers: vec![authority_id.clone()],
+                variant,
+            }
+        };
+        let grant = signed(
+            TransitionVariant::RoleGrant {
+                target: target.to_string(),
+                role: crate::network_state::Role::Member,
+            },
+            1,
+        );
+        let evict = signed(
+            TransitionVariant::Evict {
+                target: target.to_string(),
+            },
+            2,
+        );
+        state.peers.with_governance_commit(|gov| {
+            gov.kind = crate::network_state::NetworkKind::Closed;
+            gov.roles.insert(
+                state.identity.public_id().to_string(),
+                crate::network_state::Role::Owner,
+            );
+            gov.roles
+                .insert(authority_id.clone(), crate::network_state::Role::Owner);
+            gov.member_log = vec![grant, evict];
+        });
+    }
+
+    /// An evicted peer is dropped when the denial's send attempt returns, and a
+    /// send that failed does not postpone it.
+    ///
+    /// The discriminating case for B3. The old shape sent the signed proof,
+    /// spawned a detached task, slept a fixed interval and only then dropped the
+    /// peer — which made an elapsed duration the thing that ended a session the
+    /// policy had already ended, and left the peer live and sendable in between.
+    ///
+    /// **The observation is taken with nothing in between.** No yield, no
+    /// settle loop, no sleep separates `deny_if_evicted` returning from the
+    /// assertion that B is gone. A detached-and-sleep implementation would still
+    /// have B installed at this line; only a drop performed before the call
+    /// returns can satisfy it.
+    ///
+    /// The send genuinely fails here — B's connector never opened a data channel
+    /// — which is asserted rather than assumed, because "the proof did not go
+    /// out" is precisely the arm where the old shape's timer was load-bearing.
+    /// The proof is best effort: nothing waits for it, receives an
+    /// acknowledgement for it, or retries it.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r6_core_b3_a_denied_peer_is_dropped_when_the_send_attempt_returns() {
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04b3-denied").await;
+        evict_by_signed_member_log(&state, "device-b");
+
+        let peer_b = state.peers.get("device-b").expect("B is installed");
+        let frames_before = peer_b.state.read().diag.frames_out;
+        let owner_b = state.peers.owner("device-b").expect("B is installed");
+        assert!(
+            state.peers.owner("device-c").is_some(),
+            "non-vacuity: C is installed and stays that way"
+        );
+
+        let denied = governance::deny_if_evicted(&state, &owner_b).await;
+
+        assert!(
+            denied,
+            "the signed state evicts B, so the gate denies it and the caller \
+             stops the admission flow"
+        );
+        assert_eq!(
+            peer_b.state.read().diag.frames_out,
+            frames_before,
+            "non-vacuity: this is the failed-send arm — the proof never reached \
+             the wire"
+        );
+        assert!(
+            state.peers.owner("device-b").is_none(),
+            "and B is already gone at the instant the call returned: the drop \
+             follows the send attempt, not an elapsed duration"
+        );
+        assert!(
+            state.peers.owner("device-c").is_some(),
+            "while C, which the signed state does not evict, is untouched"
+        );
+
+        // The exact-owner clause: a stale token cannot drop a successor.
+        //
+        // `insert_promoted_peer` rather than `insert_admitted_peer`, and the
+        // difference is the policy this control just committed: the signed log
+        // evicts this Device ID, so a successor cannot be *application-admitted*
+        // under it and a fixture claiming otherwise would be arranging something
+        // the engine would never produce. What the clause needs is only a new
+        // current installation — a peer entry and an owner token that are not
+        // the ones the denial named — and this installs exactly that, with its
+        // own live connector and its own authenticated channel, admitted by
+        // nothing.
+        let _successor = insert_promoted_peer(&state, "device-b").await;
+        assert!(
+            state.peers.owner("device-b").is_some(),
+            "non-vacuity: there is a successor installed for the stale denial to \
+             have dropped"
+        );
+
+        assert!(governance::deny_if_evicted(&state, &owner_b).await);
+        assert!(
+            state.peers.owner("device-b").is_some(),
+            "the successor installation under the same Device ID is not dropped \
+             by its predecessor's denial: the owner token names an installation, \
+             and that one is no longer current"
+        );
+    }
+
+    /// The positive twin: a denial that really goes out drops the peer on the
+    /// same boundary, once.
+    ///
+    /// B is the near end of a genuinely connected link here, so the proof
+    /// reaches the wire — asserted through the peer's own outbound frame count.
+    /// Without this arm the control above would be satisfied by a build that
+    /// dropped the peer *instead of* attempting the proof, which is a different
+    /// behaviour with the same visible cleanup.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r6_core_b3_a_delivered_denial_drops_the_peer_on_the_same_boundary() {
+        let (state, _rpc, _b, _c, _far) =
+            two_authenticated_peers_over_a_real_link("arc04b3-delivered").await;
+        evict_by_signed_member_log(&state, "device-b");
+
+        let peer_b = state.peers.get("device-b").expect("B is installed");
+        let frames_before = peer_b.state.read().diag.frames_out;
+        let owner_b = state.peers.owner("device-b").expect("B is installed");
+
+        let denied = governance::deny_if_evicted(&state, &owner_b).await;
+
+        assert!(denied);
+        assert!(
+            peer_b.state.read().diag.frames_out > frames_before,
+            "the signed proof really went out over the live link"
+        );
+        assert!(
+            state.peers.owner("device-b").is_none(),
+            "and the peer is dropped as the send returns — success and failure \
+             reach the same boundary, and neither waits"
+        );
+    }
+
+    /// A refusal that cannot be sent retires the exact session that asked for
+    /// it, and nothing else.
+    ///
+    /// The discriminating case for A3's unary/refusal arm. `refuse_rpc_request`
+    /// is the terminal for an inbound call this node will not run, and it is the
+    /// only thing coming: discarding its send result left the remote caller
+    /// pending on an operation that would never settle, on a session this side
+    /// went on treating as healthy.
+    ///
+    /// The fixture is what makes the failure real rather than injected. B is a
+    /// fully admitted peer whose connector answered a negotiation that never
+    /// happened, so its data channel was never opened and every application send
+    /// through it fails before it reaches the native sender — see
+    /// [`two_authenticated_peers`]. Nothing here simulates a transport error.
+    ///
+    /// C is the bystander, and it is the half that makes this about the *exact*
+    /// session: it is equally unsendable, and it is untouched, because nothing
+    /// retires a session that did not own the operation.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r6_core_a3_a_refusal_that_cannot_be_sent_retires_only_its_own_session() {
+        let (state, _rpc, _b, _c) = two_authenticated_peers("arc04a3-refusal-send").await;
+        let (bystander, bystander_rx) = file_pending(&state, "device-c");
+
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            Some(0),
+            "non-vacuity: B has a live session to lose"
+        );
+
+        // No handler is bound for this method, so the request is refused inline
+        // and the refusal is the only frame the call produces.
+        deliver_rpc_request(&state, "device-b", "req-unsendable", "unbound", false).await;
+
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            None,
+            "the session whose refusal could not be delivered is retired, so \
+             everything it was carrying is resolved by that ending"
+        );
+        assert_eq!(
+            pending_len(&state, "device-c"),
+            Some(1),
+            "and C is untouched: it did not file this call and is not retired \
+             for it"
+        );
+        let owner_c = state.peers.owner("device-c").expect("C is installed");
+        assert!(
+            state
+                .peers
+                .with_live_session_state(
+                    &owner_c,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                    |_session, app| app.rpc_mut().still_holds(&bystander),
+                )
+                .expect("C still has a live session"),
+            "C holds the very operation it filed, not merely one under the same id"
+        );
+        drop(bystander_rx);
+
+        // The device id is usable again: a replacement promotes normally and
+        // starts empty, so the retirement ended a session rather than blocking a
+        // peer.
+        let _replacement = insert_admitted_peer(&state, "device-b").await;
+        assert_eq!(pending_len(&state, "device-b"), Some(0));
+    }
+
+    /// A stream chunk that cannot be sent retires the session and stops the
+    /// stream there.
+    ///
+    /// The discriminating case for A3's stream arm, and the reason it is not the
+    /// same control as the refusal above: a chunk has already taken its sequence
+    /// position by the time the send fails. Continuing would put the next chunk
+    /// on the wire under a later number with the failed one missing, which is a
+    /// gap the remote stream cannot recover its ordering from — a silently
+    /// poisoned stream rather than a stream that ended.
+    ///
+    /// The producer's own sender is held for the whole control, so the run
+    /// cannot end by its mailbox closing: the only thing that can end it here is
+    /// the failed send. `finished()` is the observation that it did end, and it
+    /// counts the task's end *after* its lease is released, so this is also the
+    /// statement that the run stopped costing the owner it no longer has.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r6_core_a3_a_chunk_that_cannot_be_sent_retires_the_session_and_stops() {
+        let handler_task = crate::rpc::handler_task_claim_for(
+            "device-b",
+            "stream-unsendable",
+            "produces",
+            &serde_json::Value::Null,
+        )
+        .expect("the handler task is representable");
+        let (state, rpc, _b, _c) =
+            two_authenticated_peers_with("arc04a3-chunk-send", handler_task).await;
+        let (_bystander, _bystander_rx) = file_pending(&state, "device-c");
+
+        // Held across the whole control: a stream whose sender is gone ends by
+        // itself, and this control would then be about a producer that finished
+        // rather than one whose send failed.
+        #[allow(clippy::type_complexity)]
+        let keeper: Arc<
+            parking_lot::Mutex<
+                Option<crate::resource::ResourceMailboxSender<crate::rpc::RpcStreamItem>>,
+            >,
+        > = Arc::new(parking_lot::Mutex::new(None));
+        let producing = Arc::clone(&state);
+        let kept = Arc::clone(&keeper);
+        rpc.serve_stream("produces", move |_call: crate::rpc::RpcCall| {
+            let producing = Arc::clone(&producing);
+            let kept = Arc::clone(&kept);
+            async move {
+                let (tx, rx) =
+                    funded_stream_parts_with_one_chunk(&producing, serde_json::json!("chunk"))?;
+                *kept.lock() = Some(tx);
+                Ok(rx)
+            }
+        })
+        .expect("the live gateway admits a streaming handler");
+
+        deliver_rpc_request(&state, "device-b", "stream-unsendable", "produces", true).await;
+
+        assert!(
+            settle_until(|| state.rpc_send_boundary.finished() == 1).await,
+            "the run ends rather than looping on to the next chunk"
+        );
+        assert!(
+            keeper.lock().is_some(),
+            "non-vacuity: the producer's own sender is still held, so the run \
+             ended on the failed send and not because its mailbox closed"
+        );
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            None,
+            "and the exact session that owned the stream is retired"
+        );
+        assert_eq!(
+            pending_len(&state, "device-c"),
+            Some(1),
+            "while the bystander keeps its own session and its own operation"
+        );
+    }
+
+    /// The positive twin for both: a peer-facing RPC frame that *is* delivered
+    /// leaves its session exactly where it was.
+    ///
+    /// Without this, every control above would be satisfied by a build that
+    /// retired the session on success too — which would be strictly worse than
+    /// the discarded result it replaces. B is the near end of a genuinely
+    /// connected link here, so the refusal really reaches the wire.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_r6_core_a3_a_delivered_refusal_leaves_its_session_live() {
+        let (state, _rpc, _b, _c, _far) =
+            two_authenticated_peers_over_a_real_link("arc04a3-delivered").await;
+        let (_bystander, _bystander_rx) = file_pending(&state, "device-c");
+
+        assert_eq!(pending_len(&state, "device-b"), Some(0));
+
+        deliver_rpc_request(&state, "device-b", "req-delivered", "unbound", false).await;
+
+        assert_eq!(
+            pending_len(&state, "device-b"),
+            Some(0),
+            "a refusal that reached its peer settles that call and nothing else \
+             — the session stays live"
+        );
+        assert_eq!(
+            pending_len(&state, "device-c"),
+            Some(1),
+            "and the bystander is untouched, as always"
+        );
     }
 
     /// Revocation between the mint and the run's first poll never reaches the

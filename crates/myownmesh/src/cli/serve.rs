@@ -29,9 +29,20 @@ pub async fn run() -> Result<()> {
         myownmesh::embedded::start_infrastructure_only(cfg, resources).await?
     };
 
-    // Wait for SIGINT (Ctrl-C) or SIGTERM.
-    wait_for_shutdown_signal().await;
-    tracing::info!("shutdown requested");
+    // Subscribed before the wait, not inside it: a broadcast receiver sees only
+    // what is sent after it subscribes, and the daemon can ask for its own
+    // shutdown the moment a reset request lands.
+    let mut runtime_shutdown = daemon.supervisor().subscribe();
+    // Two ways this process stops serving, and neither is a duration. The host
+    // signal is the operator's; the runtime request is the daemon's own, raised
+    // by a reset that has already removed the state it was running on. Either
+    // way the drain below is the same one.
+    tokio::select! {
+        () = wait_for_shutdown_signal() => tracing::info!("shutdown requested"),
+        _ = runtime_shutdown.recv() => {
+            tracing::info!("daemon runtime requested shutdown — returning so the service supervisor can start a fresh instance");
+        }
+    }
     daemon.shutdown().await;
     Ok(())
 }

@@ -72,7 +72,7 @@ pub(crate) struct TestLink {
 ///
 /// Deliberately mirrors `engine::mod`'s `DataChannelOpen` arm: the binding is
 /// taken from the connector before the handoff moves, the context is fixed from
-/// the mesh and the exact Device pair, the profile is derived inside endpoint
+/// the mesh and the exact Device pair, the profile is fixed inside endpoint
 /// authentication rather than selected here, and the signing key moves into the
 /// task. A fixture that constructed the context differently could prove nothing
 /// about the production transition.
@@ -641,7 +641,7 @@ impl LiveAttempt {
     /// The peer's half, committing to the caller's chosen remote fingerprint.
     ///
     /// Every other field is the genuine one: right signer, right identities,
-    /// right mesh context, right derived profile, right contribution pair. The
+    /// right mesh context, right fixed profile, right contribution pair. The
     /// mirror context reconstructs what the peer would sign, so the only way
     /// the two twins diverge is the component passed here.
     fn peer_proof_committing_to(&self, remote_component: &str) -> String {

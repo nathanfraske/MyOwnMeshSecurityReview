@@ -19,6 +19,7 @@ pub mod embedded;
 pub mod ipc;
 pub mod registry;
 pub mod services;
+pub mod supervisor;
 
 /// One real two-peer link, shared by the families whose controls need one.
 ///

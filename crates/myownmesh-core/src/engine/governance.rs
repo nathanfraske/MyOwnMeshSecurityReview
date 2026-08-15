@@ -1137,23 +1137,18 @@ pub(super) async fn deny_if_evicted(
         transitions,
         member_log,
     });
+    // One attempt, and the attempt's return is the boundary. The proof is
+    // best-effort diagnostic material rather than authority — the peer is
+    // already denied by the current policy projection — so nothing here waits
+    // for it to be received, acknowledged, or retried, and no elapsed duration
+    // participates in the drop.
     if let Err(e) = super::send_to_peer_owner(state, owner, &deny).await {
         tracing::debug!(peer = %device_id, err = %e, "eviction deny send failed");
     }
-    // Do NOT tear the session down in the same breath: the data channel's
-    // send is buffered, and closing the connection here reliably discards
-    // the deny before it flushes — the device never gets its proof and
-    // redials forever (observed: every retry denied, zero adoptions). The
-    // receiving side drops the link itself the moment the deny lands
-    // (`on_deny`); this delayed drop is only the janitor for a peer that
-    // never processes it. Until then the peer sits unauthenticated-for-
-    // app-traffic (never approved), so nothing rides the grace window.
-    let owner = owner.clone();
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        super::drop_peer_if_current(&state, &owner, DropReason::Denied).await;
-    });
+    // Owner-bound, so a peer that was already replaced under the same Device ID
+    // keeps its successor: `drop_peer_if_current` drops nothing when this token
+    // is no longer the current one.
+    super::drop_peer_if_current(state, owner, DropReason::Denied).await;
     true
 }
 

@@ -304,6 +304,49 @@ impl std::fmt::Debug for RealtimeFlowHandle {
     }
 }
 
+/// One real [`RealtimeFlowHandle`] for a flow that is already gone.
+///
+/// **Why this exists, and why nothing smaller would do.** The daemon installs a
+/// flow into one client's table and answers with the capability naming it, and
+/// the property under test is what happens to that installation when the answer
+/// is never written. That property is entirely the daemon's, and it is about the
+/// handle it was given — which it cannot construct, because every field of a
+/// handle is core's and every production path to one runs through a promoted
+/// session on a live connector. A control that opened a real flow to test a
+/// rollback would be a two-node WebRTC test of a table lookup.
+///
+/// **It is a real handle, not a lookalike.** The type, the move-only ownership,
+/// the `Drop` and `close_realtime` behaviour are all production's. What is
+/// arranged is only *which* flow it names: all three identities are `Weak`s that
+/// never upgrade, which is exactly what a retired session's identities become,
+/// and the closer is a `Weak` to no engine. So this handle is one whose flow set
+/// and record are gone — a state production reaches routinely, and one every
+/// operation here already answers by refusing silently. `Drop` takes its first
+/// early return; [`crate::JoinedNetwork::close_realtime`] finds no current owner
+/// and refuses with [`RealtimeRefusal::SessionNotCurrent`].
+///
+/// **What that bounds.** A control using this can prove the daemon takes the
+/// exact flow out of the exact client and hands it to the close path, and that
+/// it does not when the answer was delivered. It cannot prove the native
+/// retirement that a live flow's close performs — that is core's own, and core
+/// tests it against real sessions.
+///
+/// Behind `transport-lab` and `#[doc(hidden)]`: not part of the published
+/// surface, not reachable from a default build, and there is no production
+/// caller.
+#[cfg(feature = "transport-lab")]
+#[doc(hidden)]
+pub fn transport_lab_retired_flow_handle(device_id: &str, label: &[u8]) -> RealtimeFlowHandle {
+    RealtimeFlowHandle {
+        owner: crate::engine::peer_registry::PeerOwnerToken::detached_for_control(device_id),
+        flow_set: crate::transport::webrtc::RealtimeFlowSetIdentity::detached_for_control(),
+        flow: crate::transport::webrtc::RealtimeFlowIdentity::detached_for_control(),
+        name: crate::transport::webrtc::RealtimeFlowName::new(label.to_vec())
+            .expect("a control's flow label is 1..=255 bytes"),
+        closer: None,
+    }
+}
+
 /// Why a realtime operation was refused.
 ///
 /// Four cases, each a distinct fact a client can act on. There is deliberately

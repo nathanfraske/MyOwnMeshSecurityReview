@@ -1308,6 +1308,28 @@ impl PendingCancellation {
         }
     }
 
+    /// A cancellation with nothing filed to withdraw.
+    ///
+    /// For [`TransportLabStreamInbox::stream`] and nothing else. A control that
+    /// wants a real [`RpcStream`] does not have — and must not fabricate — a
+    /// pending entry on some network's gateway: it is testing what the *holder*
+    /// of a stream does, and the withdrawal this type performs is the gateway's
+    /// own behaviour, covered where the gateway is. Both halves are inert rather
+    /// than fake: the `Weak` never upgrades and there is nothing filed, so `drop`
+    /// takes its first early return and reaches no gateway at all.
+    ///
+    /// `request_id` is never called on one. It is read only at the three call
+    /// sites, on the cancellation each has just built from its own filed
+    /// request.
+    #[cfg(feature = "transport-lab")]
+    fn unarmed() -> Self {
+        Self {
+            network: Weak::new(),
+            peer: String::new(),
+            filed: None,
+        }
+    }
+
     fn request_id(&self) -> &str {
         &self.filed.as_ref().expect("armed cancellation").request_id
     }
@@ -1643,14 +1665,39 @@ impl RpcStreamTerminal {
 #[cfg(feature = "transport-lab")]
 #[doc(hidden)]
 pub struct TransportLabStreamInbox {
-    inbox: RpcStreamInbox,
+    inbox: Arc<RpcStreamInbox>,
 }
 
 #[cfg(feature = "transport-lab")]
 impl TransportLabStreamInbox {
     pub fn new() -> Self {
         Self {
-            inbox: RpcStreamInbox::new(),
+            inbox: Arc::new(RpcStreamInbox::new()),
+        }
+    }
+
+    /// The receiving half, as production's own [`RpcStream`], over this exact
+    /// inbox.
+    ///
+    /// **Why this exists.** A stream's *holder* is another crate: the daemon
+    /// files one, answers its caller, and only then starts forwarding it. What
+    /// that crate has to be able to prove is what happens to the stream when the
+    /// answer never arrives — and it cannot, because `RpcStream`'s fields are
+    /// private and every production constructor needs a network, a peer and a
+    /// filed pending entry, none of which a control about the *holder* has any
+    /// business arranging.
+    ///
+    /// What is shared is the real thing: the same `Arc<RpcStreamInbox>` this
+    /// fixture pushes into and settles, drained by the production `recv_funded`.
+    /// The one part that is not production's is the cancellation, which is
+    /// [`PendingCancellation::unarmed`] — inert, because the withdrawal it would
+    /// perform belongs to the gateway that filed the entry and is tested there.
+    /// Nothing here relaxes a rule: a control still cannot mint a terminal, and
+    /// this still cannot reach a network.
+    pub fn stream(&self) -> RpcStream {
+        RpcStream {
+            inbox: Arc::clone(&self.inbox),
+            _cancellation: PendingCancellation::unarmed(),
         }
     }
 

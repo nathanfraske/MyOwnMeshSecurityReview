@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use myownmesh_core::{realtime::RealtimeRefusal, transport as core_webrtc};
 
+use crate::control::handoff::ProvisionalHandoff;
 use crate::control::reply::{FundedVariableReply, OperationReplyData, ResponseOwner};
 use crate::control::ControlState;
 
@@ -42,13 +43,16 @@ fn refused_flow(owner: ResponseOwner, refusal: RealtimeRefusal) -> FundedVariabl
 /// The request's fields arrive as [`FlowOpen`] rather than as a `Request`, so
 /// a caller that gets the variant wrong cannot compile rather than reaching a
 /// runtime panic.
+/// The installed flow travels back with the reply rather than being kept here:
+/// the capability naming it is the client's only copy, and only the connection
+/// loop knows whether that copy was delivered. See [`ProvisionalHandoff`].
 pub(in crate::control) async fn flow_open(
     state: &Arc<ControlState>,
     owner: ResponseOwner,
     open: FlowOpen,
     client_id: crate::ipc::ClientId,
     client_capability: String,
-) -> FundedVariableReply {
+) -> (FundedVariableReply, ProvisionalHandoff) {
     let FlowOpen {
         network,
         peer,
@@ -60,10 +64,16 @@ pub(in crate::control) async fn flow_open(
         channels,
     } = open;
     let Some(client) = state.clients.authenticate(client_id, &client_capability) else {
-        return owner.finish(Err("invalid local client authority".to_owned()));
+        return (
+            owner.finish(Err("invalid local client authority".to_owned())),
+            ProvisionalHandoff::None,
+        );
     };
     let Some(net) = state.registry.get(&network) else {
-        return owner.finish(Err(format!("unknown network: {network}")));
+        return (
+            owner.finish(Err(format!("unknown network: {network}"))),
+            ProvisionalHandoff::None,
+        );
     };
     let chosen = flow_label.clone();
     let requested = core_webrtc::WebRtcRealtimeFlowOpen {
@@ -76,17 +86,26 @@ pub(in crate::control) async fn flow_open(
     };
     match net.open_webrtc_realtime(&peer, requested).await {
         Ok(flow) => match state.clients.install_realtime_flow(&client, network, flow) {
-            Ok(capability) => owner.finish(Ok(OperationReplyData::RealtimeOpened {
-                flow_label: chosen,
-                capability: capability.expose().to_owned(),
-            })),
+            Ok(capability) => {
+                let capability = capability.expose().to_owned();
+                (
+                    owner.finish(Ok(OperationReplyData::RealtimeOpened {
+                        flow_label: chosen,
+                        capability: capability.clone(),
+                    })),
+                    ProvisionalHandoff::RealtimeFlow { client, capability },
+                )
+            }
             Err(rejected) => {
                 let reason = rejected.reason.to_string();
                 let _ = net.close_realtime(rejected.flow).await;
-                owner.finish(Err(format!("realtime flow open refused: {reason}")))
+                (
+                    owner.finish(Err(format!("realtime flow open refused: {reason}"))),
+                    ProvisionalHandoff::None,
+                )
             }
         },
-        Err(refusal) => refused_flow(owner, refusal),
+        Err(refusal) => (refused_flow(owner, refusal), ProvisionalHandoff::None),
     }
 }
 

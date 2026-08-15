@@ -38,7 +38,7 @@ pub struct EmbeddedDaemon {
     mesh: myownmesh_core::MeshHandle,
     registry: std::sync::Arc<NetworkRegistry>,
     service_manager: std::sync::Arc<ServiceManager>,
-    shutdown_tx: broadcast::Sender<()>,
+    supervisor: crate::supervisor::RuntimeSupervisor,
     /// The control surface, retained so shutdown can wait for it.
     ///
     /// Held rather than detached, and that is the whole of it: dropping the
@@ -58,6 +58,17 @@ impl EmbeddedDaemon {
         &self.mesh
     }
 
+    /// The runtime's shutdown request, for a host that must observe one it did
+    /// not make.
+    ///
+    /// A reset submits through this object, so a host that only ever waits on
+    /// its own signal would keep running against state the daemon has deleted.
+    /// Subscribe while starting up: a broadcast receiver sees only what is sent
+    /// after it subscribes.
+    pub fn supervisor(&self) -> &crate::supervisor::RuntimeSupervisor {
+        &self.supervisor
+    }
+
     /// Graceful teardown, exactly like the serve binary's signal path.
     ///
     /// The control surface goes first and is *awaited*, and the order is the
@@ -73,7 +84,11 @@ impl EmbeddedDaemon {
     /// tasks, and it ends them by signalling rather than by aborting, so a
     /// request already in flight is finished rather than dropped half-applied.
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
+        // The same request a reset submits, through the same object: idempotent,
+        // so a daemon already draining because its state was reset is not
+        // signalled twice, and an embedder is never told to wait on a second
+        // drain that will not happen.
+        self.supervisor.request_shutdown();
         // The control surface, before anything it might still be serving is
         // taken away. A panic in the control task is reported rather than
         // swallowed: it means the drain did not complete, and the teardown below
@@ -190,10 +205,12 @@ async fn start_with_mesh(
     // Control socket: the same listener + wire protocol every client talks
     // to, whether the daemon is a process or embedded.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let supervisor = crate::supervisor::RuntimeSupervisor::new(shutdown_tx);
+    let ctl_supervisor = supervisor.clone();
     let ctl_mesh = mesh.clone();
     let ctl_registry = registry.clone();
     let ctl_services = service_manager.clone();
-    let ctl_shutdown = shutdown_tx.subscribe();
+    let ctl_shutdown = supervisor.subscribe();
     let ctl_socket = cfg.daemon.control_socket.clone();
     // Kept, not discarded. See [`EmbeddedDaemon::control`].
     let control = tokio::spawn(async move {
@@ -203,6 +220,7 @@ async fn start_with_mesh(
             ctl_services,
             ctl_socket,
             realtime,
+            ctl_supervisor,
             ctl_shutdown,
         )
         .await
@@ -215,7 +233,7 @@ async fn start_with_mesh(
         mesh,
         registry,
         service_manager,
-        shutdown_tx,
+        supervisor,
         control,
     })
 }
@@ -375,6 +393,93 @@ mod tests {
             LocalSocketStream::connect(name).await.is_err(),
             "serve returned, so its control socket no longer accepts connections"
         );
+    }
+
+    /// The reset path's own action: one runtime shutdown request drains this
+    /// daemon and leaves the process hosting it running.
+    ///
+    /// This is what the deleted shape could not pass. A reset used to spawn a
+    /// detached task, sleep for a fixed interval it hoped was longer than the
+    /// write, and call `std::process::exit(0)` — which ends the *host*, not the
+    /// daemon, and takes every embedder's own state with it. Here the request is
+    /// submitted the way the reset arm submits it, after the response reached a
+    /// write disposition, and what follows is the ordinary drain.
+    ///
+    /// The request and the embedder's later `shutdown` are the same idempotent
+    /// path, so the second one submits nothing second — asserted here rather
+    /// than inferred, because a second send on a capacity-one broadcast would
+    /// overwrite an unread first.
+    ///
+    /// The host being alive is not asserted with a duration or a probe: this
+    /// control body simply continues, and a process that had exited could not
+    /// run it.
+    ///
+    /// Unix-only for the reason the control above is: the socket sits at a path
+    /// this control chooses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v4_r6_daemon_b2_a_runtime_shutdown_request_drains_and_leaves_the_host_alive() {
+        use interprocess::local_socket::{tokio::prelude::*, GenericFilePath, ToFsName};
+
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let temp = tempfile::tempdir().expect("temporary daemon state");
+        let socket = temp.path().join("private").join("daemon.sock");
+        let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
+        daemon_config.control_socket = Some(socket.clone());
+        let mut services = myownmesh_core::MeshConfig::default().services;
+        services.node.enabled = false;
+        let cfg = myownmesh_core::MeshConfig {
+            auto_update: myownmesh_core::AutoUpdateConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            daemon: daemon_config,
+            services,
+            ..Default::default()
+        };
+        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            cfg.clone(),
+            std::sync::Arc::new(myownmesh_core::Identity::ephemeral()),
+            crate::test_resource_provider(),
+        )
+        .await
+        .expect("the test identity opens an infrastructure-only mesh");
+        let daemon = start_with_mesh(cfg, mesh, control::RealtimeAdvert::unsupported())
+            .await
+            .expect("the daemon test grant starts an infrastructure-only daemon");
+
+        assert!(
+            !daemon.supervisor().shutdown_requested(),
+            "non-vacuity: nothing has asked this runtime to stop yet"
+        );
+        // The reset arm's action, submitted once the response has reached its
+        // write disposition.
+        assert!(
+            daemon.supervisor().request_shutdown(),
+            "the reset submits the one request"
+        );
+        // And the embedder's own shutdown, on the same path, afterwards.
+        assert!(
+            !daemon.supervisor().request_shutdown(),
+            "which a later caller does not submit a second time"
+        );
+
+        match tokio::time::timeout(HANG_GUARD, daemon.shutdown()).await {
+            Ok(()) => {}
+            Err(_) => panic!("hang guard: the requested drain returns"),
+        }
+
+        let name = socket
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the control socket path is a valid fs name");
+        assert!(
+            LocalSocketStream::connect(name).await.is_err(),
+            "the drain really ran: serve returned and took its listener with it"
+        );
+        // Reached, which is the whole of the host-process claim.
+        drop(temp);
     }
 
     #[tokio::test]

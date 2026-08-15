@@ -415,6 +415,19 @@ struct RealtimeFlowSetToken;
 /// outstanding.
 pub(crate) struct RealtimeFlowSetIdentity(std::sync::Weak<RealtimeFlowSetToken>);
 
+#[cfg(feature = "transport-lab")]
+impl RealtimeFlowSetIdentity {
+    /// An identity for a flow set that is gone.
+    ///
+    /// A `Weak` that never upgrades is exactly what a retired session's identity
+    /// becomes, so this is not a fabricated authority — it is the state every
+    /// identity here reaches, minted directly. Used only by
+    /// [`crate::realtime::transport_lab_retired_flow_handle`].
+    pub(crate) fn detached_for_control() -> Self {
+        Self(std::sync::Weak::new())
+    }
+}
+
 /// Every real-time flow one promoted session holds, and the label namespace
 /// they are drawn from.
 ///

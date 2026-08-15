@@ -182,6 +182,15 @@ impl RealtimeFlowLabel {
 #[derive(Debug)]
 pub(crate) struct RealtimeFlowIdentity(std::sync::Weak<LeasedLabel>);
 
+#[cfg(feature = "transport-lab")]
+impl RealtimeFlowIdentity {
+    /// An identity for a flow record that is gone, on the same reasoning as
+    /// [`super::RealtimeFlowSetIdentity::detached_for_control`].
+    pub(crate) fn detached_for_control() -> Self {
+        Self(std::sync::Weak::new())
+    }
+}
+
 impl std::borrow::Borrow<[u8]> for RealtimeFlowLabel {
     /// Lets a collection keyed by label be looked up with the raw bytes a peer
     /// sent, without minting a lease merely to ask a question. Consistent with

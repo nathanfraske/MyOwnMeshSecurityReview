@@ -189,8 +189,12 @@ async fn network_remove_result(
 /// Forget every joined network at once — the bulk `NetworkRemove{purge:true}`.
 /// Each network is torn down live and its signed state + roster deleted from
 /// disk; the device identity is kept. Snapshots the set first so removing as we
-/// go can't skip an entry. Schedules a daemon exit ([`schedule_daemon_exit`]) so
-/// every layer reloads clean around the wipe.
+/// go can't skip an entry.
+///
+/// The runtime shutdown that drops every in-memory cache around the wipe is not
+/// this function's to start: the connection loop submits it once the response to
+/// this request has actually been attempted, so no cache is dropped while the
+/// answer is still unwritten and no duration stands in for the write.
 pub(in crate::control) async fn forget_all_networks(
     state: &Arc<ControlState>,
     owner: ResponseOwner,
@@ -201,19 +205,16 @@ pub(in crate::control) async fn forget_all_networks(
         let _ = network_remove_result(state, &n.config_id, true, &owner).await;
         forgotten.push(n.config_id);
     }
-    schedule_daemon_exit();
     owner.finish(Ok(OperationReplyData::Forgotten(forgotten)))
 }
 
 /// Factory reset — return this device to a brand-new state. First quiesce every
 /// network (tear it down + purge its files) so nothing re-persists mid-wipe,
 /// then remove the whole state directory (identity, config, and any leftovers),
-/// and finally exit so a fresh daemon mints a new identity on empty state. The
-/// live control socket + log file descriptors stay valid until exit; the
-/// supervising service, or the GUI's `ensure_daemon_running` on relaunch, brings
-/// the daemon back. Best-effort per step — we always schedule the exit so a
-/// partial failure still ends in a clean restart rather than a half-wiped daemon
-/// re-persisting stale caches.
+/// so a fresh runtime mints a new identity on empty state. Best-effort per step,
+/// and a partial failure is still a reset: the connection loop submits the one
+/// runtime shutdown request after this answer has been attempted either way,
+/// rather than leaving a half-wiped daemon re-persisting stale caches.
 pub(in crate::control) async fn factory_reset(
     state: &Arc<ControlState>,
     owner: ResponseOwner,
@@ -226,9 +227,9 @@ pub(in crate::control) async fn factory_reset(
     let dir = match myownmesh_core::dirs::data_dir() {
         Ok(d) => d,
         Err(e) => {
-            // Can't find the dir to wipe — still restart so we don't leave the
-            // caller hanging on a half-done reset.
-            schedule_daemon_exit();
+            // The networks above are already torn down and purged, so the
+            // connection loop's shutdown request still follows this answer: a
+            // half-done reset must not go on running either.
             return owner.finish(Err(format!("factory reset: resolve state dir: {e}")));
         }
     };
@@ -239,23 +240,7 @@ pub(in crate::control) async fn factory_reset(
             warn!(dir = %dir.display(), "factory reset: remove_dir_all: {e:#}");
         }
     }
-    schedule_daemon_exit();
     owner.finish(Ok(OperationReplyData::Reset))
-}
-
-/// Exit the daemon shortly after the current response flushes, so a fresh
-/// instance reloads from the now-clean disk. The reset commands use this: the
-/// only reliable way to drop every in-memory cache — which would otherwise
-/// re-persist and "resurrect" the state we just deleted — is a clean process
-/// restart. The short delay lets the JSON response reach the client first; the
-/// supervising service (Restart=always) or the GUI's `ensure_daemon_running` on
-/// relaunch starts a fresh daemon.
-fn schedule_daemon_exit() {
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        info!("reset complete — exiting so a fresh daemon reloads clean state");
-        std::process::exit(0);
-    });
 }
 
 /// Reconnect a joined network in place — the non-destructive twin of

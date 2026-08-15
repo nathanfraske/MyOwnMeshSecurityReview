@@ -19,6 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use interprocess::local_socket::tokio::prelude::*;
 use myownmesh_core::MeshHandle;
+#[cfg(test)]
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
@@ -26,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::registry::NetworkRegistry;
 use crate::services::ServiceManager;
+use crate::supervisor::RuntimeSupervisor;
 
 /// One decoded control request and the exact retention that funds its tree.
 ///
@@ -499,6 +501,7 @@ pub async fn serve(
     services: Arc<ServiceManager>,
     custom: Option<PathBuf>,
     realtime: RealtimeAdvert,
+    supervisor: RuntimeSupervisor,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     serve_with_hooks(
@@ -507,6 +510,7 @@ pub async fn serve(
             registry,
             services,
             realtime,
+            supervisor,
         },
         custom,
         shutdown,
@@ -526,6 +530,10 @@ struct ControlSurface {
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
     realtime: RealtimeAdvert,
+    /// The one path to the runtime drain, shared with the embedder's own
+    /// `shutdown`. A reset submits through it after its response has been
+    /// written; nothing here ends the host process.
+    supervisor: RuntimeSupervisor,
 }
 
 async fn serve_with_hooks(
@@ -539,6 +547,7 @@ async fn serve_with_hooks(
         registry,
         services,
         realtime,
+        supervisor,
     } = surface;
     // Both are optional, and absence is not absence of a bound. Nothing a
     // connection retains is held without a lease -- a frame's growth funded per
@@ -584,6 +593,7 @@ async fn serve_with_hooks(
         json_line_bytes,
         realtime_frame_bytes,
         realtime,
+        supervisor,
         #[cfg(test)]
         before_events_subscribe_commit: hooks.before_events_subscribe_commit,
         #[cfg(test)]
@@ -903,6 +913,8 @@ struct ControlState {
     services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
     realtime: RealtimeAdvert,
+    /// See [`ControlSurface::supervisor`].
+    supervisor: RuntimeSupervisor,
     json_line_bytes: Option<usize>,
     realtime_frame_bytes: Option<usize>,
     #[cfg(test)]
@@ -910,6 +922,53 @@ struct ControlState {
     /// See [`ControlHooks::at_events_stream_entry`].
     #[cfg(test)]
     at_events_stream_entry: Option<Arc<DispatchBarrier>>,
+}
+
+/// One control surface with nothing joined, for the controls that are about
+/// what a connection does rather than about what it is connected to.
+///
+/// Everything a [`ControlState`] needs and nothing more: no network is in the
+/// registry, so the cleanup a disconnect performs walks empty lists and a
+/// network lookup answers `None` — which is what lets a control drive a refusal
+/// arm, or a disconnect, without arranging a joined network first. The mesh is
+/// infrastructure-only over the one daemon test grant the whole binary spends
+/// from.
+///
+/// Here rather than in one control's own module because three sibling modules
+/// need the same value, and a copy in each would be three things to keep in
+/// step with this struct.
+#[cfg(test)]
+pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
+    let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+        myownmesh_core::MeshConfig::default(),
+        Arc::new(myownmesh_core::Identity::ephemeral()),
+        crate::test_resource_provider(),
+    )
+    .await
+    .expect("the daemon test grant opens an infrastructure-only mesh");
+    let registry = NetworkRegistry::new();
+    let services = ServiceManager::new(mesh.clone(), registry.clone());
+    let clients = crate::ipc::ClientRegistry::new(
+        mesh.local_application_resource_scope()
+            .expect("the fixture grant issues the registry's scope"),
+    );
+    Arc::new(ControlState {
+        finished: tokio::sync::Notify::new(),
+        ended: std::sync::atomic::AtomicUsize::new(0),
+        mesh,
+        registry,
+        services,
+        clients,
+        realtime: RealtimeAdvert {
+            supported: false,
+            encodings: Vec::new(),
+        },
+        supervisor: RuntimeSupervisor::new(broadcast::channel(1).0),
+        json_line_bytes: None,
+        realtime_frame_bytes: None,
+        before_events_subscribe_commit: None,
+        at_events_stream_entry: None,
+    })
 }
 
 // The daemon keeps no realtime flow state of its own, and deliberately holds
@@ -1520,7 +1579,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("realtime operation result was not admitted")?;
-                let variable = dispatch::realtime::flow_open(
+                let (variable, provisional) = dispatch::realtime::flow_open(
                     &state,
                     owner,
                     dispatch::realtime::FlowOpen {
@@ -1537,10 +1596,14 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
-                match write_variable(&mut writer, &json_lines, &cancel, variable)
-                    .await
-                    .context("realtime response line was not admitted")?
-                {
+                // The capability naming this flow is the client's only copy, so
+                // the flow is not this daemon's until the line carrying it has
+                // actually been written.
+                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
+                provisional
+                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
+                    .await;
+                match wrote.context("realtime response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -1578,7 +1641,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("RPC stream setup result was not admitted")?;
-                let variable = dispatch::rpc::call_stream_funded(
+                let (variable, provisional) = dispatch::rpc::call_stream_funded(
                     &state,
                     &cancel,
                     owner,
@@ -1592,10 +1655,15 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
-                match write_variable(&mut writer, &json_lines, &cancel, variable)
-                    .await
-                    .context("RPC stream setup response line was not admitted")?
-                {
+                // The request id is the client's only handle on this stream.
+                // Until the setup line is written, the stream is filed but
+                // nothing forwards it; the settle below either starts the
+                // forwarding or withdraws the stream.
+                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
+                provisional
+                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
+                    .await;
+                match wrote.context("RPC stream setup response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -1916,10 +1984,16 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("network reset result was not admitted")?;
                 let variable = dispatch::network::forget_all_networks(&state, owner).await;
-                match write_variable(&mut writer, &json_lines, &cancel, variable)
-                    .await
-                    .context("network reset response line was not admitted")?
-                {
+                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
+                // The reset has already removed the state this daemon was
+                // running on, so the shutdown request follows the *write
+                // attempt* rather than its outcome: `Sent` means the client saw
+                // the answer, `Ended` means the socket did not, and a refused
+                // line means no answer exists — none of the three makes
+                // continuing on deleted state safe. One idempotent request, no
+                // elapsed time, and the host process is left alive.
+                state.supervisor.request_shutdown();
+                match wrote.context("network reset response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -1928,10 +2002,16 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("network reset result was not admitted")?;
                 let variable = dispatch::network::factory_reset(&state, owner).await;
-                match write_variable(&mut writer, &json_lines, &cancel, variable)
-                    .await
-                    .context("network reset response line was not admitted")?
-                {
+                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
+                // The reset has already removed the state this daemon was
+                // running on, so the shutdown request follows the *write
+                // attempt* rather than its outcome: `Sent` means the client saw
+                // the answer, `Ended` means the socket did not, and a refused
+                // line means no answer exists — none of the three makes
+                // continuing on deleted state safe. One idempotent request, no
+                // elapsed time, and the host process is left alive.
+                state.supervisor.request_shutdown();
+                match wrote.context("network reset response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -2032,10 +2112,25 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::GovernanceMfaEnroll { network } => {
-                let (reply, output) = dispatch::governance::mfa_enroll(&json_lines, network)?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("MFA enrollment response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let ((reply, output), provisional) =
+                    dispatch::governance::mfa_enroll(&json_lines, network)?;
+                // The secret and the recovery codes are shown exactly once and
+                // are not recoverable from disk, so nothing is written until
+                // this line is.
+                let line =
+                    match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
+                        Ok(line) => line,
+                        Err(error) => {
+                            provisional.settle(&state, false).await;
+                            return Err(error)
+                                .context("MFA enrollment response changed after measurement");
+                        }
+                    };
+                let wrote = write_admitted_line(&mut writer, &cancel, line).await;
+                provisional
+                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
+                    .await;
+                match wrote? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -2382,6 +2477,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
 /// Frame-shaped work only: reading units off a socket and writing them back.
 /// It decides nothing about admission — the binding is checked before either
 /// pump starts, and every refusal it can meet comes from core.
+mod handoff;
 mod realtime_pipe;
 
 #[cfg(test)]
@@ -2615,12 +2711,6 @@ where
         }
     }
 }
-
-/// Single shared `MeshHandle` storage for the ctl client. Mostly a
-/// future-proofing hook so a follow-up can attach per-network
-/// state without changing the protocol.
-#[allow(dead_code)]
-static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(None);
 
 /// What a client may say on this socket, and what it may not.
 ///
@@ -3483,6 +3573,7 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
+                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
             },
             Some(socket.clone()),
             shutdown_rx,
@@ -3619,6 +3710,7 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
+                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
             },
             Some(socket.clone()),
             shutdown_rx,
@@ -3769,6 +3861,7 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
+                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
             },
             Some(socket.clone()),
             shutdown_rx,
@@ -3927,6 +4020,7 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
+                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
             },
             Some(socket.clone()),
             shutdown_rx,

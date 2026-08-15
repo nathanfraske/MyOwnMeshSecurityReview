@@ -79,6 +79,28 @@ impl PeerOwnerToken {
     pub(crate) fn device_id(&self) -> &str {
         &self.peer.device_id
     }
+
+    /// A token naming a peer that is installed nowhere.
+    ///
+    /// For the one control seam that needs a [`RealtimeFlowHandle`] outside this
+    /// crate — see [`crate::realtime::transport_lab_retired_flow_handle`]. The
+    /// installation marker is this token's own and matches no registry entry, so
+    /// it authorizes nothing: every operation that takes an owner resolves it
+    /// against the installed peer first and finds nothing to act on.
+    ///
+    /// That is the point. It is not a weaker version of an admitted token; it is
+    /// a token for a peer that is gone, which is a state production reaches and
+    /// production code already answers correctly.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn detached_for_control(device_id: &str) -> Self {
+        Self {
+            peer: Arc::new(super::connection::PeerConnection::new(
+                device_id.to_string(),
+                None,
+            )),
+            installation: Arc::new(()),
+        }
+    }
 }
 
 impl Default for PeerRegistry {
