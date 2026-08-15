@@ -3328,7 +3328,6 @@ mod stream_cancellation_tests {
 #[cfg(all(test, unix))]
 mod terminal_shutdown_tests {
     use interprocess::local_socket::{GenericFilePath, ToFsName};
-    use std::num::NonZeroUsize;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
