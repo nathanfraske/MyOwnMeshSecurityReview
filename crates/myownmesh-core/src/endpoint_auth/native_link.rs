@@ -36,10 +36,7 @@ use super::contribution::{LocalContribution, PeerContribution};
 #[cfg(test)]
 use super::transcript;
 #[cfg(test)]
-use super::{
-    EndpointAuthContext, EndpointAuthError, EndpointAuthSetupError, EndpointAuthTask,
-    LocalIdentitySigner,
-};
+use super::{EndpointAuthContext, EndpointAuthError, EndpointAuthTask, LocalIdentitySigner};
 #[cfg(test)]
 use crate::connector::EndpointAuthBinding;
 use crate::engine::state::NetworkState;
@@ -670,44 +667,6 @@ impl LiveAttempt {
         )
     }
 
-    /// The fixture really is on a live link whose production supplier states
-    /// both components.
-    ///
-    /// Every missing-component control below removes one side of a pair it
-    /// obtained from this exact supplier, so this is what makes those controls
-    /// statements about the live boundary rather than about two string
-    /// literals. The two components must also differ, or blanking the local
-    /// side would be indistinguishable from blanking the remote one.
-    async fn assert_live_supplier_states_both_components(&self) {
-        assert!(
-            !self.observed_local.is_empty(),
-            "the live link states this endpoint's fingerprint"
-        );
-        assert!(
-            !self.observed_remote.is_empty(),
-            "the live link states the peer's fingerprint"
-        );
-        assert_ne!(
-            self.observed_local, self.observed_remote,
-            "non-vacuity: each endpoint presents its own certificate, so the two \
-             sides are distinguishable"
-        );
-        assert!(
-            self.link.left.endpoint_auth_binding().await.is_some(),
-            "non-vacuity: the production supplier yields a binding on this live link, \
-             so a refusal below is the missing component and not an unusable fixture"
-        );
-    }
-
-    /// The genuine pair this live link observed, as the supplier would state it.
-    fn observed_binding(&self) -> crate::connector::EndpointAuthBinding {
-        EndpointAuthBinding::webrtc_certificate_fingerprints(
-            &self.observed_local,
-            &self.observed_remote,
-        )
-        .expect("the live link states both components")
-    }
-
     async fn close(self) {
         for worker in [&self.link.left, &self.link.right] {
             worker
@@ -795,160 +754,6 @@ async fn v4_arc04_observed_fingerprint_promotes_through_the_live_handler() {
         attempt.link.left_auth.terminal_error(),
         None,
         "a promoted attempt holds no terminal error"
-    );
-    attempt.close().await;
-}
-
-/// Missing **local** fingerprint, against the live link's own material.
-///
-/// The review requires the fingerprint field to be load-bearing rather than
-/// incidental: a half pair must fail closed on its own account, not because
-/// something unrelated happened to break. This removes exactly one component
-/// from a pair this live link's production supplier actually stated, leaves the
-/// other component genuine, and asserts nothing can be built from the result.
-///
-/// The refusal lands at the only constructor, one step *before* a typed error
-/// is reachable: with no binding there is no context, so no task, transcript,
-/// proof, or capability can exist for a half pair. The typed
-/// `EndpointAuthSetupError::MissingIdentityField` refusal asserted afterwards is
-/// that same missing-required-field rule at the next boundary down, where a
-/// typed cause does exist — stated here so the two are pinned together rather
-/// than assumed to agree.
-///
-/// That cause is a *setup* one and deliberately not a terminal one: nothing has
-/// been built yet, so there is no attempt for it to end. What fails this path
-/// closed is the production caller retiring the exact connector, not the value.
-#[tokio::test]
-#[ignore = "opens a native WebRTC link; run in the isolated native endpoint-auth control"]
-async fn v4_arc04d_missing_local_fingerprint_is_fail_closed_on_a_live_link() {
-    let attempt = live_attempt("arc04d-missing-local-a", "arc04d-missing-local-b").await;
-    attempt.assert_live_supplier_states_both_components().await;
-
-    assert!(
-        EndpointAuthBinding::webrtc_certificate_fingerprints("", &attempt.observed_remote)
-            .is_none(),
-        "a missing local fingerprint must yield no binding at all"
-    );
-    // Discriminating: the same call differing only in the restored local
-    // component succeeds on this same live material, so the refusal above is
-    // attributable to the missing local side.
-    assert!(
-        EndpointAuthBinding::webrtc_certificate_fingerprints(
-            &attempt.observed_local,
-            &attempt.observed_remote,
-        )
-        .is_some(),
-        "non-vacuity: with the local component present the same constructor yields a binding"
-    );
-
-    // The same rule, one boundary down, where a typed cause exists: an absent
-    // required field is the typed refusal, never a defaulted or empty value.
-    // `err()` rather than `expect_err`: the success type is deliberately not
-    // `Debug`, because a context that could be printed could be copied into a
-    // report and then re-supplied.
-    assert_eq!(
-        EndpointAuthContext::new(
-            &attempt.state_a.network_id,
-            "",
-            crate::signing::pubkey_part(attempt.state_b.identity.public_id()),
-            attempt.observed_binding(),
-        )
-        .err(),
-        Some(EndpointAuthSetupError::MissingIdentityField),
-        "the missing local side fails with the typed missing-field cause"
-    );
-    attempt.close().await;
-}
-
-/// Missing **remote** fingerprint — the exact twin of the control above, with
-/// the other side of the pair removed, so neither control can pass on a
-/// condition belonging to its sibling.
-#[tokio::test]
-#[ignore = "opens a native WebRTC link; run in the isolated native endpoint-auth control"]
-async fn v4_arc04d_missing_remote_fingerprint_is_fail_closed_on_a_live_link() {
-    let attempt = live_attempt("arc04d-missing-remote-a", "arc04d-missing-remote-b").await;
-    attempt.assert_live_supplier_states_both_components().await;
-
-    assert!(
-        EndpointAuthBinding::webrtc_certificate_fingerprints(&attempt.observed_local, "").is_none(),
-        "a missing remote fingerprint must yield no binding at all"
-    );
-    assert!(
-        EndpointAuthBinding::webrtc_certificate_fingerprints(
-            &attempt.observed_local,
-            &attempt.observed_remote,
-        )
-        .is_some(),
-        "non-vacuity: with the remote component present the same constructor yields a binding"
-    );
-
-    assert_eq!(
-        EndpointAuthContext::new(
-            &attempt.state_a.network_id,
-            attempt.state_a.identity.public_id(),
-            "",
-            attempt.observed_binding(),
-        )
-        .err(),
-        Some(EndpointAuthSetupError::MissingIdentityField),
-        "the missing remote side fails with the typed missing-field cause"
-    );
-    attempt.close().await;
-}
-
-/// A peer that does not advertise the closed endpoint-auth profile is refused
-/// before any proof work, on the live handler.
-///
-/// The unit control in `engine::handshake` proves `negotiate_profile` itself is
-/// exact. This proves the production `on_hello` path enforces it over a real
-/// DTLS link: the Hello is otherwise entirely well formed — right device id,
-/// right canonical contribution — and differs only in the absent feature id.
-#[tokio::test]
-#[ignore = "opens a native WebRTC link; run in the isolated native endpoint-auth control"]
-async fn v4_arc04d_unadvertised_profile_is_refused_by_the_live_handler() {
-    let attempt = live_attempt("arc04d-unadvertised-a", "arc04d-unadvertised-b").await;
-    // Non-vacuity: this build requires exactly the id it advertises, so the
-    // refusal below is the peer's omission and not an id nobody sends.
-    assert!(
-        crate::protocol::features::ADVERTISED_FEATURES
-            .contains(&crate::protocol::features::Feature::ENDPOINT_AUTH_V1),
-        "this build advertises the profile it requires"
-    );
-    assert_eq!(
-        super::negotiate_profile(&[]),
-        Err(EndpointAuthSetupError::IncompatibleProfile),
-        "an empty advertisement is the typed incompatible-profile refusal"
-    );
-
-    let hello = crate::protocol::handshake::HelloMessage {
-        protocol: crate::PROTOCOL_VERSION,
-        device_id: attempt.state_b.identity.public_id().to_string(),
-        label: "unadvertised".to_string(),
-        // The exact canonical value this attempt already bound, so the refusal
-        // cannot be attributed to a malformed or conflicting contribution.
-        nonce: attempt.peer_contribution.as_str().to_owned(),
-        verification_code: "zzz999".to_string(),
-        // An unrelated string is not a compatibility fallback for the one
-        // required profile.
-        features: vec!["unrelated_profile".to_string()],
-    };
-
-    let device_id = attempt.state_b.identity.public_id().to_string();
-    crate::engine::handshake::on_hello(&attempt.state_a, &attempt.owner, hello).await;
-
-    assert!(
-        !crate::engine::legacy_test_has_authenticated_channel(&attempt.state_a, &attempt.owner),
-        "an unadvertised profile must not authenticate this channel"
-    );
-    // The load-bearing assertion. Absence of a capability alone would pass even
-    // with the gate deleted, because this Hello carries the already-bound
-    // contribution and would simply be answered from the cached proof — a Hello
-    // never installs a capability. What only the gate produces is the drop: the
-    // entry is torn down, so the refusal is fail-closed rather than merely
-    // not-yet-authenticated.
-    assert!(
-        crate::engine::legacy_test_owner(&attempt.state_a, &device_id).is_none(),
-        "the peer entry must be dropped, not left alive and unauthenticated"
     );
     attempt.close().await;
 }

@@ -79,17 +79,6 @@ impl PeerOwnerToken {
     pub(crate) fn device_id(&self) -> &str {
         &self.peer.device_id
     }
-
-    /// The exact installed connection this token names.
-    ///
-    /// Borrowed, and holding it proves nothing on its own: an owner token
-    /// outlives the installation it names, which is the whole reason it exists.
-    /// A caller that must act on the peer settles that first with
-    /// [`PeerRegistry::get_if_current`], and uses this only to *read* the
-    /// connection it already measured.
-    pub(super) fn peer(&self) -> &Arc<PeerConnection> {
-        &self.peer
-    }
 }
 
 impl Default for PeerRegistry {
@@ -713,12 +702,11 @@ impl PeerRegistry {
 
     /// Snapshot owner tokens for the entries a fanout selects.
     ///
-    /// Fanout used to collect device id **strings** and then re-resolve each one
-    /// at send time. That is the same re-resolution defect the inbound path
-    /// removed: between the collection and the send, a peer can be replaced, and
-    /// the replacement answers the lookup and receives the payload. An owner
-    /// token names one *installation*, so after replacement it names nothing and
-    /// that element of the fanout simply drops.
+    /// Owner tokens rather than device id **strings**, because a string has to
+    /// be re-resolved at send time: between the collection and the send a peer
+    /// can be replaced, and the replacement answers the lookup and receives the
+    /// payload. An owner token names one *installation*, so after replacement it
+    /// names nothing and that element of the fanout simply drops.
     ///
     /// Selection stays a policy read — it is not authority. Each element is
     /// still individually authorized by the session gate when it is sent.
@@ -757,46 +745,9 @@ impl PeerRegistry {
             .collect()
     }
 
-    /// Stage at most `limit` installed peers as owner tokens, in a boxed slice.
-    ///
-    /// The bounded form of [`Self::values_snapshot`], for a caller that had to
-    /// pay for the list before it could exist. The retained form is
-    /// `Box<[PeerOwnerToken]>` rather than a `Vec` for one reason: a boxed slice
-    /// has no capacity. Its layout is exactly `len * size_of::<PeerOwnerToken>()`,
-    /// so a caller that funded that arithmetic funded what it holds.
-    /// `Vec::with_capacity` guarantees only *at least* the requested capacity,
-    /// so a claim resting on it would be a lower bound wearing an exact number's
-    /// clothes. The `Vec` below is transient scaffolding, and
-    /// `into_boxed_slice` shrinks it to exactly `len` on the way out.
-    ///
-    /// **This is a bound, not a fence.** A peer installed after the count that
-    /// produced `limit` is simply not in this observation, exactly as it would
-    /// not be in a `values_snapshot` taken a moment earlier — and the caller can
-    /// see that happened, because the returned length is shorter than the limit
-    /// it asked for. What the caller gets instead of a fence is identity: every
-    /// entry is an owner token, so a *replacement* under a staged device id is
-    /// detectable by [`Self::get_if_current`] rather than silently substituted.
-    ///
-    /// The loop clones two `Arc`s per entry and nothing else — no allocation,
-    /// no acquisition, and no peer-state lock — so the shard guard `iter` holds
-    /// is released without ever having been held across either.
-    pub(super) fn stage_owners(&self, limit: usize) -> Box<[PeerOwnerToken]> {
-        let mut staged = Vec::with_capacity(limit);
-        for entry in self.peers.iter() {
-            if staged.len() == limit {
-                break;
-            }
-            staged.push(PeerOwnerToken {
-                peer: Arc::clone(&entry.value().peer),
-                installation: Arc::clone(&entry.value().installation),
-            });
-        }
-        staged.into_boxed_slice()
-    }
-
     /// Build one output vector from an `Arc`-only snapshot. The DashMap guards
-    /// are released before the callback can take a peer-state lock. This avoids
-    /// the old key clones without introducing a registry-to-peer lock order.
+    /// are released before the callback can take a peer-state lock, so no key
+    /// is cloned and no registry-to-peer lock order is introduced.
     pub(super) fn collect_map<T>(
         &self,
         mut map: impl FnMut(&PeerConnection) -> Option<T>,
@@ -1011,13 +962,12 @@ impl AdmittedSessionOperation<'_> {
 /// Move-only authority to dispatch exactly one already-parsed inbound
 /// application frame against one exact peer installation.
 ///
-/// This is what the inbound path used to answer with an `Option<bool>`. The
-/// boolean was the defect: it outlived the fence that produced it, and every
-/// dispatch arm below then re-resolved the peer *by device id*, so a
-/// replacement installed during the await answered the lookup and received the
-/// effect, the liveness touch, the counters, and the delivery. An authority
-/// cannot be re-resolved — it names one installation, and after replacement it
-/// names nothing.
+/// An authority rather than an `Option<bool>`, because a boolean outlives the
+/// fence that produced it: every dispatch arm would then re-resolve the peer *by
+/// device id*, so a replacement installed during the await would answer the
+/// lookup and receive the effect, the liveness touch, the counters, and the
+/// delivery. An authority cannot be re-resolved — it names one installation, and
+/// after replacement it names nothing.
 ///
 /// Carries all three things one admission decided, as a single value: the
 /// exact owner, the exact captured peer, and the one parsed frame. Deliberately

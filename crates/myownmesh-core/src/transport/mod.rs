@@ -28,7 +28,8 @@ pub(crate) use webrtc::TransportEvent;
 #[cfg(feature = "transport-lab")]
 pub use webrtc::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant, TransportEvent,
+    transport_lab_remote_description_fixture_grant, TransportEvent, TransportLabCallbackGrant,
+    TransportLabCallbackWorkload, TransportLabRealtimeWorkload,
 };
 // `EndpointAuthHandoff` is deliberately no longer re-exported: it is now an
 // internal WebRTC detail that converts to the generic
@@ -59,9 +60,9 @@ pub(crate) use webrtc::{
 /// caller updates the spelling or does not compile, which is the only signal
 /// strong enough to relocate a concept.
 pub use webrtc::{
-    LocalIceCandidate, PeerSession, PendingRemoteCandidatePolicy, Role, Transport,
-    WebRtcConnectorProfile, WebRtcConnectorProfileError, WebRtcRealtimeCodec,
-    WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming, WebRtcRealtimeInboundArrival,
-    WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit, WebRtcRealtimeProfile,
-    WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
+    LocalIceCandidate, PeerSession, Role, Transport, WebRtcConnectorProfile,
+    WebRtcConnectorProfileError, WebRtcRealtimeCodec, WebRtcRealtimeFlowOpen,
+    WebRtcRealtimeFraming, WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit,
+    WebRtcRealtimeOutboundUnit, WebRtcRealtimeProfile, WebRtcRealtimeProfileError,
+    WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };

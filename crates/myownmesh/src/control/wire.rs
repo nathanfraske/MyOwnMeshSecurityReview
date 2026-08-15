@@ -762,13 +762,12 @@ pub struct RealtimeEncoding {
 
 /// What this daemon can carry on the realtime path.
 ///
-/// Three facts, and no promise: whether the daemon supports the path at all,
-/// which encoding families it registered, and the ceiling **only when the owner
-/// explicitly selected one**. A flat capacity number would be a promise, because
-/// a caller would size its concurrent flows against it — and the directional resource
-/// envelopes underneath answer `flow_refused` before any aggregate is reached.
-/// Feasibility is learned where it is decided, from the typed refusal on
-/// `realtime_flow_open`.
+/// Two facts, and no promise: whether the daemon supports the path at all, and
+/// which encoding families it registered. A capacity number would be a promise,
+/// because a caller would size its concurrent flows against it — and the
+/// directional resource envelopes underneath answer `flow_refused` before any
+/// aggregate is reached. Feasibility is learned where it is decided, from the
+/// typed refusal on `realtime_flow_open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RealtimeAdvert {
     /// False when no profile was registered: no codecs, so nothing can be
@@ -778,23 +777,6 @@ pub struct RealtimeAdvert {
     pub supported: bool,
     /// The registered families, deduplicated. Empty when unsupported.
     pub encodings: Vec<RealtimeEncoding>,
-    /// Present only when the owner selected an explicit ceiling. Absent means
-    /// no ceiling was stated — not that the ceiling is zero or unbounded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub flow_ceiling: Option<RealtimeFlowCeiling>,
-}
-
-/// The owner's explicitly selected per-peer concurrent-flow ceiling.
-///
-/// Reported per direction, because that is how the connector holds it and how
-/// it refuses. A single combined figure would have to be invented here — the
-/// sum is not a bound anything enforces, and a caller that opened against it
-/// would be refused by whichever direction ran out first, which is the exact
-/// failure the flat count produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct RealtimeFlowCeiling {
-    pub max_inbound_flows: u64,
-    pub max_outbound_flows: u64,
 }
 
 impl RealtimeAdvert {
@@ -803,20 +785,14 @@ impl RealtimeAdvert {
         Self {
             supported: false,
             encodings: Vec::new(),
-            flow_ceiling: None,
         }
     }
 
-    /// A daemon that registered `encodings`, with the owner's explicit ceiling
-    /// if one was selected.
-    pub fn registered(
-        encodings: Vec<RealtimeEncoding>,
-        flow_ceiling: Option<RealtimeFlowCeiling>,
-    ) -> Self {
+    /// A daemon that registered `encodings`.
+    pub fn registered(encodings: Vec<RealtimeEncoding>) -> Self {
         Self {
             supported: true,
             encodings,
-            flow_ceiling,
         }
     }
 }

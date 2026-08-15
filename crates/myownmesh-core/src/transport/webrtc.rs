@@ -64,13 +64,11 @@ use webrtc::track::track_remote::TrackRemote;
 use crate::error::{Error, Result};
 use crate::resource::{
     ObservationLease, PeerConnectionResourceScope, PreAuthResourceFamily, ProcessResourceRoot,
-    ResourceMeasurement, ResourceReclaimSubscription, ResourceUnavailable, ResourceUse,
+    ResourceMeasurement, ResourceUnavailable, ResourceUse,
 };
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness, ConnectorCallbackPolicy,
     ConnectorCandidateCapability, ConnectorResourceOwnerReport, ConnectorWorkResourceScope,
-    EnabledRealtimeConnectorPolicy, MaxCumulativeRemoteCandidateApplications,
-    MaxCumulativeRemoteCandidateContentBytes, MaxCumulativeRemoteCandidateSubmissions,
     MeshConnectorResourceReport, MeshConnectorResourceScope,
     OwnedRemoteCandidate as ElasticRemoteCandidateLease, RealtimeConnectorPolicy,
     RemoteCandidateAdmission as ElasticRemoteCandidateAdmission,
@@ -78,7 +76,7 @@ use crate::runtime::attempt::{
     RemoteCandidateApplyError as ElasticRemoteCandidateApplyError,
     RemoteCandidateAttempt as ElasticRemoteCandidateAttempt,
     RemoteCandidateDigestDecision as ElasticRemoteCandidateDigestDecision,
-    RemoteCandidateInput as ElasticRemoteCandidateInput, RemoteCandidateLocalCeilings,
+    RemoteCandidateInput as ElasticRemoteCandidateInput,
     RemoteCandidateTerminalReason as ElasticRemoteCandidateTerminalReason,
     WebRtcConnectorCapablePolicy,
 };
@@ -86,6 +84,13 @@ use crate::runtime::attempt::{
 use super::ice::build_rtc_configuration;
 
 mod callback;
+/// The callback grant a scope-less lab connector states for itself.
+///
+/// Published only where a scope-less connector can be built at all. Production
+/// never names it: a production connector has a real work scope and acquires
+/// against the owner's provider, so there is nothing for it to state.
+#[cfg(feature = "transport-lab")]
+pub use callback::TransportLabCallbackGrant;
 mod cleanup;
 mod h264;
 mod inbound;
@@ -800,8 +805,8 @@ struct RealtimeNegotiatedTrack {
 ///   folded into the bytes above; the other three have no exposed size, and all
 ///   four are what a completed `stop` gives back.
 /// - **Scheduled work, one:** the receiver's read activity. A `recvonly`
-///   transceiver is not inert — it is the thing the review names as still
-///   running after an implicit teardown — and it is exactly what `stop` retires.
+///   transceiver is not inert — it goes on running after an implicit teardown —
+///   and it is exactly what `stop` retires.
 ///
 /// Nothing here names the flow, the label, the port or the map node. Those are
 /// the logical session-flow objects, they are charged where they are allocated,
@@ -873,10 +878,9 @@ fn negotiated_inbound_record_claim() -> std::result::Result<
 /// claimant and every waiter holds a handle to this cell and any of them can
 /// outlive the table's record, so a lease held by the record would tell the
 /// provider this allocation was gone while a loser was still parked on it. That
-/// is why the funding is not on the record — but keeping it *inside* this
-/// struct, as it used to be, only moved the problem: a lease among these fields
-/// is released by this value's own drop glue, while the allocation is still
-/// there.
+/// is why the funding is not on the record — and keeping it *inside* this
+/// struct would only move the problem: a lease among these fields is released
+/// by this value's own drop glue, while the allocation is still there.
 ///
 /// [`FundedArc`] answers both at once. Every handle shares the one reservation,
 /// so the charge spans every waiter; and the token sits beside the pointer, so
@@ -989,10 +993,6 @@ impl RealtimeRetirement {
     /// subscription to the winner's announcement — not a refusal, and never to
     /// be treated as "already done". Both arms are the same allocation, which is
     /// what makes a loser's wait and a winner's announcement the same fact.
-    #[expect(
-        clippy::result_large_err,
-        reason = "both arms are the same funded allocation, which is the whole point: the loser's Err is not a diagnosis but its subscription to the winner's announcement, and it must arrive already funded. Boxing the Err would allocate on the very path that lost the race, and narrowing it would destroy the one property being asserted — that the two arms name one allocation"
-    )]
     fn claim(
         &mut self,
     ) -> std::result::Result<
@@ -1011,13 +1011,13 @@ impl RealtimeRetirement {
 /// flow it belongs to.
 ///
 /// **It submits on drop, and that is the whole point.** An explicit close takes
-/// the submission out and awaits the receipt, exactly as before. Every other way
-/// a flow ends — policy revocation, peer replacement, shutdown, the promoted
-/// session simply going — used to drop an `Arc<RealtimeTrackIdentity>` and start
-/// nothing, leaving an `m` line, a `recvonly` transceiver and its read activity
-/// on a connector that may well go on hosting another session. The superseding
-/// install does sweep those, but only when a *next* session is promoted, so on a
-/// connector that hosts no further session the leak has no end.
+/// the submission out and awaits the receipt. Every other way a flow ends —
+/// policy revocation, peer replacement, shutdown, the promoted session simply
+/// going — reaches only this drop, and starting nothing here would leave an `m`
+/// line, a `recvonly` transceiver and its read activity on a connector that may
+/// well go on hosting another session. The superseding install does sweep
+/// those, but only when a *next* session is promoted, so on a connector that
+/// hosts no further session such a leak would have no end.
 ///
 /// **Exactly-once is the existing claim, not a new flag.** Four parties can
 /// reach one transceiver — an explicit close, the pump that was feeding it, the
@@ -1808,20 +1808,12 @@ impl QueuedTransportEvent {
     }
 }
 
-fn callback_payload_limit(
-    policy: ConnectorCallbackPolicy,
-    class: ConnectorCallbackClass,
-) -> Option<usize> {
-    match class {
-        ConnectorCallbackClass::Control => None,
-        ConnectorCallbackClass::EndpointData => None,
-        ConnectorCallbackClass::Realtime => match policy.realtime() {
-            RealtimeConnectorPolicy::Disabled => None,
-            RealtimeConnectorPolicy::Enabled(Some(enabled)) => Some(enabled.max_unit_bytes().get()),
-            RealtimeConnectorPolicy::Enabled(None) => None,
-        },
-    }
-}
+// A per-class callback payload limit used to be looked up here. Control and
+// endpoint data never had one, and the real-time class had one only when the
+// owner had stated a unit-byte ceiling. That ceiling is gone, so the lookup
+// could only ever answer "no limit" and the two callers that consulted it are
+// simpler without it. Every callback is still admitted at its actual payload
+// size against the provider immediately below where this check used to stand.
 
 #[derive(Clone)]
 struct ConnectorEventMailboxes {
@@ -1910,9 +1902,6 @@ impl ConnectorEventMailboxes {
                         CallbackMailboxInsertErrorKind::Closed => {
                             ConnectorCallbackInsertResult::ReceiverClosed
                         }
-                        CallbackMailboxInsertErrorKind::LocalItemCeiling => {
-                            ConnectorCallbackInsertResult::Overloaded
-                        }
                         CallbackMailboxInsertErrorKind::MissingLease
                         | CallbackMailboxInsertErrorKind::WrongClass
                         | CallbackMailboxInsertErrorKind::WrongPhase => {
@@ -1937,7 +1926,6 @@ struct ConnectorEventSink {
     candidate_promoted: Arc<AtomicBool>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     callback_violation_reported: Arc<AtomicBool>,
-    callback_policy: ConnectorCallbackPolicy,
     callback_producer: CallbackProducerOwner,
     operation_fence: Arc<ConnectorOperationFence>,
     close_owner: Option<Weak<ConnectorCloseOwner>>,
@@ -2198,16 +2186,6 @@ impl ConnectorEventSink {
             }
             _ => (0, 0),
         };
-        let payload_limit = callback_payload_limit(self.callback_policy, callback_class);
-        if let Some(limit) = payload_limit.filter(|limit| payload_bytes > *limit) {
-            warn!(
-                payload_bytes,
-                limit,
-                callback_class = ?callback_class,
-                "dropping oversized connector callback payload"
-            );
-            return ConnectorCallbackInsertResult::PolicyRefused;
-        }
         let callback_work = match self.callback_producer.try_admit_with_accounted_slack(
             callback_class,
             payload_bytes,
@@ -2272,9 +2250,6 @@ impl ConnectorEventSink {
                 CallbackMailboxInsertErrorKind::Closed => {
                     ConnectorCallbackInsertResult::ReceiverClosed
                 }
-                CallbackMailboxInsertErrorKind::LocalItemCeiling => {
-                    ConnectorCallbackInsertResult::Overloaded
-                }
                 CallbackMailboxInsertErrorKind::MissingLease
                 | CallbackMailboxInsertErrorKind::WrongClass
                 | CallbackMailboxInsertErrorKind::WrongPhase => {
@@ -2294,7 +2269,6 @@ pub(crate) struct WebRtcConnectorEventReceiver {
     attempt_lifetime: Option<AttemptLifetime>,
     remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
     close_owner: Option<Arc<ConnectorCloseOwner>>,
-    reclaim: Option<ResourceReclaimSubscription>,
     data_channel_open_committed: bool,
     data_channel_closed: bool,
     operation_fence: Arc<ConnectorOperationFence>,
@@ -2505,27 +2479,11 @@ impl WebRtcConnectorEventReceiver {
             {
                 return None;
             }
-            if self
-                .reclaim
-                .as_ref()
-                .is_some_and(ResourceReclaimSubscription::is_requested)
-            {
-                if let Some(close_owner) = self.close_owner.as_ref() {
-                    close_owner.start();
-                }
-                return None;
-            }
             let queued = tokio::select! {
                 biased;
                 _ = self.retirement.changed() => {
                     if let Some(close) = self.expose_recorded_close() {
                         return Some(close);
-                    }
-                    return None;
-                },
-                _ = wait_for_optional_reclaim(self.reclaim.as_ref()) => {
-                    if let Some(close_owner) = self.close_owner.as_ref() {
-                        close_owner.start();
                     }
                     return None;
                 },
@@ -2600,13 +2558,6 @@ async fn wait_for_optional_retirement(retirement: &mut Option<watch::Receiver<bo
         Some(retirement) => {
             let _ = retirement.changed().await;
         }
-        None => std::future::pending::<()>().await,
-    }
-}
-
-async fn wait_for_optional_reclaim(reclaim: Option<&ResourceReclaimSubscription>) {
-    match reclaim {
-        Some(reclaim) => reclaim.requested().await,
         None => std::future::pending::<()>().await,
     }
 }
@@ -2748,15 +2699,13 @@ struct CandidateObservationLease {
 struct PendingRemoteCandidateQueue {
     entries: std::collections::LinkedList<PendingRemoteCandidate>,
     container_observation: Option<ObservationLease>,
-    budget: Arc<PendingRemoteCandidateBudget>,
 }
 
 impl PendingRemoteCandidateQueue {
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
+    fn new() -> Self {
         Self {
             entries: std::collections::LinkedList::new(),
             container_observation: None,
-            budget: Arc::new(PendingRemoteCandidateBudget::new(policy)),
         }
     }
 
@@ -2826,15 +2775,11 @@ impl PendingRemoteCandidateQueue {
         attempt: Arc<RemoteCandidateAttemptIdentity>,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
-        let Some(content_bytes) = candidate_content_bytes(&candidate) else {
-            self.budget.poison();
+        if candidate_content_bytes(&candidate).is_none() {
             return PendingRemoteCandidateQueuePush::Refused;
-        };
-        let Some(reservation) = self.budget.reserve(content_bytes) else {
-            return PendingRemoteCandidateQueuePush::Refused;
-        };
+        }
         let mut pending = PendingRemoteCandidate::observe(candidate, attempt, resource_scope);
-        pending._queue_reservation = Some(reservation);
+        pending._queue_reservation = Some(PendingRemoteCandidateReservation::default());
         self.entries.push_back(pending);
         let measurement = queue_container_resource_measurement(&self.entries);
         match self.container_observation.as_mut() {
@@ -2917,125 +2862,29 @@ enum PendingRemoteCandidateQueuePush {
     Retired,
 }
 
-#[derive(Debug)]
-struct PendingRemoteCandidateBudgetState {
-    items: usize,
-    content_bytes: usize,
-    duplicate_submissions: usize,
-    application_work: usize,
-    accounting_poisoned: bool,
-}
+// A four-dimensional owner-selected candidate budget used to stand here: unique
+// items, cumulative content bytes, duplicate submissions and native application
+// work, each with its own ceiling, its own counter, and a shared poison flag.
+// All of it is gone.
+//
+// Every one of those counters shadowed an exact claim the candidate path
+// already takes: the queue wrapper, the retained strings, the queued content
+// bytes and the digest node are each admitted against the process provider at
+// their real size, and the native application is admitted against the elastic
+// attempt. A second count in front of those could only refuse a candidate the
+// owner's real grant would have funded, in units the owner never chose — and
+// the poison flag existed only to stop the shadow arithmetic being read after
+// it had gone wrong, which is not a condition that can arise once nothing keeps
+// the shadow.
 
-#[derive(Debug)]
-struct PendingRemoteCandidateBudget {
-    policy: PendingRemoteCandidatePolicy,
-    state: SyncMutex<PendingRemoteCandidateBudgetState>,
-}
-
-impl PendingRemoteCandidateBudget {
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
-        Self {
-            policy,
-            state: SyncMutex::new(PendingRemoteCandidateBudgetState {
-                items: 0,
-                content_bytes: 0,
-                duplicate_submissions: 0,
-                application_work: 0,
-                accounting_poisoned: false,
-            }),
-        }
-    }
-
-    fn reserve(
-        self: &Arc<Self>,
-        content_bytes: usize,
-    ) -> Option<PendingRemoteCandidateReservation> {
-        let Some(local) = self.policy.local_ceiling() else {
-            return Some(PendingRemoteCandidateReservation {
-                budget: Arc::clone(self),
-                application: None,
-            });
-        };
-        let mut state = self.state.lock();
-        if state.accounting_poisoned {
-            return None;
-        }
-        let Some(remaining_content) = local
-            .max_content_bytes()
-            .get()
-            .checked_sub(state.content_bytes)
-        else {
-            state.accounting_poisoned = true;
-            return None;
-        };
-        if state.items >= local.max_unique_items().get() || content_bytes > remaining_content {
-            return None;
-        }
-        let items = state.items + 1;
-        let Some(bytes) = state.content_bytes.checked_add(content_bytes) else {
-            state.accounting_poisoned = true;
-            return None;
-        };
-        state.items = items;
-        state.content_bytes = bytes;
-        Some(PendingRemoteCandidateReservation {
-            budget: Arc::clone(self),
-            application: None,
-        })
-    }
-
-    fn poison(&self) {
-        self.state.lock().accounting_poisoned = true;
-    }
-
-    fn record_duplicate(&self) -> bool {
-        let Some(local) = self.policy.local_ceiling() else {
-            return true;
-        };
-        let mut state = self.state.lock();
-        if state.accounting_poisoned {
-            return false;
-        }
-        if state.duplicate_submissions >= local.max_duplicate_submissions().get() {
-            return false;
-        }
-        let duplicates = state.duplicate_submissions + 1;
-        state.duplicate_submissions = duplicates;
-        true
-    }
-
-    fn reserve_application_work(&self) -> bool {
-        let Some(local) = self.policy.local_ceiling() else {
-            return true;
-        };
-        let mut state = self.state.lock();
-        if state.accounting_poisoned {
-            return false;
-        }
-        if state.application_work >= local.max_application_work().get() {
-            return false;
-        }
-        let work = state.application_work + 1;
-        state.application_work = work;
-        true
-    }
-
-    #[cfg(test)]
-    fn report(&self) -> (usize, usize, usize, usize, bool) {
-        let state = self.state.lock();
-        (
-            state.items,
-            state.content_bytes,
-            state.duplicate_submissions,
-            state.application_work,
-            state.accounting_poisoned,
-        )
-    }
-}
-
-#[derive(Debug)]
+/// What a queued candidate keeps once it has reached native application.
+///
+/// It no longer reserves anything at queue time — the queue's own leases do
+/// that — so an unapplied candidate carries the default. The one thing it still
+/// owns is the elastic attempt's post-application ownership, which the envelope
+/// retains for the life of the attempt.
+#[derive(Debug, Default)]
 struct PendingRemoteCandidateReservation {
-    budget: Arc<PendingRemoteCandidateBudget>,
     application: Option<crate::runtime::attempt::ApplyingRemoteCandidate>,
 }
 
@@ -3193,20 +3042,14 @@ struct RemoteCandidateAttemptEnvelope {
 }
 
 impl RemoteCandidateAttemptEnvelope {
-    fn new(
-        policy: PendingRemoteCandidatePolicy,
-        work_resources: ConnectorWorkResourceScope,
-    ) -> Self {
-        let elastic_attempt = ElasticRemoteCandidateAttempt::new(
-            work_resources.clone(),
-            elastic_remote_candidate_ceilings(policy),
-        );
+    fn new(work_resources: ConnectorWorkResourceScope) -> Self {
+        let elastic_attempt = ElasticRemoteCandidateAttempt::new(work_resources.clone());
         Self {
             attempt: Arc::new(RemoteCandidateAttemptIdentity::default()),
             elastic_attempt,
             work_resources,
             remote_description_set: false,
-            pending: PendingRemoteCandidateQueue::new(policy),
+            pending: PendingRemoteCandidateQueue::new(),
             seen: std::collections::BTreeSet::new(),
             retained_reservations: std::collections::LinkedList::new(),
             remote_ice_credentials: None,
@@ -3215,10 +3058,7 @@ impl RemoteCandidateAttemptEnvelope {
         }
     }
 
-    fn new_provisional(
-        policy: PendingRemoteCandidatePolicy,
-        work_resources: ConnectorWorkResourceScope,
-    ) -> Result<Self> {
+    fn new_provisional(work_resources: ConnectorWorkResourceScope) -> Result<Self> {
         let root_lease = work_resources
             .acquire(
                 crate::resource::ResourceAuthorityClass::Speculative,
@@ -3231,7 +3071,7 @@ impl RemoteCandidateAttemptEnvelope {
                 )?,
             )
             .map_err(Error::from)?;
-        let mut replacement = Self::new(policy, work_resources);
+        let mut replacement = Self::new(work_resources);
         replacement.provisional_root_lease = Some(root_lease);
         Ok(replacement)
     }
@@ -3262,17 +3102,13 @@ impl RemoteCandidateAttemptEnvelope {
             sdp_mline_index: candidate.sdp_mline_index,
             username_fragment: candidate.username_fragment.as_deref().map(str::as_bytes),
         };
-        let Some(content_bytes) = candidate_content_bytes(&candidate) else {
-            self.pending.budget.poison();
+        if candidate_content_bytes(&candidate).is_none() {
             self.retire();
             return (PendingRemoteCandidateQueuePush::Refused, None);
-        };
+        }
         let mut kind = None;
         let mut binding = None;
-        let mut local_reservation = None;
         let seen = &self.seen;
-        let duplicate_budget = Arc::clone(&self.pending.budget);
-        let unique_budget = Arc::clone(&self.pending.budget);
         let admitted = self.elastic_attempt.admit_with_digest_decision(
             elastic_input,
             || {
@@ -3284,16 +3120,9 @@ impl RemoteCandidateAttemptEnvelope {
             },
             |digest| {
                 if seen.contains(&digest) {
-                    if duplicate_budget.record_duplicate() {
-                        ElasticRemoteCandidateDigestDecision::Duplicate
-                    } else {
-                        ElasticRemoteCandidateDigestDecision::Refuse
-                    }
-                } else if let Some(reservation) = unique_budget.reserve(content_bytes) {
-                    local_reservation = Some(reservation);
-                    ElasticRemoteCandidateDigestDecision::Retain
+                    ElasticRemoteCandidateDigestDecision::Duplicate
                 } else {
-                    ElasticRemoteCandidateDigestDecision::Refuse
+                    ElasticRemoteCandidateDigestDecision::Retain
                 }
             },
         );
@@ -3362,9 +3191,7 @@ impl RemoteCandidateAttemptEnvelope {
             Arc::clone(&self.attempt),
             resource_scope,
             &self.work_resources,
-            local_reservation
-                .take()
-                .expect("retained candidate owns its pre-retention local reservation"),
+            PendingRemoteCandidateReservation::default(),
             elastic_lease,
         );
         if result == PendingRemoteCandidateQueuePush::Queued {
@@ -3416,15 +3243,10 @@ impl RemoteCandidateAttemptEnvelope {
             .retain_remote_restart_migratable_candidates(credentials);
 
         for pending in &mut self.pending.entries {
-            let Some(content_bytes) = candidate_content_bytes(&pending.candidate) else {
-                self.retire();
-                self.pending.budget.poison();
-                return false;
-            };
-            let Some(reservation) = self.pending.budget.reserve(content_bytes) else {
+            if candidate_content_bytes(&pending.candidate).is_none() {
                 self.retire();
                 return false;
-            };
+            }
             let input = ElasticRemoteCandidateInput {
                 candidate: pending.candidate.candidate.as_bytes(),
                 sdp_mid: pending.candidate.sdp_mid.as_deref().map(str::as_bytes),
@@ -3451,7 +3273,7 @@ impl RemoteCandidateAttemptEnvelope {
                 return false;
             };
             pending.attempt = Arc::clone(&self.attempt);
-            pending._queue_reservation = Some(reservation);
+            pending._queue_reservation = Some(PendingRemoteCandidateReservation::default());
             pending._elastic_lease = Some(elastic_lease);
             self.seen.insert(digest);
         }
@@ -3470,58 +3292,49 @@ struct ProvisionalRemoteCandidateAttempt {
     envelope: RemoteCandidateAttemptEnvelope,
 }
 
-fn elastic_remote_candidate_ceilings(
-    policy: PendingRemoteCandidatePolicy,
-) -> RemoteCandidateLocalCeilings {
-    let Some(policy) = policy.local_ceiling() else {
-        return RemoteCandidateLocalCeilings::none();
-    };
-    let unique = u64::try_from(policy.max_unique_items().get())
-        .expect("usize candidate item ceiling fits u64 on supported platforms");
-    let duplicates = u64::try_from(policy.max_duplicate_submissions().get())
-        .expect("usize duplicate ceiling fits u64 on supported platforms");
-    // The two optional wrappers remain independently enforced below the
-    // primitive. If their sum cannot be represented, omit the redundant
-    // aggregate ceiling instead of panicking or inventing a smaller bound.
-    let submissions = unique
-        .checked_add(duplicates)
-        .and_then(std::num::NonZeroU64::new);
-    let content = std::num::NonZeroU64::new(
-        u64::try_from(policy.max_content_bytes().get())
-            .expect("usize candidate content ceiling fits u64 on supported platforms"),
-    )
-    .expect("candidate content ceiling is nonzero");
-    let applications = std::num::NonZeroU64::new(
-        u64::try_from(policy.max_application_work().get())
-            .expect("usize candidate application ceiling fits u64 on supported platforms"),
-    )
-    .expect("candidate application ceiling is nonzero");
-    RemoteCandidateLocalCeilings::new(
-        submissions.map(MaxCumulativeRemoteCandidateSubmissions::new),
-        Some(MaxCumulativeRemoteCandidateContentBytes::new(content)),
-        Some(MaxCumulativeRemoteCandidateApplications::new(applications)),
-    )
+// The owner's four candidate ceilings used to be translated here into the
+// elastic attempt's optional cumulative ceilings. Both ends of that translation
+// are gone: there is no owner ceiling to read, and the primitive no longer
+// carries an optional one to write. What the attempt enforces is what it always
+// enforced without them — an exact claim per submission, per digest node, and
+// per native application.
+
+/// The candidate work one raw candidate-state control intends to fund.
+///
+/// Not a policy and not a ceiling: nothing reads these two numbers at run time.
+/// They size the fixture's *grant*, so a control that says "one candidate of
+/// this many content bytes" gets a provider that can fund exactly that and
+/// refuses the next one — which is the only mechanism left that can refuse a
+/// candidate, and therefore the one these controls have to exercise.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct RemoteCandidateFixtureWork {
+    unique: u64,
+    content: u64,
+}
+
+#[cfg(test)]
+impl RemoteCandidateFixtureWork {
+    fn new(unique: usize, content: usize) -> Self {
+        Self {
+            unique: u64::try_from(unique).expect("fixture candidate count fits u64"),
+            content: u64::try_from(content).expect("fixture candidate content fits u64"),
+        }
+    }
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_scope(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
 ) -> ConnectorWorkResourceScope {
-    elastic_remote_candidate_test_scope_with_additional(
-        policy,
-        crate::resource::ResourceClaim::ZERO,
-    )
+    elastic_remote_candidate_test_scope_with_additional(work, crate::resource::ResourceClaim::ZERO)
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_scope_with_restart_overlap(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
 ) -> ConnectorWorkResourceScope {
-    let local = policy
-        .local_ceiling()
-        .expect("raw candidate-state tests declare an explicit local fixture ceiling");
-    let unique =
-        u64::try_from(local.max_unique_items().get()).expect("fixture candidate count fits u64");
+    let unique = work.unique;
     let reservation_records = unique
         .checked_add(1)
         .expect("fixture restart reservation records fit");
@@ -3538,22 +3351,22 @@ fn elastic_remote_candidate_test_scope_with_restart_overlap(
             ))
         })
         .expect("fixture restart overlap claim is representable");
-    elastic_remote_candidate_test_scope_with_additional(policy, overlap)
+    elastic_remote_candidate_test_scope_with_additional(work, overlap)
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_scope_with_additional(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
     additional: crate::resource::ResourceClaim,
 ) -> ConnectorWorkResourceScope {
     let (_provider, _owner, _candidate, _lifetime, work_scope) =
-        elastic_remote_candidate_test_resources_with_additional(policy, additional);
+        elastic_remote_candidate_test_resources_with_additional(work, additional);
     work_scope
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_resources_with_additional(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
     additional: crate::resource::ResourceClaim,
 ) -> (
     crate::resource::FiniteResourceProvider,
@@ -3562,13 +3375,7 @@ fn elastic_remote_candidate_test_resources_with_additional(
     AttemptLifetime,
     ConnectorWorkResourceScope,
 ) {
-    let policy = policy
-        .local_ceiling()
-        .expect("raw candidate-state tests declare an explicit local fixture ceiling");
-    let unique =
-        u64::try_from(policy.max_unique_items().get()).expect("fixture candidate count fits u64");
-    let content = u64::try_from(policy.max_content_bytes().get())
-        .expect("fixture candidate content fits u64");
+    let RemoteCandidateFixtureWork { unique, content } = work;
     let parsing = content
         .checked_add(crate::runtime::attempt::REMOTE_CANDIDATE_MAX_DIGEST_OVERHEAD_BYTES)
         .expect("fixture parsing work fits");
@@ -3629,27 +3436,23 @@ struct RemoteCandidateState {
 }
 
 impl RemoteCandidateState {
-    fn with_resources(
-        policy: PendingRemoteCandidatePolicy,
-        work_resources: ConnectorWorkResourceScope,
-    ) -> Self {
+    fn with_resources(work_resources: ConnectorWorkResourceScope) -> Self {
         Self {
-            current: RemoteCandidateAttemptEnvelope::new(policy, work_resources),
+            current: RemoteCandidateAttemptEnvelope::new(work_resources),
             provisional: None,
         }
     }
 
     #[cfg(test)]
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
-        Self::with_resources(policy, elastic_remote_candidate_test_scope(policy))
+    fn new(work: RemoteCandidateFixtureWork) -> Self {
+        Self::with_resources(elastic_remote_candidate_test_scope(work))
     }
 
     #[cfg(test)]
-    fn new_with_restart_overlap(policy: PendingRemoteCandidatePolicy) -> Self {
-        Self::with_resources(
-            policy,
-            elastic_remote_candidate_test_scope_with_restart_overlap(policy),
-        )
+    fn new_with_restart_overlap(work: RemoteCandidateFixtureWork) -> Self {
+        Self::with_resources(elastic_remote_candidate_test_scope_with_restart_overlap(
+            work,
+        ))
     }
 
     fn admission_target(&mut self) -> &mut RemoteCandidateAttemptEnvelope {
@@ -3696,12 +3499,9 @@ impl RemoteCandidateState {
                     .to_string(),
             ));
         }
-        let policy = self.current.pending.budget.policy;
         let retiring = Arc::clone(&self.current.attempt);
-        let replacement = RemoteCandidateAttemptEnvelope::new_provisional(
-            policy,
-            self.current.work_resources.clone(),
-        )?;
+        let replacement =
+            RemoteCandidateAttemptEnvelope::new_provisional(self.current.work_resources.clone())?;
         self.current.retire();
         let replacement_attempt = Arc::clone(&replacement.attempt);
         self.provisional = Some(ProvisionalRemoteCandidateAttempt {
@@ -3862,11 +3662,8 @@ impl RemoteCandidateState {
             });
         }
 
-        let policy = self.current.pending.budget.policy;
-        let mut replacement = RemoteCandidateAttemptEnvelope::new_provisional(
-            policy,
-            self.current.work_resources.clone(),
-        )?;
+        let mut replacement =
+            RemoteCandidateAttemptEnvelope::new_provisional(self.current.work_resources.clone())?;
         replacement.remote_ice_credentials = Some(credentials.clone());
         replacement.remote_description_in_flight = true;
         let migrated =
@@ -4622,12 +4419,11 @@ impl EndpointAuthHandoff {
     /// identity for this exact incarnation, and this close owner as the
     /// retention obligation. Nothing is copied and nothing is left behind — the
     /// consumed WebRTC handoff drops with no capability, so the claim is
-    /// retained exactly once, by the generic handoff's `Drop`, through the same
-    /// close owner as before.
+    /// retained exactly once, by the generic handoff's `Drop`, through this same
+    /// close owner.
     ///
-    /// Returns `None` only if the capability was already moved out, which is
-    /// the same condition under which the old `Drop` would have retained
-    /// nothing.
+    /// Returns `None` only if the capability was already moved out — the same
+    /// condition under which this handoff's own `Drop` retains nothing.
     pub(crate) fn into_generic(mut self) -> Option<crate::connector::ConnectedChannelHandoff> {
         let capability = self.capability.take()?;
         Some(crate::connector::ConnectedChannelHandoff::new(
@@ -4752,8 +4548,6 @@ struct AdmittedConnectorOwnership {
     resource_scope: PeerConnectionResourceScope,
     work_resource_scope: ConnectorWorkResourceScope,
     transport_observation: ObservationLease,
-    remote_candidate_policy: PendingRemoteCandidatePolicy,
-    reclaim: ResourceReclaimSubscription,
 }
 
 /// The session side of the realtime flow binding.
@@ -5111,13 +4905,10 @@ impl WebRtcConnectorWorker {
             resource_scope,
             work_resource_scope,
             transport_observation,
-            remote_candidate_policy,
-            reclaim,
         } = admitted;
         let attempt_retirement = attempt_liveness.subscribe_retirement();
         let session = Arc::new(session);
         let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::with_resources(
-            remote_candidate_policy,
             work_resource_scope,
         )));
         if !close_owner.attach_remote_candidates(Arc::clone(&remote_candidates)) {
@@ -5142,7 +4933,6 @@ impl WebRtcConnectorWorker {
             attempt_lifetime: Some(attempt_lifetime),
             remote_candidates: Arc::clone(&remote_candidates),
             close_owner: Some(Arc::clone(&close_owner)),
-            reclaim: Some(reclaim),
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -5472,11 +5262,7 @@ impl WebRtcConnectorWorker {
                 "remote candidate does not match the exact current ICE attempt".to_string(),
             ));
         }
-        let Some(budget) = pending
-            ._queue_reservation
-            .as_ref()
-            .map(|reservation| Arc::clone(&reservation.budget))
-        else {
+        if pending._queue_reservation.is_none() {
             self.remote_candidates
                 .lock()
                 .retire_attempt(&pending.attempt);
@@ -5484,16 +5270,11 @@ impl WebRtcConnectorWorker {
                 "remote candidate reached production application without queue ownership"
                     .to_string(),
             ));
-        };
-        if !budget.reserve_application_work() {
-            self.remote_candidates
-                .lock()
-                .retire_attempt(&pending.attempt);
-            return Err(Error::Transport(
-                "remote-candidate application work exceeded the owner-selected ICE-attempt envelope"
-                    .to_string(),
-            ));
         }
+        // What refuses the native application below is the elastic attempt's own
+        // claim for it. The owner-selected application-work count that used to
+        // be checked here is gone: it could only refuse an apply the owner's
+        // grant would have funded.
         let _ice_observation =
             observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::IceWork, 1, 0);
         let PendingRemoteCandidate {
@@ -5933,6 +5714,16 @@ struct PeerOpenOwnership {
     candidate_promoted: Arc<AtomicBool>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     callback_policy: ConnectorCallbackPolicy,
+    /// The explicit callback grant a scope-less lab connector mints its own
+    /// provider from.
+    ///
+    /// Present only on the lab entry points, and only because they are the one
+    /// way to build a connector with no connector work scope at all. A
+    /// production connector always carries a scope and acquires against it, so
+    /// there is nothing here for a deployment to state — and nothing core
+    /// could invent on its behalf: the fixture names its own numbers.
+    #[cfg(any(test, feature = "transport-lab"))]
+    local_lab_callback_grant: Option<callback::TransportLabCallbackGrant>,
     operation_fence: Arc<ConnectorOperationFence>,
     /// The application's registered codecs, carried through to the session so
     /// a flow set can resolve framing without re-reading the connector profile.
@@ -6188,12 +5979,11 @@ fn realtime_media_codecs(
                     payload_type: codec.payload_type,
                     ..Default::default()
                 },
-                // `codec.kind` is already a `WebRtcRtpKind`; the `from` that
-                // used to wrap it dated from when the two sides of this match
-                // were different types and had become an identity conversion.
-                // Matching the value directly keeps the total map — every
-                // variant still names its `RTPCodecType`, so adding one is
-                // still a compile error here — without the round trip.
+                // `codec.kind` is already a `WebRtcRtpKind`, so a `from` around
+                // it would be an identity conversion. Matching the value
+                // directly keeps the total map — every variant names its
+                // `RTPCodecType`, so adding one is a compile error here —
+                // without the round trip.
                 match codec.kind {
                     WebRtcRtpKind::Audio => RTPCodecType::Audio,
                     WebRtcRtpKind::Video => RTPCodecType::Video,
@@ -6388,15 +6178,16 @@ impl Transport {
         stun: &[crate::config::StunServer],
         turn: &[crate::config::TurnServer],
         callback_policy: ConnectorCallbackPolicy,
+        callback_grant: callback::TransportLabCallbackGrant,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         let mut config = build_rtc_configuration(stun, turn);
         config.ice_transport_policy = self.ice_transport_policy;
-        self.open_peer_with_config(role, config, callback_policy)
+        self.open_peer_with_config(role, config, callback_policy, callback_grant)
             .await
     }
 
-    /// Open the engine-owned connector wrapper around the existing WebRTC
-    /// machinery. Arc 03 keeps the old transport behavior inside this owner.
+    /// Open the engine-owned connector wrapper around the WebRTC machinery.
+    /// Transport behaviour lives inside this owner.
     pub(crate) async fn open_connector_peer(
         &self,
         role: Role,
@@ -6425,12 +6216,9 @@ impl Transport {
         config.ice_transport_policy = self.ice_transport_policy;
         let (permit, attempt_lifetime, claim) =
             admit_single_connector_candidate(self.runtime.clone(), resource_owner.clone());
-        let (mut candidate, reclaim_subscription) = permit
-            .reserve_connector_candidate_cooperatively(claim)
-            .await?
-            .ok_or_else(|| {
-                Error::Transport("connector attempt retired before admission".to_string())
-            })?;
+        let mut candidate = permit.reserve_connector_candidate(claim).ok_or_else(|| {
+            Error::Transport("connector attempt retired before admission".to_string())
+        })?;
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .map_err(|error| Error::Transport(error.to_string()))?;
@@ -6460,8 +6248,6 @@ impl Transport {
         );
         let mut outer_cleanup = StartConnectorCleanupOnDrop::new(Arc::clone(&close_owner));
         let construction_close_owner = Arc::clone(&close_owner);
-        let construction_reclaim = reclaim_subscription.clone();
-        let reclaim_scope_id = work_resource_scope.scope_id();
         let (construction_tx, construction_rx) = oneshot::channel();
         // The profile answer the construction task needs, taken before it is
         // spawned. It is `Copy`, so the task owns it and the profile itself
@@ -6482,22 +6268,14 @@ impl Transport {
                     candidate_promoted: construction_candidate_promoted,
                     callback_gate: construction_incarnation,
                     callback_policy: construction_callback_policy,
+                    #[cfg(any(test, feature = "transport-lab"))]
+                    local_lab_callback_grant: None,
                     operation_fence,
                     realtime_profile: construction_realtime_profile,
                     close_owner: Some(Arc::clone(&construction_close_owner)),
                 },
             );
-            tokio::pin!(construction);
-            let result = tokio::select! {
-                result = &mut construction => result,
-                _ = construction_reclaim.requested() => {
-                    Err(Error::ResourceUnavailable(
-                        ResourceUnavailable::ReclaimRequested {
-                            scope_id: reclaim_scope_id,
-                        },
-                    ))
-                }
-            };
+            let result = construction.await;
             match result {
                 Ok((session, events)) if result_liveness.is_active() => {
                     let _ = construction_tx.send(Ok(ConstructedConnectorResult::new(
@@ -6547,8 +6325,6 @@ impl Transport {
                 resource_scope,
                 work_resource_scope,
                 transport_observation,
-                remote_candidate_policy: webrtc_profile.remote_candidates(),
-                reclaim: reclaim_subscription,
             },
         );
         if admitted.is_ok() {
@@ -6566,6 +6342,7 @@ impl Transport {
         role: Role,
         config: RTCConfiguration,
         callback_policy: ConnectorCallbackPolicy,
+        callback_grant: callback::TransportLabCallbackGrant,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         self.open_peer_with_config_observed(
             role,
@@ -6577,6 +6354,7 @@ impl Transport {
                 candidate_promoted: Arc::new(AtomicBool::new(true)),
                 callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
                 callback_policy,
+                local_lab_callback_grant: Some(callback_grant),
                 operation_fence: Arc::new(ConnectorOperationFence::default()),
                 realtime_profile: None,
                 close_owner: None,
@@ -6598,6 +6376,8 @@ impl Transport {
             candidate_promoted,
             callback_gate,
             callback_policy,
+            #[cfg(any(test, feature = "transport-lab"))]
+            local_lab_callback_grant,
             operation_fence,
             realtime_profile,
             close_owner,
@@ -6678,24 +6458,25 @@ impl Transport {
                     CallbackProducerClaims::structural_only(),
                 ),
                 #[cfg(any(test, feature = "transport-lab"))]
-                None => CallbackProducerOwner::for_local_lab_policy(callback_policy).map_err(
-                    |error| {
+                None => {
+                    let grant = local_lab_callback_grant.ok_or_else(|| {
+                        Error::Transport(
+                            "a scope-less lab connector must state its own callback grant"
+                                .to_string(),
+                        )
+                    })?;
+                    CallbackProducerOwner::for_local_lab_grant(grant).map_err(|error| {
                         Error::Transport(format!(
                             "raw transport callback resource policy is unavailable: {error:?}"
                         ))
-                    },
-                )?,
+                    })?
+                }
                 #[cfg(not(any(test, feature = "transport-lab")))]
                 None => return Err(Error::ConnectorPolicyRequired),
             };
             let callback_ready = Arc::new(tokio::sync::Notify::new());
-            let local_mailboxes = callback_policy.local_mailboxes();
             let control = callback_producer
-                .create_mailbox(
-                    ConnectorCallbackClass::Control,
-                    local_mailboxes.map(|mailboxes| mailboxes.control()),
-                    Arc::clone(&callback_ready),
-                )
+                .create_mailbox(ConnectorCallbackClass::Control, Arc::clone(&callback_ready))
                 .map_err(|error| {
                     callback_admission_error(
                         "control callback mailbox resource admission failed",
@@ -6705,7 +6486,6 @@ impl Transport {
             let endpoint_data = callback_producer
                 .create_mailbox(
                     ConnectorCallbackClass::EndpointData,
-                    local_mailboxes.map(|mailboxes| mailboxes.endpoint_data()),
                     Arc::clone(&callback_ready),
                 )
                 .map_err(|error| {
@@ -6732,19 +6512,16 @@ impl Transport {
                             error,
                         )
                     })?;
-            let (realtime_resources, realtime_local_ceiling) = match callback_policy.realtime() {
-                RealtimeConnectorPolicy::Disabled => (None, None),
-                RealtimeConnectorPolicy::Enabled(local_ceiling) => {
-                    (work_resource_scope.clone(), local_ceiling)
-                }
+            let realtime_resources = match callback_policy.realtime() {
+                RealtimeConnectorPolicy::Disabled => None,
+                RealtimeConnectorPolicy::Enabled => work_resource_scope.clone(),
             };
-            let realtime_flows =
-                RealtimeFlowRegistry::new(realtime_resources, realtime_local_ceiling);
+            let realtime_flows = RealtimeFlowRegistry::new(realtime_resources);
             // The application's codecs become a shared, leased record here —
             // once, against this connector's own work scope — and every session
-            // promoted on this connector then holds a pointer to it. Each
-            // promotion used to deep-clone the codec vector, both `String`s per
-            // codec and every feedback entry, and pay for none of it.
+            // promoted on this connector then holds a pointer to it. Deep-
+            // cloning the codec vector per promotion, both `String`s per codec
+            // and every feedback entry, would be retention nothing pays for.
             //
             // Refusal is ordinary and fails the connector rather than the
             // session: registering codecs whose retention nothing accounted for
@@ -6779,7 +6556,6 @@ impl Transport {
                 candidate_promoted,
                 callback_gate: Arc::clone(&callback_gate),
                 callback_violation_reported: Arc::new(AtomicBool::new(false)),
-                callback_policy,
                 callback_producer,
                 operation_fence: Arc::clone(&operation_fence),
                 close_owner: callback_close_owner,
@@ -7294,12 +7070,6 @@ fn install_data_channel_handlers(
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let _keep_callback_observation = &callback_observation;
             let payload_bytes = msg.data.len();
-            if callback_payload_limit(tx.callback_policy, ConnectorCallbackClass::EndpointData)
-                .is_some_and(|limit| payload_bytes > limit)
-            {
-                tx.retire_after_callback_violation();
-                return Box::pin(async {});
-            }
             let callback_work = match tx.begin_native_callback_operation_with_payload(
                 ConnectorCallbackClass::EndpointData,
                 payload_bytes,
@@ -8734,9 +8504,29 @@ impl PeerSession {
     }
 }
 
+/// The real-time work one lab fixture intends to fund, stated by the fixture.
+///
+/// These numbers used to be read off the owner's real-time ceilings, which is
+/// how a fixture could stay silent about what it was going to do and still get
+/// a grant. There are no ceilings to read now, so a fixture that wants a
+/// real-time envelope says how much of it: nothing is derived from a policy and
+/// nothing is defaulted, because a grant core picked would be a ceiling core
+/// picked, one indirection later.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug)]
+pub struct TransportLabRealtimeWorkload {
+    pub inbound_flows: usize,
+    pub outbound_flows: usize,
+    pub queued_units_per_flow: usize,
+    pub in_progress_units_per_inbound_flow: usize,
+    pub fragments_per_unit: usize,
+    pub max_fragment_bytes: usize,
+    pub max_unit_bytes: usize,
+}
+
 #[cfg(any(test, feature = "transport-lab"))]
 fn realtime_fixture_provider_grant(
-    local: crate::runtime::attempt::EnabledRealtimeConnectorPolicy,
+    workload: TransportLabRealtimeWorkload,
 ) -> Result<crate::resource::ResourceClaim> {
     use crate::resource::FiniteResourceProvider;
 
@@ -8754,20 +8544,19 @@ fn realtime_fixture_provider_grant(
         Ok(())
     }
 
-    let flows = local.flows();
-    let inbound_flows = flows.max_inbound_active_flows().get();
-    let outbound_flows = flows.max_outbound_active_flows().get();
+    let inbound_flows = workload.inbound_flows;
+    let outbound_flows = workload.outbound_flows;
     let total_flows = inbound_flows
         .checked_add(outbound_flows)
         .ok_or_else(|| Error::Transport("fixture flow total overflowed".to_string()))?;
     let queue_slots = total_flows
-        .checked_mul(flows.queue_capacity_per_flow().get())
+        .checked_mul(workload.queued_units_per_flow)
         .ok_or_else(|| Error::Transport("fixture queue-slot total overflowed".to_string()))?;
     let inbound_units = inbound_flows
-        .checked_mul(flows.max_in_progress_units_per_flow().get())
+        .checked_mul(workload.in_progress_units_per_inbound_flow)
         .ok_or_else(|| Error::Transport("fixture assembly total overflowed".to_string()))?;
     let fragments = inbound_units
-        .checked_mul(flows.max_inbound_fragments_per_unit().get())
+        .checked_mul(workload.fragments_per_unit)
         .ok_or_else(|| Error::Transport("fixture fragment total overflowed".to_string()))?;
 
     let mut grant = crate::resource::ResourceClaim::ZERO;
@@ -8794,17 +8583,17 @@ fn realtime_fixture_provider_grant(
     for _ in 0..fragments {
         add_lease(
             &mut grant,
-            RealtimeFlowRegistry::ordered_fragment_claim(flows.max_inbound_fragment_bytes().get())?,
+            RealtimeFlowRegistry::ordered_fragment_claim(workload.max_fragment_bytes)?,
         )?;
     }
     for _ in 0..queue_slots {
         add_lease(
             &mut grant,
-            RealtimeFlowRegistry::output_claim(local.max_unit_bytes().get())?,
+            RealtimeFlowRegistry::output_claim(workload.max_unit_bytes)?,
         )?;
         add_lease(
             &mut grant,
-            RealtimeFlowRegistry::queue_claim(local.max_unit_bytes().get())?,
+            RealtimeFlowRegistry::queue_claim(workload.max_unit_bytes)?,
         )?;
     }
     // One packet-work lease per inbound pump, because each holds exactly one
@@ -8816,10 +8605,7 @@ fn realtime_fixture_provider_grant(
     // ceiling, and the pump takes this lease before it knows which shape it
     // holds. Taking the larger of the two is what keeps the lab grant from
     // refusing work the policy actually admits.
-    let max_packet_bytes = flows
-        .max_inbound_fragment_bytes()
-        .get()
-        .max(local.max_unit_bytes().get());
+    let max_packet_bytes = workload.max_fragment_bytes.max(workload.max_unit_bytes);
     for _ in 0..inbound_flows {
         add_lease(
             &mut grant,
@@ -8829,59 +8615,42 @@ fn realtime_fixture_provider_grant(
     Ok(grant)
 }
 
-/// The per-class callback payload ceilings one fixture profile states, as
-/// bytes, or a refusal naming the class it left out.
+/// The callback work one lab fixture intends to fund, stated by the fixture.
 ///
-/// `(0, 0)` only for a profile with no local mailboxes at all — the elastic
-/// shape, which declares no bounded callback surface to fund. Every profile that
-/// *does* declare mailboxes must state both ceilings, because this function's
-/// caller mints an explicit finite provider from the answer: a profile that
-/// declares what its callbacks may carry and then funds none of it is the exact
-/// underfunding this whole path was repaired for, and defaulting the missing
-/// number to zero is what let it pass unnoticed the first time.
+/// The per-class payload ceilings used to be read off the profile's mailbox
+/// capacities, and a profile that declared mailboxes without stating what they
+/// could carry was refused here. Neither the capacities nor the ceilings exist
+/// any more, so the fixture states its own two numbers — the largest payload it
+/// will fund per class — and this function derives nothing.
 ///
-/// No other layer's limit is admissible here. A signaling or endpoint frame
-/// maximum standing in for a control callback's bytes is a borrowed number that
-/// happens to be large enough until it isn't, which is how the original defect
-/// was hidden.
+/// The two are stated separately on purpose. One number shared by both classes
+/// funds each at `max(control, endpoint)`, so the generously-sized class pays
+/// for the other; and a limit borrowed from another layer — a signaling or
+/// endpoint frame maximum standing in for an ICE candidate's bytes — is how the
+/// original underfunding stayed invisible until every gathered candidate was
+/// refused for want of `QueuedBytes`.
 #[cfg(any(test, feature = "transport-lab"))]
-fn fixture_profile_payload_ceilings(policy: ConnectorCallbackPolicy) -> Result<(u64, u64)> {
-    let Some(mailboxes) = policy.local_mailboxes() else {
-        return Ok((0, 0));
-    };
-    fn stated(bytes: Option<std::num::NonZeroUsize>, class: &'static str) -> Result<u64> {
-        let bytes = bytes.ok_or_else(|| {
-            Error::Transport(format!(
-                "an explicit transport-lab fixture grant needs the {class} callback payload \
-                 ceiling its owner will fund; build the profile's mailbox capacities with \
-                 `ConnectorCallbackMailboxCapacities::with_local_payload_ceilings`"
-            ))
-        })?;
-        u64::try_from(bytes.get()).map_err(|_| {
-            Error::Transport(format!(
-                "the stated {class} callback payload ceiling is not representable"
-            ))
-        })
-    }
-    Ok((
-        stated(mailboxes.local_control_payload_bytes(), "control")?,
-        stated(mailboxes.local_endpoint_payload_bytes(), "endpoint-data")?,
-    ))
+#[derive(Clone, Copy, Debug)]
+pub struct TransportLabCallbackWorkload {
+    pub control_slots: std::num::NonZeroUsize,
+    pub endpoint_slots: std::num::NonZeroUsize,
+    pub control_payload_bytes: u64,
+    pub endpoint_payload_bytes: u64,
+    /// The real-time envelope this fixture funds, if it opens any flows.
+    pub realtime: Option<TransportLabRealtimeWorkload>,
 }
 
 /// Derive a finite resource grant for an explicit transport-lab fixture.
 ///
-/// The caller supplies the exact connector profiles and concurrent Mesh scope
-/// count exercised by the fixture. This function selects no production value
-/// and is unavailable without the `transport-lab` feature.
-///
-/// A profile declaring bounded callback mailboxes must also state its per-class
-/// payload ceilings; see [`fixture_profile_payload_ceilings`] for why this
-/// refuses rather than assuming zero.
+/// The caller supplies the exact connector profiles, the concurrent Mesh scope
+/// count, and the callback and real-time work each connector will actually do.
+/// This function selects no production value and is unavailable without the
+/// `transport-lab` feature.
 #[cfg(any(test, feature = "transport-lab"))]
 pub fn transport_lab_connector_fixture_grant(
     profiles: &[WebRtcConnectorProfile],
     mesh_scope_count: std::num::NonZeroU64,
+    workload: TransportLabCallbackWorkload,
 ) -> Result<crate::resource::ResourceClaim> {
     use crate::resource::FiniteResourceProvider;
 
@@ -8940,13 +8709,11 @@ pub fn transport_lab_connector_fixture_grant(
             )?;
         }
 
-        let (control_payload, endpoint_payload) =
-            fixture_profile_payload_ceilings(profile.callbacks())?;
         for callback_claim in callback::connector_fixture_operation_claims(
-            profile.callbacks(),
+            Some((workload.control_slots, workload.endpoint_slots)),
             0,
-            control_payload,
-            endpoint_payload,
+            workload.control_payload_bytes,
+            workload.endpoint_payload_bytes,
         )
         .map_err(|error| {
             Error::Transport(format!(
@@ -8961,10 +8728,12 @@ pub fn transport_lab_connector_fixture_grant(
             )?;
         }
 
-        if let RealtimeConnectorPolicy::Enabled(Some(local)) = profile.callbacks().realtime() {
+        if let (RealtimeConnectorPolicy::Enabled, Some(realtime)) =
+            (profile.callbacks().realtime(), workload.realtime)
+        {
             add(
                 &mut grant,
-                realtime_fixture_provider_grant(local)?,
+                realtime_fixture_provider_grant(realtime)?,
                 "connector real-time fixture envelope",
             )?;
         }
@@ -9131,10 +8900,12 @@ pub fn transport_lab_remote_description_fixture_grant(
 #[cfg(test)]
 pub(crate) fn one_mesh_connector_fixture_grant(
     profiles: &[WebRtcConnectorProfile],
+    workload: TransportLabCallbackWorkload,
 ) -> Result<crate::resource::ResourceClaim> {
     transport_lab_connector_fixture_grant(
         profiles,
         std::num::NonZeroU64::new(1).expect("one Mesh fixture scope is nonzero"),
+        workload,
     )
 }
 
@@ -9145,11 +8916,7 @@ mod tests {
         FiniteResourceProvider, ProcessResourceRoot, ResourceFamilyReport, ResourceProviderPort,
         PRE_AUTH_RESOURCE_FAMILY_COUNT,
     };
-    use crate::runtime::attempt::{
-        ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets,
-        ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-        ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort,
-    };
+    use crate::runtime::attempt::ConnectorResourceOwnerPort;
     use std::future::Future;
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll, Waker};
@@ -9170,25 +8937,78 @@ mod tests {
     const FIXTURE_CONTROL_PAYLOAD_CEILING: usize = 4_096;
     const FIXTURE_ENDPOINT_PAYLOAD_CEILING: usize = 4_096;
 
-    /// Mailbox capacities for a fixture whose connector funds itself.
+    /// The callback grant for a fixture whose connector funds itself.
     ///
-    /// Every policy that reaches `CallbackProducerOwner::for_local_lab_policy`
+    /// Every fixture that reaches `CallbackProducerOwner::for_local_lab_grant`
     /// goes through here, so no fixture can silently rely on one class's byte
     /// grant paying for another's. Fixtures that install a real connector
-    /// resource scope keep `ConnectorCallbackMailboxCapacities::new`: they draw
-    /// on a provider they did not mint and state no ceiling.
-    fn lab_mailboxes(
+    /// resource scope need none of this: they draw on a provider they did not
+    /// mint, and state nothing.
+    fn lab_callback_grant(
         control: NonZeroUsize,
         endpoint_data: NonZeroUsize,
-    ) -> crate::runtime::attempt::ConnectorCallbackMailboxCapacities {
-        crate::runtime::attempt::ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
+    ) -> callback::TransportLabCallbackGrant {
+        lab_callback_grant_exact(
             control,
             endpoint_data,
-            NonZeroUsize::new(FIXTURE_CONTROL_PAYLOAD_CEILING)
-                .expect("the fixture control payload ceiling is nonzero"),
-            NonZeroUsize::new(FIXTURE_ENDPOINT_PAYLOAD_CEILING)
-                .expect("the fixture endpoint payload ceiling is nonzero"),
+            FIXTURE_CONTROL_PAYLOAD_CEILING,
+            FIXTURE_ENDPOINT_PAYLOAD_CEILING,
+            lab_observation_slots(),
         )
+    }
+
+    /// Every lifecycle delivery the general fixtures can produce: the reserved
+    /// open and close, plus renegotiation, ICE state and peer-connection state.
+    fn lab_observation_slots() -> NonZeroUsize {
+        NonZeroUsize::new(5).expect("the fixture lifecycle slot count is nonzero")
+    }
+
+    /// The same grant, with every number the control cares about stated by the
+    /// control.
+    ///
+    /// A control that asserts the *next* insert is refused cannot use the
+    /// general grant above. That one funds each class at a 4 KiB payload ceiling
+    /// and five lifecycle deliveries at a payload of zero, and a fixture reserves
+    /// only two of those five. What is left over is real capacity in exactly the
+    /// two dimensions an insert spends — spare `QueuedBytes` under the class
+    /// ceiling, and spare count from the unreserved lifecycle slots — sitting in
+    /// the same pool the insert draws from. So the insert that was supposed to
+    /// be refused is admitted out of capacity nothing declared and nothing
+    /// consumes, and the control passes while proving the opposite of its name.
+    ///
+    /// Callers here state the exact payload each class will queue and the exact
+    /// number of lifecycle deliveries they will reserve, so the pool is empty at
+    /// the moment the refusal is asserted.
+    fn lab_callback_grant_exact(
+        control: NonZeroUsize,
+        endpoint_data: NonZeroUsize,
+        control_payload_bytes: usize,
+        endpoint_payload_bytes: usize,
+        observation_slots: NonZeroUsize,
+    ) -> callback::TransportLabCallbackGrant {
+        callback::TransportLabCallbackGrant {
+            control_slots: control,
+            endpoint_slots: endpoint_data,
+            control_payload_bytes: NonZeroUsize::new(control_payload_bytes)
+                .expect("the fixture control payload size is nonzero"),
+            endpoint_payload_bytes: NonZeroUsize::new(endpoint_payload_bytes)
+                .expect("the fixture endpoint payload size is nonzero"),
+            observation_slots,
+        }
+    }
+
+    /// The same numbers as [`lab_callback_grant`], for the fixture-grant helper.
+    fn lab_callback_workload(capacity: NonZeroUsize) -> TransportLabCallbackWorkload {
+        let grant = lab_callback_grant(capacity, capacity);
+        TransportLabCallbackWorkload {
+            control_slots: grant.control_slots,
+            endpoint_slots: grant.endpoint_slots,
+            control_payload_bytes: u64::try_from(grant.control_payload_bytes.get())
+                .expect("the fixture control payload ceiling fits u64"),
+            endpoint_payload_bytes: u64::try_from(grant.endpoint_payload_bytes.get())
+                .expect("the fixture endpoint payload ceiling fits u64"),
+            realtime: None,
+        }
     }
 
     fn test_resource_owner(
@@ -9201,6 +9021,9 @@ mod tests {
         let connector_grant = transport_lab_connector_fixture_grant(
             &profiles,
             std::num::NonZeroU64::new(1).expect("the fixture Mesh scope count is nonzero"),
+            lab_callback_workload(
+                NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero"),
+            ),
         )
         .expect("fixture connector and callback claims are representable");
         let provider = ResourceProviderPort::new(FiniteResourceProvider::new(connector_grant))
@@ -9210,23 +9033,12 @@ mod tests {
             .expect("fixture process owner issues one explicit Mesh scope")
     }
 
-    fn test_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
-        let callback_capacity =
-            NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            lab_mailboxes(callback_capacity, callback_capacity),
-            ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("fixture callback policy is valid");
-        WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic())
+    fn test_webrtc_profile(_callback_capacity: usize) -> WebRtcConnectorProfile {
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only())
     }
 
     fn test_generic_realtime_webrtc_profile(_callback_capacity: usize) -> WebRtcConnectorProfile {
-        WebRtcConnectorProfile::new(
-            explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16),
-            PendingRemoteCandidatePolicy::elastic(),
-        )
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
     }
 
     fn close_owner_fixture(
@@ -9420,36 +9232,30 @@ mod tests {
         )
     }
 
-    fn test_pending_candidate_policy() -> PendingRemoteCandidatePolicy {
-        test_pending_candidate_policy_for(&[])
+    fn test_candidate_fixture_work() -> RemoteCandidateFixtureWork {
+        test_candidate_fixture_work_for(&[])
     }
 
-    fn test_pending_candidate_policy_for(
+    fn test_candidate_fixture_work_for(
         additional_inputs: &[LocalIceCandidate],
-    ) -> PendingRemoteCandidatePolicy {
+    ) -> RemoteCandidateFixtureWork {
         let candidate_bytes = std::iter::once(observed_candidate())
             .chain(additional_inputs.iter().cloned())
             .filter_map(|candidate| candidate_content_bytes(&candidate))
             .max()
-            .and_then(NonZeroUsize::new)
             .expect("fixture candidate has nonzero representable content");
-        PendingRemoteCandidatePolicy::new(
-            NonZeroUsize::new(1).expect("fixture item ceiling is nonzero"),
-            candidate_bytes,
-            NonZeroUsize::new(1).expect("fixture duplicate ceiling is nonzero"),
-            NonZeroUsize::new(1).expect("fixture work ceiling is nonzero"),
-        )
+        RemoteCandidateFixtureWork::new(1, candidate_bytes)
     }
 
     fn test_remote_candidate_state() -> RemoteCandidateState {
-        RemoteCandidateState::new(test_pending_candidate_policy())
+        RemoteCandidateState::new(test_candidate_fixture_work())
     }
 
     /// Build a finite test provider from the local fixture envelope. This is
     /// test accounting only. It is not a product cardinality or a production
     /// policy value.
     fn test_realtime_resource_scope(
-        local: EnabledRealtimeConnectorPolicy,
+        workload: TransportLabRealtimeWorkload,
     ) -> ConnectorWorkResourceScope {
         // One control profile per fixture registry, charged here rather than in
         // the shared envelope helper: the envelope describes flows, and which
@@ -9463,7 +9269,7 @@ mod tests {
         .expect("the control profile reservation is representable");
         let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
             .checked_add(
-                realtime_fixture_provider_grant(local)
+                realtime_fixture_provider_grant(workload)
                     .expect("fixture real-time envelope is representable"),
             )
             .and_then(|grant| grant.checked_add(profile_claim))
@@ -9712,76 +9518,207 @@ mod tests {
         )
     }
 
-    fn test_realtime_registry(policy: ConnectorCallbackPolicy) -> Arc<RealtimeFlowRegistry> {
-        match policy.realtime() {
-            RealtimeConnectorPolicy::Disabled => RealtimeFlowRegistry::new(None, None),
-            RealtimeConnectorPolicy::Enabled(Some(local)) => {
-                RealtimeFlowRegistry::new(Some(test_realtime_resource_scope(local)), Some(local))
-            }
-            RealtimeConnectorPolicy::Enabled(None) => {
-                panic!("an elastic real-time test must supply its exact provider fixture")
-            }
-        }
+    /// A registry over a provider funded for exactly the stated workload.
+    ///
+    /// The workload used to be an owner ceiling the registry then enforced, so
+    /// a control could be refused either by the ceiling or by the provider and
+    /// the two were sized together. Only the provider refuses now, and this
+    /// states what it is funded for — so a control that expects a refusal gets
+    /// one from the only thing that can still give it.
+    fn test_realtime_registry(workload: TransportLabRealtimeWorkload) -> Arc<RealtimeFlowRegistry> {
+        RealtimeFlowRegistry::new(Some(test_realtime_resource_scope(workload)))
     }
 
     fn test_realtime_registry_with_observer(
-        policy: ConnectorCallbackPolicy,
+        workload: TransportLabRealtimeWorkload,
         observer: Arc<dyn RealtimeFlowObserver>,
     ) -> Arc<RealtimeFlowRegistry> {
-        let RealtimeConnectorPolicy::Enabled(Some(local)) = policy.realtime() else {
-            panic!("an observed real-time test requires an explicit local fixture envelope");
-        };
         RealtimeFlowRegistry::with_observer(
-            Some(test_realtime_resource_scope(local)),
-            Some(local),
+            Some(test_realtime_resource_scope(workload)),
             Some(observer),
         )
     }
 
+    /// A work scope funded for exactly the listed claims and nothing else.
+    ///
+    /// The shared workload grant cannot state scarcity for one claim. It funds
+    /// every claim a flow of that shape *could* take — a native read per inbound
+    /// flow, an assembly and its fragments per in-progress unit, a packet work
+    /// lease per pump — and those claims overlap in the dimensions that matter:
+    /// a fragment and a packet work both spend `ParsingOrCpuWork`, a native read
+    /// and an output both spend `CallbackOrScheduledWork`. So a control that
+    /// funds one of a thing and expects the second to be refused is instead
+    /// afforded it out of capacity granted for work the control never does, and
+    /// the refusal it asserts is unreachable. Scarcity has to be built for the
+    /// claim under test or it is not scarcity at all.
+    ///
+    /// Callers enumerate every claim the control actually takes, including the
+    /// ones an open quietly needs — a flow is its own record *and* a separate
+    /// `LeasedMap` node — so the grant is a statement about the control rather
+    /// than about whatever slack a shape-derived envelope happened to leave.
+    /// Everything an exact-grant fixture has to keep alive for its refusals to
+    /// mean anything.
+    ///
+    /// A work scope does not own the things that were charged to build it. The
+    /// candidate holds the connector-opening reservation, and the Mesh scope
+    /// token behind it holds the owner, which owns the cleanup executor and the
+    /// infrastructure lease that executor took. Let any of them drop and the
+    /// provider gets that capacity back — so a control that then asserts "the
+    /// next acquisition is refused" is asking a pool that has quietly been
+    /// refilled with whatever its own setup returned.
+    ///
+    /// That is not hypothetical: an earlier version of this helper returned the
+    /// scope alone, dropping the candidate and the attempt lifetime as it
+    /// returned. The released `CallbackOrScheduledWork` — one from the executor
+    /// infrastructure, one from the cleanup job inside the opening claim — is
+    /// exactly what was paying for the output reservations three controls
+    /// expected to be refused. Holding this guard for the length of the control
+    /// is what makes the ledger add up.
+    struct ExactRealtimeGrant {
+        _owner: ConnectorResourceOwnerPort,
+        _candidate: ConnectorCandidateCapability,
+        _attempt: AttemptLifetime,
+    }
+
+    fn exact_realtime_work_scope(
+        claims: impl IntoIterator<Item = crate::resource::ResourceClaim>,
+    ) -> (ConnectorWorkResourceScope, ExactRealtimeGrant) {
+        // The base is every record this scope reserves, and the guard below is
+        // what keeps each of them reserved.
+        //
+        // `issue_mesh_scope` calls `cleanup_executor.prepare`, so the executor
+        // starts and takes its infrastructure lease eagerly, at Mesh issuance
+        // rather than at the first cleanup job. It has to be funded. What it
+        // must *not* do is come back: that lease and the opening claim are held
+        // for as long as the owner and the candidate live, which is why both
+        // travel out of here in `ExactRealtimeGrant` instead of dying with this
+        // function.
+        //
+        // `explicit_test_grant` is deliberately not the base. It adds a spare
+        // `connector_operation_claim` per fixture candidate — one
+        // `ParsingOrCpuWork`, the only dimension a retained fragment competes
+        // for — which nothing here ever holds.
+        let structural = crate::runtime::attempt::connector_resource_structural_claims();
+        let mut grant = FiniteResourceProvider::scope_record_charge_for_test()
+            .checked_add(FiniteResourceProvider::scope_record_charge_for_test())
+            .expect("the fixture scope records are representable")
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(
+                    structural.process_infrastructure(),
+                )
+                .expect("the cleanup infrastructure charge is representable"),
+            )
+            .expect("the fixture infrastructure grant is representable")
+            .checked_add(
+                FiniteResourceProvider::child_scope_with_reservation_charge_for_test(
+                    structural.connector_opening(),
+                )
+                .expect("the connector opening charge is representable"),
+            )
+            .expect("the exact fixture base grant is representable");
+        for claim in claims {
+            grant = grant
+                .checked_add(
+                    FiniteResourceProvider::reservation_charge_for_test(claim)
+                        .expect("the fixture reservation charge is representable"),
+                )
+                .expect("the exact fixture grant is representable");
+        }
+        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+            .expect("the exact grant accounts for its process scope");
+        let owner = ConnectorResourceOwnerPort::new(provider);
+        let mesh = owner
+            .issue_mesh_scope()
+            .expect("the exact grant accounts for its Mesh scope and cleanup executor");
+        let (permit, attempt, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), mesh);
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("the exact grant admits its connector candidate");
+        let scope = candidate.work_resource_scope();
+        (
+            scope,
+            ExactRealtimeGrant {
+                _owner: owner,
+                _candidate: candidate,
+                _attempt: attempt,
+            },
+        )
+    }
+
+    /// A registry on an exact grant, with the guard the caller must hold.
+    ///
+    /// Returned as a pair rather than hidden inside the registry so that
+    /// dropping the guard early is something a caller has to write down.
+    fn exact_realtime_registry(
+        claims: impl IntoIterator<Item = crate::resource::ResourceClaim>,
+    ) -> (Arc<RealtimeFlowRegistry>, ExactRealtimeGrant) {
+        let (scope, grant) = exact_realtime_work_scope(claims);
+        (RealtimeFlowRegistry::new(Some(scope)), grant)
+    }
+
+    fn exact_realtime_registry_with_observer(
+        claims: impl IntoIterator<Item = crate::resource::ResourceClaim>,
+        observer: Arc<dyn RealtimeFlowObserver>,
+    ) -> (Arc<RealtimeFlowRegistry>, ExactRealtimeGrant) {
+        let (scope, grant) = exact_realtime_work_scope(claims);
+        (
+            RealtimeFlowRegistry::with_observer(Some(scope), Some(observer)),
+            grant,
+        )
+    }
+
+    /// Exactly what one `open_inbound_flow` or `open_outbound_flow` acquires.
+    ///
+    /// Two, not one and not three: the flow's own record, and the registry map
+    /// node it is filed under — an independent `LeasedMap` allocation with its
+    /// own lifetime. A grant naming only the first funds half of an open and
+    /// refuses the open itself, which reads as the control's own refusal and is
+    /// not one.
+    ///
+    /// The ready obligation is deliberately *not* here. `open_flow_checked`
+    /// does not take one — a ready lease is acquired by `enqueue`, when a unit
+    /// actually becomes serviceable. Funding it at open hands the pool a spare
+    /// `CallbackOrScheduledWork`, which is the dimension an output reservation
+    /// is scarce in, so the reservation a control expects to be refused gets
+    /// paid for by a lease that open never took. Controls that enqueue add one
+    /// `ready_claim` per unit they enqueue, beside the queue claims.
+    fn exact_realtime_open_claims() -> [crate::resource::ResourceClaim; 2] {
+        [
+            RealtimeFlowRegistry::flow_claim().expect("the flow claim is representable"),
+            RealtimeFlowRegistry::flow_map_node_claim()
+                .expect("the flow map node claim is representable"),
+        ]
+    }
+
     /// The one real-time payload the shared callback fixture is sized for.
     ///
-    /// `test_callback_policy` derives its unit ceiling, fragment ceiling and
-    /// retained-byte envelope from this exact length, so a control that emits
-    /// any *other* payload through that policy is either refused as oversize or
-    /// silently given slack the policy never promised. Both are arrangement
-    /// failures wearing the costume of a result, which is why there is one
-    /// constant rather than a literal at each site.
+    /// `test_realtime_workload` funds its unit, its fragment and its queued
+    /// bytes from this exact length, so a control that emits any *other* payload
+    /// through that fixture is either refused for want of capacity or silently
+    /// given slack the fixture never funded. Both are arrangement failures
+    /// wearing the costume of a result, which is why there is one constant
+    /// rather than a literal at each site.
     const FIXTURE_REALTIME_PAYLOAD: &[u8] = b"realtime-unit";
 
-    fn test_callback_policy(capacity: NonZeroUsize) -> ConnectorCallbackPolicy {
+    /// The real-time workload the shared callback fixture funds.
+    ///
+    /// Sized from [`FIXTURE_REALTIME_PAYLOAD`] for the same reason the ceilings
+    /// it replaces were: a control that emits any *other* payload through this
+    /// fixture is either refused for want of capacity or silently handed slack
+    /// the fixture never funded, and both are arrangement failures wearing the
+    /// costume of a result.
+    fn test_realtime_workload(capacity: NonZeroUsize) -> TransportLabRealtimeWorkload {
         let unit_bytes = FIXTURE_REALTIME_PAYLOAD.len();
-        let flow_domains = 2usize;
-        let accounted_bytes = unit_bytes
-            .checked_mul(capacity.get())
-            .and_then(|bytes| bytes.checked_mul(flow_domains))
-            .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(NonZeroUsize::new)
-            .expect("fixture retained-byte envelope is representable and nonzero");
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(
-                NonZeroUsize::new(flow_domains).expect("fixture has two flow kinds"),
-                NonZeroUsize::new(flow_domains).expect("fixture has two flow kinds"),
-                capacity,
-            ),
-            ConnectorRealtimeInboundLimits::new(
-                NonZeroUsize::new(unit_bytes).expect("fixture unit is nonempty"),
-                NonZeroUsize::new(1).expect("fixture uses complete units"),
-                NonZeroUsize::new(1).expect("fixture uses one in-progress unit"),
-            ),
-            ConnectorRealtimeByteBudgets::new(accounted_bytes, accounted_bytes),
-            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
-        );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(
-            NonZeroUsize::new(unit_bytes).expect("fixture unit is nonempty"),
-            flows,
-        )
-        .expect("fixture real-time envelope is internally consistent");
-        ConnectorCallbackPolicy::new(
-            lab_mailboxes(capacity, capacity),
-            ConnectorCallbackServiceWeights::new(capacity, capacity, capacity),
-            realtime,
-        )
-        .expect("fixture callback policy is valid")
+        TransportLabRealtimeWorkload {
+            inbound_flows: 2,
+            outbound_flows: 2,
+            queued_units_per_flow: capacity.get(),
+            in_progress_units_per_inbound_flow: 1,
+            fragments_per_unit: 1,
+            max_fragment_bytes: unit_bytes,
+            max_unit_bytes: unit_bytes,
+        }
     }
 
     fn retained_realtime_bytes(state: &RealtimeFlowRegistryState) -> usize {
@@ -9810,30 +9747,36 @@ mod tests {
     fn test_event_mailboxes(capacity: usize) -> (ConnectorEventMailboxes, TransportEventReceiver) {
         let capacity =
             std::num::NonZeroUsize::new(capacity).expect("fixture callback capacity is nonzero");
-        test_event_mailboxes_with_policy(test_callback_policy(capacity))
+        test_event_mailboxes_with_workload(capacity, test_realtime_workload(capacity))
     }
 
-    fn test_event_mailboxes_with_policy(
-        policy: ConnectorCallbackPolicy,
+    fn test_event_mailboxes_with_workload(
+        capacity: NonZeroUsize,
+        realtime: TransportLabRealtimeWorkload,
     ) -> (ConnectorEventMailboxes, TransportEventReceiver) {
-        let capacities = policy
-            .local_mailboxes()
-            .expect("fixture callback mailboxes are explicit");
-        let callback_producer = CallbackProducerOwner::for_local_lab_policy(policy)
-            .expect("fixture callback resources are derivable from its local policy");
-        let realtime_flows = test_realtime_registry(policy);
+        test_event_mailboxes_with_grant(lab_callback_grant(capacity, capacity), realtime)
+    }
+
+    /// The same fixture, on a callback grant the control states itself.
+    ///
+    /// Only the controls that assert a refusal need this. Everything else is
+    /// better served by the general grant, which funds enough slack that an
+    /// arrangement step cannot fail for a reason the control was not written to
+    /// be about.
+    fn test_event_mailboxes_with_grant(
+        grant: callback::TransportLabCallbackGrant,
+        realtime: TransportLabRealtimeWorkload,
+    ) -> (ConnectorEventMailboxes, TransportEventReceiver) {
+        let callback_producer = CallbackProducerOwner::for_local_lab_grant(grant)
+            .expect("fixture callback resources are derivable from its stated grant");
+        let realtime_flows = test_realtime_registry(realtime);
         let callback_ready = Arc::new(tokio::sync::Notify::new());
         let control = callback_producer
-            .create_mailbox(
-                ConnectorCallbackClass::Control,
-                Some(capacities.control()),
-                Arc::clone(&callback_ready),
-            )
+            .create_mailbox(ConnectorCallbackClass::Control, Arc::clone(&callback_ready))
             .expect("fixture control mailbox is admitted");
         let endpoint_data = callback_producer
             .create_mailbox(
                 ConnectorCallbackClass::EndpointData,
-                Some(capacities.endpoint_data()),
                 Arc::clone(&callback_ready),
             )
             .expect("fixture endpoint mailbox is admitted");
@@ -9861,7 +9804,9 @@ mod tests {
                 callback_ready,
                 callback_failed: false,
                 realtime_flows,
-                scheduler: ConnectorCallbackScheduler::new(policy),
+                scheduler: ConnectorCallbackScheduler::new(
+                    ConnectorCallbackPolicy::elastic_realtime(),
+                ),
                 control_cursor: ConnectorControlSourceCursor::default(),
             },
         )
@@ -9869,19 +9814,18 @@ mod tests {
 
     fn test_event_sink(
         events: ConnectorEventMailboxes,
-        policy: ConnectorCallbackPolicy,
+        realtime: TransportLabRealtimeWorkload,
         resource_scope: Option<PeerConnectionResourceScope>,
     ) -> ConnectorEventSink {
         let callback_producer = events.callback_producer.clone();
         ConnectorEventSink {
             events,
-            realtime_flows: test_realtime_registry(policy),
+            realtime_flows: test_realtime_registry(realtime),
             resource_scope,
             attempt_liveness: None,
             candidate_promoted: Arc::new(AtomicBool::new(true)),
             callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
             callback_violation_reported: Arc::new(AtomicBool::new(false)),
-            callback_policy: policy,
             callback_producer,
             operation_fence: Arc::new(ConnectorOperationFence::default()),
             close_owner: None,
@@ -9890,84 +9834,38 @@ mod tests {
 
     fn test_event_sink_for_receiver(
         events: ConnectorEventMailboxes,
-        policy: ConnectorCallbackPolicy,
+        realtime: TransportLabRealtimeWorkload,
         resource_scope: Option<PeerConnectionResourceScope>,
         receiver: &TransportEventReceiver,
     ) -> ConnectorEventSink {
-        let mut sink = test_event_sink(events, policy, resource_scope);
+        let mut sink = test_event_sink(events, realtime, resource_scope);
         sink.realtime_flows = Arc::clone(&receiver.realtime_flows);
         sink
     }
 
-    fn explicit_callback_policy(
-        capacity: usize,
-        control_weight: usize,
-        endpoint_data_weight: usize,
-        realtime_weight: usize,
-        realtime: RealtimeConnectorPolicy,
-    ) -> ConnectorCallbackPolicy {
-        let capacity =
-            std::num::NonZeroUsize::new(capacity).expect("fixture callback capacity is nonzero");
-        ConnectorCallbackPolicy::new(
-            lab_mailboxes(capacity, capacity),
-            ConnectorCallbackServiceWeights::new(
-                std::num::NonZeroUsize::new(control_weight)
-                    .expect("fixture control weight is nonzero"),
-                std::num::NonZeroUsize::new(endpoint_data_weight)
-                    .expect("fixture endpoint-data weight is nonzero"),
-                std::num::NonZeroUsize::new(realtime_weight)
-                    .expect("fixture real-time weight is nonzero"),
-            ),
-            realtime,
-        )
-        .expect("fixture callback policy is valid")
-    }
-
-    fn explicit_realtime_callback_policy(
+    /// The real-time work one control funds, in the shape the grant needs.
+    ///
+    /// This replaces a helper that built an owner ceiling out of the same six
+    /// numbers. They meant "refuse past here" and now mean "fund exactly this",
+    /// which is the same arithmetic pointed at the only thing left that can
+    /// refuse. The per-unit fragment count stays at the value these controls
+    /// were written against.
+    fn explicit_realtime_workload(
         max_unit_bytes: usize,
         max_active_flows_per_domain: usize,
         queue_capacity_per_flow: usize,
         max_inbound_fragment_bytes: usize,
         max_in_progress_units_per_flow: usize,
-        max_accounted_bytes: usize,
-    ) -> ConnectorCallbackPolicy {
-        let nonzero = |value, name| {
-            std::num::NonZeroUsize::new(value)
-                .unwrap_or_else(|| panic!("fixture {name} must be nonzero"))
-        };
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(
-                nonzero(max_active_flows_per_domain, "inbound flow count"),
-                nonzero(max_active_flows_per_domain, "outbound flow count"),
-                nonzero(queue_capacity_per_flow, "per-flow queue capacity"),
-            ),
-            ConnectorRealtimeInboundLimits::new(
-                nonzero(max_inbound_fragment_bytes, "fragment limit"),
-                // The fixture is the owner here, so it names its own ceiling
-                // rather than borrowing a core constant. It used to read a
-                // shared `MAX_AU_PARTS`; core no longer has one, because a
-                // per-unit fragment count is exactly the kind of number an
-                // owner chooses and core cannot. The value is the one these
-                // controls were written against, so their arithmetic is
-                // unchanged — it is now stated where it is chosen.
-                nonzero(2_048, "fixture per-unit fragment count"),
-                nonzero(
-                    max_in_progress_units_per_flow,
-                    "per-flow in-progress unit limit",
-                ),
-            ),
-            ConnectorRealtimeByteBudgets::new(
-                nonzero(max_accounted_bytes, "inbound accounted-byte limit"),
-                nonzero(max_accounted_bytes, "outbound accounted-byte limit"),
-            ),
-            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
-        );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(
-            nonzero(max_unit_bytes, "unit limit"),
-            flows,
-        )
-        .expect("fixture real-time policy can carry one guarded assembly");
-        explicit_callback_policy(1, 1, 1, 1, realtime)
+    ) -> TransportLabRealtimeWorkload {
+        TransportLabRealtimeWorkload {
+            inbound_flows: max_active_flows_per_domain,
+            outbound_flows: max_active_flows_per_domain,
+            queued_units_per_flow: queue_capacity_per_flow,
+            in_progress_units_per_inbound_flow: max_in_progress_units_per_flow,
+            fragments_per_unit: 2_048,
+            max_fragment_bytes: max_inbound_fragment_bytes,
+            max_unit_bytes,
+        }
     }
 
     #[derive(Default)]
@@ -10046,7 +9944,7 @@ mod tests {
         second: TransportEvent,
     ) {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
+        let policy = test_realtime_workload(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
@@ -10098,7 +9996,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_endpoint_data_and_realtime_callback_capacity_are_independent() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
+        let policy = test_realtime_workload(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
@@ -10136,17 +10034,25 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_close_supersedes_prequeued_endpoint_data_without_hidden_producers() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            lab_mailboxes(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        const PREQUEUED: &[u8] = b"before-close";
+        // Exactly one endpoint payload of the prequeued size, and no spare
+        // control bytes or unreserved lifecycle slots for the overload below to
+        // be admitted out of.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                PREQUEUED.len(),
+                NonZeroUsize::new(2).expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
+        );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(
-            sink.emit_data_channel(TransportEvent::Message(Bytes::from_static(b"before-close")))
+            sink.emit_data_channel(TransportEvent::Message(Bytes::from_static(PREQUEUED)))
                 .await
         );
         assert_eq!(
@@ -10177,15 +10083,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03i_open_and_close_do_not_depend_on_control_mailbox_capacity() {
+    async fn v4_arc03i_open_and_close_remain_ordered_with_other_callbacks_queued() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            lab_mailboxes(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        let (events, mut receiver) = test_event_mailboxes_with_workload(one, policy);
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(sink.emit(TransportEvent::LocalIceCandidate(None)).await);
@@ -10218,7 +10119,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_close_supersedes_an_uncommitted_open_exactly_once() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert_eq!(
@@ -10243,15 +10144,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03i_candidate_and_gathering_overload_retires_the_connector() {
+    async fn v4_arc03i_candidate_overload_retires_the_connector() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            lab_mailboxes(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        let candidate_bytes = candidate_content_bytes(&observed_candidate())
+            .expect("the fixture candidate has representable content");
+        // Exactly one candidate's worth of control `QueuedBytes`, endpoint
+        // starved to a byte, and no unreserved lifecycle slot — so the second
+        // candidate meets an empty pool.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                candidate_bytes,
+                1,
+                NonZeroUsize::new(2).expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
+        );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(
@@ -10260,9 +10170,22 @@ mod tests {
             ))
             .await
         );
+        // The second candidate rather than the gathering-complete signal this
+        // used to use. Completion carries no payload at all, and the only bound
+        // that could have refused a zero-byte control callback was the deleted
+        // item ceiling: a pool cannot refuse something that costs nothing, and
+        // the smallest grant the other class can be given is still one whole
+        // slot. A second real candidate is refused on its own `QueuedBytes`,
+        // which keeps the claim — a candidate that cannot be queued reports
+        // overload rather than vanishing, and the connector retires — pointed at
+        // the thing that still refuses.
         assert!(
-            !sink.emit(TransportEvent::LocalIceCandidate(None)).await,
-            "gathering completion reports overload instead of disappearing"
+            !sink
+                .emit(TransportEvent::LocalIceCandidate(
+                    Some(observed_candidate())
+                ))
+                .await,
+            "an unqueueable candidate reports overload instead of disappearing"
         );
         assert_eq!(
             receiver.lifecycle.phase(),
@@ -10277,7 +10200,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_renegotiation_and_state_observations_are_coalesced() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(sink.emit(TransportEvent::RenegotiationNeeded).await);
@@ -10314,7 +10237,7 @@ mod tests {
     #[test]
     fn v4_arc03i_first_structural_violation_retires_once() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         sink.structural_violation("first fixture violation");
@@ -10341,7 +10264,7 @@ mod tests {
             }))
         );
         let (events, receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let mut sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         sink.close_owner = Some(Arc::downgrade(&close_owner));
 
@@ -10371,7 +10294,7 @@ mod tests {
         );
         let ownership = close_owner.ownership.clone();
         let (events, raw) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let mut sink = test_event_sink_for_receiver(events, policy, None, &raw);
         sink.close_owner = Some(Arc::downgrade(&close_owner));
         let mut receiver = WebRtcConnectorEventReceiver {
@@ -10382,7 +10305,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: Some(Arc::clone(&close_owner)),
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -10415,7 +10337,7 @@ mod tests {
         );
 
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         for _ in 0..32 {
             let NativeDataChannelAdmission::Violation(reason) =
@@ -10440,13 +10362,8 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03f_close_fence_rejects_callback_invoked_after_close_commit() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            lab_mailboxes(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        let (events, mut receiver) = test_event_mailboxes_with_workload(one, policy);
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(
@@ -10470,8 +10387,11 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03g_close_retires_realtime_before_forced_realtime_dispatch() {
-        let policy = explicit_realtime_callback_policy(8, 1, 2, 8, 1, 16);
-        let (events, mut raw) = test_event_mailboxes_with_policy(policy);
+        let policy = explicit_realtime_workload(8, 1, 2, 8, 1);
+        let (events, mut raw) = test_event_mailboxes_with_workload(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+            policy,
+        );
         let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
             crate::runtime::runtime_for_test(),
         );
@@ -10518,7 +10438,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: true,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -10536,13 +10455,8 @@ mod tests {
     fn v4_arc03_scheduler_gives_each_ready_class_a_bounded_service_turn() {
         let capacity = 3;
         let (events, mut receiver) = test_event_mailboxes(capacity);
-        receiver.scheduler = ConnectorCallbackScheduler::new(explicit_callback_policy(
-            capacity,
-            2,
-            1,
-            1,
-            RealtimeConnectorPolicy::enabled(),
-        ));
+        receiver.scheduler =
+            ConnectorCallbackScheduler::new(ConnectorCallbackPolicy::elastic_realtime());
         for candidate in ["candidate-1", "candidate-2", "candidate-3"] {
             events
                 .try_insert_for_test(
@@ -10578,10 +10492,15 @@ mod tests {
             reservation,
         ));
 
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(TransportEvent::LocalIceCandidate(_))
-        ));
+        // One quantum per ready class, so the rotation visits each ready class
+        // once before returning to control. The leading pair of control
+        // deliveries this used to assert was the owner-selected service weight
+        // for that class; with the weights gone every class scores one, and the
+        // property the control is named for is the rotation itself: each ready
+        // class gets a turn, and the two control deliveries at the end are the
+        // work-conserving half — an empty class is skipped rather than waited
+        // on, so control is served again immediately instead of the rotation
+        // stalling on the two classes that have drained.
         assert!(matches!(
             receiver.try_recv(),
             Ok(TransportEvent::LocalIceCandidate(_))
@@ -10593,6 +10512,10 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(TransportEvent::RealtimeUnit(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::LocalIceCandidate(_))
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -10706,7 +10629,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -10737,7 +10659,7 @@ mod tests {
     #[test]
     fn v4_arc03_observer_panic_cannot_poison_realtime_resource_ownership() {
         let registry = test_realtime_registry_with_observer(
-            explicit_realtime_callback_policy(16, 1, 1, 16, 1, 32),
+            explicit_realtime_workload(16, 1, 1, 16, 1),
             Arc::new(PanickingRealtimeObserver) as Arc<dyn RealtimeFlowObserver>,
         );
         let first = registry
@@ -10752,11 +10674,45 @@ mod tests {
     }
 
     #[test]
+    /// Two flows queue independently, and one exhausting the grant does not
+    /// take capacity from the other.
+    ///
+    /// The bound used to be a per-flow queue count, and the control drove one
+    /// flow into it. There is no count now, so the fixture funds exactly two
+    /// queued units across two flows and the third reservation is refused by
+    /// the provider — which is the same shape of refusal aimed at the thing
+    /// that actually still refuses.
     fn v4_arc03_realtime_flows_have_independent_bounded_queues() {
-        let policy = explicit_realtime_callback_policy(16, 2, 1, 16, 2, 32);
+        // Two flows, two queued units, and nothing else. The shared envelope
+        // cannot state this: it funds a native read per inbound flow and an
+        // assembly per in-progress unit, and both spend the same
+        // `CallbackOrScheduledWork` an output reservation does, so the third
+        // reservation below is afforded out of capacity for work this control
+        // never performs.
+        let unit_bytes = 5usize;
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            claims.extend(exact_realtime_open_claims());
+            claims.push(
+                RealtimeFlowRegistry::output_claim(unit_bytes)
+                    .expect("the output claim is representable"),
+            );
+            claims.push(
+                RealtimeFlowRegistry::queue_claim(unit_bytes)
+                    .expect("the queued-byte claim is representable"),
+            );
+            claims.push(
+                RealtimeFlowRegistry::queued_event_node_claim()
+                    .expect("the queue node claim is representable"),
+            );
+            // The ready obligation belongs to the enqueue, not to the open.
+            claims.push(
+                RealtimeFlowRegistry::ready_claim().expect("the ready claim is representable"),
+            );
+        }
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = test_realtime_registry_with_observer(
-            policy,
+        let (registry, _grant) = exact_realtime_registry_with_observer(
+            claims,
             observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let first = registry
@@ -10774,16 +10730,6 @@ mod tests {
             },
             first.reserve_output(5).expect("first unit is reserved"),
         ));
-        assert!(first.enqueue(
-            QueuedTransportEvent {
-                event: test_realtime_event(0, 2, b"first"),
-                observation: None,
-                callback_work: None,
-            },
-            first
-                .reserve_output(5)
-                .expect("full-queue unit is still measured before refusal"),
-        ));
         assert!(second.enqueue(
             QueuedTransportEvent {
                 event: test_realtime_event(1, 1, b"secnd"),
@@ -10792,6 +10738,10 @@ mod tests {
             },
             second.reserve_output(5).expect("second unit is reserved"),
         ));
+        assert!(
+            first.reserve_output(5).is_none(),
+            "the grant funds two queued units, and the third is refused"
+        );
 
         assert!(matches!(
             registry.try_recv().map(|queued| queued.event),
@@ -10814,32 +10764,21 @@ mod tests {
             matches!(
                 observation,
                 RealtimeFlowObservation::Drop {
-                    reason: RealtimeFlowDropReason::FlowQueueFull,
+                    reason: RealtimeFlowDropReason::ResourceUnavailable(_),
                     ..
                 }
             )
         }));
     }
 
-    #[test]
-    fn v4_arc03f_inbound_and_outbound_flow_slots_cannot_starve_each_other() {
-        let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
-        let registry = test_realtime_registry(policy);
-
-        let inbound = registry
-            .open_inbound_flow()
-            .expect("the inbound quarantine owns its slot");
-        assert!(registry.open_inbound_flow().is_none());
-        let outbound = registry
-            .open_outbound_flow()
-            .expect("inbound saturation cannot consume the outbound slot");
-        assert!(registry.open_outbound_flow().is_none());
-
-        drop(inbound);
-        assert!(registry.open_inbound_flow().is_some());
-        drop(outbound);
-        assert!(registry.open_outbound_flow().is_some());
-    }
+    // A control asserting that inbound saturation cannot consume the outbound
+    // slot used to live here. Its premise was the owner-selected per-domain flow
+    // partition, and that partition is gone: what funds a flow now is one pooled
+    // provider grant with no domain in it, so a second inbound open legitimately
+    // spends what a fixture intended for an outbound flow. No choice of grant
+    // size restores the guarantee — a pool cannot express a partition — and
+    // rebuilding one out of per-domain scopes would be reintroducing the policy
+    // under a new name. The property is not weakened here, it no longer exists.
 
     /// The bytes follow the delivery, whole, into whatever holds it next.
     ///
@@ -10857,7 +10796,7 @@ mod tests {
     /// have.
     #[test]
     fn v4_arc03f_realtime_bytes_follow_the_payload_owner_through_downstream_queues() {
-        let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
+        let policy = explicit_realtime_workload(8, 1, 1, 8, 1);
         let registry = test_realtime_registry(policy);
         let flow = registry
             .open_inbound_flow()
@@ -10898,7 +10837,7 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03f_complete_realtime_unit_has_no_wall_clock_expiry() {
-        let policy = explicit_realtime_callback_policy(16, 1, 2, 16, 1, 32);
+        let policy = explicit_realtime_workload(16, 1, 2, 16, 1);
         let observer = Arc::new(TestRealtimeObserver::default());
         let registry = test_realtime_registry_with_observer(
             policy,
@@ -10931,73 +10870,109 @@ mod tests {
             .any(|observation| { matches!(observation, RealtimeFlowObservation::Drop { .. }) }));
     }
 
+    /// A byte claim is taken before the bytes are recorded, so a refusal leaves
+    /// the accounting exactly where it was.
+    ///
+    /// Most of what this control used to assert was ceiling arithmetic — that a
+    /// unit ceiling was consulted before a fragment ceiling, that the next byte
+    /// was refused at a connector aggregate, that an oversized output and an
+    /// oversized fragment were rejected on sight. None of those checks exist:
+    /// there is no unit ceiling, no aggregate, and no oversize refusal standing
+    /// in front of the claim. The claim *is* the admission.
+    ///
+    /// What survives is the ordering the name states, and it is the part that
+    /// actually protects the accounting: the provider is asked first, and the
+    /// domain's retained-byte total moves only if the answer was yes. A refused
+    /// fragment and a refused output each leave the total untouched, which is
+    /// what makes a refusal safe to retry rather than a silent leak.
     #[test]
     fn v4_arc03_realtime_byte_claims_precede_fragment_and_output_retention() {
-        let policy = explicit_realtime_callback_policy(4, 1, 1, 4, 1, 8);
-        let registry = test_realtime_registry(policy);
+        let bytes = 4usize;
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::assembly_claim()
+                    .expect("the assembly claim is representable"),
+                RealtimeFlowRegistry::ordered_fragment_claim(bytes)
+                    .expect("the ordered fragment claim is representable"),
+                RealtimeFlowRegistry::output_claim(bytes)
+                    .expect("the output claim is representable"),
+            ]),
+        );
         let flow = registry.open_inbound_flow().expect("flow is admitted");
-        let mut assembly = flow.begin_unit().expect("first unit is admitted");
-        assert!(flow.begin_unit().is_none(), "in-progress limit is exact");
-        assert!(assembly.retain_ordered_fragment(4));
+        let mut assembly = flow.begin_unit().expect("the funded unit is admitted");
+
+        assert!(assembly.retain_ordered_fragment(bytes));
+        assert_eq!(retained_realtime_bytes(&registry.state.lock()), bytes);
         assert!(
-            !assembly.retain_ordered_fragment(3),
-            "unit ceiling is checked first"
+            !assembly.retain_ordered_fragment(bytes),
+            "the grant funds one retained fragment, and the second is refused"
         );
-        let concurrent_output = flow
-            .reserve_output(4)
-            .expect("one complete output fits beside the guarded input");
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            bytes,
+            "the refused fragment retained nothing: the claim came first, so the \
+             total is exactly where the successful fragment left it"
+        );
+
+        let output = flow
+            .reserve_output(bytes)
+            .expect("the funded output is admitted beside the guarded input");
+        assert_eq!(retained_realtime_bytes(&registry.state.lock()), bytes * 2);
         assert!(
-            flow.reserve_output(1).is_none(),
-            "the next byte is refused at the connector aggregate"
+            flow.reserve_output(bytes).is_none(),
+            "the grant funds one output reservation, and the second is refused"
         );
-        drop(concurrent_output);
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            bytes * 2,
+            "and the refused output retained nothing either"
+        );
+
+        drop(output);
         drop(assembly);
-
-        let first_output = flow.reserve_output(4).expect("first output is admitted");
-        let second_output = flow
-            .reserve_output(4)
-            .expect("the exact aggregate ceiling is admitted");
-        assert!(flow.reserve_output(1).is_none());
-        drop(first_output);
-        drop(second_output);
-        assert!(
-            flow.reserve_output(5).is_none(),
-            "oversized output is refused"
-        );
-
-        let mut oversized_fragment = flow.begin_unit().expect("unit slot was released");
-        assert!(!oversized_fragment.retain_ordered_fragment(5));
-        drop(oversized_fragment);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
         assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
         assert_eq!(state.accounting_poisoned_by_domain, [false, false]);
     }
 
+    /// How many fragments one unit may retain is a funding question now.
+    ///
+    /// It used to be a `fragments_per_unit` ceiling the assembler counted
+    /// against. That number is gone, and what stops an unbounded fragment
+    /// stream is that each retained fragment holds an exact claim for as long as
+    /// the assembly lives: fund one and the second is refused, and the refusal
+    /// is the provider's rather than a counter's. Still structural in the sense
+    /// the name claims — no timer, no cumulative tally, and the capacity comes
+    /// back exactly when the assembly drops.
+    ///
+    /// The grant is enumerated rather than shaped, because the shared envelope
+    /// funds a packet-work lease per inbound pump and a fragment and a packet
+    /// work both spend `ParsingOrCpuWork`. Under that envelope the second
+    /// fragment is afforded out of pump capacity this control never uses.
     #[test]
     fn v4_arc03f_realtime_fragment_count_is_structurally_bounded() {
-        let nonzero = |value| NonZeroUsize::new(value).expect("fixture value is nonzero");
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(nonzero(1), nonzero(1), nonzero(1)),
-            ConnectorRealtimeInboundLimits::new(nonzero(4), nonzero(1), nonzero(1)),
-            ConnectorRealtimeByteBudgets::new(nonzero(8), nonzero(4)),
-            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
+        let fragment_bytes = 1usize;
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::assembly_claim()
+                    .expect("the assembly claim is representable"),
+                RealtimeFlowRegistry::ordered_fragment_claim(fragment_bytes)
+                    .expect("the ordered fragment claim is representable"),
+            ]),
         );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(nonzero(4), flows)
-            .expect("fixture can hold one guarded input and output");
-        let policy = ConnectorCallbackPolicy::new(
-            lab_mailboxes(nonzero(1), nonzero(1)),
-            ConnectorCallbackServiceWeights::new(nonzero(1), nonzero(1), nonzero(1)),
-            realtime,
-        )
-        .expect("fixture callback policy is valid");
-        let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembly = flow.begin_unit().expect("unit is admitted");
 
-        assert!(assembly.retain_ordered_fragment(1));
-        assert!(!assembly.retain_ordered_fragment(1));
-        assert_eq!(retained_realtime_bytes(&registry.state.lock()), 1);
+        assert!(assembly.retain_ordered_fragment(fragment_bytes));
+        assert!(
+            !assembly.retain_ordered_fragment(fragment_bytes),
+            "the grant funds one retained fragment, and the second is refused"
+        );
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            fragment_bytes
+        );
 
         drop(assembly);
         let state = registry.state.lock();
@@ -11006,9 +10981,25 @@ mod tests {
         assert!(realtime_accounting_is_clean(&state));
     }
 
+    /// Damaged local accounting is contained to the domain that suffered it.
+    ///
+    /// This used to assert that corruption *failed closed*: the damaged domain
+    /// was pinned to the owner's byte ceiling, so every later admission was
+    /// refused against a number the registry had invented for itself. There is
+    /// no ceiling to pin it to now, and — more to the point — nothing for the
+    /// registry to refuse against: what admits real-time work is the provider,
+    /// whose accounting is exact and entirely unaffected by a local counter
+    /// going wrong. Refusing here would mean refusing work the provider has
+    /// already funded, on the strength of a number this registry itself knows is
+    /// untrustworthy.
+    ///
+    /// What survives is the containment, which is the part that was ever this
+    /// registry's to promise: the damaged domain stops reporting a figure rather
+    /// than reporting a wrong one, and the independent domain is untouched and
+    /// still admits work.
     #[test]
-    fn v4_arc03_realtime_accounting_corruption_fails_closed() {
-        let policy = explicit_realtime_callback_policy(4, 1, 1, 4, 1, 8);
+    fn v4_arc03_realtime_accounting_corruption_is_contained_per_domain() {
+        let policy = explicit_realtime_workload(4, 1, 1, 4, 1);
         let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let reservation = flow.reserve_output(4).expect("output is admitted");
@@ -11018,17 +11009,10 @@ mod tests {
 
         let state = registry.state.lock();
         assert!(state.accounting_poisoned_by_domain[RealtimeFlowDomain::InboundQuarantine.index()]);
-        assert_eq!(
-            state.retained_bytes_by_domain[RealtimeFlowDomain::InboundQuarantine.index()],
-            8,
-            "a damaged domain is conservatively charged at its full ceiling"
-        );
         assert!(
             !state.accounting_poisoned_by_domain[RealtimeFlowDomain::OutboundCompatibility.index()]
         );
         drop(state);
-        assert!(registry.open_inbound_flow().is_none());
-        assert!(flow.reserve_output(1).is_none());
         assert!(
             registry.open_outbound_flow().is_some(),
             "inbound accounting corruption does not poison the independent outbound owner"
@@ -11041,60 +11025,32 @@ mod tests {
     /// about to cost, and that capacity returns when the packet's work does.
     #[test]
     fn v4_arc03h_sustained_inbound_rtp_is_bounded_by_its_exact_packet_work() {
-        // A grant sized to exactly what this control opens, and nothing else:
-        // the fixture base, the one inbound flow it takes, and exactly one
-        // packet-work claim.
+        // The shared shaped envelope cannot state this. It funds one
+        // ordered-fragment claim per admissible fragment, and a fragment claim
+        // spends `ParsingOrCpuWork` — the only dimension the packet claim is
+        // scarce in — so under it the second packet below is afforded out of
+        // fragment capacity this control never retains a fragment against, and
+        // the refusal is unreachable. Scarcity has to be built for the claim
+        // under test or it is not scarcity at all.
         //
-        // Opening one flow is *two* reservations, not one. The registry admits
-        // the flow's own record and its registry map node separately, because
-        // the map node is an independent `LeasedMap` allocation with its own
-        // lifetime, so a grant that names only the flow claim funds half of what
-        // one `open_inbound_flow` takes. Enumerating both is what keeps this
-        // grant a statement about the flow rather than about whatever slack the
-        // fixture base happened to leave. It does not soften the refusal below:
-        // the map node claim carries no `ParsingOrCpuWork`, which is the only
-        // dimension the packet claim is scarce in.
+        // This used to build that grant inline on `explicit_test_grant(1, 1)`,
+        // and the comment above it claimed the enumeration was what kept the
+        // refusal honest. It was not: that base adds one spare
+        // `connector_operation_claim` per fixture candidate, carrying exactly
+        // one `ParsingOrCpuWork` that nothing here holds — so the second packet
+        // was afforded after all, and this control was passing on capacity it
+        // had never named. It shares `exact_realtime_work_scope` now, which
+        // funds only the records the scope genuinely reserves.
         //
-        // The shared real-time fixture grant cannot express this. It also funds
-        // one ordered-fragment claim per admissible fragment, and a fragment
-        // claim carries `ParsingOrCpuWork` — the same dimension the packet claim
-        // is scarce in. Under that grant the second packet below is afforded out
-        // of fragment capacity this control never retains a fragment against,
-        // and the refusal it asserts is unreachable. Scarcity has to be built
-        // for the claim under test or it is not scarcity at all.
-        let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
-        let RealtimeConnectorPolicy::Enabled(Some(local)) = policy.realtime() else {
-            panic!("the fixture policy carries an explicit local envelope");
-        };
+        // The ready obligation is gone from the list for the same reason: a
+        // ready lease belongs to an enqueue, and this control never enqueues.
         let packet_bytes = 8usize;
-        let mut grant = crate::runtime::attempt::explicit_test_grant(1, 1);
-        for claim in [
-            RealtimeFlowRegistry::flow_claim().expect("the flow claim is representable"),
-            RealtimeFlowRegistry::flow_map_node_claim()
-                .expect("the flow map node claim is representable"),
-            RealtimeFlowRegistry::ready_claim().expect("the ready claim is representable"),
-            RealtimeFlowRegistry::session_packet_work_claim(packet_bytes)
-                .expect("the packet work claim is representable"),
-        ] {
-            grant = grant
-                .checked_add(
-                    FiniteResourceProvider::reservation_charge_for_test(claim)
-                        .expect("the fixture reservation charge is representable"),
-                )
-                .expect("the exact packet-work grant is representable");
-        }
-        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
-            .expect("the exact grant accounts for its process scope");
-        let mesh = ConnectorResourceOwnerPort::new(provider)
-            .issue_mesh_scope()
-            .expect("the exact grant accounts for its Mesh scope");
-        let (permit, _attempt, claim) =
-            admit_single_connector_candidate(crate::runtime::runtime_for_test(), mesh);
-        let candidate = permit
-            .reserve_connector_candidate(claim)
-            .expect("the exact grant admits its connector candidate");
-        let registry =
-            RealtimeFlowRegistry::new(Some(candidate.work_resource_scope()), Some(local));
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::session_packet_work_claim(packet_bytes)
+                    .expect("the packet work claim is representable"),
+            ]),
+        );
 
         let _flow = registry
             .open_inbound_flow()
@@ -11117,7 +11073,7 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03_cancelled_realtime_output_work_releases_its_claim() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_workload(8, 1, 1, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -11139,7 +11095,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_realtime_flow_retirement_drains_its_owned_queue() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 2, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_workload(8, 1, 2, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         assert!(flow.enqueue(
             QueuedTransportEvent {
@@ -11163,30 +11119,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03_endpoint_payloads_are_provider_admitted_independently_of_realtime_limits() {
+    /// Each payload is admitted at the size it actually is, in its own family.
+    ///
+    /// This used to also assert that the owner's real-time unit ceiling did not
+    /// reach the endpoint class — a real-time payload ceiling could be stated,
+    /// and the control's job was to show it stopped where it should. No ceiling
+    /// of either kind exists now, so what is left to hold is the part that was
+    /// always load-bearing: an endpoint frame and a real-time unit are admitted
+    /// separately, against their own families, at their own real sizes.
+    async fn v4_arc03_endpoint_and_realtime_payloads_are_admitted_at_their_actual_size() {
         let realtime_limit = 4;
-        let policy = explicit_realtime_callback_policy(realtime_limit, 1, 2, realtime_limit, 1, 16);
-        assert_eq!(
-            callback_payload_limit(policy, ConnectorCallbackClass::EndpointData),
-            None
-        );
-        assert_eq!(
-            callback_payload_limit(policy, ConnectorCallbackClass::Realtime),
-            Some(realtime_limit)
-        );
+        let policy = explicit_realtime_workload(realtime_limit, 1, 2, realtime_limit, 1);
 
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let (events, mut receiver) = test_event_mailboxes_with_workload(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+            policy,
+        );
         let sink = test_event_sink_for_receiver(events, policy, Some(scope.clone()), &receiver);
 
         let flow = sink
             .open_inbound_realtime_flow()
             .expect("fixture admits one exact real-time flow");
-        assert!(flow.reserve_output(5).is_none());
         assert!(receiver.try_recv().is_err());
 
         assert!(
@@ -12463,7 +12421,7 @@ mod tests {
         let scope = context.peer_connection_scope();
         let candidate = observed_candidate();
         let candidate_use = candidate_resource_measurement(&candidate).observed();
-        let mut queue = PendingRemoteCandidateQueue::new(test_pending_candidate_policy());
+        let mut queue = PendingRemoteCandidateQueue::new();
         assert_eq!(
             queue.push_observed_for_test(
                 candidate,
@@ -12506,7 +12464,7 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let mut candidate = observed_candidate();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let pressure = state
             .current
             .work_resources
@@ -12541,7 +12499,14 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc03g_candidate_queue_deduplicates_before_retention_and_enforces_both_bounds() {
+    /// One digest, one retention: a repeat submission is refused before it can
+    /// take a second retention lease.
+    ///
+    /// The control used to also drive an item ceiling and a content-byte
+    /// ceiling to refusal. Neither exists, so what is left is the half that was
+    /// never a ceiling at all — the digest set — plus the fact that a candidate
+    /// the fixture's grant cannot fund is refused by the provider.
+    fn v4_arc03g_candidate_queue_deduplicates_before_retention() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -12550,19 +12515,12 @@ mod tests {
         let first = observed_candidate();
         let content_bytes =
             candidate_content_bytes(&first).expect("fixture content is representable");
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
         let two_candidates = content_bytes
             .checked_mul(2)
-            .and_then(NonZeroUsize::new)
-            .expect("two candidate contents are representable and nonzero");
+            .expect("two candidate contents are representable");
 
-        let mut item_bounded = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
-            one,
-            two_candidates,
-            one,
-            two,
-        ));
+        let mut item_bounded =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(2, two_candidates));
         assert_eq!(
             item_bounded.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Queued
@@ -12571,10 +12529,7 @@ mod tests {
             item_bounded.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Duplicate
         );
-        assert_eq!(
-            item_bounded.current.pending.budget.report(),
-            (1, content_bytes, 1, 0, false)
-        );
+        assert_eq!(item_bounded.current.seen.len(), 1);
         let mut distinct = first.clone();
         distinct.candidate.replace_range(0..1, "C");
         assert_eq!(
@@ -12584,32 +12539,47 @@ mod tests {
         );
         assert_eq!(
             item_bounded.admit(distinct.clone(), &scope),
-            PendingRemoteCandidateQueuePush::Refused
+            PendingRemoteCandidateQueuePush::Queued,
+            "a distinct candidate the grant funds is retained, not refused by a count"
         );
-        assert_eq!(
-            item_bounded.current.pending.budget.report(),
-            (1, content_bytes, 1, 0, false)
-        );
+        assert_eq!(item_bounded.current.seen.len(), 2);
 
-        let exact_one_payload =
-            NonZeroUsize::new(content_bytes).expect("fixture candidate content is nonzero");
-        let mut byte_bounded = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
-            two,
-            exact_one_payload,
-            one,
-            two,
-        ));
+        // A grant funded for exactly one candidate refuses the second, and the
+        // refusal comes from the provider rather than from a number beside it.
+        let mut exactly_one =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(1, content_bytes));
         assert_eq!(
-            byte_bounded.admit(first, &scope),
+            exactly_one.admit(first, &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(
-            byte_bounded.admit(distinct, &scope),
-            PendingRemoteCandidateQueuePush::Refused
+        // A provider refusal is terminal for the attempt, and the digest set goes
+        // with it. Every refusal path in `RemoteCandidateAttemptEnvelope::admit`
+        // calls `retire()` before returning, and `retire()` clears `seen` along
+        // with the queue and the retained reservations. So there is no outcome
+        // in which the second candidate is refused and the first candidate's
+        // digest survives — an earlier version of this control asserted exactly
+        // that, and it was asserting a state the type cannot reach.
+        //
+        // This is deliberate rather than a leak: a candidate the owner's grant
+        // cannot fund ends the ICE attempt, and the caller restarts. Retaining
+        // digests for an attempt that is already dead would be keeping dedup
+        // state for submissions that can only ever be answered `Retired`.
+        assert!(
+            matches!(
+                exactly_one.admit(distinct, &scope),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+                    | PendingRemoteCandidateQueuePush::Retired
+            ),
+            "the second candidate is refused by the provider"
         );
-        assert_eq!(
-            byte_bounded.current.pending.budget.report(),
-            (1, content_bytes, 0, 0, false)
+        assert!(
+            !exactly_one.current.attempt.is_active(),
+            "the refusal retired the attempt"
+        );
+        assert!(
+            exactly_one.current.seen.is_empty(),
+            "and released its digests with it, rather than retaining dedup state \
+             for an attempt that can only answer `Retired`"
         );
     }
 
@@ -12668,16 +12638,7 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let candidate = observed_candidate();
-        let content_bytes =
-            candidate_content_bytes(&candidate).expect("fixture content is representable");
-        let policy = PendingRemoteCandidatePolicy::new(
-            NonZeroUsize::new(1).expect("one is nonzero"),
-            NonZeroUsize::new(content_bytes).expect("fixture content is nonzero"),
-            NonZeroUsize::new(1).expect("one is nonzero"),
-            NonZeroUsize::new(1).expect("one is nonzero"),
-        );
-        let mut queue = PendingRemoteCandidateQueue::new(policy);
-        let budget = Arc::clone(&queue.budget);
+        let mut queue = PendingRemoteCandidateQueue::new();
         assert_eq!(
             queue.push_observed_for_test(
                 candidate,
@@ -12696,10 +12657,8 @@ mod tests {
         let waker = Waker::noop();
         let mut task_context = Context::from_waker(waker);
         assert_eq!(application.as_mut().poll(&mut task_context), Poll::Pending);
-        assert_eq!(budget.report(), (1, content_bytes, 0, 0, false));
 
         drop(application);
-        assert_eq!(budget.report(), (1, content_bytes, 0, 0, false));
         drop(drain);
     }
 
@@ -12710,9 +12669,8 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let policy = test_pending_candidate_policy();
-        let mut state = RemoteCandidateState::new(policy);
-        let displaced_budget = Arc::clone(&state.current.pending.budget);
+        let work = test_candidate_fixture_work();
+        let mut state = RemoteCandidateState::new(work);
         assert_eq!(
             state.current.pending.push_observed_for_test(
                 observed_candidate(),
@@ -12721,12 +12679,12 @@ mod tests {
             ),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(displaced_budget.report().0, 1);
+        assert_eq!(state.current.pending.entries.len(), 1);
 
-        let displaced = std::mem::replace(&mut state, RemoteCandidateState::new(policy));
+        let displaced = std::mem::replace(&mut state, RemoteCandidateState::new(work));
         drop(displaced);
-        assert_eq!(displaced_budget.report().0, 1);
-        assert_eq!(state.current.pending.budget.report(), (0, 0, 0, 0, false));
+        assert!(state.current.pending.entries.is_empty());
+        assert!(state.current.seen.is_empty());
     }
 
     #[tokio::test]
@@ -12736,7 +12694,7 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         assert_eq!(
             state.admit(observed_candidate(), &scope),
             PendingRemoteCandidateQueuePush::Queued
@@ -12812,14 +12770,14 @@ mod tests {
 
     #[test]
     fn v4_arc03_local_restart_overlap_charge_releases_on_commit_and_failure() {
-        let policy = test_pending_candidate_policy();
+        let policy = test_candidate_fixture_work();
         let root_claim = crate::runtime::attempt::remote_candidate_attempt_root_claim()
             .expect("fixture restart root claim is representable");
         let overlap_charge = FiniteResourceProvider::reservation_charge_for_test(root_claim)
             .expect("fixture restart reservation charge is representable");
         let (provider, _owner, _candidate, _lifetime, work_scope) =
             elastic_remote_candidate_test_resources_with_additional(policy, overlap_charge);
-        let mut state = RemoteCandidateState::with_resources(policy, work_scope);
+        let mut state = RemoteCandidateState::with_resources(work_scope);
         let baseline = provider.in_use();
 
         let (_, replacement) = state
@@ -12851,7 +12809,7 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03_dropped_ice_transaction_fences_attempt_and_starts_exact_close_owner() {
-        let policy = test_pending_candidate_policy();
+        let policy = test_candidate_fixture_work();
         let state = Arc::new(SyncMutex::new(
             RemoteCandidateState::new_with_restart_overlap(policy),
         ));
@@ -12889,7 +12847,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_dropped_remote_description_cannot_leave_reusable_inflight_state() {
         let state = Arc::new(SyncMutex::new(RemoteCandidateState::new(
-            test_pending_candidate_policy(),
+            test_candidate_fixture_work(),
         )));
         let resource_owner = test_resource_owner(1, 1);
         let (close_owner, _attempt_lifetime) = close_owner_fixture(&resource_owner);
@@ -12928,7 +12886,7 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let old_attempt = Arc::clone(&state.current.attempt);
         let (_retiring, replacement) = state
             .begin_local_ice_restart()
@@ -12962,15 +12920,8 @@ mod tests {
         replacement_candidate.username_fragment = Some("second-fragment".to_string());
         let candidate_bytes = candidate_content_bytes(&replacement_candidate)
             .expect("fixture candidate content is representable");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
-        let policy = PendingRemoteCandidatePolicy::new(
-            two,
-            NonZeroUsize::new(candidate_bytes * 2)
-                .expect("two fixture candidates have nonzero content"),
-            two,
-            two,
-        );
-        let mut state = RemoteCandidateState::new(policy);
+        let mut state =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(2, candidate_bytes * 2));
         let fingerprint = "AA:BB:CC:DD";
         let initial_sdp = exact_ice_sdp("remote-fragment", "old-password", fingerprint);
         let initial = state
@@ -13066,7 +13017,7 @@ mod tests {
     fn v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates() {
         fn initialized_state() -> RemoteCandidateState {
             let mut state =
-                RemoteCandidateState::new_with_restart_overlap(test_pending_candidate_policy());
+                RemoteCandidateState::new_with_restart_overlap(test_candidate_fixture_work());
             let initial = state
                 .prepare_remote_description(
                     sdp_ice_credentials(&exact_ice_sdp("old-u", "old-p", "AA:BB:CC:DD"))
@@ -13200,7 +13151,7 @@ mod tests {
 
     #[test]
     fn v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt() {
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let initial_sdp = exact_ice_sdp("data-u", "data-p", "AA:BB:CC:DD");
         let initial = state
             .prepare_remote_description(
@@ -13249,16 +13200,26 @@ mod tests {
         let mut over_limit = observed_candidate();
         over_limit.candidate.push_str(" distinct");
         let mut state =
-            RemoteCandidateState::new(test_pending_candidate_policy_for(&[over_limit.clone()]));
+            RemoteCandidateState::new(test_candidate_fixture_work_for(&[over_limit.clone()]));
         assert_eq!(
             state.admit(observed_candidate(), &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(
-            state.admit(over_limit, &scope),
-            PendingRemoteCandidateQueuePush::Refused
+        // The provider refuses, and says so in its own vocabulary. This used to
+        // read `Refused`, which was the owner's answer under the deleted
+        // cumulative envelope — a candidate the grant could have funded, turned
+        // away by a number beside the grant. There is no such answer now: the
+        // only thing that declines a candidate is the provider running out, and
+        // it reports which dimension and by how much.
+        assert!(
+            matches!(
+                state.admit(over_limit, &scope),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+            ),
+            "the exhausting candidate is refused by the provider, not by a ceiling"
         );
-        let terminal_report = state.current.pending.budget.report();
+        let terminal_queue_len = state.current.pending.entries.len();
+        let terminal_digest_len = state.current.seen.len();
         for index in 0..1024 {
             let mut hostile = observed_candidate();
             hostile.candidate.push_str(&format!(" hostile-{index}"));
@@ -13268,14 +13229,33 @@ mod tests {
             );
         }
         assert_eq!(
-            state.current.pending.budget.report(),
-            terminal_report,
-            "terminal attempts perform no later digest, retention, duplicate, or work accounting"
+            (
+                state.current.pending.entries.len(),
+                state.current.seen.len()
+            ),
+            (terminal_queue_len, terminal_digest_len),
+            "terminal attempts perform no later digest work and take no later retention"
         );
     }
 
+    /// Post-SDP candidates draw on one envelope, and exhausting it retires the
+    /// attempt for everything that follows.
+    ///
+    /// The envelope used to be *cumulative*: it counted submissions, so
+    /// resubmitting one candidate three times consumed it and the third repeat
+    /// was refused. That tally is gone, and with it the only thing that made a
+    /// duplicate cost anything — a repeat is now recognised by the digest set
+    /// and turned away before it can take a lease, so it is free and can never
+    /// exhaust anything. Draining the envelope needs candidates that are
+    /// actually distinct, which is what this now does.
+    ///
+    /// The sharing claim itself is untouched and is the reason the control
+    /// survives: one funded envelope backs every post-SDP candidate on the
+    /// attempt, so the one that finds it empty retires the attempt and every
+    /// later submission — unique or not — is a constant-work refusal until an
+    /// explicit restart mints a fresh envelope.
     #[test]
-    fn v4_arc03h_post_sdp_candidates_share_one_cumulative_attempt_envelope() {
+    fn v4_arc03h_post_sdp_candidates_share_one_attempt_envelope() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -13283,14 +13263,8 @@ mod tests {
             .peer_connection_scope();
         let first = observed_candidate();
         let content_bytes = candidate_content_bytes(&first).expect("fixture content is finite");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
-        let policy = PendingRemoteCandidatePolicy::new(
-            two,
-            NonZeroUsize::new(content_bytes * 2).expect("fixture content bound is nonzero"),
-            two,
-            NonZeroUsize::new(1).expect("one application is permitted"),
-        );
-        let mut state = RemoteCandidateState::new(policy);
+        let mut state =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(2, content_bytes * 2));
         state.current.remote_description_set = true;
 
         assert_eq!(
@@ -13304,36 +13278,44 @@ mod tests {
             .expect("post-SDP candidate moves directly to application");
         let first_reservation = first_pending
             ._queue_reservation
-            .expect("unique candidate carries the attempt budget");
-        assert!(first_reservation.budget.reserve_application_work());
+            .expect("a queued candidate carries its post-application ownership slot");
         state
             .current
             .retained_reservations
             .push_back(first_reservation);
 
         assert_eq!(
-            state.admit(first.clone(), &scope),
-            PendingRemoteCandidateQueuePush::Duplicate
-        );
-        assert_eq!(
-            state.admit(first.clone(), &scope),
-            PendingRemoteCandidateQueuePush::Duplicate
-        );
-        assert_eq!(
             state.admit(first, &scope),
-            PendingRemoteCandidateQueuePush::Refused
+            PendingRemoteCandidateQueuePush::Duplicate,
+            "a repeat is recognised before it can take a lease, so it costs the \
+             shared envelope nothing"
         );
 
-        let old_budget = Arc::clone(&state.current.pending.budget);
-        assert_eq!(old_budget.report(), (1, content_bytes, 2, 1, false));
+        let distinct = |replacement: &str| {
+            let mut candidate = observed_candidate();
+            candidate.candidate.replace_range(0..1, replacement);
+            candidate
+        };
+        assert_eq!(
+            state.admit(distinct("C"), &scope),
+            PendingRemoteCandidateQueuePush::Queued,
+            "the second distinct candidate draws on the same envelope the first did"
+        );
+        assert!(
+            matches!(
+                state.admit(distinct("D"), &scope),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+                    | PendingRemoteCandidateQueuePush::Retired
+            ),
+            "and the one that finds the shared envelope empty is refused"
+        );
+
         assert!(!state.current.attempt.is_active());
 
-        let mut second = observed_candidate();
-        second.candidate.replace_range(0..1, "C");
         assert_eq!(
-            state.admit(second, &scope),
+            state.admit(distinct("E"), &scope),
             PendingRemoteCandidateQueuePush::Retired,
-            "the first envelope refusal makes later unique submissions constant-work refusals"
+            "the envelope refusal makes later unique submissions constant-work refusals"
         );
         let (retiring_attempt, replacement_attempt) = state
             .begin_local_ice_restart()
@@ -13347,11 +13329,8 @@ mod tests {
             &replacement.envelope.attempt,
             &replacement_attempt
         ));
-        assert_eq!(
-            replacement.envelope.pending.budget.report(),
-            (0, 0, 0, 0, false)
-        );
-        assert_eq!(old_budget.report(), (1, content_bytes, 2, 1, false));
+        assert!(replacement.envelope.pending.entries.is_empty());
+        assert!(replacement.envelope.seen.is_empty());
     }
 
     #[test]
@@ -13375,19 +13354,12 @@ mod tests {
                 .expect("finite observation burst content is representable");
             candidates.push(candidate);
         }
-        let policy = PendingRemoteCandidatePolicy::new(
-            candidate_count,
-            NonZeroUsize::new(total_content_bytes)
-                .expect("observation burst carries nonzero candidate content"),
-            candidate_count,
-            candidate_count,
-        );
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut queue = PendingRemoteCandidateQueue::new(policy);
+        let mut queue = PendingRemoteCandidateQueue::new();
         let started = Instant::now();
         for (index, candidate) in candidates.iter().cloned().enumerate() {
             let pushed_at = Instant::now();
@@ -13399,9 +13371,9 @@ mod tests {
                 ),
                 PendingRemoteCandidateQueuePush::Queued
             );
-            let (items, content_bytes, duplicates, work, poisoned) = queue.budget.report();
+            let items = queue.entries.len();
             println!(
-                "arc03_candidate_burst_raw index={index} push_ns={} items={items} content_bytes={content_bytes} duplicates={duplicates} application_work={work} poisoned={poisoned}",
+                "arc03_candidate_burst_raw index={index} push_ns={} items={items}",
                 pushed_at.elapsed().as_nanos()
             );
         }
@@ -13419,11 +13391,11 @@ mod tests {
             duplicate_at.elapsed().as_nanos(),
             started.elapsed().as_nanos()
         );
-        let budget = Arc::clone(&queue.budget);
+        assert_eq!(queue.entries.len(), candidate_count.get());
         drop(queue.take());
-        assert_eq!(
-            budget.report(),
-            (candidate_count.get(), total_content_bytes, 1, 0, false)
+        assert!(
+            total_content_bytes > 0,
+            "the observed burst carried real candidate content"
         );
     }
 
@@ -13542,7 +13514,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -13557,9 +13528,27 @@ mod tests {
     }
 
     fn assert_callback_class_backpressure(first: TransportEvent, second: TransportEvent) {
-        let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
-            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        let TransportEvent::Message(ref first_payload) = first else {
+            panic!("fixture class backpressure is arranged out of endpoint data");
+        };
+        let endpoint_bytes = first_payload.len();
+        let one = std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero");
+        let policy = test_realtime_workload(one);
+        // One endpoint payload of exactly the size the first event carries, the
+        // control class starved to a single byte so it cannot pay for endpoint
+        // work, and only the two lifecycle deliveries this fixture actually
+        // reserves. The second insert therefore meets an empty pool rather than
+        // the slack a general fixture grant would have left it.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                endpoint_bytes,
+                std::num::NonZeroUsize::new(2)
+                    .expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
         );
         let sink = test_event_sink(events, policy, None);
         let waker = Waker::noop();
@@ -13582,19 +13571,34 @@ mod tests {
     }
 
     fn assert_realtime_flow_backpressure(first: TransportEvent, second: TransportEvent) {
-        let policy = explicit_realtime_callback_policy(16, 1, 1, 16, 1, 32);
+        let payload_bytes = |event: &TransportEvent| match event {
+            TransportEvent::RealtimeUnit(delivery) => delivery.payload_bytes(),
+            _ => panic!("fixture event must be a real-time unit"),
+        };
+        // One flow and exactly one queued unit of the first event's size. The
+        // shaped envelope funds a queue slot per flow per domain and a native
+        // read per inbound flow, and those spend the same
+        // `CallbackOrScheduledWork` a second output reservation needs — so under
+        // it the competing unit is admitted out of capacity for work this
+        // control never does.
+        let first_bytes = payload_bytes(&first);
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = test_realtime_registry_with_observer(
-            policy,
+        let (registry, _grant) = exact_realtime_registry_with_observer(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::output_claim(first_bytes)
+                    .expect("the output claim is representable"),
+                RealtimeFlowRegistry::queue_claim(first_bytes)
+                    .expect("the queued-byte claim is representable"),
+                RealtimeFlowRegistry::queued_event_node_claim()
+                    .expect("the queue node claim is representable"),
+                // Taken by the enqueue below, not by the open above.
+                RealtimeFlowRegistry::ready_claim().expect("the ready claim is representable"),
+            ]),
             observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let flow = registry
             .open_inbound_flow()
             .expect("fixture admits one exact real-time flow");
-        let payload_bytes = |event: &TransportEvent| match event {
-            TransportEvent::RealtimeUnit(delivery) => delivery.payload_bytes(),
-            _ => panic!("fixture event must be a real-time unit"),
-        };
         let first_reservation = flow
             .reserve_output(payload_bytes(&first))
             .expect("fixture reserves the first complete unit");
@@ -13606,22 +13610,17 @@ mod tests {
             },
             first_reservation,
         ));
-        let second_reservation = flow
-            .reserve_output(payload_bytes(&second))
-            .expect("aggregate bytes admit the competing unit before queue pressure");
-        assert!(flow.enqueue(
-            QueuedTransportEvent {
-                event: second,
-                observation: None,
-                callback_work: None,
-            },
-            second_reservation,
-        ));
+        // The competing unit is refused where the refusal now lives: the
+        // fixture funds one queued unit, so the second reservation cannot be
+        // admitted at all. It used to be reserved and then dropped by a per-flow
+        // queue count, which is a bound that no longer exists.
+        assert!(flow.reserve_output(payload_bytes(&second)).is_none());
+        drop(second);
         assert!(observer.observations.lock().iter().any(|observation| {
             matches!(
                 observation,
                 RealtimeFlowObservation::Drop {
-                    reason: RealtimeFlowDropReason::FlowQueueFull,
+                    reason: RealtimeFlowDropReason::ResourceUnavailable(_),
                     ..
                 }
             )
@@ -13637,7 +13636,7 @@ mod tests {
     fn v4_arc03i_lifecycle_control_does_not_compete_for_mailbox_capacity() {
         let (events, mut receiver) = test_event_mailboxes(1);
         let policy =
-            test_callback_policy(NonZeroUsize::new(1).expect("fixture capacity is nonzero"));
+            test_realtime_workload(NonZeroUsize::new(1).expect("fixture capacity is nonzero"));
         let sink = test_event_sink(events, policy, None);
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -13693,13 +13692,14 @@ mod tests {
         // This raw laboratory envelope is derived only to hold the requested
         // finite observation workload. It is not a production policy or a
         // proposed default.
-        let policy = test_callback_policy(callback_capacity);
+        let policy = test_realtime_workload(callback_capacity);
 
         for class in [
             ConnectorCallbackClass::Control,
             ConnectorCallbackClass::EndpointData,
         ] {
-            let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+            let (events, mut receiver) =
+                test_event_mailboxes_with_workload(callback_capacity, policy);
             let sink = test_event_sink(events, policy, None);
             let mut queued_at = std::collections::VecDeque::new();
             for index in 0..samples.get() {
@@ -13796,16 +13796,12 @@ mod tests {
             .get()
             .checked_add(latency_units.get())
             .expect("finite observation unit count is representable");
-        let retained_bytes = total_units
-            .checked_mul(payload_bytes.get())
-            .expect("finite observation bytes are representable");
-        let policy = explicit_realtime_callback_policy(
+        let policy = explicit_realtime_workload(
             payload_bytes.get(),
             2,
             saturated_units.get(),
             payload_bytes.get(),
             1,
-            retained_bytes,
         );
         let registry = test_realtime_registry(policy);
         let saturated_label = test_label(0);
@@ -13903,14 +13899,27 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03h_callback_producer_flood_cannot_queue_behind_full_mailbox() {
-        let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
-            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        const RETAINED: &[u8] = b"retained";
+        let one = std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero");
+        let policy = test_realtime_workload(one);
+        // Exactly one endpoint payload, so the flood below meets an empty pool
+        // rather than the slack a general fixture grant leaves in the two
+        // dimensions an insert spends.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                RETAINED.len(),
+                std::num::NonZeroUsize::new(2)
+                    .expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
         );
         let sink = test_event_sink(events, policy, None);
 
         assert!(
-            sink.emit(TransportEvent::Message(Bytes::from_static(b"retained")))
+            sink.emit(TransportEvent::Message(Bytes::from_static(RETAINED)))
                 .await
         );
         let mut producers = tokio::task::JoinSet::new();
@@ -13931,7 +13940,7 @@ mod tests {
         .expect("all overloaded producers finish without a hidden queue");
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::Message(bytes)) if bytes == Bytes::from_static(b"retained")
+            Ok(TransportEvent::Message(bytes)) if bytes == Bytes::from_static(RETAINED)
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -13952,7 +13961,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -14004,7 +14012,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -14935,7 +14942,7 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let mut state =
-            RemoteCandidateState::new(test_pending_candidate_policy_for(&[conflicting.clone()]));
+            RemoteCandidateState::new(test_candidate_fixture_work_for(&[conflicting.clone()]));
         assert_eq!(
             state.admit(conflicting, &scope),
             PendingRemoteCandidateQueuePush::InvalidBinding(
@@ -15005,7 +15012,7 @@ mod tests {
                 )
             })
             .expect("fixture description grant is representable");
-        let policy = test_pending_candidate_policy_for(&[observed_candidate()]);
+        let policy = test_candidate_fixture_work_for(&[observed_candidate()]);
         let (provider, _owner, _candidate, _lifetime, work_scope) =
             elastic_remote_candidate_test_resources_with_additional(policy, additional);
         let baseline = provider.in_use();
@@ -15169,7 +15176,7 @@ mod tests {
                 .network_instance_scope()
                 .peer_connection_scope();
             let mut state =
-                RemoteCandidateState::new(test_pending_candidate_policy_for(&[invalid.clone()]));
+                RemoteCandidateState::new(test_candidate_fixture_work_for(&[invalid.clone()]));
             assert_eq!(
                 state.admit(observed_candidate(), &scope),
                 PendingRemoteCandidateQueuePush::Queued,
@@ -15188,7 +15195,6 @@ mod tests {
 
             let terminal_queue_len = state.current.pending.entries.len();
             let terminal_digest_len = state.current.seen.len();
-            let terminal_budget = state.current.pending.budget.report();
             let terminal_resources = candidate_report(&process.report().pre_authentication);
             let terminal_resource_counters = (
                 terminal_resources.active,
@@ -15217,7 +15223,6 @@ mod tests {
             assert_eq!(classified_results, 1);
             assert_eq!(state.current.pending.entries.len(), terminal_queue_len);
             assert_eq!(state.current.seen.len(), terminal_digest_len);
-            assert_eq!(state.current.pending.budget.report(), terminal_budget);
             let later_resources = candidate_report(&process.report().pre_authentication);
             assert_eq!(
                 (
@@ -15237,7 +15242,7 @@ mod tests {
 
     #[test]
     fn v4_arc03j_restart_transactions_reject_ambiguous_interleavings() {
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let credentials = sdp_ice_credentials(&exact_ice_sdp(
             "remote-fragment",
             "remote-password",
@@ -15267,7 +15272,25 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let corrupt_candidates = ["one", "two"].map(|suffix| {
+        // Eight, and the count is deliberately a wide margin rather than the
+        // smallest number that fails.
+        //
+        // The submission ceiling that used to refuse this migration is gone, so
+        // the refusal has to come from the replacement attempt's grant running
+        // out. How many candidates that grant actually holds is not one number:
+        // the restart-overlap fixture funds a second attempt's worth of digest
+        // retention on purpose — that overlap is the whole point, it is what
+        // lets a legitimate migration carry its queue across — and on top of it
+        // the per-candidate queue claim and the fixture's `content` term each
+        // leave room for another candidate or two in a different dimension.
+        // Picking the exact first count that tips it would tie this control to
+        // three separate constants and quietly stop testing anything the day one
+        // of them moves. A queue several times larger than any of those terms is
+        // refused whichever dimension binds first.
+        let corrupt_candidates = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ]
+        .map(|suffix| {
             let mut candidate = observed_candidate();
             candidate.username_fragment = Some("replacement-fragment".to_string());
             candidate.candidate.push_str(suffix);
@@ -15279,9 +15302,8 @@ mod tests {
             .max()
             .and_then(NonZeroUsize::new)
             .expect("corrupt fixture candidates have finite nonzero content");
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
         let mut state = RemoteCandidateState::new_with_restart_overlap(
-            PendingRemoteCandidatePolicy::new(one, candidate_bytes, one, one),
+            RemoteCandidateFixtureWork::new(1, candidate_bytes.get()),
         );
         let initial_credentials = sdp_ice_credentials(&exact_ice_sdp(
             "initial-fragment",
@@ -15425,9 +15447,39 @@ mod tests {
     const FU_M: &[u8] = &[0x7C, 0x05, 0x22];
     const FU_E: &[u8] = &[0x7C, 0x45, 0x33];
 
+    /// A guarded assembler whose fragment the provider will not fund rolls the
+    /// unit back rather than retaining half of it.
+    ///
+    /// The refusal used to be a fragment-byte ceiling: the payload was three
+    /// bytes, the owner's fragment maximum was two, and the assembler rejected
+    /// it on sight. There is no maximum to compare against now, so the refusal
+    /// has to come from the provider — and *which* acquisition it lands on
+    /// decides what the caller sees, which an earlier version of this control
+    /// got wrong by funding neither.
+    ///
+    /// `RealtimeUnitAssembler::push` has two refusal exits and they are not
+    /// interchangeable. A refused `begin_unit` leaves `self.assembly` at `None`,
+    /// clears the current parts and returns `Ok(None)` — the packet is dropped
+    /// quietly, because nothing was ever begun. Only a refused
+    /// `retain_ordered_fragment`, on an assembly that already exists, clears the
+    /// parts *and* `prev_end` and returns `Err`. This control is named for the
+    /// second one, so the grant funds the assembly and stops there: the unit
+    /// begins, the fragment is refused, and the error is the caller's signal
+    /// that the stream lost its anchor.
+    ///
+    /// Funding the assembly is also what keeps the ledger assertions from being
+    /// vacuous. `in_progress_units` really does reach one before the refusal, so
+    /// reading zero afterwards is a rollback rather than a state that was never
+    /// entered — and the refused fragment retaining no bytes is the ordering
+    /// property the name claims.
     #[test]
     fn v4_arc03_guarded_video_refuses_fragment_before_retention() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 2, 1, 16));
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims()
+                .into_iter()
+                .chain([RealtimeFlowRegistry::assembly_claim()
+                    .expect("the assembly claim is representable")]),
+        );
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembler =
             RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&flow));
@@ -15441,7 +15493,7 @@ mod tests {
 
     #[test]
     fn v4_arc03f_silent_partial_unit_retains_only_its_finite_claim_until_owner_drop() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_workload(8, 1, 1, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembler =
             RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&flow));
@@ -15496,8 +15548,7 @@ mod tests {
             }
         }
 
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
         let name = fixture_flow_name();
         let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the fixture encoding names a shape a flow can carry");
@@ -15633,8 +15684,7 @@ mod tests {
     /// while it is open, and really does stop after the close.
     #[test]
     fn v4_macro1_one_inbound_flow_holds_exactly_one_active_flow_slot() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
         let name = fixture_flow_name();
         let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the fixture encoding names a shape a flow can carry");
@@ -15755,8 +15805,7 @@ mod tests {
     /// can only succeed if the refusal consumed neither.
     #[test]
     fn v4_macro1_an_unregistered_outbound_open_costs_no_label_and_no_capacity() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
         let name = fixture_flow_name();
         let incarnation = crate::connector::ConnectorIncarnation::new();
         let session = FlowFixtureSession {
@@ -15909,8 +15958,7 @@ mod tests {
     /// the envelope one unarrived flow at a time.
     #[test]
     fn v4_macro1_a_unit_for_an_unopened_flow_is_dropped_and_its_bytes_released() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
         let flows = SessionRealtimeFlows::new(
             Arc::clone(&registry),
             Some(session_flow::leased_control_profile(&registry)),
@@ -15970,8 +16018,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_guarded_video_reordered_unit_transfers_exact_output_claim() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(32, 1, 1, 8, 1, 64));
+        let registry = test_realtime_registry(explicit_realtime_workload(32, 1, 1, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembler =
             RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&flow));
@@ -16003,8 +16050,7 @@ mod tests {
 
     #[test]
     fn v4_arc03f_guarded_video_in_progress_limit_is_independent_per_flow() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
+        let registry = test_realtime_registry(explicit_realtime_workload(32, 2, 1, 8, 1));
         let first_flow = registry
             .open_inbound_flow()
             .expect("first flow is admitted");
@@ -16039,34 +16085,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v4_arc03f_in_progress_unit_limit_is_enforced_per_flow() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
-        let first_flow = registry
-            .open_inbound_flow()
-            .expect("first flow is admitted");
-        let second_flow = registry
-            .open_inbound_flow()
-            .expect("second flow is admitted");
-
-        let first_unit = first_flow.begin_unit().expect("first unit is admitted");
-        assert!(
-            first_flow.begin_unit().is_none(),
-            "the same flow cannot exceed its unit ceiling"
-        );
-        let second_unit = second_flow
-            .begin_unit()
-            .expect("another flow retains its independent unit slot");
-        assert_eq!(
-            RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
-            2
-        );
-
-        drop(first_unit);
-        assert!(first_flow.begin_unit().is_some());
-        drop(second_unit);
-    }
+    // A control asserting that one flow could not exceed *its own* in-progress
+    // unit ceiling while a second flow kept an independent slot used to live
+    // here. Both halves were the owner-selected per-flow unit ceiling: there is
+    // no per-flow limit now, and the capacity that admits an assembly is one
+    // pooled provider grant with no flow in it, so a second unit on the first
+    // flow legitimately spends what a fixture intended for the second flow. No
+    // grant size expresses "per flow" out of a pool — funding one assembly
+    // refuses the second flow too, which is not the claim. What survives is that
+    // in-progress units are counted and released per flow, and
+    // `v4_arc03f_guarded_video_in_progress_limit_is_independent_per_flow` above
+    // already proves exactly that, on two flows, without a ceiling.
 
     #[test]
     fn single_packet_units_emit_in_order() {
@@ -16206,7 +16235,7 @@ mod tests {
         // acquisition answers `OwnerPolicyMissing` before capacity is even a
         // question — so asking for one would make the fixture, rather than the
         // slot, the thing under test.
-        let registry = RealtimeFlowRegistry::new(None, None);
+        let registry = RealtimeFlowRegistry::new(None);
         // Shared, because the table owns the retirement of the transceivers it
         // records and hands a clone of itself to whichever task performs one.
         // This control negotiates none, so that sweep has nothing to do here.
@@ -16306,8 +16335,7 @@ mod tests {
     /// all, and a `try_current`-based submitter fails it outright.
     #[test]
     fn v4_arc05_an_implicitly_ended_inbound_flow_submits_its_retirement() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(16, 1, 1, 16, 1, 128));
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
         let name = fixture_flow_name();
         let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the fixture encoding names a shape a flow can carry");
@@ -17190,21 +17218,16 @@ mod tests {
         endpoint_ceiling: usize,
     ) -> CallbackProducerOwner {
         let slots = NonZeroUsize::new(slots).expect("the control states a nonzero slot count");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
-                slots,
-                slots,
-                NonZeroUsize::new(control_ceiling)
-                    .expect("the control states a nonzero control ceiling"),
-                NonZeroUsize::new(endpoint_ceiling)
-                    .expect("the control states a nonzero endpoint ceiling"),
-            ),
-            ConnectorCallbackServiceWeights::data_only(slots, slots),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("the control's callback policy is valid");
-        CallbackProducerOwner::for_local_lab_policy(policy)
-            .expect("a policy that states both ceilings derives a lab provider")
+        CallbackProducerOwner::for_local_lab_grant(callback::TransportLabCallbackGrant {
+            control_slots: slots,
+            endpoint_slots: slots,
+            control_payload_bytes: NonZeroUsize::new(control_ceiling)
+                .expect("the control states a nonzero control ceiling"),
+            endpoint_payload_bytes: NonZeroUsize::new(endpoint_ceiling)
+                .expect("the control states a nonzero endpoint ceiling"),
+            observation_slots: lab_observation_slots(),
+        })
+        .expect("a grant that states both ceilings derives a lab provider")
     }
 
     // The size of a host candidate actually gathered on the native loopback
@@ -17365,64 +17388,12 @@ mod tests {
         drop(held);
     }
 
-    /// The ceilings are required, not defaulted. A lab policy that states none
-    /// is refused by name, and the refusal says which class it was asked for —
-    /// there is no product limit to fall back to, and inventing one is what hid
-    /// this defect the first time.
-    #[test]
-    fn v4_f8_a_lab_policy_without_stated_ceilings_refuses_instead_of_inventing_them() {
-        let capacity = NonZeroUsize::new(1).expect("one mailbox slot is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            ConnectorCallbackServiceWeights::data_only(capacity, capacity),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("the control's callback policy is valid");
-        assert!(matches!(
-            CallbackProducerOwner::for_local_lab_policy(policy),
-            Err(CallbackProducerOverload::LocalPayloadCeilingRequired {
-                class: ConnectorCallbackClass::Control
-            })
-        ));
-    }
-
-    /// The explicit fixture grant refuses a profile that declares bounded
-    /// callback mailboxes and states no ceilings, instead of pricing their
-    /// payload at zero.
-    ///
-    /// This is the guard the other controls cannot provide. The defect was never
-    /// that one call site chose a bad number — it was that a missing number
-    /// silently became zero, so a fixture could declare a sixteen-slot mailbox,
-    /// mint a provider that funded no bytes for it, and look correct. Any future
-    /// fixture that mints its own provider now has to answer the question, and
-    /// gets told which class it left out.
-    #[test]
-    fn v4_f8_an_explicit_fixture_grant_refuses_a_profile_that_states_no_payload_ceilings() {
-        let capacity = NonZeroUsize::new(1).expect("one mailbox slot is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            ConnectorCallbackServiceWeights::data_only(capacity, capacity),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("the control's callback policy is valid");
-        let silent =
-            WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
-        let one_scope = std::num::NonZeroU64::new(1).expect("one Mesh fixture scope is nonzero");
-        assert!(
-            transport_lab_connector_fixture_grant(std::slice::from_ref(&silent), one_scope)
-                .is_err(),
-            "a profile declaring mailboxes without stating their payload ceilings must be refused, \
-             not priced at zero"
-        );
-
-        // Non-vacuity: the identical call succeeds once the ceilings are stated,
-        // so the refusal above is about the missing ceilings and nothing else.
-        let stated = test_webrtc_profile(1);
-        assert!(
-            transport_lab_connector_fixture_grant(std::slice::from_ref(&stated), one_scope).is_ok(),
-            "a profile that states both ceilings is priced normally"
-        );
-    }
+    // Two controls stood here proving that a self-funding fixture which stated
+    // no per-class payload ceiling was refused by name rather than having its
+    // payload priced at zero. Both are gone, and the property is stronger for
+    // it: the ceilings are now required fields on `TransportLabCallbackGrant`
+    // and `TransportLabCallbackWorkload`, so a fixture that omits one does not
+    // compile. There is no run-time state left for a control to observe.
 
     #[tokio::test]
     async fn loopback_handshake_opens_data_channel() {
@@ -17444,12 +17415,18 @@ mod tests {
         let transport = Transport::new().expect("transport");
         let cfg = RTCConfiguration::default();
         let callback_policy = test_webrtc_profile(NATIVE_LOOPBACK_CALLBACK_CAPACITY).callbacks();
+        let callback_grant = lab_callback_grant(
+            NonZeroUsize::new(NATIVE_LOOPBACK_CALLBACK_CAPACITY)
+                .expect("the loopback fixture callback capacity is nonzero"),
+            NonZeroUsize::new(NATIVE_LOOPBACK_CALLBACK_CAPACITY)
+                .expect("the loopback fixture callback capacity is nonzero"),
+        );
         let (offerer, mut off_rx) = transport
-            .open_peer_with_config(Role::Offerer, cfg.clone(), callback_policy)
+            .open_peer_with_config(Role::Offerer, cfg.clone(), callback_policy, callback_grant)
             .await
             .expect("offerer");
         let (answerer, mut ans_rx) = transport
-            .open_peer_with_config(Role::Answerer, cfg, callback_policy)
+            .open_peer_with_config(Role::Answerer, cfg, callback_policy, callback_grant)
             .await
             .expect("answerer");
 
@@ -17625,8 +17602,11 @@ mod tests {
             ),
         ] {
             let observed_at = Instant::now();
-            let grant = one_mesh_connector_fixture_grant(&[profile.clone()])
-                .expect("the codec-neutral fixture claim is representable");
+            let grant = one_mesh_connector_fixture_grant(
+                &[profile.clone()],
+                lab_callback_workload(NonZeroUsize::new(4).expect("four is nonzero")),
+            )
+            .expect("the codec-neutral fixture claim is representable");
             let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
                 .expect("the codec-neutral fixture accounts for its process scope");
             let owner = ConnectorResourceOwnerPort::new(provider)

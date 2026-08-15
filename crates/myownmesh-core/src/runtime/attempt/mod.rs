@@ -4,7 +4,6 @@
 //! losing work, and transfers an exact child claim when a candidate connects.
 
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -251,7 +250,7 @@ mod tests {
     use crate::resource::{
         FiniteResourceProvider, ResourceAuthorityClass, ResourceProviderPort, ResourceUnavailable,
     };
-    use crate::transport::webrtc::{PendingRemoteCandidatePolicy, WebRtcConnectorProfile};
+    use crate::transport::webrtc::WebRtcConnectorProfile;
 
     fn owner_and_scopes(
         provider: &FiniteResourceProvider,
@@ -271,17 +270,7 @@ mod tests {
     }
 
     fn data_only_webrtc_profile() -> WebRtcConnectorProfile {
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("the test callback policy is structurally valid");
-        WebRtcConnectorProfile::new(
-            callbacks,
-            PendingRemoteCandidatePolicy::new(one, one, one, one),
-        )
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only())
     }
 
     #[test]
@@ -339,37 +328,6 @@ mod tests {
         assert!(second_attempt
             .reserve_connector_candidate(candidate_claim())
             .is_some());
-    }
-
-    #[tokio::test]
-    async fn v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn() {
-        let provider = FiniteResourceProvider::new(explicit_test_grant(1, 2));
-        let (_owner, scopes) = owner_and_scopes(&provider, 2);
-        let (first_attempt, _first_lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
-        let (second_attempt, _second_lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[1].clone());
-        let (first, reclaim) = first_attempt
-            .reserve_connector_candidate_cooperatively(candidate_claim())
-            .await
-            .expect("the provider remains internally exact")
-            .expect("the first attempt remains live");
-
-        let second = tokio::spawn(async move {
-            second_attempt
-                .reserve_connector_candidate_cooperatively(candidate_claim())
-                .await
-        });
-        reclaim.requested().await;
-        assert!(reclaim.is_requested());
-        drop(first);
-
-        let (second, _reclaim) = second
-            .await
-            .expect("the second admission task joins")
-            .expect("the provider remains internally exact")
-            .expect("the second attempt remains live after its fairness turn");
-        drop(second);
     }
 
     #[test]

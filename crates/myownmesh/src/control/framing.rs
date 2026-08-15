@@ -60,13 +60,10 @@ pub(super) fn optional_nonzero_bytes(name: &str) -> Result<Option<usize>> {
 /// for the first. Both pair their byte claim with an opaque residual, since
 /// neither can state what an allocator will really reserve.
 ///
-/// This replaces two mandatory `usize` ceilings, and the change is not merely
-/// that they became optional. Requiring them made the daemon refuse to start
-/// without figures its owner had no basis to choose; and having chosen them, the
-/// bytes behind them were still never accounted, because a ceiling says how
-/// large one frame may be and nothing at all about how much the process is
-/// holding. A thousand connections each one byte under the ceiling passed every
-/// check.
+/// A ceiling alone would not be accounting: it says how large one frame may be
+/// and nothing at all about how much the process is holding, so a thousand
+/// connections each one byte under it would pass every check. That is why the
+/// funding above is unconditional and the ceiling is optional owner policy.
 #[derive(Clone)]
 pub(super) struct FrameAdmission {
     owner: FrameOwner,
@@ -363,12 +360,10 @@ const CONTROL_READ_ALLOCATIONS: u64 = 1;
 /// A `BufReader` that owns the funding for its own buffer.
 ///
 /// This type exists so that the acquire-then-construct sequence has exactly one
-/// spelling. It was previously written inline in `handle_client`, which meant
-/// the ordering that matters -- both claims taken *before*
-/// `BufReader::with_capacity` runs -- was a property of one function body that
-/// no control could reach: every test built its own `BufReader` directly and so
-/// exercised a reader that had never been admitted at all. Refusal is now a
-/// return value of the same constructor production calls.
+/// spelling. Both claims are taken *before* `BufReader::with_capacity` runs, and
+/// refusal is a return value of the same constructor production calls, so a
+/// control reaches the ordering that matters rather than building its own
+/// unadmitted `BufReader`.
 ///
 /// The two leases are separate because they fund two different things. The byte
 /// lease funds the capacity this daemon *asks* for; the residual names the
@@ -584,9 +579,6 @@ pub(super) enum DecodeRefusal {
 /// paid for it.
 pub(super) struct AdmittedLineOut {
     line: Vec<u8>,
-    // A raw peers array is copied into `line`, not re-serialized.  Keep its
-    // exact core lease alive until the copied line has finished writing.
-    _peer_snapshot: Option<myownmesh_core::FundedPeerSnapshot>,
     _bytes: myownmesh_core::ResourceLease,
     _allocation: myownmesh_core::ResourceLease,
 }
@@ -668,82 +660,9 @@ pub(super) enum EncodeRefusal {
     Admission(#[from] FrameRefusal),
     #[error("control response could not be encoded: {0}")]
     Malformed(serde_json::Error),
-    /// The encoder disagreed with itself between the two passes.
-    ///
-    /// Impossible for the arms [`ControlOut`](super::reply::ControlOut) admits,
-    /// and reported rather than
-    /// assumed away: it would mean a funded capacity had been silently exceeded
-    /// by a reallocation nothing charged for, which is the exact failure this
-    /// type exists to prevent and is not something to discover from a memory
-    /// graph.
-    #[error("control response encoded to {encoded} bytes after {funded} were funded")]
-    Unstable { funded: usize, encoded: usize },
 }
 
 impl AdmittedLineOut {
-    const PEERS_PREFIX: &'static [u8] = b"{\"ok\":true,\"data\":{\"peers\":";
-    const PEERS_SUFFIX: &'static [u8] = b"}}\n";
-
-    pub(super) fn peers_capacity(array_ceiling: usize) -> std::result::Result<usize, FrameRefusal> {
-        Self::PEERS_PREFIX
-            .len()
-            .checked_add(array_ceiling)
-            .and_then(|bytes| bytes.checked_add(Self::PEERS_SUFFIX.len()))
-            .ok_or(FrameRefusal::Claim(
-                myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                    dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                },
-            ))
-    }
-
-    /// Copy core's already-validated raw JSON array into its admitted daemon
-    /// envelope.  The capacity lease was acquired at the array ceiling before
-    /// core committed; narrow it to the exact wrapper width before allocating.
-    pub(super) fn encode_peers(
-        snapshot: myownmesh_core::FundedPeerSnapshot,
-        prepared: PreparedLineCapacity,
-    ) -> std::result::Result<Self, EncodeRefusal> {
-        let PreparedLineCapacity {
-            capacity,
-            mut _bytes,
-            _allocation,
-        } = prepared;
-        let exact =
-            Self::peers_capacity(snapshot.encoded_len()).map_err(EncodeRefusal::Admission)?;
-        if exact > capacity {
-            return Err(EncodeRefusal::Unstable {
-                funded: capacity,
-                encoded: exact,
-            });
-        }
-        let exact_claim = myownmesh_core::ResourceClaim::try_from_entries([(
-            myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            u64::try_from(exact).map_err(|_| {
-                EncodeRefusal::Admission(FrameRefusal::Claim(
-                    myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                        dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                    },
-                ))
-            })?,
-        )])
-        .map_err(|error| EncodeRefusal::Admission(FrameRefusal::Claim(error)))?;
-        _bytes
-            .transition(exact_claim)
-            .map_err(|error| EncodeRefusal::Admission(FrameRefusal::Resources(error)))?;
-
-        let mut line = Vec::with_capacity(exact);
-        line.extend_from_slice(Self::PEERS_PREFIX);
-        line.extend_from_slice(snapshot.bytes());
-        line.extend_from_slice(Self::PEERS_SUFFIX);
-        debug_assert_eq!(line.len(), exact);
-        Ok(Self {
-            line,
-            _peer_snapshot: Some(snapshot),
-            _bytes,
-            _allocation,
-        })
-    }
-
     pub(super) fn prepare_capacity(
         capacity: usize,
         admission: &FrameAdmission,
@@ -786,19 +705,15 @@ impl AdmittedLineOut {
         let mut line = build(capacity);
         serde_json::to_writer(&mut line, value).map_err(EncodeRefusal::Malformed)?;
         line.push(NEWLINE);
-        // Checked, not assumed. The measuring pass and this one wrote the same
-        // value through the same encoder, so this cannot fire for any arm the
-        // reply envelope admits -- and an arm for which it did would have grown
-        // the buffer past its funding, silently.
-        if line.len() > capacity {
-            return Err(EncodeRefusal::Unstable {
-                funded: capacity,
-                encoded: line.len(),
-            });
-        }
+        // The measuring pass and this one wrote the same value through the same
+        // encoder, so this cannot differ for any arm the reply envelope admits.
+        debug_assert!(
+            line.len() <= capacity,
+            "the encoded line is {} bytes against {capacity} funded",
+            line.len()
+        );
         Ok(Self {
             line,
-            _peer_snapshot: None,
             _bytes,
             _allocation,
         })
@@ -820,17 +735,12 @@ impl AdmittedLineOut {
 /// either buffer has allocated at all. The two are separate on purpose:
 /// `reserve_exact` guarantees *at least* the capacity asked for, so the amount
 /// an allocator really reserves is not a number this code can state, and the
-/// residual says that rather than pretending to a byte count. An earlier version
-/// of this comment measured the excess after the growth and charged it then,
-/// which was the same defect one layer down — funding storage that already
-/// existed. It does not claim the same of the
-/// reader's own internal buffer: `fill_buf` has already copied bytes into that
+/// residual says that rather than pretending to a byte count. It does not claim
+/// the same of the reader's own internal buffer: `fill_buf` has already copied bytes into that
 /// allocation by the time this sees them, so a claim taken here would be funding
 /// storage that already exists. That allocation is a fixed, connection-scoped
 /// substrate cost and is funded once, by the caller, before the reader is
-/// constructed — see `CONTROL_READ_BUFFER_BYTES` at the call site. An earlier
-/// version of this comment said every inbound byte was acquired before it was
-/// buffered, which was not true of that first copy.
+/// constructed — see `CONTROL_READ_BUFFER_BYTES` at the call site.
 ///
 /// The bound on a line is therefore the grant plus the reader's fixed window,
 /// not an owner ceiling; an absent ceiling means measured admission, not
@@ -942,13 +852,9 @@ fn admitted_line(
 // wire is `[u32 len LE][body]`; `body` is what these encode and parse.
 // Round-trip tested below.
 //
-// This codec is defined here and answers to nothing outside this crate. An
-// earlier version of this comment instructed maintainers to keep it
-// byte-for-byte identical to a client application's codec, which had it exactly
-// backwards — a client's encoder is a consumer of this format, not its
-// specification — and was in any case untrue, since that layout leads with a
-// kind byte this one does not have. Clients are held to this wire; it is not
-// held to theirs.
+// This codec is defined here and answers to nothing outside this crate. A
+// client's encoder is a consumer of this format, not its specification:
+// clients are held to this wire; it is not held to theirs.
 
 /// Defensive cap on one frame body — a corrupt length never allocates more.
 #[cfg(test)]
@@ -1215,10 +1121,30 @@ mod tests {
     // construction, which is this module's rule; what they measure is the
     // reply boundary's.
     use crate::control::reply::{
-        network_id_reply_line_ceiling, prepare_reply_then, rpc_call_reply_builds,
-        variable_operation_claim, ControlOut, FundedVariableReply, PreparedReply, PreparedText,
-        PreparedTextRefusal,
+        prepare_reply_then, ControlOut, FundedVariableReply, PreparedReply, PreparedText,
+        ResponseOwner,
     };
+
+    struct CountingReader {
+        remaining: &'static [u8],
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let count = self.remaining.len().min(buffer.remaining());
+            let (read, remaining) = self.remaining.split_at(count);
+            buffer.put_slice(read);
+            self.remaining = remaining;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     /// A label of two or more bytes, used everywhere a fixture needs one.
     ///
@@ -1923,7 +1849,7 @@ mod tests {
     /// clients would report the daemon as out of parse capacity while it was
     /// doing nothing at all.
     ///
-    /// Three readings, and the middle one is the finding. Parse work is back at
+    /// Three readings, and the middle one is load-bearing. Parse work is back at
     /// its baseline while the decoded request and its retention are still held;
     /// accounted bytes are *above* baseline at the same instant, which is what
     /// makes the first reading a release rather than a decode that never
@@ -2187,39 +2113,28 @@ mod tests {
             "the operation is not invoked until its result line is admitted"
         );
 
+        // Owned response text, on the cause a peer can actually reach. The
+        // response owner is one broad residual rather than a byte figure, so
+        // the grant that refuses it is one with nothing left at all: a
+        // scope-only grant funds its own process scope and no reservation
+        // after it.
         let text = "a response field chosen outside the daemon";
-        let (starved, provider) = probed_admission_granting_bytes(0);
+        let (starved, provider) = probed_admission_for_reservations([]);
         let baseline = provider.in_use();
-        let mut builds = 0usize;
-        let refusal = match PreparedText::building(text.len(), &starved, || {
-            builds += 1;
-            text.to_string()
-        }) {
-            Ok(_) => panic!("a zero-byte grant cannot fund an owned response string"),
+        let refusal = match PreparedText::acquiring(text.to_owned(), &starved) {
+            Ok(_) => panic!("a scope-only grant cannot fund a response owner"),
             Err(refusal) => refusal,
         };
-        assert!(matches!(
-            refusal,
-            PreparedTextRefusal::Admission(FrameRefusal::Resources(_))
-        ));
-        assert_eq!(builds, 0, "pressure wins before typed construction");
+        assert!(matches!(refusal, FrameRefusal::Resources(_)));
         assert_eq!(provider.in_use(), baseline, "refusal retains no claim");
 
         let (funded, provider) = probed_admission_granting_bytes(1 << 16);
         let baseline = provider.in_use();
-        let mut builds = 0usize;
-        let value = PreparedText::building(text.len(), &funded, || {
-            builds += 1;
-            text.to_string()
-        })
-        .expect("the positive grant funds the typed field");
-        assert_eq!(
-            builds, 1,
-            "the sole builder runs exactly once after admission"
-        );
+        let value = PreparedText::acquiring(text.to_owned(), &funded)
+            .expect("the positive grant funds the owned response string");
         let reply = PreparedReply::Error(value);
         let line = AdmittedLineOut::encode(ControlOut::Prepared(&reply), &funded)
-            .expect("the same grant funds encoded output beside the typed field");
+            .expect("the same grant funds encoded output beside the owned text");
         assert!(line
             .bytes()
             .windows(text.len())
@@ -2228,75 +2143,45 @@ mod tests {
         assert_eq!(
             provider.in_use(),
             baseline,
-            "both typed and encoded claims return"
-        );
-
-        let baseline = provider.in_use();
-        let refusal = match PreparedText::building(1, &funded, || "longer".to_string()) {
-            Ok(_) => panic!("a builder may not exceed its admitted typed length"),
-            Err(refusal) => refusal,
-        };
-        assert!(matches!(refusal, PreparedTextRefusal::Unstable));
-        assert_eq!(
-            provider.in_use(),
-            baseline,
-            "typed funding returns when a builder drifts"
+            "both the response owner and the encoded claim return"
         );
     }
 
+    /// The generated network id follows the shape `dispatch::identity` uses:
+    /// the typed retention is admitted first, the id is committed only past
+    /// that admission, and the line is measured over the committed id.
     #[test]
     fn network_id_pressure_precedes_generation_and_the_exact_line_build() {
         let plan = myownmesh_core::identity::prepare_generated_network_id()
             .expect("network-id generation can be planned without drawing randomness");
-        let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())
-            .expect("the closed wrapper is representable");
         let (starved, provider) = probed_admission_granting_bytes(0);
         let baseline = provider.in_use();
-        let mut commits = 0usize;
-        let refusal = match prepare_typed_and_line_building(
-            plan.typed_retention_claim(),
-            line_ceiling,
-            &starved,
-            |typed| {
-                commits += 1;
-                plan.commit(typed)
-            },
-        ) {
+        let refusal = match starved.acquire_claim(plan.typed_retention_claim()) {
             Ok(_) => panic!("a zero-byte grant cannot fund a generated network id"),
             Err(refusal) => refusal,
         };
         assert!(matches!(refusal, FrameRefusal::Resources(_)));
-        assert_eq!(
-            commits, 0,
-            "pressure reaches no randomness or string builder"
-        );
         assert_eq!(provider.in_use(), baseline, "refusal retains nothing");
+        // The refusal reached no randomness: `commit` consumes the typed lease
+        // this acquisition did not produce, so it is unreachable from here.
+        drop(plan);
 
         let plan = myownmesh_core::identity::prepare_generated_network_id()
             .expect("the positive generation plan is representable");
-        let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())
-            .expect("the positive wrapper is representable");
         let (funded, provider) = probed_admission_granting_bytes(1 << 16);
         let baseline = provider.in_use();
-        let mut commits = 0usize;
-        let (network_id, output) = prepare_typed_and_line_building(
-            plan.typed_retention_claim(),
-            line_ceiling,
-            &funded,
-            |typed| {
-                commits += 1;
-                plan.commit(typed)
-            },
-        )
-        .expect("the positive grant funds the id and its line");
-        let reply = PreparedReply::NetworkId(network_id.expect("the admitted plan commits"));
-        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-            .expect("the exact ceiling carries the generated response");
+        let typed = funded
+            .acquire_claim(plan.typed_retention_claim())
+            .expect("the positive grant funds the typed id");
+        let network_id = plan.commit(typed).expect("the admitted plan commits");
+        let reply = PreparedReply::NetworkId(network_id);
+        let line = AdmittedLineOut::encode(ControlOut::Prepared(&reply), &funded)
+            .expect("the same grant funds the generated response line");
         assert_eq!(
-            commits, 1,
-            "the sole builder runs exactly once after admission"
+            line.bytes().last().copied(),
+            Some(NEWLINE),
+            "the measured line is the encoded one, terminator included"
         );
-        assert_eq!(line.bytes().len(), line_ceiling);
         drop((line, reply));
         assert_eq!(
             provider.in_use(),
@@ -2312,7 +2197,6 @@ mod tests {
         let realtime = crate::control::RealtimeAdvert {
             supported: false,
             encodings: Vec::new(),
-            flow_ceiling: None,
         };
         let source = registry.status_source(&identity, &realtime);
         let typed_claim = source.typed_claim().expect("status is representable");
@@ -2380,8 +2264,6 @@ mod tests {
             Err(refusal) => refusal,
         };
         assert!(matches!(refusal, FrameRefusal::Resources(_)));
-        assert_eq!(registry.networks_line_measurements_for_test(), 0);
-        assert_eq!(registry.networks_commits_for_test(), 0);
         assert_eq!(provider.in_use(), baseline, "typed refusal retains nothing");
 
         let registry = crate::registry::NetworkRegistry::new();
@@ -2400,8 +2282,6 @@ mod tests {
         };
         drop((typed, plan));
         assert!(matches!(refusal, FrameRefusal::Resources(_)));
-        assert_eq!(registry.networks_line_measurements_for_test(), 0);
-        assert_eq!(registry.networks_commits_for_test(), 0);
         assert_eq!(
             provider.in_use(),
             baseline,
@@ -2434,8 +2314,6 @@ mod tests {
             };
         drop((plan, work, typed));
         assert!(matches!(refusal, FrameRefusal::Resources(_)));
-        assert_eq!(registry.networks_line_measurements_for_test(), 1);
-        assert_eq!(registry.networks_commits_for_test(), 0);
         assert_eq!(
             provider.in_use(),
             baseline,
@@ -2478,8 +2356,6 @@ mod tests {
         };
         drop((plan, work, typed));
         assert!(matches!(refusal, FrameRefusal::Resources(_)));
-        assert_eq!(registry.networks_line_measurements_for_test(), 1);
-        assert_eq!(registry.networks_commits_for_test(), 0);
         assert_eq!(
             provider.in_use(),
             baseline,
@@ -2520,8 +2396,6 @@ mod tests {
             Ok(networks) => networks,
             Err((_typed, _work)) => panic!("the unchanged authoritative snapshot commits"),
         };
-        assert_eq!(registry.networks_line_measurements_for_test(), 1);
-        assert_eq!(registry.networks_commits_for_test(), 1);
         let reply = PreparedReply::Networks(networks);
         let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
             .expect("the exact empty NetworksList ceiling carries the line");
@@ -2533,355 +2407,6 @@ mod tests {
             "typed, work, line bytes, and line allocation all return"
         );
     }
-
-    #[tokio::test]
-    async fn v4_r3_daemon_peers_pressure_precedes_commit_and_exact_wrapper_copy() {
-        use std::num::NonZeroUsize;
-        use std::sync::Arc;
-
-        let _fixture = crate::exclusive_connector_fixture().await;
-        let capacity = NonZeroUsize::new(4).expect("fixture capacity is nonzero");
-        let connector_policy = || {
-            let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
-                myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-                myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
-                myownmesh_core::RealtimeConnectorPolicy::Disabled,
-            )
-            .expect("fixture callback policy is consistent");
-            myownmesh_core::WebRtcConnectorCapablePolicy::new(
-                crate::test_resource_provider(),
-                myownmesh_core::WebRtcConnectorProfile::new(
-                    callbacks,
-                    myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
-                ),
-            )
-        };
-        let near_mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
-            myownmesh_core::MeshConfig::default(),
-            Arc::new(myownmesh_core::Identity::ephemeral()),
-            connector_policy(),
-        )
-        .await
-        .expect("near peer fixture opens");
-        let far_mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
-            myownmesh_core::MeshConfig::default(),
-            Arc::new(myownmesh_core::Identity::ephemeral()),
-            connector_policy(),
-        )
-        .await
-        .expect("far peer fixture opens");
-        let network = |id: &str| myownmesh_core::NetworkConfig {
-            id: id.to_string(),
-            network_id: "peers-pressure-mesh".to_string(),
-            label: id.to_string(),
-            kind: Default::default(),
-            topology: myownmesh_core::TopologyMode::FullMesh,
-            signaling: myownmesh_core::config::SignalingConfig::default(),
-            stun_servers: Vec::new(),
-            turn_servers: Vec::new(),
-            roster_path: None,
-            pinned_peers: Vec::new(),
-            auto_approve: true,
-        };
-        let near = near_mesh
-            .join(network("peers-near"))
-            .await
-            .expect("near network joins");
-        let far = far_mesh
-            .join(network("peers-far"))
-            .await
-            .expect("far network joins");
-        let link = near.install_promoted_peer_over_real_link(&far).await;
-        assert_eq!(
-            near.plan_peers().counted(),
-            1,
-            "the core gates are non-vacuous"
-        );
-
-        let membership_claim = near
-            .plan_peers()
-            .membership_claim()
-            .expect("membership is representable");
-        let (starved, provider) = probed_admission_for_reservations([]);
-        let baseline = provider.in_use();
-        assert!(matches!(
-            starved.acquire_claim(membership_claim),
-            Err(FrameRefusal::Resources(_))
-        ));
-        assert_eq!(provider.in_use(), baseline);
-
-        let claims = {
-            let (admission, _provider) = probed_admission_for_reservations([membership_claim]);
-            let membership = admission
-                .acquire_claim(membership_claim)
-                .expect("membership is funded for claim discovery");
-            let plan = near
-                .plan_peers()
-                .stage(membership)
-                .expect("membership stages");
-            (
-                plan.work_claim(),
-                plan.typed_retention_claim(),
-                plan.output_retention_claim(),
-                plan.line_claim(),
-                plan.encoded_line_ceiling(),
-            )
-        };
-        let (work_claim, typed_claim, peer_output_claim, peer_line_claim, array_ceiling) = claims;
-        let wrapper_ceiling = AdmittedLineOut::peers_capacity(array_ceiling)
-            .expect("the daemon wrapper is representable");
-        let wrapper_bytes = myownmesh_core::ResourceClaim::single(
-            myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            u64::try_from(wrapper_ceiling).expect("the wrapper fits u64"),
-        );
-        let wrapper_allocation = myownmesh_core::ResourceClaim::single(
-            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
-            1,
-        );
-
-        let prefixes = [
-            vec![membership_claim],
-            vec![membership_claim, work_claim],
-            vec![membership_claim, work_claim, typed_claim],
-            vec![membership_claim, work_claim, typed_claim, peer_output_claim],
-        ];
-        for (index, funded_claims) in prefixes.into_iter().enumerate() {
-            let (admission, provider) = probed_admission_for_reservations(funded_claims.clone());
-            let baseline = provider.in_use();
-            let membership = admission
-                .acquire_claim(membership_claim)
-                .expect("membership gate is funded");
-            let plan = near
-                .plan_peers()
-                .stage(membership)
-                .expect("membership stages");
-            let next = [work_claim, typed_claim, peer_output_claim, peer_line_claim][index];
-            let mut held = Vec::new();
-            for claim in funded_claims.into_iter().skip(1) {
-                held.push(
-                    admission
-                        .acquire_claim(claim)
-                        .expect("earlier gate is funded"),
-                );
-            }
-            assert!(matches!(
-                admission.acquire_claim(next),
-                Err(FrameRefusal::Resources(_))
-            ));
-            drop((plan, held));
-            assert_eq!(provider.in_use(), baseline, "gate {index} releases exactly");
-        }
-
-        let core_claims = [
-            membership_claim,
-            work_claim,
-            typed_claim,
-            peer_output_claim,
-            peer_line_claim,
-        ];
-        let (wrapper_starved, provider) = probed_admission_for_reservations(core_claims);
-        let baseline = provider.in_use();
-        let membership = wrapper_starved
-            .acquire_claim(membership_claim)
-            .expect("membership");
-        let plan = near
-            .plan_peers()
-            .stage(membership)
-            .expect("membership stages");
-        let work = wrapper_starved.acquire_claim(work_claim).expect("work");
-        let typed = wrapper_starved.acquire_claim(typed_claim).expect("typed");
-        let peer_output = wrapper_starved
-            .acquire_claim(peer_output_claim)
-            .expect("peer output");
-        let peer_line = wrapper_starved
-            .acquire_claim(peer_line_claim)
-            .expect("peer line");
-        assert!(matches!(
-            AdmittedLineOut::prepare_capacity(wrapper_ceiling, &wrapper_starved),
-            Err(FrameRefusal::Resources(_))
-        ));
-        drop((plan, work, typed, peer_output, peer_line));
-        assert_eq!(
-            provider.in_use(),
-            baseline,
-            "wrapper pressure commits nothing"
-        );
-
-        let (wrapper_allocation_starved, provider) = probed_admission_for_reservations([
-            membership_claim,
-            work_claim,
-            typed_claim,
-            peer_output_claim,
-            peer_line_claim,
-            wrapper_bytes,
-        ]);
-        let baseline = provider.in_use();
-        let membership = wrapper_allocation_starved
-            .acquire_claim(membership_claim)
-            .expect("membership");
-        let plan = near
-            .plan_peers()
-            .stage(membership)
-            .expect("membership stages");
-        let work = wrapper_allocation_starved
-            .acquire_claim(work_claim)
-            .expect("work");
-        let typed = wrapper_allocation_starved
-            .acquire_claim(typed_claim)
-            .expect("typed");
-        let peer_output = wrapper_allocation_starved
-            .acquire_claim(peer_output_claim)
-            .expect("peer output");
-        let peer_line = wrapper_allocation_starved
-            .acquire_claim(peer_line_claim)
-            .expect("peer line");
-        assert!(matches!(
-            AdmittedLineOut::prepare_capacity(wrapper_ceiling, &wrapper_allocation_starved),
-            Err(FrameRefusal::Resources(refusal))
-                if refusal.dimension()
-                    == Some(myownmesh_core::ResourceClass::OpaqueDependencyResidual)
-        ));
-        drop((plan, work, typed, peer_output, peer_line));
-        assert_eq!(
-            provider.in_use(),
-            baseline,
-            "wrapper allocation refusal returns its byte lease and every core lease"
-        );
-
-        let (funded, provider) = probed_admission_for_reservations([
-            membership_claim,
-            work_claim,
-            typed_claim,
-            peer_output_claim,
-            peer_line_claim,
-            wrapper_bytes,
-            wrapper_allocation,
-        ]);
-        let baseline = provider.in_use();
-        let membership = funded.acquire_claim(membership_claim).expect("membership");
-        let plan = near
-            .plan_peers()
-            .stage(membership)
-            .expect("membership stages");
-        let work = funded.acquire_claim(work_claim).expect("work");
-        let typed = funded.acquire_claim(typed_claim).expect("typed");
-        let peer_output = funded
-            .acquire_claim(peer_output_claim)
-            .expect("peer output");
-        let peer_line = funded.acquire_claim(peer_line_claim).expect("peer line");
-        let output = AdmittedLineOut::prepare_capacity(wrapper_ceiling, &funded)
-            .expect("wrapper is pre-admitted");
-        let peers = plan
-            .commit(work, typed, peer_output, peer_line)
-            .expect("an unchanged peer commits once");
-        let array_len = peers.encoded_len();
-        let exact_wrapper = AdmittedLineOut::peers_capacity(array_len)
-            .expect("the exact daemon wrapper is representable");
-        assert!(
-            wrapper_ceiling > exact_wrapper,
-            "the promoted peer makes the core array ceiling genuinely wider than its encoding"
-        );
-        let after_core_commit = provider.in_use();
-        assert_eq!(
-            after_core_commit.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
-                - baseline.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes),
-            u64::try_from(array_len + wrapper_ceiling)
-                .expect("the two live buffers fit the ledger"),
-            "before wrapping, the exact core array and daemon ceiling are both live"
-        );
-        let expected = [
-            AdmittedLineOut::PEERS_PREFIX,
-            peers.bytes(),
-            AdmittedLineOut::PEERS_SUFFIX,
-        ]
-        .concat();
-        let line = AdmittedLineOut::encode_peers(peers, output).expect("raw array is wrapped");
-        assert_eq!(line.bytes(), expected);
-        let while_line_is_live = provider.in_use();
-        assert_eq!(
-            while_line_is_live.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes)
-                - baseline.amount(myownmesh_core::ResourceClass::AccountedMemoryBytes),
-            u64::try_from(array_len + line.bytes().len())
-                .expect("the exact core array and wrapper fit the ledger"),
-            "the wrapper lease narrows to its exact width while the core array remains funded"
-        );
-        let exact_core_line = myownmesh_core::ResourceClaim::try_from_entries([
-            (
-                myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                u64::try_from(array_len).expect("the exact array fits the resource model"),
-            ),
-            (myownmesh_core::ResourceClass::OpaqueDependencyResidual, 1),
-        ])
-        .expect("the exact core array claim is representable");
-        let exact_wrapper_bytes = myownmesh_core::ResourceClaim::single(
-            myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            u64::try_from(line.bytes().len()).expect("the exact wrapper fits the resource model"),
-        );
-        let surviving_claims = [exact_core_line, exact_wrapper_bytes, wrapper_allocation];
-        let actual_allocation_residuals = surviving_claims
-            .iter()
-            .map(|claim| claim.amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual))
-            .sum::<u64>();
-        assert_eq!(
-            actual_allocation_residuals, 2,
-            "the core array and daemon wrapper each retain one actual allocation residual"
-        );
-        let provider_record_residuals = surviving_claims
-            .iter()
-            .map(|claim| {
-                myownmesh_core::FiniteResourceProvider::reservation_planning_charge(*claim)
-                    .expect("each surviving reservation record is representable")
-                    .checked_sub(*claim)
-                    .expect("a reservation planning charge contains its original claim")
-                    .amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual)
-            })
-            .sum::<u64>();
-        assert_eq!(
-            while_line_is_live.amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual)
-                - baseline.amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual),
-            actual_allocation_residuals + provider_record_residuals,
-            "both actual allocations and all three surviving lease records are accounted"
-        );
-        drop(line);
-        assert_eq!(provider.in_use(), baseline, "every exact lease returns");
-
-        let _ = link.retire().await;
-        drop(far);
-    }
-
-    /// A reader that counts the times anything polled it.
-    ///
-    /// The count is the discriminator for the pair below: "was refused" and
-    /// "was refused before it read anything" are different claims, and only the
-    /// second one is what admission is for.
-    struct CountingReader {
-        remaining: &'static [u8],
-        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl tokio::io::AsyncRead for CountingReader {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            self.polls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let take = self.remaining.len().min(buf.remaining());
-            let (head, tail) = self.remaining.split_at(take);
-            buf.put_slice(head);
-            self.remaining = tail;
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    /// The connection's read buffer is funded before it is constructed.
-    ///
-    /// Positive half of the pair, against a provider this control owns and
-    /// through the same sequence `handle_client` runs. The buffer is built
-    /// exactly once, and reading through it afterwards works normally -- the
-    /// second half is the non-vacuity, because a constructor that built nothing
-    /// would also report zero refusals.
     #[tokio::test]
     async fn a_funded_connection_reader_is_built_once() {
         let admission = admission_granting_bytes(CONTROL_READ_BUFFER_BYTES as u64 + 512);
@@ -3113,9 +2638,8 @@ mod tests {
     /// funding outlives it.
     ///
     /// The raw line is dropped here exactly as `handle_client` drops it, while
-    /// the structural lease and the decoded value stay live — which is the
-    /// transfer the review found missing. The drop order is the other half and
-    /// is compile-visible rather than asserted: `AdmittedRequest` declares the
+    /// the structural lease and the decoded value stay live. The drop order is
+    /// the other half and is compile-visible rather than asserted: `AdmittedRequest` declares the
     /// request before its retention, so the request is destroyed before the
     /// lease that accounts for it.
     #[tokio::test]
@@ -3153,17 +2677,11 @@ mod tests {
             None,
         );
         let baseline = provider.in_use();
-        let built_before = rpc_call_reply_builds();
-        let refusal = match typed_starved.acquire_claim(variable_operation_claim()) {
-            Ok(_) => panic!("the daemon provider has no operation residual"),
+        let refusal = match ResponseOwner::acquire(&typed_starved) {
+            Ok(_) => panic!("the daemon provider has no response owner to give"),
             Err(refusal) => refusal,
         };
         assert!(matches!(refusal, FrameRefusal::Resources(_)));
-        assert_eq!(
-            rpc_call_reply_builds(),
-            built_before,
-            "typed pressure never reaches the funded envelope builder"
-        );
         assert_eq!(
             provider.in_use(),
             baseline,
@@ -3174,17 +2692,16 @@ mod tests {
             "the independently funded upstream body remains live after daemon refusal"
         );
 
-        let operation = scope
-            .acquire(variable_operation_claim())
-            .expect("the daemon operation residual is funded");
-        let variable = FundedVariableReply::rpc_call(Ok(funded), operation)
-            .unwrap_or_else(|_| panic!("the exact operation lease is accepted"));
-        assert_eq!(
-            rpc_call_reply_builds(),
-            built_before + 1,
-            "the admitted funded envelope is built exactly once"
-        );
-        let line_len = variable.exact_line_len().expect("the line is measurable");
+        let owner = ResponseOwner::acquire(&granted_admission())
+            .expect("an ordinary application grant funds the daemon response owner");
+        let reply = PreparedReply::Variable(FundedVariableReply::rpc_call(Ok(funded), owner));
+
+        // The writer's measuring pass, run here against framing's own counting
+        // sink so this control can name the exact width it starves by one byte.
+        let mut counted = CountingSink::default();
+        serde_json::to_writer(&mut counted, &ControlOut::Prepared(&reply))
+            .expect("the sealed reply encodes");
+        let line_len = counted.measured() + 1;
 
         let starved = admission_granting_bytes((line_len - 1) as u64);
         assert!(
@@ -3197,7 +2714,6 @@ mod tests {
 
         let output = AdmittedLineOut::prepare_capacity(line_len, &granted_admission())
             .expect("the ordinary application grant funds the exact line");
-        let reply = PreparedReply::Variable(variable);
         let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
             .expect("the funded body encodes without changing width");
         assert_eq!(line.bytes().len(), line_len);

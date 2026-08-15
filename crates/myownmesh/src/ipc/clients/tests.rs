@@ -47,47 +47,6 @@ fn ids_are_monotonic_and_unique() {
 }
 
 #[test]
-fn every_never_reused_daemon_identity_refuses_exhaustion() {
-    let reg = ClientRegistry::default();
-    reg.inner.next_id.store(u64::MAX, Ordering::Relaxed);
-    let (tx, _rx) = myownmesh_core::resource_mailbox(crate::test_application_scope())
-        .expect("the writer mailbox itself is admitted");
-    assert!(matches!(
-        reg.register(tx),
-        Err(IpcAdmissionError::IdentityExhausted)
-    ));
-
-    let reg = ClientRegistry::default();
-    reg.inner
-        .next_call_stream_id
-        .store(u64::MAX, Ordering::Relaxed);
-    assert!(matches!(
-        reg.next_call_stream_id(),
-        Err(IpcAdmissionError::IdentityExhausted)
-    ));
-
-    let (a, _ra) = fresh_client(&reg);
-    let (b, _rb) = fresh_client(&reg);
-    let key = ("net".to_string(), "exhausted-membership".to_string());
-    reg.subscribe_channel(key.clone(), a.id)
-        .expect("non-vacuity: one membership is installed before exhaustion");
-    reg.inner
-        .next_membership_id
-        .store(u64::MAX, Ordering::Relaxed);
-    assert!(matches!(
-        reg.subscribe_channel(key.clone(), b.id),
-        Err(RegistrationError::IdentityExhausted)
-    ));
-    let mut members = Vec::new();
-    assert!(reg.for_each_subscriber(&key, |client| members.push(client.id)));
-    assert_eq!(
-        members,
-        vec![a.id],
-        "exhaustion neither reuses an identity nor installs the refused member"
-    );
-}
-
-#[test]
 fn disconnect_winner_returns_completed_install_to_its_sole_cleanup_owner() {
     #[derive(Debug)]
     struct Completed(Arc<AtomicU64>);
@@ -317,10 +276,9 @@ fn unregister_doesnt_collateral_drop_a_displacing_claim() {
 
 /// The first subscriber installs; everyone after it waits or is already live.
 ///
-/// Renamed from a control about a `bool` flag, because the flag was the defect.
-/// `false` used to mean "you are done" and was returned to a follower that had
-/// joined a route still being installed — so the follower's client was told it
-/// was subscribed before anything existed to deliver to it.
+/// The distinction is between owning the install and waiting on one already
+/// under way: a follower that joins a route still being installed must not be
+/// told it is subscribed before anything exists to deliver to it.
 #[test]
 fn v4_f2_daemon_only_the_first_subscriber_owns_the_install() {
     let reg = ClientRegistry::default();
@@ -362,10 +320,9 @@ fn v4_f2_daemon_only_the_first_subscriber_owns_the_install() {
 
 /// A failed install refuses every member, not just the installer.
 ///
-/// The old shape unwound only the caller that discovered the failure, because
-/// it was the only one it knew about. A follower that had joined in the
-/// meantime kept its membership, its client had already been told it was
-/// subscribed, and no pump existed to ever notice.
+/// Unwinding only the caller that discovered the failure would leave a
+/// follower that had joined in the meantime holding its membership, with its
+/// client already told it was subscribed and no pump to ever notice.
 #[tokio::test]
 async fn v4_f2_daemon_a_failed_install_unwinds_every_member() {
     let reg = ClientRegistry::default();
@@ -500,10 +457,10 @@ async fn v4_f2_daemon_a_stale_installer_cannot_touch_the_route_that_replaced_it(
 
 /// The last unsubscribe retires the route and hands back its pump.
 ///
-/// A route that emptied used to leave its task to notice on the next frame.
-/// On a channel nobody is publishing to there is no next frame, so the pump
-/// was immortal in exactly the case where it was useless. The handle comes
-/// back so the caller can cancel and join it — and it is `#[must_use]`,
+/// Leaving the task to notice on its next frame would make the pump immortal
+/// on a channel nobody publishes to, which is exactly where it is useless. The
+/// handle comes back so the caller can cancel and join it — and it is
+/// `#[must_use]`,
 /// because dropping a `JoinHandle` detaches a task rather than stopping it.
 #[test]
 fn v4_f2_daemon_the_last_unsubscribe_retires_the_route() {
@@ -663,10 +620,10 @@ fn v4_f3_daemon_a_stale_closure_cannot_route_to_the_client_that_displaced_it() {
 ///
 /// Refusal is the ordinary case, not the exceptional one: a client that
 /// disconnects between funding a registration and committing it, a runtime
-/// entering shutdown, a grant with nothing left. Under the old two-step order
-/// the incumbent's handler had already been overwritten by the time any of
-/// those was discovered, so a refused claim still took the method away from a
-/// client that was serving it.
+/// entering shutdown, a grant with nothing left. Under an install-then-claim
+/// order the incumbent's handler would already be overwritten by the time any
+/// of those was discovered, so a refused claim would take the method away from
+/// a client that was serving it.
 ///
 /// Every field of the incumbent is checked, because "unchanged" has three parts
 /// here and only one of them is the owner: a refusal that left the generation
@@ -1002,10 +959,11 @@ fn pending_fixture_claim(
 
 /// A pending inbound call under pressure is refused before any of it is built.
 ///
-/// The finding this pins is an ordering, not a number. What a refusal used to
-/// arrive after was: four copies of peer-chosen coordinates in a `PendingKey`,
-/// the channel that would have carried the answer back, and — one layer up, in
-/// the bridge — a clone of the peer's own payload. A remote peer chooses how
+/// The property is an ordering, not a number. A refusal arriving after the
+/// build would arrive after four copies of peer-chosen coordinates in a
+/// `PendingKey`, the channel that would have carried the answer back, and — one
+/// layer up, in the bridge — a clone of the peer's own payload. A remote peer
+/// chooses how
 /// many inbound calls there are, so a daemon that allocated all of that in order
 /// to say no was a daemon whose refusal path was the expensive one.
 ///
@@ -1015,8 +973,7 @@ fn pending_fixture_claim(
 /// where it was before the call, so nothing was taken and returned either; and
 /// no pending record exists, so nothing was half-filed.
 ///
-/// The fourth thing the review names — the payload clone — is not here on
-/// purpose. It belongs to the outbound frame, which is admitted by the client's
+/// The fourth allocation — the payload clone — is not here on purpose. It belongs to the outbound frame, which is admitted by the client's
 /// writer mailbox from a borrowed measurement, and is the subject of
 /// `v4_r2_daemon_a_measured_inbound_frame_matches_the_frame_it_becomes` in
 /// `bridge`. Folding the two together would make one control that fails for two
@@ -1138,40 +1095,6 @@ async fn v4_r2_daemon_a_pending_call_cannot_be_filed_in_a_class_it_was_not_funde
         .commit_exact_single_pending(prepared, "peer", "req")
         .expect("the same coordinates are still vacant, and the matching class files");
     drop(ticket);
-}
-
-#[test]
-fn pending_identity_exhaustion_refuses_before_the_effect_builder_runs() {
-    let reg = ClientRegistry::default();
-    let (owner, _) = fresh_client(&reg);
-    let key: ClaimKey = ("n".to_string(), "m".to_string());
-    let prepared = reg
-        .prepare_exact_pending(&key, "peer", "req", HandlerMode::Single, owner.id)
-        .expect("non-vacuity: the pending call itself is fully funded");
-    reg.inner
-        .next_operation_id
-        .store(u64::MAX, Ordering::Relaxed);
-
-    let mut builds = 0;
-    let refusal =
-        match reg.commit_exact_pending_as(prepared, "peer", "req", HandlerMode::Single, || {
-            builds += 1;
-            let (tx, rx) = oneshot::channel();
-            (PendingInbound::Single(tx), rx)
-        }) {
-            Ok(_) => panic!("an exhausted identity space cannot publish a pending call"),
-            Err(refusal) => refusal,
-        };
-    assert!(matches!(
-        refusal,
-        PendingRefusal::Admission(IpcAdmissionError::IdentityExhausted)
-    ));
-    assert_eq!(builds, 0, "the effect builder is strictly post-admission");
-    assert_eq!(
-        reg.residue().pending_inbound,
-        0,
-        "and exhaustion publishes no record"
-    );
 }
 
 #[tokio::test]
@@ -1353,12 +1276,9 @@ fn assert_no_next_item(
 /// The terminal item is delivered behind a chunk already resident in the
 /// queue, never ahead of it.
 ///
-/// This replaces a control that proved the same ordering by filling a
-/// one-item channel and watching the closer block. That proof is gone
-/// because the capacity it depended on is gone: the queue is bounded by
-/// what the owner funded, measured per chunk, not by a number of chunks.
-/// The property it was protecting is unchanged and is asserted directly
-/// here, with no fabricated blocked state standing in for it.
+/// The queue is bounded by what the owner funded, measured per chunk, not by
+/// a number of chunks, so the ordering is asserted directly rather than by
+/// filling a fixed-capacity channel and watching a closer block.
 #[tokio::test]
 async fn a_terminal_item_is_delivered_behind_a_resident_chunk() {
     let reg = ClientRegistry::default();

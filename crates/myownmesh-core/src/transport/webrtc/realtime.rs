@@ -29,16 +29,24 @@ impl RealtimeFlowKey {
     }
 }
 
+/// Why one real-time acquisition was refused.
+///
+/// Seven owner-ceiling refusals used to stand beside these four: an active-flow
+/// ceiling, a fragment byte and a fragment count ceiling, a unit byte ceiling, a
+/// per-flow in-progress ceiling, a per-domain aggregate byte ceiling, and a
+/// per-flow queue depth. Every one of them was reachable only on a registry the
+/// owner had handed a local ceiling, and none of them is reachable now that no
+/// owner can state one. They are deleted rather than kept as never-returned
+/// names, because a refusal reason no code path can produce is a claim about
+/// behaviour that does not happen.
+///
+/// What refuses real-time work now is what refused it on every elastic registry
+/// already: an exact `ResourceClaim` the provider could not fund
+/// (`ResourceUnavailable`), a registry with no connector scope at all
+/// (`OwnerPolicyMissing`), a retired registry, and an ownership mismatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RealtimeFlowDropReason {
     OwnerPolicyMissing,
-    LocalFlowCeiling,
-    FragmentOversize,
-    FragmentCount,
-    UnitOversize,
-    InProgressLimit,
-    AggregateBytes,
-    FlowQueueFull,
     Retired,
     OwnershipMismatch,
     ResourceUnavailable(ResourceUnavailable),
@@ -246,17 +254,11 @@ pub(super) struct RealtimeFlowRegistry {
     /// Presence of this exact connector scope enables generic real-time work.
     /// It grants no capacity by itself.
     resources: Option<ConnectorWorkResourceScope>,
-    /// Optional local or compatibility ceilings. Basal admission never
-    /// requires these values and is governed by provider leases.
-    local_ceiling: Option<EnabledRealtimeConnectorPolicy>,
-    /// The owner's per-unit byte ceiling, when the owner selected one.
-    ///
-    /// `None` is absence, and absence is not zero. The absence lives in the
-    /// value rather than in a companion field a reader has to consult first: a
-    /// sentinel `0` guarded by `local_ceiling.is_some()` puts the real meaning
-    /// somewhere a reader can forget to look, and forgetting refuses every
-    /// unit. `Option` cannot be read past.
-    pub(super) max_unit_bytes: Option<NonZeroUsize>,
+    // An optional owner ceiling and a per-unit byte maximum derived from it
+    // used to sit here. Both are gone. Every branch that consulted them was
+    // guarded on the ceiling being present, so a registry an owner left elastic
+    // — the only kind an owner can build now — took none of them, and admission
+    // is exactly what it already was on that path: the provider's leases.
     pub(super) state: SyncMutex<RealtimeFlowRegistryState>,
     pub(super) ready: tokio::sync::Notify,
     observer: Option<Arc<dyn RealtimeFlowObserver>>,
@@ -325,20 +327,16 @@ pub(super) struct RealtimeNativeReadLease {
 }
 
 impl RealtimeFlowRegistry {
-    pub(super) fn new(
-        resources: Option<ConnectorWorkResourceScope>,
-        local_ceiling: Option<EnabledRealtimeConnectorPolicy>,
-    ) -> Arc<Self> {
-        Self::with_observer(resources, local_ceiling, None)
+    pub(super) fn new(resources: Option<ConnectorWorkResourceScope>) -> Arc<Self> {
+        Self::with_observer(resources, None)
     }
 
-    /// An elastic registry over a real provider: resources, and **no** owner
-    /// ceilings.
+    /// An elastic registry over a real provider.
     ///
-    /// `Enabled(None)` as a deployment actually states it. Controls that mint a
-    /// label or move a unit against this are proving the elastic path admits
-    /// through real leases — absence of a ceiling is not absence of accounting
-    /// — rather than proving that admission was skipped.
+    /// The only deployment there is. Controls that mint a label or move a unit
+    /// against this are proving the elastic path admits through real leases —
+    /// absence of a ceiling is not absence of accounting — rather than proving
+    /// that admission was skipped.
     #[cfg(test)]
     pub(super) fn elastic_for_control(
         grant: ResourceClaim,
@@ -360,7 +358,7 @@ impl RealtimeFlowRegistry {
             .reserve_connector_candidate_checked(claim)
             .expect("the control grant has no provider invariant failure")
             .expect("the exact attempt remains active");
-        let registry = Self::new(Some(candidate.work_resource_scope()), None);
+        let registry = Self::new(Some(candidate.work_resource_scope()));
         (
             registry,
             ElasticControlResources {
@@ -374,16 +372,10 @@ impl RealtimeFlowRegistry {
 
     pub(super) fn with_observer(
         resources: Option<ConnectorWorkResourceScope>,
-        local_ceiling: Option<EnabledRealtimeConnectorPolicy>,
         observer: Option<Arc<dyn RealtimeFlowObserver>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             resources,
-            local_ceiling,
-            // Absence stays absence. An owner that selected no ceiling is
-            // elastic — admission is the provider's leases — not capped at
-            // zero and not unlimited.
-            max_unit_bytes: local_ceiling.map(|enabled| enabled.max_unit_bytes()),
             state: SyncMutex::new(RealtimeFlowRegistryState {
                 flows: crate::resource::LeasedMap::new(),
                 ready: RealtimeReadyQueue::default(),
@@ -466,6 +458,21 @@ impl RealtimeFlowRegistry {
     /// two callers cannot bill the same node twice.
     pub(super) fn queue_node_claim<T>() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         crate::resource::LeasedQueue::<T>::entry_claim().map_err(Self::claim_arithmetic_unavailable)
+    }
+
+    /// The queue node one enqueued real-time event costs, for callers that must
+    /// fund an enqueue without being able to name its element type.
+    ///
+    /// [`QueuedRealtimeEvent`] is private to this module and stays that way —
+    /// its shape is this owner's business. A fixture building an exact grant
+    /// still has to fund the node an enqueue allocates, and restating the claim
+    /// on its side would keep passing after the queue's calibration changed,
+    /// which is the failure a resource control exists to catch. So the type
+    /// stays in and the number comes out.
+    #[cfg(test)]
+    pub(super) fn queued_event_node_claim(
+    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        Self::queue_node_claim::<QueuedRealtimeEvent>()
     }
 
     /// Fund one node of a caller-owned [`crate::resource::LeasedMap`] against
@@ -967,28 +974,7 @@ impl RealtimeFlowRegistry {
         if state.retired {
             return Err(RealtimeFlowDropReason::Retired);
         }
-        if self.local_ceiling.is_some() && state.accounting_poisoned_by_domain[domain.index()] {
-            return Err(RealtimeFlowDropReason::AggregateBytes);
-        }
         let active_in_domain = state.active_flows_by_domain[domain.index()];
-        if let Some(policy) = self.local_ceiling {
-            let limit = match domain {
-                RealtimeFlowDomain::InboundQuarantine => {
-                    policy.flows().max_inbound_active_flows().get()
-                }
-                RealtimeFlowDomain::OutboundCompatibility => {
-                    policy.flows().max_outbound_active_flows().get()
-                }
-            };
-            if active_in_domain >= limit {
-                drop(state);
-                return Err(self.record_drop(
-                    Some(key),
-                    RealtimeFlowDropReason::LocalFlowCeiling,
-                    0,
-                ));
-            }
-        }
         if state
             .flows
             .insert(
@@ -1112,24 +1098,21 @@ impl RealtimeFlowRegistry {
             .unwrap_or(RealtimeObservedQuantity::Inexact)
     }
 
-    fn domain_byte_limit(&self, domain: RealtimeFlowDomain) -> Option<usize> {
-        let budgets = self.local_ceiling?.flows().byte_budgets();
-        Some(match domain {
-            RealtimeFlowDomain::InboundQuarantine => budgets.max_inbound_bytes().get(),
-            RealtimeFlowDomain::OutboundCompatibility => budgets.max_outbound_bytes().get(),
-        })
-    }
-
+    /// Mark one domain's local observation untrustworthy.
+    ///
+    /// It used to also pin the domain's retained-byte counter to the owner's
+    /// ceiling, so that a damaged domain refused every later admission against
+    /// that ceiling. There is no ceiling to pin it to any more, and there is
+    /// nothing to refuse against: what admits real-time work is the provider,
+    /// which does its own exact accounting and is unaffected by this flag. So
+    /// this now does the one thing it always did on an elastic registry —
+    /// stop reporting a number that would be wrong.
     fn poison_domain_locked(
         &self,
         state: &mut RealtimeFlowRegistryState,
         domain: RealtimeFlowDomain,
     ) {
-        let index = domain.index();
-        state.accounting_poisoned_by_domain[index] = true;
-        if let Some(limit) = self.domain_byte_limit(domain) {
-            state.retained_bytes_by_domain[index] = limit;
-        }
+        state.accounting_poisoned_by_domain[domain.index()] = true;
     }
 
     fn release_bytes_locked(
@@ -1192,20 +1175,11 @@ impl RealtimeFlowRegistry {
             .get(&key)
             .ok_or(RealtimeFlowDropReason::Retired)?
             .domain;
-        if self.local_ceiling.is_some() && state.accounting_poisoned_by_domain[domain.index()] {
-            return Err(RealtimeFlowDropReason::AggregateBytes);
-        }
         let current_flow_units = state
             .flows
             .get(&key)
             .ok_or(RealtimeFlowDropReason::Retired)?
             .in_progress_units;
-        if self.local_ceiling.is_some_and(|policy| {
-            current_flow_units >= policy.flows().max_in_progress_units_per_flow().get()
-        }) {
-            drop(state);
-            return Err(self.record_drop(Some(key), RealtimeFlowDropReason::InProgressLimit, 0));
-        }
         let Some(next_flow_units) = current_flow_units.checked_add(1) else {
             self.poison_domain_locked(&mut state, domain);
             return Err(RealtimeFlowDropReason::ResourceUnavailable(
@@ -1257,16 +1231,15 @@ impl RealtimeFlowRegistry {
     /// already attached to a binding the promoted session established, so the
     /// question of whether this packet may be processed at all was answered
     /// before this pump existed. What is decided here is whether the provider
-    /// can currently afford the work, and whether this domain's accounting is
-    /// still trustworthy.
+    /// can currently afford the work.
     ///
     /// There is deliberately no cumulative packet or byte envelope. A ceiling
     /// that latches would end a long-lived session at an arbitrary packet
     /// count, and one that resets would be a timer by another name. Sustained
-    /// inbound pressure is bounded where it is actually held — the per-packet
-    /// claim above, the per-flow in-progress and fragment limits, the queue
-    /// depth, and the aggregate retained-byte ceiling — every one of which
-    /// releases as the work completes.
+    /// inbound pressure is bounded where it is actually held — the exact
+    /// per-packet claim below, and the exact claim every fragment, unit and
+    /// queued event takes after it — each of which releases as the work
+    /// completes.
     pub(super) fn admit_session_packet_checked(
         &self,
         payload_bytes: usize,
@@ -1274,16 +1247,8 @@ impl RealtimeFlowRegistry {
         let work = self
             .acquire(Self::session_packet_work_claim(payload_bytes))
             .map_err(|reason| self.record_drop(None, reason, payload_bytes))?;
-        let state = self.state.lock();
-        let domain = RealtimeFlowDomain::InboundQuarantine;
-        if state.retired {
+        if self.state.lock().retired {
             return Err(RealtimeFlowDropReason::Retired);
-        }
-        // Same answer as every other acquisition on a damaged domain: the
-        // aggregate is no longer trustworthy, so nothing more is admitted
-        // against it.
-        if self.local_ceiling.is_some() && state.accounting_poisoned_by_domain[domain.index()] {
-            return Err(RealtimeFlowDropReason::AggregateBytes);
         }
         Ok(RealtimeSessionPacketWorkLease { _lease: work })
     }
@@ -1310,11 +1275,8 @@ impl RealtimeFlowRegistry {
         key: RealtimeFlowKey,
         bytes: usize,
     ) -> std::result::Result<RealtimeOutputReservation, RealtimeFlowDropReason> {
-        // No ceiling selected means no oversize refusal: the lease below is the
+        // There is no oversize refusal in front of this: the lease below is the
         // admission, and a provider under pressure is what says no.
-        if self.max_unit_bytes.is_some_and(|max| bytes > max.get()) {
-            return Err(self.record_drop(Some(key), RealtimeFlowDropReason::UnitOversize, bytes));
-        }
         let lease = self
             .acquire(Self::output_claim(bytes))
             .map_err(|reason| self.record_drop(Some(key), reason, bytes))?;
@@ -1327,32 +1289,14 @@ impl RealtimeFlowRegistry {
             .get(&key)
             .ok_or(RealtimeFlowDropReason::Retired)?
             .domain;
-        if self.local_ceiling.is_some() && state.accounting_poisoned_by_domain[domain.index()] {
-            return Err(RealtimeFlowDropReason::AggregateBytes);
-        }
         let index = domain.index();
-        let next_domain = match state.retained_bytes_by_domain[index].checked_add(bytes) {
-            Some(next) => Some(next),
-            None if self.local_ceiling.is_some() => {
-                self.poison_domain_locked(&mut state, domain);
-                return Err(RealtimeFlowDropReason::AggregateBytes);
-            }
+        match state.retained_bytes_by_domain[index].checked_add(bytes) {
+            Some(next) => state.retained_bytes_by_domain[index] = next,
             None => {
                 // Provider accounting remains authoritative. Mark the local
                 // observation inexact without inventing a replacement value.
-                state.accounting_poisoned_by_domain[index] = true;
-                None
+                self.poison_domain_locked(&mut state, domain);
             }
-        };
-        if next_domain.is_some_and(|next| {
-            self.domain_byte_limit(domain)
-                .is_some_and(|limit| next > limit)
-        }) {
-            drop(state);
-            return Err(self.record_drop(Some(key), RealtimeFlowDropReason::AggregateBytes, bytes));
-        }
-        if let Some(next_domain) = next_domain {
-            state.retained_bytes_by_domain[index] = next_domain;
         }
         drop(state);
         Ok(RealtimeOutputReservation {
@@ -1370,7 +1314,7 @@ impl RealtimeFlowRegistry {
         key: RealtimeFlowKey,
         mut event: QueuedTransportEvent,
         reservation: RealtimeOutputReservation,
-    ) -> std::result::Result<bool, RealtimeFlowDropReason> {
+    ) -> std::result::Result<(), RealtimeFlowDropReason> {
         if !std::ptr::eq(self, Arc::as_ref(&reservation.registry))
             || reservation.key != key
             || !reservation.active
@@ -1400,9 +1344,6 @@ impl RealtimeFlowRegistry {
             if state.retired {
                 return Err(RealtimeFlowDropReason::Retired);
             }
-            if self.local_ceiling.is_some() && state.accounting_poisoned_by_domain[domain.index()] {
-                return Err(RealtimeFlowDropReason::AggregateBytes);
-            }
             let Some(flow) = state.flows.get(&key) else {
                 drop(state);
                 return Err(self.record_drop(
@@ -1415,26 +1356,12 @@ impl RealtimeFlowRegistry {
                 self.poison_domain_locked(&mut state, domain);
                 return Err(RealtimeFlowDropReason::OwnershipMismatch);
             }
-            if self.local_ceiling.is_some_and(|policy| {
-                flow.events.len() >= policy.flows().queue_capacity_per_flow().get()
-            }) {
-                drop(state);
-                self.record_drop(
-                    Some(key),
-                    RealtimeFlowDropReason::FlowQueueFull,
-                    payload_bytes,
-                );
-                return Ok(
-                    match self
-                        .local_ceiling
-                        .expect("checked local ceiling")
-                        .flows()
-                        .overflow_rule()
-                    {
-                        crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest => true,
-                    },
-                );
-            }
+            // No per-flow queue depth stands here, and therefore no overflow
+            // rule choosing which admitted event to destroy. What bounds this
+            // queue is that every event in it holds an exact queue record and
+            // an exact byte lease, both taken above against the provider: a
+            // queue that cannot be funded cannot grow, and the refusal names
+            // the resource rather than a number the owner picked.
             let needs_ready = flow.events.is_empty() && !flow.scheduled;
             if needs_ready && ready_lease.is_none() {
                 drop(state);
@@ -1498,7 +1425,7 @@ impl RealtimeFlowRegistry {
             retained_bytes,
         });
         self.ready.notify_one();
-        Ok(true)
+        Ok(())
     }
 
     pub(super) fn try_recv(&self) -> Option<QueuedTransportEvent> {
@@ -1645,7 +1572,7 @@ impl RealtimeFlowPort {
         &self,
         event: QueuedTransportEvent,
         reservation: RealtimeOutputReservation,
-    ) -> std::result::Result<bool, RealtimeFlowDropReason> {
+    ) -> std::result::Result<(), RealtimeFlowDropReason> {
         self.lifetime
             .registry
             .enqueue_checked(self.key(), event, reservation)
@@ -1656,7 +1583,7 @@ impl RealtimeFlowPort {
         event: QueuedTransportEvent,
         reservation: RealtimeOutputReservation,
     ) -> bool {
-        self.enqueue_checked(event, reservation).unwrap_or(false)
+        self.enqueue_checked(event, reservation).is_ok()
     }
 
     /// Fund one node of a caller-owned [`crate::resource::LeasedQueue`] against
@@ -1706,19 +1633,10 @@ impl RealtimeAssemblyReservation {
         bytes: usize,
     ) -> std::result::Result<(), RealtimeFlowDropReason> {
         let claim = RealtimeFlowRegistry::ordered_fragment_claim(bytes);
-        let local_ceiling = self
-            .registry
-            .local_ceiling
-            .map(EnabledRealtimeConnectorPolicy::flows);
-        if local_ceiling.is_some_and(|policy| bytes > policy.max_inbound_fragment_bytes().get()) {
-            self.registry.record(RealtimeFlowObservation::Drop {
-                key: Some(self.key),
-                reason: RealtimeFlowDropReason::FragmentOversize,
-                queue_age: Duration::ZERO,
-                payload_bytes: bytes,
-            });
-            return Err(RealtimeFlowDropReason::FragmentOversize);
-        }
+        // No fragment byte ceiling, no fragment count ceiling and no unit byte
+        // ceiling in front of this. Each accepted fragment takes one exact
+        // claim sized to its actual bytes, and the unit it builds is bounded by
+        // the sum of those claims against the owner's real grant.
         let Some(fragment_count) = self.retained_fragments.checked_add(1) else {
             self.poison_domain();
             return Err(RealtimeFlowDropReason::ResourceUnavailable(
@@ -1727,17 +1645,6 @@ impl RealtimeAssemblyReservation {
                 },
             ));
         };
-        if local_ceiling
-            .is_some_and(|policy| fragment_count > policy.max_inbound_fragments_per_unit().get())
-        {
-            self.registry.record(RealtimeFlowObservation::Drop {
-                key: Some(self.key),
-                reason: RealtimeFlowDropReason::FragmentCount,
-                queue_age: Duration::ZERO,
-                payload_bytes: bytes,
-            });
-            return Err(RealtimeFlowDropReason::FragmentCount);
-        }
         let Some(unit_bytes) = self.retained_bytes.checked_add(bytes) else {
             self.poison_domain();
             return Err(RealtimeFlowDropReason::ResourceUnavailable(
@@ -1746,20 +1653,6 @@ impl RealtimeAssemblyReservation {
                 },
             ));
         };
-        if self
-            .registry
-            .max_unit_bytes
-            .is_some_and(|max| unit_bytes > max.get())
-        {
-            self.registry.record(RealtimeFlowObservation::Drop {
-                key: Some(self.key),
-                reason: RealtimeFlowDropReason::UnitOversize,
-                queue_age: Duration::ZERO,
-                payload_bytes: unit_bytes,
-            });
-            return Err(RealtimeFlowDropReason::UnitOversize);
-        }
-
         // Acquire before the compatibility assembler retains its payload
         // clone. Each accepted fragment keeps one distinct finite lease until
         // the complete unit, cancellation, replacement, or flow retirement
@@ -1769,39 +1662,10 @@ impl RealtimeAssemblyReservation {
             .acquire(claim)
             .map_err(|reason| self.registry.record_drop(Some(self.key), reason, bytes))?;
         let mut state = self.registry.state.lock();
-        if self.registry.local_ceiling.is_some()
-            && state.accounting_poisoned_by_domain[self.domain.index()]
-        {
-            return Err(RealtimeFlowDropReason::AggregateBytes);
-        }
         let index = self.domain.index();
-        let next_domain = match state.retained_bytes_by_domain[index].checked_add(bytes) {
-            Some(next) => Some(next),
-            None if self.registry.local_ceiling.is_some() => {
-                self.registry.poison_domain_locked(&mut state, self.domain);
-                return Err(RealtimeFlowDropReason::AggregateBytes);
-            }
-            None => {
-                state.accounting_poisoned_by_domain[index] = true;
-                None
-            }
-        };
-        if next_domain.is_some_and(|next| {
-            self.registry
-                .domain_byte_limit(self.domain)
-                .is_some_and(|limit| next > limit)
-        }) {
-            drop(state);
-            self.registry.record(RealtimeFlowObservation::Drop {
-                key: Some(self.key),
-                reason: RealtimeFlowDropReason::AggregateBytes,
-                queue_age: Duration::ZERO,
-                payload_bytes: bytes,
-            });
-            return Err(RealtimeFlowDropReason::AggregateBytes);
-        }
-        if let Some(next_domain) = next_domain {
-            state.retained_bytes_by_domain[index] = next_domain;
+        match state.retained_bytes_by_domain[index].checked_add(bytes) {
+            Some(next) => state.retained_bytes_by_domain[index] = next,
+            None => self.registry.poison_domain_locked(&mut state, self.domain),
         }
         self.fragment_leases.push(fragment_lease);
         self.retained_bytes = unit_bytes;
@@ -2060,7 +1924,7 @@ mod elastic_resource_tests {
             .reserve_connector_candidate_checked(claim)
             .expect("the derived grant has no provider invariant failure")
             .expect("the exact attempt remains active");
-        let registry = RealtimeFlowRegistry::new(Some(candidate.work_resource_scope()), None);
+        let registry = RealtimeFlowRegistry::new(Some(candidate.work_resource_scope()));
         TestContext {
             provider,
             registry,

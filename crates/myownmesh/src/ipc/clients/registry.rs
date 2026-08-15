@@ -44,8 +44,7 @@ fn remove_channel_member(
     // caller rather than being dropped here. Dropping a `JoinHandle` detaches
     // the task instead of stopping it, so a route torn down without the caller
     // cancelling and joining would leave a pump running against a channel
-    // nobody is subscribed to — which is precisely the "exits on its next
-    // iteration" hand-wave this replaces.
+    // nobody is subscribed to.
     // Retired rather than dropped, and returned rather than finished here: both
     // stages owe somebody something — a pump owes a join, an unfinished install
     // owes its followers an answer — and paying either means awaiting or
@@ -67,9 +66,9 @@ fn remove_channel_member(
 /// No key clones: `pop_first_where` detaches matches in place. What is left is
 /// one node per record, and each record carries the lease that funds its own
 /// node — acquired when the call was filed, moved into the node here, released
-/// after that node is freed. A `Vec` was wrong twice over: its buffer is sized
-/// by capacity rather than by length, and its `Drop` destroys the records before
-/// it frees the buffer they sat in.
+/// after that node is freed. A `Vec` cannot carry this: its buffer is sized by
+/// capacity rather than by length, and its `Drop` destroys the records before it
+/// frees the buffer they sat in.
 fn take_pending_under(
     tables: &mut RegistryTables,
     mut names: impl FnMut(&PendingKey, &PendingRecord) -> bool,
@@ -96,14 +95,12 @@ fn take_pending_under(
 ///
 /// `pop_first_where` detaches only the first match and leaves every rejected
 /// node in the allocation it already had, so this needs no key clone, no
-/// snapshot vector, and no reinsertion. That is what lets a pending call be
-/// charged for the two copies of its coordinates that really exist — the map's
-/// and the ticket's — instead of a third that only ever existed to drive a
-/// two-pass sweep.
+/// snapshot vector, and no reinsertion. A pending call is therefore charged for
+/// exactly the two copies of its coordinates that exist: the map's and the
+/// ticket's.
 ///
-/// Nothing here can be refused. Every allocation the old shape needed is gone
-/// rather than pre-paid, which is the stronger form of the same guarantee: a
-/// disconnect path that cannot allocate cannot be told no.
+/// Nothing here can be refused, because nothing here allocates. A disconnect
+/// path that cannot allocate cannot be told no.
 fn settle_pending_where(
     tables: &parking_lot::Mutex<RegistryTables>,
     mut names: impl FnMut(&PendingKey, &PendingRecord) -> bool,
@@ -153,10 +150,8 @@ fn admitting(tables: &RegistryTables) -> Result<(), IpcAdmissionError> {
 impl ClientRegistry {
     /// One registry over one acquisition port.
     ///
-    /// It used to be `with_stream_capacity`, and took a mandatory item count for
-    /// the inbound RPC stream queue. That queue is a resource mailbox now and
-    /// has no item count to select, so there was nothing left for the argument
-    /// to mean.
+    /// No queue sizing to select: the inbound RPC stream queue is a resource
+    /// mailbox, so its capacity is the grant rather than an item count.
     pub fn new(resources: LocalApplicationResourceScope) -> Self {
         Self::over(RegistryResources::Application(resources))
     }
@@ -567,12 +562,7 @@ impl ClientRegistry {
         let entry = self
             .inner
             .lease_entry::<ClientId, FundedArc<ClientHandle>>()?;
-        let id = ClientId(
-            self.inner
-                .next_id
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .map_err(|_| IpcAdmissionError::IdentityExhausted)?,
-        );
+        let id = ClientId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let handle = FundedArc::new(
             ClientHandle {
                 id,
@@ -751,14 +741,12 @@ impl ClientRegistry {
     /// and every pending operation it owns. A stream sender disappearing
     /// without an explicit terminal item is a peer-visible failure in core.
     ///
-    /// Answers which methods it was the last claimant of. Those synthetic
-    /// handlers used to be left installed on the engine forever, on the reasoning
-    /// that a future claimant might re-take the method and save the install. That
-    /// traded a bounded, once-per-claim cost for an unbounded one: a client could
-    /// claim a thousand methods, disconnect, and leave a thousand handlers — each
-    /// holding its own retention in the network's gateway scope — installed for a
-    /// method nobody serves. What the engine kept is not free, and it is not this
-    /// registry's to spend.
+    /// Answers which methods it was the last claimant of, so the caller can
+    /// uninstall their synthetic handlers. Leaving them installed against a
+    /// future re-claim would be unbounded: a client can claim a thousand
+    /// methods, disconnect, and leave a thousand handlers installed for methods
+    /// nobody serves — each holding its own retention in the network's gateway
+    /// scope, which is not this registry's to spend.
     pub fn unregister(&self, id: ClientId) -> Option<UnregisteredClient> {
         let mut tables = self.inner.tables.lock();
         let handle = tables.clients.remove(&id)?;
@@ -911,20 +899,12 @@ impl ClientRegistry {
     /// capture it. Minting is not claiming: a generation that never reaches a
     /// commit is simply never seen again, and the counter is monotonic so it
     /// cannot be confused with a later one.
-    /// Exhaustion is refused rather than wrapped. `fetch_add` would roll over
-    /// at `u64::MAX` and start handing out generations that are already in use,
-    /// which is the one thing this counter exists to prevent -- and a
-    /// uniqueness claim that is only true until it silently is not is worse
-    /// than no claim. The checked update leaves the counter at `u64::MAX` and
-    /// refuses every later mint, so no generation is ever issued twice.
-    pub fn next_handler_generation(&self) -> Result<HandlerGeneration, RegistrationError> {
-        self.inner
-            .next_handler_generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |issued| {
-                issued.checked_add(1)
-            })
-            .map(HandlerGeneration)
-            .map_err(|_| RegistrationError::GenerationExhausted)
+    pub fn next_handler_generation(&self) -> HandlerGeneration {
+        HandlerGeneration(
+            self.inner
+                .next_handler_generation
+                .fetch_add(1, Ordering::Relaxed),
+        )
     }
 
     /// Who owns this method *for the caller's own installation of it*.
@@ -1053,7 +1033,7 @@ impl ClientRegistry {
         new_owner: ClientId,
         mode: HandlerMode,
     ) -> Result<(HandlerGeneration, Option<ClientId>), RegistrationError> {
-        let generation = self.next_handler_generation()?;
+        let generation = self.next_handler_generation();
         let committed = self.claim_under_lock(&key, new_owner, mode, generation)?;
         {
             let mut tables = self.inner.tables.lock();
@@ -1313,12 +1293,11 @@ impl ClientRegistry {
     /// [`Self::claim_method`] funds first: a half-installed subscription is a
     /// client that receives channel traffic its disconnect will not stop.
     ///
-    /// The answer used to be a bare `bool` meaning "you are first". That was
-    /// wrong for every follower that arrived while a route was still being
-    /// installed: it was told it had subscribed, and if the install then failed
-    /// it stayed subscribed to a route with no pump. The three arms of
-    /// [`ChannelJoin`] are the three real cases, and two of them mean *do not
-    /// answer the client yet*.
+    /// The three arms of [`ChannelJoin`] are the three real cases, and two of
+    /// them mean *do not answer the client yet*. A follower arriving while a
+    /// route is still being installed is one of those two: telling it that it
+    /// had subscribed would leave it subscribed to a route with no pump if the
+    /// install then failed.
     pub(crate) fn subscribe_channel_borrowed(
         &self,
         key: &ClaimKey,
@@ -1390,8 +1369,7 @@ impl ClientRegistry {
             false => Some(ChannelMembershipId(
                 self.inner
                     .next_membership_id
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                    .map_err(|_| RegistrationError::IdentityExhausted)?,
+                    .fetch_add(1, Ordering::Relaxed),
             )),
         };
         // Nothing below can fail.
@@ -1592,20 +1570,18 @@ impl ClientRegistry {
     /// One step of a channel fan-out: the next subscriber after `after`.
     ///
     /// **The lock is released between subscribers, and that is the whole point
-    /// of this shape.** The method this replaces held `RegistryTables` across
-    /// the caller's entire callback, and the caller's callback deep-cloned a
-    /// peer-controlled JSON payload, measured its serialized size, acquired
-    /// against the provider, inserted into a mailbox and logged refusals — once
-    /// per subscriber. Every one of those is synchronous, but the *duration* of
-    /// the whole is chosen by the remote payload's shape multiplied by the local
-    /// subscriber count, and it was chosen while the one lock protecting
+    /// of this shape.** Per subscriber the caller deep-clones a peer-controlled
+    /// JSON payload, measures its serialized size, acquires against the
+    /// provider, inserts into a mailbox and logs refusals. Each step is
+    /// synchronous, but the *duration* of the whole is the remote payload's
+    /// shape multiplied by the local subscriber count — and one lock protects
     /// clients, method claims, channel routes, pending calls, installed
-    /// handlers, lifecycle state and live-task accounting was held. A client
-    /// disconnect, a control shutdown, a method displacement, a pending RPC
-    /// settlement and a route retirement all queued behind a remote peer's
-    /// choice of payload. Visiting in place is not enough when what is visited
-    /// is attacker-sized; the lock has to be released before that work happens,
-    /// and a cursor is how a caller resumes without holding it.
+    /// handlers, lifecycle state and live-task accounting. Holding it across
+    /// that work would queue a client disconnect, a control shutdown, a method
+    /// displacement, a pending RPC settlement and a route retirement behind a
+    /// remote peer's choice of payload. Visiting in place is not enough when
+    /// what is visited is attacker-sized; the lock has to be released before
+    /// that work happens, and a cursor is how a caller resumes without it.
     ///
     /// **Exact by three identities, and none of them is a position.** The
     /// subscriber cursor is a [`ChannelMembershipId`], which is monotonic and
@@ -1730,11 +1706,10 @@ impl ClientRegistry {
     /// id internally but doesn't expose it; the IPC layer
     /// generates its own correlation id so clients can match
     /// chunks back to their originating call.
-    pub fn next_call_stream_id(&self) -> Result<u64, IpcAdmissionError> {
+    pub fn next_call_stream_id(&self) -> u64 {
         self.inner
             .next_call_stream_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| IpcAdmissionError::IdentityExhausted)
+            .fetch_add(1, Ordering::Relaxed)
     }
 
     /// Fund one inbound call before any of it is built.
@@ -1742,11 +1717,11 @@ impl ClientRegistry {
     /// **Borrowed coordinates in, funding out, and nothing constructed.** Every
     /// term of the claim is a length, and a length is readable from the inbound
     /// call's own fields — so this can be refused while the peer's coordinates
-    /// still exist only as borrows of the call core already funded. The shape
-    /// this replaces copied all four coordinates into a `PendingKey` and built
-    /// the channel that answers the call *first*, and asked for funding second,
-    /// which is not an admission: the memory a refusal was about had already
-    /// been taken, at whatever rate the peer chose to call.
+    /// still exist only as borrows of the call core already funded. Copying the
+    /// coordinates into a `PendingKey` and building the answering channel
+    /// before asking for funding would not be an admission at all: the memory
+    /// the refusal is about would already have been taken, at whatever rate the
+    /// peer chose to call.
     ///
     /// The liveness checks are here too, and deliberately not only here: a
     /// closing runtime or a departed owner refuses before anything is acquired,
@@ -1887,15 +1862,11 @@ impl ClientRegistry {
         if tables.exact_pending_inbound.contains_key(&key) {
             return Err(PendingRefusal::Duplicate);
         }
-        // The identity is the last fallible admission and is consumed before
-        // construction. Exhaustion therefore invokes no builder. Once minted
-        // it is never returned to the counter, even if a later invariant bug
-        // were to make the infallible tail stop short of publication.
-        let operation_id = self
-            .inner
-            .next_operation_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| PendingRefusal::Admission(IpcAdmissionError::IdentityExhausted))?;
+        // Minted past every refusal, so no builder ever runs against an
+        // identity that was taken and then abandoned. Once minted it is never
+        // returned to the counter, even if a later invariant bug were to make
+        // the infallible tail stop short of publication.
+        let operation_id = self.inner.next_operation_id.fetch_add(1, Ordering::Relaxed);
         // Past every refusal, and still holding the lock the insertion is made
         // under: what this builds cannot be refused and cannot be left behind.
         let (effect, caller) = build();
@@ -2022,11 +1993,6 @@ impl ClientRegistry {
     /// kept for the controls that drive the table directly and have no inbound
     /// call to borrow coordinates from.
     #[cfg(test)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "the Err returns the exact pending effect by value so its caller can settle or \
-                  drop it; boxing would allocate on the refusal path and change ownership"
-    )]
     pub fn insert_exact_pending(
         &self,
         key: PendingKey,
@@ -2114,19 +2080,7 @@ impl ClientRegistry {
                 })
             }
         };
-        let operation_id = match self.inner.next_operation_id.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |id| id.checked_add(1),
-        ) {
-            Ok(operation_id) => operation_id,
-            Err(_) => {
-                return Err(PendingRejected {
-                    effect,
-                    reason: PendingRefusal::Admission(IpcAdmissionError::IdentityExhausted),
-                })
-            }
-        };
+        let operation_id = self.inner.next_operation_id.fetch_add(1, Ordering::Relaxed);
         // One charge, two owners. It is released when the later of the record
         // and the ticket goes, which is the only moment at which no copy of
         // these buffers is still live.
@@ -2211,14 +2165,11 @@ impl ClientRegistry {
 
     /// Push one chunk into an in-flight stream. `true` if it was accepted.
     ///
-    /// Synchronous, and that is the whole shape of this function now. It used
-    /// to await, because a bounded channel made a full queue something to wait
-    /// on — and that wait was what created the race this had to be `biased`
-    /// about: the sender was cloned out, the map guard released, and a
-    /// settlement landing meanwhile could no longer be seen by looking the
-    /// record up again. The queue is resource-bounded rather than
-    /// count-bounded now, so admission is decided immediately and there is no
-    /// interval for a settlement to land in.
+    /// Synchronous, and that is the whole shape of it. The queue is
+    /// resource-bounded rather than count-bounded, so admission is decided
+    /// immediately: nothing awaits a full queue, and so there is no interval —
+    /// after the sender is cloned out and the map guard released — in which a
+    /// settlement could land unseen.
     ///
     /// Cancellation is still checked, because it is still a real answer: every
     /// terminal path — [`Self::close_exact_stream`], [`Self::unregister`],
@@ -2228,9 +2179,8 @@ impl ClientRegistry {
     /// after the `End` its peer has already been told is final.
     ///
     /// A refusal from the mailbox itself — the provider would not fund this
-    /// chunk's retention — answers `false` too. The client learns its chunk was
-    /// not accepted, which is the truthful outcome and the one the old bounded
-    /// queue expressed by blocking instead.
+    /// chunk's retention — answers `false` too, so the client learns its chunk
+    /// was not accepted rather than waiting on capacity that is not coming.
     pub fn push_exact_stream(
         &self,
         key: &PendingKey,

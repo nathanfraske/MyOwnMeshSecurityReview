@@ -150,19 +150,13 @@ pub use engine::ladder::ConnectionTier;
 /// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
 /// it answers the same question under a different contract: measured before it
 /// is built, and refusable at four separate points.
-pub use engine::peer_snapshot::{
-    FundedPeerSnapshot, PeerSnapshotRefusal, PeerSnapshotStaging, PreparedPeerSnapshot,
-};
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 /// The real-link fixture owner, exported at the root for the same reason the
 /// fixture exists: the controls that need it live in another crate.
 #[cfg(feature = "transport-lab")]
 pub use handle::TransportLabPromotedPeer;
-pub use handle::{
-    snapshot_planning_claim, FundedGovernanceSnapshot, FundedRosterSnapshot, JoinedNetwork, Mesh,
-    MeshHandle, PeerInfo, PreparedGovernanceSnapshot, PreparedRosterSnapshot,
-};
+pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
 pub use network_state::{
     NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
@@ -174,25 +168,21 @@ pub use resource::{
     prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
     serialized_mailbox_item_claim_as, FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap,
     LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
-    PreparedResourceMailbox, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
-    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease,
-    ResourceMailboxAdmissionError, ResourceMailboxCreateError, ResourceMailboxDelivery,
-    ResourceMailboxItem, ResourceMailboxItemBuilder, ResourceMailboxItemError,
-    ResourceMailboxPlanningError, ResourceMailboxReceiver, ResourceMailboxSendError,
-    ResourceMailboxSender, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
-    ResourceProviderConflict, ResourceProviderPort, ResourceReservationState, ResourceScope,
-    ResourceScopeId, ResourceUnavailable, RESOURCE_CLASS_COUNT,
+    PreparedResourceMailbox, ProcessResourceRoot, ResourceAuthorityClass, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
+    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
+    ResourceMailboxItemBuilder, ResourceMailboxItemError, ResourceMailboxPlanningError,
+    ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender, ResourcePressure,
+    ResourceProvider, ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
+    ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
+    RESOURCE_CLASS_COUNT,
 };
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
-    connector_resource_structural_claims, ConnectorCallbackMailboxCapacities,
-    ConnectorCallbackPolicy, ConnectorCallbackPolicyError, ConnectorCallbackServiceWeights,
-    ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-    ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
-    ConnectorResourceStructuralClaims, EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport,
-    MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
-    WebRtcConnectorCapablePolicy,
+    connector_resource_structural_claims, ConnectorCallbackPolicy, ConnectorResourceOwnerPort,
+    ConnectorResourceOwnerReport, ConnectorResourceStructuralClaims, MeshConnectorResourceReport,
+    MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
 pub use runtime::session_broker::session_reservation_planning_claim;
 pub use services::{ServiceAdvert, ServiceRole};
@@ -200,20 +190,20 @@ pub use topology::Topology;
 #[cfg(feature = "transport-lab")]
 pub use transport::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant,
+    transport_lab_remote_description_fixture_grant, TransportLabCallbackGrant,
+    TransportLabCallbackWorkload, TransportLabRealtimeWorkload,
 };
 /// Every realtime name at the crate root is `WebRtc`-qualified.
 ///
 /// The generic realtime vocabulary lives in [`realtime`] and names no codec, no
 /// media kind and no RTP fact; everything that does is a property of the WebRTC
 /// provider and says so in its own name. There is no unqualified spelling and no
-/// compatibility alias for the ones that used to be here — a caller updates the
-/// name or does not compile.
+/// compatibility alias — a caller names the qualified type or does not compile.
 pub use transport::{
-    PendingRemoteCandidatePolicy, WebRtcConnectorProfile, WebRtcConnectorProfileError,
-    WebRtcRealtimeCodec, WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming,
-    WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit,
-    WebRtcRealtimeProfile, WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
+    WebRtcConnectorProfile, WebRtcConnectorProfileError, WebRtcRealtimeCodec,
+    WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming, WebRtcRealtimeInboundArrival,
+    WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit, WebRtcRealtimeProfile,
+    WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };
 
 /// App-id used to derive the Trystero room handle. Two MyOwnMesh peers

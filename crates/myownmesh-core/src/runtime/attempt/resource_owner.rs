@@ -2,8 +2,7 @@
 
 use super::*;
 use crate::resource::{
-    ReclaimResult, ResourceAdmission, ResourceAuthorityClass, ResourceClaim, ResourceClass,
-    ResourceLease, ResourceProviderPort, ResourceReclaimSubscription, ResourceReclaimTarget,
+    ResourceAuthorityClass, ResourceClaim, ResourceClass, ResourceLease, ResourceProviderPort,
     ResourceScope, ResourceUnavailable,
 };
 use futures_util::FutureExt;
@@ -194,7 +193,6 @@ pub(super) struct MeshConnectorResourceScopeToken {
 pub(crate) struct ConnectorWorkResourceScope {
     provider: ResourceProviderPort,
     scope: ResourceScope,
-    reclaim_target: Option<ResourceReclaimTarget>,
     /// The process cleanup executor this connector's subordinate native objects
     /// submit their retirements to.
     ///
@@ -207,10 +205,6 @@ pub(crate) struct ConnectorWorkResourceScope {
 }
 
 impl ConnectorWorkResourceScope {
-    pub(crate) fn scope_id(&self) -> crate::resource::ResourceScopeId {
-        self.scope.id()
-    }
-
     /// Where this connector's subordinate native retirements are submitted.
     pub(crate) fn cleanup_submission(&self) -> &ConnectorCleanupSubmissionPort {
         &self.cleanup_submission
@@ -221,12 +215,7 @@ impl ConnectorWorkResourceScope {
         authority: ResourceAuthorityClass,
         claim: ResourceClaim,
     ) -> Result<ResourceLease, ResourceUnavailable> {
-        match (authority, self.reclaim_target.as_ref()) {
-            (ResourceAuthorityClass::Speculative, Some(target)) => self
-                .provider
-                .acquire_reclaimable_now(&self.scope, claim, target.clone()),
-            _ => self.provider.acquire(&self.scope, authority, claim),
-        }
+        self.provider.acquire(&self.scope, authority, claim)
     }
 
     #[cfg(test)]
@@ -364,7 +353,6 @@ impl MeshConnectorResourceScope {
         let work_scope = ConnectorWorkResourceScope {
             provider: self.token.owner.provider.clone(),
             scope: connector_scope,
-            reclaim_target: None,
             cleanup_submission: self.cleanup_submission_port(),
         };
         self.token.owner.diagnostics.note_acquired();
@@ -379,59 +367,6 @@ impl MeshConnectorResourceScope {
                 cleanup_lifecycle: Mutex::new(Default::default()),
             }),
         })
-    }
-
-    /// Wait for one fair process turn, then atomically install the child scope
-    /// and its first reclaimable speculative lease.
-    ///
-    /// No time limit applies. The pending demand is move-only and cancellation
-    /// drops its fairness turn without installing an empty child scope.
-    pub(super) async fn reserve_cooperatively(
-        &self,
-        claim: ResourceClaim,
-    ) -> Result<(ConnectorCandidateReservation, ResourceReclaimSubscription), ResourceUnavailable>
-    {
-        let (reclaim_target, reclaim_subscription) = ResourceReclaimSubscription::channel();
-        let work_reclaim_target = reclaim_target.clone();
-        let mut admission = self
-            .token
-            .owner
-            .provider
-            .create_scope_with_reclaimable_lease_cooperatively(
-                &self.token.scope,
-                claim,
-                reclaim_target,
-            )?;
-        let lease = loop {
-            match admission {
-                ResourceAdmission::Acquired(lease) => break lease,
-                ResourceAdmission::Pending(demand) => {
-                    demand.ready().await?;
-                    admission = demand.retry()?;
-                }
-            }
-        };
-        let work_scope = ConnectorWorkResourceScope {
-            provider: self.token.owner.provider.clone(),
-            scope: lease.scope(),
-            reclaim_target: Some(work_reclaim_target),
-            cleanup_submission: self.cleanup_submission_port(),
-        };
-        self.token.owner.diagnostics.note_acquired();
-        self.token.diagnostics.note_acquired();
-        Ok((
-            ConnectorCandidateReservation {
-                state: Arc::new(ConnectorCandidateReservationState {
-                    lease: Mutex::new(Some(lease)),
-                    work_scope,
-                    process_diagnostics: Arc::clone(&self.token.owner.diagnostics),
-                    mesh_diagnostics: Arc::clone(&self.token.diagnostics),
-                    cleanup_capability_issued: AtomicBool::new(false),
-                    cleanup_lifecycle: Mutex::new(Default::default()),
-                }),
-            },
-            reclaim_subscription,
-        ))
     }
 
     #[cfg(test)]
@@ -927,15 +862,11 @@ pub(super) fn retain_failed_reservation(
 ) {
     let expected = lease.claim();
     match lease.retain_after_failed_cleanup() {
-        ReclaimResult::Retained(retained) if retained == expected => {
+        Ok(retained) if retained == expected => {
             process_diagnostics.note_failed_cleanup();
             mesh_diagnostics.note_failed_cleanup();
         }
-        ReclaimResult::NotNeeded
-        | ReclaimResult::Reclaimed(_)
-        | ReclaimResult::Retained(_)
-        | ReclaimResult::Deferred(_)
-        | ReclaimResult::ProviderInvariant { .. } => {
+        Ok(_) | Err(_) => {
             process_diagnostics.poison();
             mesh_diagnostics.poison();
         }

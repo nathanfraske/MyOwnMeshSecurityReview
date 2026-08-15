@@ -14,13 +14,12 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
-use super::{funded, refused, unknown_network, Answer};
+use super::{funded, refused, refused_text, unknown_network, Answer};
 use crate::control::framing::{AdmittedLineOut, FrameAdmission};
 use crate::control::reply::{
-    prepare_reply_then, variable_operation_claim, ControlOut, FundedVariableReply, PreparedReply,
-    PreparedText,
+    prepare_reply_then, ControlOut, FundedVariableReply, PreparedReply, ResponseOwner,
 };
 use crate::control::{ConnectionCancel, ControlState};
 
@@ -65,15 +64,7 @@ pub(in crate::control) async fn register(
         crate::ipc::clients::HandlerMode::Single
     };
     let key = (network, method);
-    let generation = match state.clients.next_handler_generation() {
-        Ok(generation) => generation,
-        Err(refusal) => {
-            drop(output);
-            let text = PreparedText::rpc_registration_error(&refusal, admission)
-                .context("RPC-register refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
-        }
-    };
+    let generation = state.clients.next_handler_generation();
     let prepared = match crate::ipc::bridge::prepare_handler_for_mode(
         &net.rpc(),
         &key,
@@ -84,9 +75,7 @@ pub(in crate::control) async fn register(
         Ok(prepared) => prepared,
         Err(refusal) => {
             drop(output);
-            let text = PreparedText::rpc_gateway_error(&refusal, admission)
-                .context("RPC-register gateway refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
+            return refused_text(format!("rpc register refused: {refusal}"), admission);
         }
     };
     let previous = match state
@@ -96,9 +85,7 @@ pub(in crate::control) async fn register(
         Ok(previous) => previous,
         Err(refusal) => {
             drop(output);
-            let text = PreparedText::rpc_registration_error(&refusal, admission)
-                .context("RPC-register commit refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
+            return refused_text(format!("rpc register refused: {refusal}"), admission);
         }
     };
     if let Some((previous, key)) = previous {
@@ -207,9 +194,10 @@ pub(in crate::control) async fn respond(
         return Ok((success, output));
     }
     drop(output);
-    let text = PreparedText::no_inflight_rpc(&key.remote_request_id, admission)
-        .context("RPC-resolve refusal text was not admitted")?;
-    funded(PreparedReply::Error(text), admission)
+    refused_text(
+        format!("no in-flight inbound RPC for '{}'", key.remote_request_id),
+        admission,
+    )
 }
 
 /// Push one chunk onto an in-flight streaming response.
@@ -254,9 +242,13 @@ pub(in crate::control) async fn stream_chunk(
         return Ok((success, output));
     }
     drop(output);
-    let text = PreparedText::no_inflight_stream(&key.remote_request_id, admission)
-        .context("stream-chunk refusal text was not admitted")?;
-    funded(PreparedReply::Error(text), admission)
+    refused_text(
+        format!(
+            "no in-flight inbound stream for '{}'",
+            key.remote_request_id
+        ),
+        admission,
+    )
 }
 
 /// Close an in-flight streaming response, cleanly or with an error.
@@ -329,24 +321,22 @@ pub(in crate::control) async fn call(
     payload: serde_json::Value,
 ) -> Result<Option<Answer>> {
     let Some(joined) = state.registry.get(&network) else {
-        let text = PreparedText::unknown_network(&network, admission)
-            .context("RpcCall lookup refusal text was not admitted")?;
-        return funded(PreparedReply::Error(text), admission).map(Some);
+        return unknown_network(&network, admission).map(Some);
     };
-    // The result's size is not known until it arrives, so the residual it will
-    // occupy is admitted before the call is made rather than measured after.
-    let operation = admission
-        .acquire_claim(variable_operation_claim())
-        .context("RpcCall result operation was not admitted")?;
+    // The result's size is not known until it arrives, so the right to answer is
+    // taken before the call is made rather than after it returns.
+    let owner =
+        ResponseOwner::acquire(admission).context("RpcCall result operation was not admitted")?;
     let rpc = joined.rpc();
     let result = tokio::select! {
         biased;
         () = cancel.cancelled() => return Ok(None),
         result = rpc.call_funded(&peer, &method, payload) => result,
     };
-    let variable = FundedVariableReply::rpc_call(result, operation)
-        .map_err(|_| anyhow!("RpcCall operation lease did not match"))?;
-    let output = AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, admission)
-        .context("RpcCall response line was not admitted")?;
-    Ok(Some((PreparedReply::Variable(variable), output)))
+    funded(
+        PreparedReply::Variable(FundedVariableReply::rpc_call(result, owner)),
+        admission,
+    )
+    .context("RpcCall response line was not admitted")
+    .map(Some)
 }

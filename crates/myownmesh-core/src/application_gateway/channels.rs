@@ -13,17 +13,13 @@ pub(crate) struct GatewayChannelFrame {
     pub(crate) payload: serde_json::Value,
 }
 
-/// One subscriber's queue, shared between the subscription that owns it, the
-/// channel registry that routes to it, and any decoded message still in the
-/// application's hands.
+/// One subscriber's queue, owned by its subscription and observed weakly by the
+/// channel registry that routes to it.
 ///
-/// **The funding rides in the handles, not in here.** It used to be an
-/// `_allocation: ResourceLease` field, which meant the lease was destroyed on
-/// the last *strong* drop while the allocation itself survived for as long as
-/// any weak registry link did — the provider told its storage was free while
-/// that storage was still there to be upgraded through. [`FundedArc`] and
-/// [`FundedWeak`] release the claim when every handle of either kind is gone,
-/// which is the only moment the allocation is actually returned.
+/// The funding rides in the strong [`FundedArc`] handles. A [`FundedWeak`]
+/// registry entry retains no claim and can upgrade only while a funded strong
+/// owner still exists. A delivered message owns its own delivery, not this
+/// mailbox, so dropping the subscription releases all queued deliveries.
 pub(crate) struct ChannelSubscriber {
     mailbox: parking_lot::Mutex<GatewayMailbox<GatewayChannelFrame>>,
     ready: tokio::sync::Notify,
@@ -116,11 +112,11 @@ impl ApplicationGateway {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(GatewayRefusal::Revoked);
         }
-        let subscriber_bytes = std::mem::size_of::<ChannelSubscriber>()
-            .checked_add(2 * std::mem::size_of::<usize>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(GatewayRefusal::Malformed)?;
-        // This residual belongs only to the shared allocation/control block.
+        let subscriber_bytes = u64::try_from(std::mem::size_of::<ChannelSubscriber>())
+            .map_err(|_| GatewayRefusal::Malformed)?;
+        // This residual covers the subscriber allocation and the dependency's
+        // internal shared-owner representation without mirroring allocator
+        // control-block arithmetic.
         // A decoded result is not a property of the subscription: applications
         // may retain any number of distinct messages. Each accepted delivery
         // therefore acquires its own decoded-result residual below.
@@ -546,6 +542,83 @@ mod tests {
         assert_eq!(later.body, "decoded-result");
         assert_eq!(decodes.load(std::sync::atomic::Ordering::Relaxed), 2);
         drop(later);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    /// A delivered value owns only its delivery, never the subscriber mailbox.
+    /// Keeping A while the subscription owner goes away must release queued B
+    /// and C immediately; otherwise an application can make abandoned mailbox
+    /// contents hostage merely by retaining one value it already received.
+    #[test]
+    fn a_delivered_channel_message_does_not_pin_the_abandoned_subscriber_mailbox() {
+        let grant = ResourceClaim::try_from_entries(
+            ResourceClass::ALL
+                .into_iter()
+                .map(|resource| (resource, 1 << 20)),
+        )
+        .expect("the broad control grant is representable");
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone())
+            .expect("the control grant funds its process scope");
+        let scope = port.process_scope();
+        let baseline = provider.in_use();
+
+        let subscriber_claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(std::mem::size_of::<ChannelSubscriber>())
+                    .expect("the subscriber layout fits the ledger"),
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .expect("the subscriber claim is representable");
+        let subscriber = FundedArc::new(
+            ChannelSubscriber::new(),
+            port.acquire(&scope, ResourceAuthorityClass::Admitted, subscriber_claim)
+                .expect("the subscriber allocation is admitted"),
+        )
+        .expect("an admitted subscriber allocation may be shared");
+
+        let payload = serde_json::Value::String("held-a".to_owned());
+        let payload_claim = crate::resource::serialized_mailbox_item_claim(&payload)
+            .expect("the payload claim is measurable");
+        let retention = channel_delivery_claim(payload_claim, "peer")
+            .expect("the delivery claim is representable");
+        let node = GatewayMailbox::<GatewayChannelFrame>::node_claim()
+            .expect("the mailbox node claim is representable");
+
+        for _ in 0..3 {
+            subscriber.accept(
+                GatewayChannelFrame {
+                    from: "peer".to_owned(),
+                    payload: payload.clone(),
+                },
+                port.acquire(&scope, ResourceAuthorityClass::Admitted, retention)
+                    .expect("the delivery retention is admitted"),
+                port.acquire(&scope, ResourceAuthorityClass::Admitted, node)
+                    .expect("the delivery node is admitted"),
+            );
+        }
+
+        let delivery = subscriber.try_recv().expect("A is delivered");
+        let body =
+            String::deserialize(&delivery.value().payload).expect("the admitted payload decodes");
+        let held = crate::channels::ChannelMessage::from_delivery(body, delivery);
+
+        drop(subscriber);
+        let held_only = baseline
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(retention)
+                    .expect("the retained delivery charge is representable"),
+            )
+            .expect("baseline and one retained delivery compose");
+        assert_eq!(
+            provider.in_use(),
+            held_only,
+            "queued B and C plus the subscriber allocation release while A is held"
+        );
+
+        drop(held);
         assert_eq!(provider.in_use(), baseline);
     }
 

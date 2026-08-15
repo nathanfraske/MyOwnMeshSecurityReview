@@ -25,7 +25,6 @@
 //! would only stop this module's callers racing each other, which was never the
 //! problem.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,8 +34,7 @@ use myownmesh_core::events::{MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{
-    ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackServiceWeights,
-    PendingRemoteCandidatePolicy, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+    ConnectorCallbackPolicy, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -89,16 +87,7 @@ pub(crate) fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
 }
 
 pub(crate) fn test_transport() -> Transport {
-    let callback_capacity =
-        NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
-    let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
-        ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
-        myownmesh_core::RealtimeConnectorPolicy::Disabled,
-    )
-    .expect("test data-only callback policy is valid");
-    let webrtc_profile =
-        WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
+    let webrtc_profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
     let policy = WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), webrtc_profile);
     Transport::new()
         .expect("transport")

@@ -1,18 +1,18 @@
 //! One sealed reply envelope, and the exact line admission that funds it.
 //!
-//! Split out of `framing.rs`, which is documented as knowing nothing about
-//! request meaning and had come to name roster snapshots, governance
-//! snapshots, updater outcomes, RPC results and MFA enrollments. The funding
-//! boundary those types enforce was never the problem; the file they lived in
-//! was. Bytes and admission stayed there, the vocabulary of what a reply *is*
-//! came here.
+//! `framing.rs` knows nothing about request meaning: bytes and admission are
+//! its subject, and the vocabulary of what a reply *is* is this module's.
 //!
-//! What this module may do: describe a reply, measure it before it exists, and
-//! keep the owner that funds it alive until the bytes are written. What it may
-//! not do: perform an operation. Every value here is constructed by a domain
-//! module that knows what it is answering — see `dispatch/network.rs` for the
-//! shape — and this module only says what such an answer costs and how it
-//! encodes.
+//! What this module may do: describe a reply, measure its encoded line before
+//! that line exists, and keep the owner that funds it alive until the bytes are
+//! written. What it may not do: perform an operation. Every value here is
+//! constructed by a domain module that knows what it is answering — see
+//! `dispatch/network.rs` for the shape — and this module only says what such an
+//! answer costs and how it encodes.
+//!
+//! There is one admission vocabulary and one measuring pass. [`ResponseOwner`]
+//! is taken before the operation runs and covers the whole answer; the writer
+//! measures the sealed reply once, on its way to funding the buffer.
 //!
 //! `pub(super)` here means `pub(in crate::control)`, exactly as it did in
 //! `framing.rs`, so the domain modules already reach these names and nothing
@@ -21,7 +21,7 @@
 use anyhow::Result;
 
 use super::framing::{
-    AdmittedLineOut, CountingSink, DecodeRefusal, EncodeRefusal, FrameAdmission, FrameRefusal,
+    AdmittedLineOut, CountingSink, EncodeRefusal, FrameAdmission, FrameRefusal,
     PreparedLineCapacity,
 };
 
@@ -46,10 +46,10 @@ use super::framing::{
 /// [`ServerOut`]: crate::ipc::ServerOut
 /// [`ConnTrace`]: myownmesh_core::ConnTrace
 pub(super) enum ControlOut<'a> {
-    /// One request's answer as the untyped envelope, which production no longer
-    /// writes: every live arm now answers through [`Self::Prepared`], where the
+    /// One request's answer as the untyped envelope, which production does not
+    /// write: every live arm answers through [`Self::Prepared`], where the
     /// reply's width is admitted before any owned field exists. The variant
-    /// stays for the controls that assert this end still encodes as the wire
+    /// exists for the controls that assert this end still encodes as the wire
     /// contract `Response` describes, and is gated so a release build does not
     /// carry a shape nothing constructs.
     #[cfg(test)]
@@ -97,272 +97,111 @@ pub(super) enum PreparedReply {
     NetworkId(myownmesh_core::identity::FundedNetworkId),
     Status(crate::registry::FundedStatus),
     Networks(crate::registry::FundedNetworksList),
+    Peers(FundedDiagnostic<Vec<myownmesh_core::PeerInfo>>),
+    Roster(FundedDiagnostic<Vec<myownmesh_core::AuthorizedPeer>>),
+    Governance(FundedDiagnostic<GovernanceDiagnostic>),
     Variable(FundedVariableReply),
 }
 
-/// One owned response string and the funding that outlives its buffer.
-pub(super) struct PreparedText {
-    value: String,
-    _retention: myownmesh_core::ResourceLease,
+pub(super) struct GovernanceDiagnostic {
+    pub(super) state: myownmesh_core::NetworkState,
+    pub(super) evicted: Vec<String>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(super) enum PreparedTextRefusal {
-    #[error(transparent)]
-    Admission(#[from] FrameRefusal),
-    #[error("prepared response text could not be formatted")]
-    Format,
-    #[error("prepared response text changed length between measurement and construction")]
-    Unstable,
+/// One broad response owner, acquired before the operation it answers for.
+///
+/// One `OpaqueDependencyResidual` covers the entire reply: the owned text it may
+/// carry, the diagnostic value it may hold, and the sealed envelope the writer
+/// serializes once.
+///
+/// **Intentionally broad.** This is not a byte budget and does not stand in for
+/// one. What bounds the bytes is the encoded-line admission the writer takes
+/// over the finished reply, before it allocates the buffer; this owner is only
+/// the right to begin forming an answer. It does not replace that later,
+/// fallible line admission. An effect whose reply carries its only usable
+/// capability or secret still needs rollback ownership until the writer reports
+/// [`crate::control::Wrote::Sent`].
+///
+/// A newtype rather than a bare lease because only [`Self::acquire`] builds one,
+/// so a reply constructor needs no runtime check that the lease it was handed
+/// carries this claim.
+pub(super) struct ResponseOwner {
+    _owner: myownmesh_core::ResourceLease,
+}
+
+const RESPONSE_OWNER_CLAIM: myownmesh_core::ResourceClaim = myownmesh_core::ResourceClaim::single(
+    myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+    1,
+);
+
+impl ResponseOwner {
+    /// Take the right to answer, before the operation that will be answered.
+    pub(super) fn acquire(admission: &FrameAdmission) -> std::result::Result<Self, FrameRefusal> {
+        Ok(Self {
+            _owner: admission.acquire_claim(RESPONSE_OWNER_CLAIM)?,
+        })
+    }
+
+    /// Seal one operation's outcome into the reply this owner funds.
+    ///
+    /// Consuming, so one owner cannot fund two answers, and the sealed value is
+    /// the only thing that leaves. The operation modules hand this back and the
+    /// connection loop writes it; there is no second place a reply is made.
+    pub(super) fn finish(
+        self,
+        result: std::result::Result<OperationReplyData, String>,
+    ) -> FundedVariableReply {
+        FundedVariableReply::Operation(FundedOperationReply {
+            result,
+            _owner: self,
+        })
+    }
+}
+
+/// One diagnostic value retained beside the response owner that funds it.
+pub(super) struct FundedDiagnostic<T> {
+    value: T,
+    _owner: ResponseOwner,
+}
+
+impl<T> FundedDiagnostic<T> {
+    pub(super) fn new(value: T, owner: ResponseOwner) -> Self {
+        Self {
+            value,
+            _owner: owner,
+        }
+    }
+}
+
+/// One owned response string, held under the response owner that funds it.
+///
+/// Every string this carries is formatted from values the request admission
+/// already bounded, and the encoded line is measured exactly once, by the
+/// writer, over the sealed reply this text is part of.
+pub(super) struct PreparedText {
+    value: String,
+    _owner: ResponseOwner,
 }
 
 impl PreparedText {
-    pub(super) fn copying(
-        value: &str,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        Self::building(value.len(), admission, || value.to_owned())
-    }
-
-    fn surrounded(
-        prefix: &'static str,
-        value: &str,
-        suffix: &'static str,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        let bytes = prefix
-            .len()
-            .checked_add(value.len())
-            .and_then(|bytes| bytes.checked_add(suffix.len()))
-            .ok_or(PreparedTextRefusal::Format)?;
-        Self::building(bytes, admission, || {
-            let mut text = String::with_capacity(bytes);
-            text.push_str(prefix);
-            text.push_str(value);
-            text.push_str(suffix);
-            text
-        })
-    }
-
-    /// Acquire the exact typed-string claim before invoking its sole builder.
-    pub(super) fn building<B>(
-        bytes: usize,
-        admission: &FrameAdmission,
-        build: B,
-    ) -> std::result::Result<Self, PreparedTextRefusal>
-    where
-        B: FnOnce() -> String,
-    {
-        let claim = match myownmesh_core::mailbox_retained_claim::<String>(bytes, 0, 1) {
-            Ok(claim) => claim,
-            Err(myownmesh_core::ResourceMailboxItemError::Claim(error)) => {
-                return Err(FrameRefusal::Claim(error).into());
-            }
-            Err(myownmesh_core::ResourceMailboxItemError::Measurement(_)) => {
-                unreachable!("a claim built from scalar counts performs no measurement")
-            }
-        };
-        let retention = admission.acquire_claim(claim)?;
-        let value = build();
-        if value.len() != bytes {
-            return Err(PreparedTextRefusal::Unstable);
-        }
-        Ok(Self {
+    /// Take owned text under an owner already acquired for this response.
+    pub(super) fn owned(value: String, owner: ResponseOwner) -> Self {
+        Self {
             value,
-            _retention: retention,
-        })
-    }
-
-    /// Format the one closed error source currently admitted at this boundary.
-    pub(super) fn core_error(
-        value: &myownmesh_core::Error,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        use std::fmt::Write as _;
-
-        struct Count(usize);
-        impl std::fmt::Write for Count {
-            fn write_str(&mut self, value: &str) -> std::fmt::Result {
-                self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
-                Ok(())
-            }
+            _owner: owner,
         }
-
-        let mut count = Count(0);
-        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
-        let claim = match myownmesh_core::mailbox_retained_claim::<String>(count.0, 0, 1) {
-            Ok(claim) => claim,
-            Err(myownmesh_core::ResourceMailboxItemError::Claim(error)) => {
-                return Err(FrameRefusal::Claim(error).into());
-            }
-            Err(myownmesh_core::ResourceMailboxItemError::Measurement(_)) => {
-                unreachable!("a claim built from scalar counts performs no measurement")
-            }
-        };
-        let retention = admission.acquire_claim(claim)?;
-        let mut text = String::with_capacity(count.0);
-        write!(&mut text, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
-        if text.len() != count.0 {
-            return Err(PreparedTextRefusal::Unstable);
-        }
-        Ok(Self {
-            value: text,
-            _retention: retention,
-        })
     }
 
-    /// The exact daemon-owned lookup refusal; no generic formatter crosses the
-    /// prepared boundary.
-    pub(super) fn unknown_network(
-        network: &str,
+    /// The same, for a refusal with nothing else to fund: the operation either
+    /// already failed or was never reached, so this is the response's only
+    /// owner.
+    pub(super) fn acquiring(
+        value: String,
         admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        const PREFIX: &str = "unknown network: ";
-        let bytes = PREFIX
-            .len()
-            .checked_add(network.len())
-            .ok_or(PreparedTextRefusal::Format)?;
-        Self::building(bytes, admission, || {
-            let mut text = String::with_capacity(bytes);
-            text.push_str(PREFIX);
-            text.push_str(network);
-            text
-        })
-    }
-
-    pub(super) fn no_inflight_rpc(
-        request_id: &str,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        Self::surrounded("no in-flight inbound RPC for '", request_id, "'", admission)
-    }
-
-    pub(super) fn no_inflight_stream(
-        request_id: &str,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        Self::surrounded(
-            "no in-flight inbound stream for '",
-            request_id,
-            "'",
-            admission,
-        )
-    }
-
-    pub(super) fn rpc_advertise_error(
-        value: &myownmesh_core::rpc::RpcError,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        use std::fmt::Write as _;
-        const PREFIX: &str =
-            "capabilities were not advertised; the node is still publishing its previous ones: ";
-        let mut count = DisplayCount(PREFIX.len());
-        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
-        let bytes = count.0;
-        Self::building(bytes, admission, || {
-            let mut text = String::with_capacity(bytes);
-            text.push_str(PREFIX);
-            write!(&mut text, "{value}").expect("formatting an error into String cannot fail");
-            text
-        })
-    }
-
-    pub(super) fn channel_error(
-        value: &myownmesh_core::ChannelError,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        use std::fmt::Write as _;
-        let mut count = DisplayCount(0);
-        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
-        Self::building(count.0, admission, || value.to_string())
-    }
-
-    pub(super) fn decode_admission_error(
-        value: &DecodeRefusal,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        use std::fmt::Write as _;
-        let mut count = DisplayCount(0);
-        write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
-        Self::building(count.0, admission, || value.to_string())
-    }
-
-    pub(super) fn no_inbound_realtime_stream(
-        peer: &str,
-        admission: &FrameAdmission,
-    ) -> std::result::Result<Self, PreparedTextRefusal> {
-        Self::surrounded(
-            "no inbound realtime stream for ",
-            peer,
-            ": the session is not current, or a live pipe already holds it — one inbound pipe per session, and the lease returns when that pipe ends",
-            admission,
-        )
+    ) -> std::result::Result<Self, FrameRefusal> {
+        Ok(Self::owned(value, ResponseOwner::acquire(admission)?))
     }
 }
-
-struct DisplayCount(usize);
-
-impl std::fmt::Write for DisplayCount {
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
-        Ok(())
-    }
-}
-
-macro_rules! closed_prefixed_error {
-    ($name:ident, $ty:ty, $prefix:literal) => {
-        impl PreparedText {
-            pub(super) fn $name(
-                value: &$ty,
-                admission: &FrameAdmission,
-            ) -> std::result::Result<Self, PreparedTextRefusal> {
-                use std::fmt::Write as _;
-                let mut count = DisplayCount($prefix.len());
-                write!(&mut count, "{value}").map_err(|_| PreparedTextRefusal::Format)?;
-                let bytes = count.0;
-                Self::building(bytes, admission, || {
-                    let mut text = String::with_capacity(bytes);
-                    text.push_str($prefix);
-                    write!(&mut text, "{value}")
-                        .expect("formatting a concrete error into String cannot fail");
-                    text
-                })
-            }
-        }
-    };
-}
-
-closed_prefixed_error!(
-    rpc_registration_error,
-    crate::ipc::clients::RegistrationError,
-    "rpc register refused: "
-);
-closed_prefixed_error!(json_parse_error, serde_json::Error, "parse: ");
-closed_prefixed_error!(
-    network_id_error,
-    myownmesh_core::identity::NetworkIdRefusal,
-    ""
-);
-closed_prefixed_error!(
-    events_registration_error,
-    crate::ipc::clients::IpcAdmissionError,
-    "events subscribe refused: "
-);
-closed_prefixed_error!(
-    rpc_gateway_error,
-    myownmesh_core::application_gateway::GatewayRefusal,
-    "rpc register refused: "
-);
-closed_prefixed_error!(
-    channel_registration_error,
-    crate::ipc::clients::RegistrationError,
-    "channel subscribe refused: "
-);
-closed_prefixed_error!(
-    channel_pump_error,
-    crate::ipc::bridge::ChannelPumpError,
-    "channel subscribe refused: "
-);
 
 impl serde::Serialize for PreparedReply {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -511,6 +350,49 @@ impl serde::Serialize for PreparedReply {
                 response.serialize_field("data", networks)?;
                 response.end()
             }
+            Self::Peers(peers) => {
+                #[derive(serde::Serialize)]
+                struct PeersData<'a> {
+                    peers: &'a [myownmesh_core::PeerInfo],
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &PeersData {
+                        peers: &peers.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::Roster(roster) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &RosterData {
+                        roster: &roster.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::Governance(governance) => {
+                #[derive(serde::Serialize)]
+                struct GovernanceData<'a> {
+                    state: &'a myownmesh_core::NetworkState,
+                    evicted: &'a [String],
+                }
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &GovernanceData {
+                        state: &governance.value.state,
+                        evicted: &governance.value.evicted,
+                    },
+                )?;
+                response.end()
+            }
             Self::Variable(variable) => variable.serialize(serializer),
         }
     }
@@ -521,63 +403,7 @@ struct RosterData<'a> {
     roster: &'a [myownmesh_core::AuthorizedPeer],
 }
 
-pub(super) enum VariableReplySource<'a> {
-    Roster(myownmesh_core::PreparedRosterSnapshot<'a>),
-    Governance(myownmesh_core::PreparedGovernanceSnapshot<'a>),
-}
-
-impl<'a> VariableReplySource<'a> {
-    pub(super) fn roster(plan: myownmesh_core::PreparedRosterSnapshot<'a>) -> Self {
-        Self::Roster(plan)
-    }
-
-    pub(super) fn governance(plan: myownmesh_core::PreparedGovernanceSnapshot<'a>) -> Self {
-        Self::Governance(plan)
-    }
-
-    pub(super) fn typed_claim(&self) -> myownmesh_core::ResourceClaim {
-        match self {
-            Self::Roster(plan) => plan.typed_retention_claim(),
-            Self::Governance(plan) => plan.typed_retention_claim(),
-        }
-    }
-
-    pub(super) fn data_ceiling(&self) -> std::result::Result<usize, FrameRefusal> {
-        match self {
-            Self::Roster(plan) => "{\"roster\":"
-                .len()
-                .checked_add(plan.encoding_ceiling())
-                .and_then(|bytes| bytes.checked_add(1))
-                .ok_or(FrameRefusal::Claim(
-                    myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                        dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                    },
-                )),
-            Self::Governance(plan) => Ok(plan.encoding_ceiling()),
-        }
-    }
-
-    pub(super) async fn commit(
-        self,
-        lease: myownmesh_core::ResourceLease,
-    ) -> anyhow::Result<FundedVariableReply> {
-        match self {
-            Self::Roster(plan) => plan
-                .commit(lease)
-                .map(FundedVariableReply::Roster)
-                .map_err(|_| anyhow::anyhow!("RosterList grew before commit")),
-            Self::Governance(plan) => plan
-                .commit(lease)
-                .await
-                .map(FundedVariableReply::Governance)
-                .map_err(anyhow::Error::from),
-        }
-    }
-}
-
 pub(super) enum FundedVariableReply {
-    Roster(myownmesh_core::FundedRosterSnapshot),
-    Governance(myownmesh_core::FundedGovernanceSnapshot),
     UpdaterStatus(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::UpdateStatus>),
     UpdaterCheck(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::CheckOutcome>),
     RpcCall(FundedRpcCallOutcome),
@@ -639,23 +465,9 @@ pub(super) struct NetworkLifecycleSummary {
     pub(super) restarted: bool,
 }
 
-pub(super) struct VariableOperationPlan {
-    operation: myownmesh_core::ResourceLease,
-}
-
 pub(super) struct FundedOperationReply {
     result: std::result::Result<OperationReplyData, String>,
-    _operation: myownmesh_core::ResourceLease,
-}
-
-const VARIABLE_OPERATION_CLAIM: myownmesh_core::ResourceClaim =
-    myownmesh_core::ResourceClaim::single(
-        myownmesh_core::ResourceClass::OpaqueDependencyResidual,
-        1,
-    );
-
-pub(super) const fn variable_operation_claim() -> myownmesh_core::ResourceClaim {
-    VARIABLE_OPERATION_CLAIM
+    _owner: ResponseOwner,
 }
 
 pub(super) struct FundedRpcCallOutcome {
@@ -663,54 +475,15 @@ pub(super) struct FundedRpcCallOutcome {
         myownmesh_core::rpc::FundedRpcCallResult,
         myownmesh_core::rpc::RpcError,
     >,
-    _operation: myownmesh_core::ResourceLease,
-}
-
-#[cfg(test)]
-static RPC_CALL_REPLY_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(super) fn rpc_call_reply_builds() -> usize {
-    RPC_CALL_REPLY_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+    _owner: ResponseOwner,
 }
 
 pub(super) struct FundedMfaEnrollment {
     result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
-    _operation: myownmesh_core::ResourceLease,
+    _owner: ResponseOwner,
 }
 
 impl FundedVariableReply {
-    #[expect(
-        clippy::result_large_err,
-        reason = "a mismatched admitted lease must be returned intact without allocating"
-    )]
-    pub(super) fn begin_operation(
-        operation: myownmesh_core::ResourceLease,
-    ) -> std::result::Result<VariableOperationPlan, myownmesh_core::ResourceLease> {
-        if operation.claim() != VARIABLE_OPERATION_CLAIM {
-            return Err(operation);
-        }
-        Ok(VariableOperationPlan { operation })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "a mismatched admitted lease must be returned intact without allocating"
-    )]
-    pub(super) fn operation(
-        result: std::result::Result<OperationReplyData, String>,
-        operation: myownmesh_core::ResourceLease,
-    ) -> std::result::Result<Self, myownmesh_core::ResourceLease> {
-        if operation.claim() != VARIABLE_OPERATION_CLAIM {
-            return Err(operation);
-        }
-        Ok(Self::Operation(FundedOperationReply {
-            result,
-            _operation: operation,
-        }))
-    }
-
     pub(super) fn updater_status(
         value: myownmesh_updater::FundedUpdaterResult<myownmesh_updater::UpdateStatus>,
     ) -> Self {
@@ -723,104 +496,33 @@ impl FundedVariableReply {
         Self::UpdaterCheck(value)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "a mismatched admitted lease is returned intact; boxing adds an unpriced allocation on the accounting refusal path"
-    )]
     pub(super) fn rpc_call(
         result: std::result::Result<
             myownmesh_core::rpc::FundedRpcCallResult,
             myownmesh_core::rpc::RpcError,
         >,
-        operation: myownmesh_core::ResourceLease,
-    ) -> std::result::Result<Self, myownmesh_core::ResourceLease> {
-        if operation.claim() != VARIABLE_OPERATION_CLAIM {
-            return Err(operation);
-        }
-        #[cfg(test)]
-        RPC_CALL_REPLY_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self::RpcCall(FundedRpcCallOutcome {
+        owner: ResponseOwner,
+    ) -> Self {
+        Self::RpcCall(FundedRpcCallOutcome {
             result,
-            _operation: operation,
-        }))
+            _owner: owner,
+        })
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "a mismatched admitted lease is returned intact; boxing adds an unpriced allocation on the accounting refusal path"
-    )]
     pub(super) fn mfa_enrollment(
         result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
-        operation: myownmesh_core::ResourceLease,
-    ) -> std::result::Result<Self, myownmesh_core::ResourceLease> {
-        if operation.claim() != VARIABLE_OPERATION_CLAIM {
-            return Err(operation);
-        }
-        Ok(Self::MfaEnrollment(FundedMfaEnrollment {
+        owner: ResponseOwner,
+    ) -> Self {
+        Self::MfaEnrollment(FundedMfaEnrollment {
             result,
-            _operation: operation,
-        }))
-    }
-
-    pub(super) fn exact_line_len(&self) -> std::result::Result<usize, FrameRefusal> {
-        let mut count = CountingSink::default();
-        serde_json::to_writer(&mut count, self).map_err(|_| {
-            FrameRefusal::Claim(myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            })
-        })?;
-        count.measured().checked_add(1).ok_or(FrameRefusal::Claim(
-            myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            },
-        ))
-    }
-}
-
-impl VariableOperationPlan {
-    pub(super) fn finish(
-        self,
-        result: std::result::Result<OperationReplyData, String>,
-    ) -> FundedVariableReply {
-        FundedVariableReply::Operation(FundedOperationReply {
-            result,
-            _operation: self.operation,
+            _owner: owner,
         })
     }
 }
 
 impl serde::Serialize for FundedVariableReply {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct as _;
         match self {
-            Self::Roster(roster) => {
-                let mut response = serializer.serialize_struct("Response", 2)?;
-                response.serialize_field("ok", &true)?;
-                response.serialize_field(
-                    "data",
-                    &RosterData {
-                        roster: roster.get(),
-                    },
-                )?;
-                response.end()
-            }
-            Self::Governance(governance) => {
-                #[derive(serde::Serialize)]
-                struct GovernanceData<'a> {
-                    state: &'a myownmesh_core::NetworkState,
-                    evicted: &'a [String],
-                }
-                let mut response = serializer.serialize_struct("Response", 2)?;
-                response.serialize_field("ok", &true)?;
-                response.serialize_field(
-                    "data",
-                    &GovernanceData {
-                        state: governance.state(),
-                        evicted: governance.evicted(),
-                    },
-                )?;
-                response.end()
-            }
             Self::UpdaterStatus(value) => serialize_updater_result(serializer, value),
             Self::UpdaterCheck(value) => serialize_updater_result(serializer, value),
             Self::RpcCall(value) => serialize_rpc_call(serializer, value),
@@ -1120,41 +822,17 @@ fn serialize_updater_result<S: serde::Serializer, T: serde::Serialize>(
     }
 }
 
-pub(super) fn variable_data_reply_line_ceiling(
-    encoded_data: usize,
-) -> std::result::Result<usize, FrameRefusal> {
-    const PREFIX: usize = "{\"ok\":true,\"data\":".len();
-    const SUFFIX: usize = "}\n".len();
-    PREFIX
-        .checked_add(encoded_data)
-        .and_then(|bytes| bytes.checked_add(SUFFIX))
-        .ok_or(FrameRefusal::Claim(
-            myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            },
-        ))
-}
-
-const NETWORK_ID_REPLY_PREFIX: &str = "{\"ok\":true,\"data\":{\"network_id\":";
-const NETWORK_ID_REPLY_SUFFIX: &str = "}}\n";
-
-pub(super) fn network_id_reply_line_ceiling(
-    encoded_network_id: usize,
-) -> std::result::Result<usize, FrameRefusal> {
-    NETWORK_ID_REPLY_PREFIX
-        .len()
-        .checked_add(encoded_network_id)
-        .and_then(|bytes| bytes.checked_add(NETWORK_ID_REPLY_SUFFIX.len()))
-        .ok_or(FrameRefusal::Claim(
-            myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            },
-        ))
-}
-
 /// Maximum encoded EventsSubscribe success line, derived by running the real
 /// closed serializer over the widest id and then adding the capability's fixed
 /// encoded width. No client or response value is constructed to answer it.
+///
+/// Taken *before* `ClientRegistry::register` installs the client, because the
+/// line it funds carries the freshly minted client capability and that
+/// capability is not queryable afterwards. Measuring after the register instead
+/// admits a reachable order — register succeeds, the line is refused under
+/// memory pressure — that leaves a client installed in the registry holding a
+/// secret no one received and no one can ask for again. The invariant is that
+/// every installed client's capability reaches exactly one recipient.
 pub(super) fn events_subscribed_line_ceiling() -> std::result::Result<usize, FrameRefusal> {
     #[derive(serde::Serialize)]
     struct EventsData<'a> {
@@ -1189,27 +867,6 @@ pub(super) fn events_subscribed_line_ceiling() -> std::result::Result<usize, Fra
         .measured()
         .checked_add(crate::ipc::ClientHandle::capability_encoded_len())
         .and_then(|bytes| bytes.checked_add(1))
-        .ok_or(FrameRefusal::Claim(
-            myownmesh_core::ResourceClaimArithmeticError::Overflow {
-                dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            },
-        ))
-}
-
-/// Bytes surrounding the compact config encoding in a successful response.
-///
-/// Named from the exact wire shape serialized by `PreparedReply::Config`, so
-/// the core ceiling is extended only by bytes this layer itself adds.
-const CONFIG_REPLY_PREFIX: &str = "{\"ok\":true,\"data\":{\"config\":";
-const CONFIG_REPLY_SUFFIX: &str = "}}\n";
-
-pub(super) fn config_reply_line_ceiling(
-    config_encoding_ceiling: usize,
-) -> std::result::Result<usize, FrameRefusal> {
-    CONFIG_REPLY_PREFIX
-        .len()
-        .checked_add(config_encoding_ceiling)
-        .and_then(|bytes| bytes.checked_add(CONFIG_REPLY_SUFFIX.len()))
         .ok_or(FrameRefusal::Claim(
             myownmesh_core::ResourceClaimArithmeticError::Overflow {
                 dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,

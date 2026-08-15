@@ -25,17 +25,6 @@ pub(crate) enum EndpointAuthBindingProfile {
     WebRtcDtlsCertificateFingerprintPair,
 }
 
-/// How the connector established the binding material it is supplying.
-///
-/// Provenance is connector-local and is never taken from a peer or a wire
-/// value. It exists so a later reader can tell a locally observed native fact
-/// from anything else without re-deriving it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EndpointAuthBindingProvenance {
-    /// Both components were read from the connector's own live native session.
-    ConnectorObservedNativeSession,
-}
-
 /// One closed, non-serializable connector binding.
 ///
 /// The components are private and are named by endpoint, not by role: the
@@ -46,7 +35,6 @@ pub(crate) enum EndpointAuthBindingProvenance {
 /// commits to.
 pub(crate) struct EndpointAuthBinding {
     profile: EndpointAuthBindingProfile,
-    provenance: EndpointAuthBindingProvenance,
     local_component: String,
     remote_component: String,
 }
@@ -68,7 +56,6 @@ impl EndpointAuthBinding {
         }
         Some(Self {
             profile: EndpointAuthBindingProfile::WebRtcDtlsCertificateFingerprintPair,
-            provenance: EndpointAuthBindingProvenance::ConnectorObservedNativeSession,
             local_component: local_component.to_owned(),
             remote_component: remote_component.to_owned(),
         })
@@ -77,11 +64,6 @@ impl EndpointAuthBinding {
     /// The closed profile this binding supplies.
     pub(crate) fn profile(&self) -> EndpointAuthBindingProfile {
         self.profile
-    }
-
-    /// How the connector established this material.
-    pub(crate) fn provenance(&self) -> EndpointAuthBindingProvenance {
-        self.provenance
     }
 
     /// The component belonging to this endpoint.
@@ -113,10 +95,6 @@ mod tests {
         assert_eq!(
             binding.profile(),
             EndpointAuthBindingProfile::WebRtcDtlsCertificateFingerprintPair
-        );
-        assert_eq!(
-            binding.provenance(),
-            EndpointAuthBindingProvenance::ConnectorObservedNativeSession
         );
         assert_eq!(binding.local_component(), "local");
         assert_eq!(binding.remote_component(), "remote");

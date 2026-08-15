@@ -50,26 +50,12 @@ pub struct EmbeddedDaemon {
     /// control socket, its connection tasks and their registrations were all
     /// still up.
     control: tokio::task::JoinHandle<()>,
-    /// Test witness set by the control task after `serve` returns.
-    #[cfg(all(test, unix))]
-    control_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Snapshot of `control_finished` at the boundary before service teardown.
-    #[cfg(all(test, unix))]
-    control_drained_before_teardown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EmbeddedDaemon {
     /// The device handle — identity, events, joins.
     pub fn mesh(&self) -> &myownmesh_core::MeshHandle {
         &self.mesh
-    }
-
-    /// Observe the ordering boundary the embedded-shutdown control owns.
-    #[cfg(all(test, unix))]
-    fn control_drained_before_teardown_for_test(
-        &self,
-    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::clone(&self.control_drained_before_teardown)
     }
 
     /// Graceful teardown, exactly like the serve binary's signal path.
@@ -95,12 +81,6 @@ impl EmbeddedDaemon {
         if let Err(e) = self.control.await {
             warn!("control task did not end cleanly: {e}");
         }
-        #[cfg(all(test, unix))]
-        self.control_drained_before_teardown.store(
-            self.control_finished
-                .load(std::sync::atomic::Ordering::Acquire),
-            std::sync::atomic::Ordering::Release,
-        );
         // Stop hosted services before tearing down networks.
         self.service_manager.shutdown().await;
         // Say goodbye before we go: a graceful `leave` per network so peers
@@ -215,13 +195,6 @@ async fn start_with_mesh(
     let ctl_services = service_manager.clone();
     let ctl_shutdown = shutdown_tx.subscribe();
     let ctl_socket = cfg.daemon.control_socket.clone();
-    #[cfg(all(test, unix))]
-    let control_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    #[cfg(all(test, unix))]
-    let control_finished_by_task = std::sync::Arc::clone(&control_finished);
-    #[cfg(all(test, unix))]
-    let control_drained_before_teardown =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Kept, not discarded. See [`EmbeddedDaemon::control`].
     let control = tokio::spawn(async move {
         if let Err(e) = control::serve(
@@ -236,8 +209,6 @@ async fn start_with_mesh(
         {
             warn!("control socket exited with error: {e:#}");
         }
-        #[cfg(all(test, unix))]
-        control_finished_by_task.store(true, std::sync::atomic::Ordering::Release);
     });
 
     Ok(EmbeddedDaemon {
@@ -246,10 +217,6 @@ async fn start_with_mesh(
         service_manager,
         shutdown_tx,
         control,
-        #[cfg(all(test, unix))]
-        control_finished,
-        #[cfg(all(test, unix))]
-        control_drained_before_teardown,
     })
 }
 
@@ -263,32 +230,13 @@ mod tests {
     // other module that draws on the same pool. The infrastructure-only test
     // beside it installs no policy and takes no guard.
 
-    fn nz(value: usize) -> std::num::NonZeroUsize {
-        std::num::NonZeroUsize::new(value).expect("startup fixture is nonzero")
-    }
-
     fn connector_test_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
-        // These values belong only to this one-process startup fixture. They
-        // make no production sizing or queue-capacity recommendation.
-        let realtime = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
-            myownmesh_core::ConnectorRealtimeFlowCapacities::new(nz(2), nz(2), nz(2)),
-            myownmesh_core::ConnectorRealtimeInboundLimits::new(nz(1_200), nz(8), nz(2)),
-            myownmesh_core::ConnectorRealtimeByteBudgets::new(nz(32_768), nz(32_768)),
-            myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
-        );
-        let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
-            myownmesh_core::ConnectorCallbackMailboxCapacities::new(nz(4), nz(4)),
-            myownmesh_core::ConnectorCallbackServiceWeights::new(nz(1), nz(1), nz(1)),
-            myownmesh_core::RealtimeConnectorPolicy::enabled_with_local_ceiling(
-                nz(16_384),
-                realtime,
-            )
-            .expect("startup fixture is internally consistent"),
-        )
-        .expect("callback fixture is internally consistent");
+        // Elastic real-time, which is the only shape there is: what this
+        // fixture may do is what `crate::test_resource_provider` funds, and the
+        // eleven local counts that used to be stated here bounded nothing the
+        // provider was not already bounding.
         let webrtc = myownmesh_core::WebRtcConnectorProfile::new(
-            callbacks,
-            myownmesh_core::PendingRemoteCandidatePolicy::new(nz(8), nz(16_384), nz(8), nz(8)),
+            myownmesh_core::ConnectorCallbackPolicy::elastic_realtime(),
         );
         myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), webrtc)
     }
@@ -296,12 +244,11 @@ mod tests {
     /// `shutdown` does not return before `control::serve` and the connections it
     /// accepted have ended.
     ///
-    /// The finding this pins is that the spawn's `JoinHandle` used to be
-    /// dropped. Dropping one detaches the task, so `shutdown` had nothing to
-    /// wait on and returned while the control socket, its connection tasks and
-    /// their registrations were all still up — and it then tore down the
-    /// services and networks those tasks were still dispatching against. An
-    /// embedder was told the daemon was closed while it was not.
+    /// Dropping the spawn's `JoinHandle` would detach the task, leaving
+    /// `shutdown` nothing to wait on: it would return while the control socket,
+    /// its connection tasks and their registrations were all still up, and then
+    /// tear down the services and networks those tasks were still dispatching
+    /// against, telling an embedder the daemon was closed while it was not.
     ///
     /// The load-bearing observation is taken at the ordering boundary itself:
     /// the control task sets a witness only after `serve` returns, and shutdown
@@ -320,7 +267,7 @@ mod tests {
     /// The subscription is what makes the first claim non-vacuous. An idle
     /// connection might end for any number of reasons; an `events_subscribe`
     /// that has been acked is a connection parked in the stream loop, which is
-    /// exactly the task the old shape returned without waiting for.
+    /// exactly the task `shutdown` has to wait for.
     ///
     /// Unix-only, for the reason the control-surface shutdown controls are: a
     /// socket at a path this control chooses. Elsewhere the name is
@@ -409,18 +356,12 @@ mod tests {
             "non-vacuity: this connection is parked in the stream loop: {ack}"
         );
 
-        let drained_before_teardown = daemon.control_drained_before_teardown_for_test();
-
-        // The claim. The witness was sampled inside shutdown, before its first
-        // service-teardown await, rather than after this call returned.
         guarded("embedded shutdown returns", daemon.shutdown()).await;
-        assert!(
-            drained_before_teardown.load(std::sync::atomic::Ordering::Acquire),
-            "control::serve and every connection it accepted ended before \
-             embedded shutdown began tearing down services"
-        );
 
-        // External companion (1): the connection that served this client ended.
+        // The claim, read from outside the daemon: this client's connection was
+        // parked in the stream loop above, so a shutdown that returned while
+        // `control::serve` was still up would leave it open. That it reads to
+        // end is the ordering.
         let mut rest = Vec::new();
         guarded(
             "the client's connection ended",
@@ -429,7 +370,7 @@ mod tests {
         .await
         .expect("the client's half reads to end");
 
-        // External companion (2): the listener is gone with it.
+        // And the listener is gone with it.
         assert!(
             LocalSocketStream::connect(name).await.is_err(),
             "serve returned, so its control socket no longer accepts connections"

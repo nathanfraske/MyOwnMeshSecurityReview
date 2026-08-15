@@ -35,12 +35,11 @@ pub use map::{LeasedMap, LeasedMapInsertRefusal};
 pub(crate) use queue::LeasedQueue;
 
 pub use provider::{
-    FiniteResourceProvider, FundedArc, FundedWeak, ReclaimResult, ResourceAcquireDemand,
-    ResourceAdmission, ResourceAuthorityClass, ResourceClaim, ResourceClaimArithmeticError,
-    ResourceClass, ResourceLease, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
-    ResourceProviderConflict, ResourceProviderPort, ResourceReclaimSubscription,
-    ResourceReclaimTarget, ResourceReservationState, ResourceScope, ResourceScopeId,
-    ResourceUnavailable, RESOURCE_CLASS_COUNT,
+    FiniteResourceProvider, FundedArc, FundedWeak, ResourceAuthorityClass, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourcePressure, ResourceProvider,
+    ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
+    ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
+    RESOURCE_CLASS_COUNT,
 };
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};

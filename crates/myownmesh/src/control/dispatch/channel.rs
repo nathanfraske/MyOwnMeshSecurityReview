@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::{funded, refused, unknown_network, Answer};
+use super::{refused, refused_text, unknown_network, Answer};
 use crate::control::framing::{AdmittedLineOut, FrameAdmission};
-use crate::control::reply::{prepare_reply_then, ControlOut, PreparedReply, PreparedText};
+use crate::control::reply::{prepare_reply_then, ControlOut, PreparedReply};
 use crate::control::{ConnectionCancel, ControlState};
 
 /// Join a typed channel, installing the network-to-client pump if this is the
@@ -53,9 +53,7 @@ pub(in crate::control) async fn subscribe(
             // The success line's funding goes back before the refusal's is
             // taken, so the two are never both outstanding.
             drop(output);
-            let text = PreparedText::channel_registration_error(&refusal, admission)
-                .context("channel-subscribe refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
+            return refused_text(format!("channel subscribe refused: {refusal}"), admission);
         }
     };
     match join {
@@ -70,9 +68,7 @@ pub(in crate::control) async fn subscribe(
                         orphan.retire().await;
                     }
                     drop(output);
-                    let text = PreparedText::channel_pump_error(&error, admission)
-                        .context("channel-pump refusal text was not admitted")?;
-                    return funded(PreparedReply::Error(text), admission);
+                    return refused_text(format!("channel subscribe refused: {error}"), admission);
                 }
             };
             if let Some(orphan) = orphan {
@@ -148,9 +144,7 @@ pub(in crate::control) async fn send_to(
         Ok(()) => Ok((reply, output)),
         Err(error) => {
             drop(output);
-            let text = PreparedText::channel_error(&error, admission)
-                .context("channel-send refusal text was not admitted")?;
-            funded(PreparedReply::Error(text), admission)
+            refused_text(error.to_string(), admission)
         }
     }
 }
@@ -187,9 +181,7 @@ pub(in crate::control) async fn send_all(
         )),
         Err(error) => {
             drop(output);
-            let text = PreparedText::channel_error(&error, admission)
-                .context("channel-broadcast refusal text was not admitted")?;
-            funded(PreparedReply::Error(text), admission)
+            refused_text(error.to_string(), admission)
         }
     }
 }
@@ -199,9 +191,9 @@ pub(in crate::control) async fn send_all(
 /// This is the one channel operation that can outlive the client's interest in
 /// the answer, so it is also the one that takes the connection's cancellation:
 /// a caller that is going away is told so rather than being made to wait for a
-/// delivery acknowledgement no one will read. The bias matches the inline arm
-/// this replaced — cancellation is polled first, because a connection already
-/// draining should not start a fresh reliable submission.
+/// delivery acknowledgement no one will read. Cancellation is polled first,
+/// because a connection already draining should not start a fresh reliable
+/// submission.
 pub(in crate::control) async fn send_reliable(
     state: &Arc<ControlState>,
     admission: &FrameAdmission,
@@ -232,9 +224,7 @@ pub(in crate::control) async fn send_reliable(
         Ok(()) => Ok((reply, output)),
         Err(error) => {
             drop(output);
-            let text = PreparedText::core_error(&error, admission)
-                .context("reliable-send refusal text was not admitted")?;
-            funded(PreparedReply::Error(text), admission)
+            refused_text(error.to_string(), admission)
         }
     }
 }

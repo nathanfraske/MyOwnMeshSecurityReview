@@ -11,11 +11,10 @@ use anyhow::{anyhow, Context, Result};
 use myownmesh_core::{MeshConfig, ServicesConfig};
 
 use super::super::ControlState;
-use super::{funded, Answer};
-use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
+use super::{funded, refused_text, Answer};
+use crate::control::framing::{prepare_typed_and_line_building, FrameAdmission};
 use crate::control::reply::{
-    config_reply_line_ceiling, FundedVariableReply, OperationReplyData, PreparedReply,
-    PreparedText, VariableOperationPlan,
+    FundedVariableReply, OperationReplyData, PreparedReply, ResponseOwner,
 };
 
 /// Replace the device services config: persist it, then reconcile the
@@ -25,22 +24,22 @@ use crate::control::reply::{
 pub(in crate::control) async fn services_set(
     state: &Arc<ControlState>,
     services: ServicesConfig,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     // Validate against the live daemon before persistence. In particular, an
     // infrastructure-only runtime must not save node participation as enabled
     // when it has no connector resource owner capable of admitting that state.
     if let Err(e) = state.services.validate_config_for_runtime(&services) {
-        return plan.finish(Err(format!("services policy rejected: {e}")));
+        return owner.finish(Err(format!("services policy rejected: {e}")));
     }
     if let Err(e) = persist_services(&services) {
-        return plan.finish(Err(format!("services config save failed: {e}")));
+        return owner.finish(Err(format!("services config save failed: {e}")));
     }
     let status = match state.services.apply(services).await {
         Ok(status) => status,
-        Err(e) => return plan.finish(Err(format!("services policy rejected: {e}"))),
+        Err(e) => return owner.finish(Err(format!("services policy rejected: {e}"))),
     };
-    plan.finish(Ok(OperationReplyData::ServicesStatus(status)))
+    owner.finish(Ok(OperationReplyData::ServicesStatus(status)))
 }
 
 fn persist_services(services: &ServicesConfig) -> Result<()> {
@@ -81,11 +80,7 @@ pub(in crate::control) async fn status(
 pub(in crate::control) fn config_show(admission: &FrameAdmission) -> Result<Answer> {
     let plan = match myownmesh_core::MeshConfig::prepare_load() {
         Ok(plan) => plan,
-        Err(error) => {
-            let text = PreparedText::core_error(&error, admission)
-                .context("config planning refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
-        }
+        Err(error) => return refused_text(error.to_string(), admission),
     };
     let work = admission
         .acquire_claim(plan.load_work_claim())
@@ -95,19 +90,10 @@ pub(in crate::control) fn config_show(admission: &FrameAdmission) -> Result<Answ
         .context("ConfigShow loader residual was not admitted")?;
     let config = match plan.commit(loader_residual, work) {
         Ok(config) => config,
-        Err(error) => {
-            let text = PreparedText::core_error(&error, admission)
-                .context("config load refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
-        }
+        Err(error) => return refused_text(error.to_string(), admission),
     };
-    let line_ceiling = config_reply_line_ceiling(
-        config
-            .compact_encoded_len()
-            .context("ConfigShow compact width was not representable")?,
-    )
-    .context("ConfigShow response width was not representable")?;
-    let output = AdmittedLineOut::prepare_capacity(line_ceiling, admission)
-        .context("ConfigShow response line was not admitted")?;
-    Ok((PreparedReply::Config(config), output))
+    // Measured over the loaded config itself, by the writer's single pass over
+    // the sealed reply.
+    funded(PreparedReply::Config(config), admission)
+        .context("ConfigShow response line was not admitted")
 }

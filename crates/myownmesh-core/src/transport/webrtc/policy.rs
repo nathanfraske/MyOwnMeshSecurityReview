@@ -4,77 +4,16 @@
 //! the application's registered real-time codecs are transport-edge choices
 //! owned by this profile.
 
-use std::num::NonZeroUsize;
-
 use crate::runtime::attempt::ConnectorCallbackPolicy;
 
-/// Owner-selected cumulative bounds for one ICE attempt's remote candidates.
-///
-/// Content bytes are the candidate strings and optional identifiers presented
-/// to the connector. They are not a claim about allocator capacity or exact
-/// retained memory. Duplicate submissions and native application work have
-/// independent cumulative ceilings. The envelope is renewed only by a new
-/// connector attempt or an explicit ICE restart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingRemoteCandidatePolicy {
-    local_ceiling: Option<PendingRemoteCandidateLocalCeiling>,
-}
-
-/// Explicit optional deployment/test envelope for one ICE attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingRemoteCandidateLocalCeiling {
-    max_unique_items: NonZeroUsize,
-    max_content_bytes: NonZeroUsize,
-    max_duplicate_submissions: NonZeroUsize,
-    max_application_work: NonZeroUsize,
-}
-
-impl PendingRemoteCandidatePolicy {
-    pub const fn new(
-        max_unique_items: NonZeroUsize,
-        max_content_bytes: NonZeroUsize,
-        max_duplicate_submissions: NonZeroUsize,
-        max_application_work: NonZeroUsize,
-    ) -> Self {
-        Self {
-            local_ceiling: Some(PendingRemoteCandidateLocalCeiling {
-                max_unique_items,
-                max_content_bytes,
-                max_duplicate_submissions,
-                max_application_work,
-            }),
-        }
-    }
-
-    /// Provider-backed candidate work with no product item ceiling.
-    pub const fn elastic() -> Self {
-        Self {
-            local_ceiling: None,
-        }
-    }
-
-    pub const fn local_ceiling(self) -> Option<PendingRemoteCandidateLocalCeiling> {
-        self.local_ceiling
-    }
-}
-
-impl PendingRemoteCandidateLocalCeiling {
-    pub const fn max_unique_items(self) -> NonZeroUsize {
-        self.max_unique_items
-    }
-
-    pub const fn max_content_bytes(self) -> NonZeroUsize {
-        self.max_content_bytes
-    }
-
-    pub const fn max_duplicate_submissions(self) -> NonZeroUsize {
-        self.max_duplicate_submissions
-    }
-
-    pub const fn max_application_work(self) -> NonZeroUsize {
-        self.max_application_work
-    }
-}
+// The owner-selected ICE candidate envelope used to live here: four cumulative
+// ceilings — unique items, content bytes, duplicate submissions and native
+// application work — that a deployment could state per attempt. It is gone, and
+// nothing replaces it. Every one of those quantities is admitted against the
+// process provider at its actual size, so a second ceiling in front of that
+// could only refuse work the owner's real grant would have funded, in units the
+// owner never chose. What remains bounding a candidate is what always really
+// bounded it: an exact `ResourceClaim` per submission.
 
 /// Why a connector profile was refused.
 ///
@@ -102,18 +41,13 @@ pub enum WebRtcConnectorProfileError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebRtcConnectorProfile {
     callbacks: ConnectorCallbackPolicy,
-    remote_candidates: PendingRemoteCandidatePolicy,
     realtime: Option<super::RealtimeProfile>,
 }
 
 impl WebRtcConnectorProfile {
-    pub const fn new(
-        callbacks: ConnectorCallbackPolicy,
-        remote_candidates: PendingRemoteCandidatePolicy,
-    ) -> Self {
+    pub const fn new(callbacks: ConnectorCallbackPolicy) -> Self {
         Self {
             callbacks,
-            remote_candidates,
             realtime: None,
         }
     }
@@ -157,7 +91,7 @@ impl WebRtcConnectorProfile {
             crate::runtime::attempt::RealtimeConnectorPolicy::Disabled => {
                 return Err(WebRtcConnectorProfileError::RealtimeProfileRequiresRealtime)
             }
-            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled(_) => {}
+            crate::runtime::attempt::RealtimeConnectorPolicy::Enabled => {}
         }
         self.realtime = Some(profile);
         Ok(self)
@@ -165,10 +99,6 @@ impl WebRtcConnectorProfile {
 
     pub const fn callbacks(&self) -> ConnectorCallbackPolicy {
         self.callbacks
-    }
-
-    pub const fn remote_candidates(&self) -> PendingRemoteCandidatePolicy {
-        self.remote_candidates
     }
 
     /// The application's registered real-time codecs, if it supplied any.

@@ -164,8 +164,8 @@ pub enum NetworkCmd {
     /// signaling + renegotiate ICE with every peer); `peer == Some(id)`
     /// reconnects just that one peer. Nothing is torn down and no `Leave` is
     /// announced, so peers keep their sessions and app-level state — this is
-    /// the gentle recovery the GUI's refresh / reconnect controls drive
-    /// instead of the old `NetworkRemove` + `NetworkAdd`. See
+    /// the gentle recovery the GUI's refresh / reconnect controls drive, in
+    /// place of a `NetworkRemove` + `NetworkAdd` pair. See
     /// [`super::network_watch::reconnect_all_in_place`].
     Reconnect { peer: Option<String> },
     /// Deliberately dial exactly one signaling-discovered peer as the
@@ -290,54 +290,12 @@ pub enum NetworkCmd {
     GovernanceSnapshot {
         reply: oneshot::Sender<crate::network_state::NetworkState>,
     },
-    /// Quote the governance snapshot's width, walking authoritative state.
-    ///
-    /// `work` is the admitted planning lease and it travels *with the
-    /// command*, not alongside it in the caller's future. The walk happens
-    /// here, on the engine, at an unbounded delay after the send; a caller
-    /// that is cancelled between the two would otherwise drop the lease and
-    /// leave the engine traversing state nothing was funding.
-    ///
-    /// It comes back in the reply so the caller can hold it for the rest of
-    /// the plan's life. If the caller is gone, `send` hands the whole tuple
-    /// back as an error and the lease is released there — after the traversal
-    /// it paid for, never before.
-    PrepareGovernanceSnapshot {
-        work: crate::resource::ResourceLease,
-        reply: oneshot::Sender<(Result<usize>, crate::resource::ResourceLease)>,
-    },
-    /// Revalidate the quoted width and build the snapshot.
-    ///
-    /// Two leases, and they are not interchangeable. `work` is the *same*
-    /// planning residual [`Self::PrepareGovernanceSnapshot`] returned: this
-    /// command walks authoritative state a second time to check the quote is
-    /// still good, and that walk is part of what the one admitted planning
-    /// operation bought. `lease` is the typed retention for the snapshot that
-    /// outlives the walk, and it is the one handed back on refusal.
-    ///
-    /// `work` travels on the command for the reason it does on Prepare: the
-    /// caller's future is cancellable at its await, and the revalidation walk
-    /// happens here regardless.
-    CommitGovernanceSnapshot {
-        ceiling: usize,
-        work: crate::resource::ResourceLease,
-        lease: crate::resource::ResourceLease,
-        reply: oneshot::Sender<
-            std::result::Result<
-                crate::handle::FundedGovernanceSnapshot,
-                crate::resource::ResourceLease,
-            >,
-        >,
-    },
 }
 
 impl ResourceMailboxItem for NetworkCmd {
     fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
         let measure = match self {
-            Self::ReplayCapabilities { .. }
-            | Self::GovernanceSnapshot { .. }
-            | Self::PrepareGovernanceSnapshot { .. }
-            | Self::CommitGovernanceSnapshot { .. } => (0, 0, 0),
+            Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
             Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
             Self::ApproveRoster {
                 device_id, label, ..
@@ -422,9 +380,7 @@ impl ResourceMailboxItem for NetworkCmd {
             | Self::DenyProposal { .. }
             | Self::WithdrawProposal { .. }
             | Self::SpawnSplit { .. }
-            | Self::GovernanceSnapshot { .. }
-            | Self::PrepareGovernanceSnapshot { .. }
-            | Self::CommitGovernanceSnapshot { .. } => 1,
+            | Self::GovernanceSnapshot { .. } => 1,
         };
         let allocations = measure.2.checked_add(effect_allocations).ok_or(
             ResourceClaimArithmeticError::Overflow {
@@ -1852,9 +1808,9 @@ impl NetworkState {
     /// **Borrows the handle and resolves nothing.** The fence is entered with
     /// the installation the flow was opened on, then the handle's two identities
     /// are proved against the set that answered. A caller whose session has been
-    /// replaced, or whose label has been closed and reopened, is refused here —
-    /// where the old path would have enqueued into the successor's flow of the
-    /// same name and told nobody, because nothing on this path is acknowledged
+    /// replaced, or whose label has been closed and reopened, is refused here.
+    /// Resolving by name instead would enqueue into the successor's flow of the
+    /// same name and tell nobody, because nothing on this path is acknowledged
     /// per unit.
     pub(crate) fn send_realtime(
         &self,
@@ -2374,20 +2330,6 @@ impl NetworkState {
     }
 
     /// Plan a funded peers snapshot.
-    ///
-    /// The counting step of the shape [`peer_snapshot`](Self::peer_snapshot)
-    /// skips: it allocates nothing, so a caller serving somebody else's request
-    /// can learn what the answer would cost and refuse it before any of it
-    /// exists. See [`super::peer_snapshot`] for what the four acquisitions are
-    /// and why they are four.
-    ///
-    /// `peer_snapshot` remains the right call for a library caller that owns
-    /// the process and is not deciding on anybody's behalf whether a roster is
-    /// affordable.
-    pub fn plan_peer_snapshot(&self) -> super::peer_snapshot::PeerSnapshotStaging<'_> {
-        super::peer_snapshot::PeerSnapshotStaging::new(&self.peers)
-    }
-
     /// Per-peer detail. Returns `None` if the peer is not in the
     /// engine's map.
     pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {

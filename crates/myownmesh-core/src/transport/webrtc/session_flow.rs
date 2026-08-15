@@ -1097,8 +1097,7 @@ impl SessionRealtimeFlows {
     ) -> Option<RealtimeInboundDelivery> {
         let (label, flow) = self.flows.get_key_value(name.as_bytes())?;
         let reservation = flow.port.reserve_output(unit.data.len())?;
-        let queued = flow
-            .port
+        flow.port
             .enqueue_checked(
                 QueuedTransportEvent {
                     event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
@@ -1111,9 +1110,6 @@ impl SessionRealtimeFlows {
                 reservation,
             )
             .ok()?;
-        if !queued {
-            return None;
-        }
         match self.registry.try_recv()?.event {
             TransportEvent::RealtimeUnit(delivery) => Some(delivery),
             _ => None,

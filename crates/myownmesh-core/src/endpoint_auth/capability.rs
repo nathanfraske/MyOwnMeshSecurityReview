@@ -8,11 +8,8 @@
 //! assembled from a bag of caller-supplied fields.
 
 use super::context::EndpointAuthContext;
-use super::{EndpointAuthProfile, EndpointRole};
-use crate::connector::{
-    ConnectedChannelHandoff, ConnectorIncarnation, EndpointAuthBindingProfile,
-    EndpointAuthBindingProvenance,
-};
+use super::EndpointRole;
+use crate::connector::{ConnectedChannelHandoff, ConnectorIncarnation};
 use crate::runtime::RuntimeIncarnation;
 use std::sync::Arc;
 
@@ -21,26 +18,22 @@ use std::sync::Arc;
 /// Crate-private, no public constructor, no `Clone`, no serialization: there is
 /// deliberately no session handle to hand out. Readback is by narrow accessor
 /// only, so a consumer reads what was proved and cannot substitute anything.
+///
+/// Every field here is one a substituted record could differ in, so every field
+/// here is compared by [`super::EndpointAuthTask::issued`]. The profile and the
+/// binding pair are deliberately *not* among them: both are already inside the
+/// bytes `transcript_digest` covers — [`super::transcript::transcript_bytes`]
+/// commits the profile tag and reorders the endpoint-relative components into
+/// role-canonical position — so a second copy here would be a second thing that
+/// can disagree with the proof rather than another thing that must match it.
 pub(crate) struct AuthenticatedBindingRecord {
     mesh_context: String,
     local_device_id: String,
     remote_device_id: String,
-    profile: EndpointAuthProfile,
     /// The exact role this endpoint proved under. Compared by
     /// [`super::EndpointAuthTask::issued`], so a record proved under the peer's
     /// role cannot be installed through this task.
     local_role: EndpointRole,
-    /// The connector-side binding profile, likewise compared on install rather
-    /// than only recorded.
-    binding_profile: EndpointAuthBindingProfile,
-    /// How the connector established the binding material this proof covers.
-    ///
-    /// Load-bearing rather than recorded-and-ignored: `issued` compares it
-    /// against the current context's provenance, so a record whose provenance
-    /// does not match the task's cannot be installed through it.
-    binding_provenance: EndpointAuthBindingProvenance,
-    /// Digest of the exact binding pair in role-canonical order.
-    binding_digest: String,
     /// Digest of the exact transcript both halves verified over.
     transcript_digest: String,
     connector: Arc<ConnectorIncarnation>,
@@ -59,19 +52,11 @@ impl AuthenticatedBindingRecord {
         connector: Arc<ConnectorIncarnation>,
         runtime: RuntimeIncarnation,
     ) -> Self {
-        let (initiator_component, responder_component) = context.canonical_binding_pair();
         Self {
             mesh_context: context.mesh_context().to_owned(),
             local_device_id: context.local_device_id().to_owned(),
             remote_device_id: context.expected_remote_device_id().to_owned(),
-            profile: context.profile(),
             local_role: context.local_role(),
-            binding_profile: context.binding().profile(),
-            binding_provenance: context.binding().provenance(),
-            binding_digest: digest_of(&[
-                initiator_component.as_bytes(),
-                responder_component.as_bytes(),
-            ]),
             transcript_digest: digest_of(&[transcript]),
             connector,
             runtime,
@@ -90,28 +75,8 @@ impl AuthenticatedBindingRecord {
         &self.remote_device_id
     }
 
-    pub(crate) fn profile(&self) -> EndpointAuthProfile {
-        self.profile
-    }
-
     pub(crate) fn local_role(&self) -> EndpointRole {
         self.local_role
-    }
-
-    pub(crate) fn binding_profile(&self) -> EndpointAuthBindingProfile {
-        self.binding_profile
-    }
-
-    /// How the connector established the binding this proof covers.
-    ///
-    /// The one narrow accessor the install path needs: `issued` compares this
-    /// against the current context's provenance.
-    pub(crate) fn binding_provenance(&self) -> EndpointAuthBindingProvenance {
-        self.binding_provenance
-    }
-
-    pub(crate) fn binding_digest(&self) -> &str {
-        &self.binding_digest
     }
 
     pub(crate) fn transcript_digest(&self) -> &str {
@@ -274,9 +239,11 @@ pub(crate) fn authenticated_for_test(
 /// skipped is only the proof exchange, exactly as for the fixture form above,
 /// and the task controls cover that separately.
 ///
-/// The binding components are derived from the two Device ids so that two peers
-/// in one control do not share a binding digest — a shared digest would let a
-/// cross-peer confusion pass unnoticed.
+/// The stand-in transcript is derived from the mesh and the remote Device id so
+/// that two peers in one control do not share a transcript digest — a shared
+/// digest would let a cross-peer confusion pass unnoticed. The binding
+/// components are likewise derived per Device, which is what a real exchange's
+/// transcript would commit.
 ///
 /// Reachable under `transport-lab` without this crate's `cfg(test)` because the
 /// promoted-peer fixture another crate's controls construct promotes through
@@ -349,26 +316,23 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc04b_record_carries_the_connector_stated_binding_context() {
-        // Every retained binding fact is recorded from the context the exchange
-        // ran under, not defaulted and not caller-supplied — which is what lets
-        // `EndpointAuthTask::issued` compare them on install. Deleting any of
-        // these fields or their derivation in `from_verified_exchange` breaks
-        // this control.
+    fn v4_arc04b_record_carries_the_role_it_proved_under() {
+        // The retained role is recorded from the context the exchange ran
+        // under, not defaulted and not caller-supplied — which is what lets
+        // `EndpointAuthTask::issued` compare it on install. Deleting the field
+        // or its derivation in `from_verified_exchange` breaks this control.
         //
-        // The limit is stated rather than hidden: `EndpointAuthBindingProfile`
-        // and `EndpointAuthBindingProvenance` each currently have exactly one
-        // variant, so no fixture can produce a record whose profile or
-        // provenance disagrees with its context, and no control can falsify
-        // those two conjuncts in `issued` today. They become discriminating the
-        // moment a second closed variant exists. Role is already discriminating
-        // — the pair below derives opposite roles from the same fixture.
+        // Role is a conjunct that discriminates today, which is why it is the
+        // one retained here: the pair below derives opposite roles from the
+        // same fixture, so the negative is real rather than deferred to a
+        // future enum variant. The profile and the binding pair are not
+        // retained alongside it — the transcript already commits both, and
+        // `transcript_digest` is what `issued` compares them through.
         let binding = crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
-            "provenance-local-fp",
-            "provenance-remote-fp",
+            "role-local-fp",
+            "role-remote-fp",
         )
         .expect("both fixture components present");
-        let stated = binding.provenance();
         let context = EndpointAuthContext::new(
             "fixture-mesh",
             "fixture-device-local",
@@ -390,36 +354,21 @@ mod tests {
         );
 
         assert_eq!(
-            record.binding_provenance(),
-            stated,
-            "the record must carry the connector's stated provenance"
-        );
-        assert_eq!(
-            record.binding_provenance(),
-            context.binding().provenance(),
-            "and it must be the provenance of the exact context it was derived from"
-        );
-        assert_eq!(
-            record.binding_profile(),
-            context.binding().profile(),
-            "the connector-side binding profile is carried too"
-        );
-        assert_eq!(
             record.local_role(),
             context.local_role(),
-            "and the exact role this endpoint proved under"
+            "the record must carry the exact role this endpoint proved under"
         );
 
-        // Role is the conjunct that already discriminates: the same fixture
-        // with the Device pair reversed derives the opposite role, so a record
-        // built under one role does not match a context built under the other.
+        // The same fixture with the Device pair reversed derives the opposite
+        // role, so a record built under one role does not match a context built
+        // under the other.
         let mirrored = EndpointAuthContext::new(
             "fixture-mesh",
             "fixture-device-remote",
             "fixture-device-local",
             crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
-                "provenance-remote-fp",
-                "provenance-local-fp",
+                "role-remote-fp",
+                "role-local-fp",
             )
             .expect("both fixture components present"),
         )

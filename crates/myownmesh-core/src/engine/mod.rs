@@ -27,7 +27,6 @@ pub mod ice_watchdog;
 pub mod ladder;
 pub mod network_watch;
 pub(crate) mod peer_registry;
-pub(crate) mod peer_snapshot;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
@@ -168,10 +167,10 @@ pub async fn run_driver(
     let mut heartbeat =
         tokio::time::interval(Duration::from_millis(scheduler::HEARTBEAT_INTERVAL_MS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // One periodic pass replaces the old separate ICE-watchdog and
-    // network-watch intervals. Recovery is event-driven first; this is the
-    // secondary safety-net tick (see `scheduler::STATE_WATCH_INTERVAL_MS`)
-    // that confirms state and handles the inherently time-based conditions.
+    // One periodic pass covers ICE watchdog and network watch together.
+    // Recovery is event-driven first; this is the secondary safety-net tick
+    // (see `scheduler::STATE_WATCH_INTERVAL_MS`) that confirms state and
+    // handles the inherently time-based conditions.
     let mut state_watch =
         tokio::time::interval(Duration::from_millis(scheduler::STATE_WATCH_INTERVAL_MS));
     state_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -406,39 +405,6 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         }
         NetworkCmd::GovernanceSnapshot { reply } => {
             let _ = reply.send(governance::snapshot(state));
-        }
-        NetworkCmd::PrepareGovernanceSnapshot { work, reply } => {
-            let ceiling = {
-                let governance = state.governance_state.read();
-                crate::handle::governance_snapshot_ceiling(&governance)
-            };
-            // `work` was owned by this arm for the whole traversal above, which
-            // is the point of carrying it on the command: the caller may have
-            // been cancelled any time after the send, and the walk still has to
-            // be something this process was admitted to do.
-            //
-            // Sending hands it back to a live caller. A caller that is gone
-            // gets no reply and `send` returns the tuple as an error, dropped
-            // here — so the residual is released after the work it funded, and
-            // the ledger returns to where it was either way.
-            let _ = reply.send((ceiling, work));
-        }
-        NetworkCmd::CommitGovernanceSnapshot {
-            ceiling,
-            work,
-            lease,
-            reply,
-        } => {
-            // `work` is handed to the commit rather than dropped after it. The
-            // revalidation walk lives inside that call, so passing the planning
-            // owner in is what makes the walk impossible to reach without it —
-            // a handler that bound `work` away would have nothing to pass and
-            // would not compile.
-            let result = {
-                let governance = state.governance_state.read();
-                crate::handle::commit_governance_snapshot(&governance, ceiling, work, lease)
-            };
-            let _ = reply.send(result);
         }
     }
 }
@@ -2568,8 +2534,7 @@ async fn handle_pc_state_change(
     // ICE-`Failed` (`handle_ice_state_change`) already kicks the in-place
     // restart, and teardown of a still-connecting peer comes from the
     // data-channel-open timeout while an already-open peer is reclaimed by
-    // inbound silence. (`Failed` used to arm the old checking-timeout; that
-    // machinery is gone — ICE/PC state no longer tears anyone down.)
+    // inbound silence. ICE and PC state tear nobody down on their own.
     if pc == RTCPeerConnectionState::Closed {
         drop_peer_if_current(state, owner, DropReason::IceFailed).await;
     }
@@ -2718,9 +2683,9 @@ async fn handle_inbound_frame_from(
     // The admission answer never becomes a value. The fence either yields an
     // authority that already binds the exact owner, the exact captured peer,
     // and the one parsed frame, or it yields nothing — and a caller holding
-    // nothing has nothing to dispatch. This is the whole of E1: what used to
-    // escape here was an `Option<bool>`, after which every arm below
-    // re-resolved the peer by device id and a replacement answered.
+    // nothing has nothing to dispatch. An `Option<bool>` escaping here would
+    // leave every arm below re-resolving the peer by device id, so a
+    // replacement could answer for the peer the fence admitted.
     //
     // Three phases, and the middle one is the point: **admit and fund** under
     // the fence, **decode** under nothing, **commit** under the same session
@@ -3325,13 +3290,6 @@ mod inbound_rpc_refusal_controls {
             128,
             "an admitted run retains the request id twice — the call's copy and              the reply path's — so it is charged twice"
         );
-        assert_eq!(
-            longer.amount(crate::resource::ResourceClass::OpaqueDependencyResidual)
-                - base.amount(crate::resource::ResourceClass::OpaqueDependencyResidual),
-            2,
-            "and two buffers are two allocations"
-        );
-
         // The other peer-chosen fields stay charged once, so the doubling above
         // is specific rather than a blanket multiplier hiding a different error.
         let longer_method = crate::rpc::handler_task_claim_for("p", "", &"m".repeat(64), &payload)
@@ -3403,14 +3361,11 @@ mod inbound_rpc_refusal_controls {
 /// revoked, so the handler future, the stream receiver, and the task lease are
 /// all released at revocation rather than at completion.
 ///
-/// This used to say the opposite — that a post-mint replacement did not cancel
-/// anything and the handler ran to completion, which was defended on the
-/// grounds that the replies were owner-bound and so failed closed. That is
-/// still true of the replies, and it is still the second line of defence, but
-/// it was never an answer to the cost: a handler authorized by a session that
-/// is now gone went on holding its task lease, its future, and whatever the
-/// embedder's code holds, for as long as it liked, against an owner with no
-/// remaining interest in it.
+/// Owner-bound replies are the second line of defence, not the first. They fail
+/// closed, but they are no answer to the cost: a handler left running under a
+/// session that is gone would go on holding its task lease, its future, and
+/// whatever the embedder's code holds, for as long as it liked, against an
+/// owner with no remaining interest in it.
 ///
 /// **No timer anywhere.** Cancellation is by the authority ending, not by a
 /// deadline. A legitimately long handler under a live session is never cut
@@ -3720,8 +3675,8 @@ async fn on_rpc_request(
                 let invoked = h.invoke(call);
                 // The same shape as the unary arm, and for the same reasons:
                 // the open, every chunk send and every terminal send are one
-                // future, raced once against the witness. The loop used to
-                // select per iteration, which left the sends between iterations
+                // future, raced once against the witness. Selecting per loop
+                // iteration instead would leave the sends between iterations
                 // outside the race — a revoked session could still be spending
                 // this task's lease inside `send_to_peer_owner` until the
                 // transport returned.
@@ -3748,7 +3703,7 @@ async fn on_rpc_request(
                     };
                     let mut seq = 0u64;
                     // And the receive loop, which is where a stream actually spends
-                    // its life. It no longer races the witness itself: the whole of
+                    // its life. It does not race the witness itself: the whole of
                     // this future is one arm of the select below, so revocation ends
                     // the receive, the chunk send and the terminal send alike.
                     // Dropping this future drops the receiver, which ends the
@@ -3819,40 +3774,32 @@ async fn on_rpc_request(
 
 /// The three inbound arms that settle a *locally originated* call.
 ///
-/// Each one previously took the dispatch witness as `_dispatch` and
-/// threw it away, reaching the pending map with nothing but the
-/// request id the inbound frame itself carried. That made a request
-/// id an authority: any authenticated peer able to learn or guess
-/// another peer's in-flight id could resolve that caller's oneshot
-/// with a body of its own choosing, push chunks into that caller's
-/// stream, or end the stream early — all under the victim peer's
-/// identity, because the caller never learns who actually answered.
+/// The source is taken from `dispatch.owner()`, the owner token minted when the
+/// frame was admitted, which names the peer the transport actually
+/// authenticated. It is never the request id, never a fresh registry lookup,
+/// and never anything the frame carries: a sender cannot nominate its own
+/// authority. Reaching the pending map with nothing but the request id the
+/// frame carried would make that id an authority — any authenticated peer able
+/// to learn or guess another peer's in-flight id could resolve that caller's
+/// oneshot with a body of its own choosing, push chunks into that caller's
+/// stream, or end the stream early, all under the victim peer's identity,
+/// because the caller never learns who actually answered.
 ///
-/// The source is now taken from `dispatch.owner()`, the owner token
-/// minted when the frame was admitted, which names the peer the
-/// transport actually authenticated. It is never the request id,
-/// never a fresh registry lookup, and never anything the frame
-/// carries: a sender cannot nominate its own authority.
+/// **Ownership rather than comparison, so there is nothing to get wrong.** The
+/// pending map is a field of one `PeerSessionState`, so every arm below reaches
+/// it through `with_captured_session_state` and can only ever see the
+/// operations *that exact session* filed. A replacement session has its own
+/// empty map and no way to name its predecessor's entries — not because a check
+/// refuses it, but because there is nothing there to find. The predecessor's
+/// calls were already resolved when it was retired: dropping a session drops
+/// its `SessionRpcState`, whose `Drop` closes every pending sender and finishes
+/// every open stream, so its callers are answered rather than left for a
+/// successor to answer.
 ///
-/// **There is no comparison left to get wrong.** These arms used to hold a
-/// bound canonical device on each pending operation and compare it against the
-/// admitted owner, under a rule that deliberately admitted one replacement case:
-/// the same device returning over a freshly authenticated connector was allowed
-/// to complete a call its predecessor had filed. That rule is gone, along with
-/// the field it was stated on.
-///
-/// What replaced it is ownership rather than comparison. The pending map is a
-/// field of one `PeerSessionState`, so every arm below reaches it through
-/// `with_captured_session_state` and can only ever see the operations *that
-/// exact session* filed. A replacement session has its own empty map and no way
-/// to name its predecessor's entries — not because a check refuses it, but
-/// because there is nothing there to find. The predecessor's calls were already
-/// resolved when it was retired: dropping a session drops its `SessionRpcState`,
-/// whose `Drop` closes every pending sender and finishes every open stream, so
-/// its callers are answered rather than left for a successor to answer.
-///
-/// So a replacement must **not** settle the old call, and the prose that said it
-/// should has been removed rather than softened. A caller waiting on a session
+/// A bound canonical device compared against the admitted owner would be weaker,
+/// because it would admit one replacement case: the same device returning over a
+/// freshly authenticated connector completing a call its predecessor had filed.
+/// A replacement must **not** settle that call. A caller waiting on a session
 /// that ended is answered by that ending, not by whoever authenticates next.
 ///
 /// Each arm holds no pending-map guard across an await: it decides, funds and
@@ -3886,9 +3833,10 @@ async fn on_rpc_response(
     // cheaper refusal and the truthful one.
     //
     // *Fund before removing*, because the body and the error text are both
-    // peer-sized and both used to travel through the caller's oneshot after the
-    // decoded frame that funded them had already been released, retained by
-    // nobody for an interval the caller controls. Acquiring here charges them to
+    // peer-sized: sent through the caller's oneshot unfunded they would travel
+    // after the decoded frame that funded them had already been released,
+    // retained by nobody for an interval the caller controls. Acquiring here
+    // charges them to
     // the session that delivered them, while that session is proved current and
     // its frame funding still lives — and leaving the removal until last means a
     // refusal leaves the pending entry exactly as it was.
@@ -3985,12 +3933,12 @@ async fn on_rpc_stream_chunk(
             }
             return None;
         };
-        // Settled with the reason the admission actually gave. A single
-        // sentence for both arms used to say "refused by resource owner" for a
-        // chunk the resource owner never saw — the application was told its
-        // provider was short when what had happened was that a peer sent an
-        // item this side could not admit. The two want different responses from
-        // whoever reads them, so they are told apart here.
+        // Settled with the reason the admission actually gave. One sentence for
+        // both arms would say "refused by resource owner" for a chunk the
+        // resource owner never saw — telling the application its provider was
+        // short when a peer had sent an item this side could not admit. The two
+        // want different responses from whoever reads them, so they are told
+        // apart here.
         let (refusal, reason) = match stream.push(session, chunk.payload) {
             Ok(()) => return None,
             Err(crate::application_gateway::GatewayRefusal::Malformed) => (
@@ -4102,15 +4050,15 @@ async fn on_channel_frame(
         // refusals below are sorted by whether they say something about the
         // *session* or only about this one delivery.
         //
-        // `Pressure` says only the latter, and used to be treated as terminal.
+        // `Pressure` says only the latter, and is deliberately not terminal.
         // Nothing local is waiting on a `Channel` frame — it carries no
         // sequence, is acknowledged by nobody, and its acknowledged counterpart
         // is `ChannelSeq`, which keeps its own retirement — so losing one under
         // an owner that would not fund the subscriber queue settles nothing and
-        // strands nobody. Retiring for it meant an admitted peer could end its
-        // own working session at will by sending payload we could not afford,
-        // and could do it to a session carrying other peers' answers. The frame
-        // is dropped; the session carries on. This is the inner half of the same
+        // strands nobody. Retiring for it would let an admitted peer end its own
+        // working session at will by sending payload we could not afford, and do
+        // it to a session carrying other peers' answers. The frame is dropped;
+        // the session carries on. This is the inner half of the same
         // rule the outer admission arm applies before decode, and the two are
         // deliberately the same rule: a peer must not be able to convert this
         // side's backpressure into a teardown at either point.
@@ -4991,23 +4939,8 @@ fn build_test_state_parts_metered(
     let endpoint_payload_ceiling = std::num::NonZeroUsize::new(16_384)
         .expect("engine fixture endpoint payload ceiling is nonzero");
     let webrtc_profile = profile_override.unwrap_or_else(|| {
-        let callbacks = crate::runtime::attempt::ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
-                callback_capacity,
-                callback_capacity,
-                control_payload_ceiling,
-                endpoint_payload_ceiling,
-            ),
-            crate::runtime::attempt::ConnectorCallbackServiceWeights::data_only(
-                callback_capacity,
-                callback_capacity,
-            ),
-            crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("engine fixture data-only callback policy is valid");
         crate::WebRtcConnectorProfile::new(
-            callbacks,
-            crate::PendingRemoteCandidatePolicy::elastic(),
+            crate::runtime::attempt::ConnectorCallbackPolicy::elastic_data_only(),
         )
     });
     let profiles = vec![webrtc_profile.clone(); max_connectors.get()];
@@ -5053,8 +4986,34 @@ fn build_test_state_parts_metered(
             frame_bytes,
         )
         .expect("engine fixture remote-SDP grant is mechanically representable");
-    let grant = crate::transport::webrtc::one_mesh_connector_fixture_grant(&profiles)
-        .expect("engine fixture construction grant is mechanically representable");
+    let grant = crate::transport::webrtc::one_mesh_connector_fixture_grant(
+        &profiles,
+        crate::transport::webrtc::TransportLabCallbackWorkload {
+            control_slots: callback_capacity,
+            endpoint_slots: callback_capacity,
+            control_payload_bytes: u64::try_from(control_payload_ceiling.get())
+                .expect("the engine fixture control payload ceiling fits u64"),
+            endpoint_payload_bytes: u64::try_from(endpoint_payload_ceiling.get())
+                .expect("the engine fixture endpoint payload ceiling fits u64"),
+            // The engine real-time fixture's own workload, stated here because
+            // nothing else can state it: the profile carries no capacity and
+            // core invents none. A data-only profile funds no flows at all.
+            realtime: matches!(
+                webrtc_profile.callbacks().realtime(),
+                crate::runtime::attempt::RealtimeConnectorPolicy::Enabled
+            )
+            .then_some(crate::transport::webrtc::TransportLabRealtimeWorkload {
+                inbound_flows: 2,
+                outbound_flows: 2,
+                queued_units_per_flow: 16,
+                in_progress_units_per_inbound_flow: 1,
+                fragments_per_unit: 16,
+                max_fragment_bytes: 8,
+                max_unit_bytes: 8,
+            }),
+        },
+    )
+    .expect("engine fixture construction grant is mechanically representable");
     // One post-authentication session reservation per simultaneous connector
     // slot, at the full price the provider charges for one: the broker's own
     // session claim — the accounted memory of the session record and the
@@ -5272,259 +5231,6 @@ fn build_test_state_parts_metered(
 /// The command receiver is deliberately undriven. Polling each caller once
 /// proves it has enqueued and parked; dropping it then creates the exact
 /// cancellation window without a timer, scheduler race or synthetic command.
-#[cfg(test)]
-async fn run_v4_r5_core_f4_governance_planning_cancellation_control() {
-    use std::future::Future as _;
-    use std::task::{Context, Poll};
-
-    let planning = crate::snapshot_planning_claim();
-    let planning_charge =
-        crate::resource::FiniteResourceProvider::reservation_charge_for_test(planning)
-            .expect("the planning reservation is representable");
-    let child_scope_charge =
-        crate::resource::FiniteResourceProvider::scope_record_charge_for_test();
-    let discovery_headroom = child_scope_charge
-        .checked_add(planning_charge)
-        .expect("the discovery scope and planning reservation are representable");
-    let (state, mut commands, provider, _grant) = build_test_state_parts_metered(
-        "r5-f4-governance-plan-discovery",
-        None,
-        FIXTURE_CONNECTOR_SLOTS,
-        Some(discovery_headroom),
-    );
-    let scope = state
-        .local_application_resource_scope()
-        .expect("the fixture retains its application scope");
-    let baseline = provider.in_use();
-
-    // Positive non-vacuity: the real prepare command produces the real plan,
-    // and that plan is the authority for the private typed-retention claim.
-    let work = scope
-        .acquire(planning)
-        .expect("the positive planning walk is funded");
-    assert_eq!(
-        provider.in_use().checked_sub(baseline),
-        Ok(planning_charge),
-        "the private ledger charges exactly one planning reservation"
-    );
-    let mut positive = Box::pin(crate::handle::prepare_governance_snapshot(
-        state.as_ref(),
-        work,
-    ));
-    {
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            positive.as_mut().poll(&mut context),
-            Poll::Pending
-        ));
-    }
-    let traversals = crate::handle::governance_state_traversals_for_test();
-    tests::drive_one_governance_planning_command(&state, &mut commands).await;
-    let plan = positive.await.expect("the engine returns a real plan");
-    assert_eq!(
-        crate::handle::governance_state_traversals_for_test(),
-        traversals + 1,
-        "the positive prepare traverses authoritative state once"
-    );
-    let typed_claim = plan.typed_retention_claim();
-    let typed_charge =
-        crate::resource::FiniteResourceProvider::reservation_charge_for_test(typed_claim)
-            .expect("the typed reservation is representable");
-    let wrong_claim = crate::resource::ResourceClaim::single(
-        crate::resource::ResourceClass::AccountedMemoryBytes,
-        1,
-    );
-    let wrong_charge =
-        crate::resource::FiniteResourceProvider::reservation_charge_for_test(wrong_claim)
-            .expect("the wrong-claim reservation is representable");
-    drop(plan);
-    assert_eq!(
-        provider.in_use(),
-        baseline,
-        "dropping the plan releases its work"
-    );
-    drop((scope, commands, state, provider));
-
-    // The cancellation fixture prices every extra owner it creates: the child
-    // application scope, one planning reservation, and the distinct typed
-    // snapshot reservation obtained from the real plan above.
-    let cancellation_headroom = child_scope_charge
-        .checked_add(planning_charge)
-        .and_then(|claim| claim.checked_add(typed_charge))
-        .and_then(|claim| claim.checked_add(wrong_charge))
-        .expect("the cancellation control's exact headroom is representable");
-    let (state, mut commands, provider, _grant) = build_test_state_parts_metered(
-        "r5-f4-governance-cancellation",
-        None,
-        FIXTURE_CONNECTOR_SLOTS,
-        Some(cancellation_headroom),
-    );
-    let scope = state
-        .local_application_resource_scope()
-        .expect("the explicitly priced application child scope is retained");
-    let baseline = provider.in_use();
-
-    // A different claim cannot buy entry to the queue or a traversal.
-    let wrong = scope
-        .acquire(wrong_claim)
-        .expect("the unrelated claim itself is fundable");
-    let before_wrong = crate::handle::governance_state_traversals_for_test();
-    assert!(
-        crate::handle::prepare_governance_snapshot(state.as_ref(), wrong)
-            .await
-            .is_err(),
-        "a wrong claim is refused"
-    );
-    assert_eq!(
-        crate::handle::governance_state_traversals_for_test(),
-        before_wrong,
-        "wrong-claim refusal precedes traversal"
-    );
-    assert!(
-        commands.try_recv().is_none(),
-        "wrong claim queues no command"
-    );
-    assert_eq!(
-        provider.in_use(),
-        baseline,
-        "wrong-claim refusal releases exactly"
-    );
-
-    // Prepare cancellation: after the caller disappears, the command still
-    // owns the exact planning reservation and the traversal has not begun.
-    let work = scope.acquire(planning).expect("prepare work is funded");
-    assert_eq!(provider.in_use().checked_sub(baseline), Ok(planning_charge));
-    let mut cancelled_prepare = Box::pin(crate::handle::prepare_governance_snapshot(
-        state.as_ref(),
-        work,
-    ));
-    {
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            cancelled_prepare.as_mut().poll(&mut context),
-            Poll::Pending
-        ));
-    }
-    let queued_prepare = provider.in_use();
-    let before_prepare = crate::handle::governance_state_traversals_for_test();
-    drop(cancelled_prepare);
-    assert_eq!(
-        provider.in_use(),
-        queued_prepare,
-        "caller drop releases no command owner"
-    );
-    assert!(
-        queued_prepare
-            .checked_sub(baseline)
-            .and_then(|delta| delta.checked_sub(planning_charge))
-            .is_ok(),
-        "the queued prepare still contains the exact planning reservation"
-    );
-    assert_eq!(
-        crate::handle::governance_state_traversals_for_test(),
-        before_prepare,
-        "the undriven command is a deterministic pre-traversal barrier"
-    );
-    tests::drive_one_governance_planning_command(&state, &mut commands).await;
-    assert!(
-        commands.try_recv().is_none(),
-        "only the prepare command was handled"
-    );
-    assert_eq!(
-        crate::handle::governance_state_traversals_for_test(),
-        before_prepare + 1,
-        "the funded queued prepare traverses exactly once"
-    );
-    assert_eq!(
-        provider.in_use(),
-        baseline,
-        "prepare cancellation releases exactly"
-    );
-
-    // Commit cancellation starts from another real plan. Its planning owner
-    // and separately funded typed owner both move to the queued command.
-    let work = scope.acquire(planning).expect("commit plan work is funded");
-    let mut prepare_commit = Box::pin(crate::handle::prepare_governance_snapshot(
-        state.as_ref(),
-        work,
-    ));
-    {
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            prepare_commit.as_mut().poll(&mut context),
-            Poll::Pending
-        ));
-    }
-    tests::drive_one_governance_planning_command(&state, &mut commands).await;
-    let plan = prepare_commit
-        .await
-        .expect("the commit starts from a real plan");
-    assert_eq!(plan.typed_retention_claim(), typed_claim);
-    assert_eq!(
-        provider.in_use().checked_sub(baseline),
-        Ok(planning_charge),
-        "the real plan retains exactly its planning reservation"
-    );
-    let typed = scope
-        .acquire(typed_claim)
-        .expect("typed snapshot is funded separately");
-    assert_eq!(
-        provider.in_use().checked_sub(baseline),
-        Ok(planning_charge
-            .checked_add(typed_charge)
-            .expect("the two reservations are representable together"),),
-        "planning and typed retention are distinct exact reservations"
-    );
-    let mut cancelled_commit = Box::pin(plan.commit(typed));
-    {
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            cancelled_commit.as_mut().poll(&mut context),
-            Poll::Pending
-        ));
-    }
-    let queued_commit = provider.in_use();
-    let before_commit = crate::handle::governance_state_traversals_for_test();
-    drop(cancelled_commit);
-    assert_eq!(
-        provider.in_use(),
-        queued_commit,
-        "commit caller drop releases no owner"
-    );
-    assert!(
-        queued_commit
-            .checked_sub(baseline)
-            .and_then(|delta| delta.checked_sub(planning_charge))
-            .and_then(|delta| delta.checked_sub(typed_charge))
-            .is_ok(),
-        "the queued commit retains both exact reservations"
-    );
-    assert_eq!(
-        crate::handle::governance_state_traversals_for_test(),
-        before_commit,
-        "the undriven commit has not revalidated yet"
-    );
-    tests::drive_one_governance_planning_command(&state, &mut commands).await;
-    assert!(
-        commands.try_recv().is_none(),
-        "only the commit command was handled"
-    );
-    assert_eq!(
-        crate::handle::governance_state_traversals_for_test(),
-        before_commit + 1,
-        "the funded queued commit revalidates exactly once"
-    );
-    assert_eq!(
-        provider.in_use(),
-        baseline,
-        "commit cancellation releases both owners"
-    );
-}
-
 /// The grant a fixture was built with, and a reader for what it has actually
 /// consumed, so a pressure control can make the provider's refusal exact.
 ///
@@ -5670,10 +5376,11 @@ pub(crate) fn build_test_state_with_retained_capacity(
 /// assertions after it vacuous rather than failing.
 ///
 /// One family, and video only, because a flow selects on the family and the
-/// controls open exactly one. The profile no longer declares a flow capacity of
-/// its own: how many flows may exist at once is the owner's `2 inbound + 2
-/// outbound` and the provider's leases, and there is no second advertised
-/// number that could disagree with them.
+/// controls open exactly one. The profile declares no flow capacity of its own
+/// and there is no owner ceiling behind it either: how many flows may exist at
+/// once is what the fixture's provider funds, stated once as the real-time
+/// workload the grant is built from, and there is no second advertised number
+/// that could disagree with it.
 ///
 /// No pre-provisioned tracks: what the controls need is flow authority, not
 /// m-lines. Nothing is added to the SDP, so the existing one-media-section /
@@ -5681,55 +5388,7 @@ pub(crate) fn build_test_state_with_retained_capacity(
 /// grant auto-derives from the profile.
 #[cfg(all(test, feature = "transport-lab"))]
 pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> Arc<NetworkState> {
-    use crate::runtime::attempt::{
-        ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-        ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets,
-        ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-        ConnectorRealtimeInboundLimits, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
-    };
-    let nonzero = |value: usize, name: &str| {
-        std::num::NonZeroUsize::new(value)
-            .unwrap_or_else(|| panic!("engine real-time fixture {name} is nonzero"))
-    };
-    let capacity = nonzero(16, "callback capacity");
-    let flows = ConnectorRealtimeFlowPolicy::new(
-        ConnectorRealtimeFlowCapacities::new(
-            nonzero(2, "inbound flows"),
-            nonzero(2, "outbound flows"),
-            capacity,
-        ),
-        ConnectorRealtimeInboundLimits::new(
-            nonzero(8, "fragment limit"),
-            nonzero(16, "per-unit fragment count"),
-            nonzero(1, "per-flow in-progress units"),
-        ),
-        ConnectorRealtimeByteBudgets::new(
-            nonzero(16, "inbound bytes"),
-            nonzero(16, "outbound bytes"),
-        ),
-        RealtimeQueueOverflowRule::DropNewest,
-    );
-    let realtime =
-        RealtimeConnectorPolicy::enabled_with_local_ceiling(nonzero(8, "unit limit"), flows)
-            .expect("engine real-time fixture policy is structurally valid");
-    // Supplied to the fixture above as a profile override, which prices its own
-    // provider from it, so this states its per-class payload ceilings for the
-    // same reason and on the same terms.
-    let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
-            capacity,
-            capacity,
-            nonzero(4_096, "control payload ceiling"),
-            nonzero(16_384, "endpoint payload ceiling"),
-        ),
-        ConnectorCallbackServiceWeights::new(
-            nonzero(1, "control weight"),
-            nonzero(1, "endpoint-data weight"),
-            nonzero(1, "real-time weight"),
-        ),
-        realtime,
-    )
-    .expect("engine real-time fixture callback policy is valid");
+    use crate::runtime::attempt::ConnectorCallbackPolicy;
     let realtime_profile = crate::WebRtcRealtimeProfile::new(vec![crate::WebRtcRealtimeCodec {
         kind: crate::WebRtcRtpKind::Video,
         payload_type: 102,
@@ -5741,12 +5400,9 @@ pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> A
         rtcp_feedback: Vec::new(),
     }])
     .expect("engine real-time fixture registers one well-formed family");
-    let profile = crate::WebRtcConnectorProfile::new(
-        callbacks,
-        crate::PendingRemoteCandidatePolicy::elastic(),
-    )
-    .with_realtime_profile(realtime_profile)
-    .expect("the engine real-time fixture enables real-time, so a profile is accepted");
+    let profile = crate::WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
+        .with_realtime_profile(realtime_profile)
+        .expect("the engine real-time fixture enables real-time, so a profile is accepted");
     let (state, cmd_rx) = build_test_state_parts_with(
         network_id_suffix,
         Some(profile),
@@ -6229,23 +5885,6 @@ mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
     use std::time::{Duration, Instant};
-
-    pub(super) async fn drive_one_governance_planning_command(
-        state: &Arc<NetworkState>,
-        commands: &mut crate::resource::ResourceMailboxReceiver<NetworkCmd>,
-    ) {
-        commands
-            .recv()
-            .await
-            .expect("one governance planning command is queued")
-            .run_terminal_effect(|command| handle_command(state, command))
-            .await;
-    }
-
-    #[tokio::test]
-    async fn v4_r5_core_f4_governance_planning_survives_prepare_and_commit_cancellation() {
-        super::run_v4_r5_core_f4_governance_planning_cancellation_control().await;
-    }
 
     /// The borrowed stream frame exists so the sender never owns what it sends.
     /// The cost is a second spelling of a wire shape, and the risk is that the

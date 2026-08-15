@@ -12,14 +12,11 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
-use super::{funded, Answer};
-use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
-use crate::control::reply::{
-    network_id_reply_line_ceiling, variable_operation_claim, FundedVariableReply,
-    OperationReplyData, PreparedReply, PreparedText,
-};
+use super::{funded, refused_text, Answer};
+use crate::control::framing::FrameAdmission;
+use crate::control::reply::{OperationReplyData, PreparedReply, ResponseOwner};
 use crate::control::ControlState;
 
 /// This device's identity as the control protocol reports it.
@@ -31,21 +28,17 @@ fn current(state: &Arc<ControlState>) -> OperationReplyData {
     }
 }
 
-/// Fund the operation residual, then answer with whatever the identity is now.
+/// Seal an outcome into the identity reply and fund the line it encodes into.
 fn answered(
     state: &Arc<ControlState>,
     admission: &FrameAdmission,
+    owner: ResponseOwner,
     outcome: std::result::Result<(), String>,
 ) -> Result<Answer> {
-    let lease = admission
-        .acquire_claim(variable_operation_claim())
-        .context("identity response was not admitted")?;
-    let plan = FundedVariableReply::begin_operation(lease)
-        .map_err(|_| anyhow!("identity operation lease did not match"))?;
-    let variable = plan.finish(outcome.map(|()| current(state)));
-    let output = AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, admission)
-        .context("identity response line was not admitted")?;
-    Ok((PreparedReply::Variable(variable), output))
+    funded(
+        PreparedReply::Variable(owner.finish(outcome.map(|()| current(state)))),
+        admission,
+    )
 }
 
 /// Report this device's id, public key and label.
@@ -53,16 +46,22 @@ pub(in crate::control) fn show(
     state: &Arc<ControlState>,
     admission: &FrameAdmission,
 ) -> Result<Answer> {
-    answered(state, admission, Ok(()))
+    let owner = ResponseOwner::acquire(admission).context("identity response was not admitted")?;
+    answered(state, admission, owner, Ok(()))
 }
 
 /// Rename this device, persisting the label before the in-memory identity
 /// takes it.
+///
+/// The response owner is taken before the write: a rename that reaches disk
+/// under a connection that cannot fund an answer still changes this device's
+/// label, and the caller is told nothing.
 pub(in crate::control) fn set_label(
     state: &Arc<ControlState>,
     admission: &FrameAdmission,
     label: String,
 ) -> Result<Answer> {
+    let owner = ResponseOwner::acquire(admission).context("identity response was not admitted")?;
     let outcome = match myownmesh_core::identity::set_label(&label) {
         Err(error) => Err(error.to_string()),
         Ok(()) => {
@@ -70,35 +69,26 @@ pub(in crate::control) fn set_label(
             Ok(())
         }
     };
-    answered(state, admission, outcome)
+    answered(state, admission, owner, outcome)
 }
 
 /// Mint a fresh network id.
+///
+/// The typed retention is admitted before the id is committed, because
+/// committing is what allocates. The response line is then measured over the
+/// committed id itself. Nothing outside this process has observed anything by
+/// that point, so a refused line leaves nothing to undo.
 pub(in crate::control) fn network_id_generate(admission: &FrameAdmission) -> Result<Answer> {
     let plan = match myownmesh_core::identity::prepare_generated_network_id() {
         Ok(plan) => plan,
-        Err(error) => {
-            let text = PreparedText::core_error(&error, admission)
-                .context("network-id generation refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
-        }
+        Err(error) => return refused_text(error.to_string(), admission),
     };
-    let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())?;
-    let (committed, output) = prepare_typed_and_line_building(
-        plan.typed_retention_claim(),
-        line_ceiling,
-        admission,
-        |typed| plan.commit(typed),
-    )
-    .context("generated network id or response line was not admitted")?;
-    match committed {
-        Ok(network_id) => Ok((PreparedReply::NetworkId(network_id), output)),
-        Err(error) => {
-            drop(output);
-            let text = PreparedText::core_error(&error, admission)
-                .context("network-id generation refusal text was not admitted")?;
-            funded(PreparedReply::Error(text), admission)
-        }
+    let typed = admission
+        .acquire_claim(plan.typed_retention_claim())
+        .context("generated network id was not admitted")?;
+    match plan.commit(typed) {
+        Ok(network_id) => funded(PreparedReply::NetworkId(network_id), admission),
+        Err(error) => refused_text(error.to_string(), admission),
     }
 }
 
@@ -109,31 +99,17 @@ pub(in crate::control) fn network_id_normalize(
 ) -> Result<Answer> {
     let plan = match myownmesh_core::identity::prepare_normalized_network_id(&input) {
         Ok(plan) => plan,
-        Err(refusal) => {
-            let text = PreparedText::network_id_error(&refusal, admission)
-                .context("network-id validation refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
-        }
+        Err(refusal) => return refused_text(refusal.to_string(), admission),
     };
-    let line_ceiling = network_id_reply_line_ceiling(plan.encoding_ceiling())?;
-    let (committed, output) = prepare_typed_and_line_building(
-        plan.typed_retention_claim(),
-        line_ceiling,
-        admission,
-        |typed| plan.commit(typed),
-    )
-    .context("normalized network id or response line was not admitted")?;
-    let network_id = match committed {
+    let typed = admission
+        .acquire_claim(plan.typed_retention_claim())
+        .context("normalized network id was not admitted")?;
+    let network_id = match plan.commit(typed) {
         Ok(network_id) => network_id,
-        Err(error) => {
-            drop(output);
-            let text = PreparedText::core_error(&error, admission)
-                .context("network-id normalization refusal text was not admitted")?;
-            return funded(PreparedReply::Error(text), admission);
-        }
+        Err(error) => return refused_text(error.to_string(), admission),
     };
     // The caller's text is held until here because the plan borrowed it; the
     // committed id is the only thing that outlives this point.
     drop(input);
-    Ok((PreparedReply::NetworkId(network_id), output))
+    funded(PreparedReply::NetworkId(network_id), admission)
 }

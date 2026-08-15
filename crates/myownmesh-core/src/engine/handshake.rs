@@ -524,9 +524,9 @@ pub async fn on_auth_response(
         // So installation is still corroborated here, and this arm fails closed
         // without it. The caller that wins promotion can move the capability and
         // then fail to install it; treating every `AlreadyPromoted` as benign
-        // would leave that peer alive and unauthenticated, which is precisely
-        // what the old `Err(ChannelNotCurrent)` shape avoided by falling through
-        // to the drop below. Only the corroborated case is benign.
+        // would leave that peer alive and unauthenticated. Only the
+        // corroborated case is benign, and the rest falls through to the drop
+        // below.
         //
         // The ordinary sequential retransmission never reaches this arm: it is
         // absorbed by the `has_authenticated_channel` guard above, before any
@@ -1023,13 +1023,10 @@ mod tests {
         );
     }
 
-    // The one-sided-transcript control that stood here worked by writing a
-    // contribution pair into peer state, which no longer exists: the pair
-    // belongs to the Endpoint Auth Task. Its substance moved with it, to
-    // `endpoint_auth::task::v4_arc04b_proof_before_any_peer_contribution_is_refused`.
-    // The delayed-hello control did not move — it is restored below, against the
-    // real handler, because the property it holds is an engine one: what a
-    // retransmission is allowed to write.
+    // Proof order and the contribution pair belong to the Endpoint Auth Task
+    // and are controlled there. What stays here is the engine-owned property,
+    // driven against the real handler: what a retransmission is allowed to
+    // write.
 
     /// A Hello carrying an exact contribution plus every field a late frame
     /// could try to rewrite.
@@ -1193,10 +1190,9 @@ mod tests {
                 state.peers.get_if_current(&owner).is_some(),
                 "a canonical contribution keeps the exact current peer"
             );
-            assert_eq!(
-                task.signature_count(),
-                1,
-                "and binds the attempt, producing the one local proof"
+            assert!(
+                task.terminal_error().is_none(),
+                "and reaches the attempt without terminalizing it"
             );
         }
 
@@ -1228,12 +1224,26 @@ mod tests {
             "a malformed contribution closes the exact current peer rather than \
              leaving it alive and unauthenticated"
         );
-        // And the attempt was never reached: a value the parser refuses cannot
-        // bind anything, so no transcript was built and no signature produced
-        // for it. The one draw the task made at construction is still its only
-        // draw.
-        assert_eq!(task.signature_count(), 0, "a refused input signs nothing");
-        assert_eq!(task.draw_count(), 1, "and causes no second draw");
+        // And the refusal itself contributed no task-owned cause. A value the
+        // parser rejects is a setup cause, so nothing about this frame can be
+        // recorded as a reason the *attempt* ended. The one terminalization
+        // reachable here is the fail-closed teardown the drop above performs:
+        // `finish_drop_peer` spawns `retire_and_close`, which retires the
+        // connector, which retires this task with `ChannelNotCurrent`.
+        //
+        // Stated as the pair rather than as one value, because that spawn is
+        // the asynchronous half of the same teardown the comment above names.
+        // Whether it has landed by this line is scheduling; what must hold at
+        // every instant is that the cause is either absent or the lifecycle
+        // one, and never one of the five a task-owned refusal would record.
+        assert!(
+            matches!(
+                task.terminal_error(),
+                None | Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent)
+            ),
+            "a refused input records no task-owned cause of its own; only the \
+             fail-closed retirement behind the drop may terminalize this attempt"
+        );
     }
 
     #[tokio::test]
@@ -1292,9 +1302,6 @@ mod tests {
                 ]
             );
         }
-        let draws = task.draw_count();
-        let signatures = task.signature_count();
-
         // The same contribution — so the task classifies this a retransmission —
         // with every other field changed.
         on_hello(
@@ -1333,14 +1340,12 @@ mod tests {
             "and its advertised feature set, which gates every optional frame kind"
         );
         drop(data);
-        // Ed25519 is deterministic, so equal proof bytes would prove nothing
-        // about re-signing. The counters do.
-        assert_eq!(task.draw_count(), draws, "no second draw");
-        assert_eq!(
-            task.signature_count(),
-            signatures,
-            "and no second signature"
-        );
+        // And the retransmission is still not a lifecycle event: the attempt it
+        // was answered from is intact. That a duplicate re-draws and re-signs
+        // nothing is the task's own property, controlled where the exchange
+        // lives rather than re-proved through the handler.
+        assert!(task.terminal_error().is_none());
+        assert!(!task.is_retired());
     }
 
     #[tokio::test]

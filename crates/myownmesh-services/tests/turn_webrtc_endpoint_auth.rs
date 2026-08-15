@@ -13,10 +13,9 @@ use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackMailboxCapacities,
-    ConnectorCallbackPolicy, ConnectorCallbackServiceWeights, FiniteResourceProvider, MeshEvent,
-    PeerEvent, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy, ResourceProviderPort,
-    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackPolicy,
+    FiniteResourceProvider, MeshEvent, PeerEvent, ResourceProviderPort,
+    TransportLabCallbackWorkload, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -47,10 +46,10 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
     let four = std::num::NonZeroUsize::new(4)
         .expect("the four-connector fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
-    // This fixture mints its own finite provider from these profiles via
+    // This fixture mints its own finite provider via
     // `transport_lab_connector_fixture_grant`, so it has to state the largest
     // payload it will fund for each callback class — nothing else can derive
-    // the byte grant, and a declared mailbox funded for no payload is what left
+    // the byte grant, and a callback class funded for no payload is what left
     // gathered ICE candidates refused for want of `QueuedBytes`.
     //
     // Both are fixture numbers chosen here and stated here. Deliberately *not*
@@ -63,18 +62,16 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
         std::num::NonZeroUsize::new(4_096).expect("the fixture control payload ceiling is nonzero");
     let endpoint_payload_ceiling = std::num::NonZeroUsize::new(16_384)
         .expect("the fixture endpoint payload ceiling is nonzero");
-    let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
-            callback,
-            callback,
-            control_payload_ceiling,
-            endpoint_payload_ceiling,
-        ),
-        ConnectorCallbackServiceWeights::data_only(callback, callback),
-        RealtimeConnectorPolicy::Disabled,
-    )
-    .expect("fixture data-only callback policy is valid");
-    let webrtc = WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
+    let callback_workload = TransportLabCallbackWorkload {
+        control_slots: callback,
+        endpoint_slots: callback,
+        control_payload_bytes: u64::try_from(control_payload_ceiling.get())
+            .expect("the fixture control payload ceiling fits u64"),
+        endpoint_payload_bytes: u64::try_from(endpoint_payload_ceiling.get())
+            .expect("the fixture endpoint payload ceiling fits u64"),
+        realtime: None,
+    };
+    let webrtc = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
     let connectors = std::num::NonZeroU64::new(
         u64::try_from(four.get()).expect("fixture connector count fits u64"),
     )
@@ -151,7 +148,7 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
                     .expect("the fixture JSON claim count is representable"),
             )
             .expect("the fixture JSON input capacity is representable");
-    let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes)
+    let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes, callback_workload)
         .expect("fixture structural and callback claims are representable")
         .checked_add(candidate_workload)
         .and_then(|claim| claim.checked_add(remote_descriptions))

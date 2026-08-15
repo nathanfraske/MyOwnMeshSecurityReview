@@ -1,153 +1,20 @@
 //! Owner-selected connector policy values.
 
-use super::*;
 use crate::transport::webrtc::WebRtcConnectorProfile;
 
-/// Owner-selected bounds for the connector's closed callback-class set.
-///
-/// Codec and media names belong to the WebRTC provider. The connector resource
-/// owner accounts only for control, endpoint data, and codec-neutral real-time
-/// flow callbacks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorCallbackMailboxCapacities {
-    control: NonZeroUsize,
-    endpoint_data: NonZeroUsize,
-    local_payload_ceilings: Option<LocalCallbackPayloadCeilings>,
-}
-
-/// The largest single payload an owner will fund, stated once per callback
-/// class.
-///
-/// Per class and not one shared number, because one number multiplied across
-/// both classes is the same cross-funding defect in a softer form: the grant
-/// would carry `max(control, endpoint)` for each, so whichever class the owner
-/// sized generously would silently pay for the other, and neither ceiling would
-/// mean what it says. Both are required together — an owner that has to size a
-/// provider knows both answers or neither.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LocalCallbackPayloadCeilings {
-    control: NonZeroUsize,
-    endpoint_data: NonZeroUsize,
-}
-
-impl ConnectorCallbackMailboxCapacities {
-    /// Slot counts only, for an owner whose connector draws on a provider it
-    /// did not mint. Carries no byte ceiling because it needs none: the process
-    /// resource owner already holds the byte capacity, and every callback is
-    /// admitted against it at the payload's actual size.
-    pub const fn new(control: NonZeroUsize, endpoint_data: NonZeroUsize) -> Self {
-        Self {
-            control,
-            endpoint_data,
-            local_payload_ceilings: None,
-        }
-    }
-
-    /// Slot counts plus the largest single payload this owner will fund for
-    /// each callback class, for the one caller that has to size a provider
-    /// itself.
-    ///
-    /// Required only by the raw transport-lab path, which mints its own finite
-    /// provider from this policy and therefore has nothing else to derive a byte
-    /// grant from. Stated rather than inferred for the same reason
-    /// [`RealtimeConnectorPolicy::enabled_with_local_ceiling`] is: a ceiling
-    /// picked here by core would be a product limit nobody chose, and a ceiling
-    /// borrowed from another class — an endpoint frame maximum standing in for
-    /// an ICE candidate's bytes — funds one class out of another's budget and
-    /// hides the moment either becomes wrong.
-    ///
-    /// Both bound the *grant*, not the wire: a connector drawing on the process
-    /// provider ignores them entirely, and nothing here gates what the protocol
-    /// will carry.
-    pub const fn with_local_payload_ceilings(
-        control: NonZeroUsize,
-        endpoint_data: NonZeroUsize,
-        control_payload_bytes: NonZeroUsize,
-        endpoint_payload_bytes: NonZeroUsize,
-    ) -> Self {
-        Self {
-            control,
-            endpoint_data,
-            local_payload_ceilings: Some(LocalCallbackPayloadCeilings {
-                control: control_payload_bytes,
-                endpoint_data: endpoint_payload_bytes,
-            }),
-        }
-    }
-
-    pub const fn control(self) -> NonZeroUsize {
-        self.control
-    }
-
-    pub const fn endpoint_data(self) -> NonZeroUsize {
-        self.endpoint_data
-    }
-
-    /// The owner-stated control-callback payload ceiling, when this policy is
-    /// one that has to fund its own provider. `None` for every owner backed by
-    /// the process resource root.
-    pub const fn local_control_payload_bytes(self) -> Option<NonZeroUsize> {
-        match self.local_payload_ceilings {
-            Some(ceilings) => Some(ceilings.control),
-            None => None,
-        }
-    }
-
-    /// The owner-stated endpoint-data payload ceiling, on the same terms as
-    /// [`Self::local_control_payload_bytes`]. Present exactly when that one is.
-    pub const fn local_endpoint_payload_bytes(self) -> Option<NonZeroUsize> {
-        match self.local_payload_ceilings {
-            Some(ceilings) => Some(ceilings.endpoint_data),
-            None => None,
-        }
-    }
-}
-
-/// Owner-selected scheduler weights for the closed callback-class set.
-///
-/// No default exists. A weight is a maximum consecutive service quantum when
-/// the selected class remains ready. Empty classes are skipped, so a stalled
-/// class cannot block the others.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorCallbackServiceWeights {
-    control: NonZeroUsize,
-    endpoint_data: NonZeroUsize,
-    realtime: Option<NonZeroUsize>,
-}
-
-impl ConnectorCallbackServiceWeights {
-    pub const fn new(
-        control: NonZeroUsize,
-        endpoint_data: NonZeroUsize,
-        realtime: NonZeroUsize,
-    ) -> Self {
-        Self {
-            control,
-            endpoint_data,
-            realtime: Some(realtime),
-        }
-    }
-
-    pub const fn data_only(control: NonZeroUsize, endpoint_data: NonZeroUsize) -> Self {
-        Self {
-            control,
-            endpoint_data,
-            realtime: None,
-        }
-    }
-
-    pub const fn control(self) -> NonZeroUsize {
-        self.control
-    }
-
-    pub const fn endpoint_data(self) -> NonZeroUsize {
-        self.endpoint_data
-    }
-
-    pub const fn realtime(self) -> Option<NonZeroUsize> {
-        self.realtime
-    }
-}
+// The owner-selected callback mailbox capacities and scheduler service weights
+// used to live here: per-class slot counts, per-class payload ceilings for an
+// owner minting its own provider, and a consecutive-service quantum per class.
+// All of it is gone, and nothing replaces it.
+//
+// Every one of those numbers was a local ceiling in front of an admission that
+// already had to happen: a callback is admitted against the process provider at
+// the payload's actual size, so a slot count could only refuse work the owner's
+// real grant would have funded. The scheduler keeps the property the weights
+// were there to state — structurally fair, work-conserving service across the
+// closed class set, with empty classes skipped — as behaviour rather than as
+// configuration, so there is no number for a deployment to get wrong and none
+// for this file and the scheduler to disagree about.
 
 /// Owner-selected callback behavior for one connector.
 ///
@@ -159,249 +26,37 @@ impl ConnectorCallbackServiceWeights {
 /// when it is not there. Naming a frame limit here would promise a check that no
 /// longer runs.
 ///
-/// The real-time unit ceiling and the structural queue capacities remain
-/// distinct operational inputs, because an encoded access unit is not an
-/// endpoint message frame.
-///
-/// The single exception is a grant, not a gate:
-/// [`ConnectorCallbackMailboxCapacities::with_local_payload_ceilings`] states
-/// how many bytes an owner that mints its own provider is willing to fund per
-/// callback, per class. Those bound what that owner reserved, never what the
-/// connector accepts — admission still measures the payload in front of it.
+/// An encoded access unit is not an endpoint message frame, and neither one is
+/// bounded here: both are admitted against the provider at the size actually in
+/// front of the connector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCallbackPolicy {
-    local_mailboxes: Option<ConnectorCallbackMailboxCapacities>,
-    local_service_weights: Option<ConnectorCallbackServiceWeights>,
     realtime: RealtimeConnectorPolicy,
 }
 
 /// Owner-selected real-time behavior for one connector.
 ///
-/// `Disabled` is a complete data-only policy. It carries no placeholder
-/// media limits. `Enabled` contains every value needed by the generic
-/// real-time owner and has no production default.
+/// Two states and no payload. `Disabled` is a complete data-only policy that
+/// carries no placeholder media limits; `Enabled` admits generic real-time work
+/// against the provider.
+///
+/// The variant used to carry an optional local ceiling — a unit-byte maximum,
+/// active-flow counts, a per-flow queue capacity, fragment and in-progress
+/// limits, inbound and outbound byte partitions, and a one-variant overflow
+/// rule. Every one of those is gone. The registry that enforced them enforces
+/// the provider's real leases instead, which is what it already did whenever an
+/// owner declined to state a ceiling, so the elastic path is not a fallback
+/// here: it is the path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RealtimeConnectorPolicy {
     Disabled,
-    Enabled(Option<EnabledRealtimeConnectorPolicy>),
-}
-
-/// Validated resource and queue policy for enabled real-time work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EnabledRealtimeConnectorPolicy {
-    max_unit_bytes: NonZeroUsize,
-    flows: ConnectorRealtimeFlowPolicy,
-}
-
-/// Deterministic compatibility behavior when one bounded real-time flow
-/// queue is full. This is connector-local backpressure, not application flow
-/// policy. Arc 03 supports only dropping the newly offered complete unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RealtimeQueueOverflowRule {
-    DropNewest,
-}
-
-/// Owner-selected concurrency and queue bounds for real-time flows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorRealtimeFlowCapacities {
-    max_inbound_active_flows: NonZeroUsize,
-    max_outbound_active_flows: NonZeroUsize,
-    queue_capacity_per_flow: NonZeroUsize,
-}
-
-impl ConnectorRealtimeFlowCapacities {
-    pub const fn new(
-        max_inbound_active_flows: NonZeroUsize,
-        max_outbound_active_flows: NonZeroUsize,
-        queue_capacity_per_flow: NonZeroUsize,
-    ) -> Self {
-        Self {
-            max_inbound_active_flows,
-            max_outbound_active_flows,
-            queue_capacity_per_flow,
-        }
-    }
-}
-
-/// Owner-selected structural bounds for one inbound real-time flow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorRealtimeInboundLimits {
-    max_fragment_bytes: NonZeroUsize,
-    max_fragments_per_unit: NonZeroUsize,
-    max_in_progress_units: NonZeroUsize,
-}
-
-impl ConnectorRealtimeInboundLimits {
-    pub const fn new(
-        max_fragment_bytes: NonZeroUsize,
-        max_fragments_per_unit: NonZeroUsize,
-        max_in_progress_units: NonZeroUsize,
-    ) -> Self {
-        Self {
-            max_fragment_bytes,
-            max_fragments_per_unit,
-            max_in_progress_units,
-        }
-    }
-}
-
-/// Optional owner-selected local ceiling for connector-local real-time flows.
-///
-/// The ceiling is codec-neutral. It can restrict independent flow queues and
-/// bytes retained by real-time work on one connector. No production default
-/// exists. Omitting this ceiling leaves provider-backed elastic real-time
-/// admission available when the generic connector policy enables it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorRealtimeFlowPolicy {
-    max_inbound_active_flows: NonZeroUsize,
-    max_outbound_active_flows: NonZeroUsize,
-    queue_capacity_per_flow: NonZeroUsize,
-    max_inbound_fragment_bytes: NonZeroUsize,
-    max_inbound_fragments_per_unit: NonZeroUsize,
-    max_in_progress_units_per_flow: NonZeroUsize,
-    byte_budgets: ConnectorRealtimeByteBudgets,
-    overflow_rule: RealtimeQueueOverflowRule,
-}
-
-/// Owner-selected byte partitions for one connector's real-time work.
-///
-/// The inbound and outbound ceilings are independent hard partitions. There is
-/// no borrowing and therefore no third aggregate input for an owner to select.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectorRealtimeByteBudgets {
-    max_inbound_bytes: NonZeroUsize,
-    max_outbound_bytes: NonZeroUsize,
-}
-
-impl ConnectorRealtimeByteBudgets {
-    pub const fn new(max_inbound_bytes: NonZeroUsize, max_outbound_bytes: NonZeroUsize) -> Self {
-        Self {
-            max_inbound_bytes,
-            max_outbound_bytes,
-        }
-    }
-
-    pub const fn max_inbound_bytes(self) -> NonZeroUsize {
-        self.max_inbound_bytes
-    }
-
-    pub const fn max_outbound_bytes(self) -> NonZeroUsize {
-        self.max_outbound_bytes
-    }
-}
-
-impl ConnectorRealtimeFlowPolicy {
-    pub const fn new(
-        capacities: ConnectorRealtimeFlowCapacities,
-        inbound: ConnectorRealtimeInboundLimits,
-        byte_budgets: ConnectorRealtimeByteBudgets,
-        overflow_rule: RealtimeQueueOverflowRule,
-    ) -> Self {
-        Self {
-            max_inbound_active_flows: capacities.max_inbound_active_flows,
-            max_outbound_active_flows: capacities.max_outbound_active_flows,
-            queue_capacity_per_flow: capacities.queue_capacity_per_flow,
-            max_inbound_fragment_bytes: inbound.max_fragment_bytes,
-            max_inbound_fragments_per_unit: inbound.max_fragments_per_unit,
-            max_in_progress_units_per_flow: inbound.max_in_progress_units,
-            byte_budgets,
-            overflow_rule,
-        }
-    }
-
-    pub const fn max_inbound_active_flows(self) -> NonZeroUsize {
-        self.max_inbound_active_flows
-    }
-
-    pub const fn max_outbound_active_flows(self) -> NonZeroUsize {
-        self.max_outbound_active_flows
-    }
-
-    pub const fn queue_capacity_per_flow(self) -> NonZeroUsize {
-        self.queue_capacity_per_flow
-    }
-
-    pub const fn max_inbound_fragment_bytes(self) -> NonZeroUsize {
-        self.max_inbound_fragment_bytes
-    }
-
-    pub const fn max_inbound_fragments_per_unit(self) -> NonZeroUsize {
-        self.max_inbound_fragments_per_unit
-    }
-
-    pub const fn max_in_progress_units_per_flow(self) -> NonZeroUsize {
-        self.max_in_progress_units_per_flow
-    }
-
-    /// Bytes whose ownership is visible to this connector's real-time
-    /// reservations. Allocator slack and memory retained internally by native
-    /// WebRTC dependencies are intentionally outside this exact quantity.
-    pub const fn byte_budgets(self) -> ConnectorRealtimeByteBudgets {
-        self.byte_budgets
-    }
-
-    pub const fn overflow_rule(self) -> RealtimeQueueOverflowRule {
-        self.overflow_rule
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ConnectorCallbackPolicyError {
-    #[error("real-time inbound fragment limit {fragment_bytes} exceeds unit limit {unit_bytes}")]
-    InboundFragmentExceedsUnit {
-        fragment_bytes: usize,
-        unit_bytes: usize,
-    },
-    #[error("real-time unit limit is too large to derive the guarded assembly bound")]
-    AssemblyBoundOverflow,
-    #[error(
-        "accounted real-time byte limit {available_bytes} cannot hold one guarded assembly requiring {required_bytes} bytes"
-    )]
-    AccountedBytesCannotHoldOneAssembly {
-        required_bytes: usize,
-        available_bytes: usize,
-    },
-    #[error(
-        "outbound real-time byte limit {available_bytes} cannot hold one complete unit requiring {required_bytes} bytes"
-    )]
-    OutboundBytesCannotHoldOneUnit {
-        required_bytes: usize,
-        available_bytes: usize,
-    },
-    #[error("data-only callback policy must not carry a real-time service weight")]
-    DisabledRealtimeHasServiceWeight,
-    #[error("enabled real-time callback policy requires an explicit real-time service weight")]
-    EnabledRealtimeMissingServiceWeight,
+    Enabled,
 }
 
 impl ConnectorCallbackPolicy {
-    pub fn new(
-        mailboxes: ConnectorCallbackMailboxCapacities,
-        service_weights: ConnectorCallbackServiceWeights,
-        realtime: RealtimeConnectorPolicy,
-    ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
-        match (realtime, service_weights.realtime()) {
-            (RealtimeConnectorPolicy::Disabled, Some(_)) => {
-                return Err(ConnectorCallbackPolicyError::DisabledRealtimeHasServiceWeight)
-            }
-            (RealtimeConnectorPolicy::Enabled(_), None) => {
-                return Err(ConnectorCallbackPolicyError::EnabledRealtimeMissingServiceWeight)
-            }
-            _ => {}
-        }
-        Ok(Self {
-            local_mailboxes: Some(mailboxes),
-            local_service_weights: Some(service_weights),
-            realtime,
-        })
-    }
-
-    /// Resource-backed data-only callbacks without a product item ceiling or
-    /// owner-selected scheduler weights.
+    /// Resource-backed data-only callbacks.
     pub const fn elastic_data_only() -> Self {
         Self {
-            local_mailboxes: None,
-            local_service_weights: None,
             realtime: RealtimeConnectorPolicy::Disabled,
         }
     }
@@ -410,18 +65,8 @@ impl ConnectorCallbackPolicy {
     /// work-conserving service and no codec or flow meaning.
     pub const fn elastic_realtime() -> Self {
         Self {
-            local_mailboxes: None,
-            local_service_weights: None,
-            realtime: RealtimeConnectorPolicy::Enabled(None),
+            realtime: RealtimeConnectorPolicy::Enabled,
         }
-    }
-
-    pub const fn local_mailboxes(self) -> Option<ConnectorCallbackMailboxCapacities> {
-        self.local_mailboxes
-    }
-
-    pub const fn local_service_weights(self) -> Option<ConnectorCallbackServiceWeights> {
-        self.local_service_weights
     }
 
     pub const fn realtime(self) -> RealtimeConnectorPolicy {
@@ -431,54 +76,7 @@ impl ConnectorCallbackPolicy {
 
 impl RealtimeConnectorPolicy {
     pub const fn enabled() -> Self {
-        Self::Enabled(None)
-    }
-
-    pub fn enabled_with_local_ceiling(
-        max_unit_bytes: NonZeroUsize,
-        flows: ConnectorRealtimeFlowPolicy,
-    ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
-        if flows.max_inbound_fragment_bytes().get() > max_unit_bytes.get() {
-            return Err(ConnectorCallbackPolicyError::InboundFragmentExceedsUnit {
-                fragment_bytes: flows.max_inbound_fragment_bytes().get(),
-                unit_bytes: max_unit_bytes.get(),
-            });
-        }
-        let required_bytes = max_unit_bytes
-            .get()
-            .checked_mul(2)
-            .ok_or(ConnectorCallbackPolicyError::AssemblyBoundOverflow)?;
-        let byte_budgets = flows.byte_budgets();
-        if byte_budgets.max_inbound_bytes().get() < required_bytes {
-            return Err(
-                ConnectorCallbackPolicyError::AccountedBytesCannotHoldOneAssembly {
-                    required_bytes,
-                    available_bytes: byte_budgets.max_inbound_bytes().get(),
-                },
-            );
-        }
-        if byte_budgets.max_outbound_bytes().get() < max_unit_bytes.get() {
-            return Err(
-                ConnectorCallbackPolicyError::OutboundBytesCannotHoldOneUnit {
-                    required_bytes: max_unit_bytes.get(),
-                    available_bytes: byte_budgets.max_outbound_bytes().get(),
-                },
-            );
-        }
-        Ok(Self::Enabled(Some(EnabledRealtimeConnectorPolicy {
-            max_unit_bytes,
-            flows,
-        })))
-    }
-}
-
-impl EnabledRealtimeConnectorPolicy {
-    pub const fn max_unit_bytes(self) -> NonZeroUsize {
-        self.max_unit_bytes
-    }
-
-    pub const fn flows(self) -> ConnectorRealtimeFlowPolicy {
-        self.flows
+        Self::Enabled
     }
 }
 

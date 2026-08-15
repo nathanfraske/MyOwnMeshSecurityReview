@@ -1,7 +1,7 @@
 //! The four updater operations.
 //!
-//! The updater crate hands out its own operation plan, so these do not use the
-//! shared `variable_operation_claim` for the two that read updater state:
+//! The updater crate hands out its own operation plan, so these do not take the
+//! shared response owner for the two that read updater state:
 //! `prepare_operation` reports what its own work will cost, the connection
 //! admits exactly that, and the lease goes back into `run`. `apply` is the
 //! exception — it answers with a plain outcome rather than an updater value,
@@ -9,17 +9,16 @@
 
 use anyhow::{anyhow, Context, Result};
 
-use super::Answer;
-use crate::control::framing::{AdmittedLineOut, FrameAdmission};
+use super::{funded, Answer};
+use crate::control::framing::FrameAdmission;
 use crate::control::reply::{
-    variable_operation_claim, FundedVariableReply, OperationReplyData, PreparedReply,
+    FundedVariableReply, OperationReplyData, PreparedReply, ResponseOwner,
 };
 
 /// Fund the line a finished updater reply encodes into.
 fn lined(variable: FundedVariableReply, admission: &FrameAdmission, what: &str) -> Result<Answer> {
-    let output = AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, admission)
-        .with_context(|| format!("updater {what} response line was not admitted"))?;
-    Ok((PreparedReply::Variable(variable), output))
+    funded(PreparedReply::Variable(variable), admission)
+        .with_context(|| format!("updater {what} response line was not admitted"))
 }
 
 /// What the updater knows without going to the network.
@@ -57,12 +56,9 @@ pub(in crate::control) async fn check(admission: &FrameAdmission) -> Result<Answ
 
 /// Install what has already been staged.
 pub(in crate::control) fn apply(admission: &FrameAdmission) -> Result<Answer> {
-    let lease = admission
-        .acquire_claim(variable_operation_claim())
-        .context("updater apply result was not admitted")?;
-    let plan = FundedVariableReply::begin_operation(lease)
-        .map_err(|_| anyhow!("updater apply lease did not match"))?;
-    let variable = plan.finish(match myownmesh_updater::apply_now() {
+    let owner =
+        ResponseOwner::acquire(admission).context("updater apply result was not admitted")?;
+    let variable = owner.finish(match myownmesh_updater::apply_now() {
         Ok(applied) => Ok(OperationReplyData::Applied(applied)),
         Err(error) => Err(error.to_string()),
     });

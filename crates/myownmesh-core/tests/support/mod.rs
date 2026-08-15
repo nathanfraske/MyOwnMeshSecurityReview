@@ -3,9 +3,8 @@ use std::sync::OnceLock;
 
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{
-    ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackServiceWeights,
-    FiniteResourceProvider, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy, ResourceClaim,
-    ResourceClass, ResourceProviderPort, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+    ConnectorCallbackPolicy, FiniteResourceProvider, ResourceClaim, ResourceClass,
+    ResourceProviderPort, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 
 static TEST_RESOURCE_PROVIDER: OnceLock<ResourceProviderPort> = OnceLock::new();
@@ -78,19 +77,7 @@ pub fn test_transport() -> Transport {
         NonZeroUsize::new(4_096).expect("fixture control payload ceiling is nonzero");
     let endpoint_payload_ceiling =
         NonZeroUsize::new(16 * 1024 * 1024).expect("fixture endpoint payload ceiling is nonzero");
-    let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::with_local_payload_ceilings(
-            callback_capacity,
-            callback_capacity,
-            control_payload_ceiling,
-            endpoint_payload_ceiling,
-        ),
-        ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
-        RealtimeConnectorPolicy::Disabled,
-    )
-    .expect("fixture data-only callback policy is valid");
-    let webrtc_profile =
-        WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
+    let webrtc_profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
     let provider = TEST_RESOURCE_PROVIDER.get_or_init(|| {
         let connectors = u64::try_from(process_connector_count.get())
             .expect("fixture connector concurrency fits u64");
@@ -101,40 +88,26 @@ pub fn test_transport() -> Transport {
                 u64::try_from(callback_capacity.get()).expect("fixture callback count fits u64"),
             )
             .expect("fixture queued-item envelope fits u64");
-        // Both ceilings are read back off the policy this fixture actually
-        // installs, not restated here. That is what keeps the two from drifting:
-        // an edit that changes the declared policy without changing this
-        // arithmetic — or the reverse — is the shape of the defect this replaces,
-        // and reading through the policy makes it unrepresentable rather than
-        // merely discouraged.
-        let stated = callbacks
-            .local_mailboxes()
-            .expect("the fixture policy states its local mailboxes");
-        let ceiling = |bytes: Option<NonZeroUsize>, class: &str| -> u64 {
-            u64::try_from(
-                bytes
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "the self-funded fixture policy must state its {class} payload ceiling"
-                        )
-                    })
-                    .get(),
-            )
-            .unwrap_or_else(|_| panic!("the stated {class} payload ceiling fits u64"))
-        };
         // Each class funds its own slots from its own stated ceiling, summed.
         // One number multiplied across the combined slot count is what this
         // replaces: it made the endpoint figure silently pay for every control
         // callback too, so neither class's budget meant what it said and removing
         // the figure would have left control funded for nothing.
+        //
+        // The two ceilings used to be read back off the installed policy so the
+        // grant and the declaration could not drift. The policy no longer
+        // carries them — nothing enforces a per-class payload ceiling any more —
+        // so they are what they always really were here: this fixture's own
+        // statement of the largest payload it intends to fund.
+        let ceiling = |bytes: NonZeroUsize, class: &str| -> u64 {
+            u64::try_from(bytes.get())
+                .unwrap_or_else(|_| panic!("the stated {class} payload ceiling fits u64"))
+        };
         let control_bytes = queued_items
-            .checked_mul(ceiling(stated.local_control_payload_bytes(), "control"))
+            .checked_mul(ceiling(control_payload_ceiling, "control"))
             .expect("fixture control byte envelope fits u64");
         let endpoint_bytes = queued_items
-            .checked_mul(ceiling(
-                stated.local_endpoint_payload_bytes(),
-                "endpoint-data",
-            ))
+            .checked_mul(ceiling(endpoint_payload_ceiling, "endpoint-data"))
             .expect("fixture endpoint byte envelope fits u64");
         let retained_bytes = control_bytes
             .checked_add(endpoint_bytes)

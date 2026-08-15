@@ -138,11 +138,10 @@ struct SessionValidity {
 
 impl SessionValidity {
     fn claim() -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
-        let record = std::mem::size_of::<Self>()
-            .checked_add(2 * std::mem::size_of::<usize>())
-            .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
-                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
-            })?;
+        // Charge the visible funded record. The residual below covers
+        // dependency-private shared-allocation metadata; exact Arc
+        // control-block layout is not part of the session contract.
+        let record = std::mem::size_of::<Self>();
         ResourceClaim::try_from_entries([
             (
                 crate::resource::ResourceClass::AccountedMemoryBytes,

@@ -97,8 +97,6 @@ pub enum IpcAdmissionError {
     /// retry — is identical for all three arms.
     #[error("the control runtime is closing and admits nothing further")]
     Closing,
-    #[error("this daemon has no unused process-local identities left")]
-    IdentityExhausted,
 }
 
 /// Everything one registry is still holding, at one instant.
@@ -182,7 +180,7 @@ pub enum Lifecycle {
 
 /// Why one registration a client asked for could not be installed.
 ///
-/// The two arms are the two things that can go wrong for a method claim, a
+/// Two of the arms are the two things that can go wrong for a method claim, a
 /// channel subscription or a realtime flow alike, which is why one type serves
 /// all three: either the client stopped being registered while its own request
 /// was in flight, or the entry it needed was refused funding. A caller has to
@@ -198,13 +196,6 @@ pub enum RegistrationError {
     /// because the client is fine and there is nothing for it to retry against.
     #[error("the network's gateway closed before the registration was published")]
     GatewayRevoked,
-    /// This daemon has issued every handler generation a `u64` can express.
-    /// Unreachable in practice and refused rather than wrapped, because a
-    /// wrapped counter reuses generations that are still installed.
-    #[error("this daemon has no unused handler generations left")]
-    GenerationExhausted,
-    #[error("this daemon has no unused process-local identities left")]
-    IdentityExhausted,
     #[error(transparent)]
     Admission(#[from] IpcAdmissionError),
 }
@@ -261,9 +252,9 @@ impl MethodRelease {
 /// caller's [`ChannelFanout`]. `End` means this frame has no further subscribers
 /// to reach, which is an ordinary end to one frame's fan-out; `Gone` means this
 /// pump's route is no longer the route under this key, which is the end of the
-/// pump rather than of the frame. Collapsing the last two — which the boolean
-/// this replaced did — made "delivered to nobody" and "there is nothing here to
-/// deliver through" the same answer.
+/// pump rather than of the frame. Collapsing the last two would make
+/// "delivered to nobody" and "there is nothing here to deliver through" the
+/// same answer.
 pub(crate) enum ChannelFanoutStep {
     Next { client: FundedArc<ClientHandle> },
     End,
@@ -395,11 +386,11 @@ impl ForgottenMethod {
 
 /// One inbound call's funding, acquired before the call's own state exists.
 ///
-/// The first half of a two-phase filing, and the reason it exists is an ordering
-/// rather than a refactor. The shape this replaces built the `PendingKey` — four
-/// copies of peer-chosen coordinates — and the oneshot or stream inbox that
-/// answers the call, and *then* asked whether any of it could be admitted. A
-/// remote peer could therefore force those allocations at whatever rate it chose
+/// The first half of a two-phase filing, and it exists for the ordering. The
+/// `PendingKey` is four copies of peer-chosen coordinates, and the oneshot or
+/// stream inbox answers the call; building either before asking whether it can
+/// be admitted lets a remote peer force those allocations at whatever rate it
+/// chose
 /// to call, and the refusal, when it came, came after the memory it was refusing
 /// had already been taken.
 ///
@@ -550,15 +541,15 @@ fn task_claim_retaining(retained: usize) -> Result<ResourceClaim, ResourceClaimA
     })?;
     ResourceClaim::try_from_entries([
         (ResourceClass::WorkerOrTask, 1),
-        (ResourceClass::OpaqueDependencyResidual, 2),
+        (ResourceClass::OpaqueDependencyResidual, 1),
         (ResourceClass::AccountedMemoryBytes, retained),
     ])
 }
 
-/// Exact claim for one registered client's own record.
+/// Claim for one registered client's own record.
 ///
-/// Covers what the handle itself retains: its shared allocation and the minted
-/// capability's bytes. The three tables it owns are inline fields, so
+/// Covers the handle's visible record and the minted capability's bytes. The
+/// three tables it owns are inline fields, so
 /// `size_of::<ClientHandle>()` already counts them — an empty [`LeasedMap`] is a
 /// null root pointer, a length and a hash seed, and allocates nothing until
 /// something is admitted into it.
@@ -580,20 +571,18 @@ fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> 
         dimension: ResourceClass::AccountedMemoryBytes,
     };
     let bytes = std::mem::size_of::<ClientHandle>()
-        // The strong and weak counts beside the value in one `Arc` allocation.
-        .checked_add(2 * std::mem::size_of::<usize>())
-        .and_then(|bytes| bytes.checked_add(CLIENT_CAPABILITY_BYTES))
+        .checked_add(CLIENT_CAPABILITY_BYTES)
         .ok_or_else(overflow)?;
     let bytes = u64::try_from(bytes).map_err(|_| overflow())?;
     ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
-        // The `Arc` allocation and the capability string's own buffer.
-        (ResourceClass::OpaqueDependencyResidual, 2),
+        // One broad residual covers dependency-private shared-allocation and
+        // string-buffer metadata without making allocator layout an invariant.
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
-    // No sweep slot. `shutdown` used to snapshot every connected client's id
-    // into a vector this term pre-paid for, and there is no vector any more:
-    // the drain takes the first client still in the table, releases it, and
-    // asks again. An allocation that does not happen needs no funding and
+    // No sweep slot. The drain takes the first client still in the table,
+    // releases it, and asks again, so no vector of ids exists to be funded.
+    // An allocation that does not happen needs no funding and
     // cannot be refused, which is a stronger answer than pre-payment.
 }
 
@@ -609,21 +598,15 @@ fn client_record_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> 
 /// admitted.
 ///
 /// `bytes` is what the caller can state exactly: the lengths of the buffers the
-/// entry will own. `allocations` is how many separate allocations those bytes
-/// live in, as an opaque residual — because `String` reserves *at least* its
-/// length and the excess an allocator adds is not a number this code can know.
-/// Neither half alone would be true, on the same pattern as the control
-/// reader's buffers.
-fn retained_claim(
-    bytes: usize,
-    allocations: u64,
-) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+/// entry will own. One broad residual covers dependency-private allocation
+/// metadata instead of counting String allocator events as protocol state.
+fn retained_claim(bytes: usize) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     let bytes = u64::try_from(bytes).map_err(|_| ResourceClaimArithmeticError::Overflow {
         dimension: ResourceClass::AccountedMemoryBytes,
     })?;
     ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
-        (ResourceClass::OpaqueDependencyResidual, allocations),
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
 }
 
@@ -650,7 +633,7 @@ fn total_len(
 
 /// The heap a [`ClaimKey`] owns: two client-chosen strings.
 fn claim_key_retained(key: &ClaimKey) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    retained_claim(total_len([key.0.len(), key.1.len()])?, 2)
+    retained_claim(total_len([key.0.len(), key.1.len()])?)
 }
 
 /// The heap a [`PendingKey`] owns: four client- or peer-chosen strings.
@@ -690,27 +673,16 @@ fn pending_key_retained_for(
         remote_peer.len(),
         remote_request_id.len(),
     ])?;
-    retained_claim(bytes, 4)
+    retained_claim(bytes)
 }
 
-/// The heap one `Arc<T>` allocation occupies.
+/// Claim for one funded shared record whose visible value type is `T`.
 ///
-/// `Arc` stores a strong count, a weak count and the value in one allocation, so
-/// the pointee is `2 * size_of::<usize>()` of counts plus the value — with
-/// padding, since the value's alignment may exceed a `usize`'s. `align_of::<T>()`
-/// is added rather than computed exactly: the true padding is at most that, so
-/// this over-states by less than one alignment and never under-states, which is
-/// the direction an accounting error has to fall in.
-///
-/// Named because an `Arc` field looks free from the outside. `size_of` on a
-/// struct holding one counts a pointer; the allocation it points at is off-node
-/// and is exactly the kind of retention `entry_claim` excludes.
-fn arc_allocation_bytes<T>() -> Result<usize, ResourceClaimArithmeticError> {
-    total_len([
-        std::mem::size_of::<T>(),
-        2 * std::mem::size_of::<usize>(),
-        std::mem::align_of::<T>(),
-    ])
+/// The record bytes are knowable here. One broad residual covers the shared
+/// allocation and dependency-private metadata; control-block layout and
+/// allocator padding are deliberately not part of the resource contract.
+fn funded_record_retained<T>() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    retained_claim(std::mem::size_of::<T>())
 }
 
 /// Everything one accepted pending call retains beyond its table node.
@@ -719,18 +691,13 @@ fn arc_allocation_bytes<T>() -> Result<usize, ResourceClaimArithmeticError> {
 /// the [`PendingTicket`] clones a second, and neither is a borrow of the other,
 /// so the pair is what is really retained for as long as the call is live.
 ///
-/// It was three until the sweep stopped needing a transient clone.
-/// `pop_first_where` detaches only the first matching node and leaves the
-/// rejected ones where they are, so a predicate-selected sweep no longer has to
-/// snapshot keys to know what to remove — the third copy is gone rather than
-/// funded, and so are the two vectors it used to drive.
+/// Two, because `pop_first_where` detaches only the first matching node and
+/// leaves the rejected ones where they are: a predicate-selected sweep needs no
+/// snapshot of keys to know what to remove, so no third copy and no vector
+/// exists to be funded.
 ///
-/// Then the two `Arc` pointees — this `PendingFunding` and the shared
-/// `PendingCancellation` — priced in **bytes**, not merely named as residuals.
-/// Both are this crate's own types, so their layouts are known here; charging
-/// only a residual for an allocation whose size is available would be
-/// understating it. An `Arc` field is the easiest retention to miss precisely
-/// because `size_of` on the struct holding it counts a pointer.
+/// The visible `PendingFunding` record is charged in bytes. Shared-allocation
+/// metadata is covered by one broad residual rather than exact Arc layout.
 ///
 /// The `PendingInbound` effect's channel state stays an opaque residual: it is a
 /// library allocation whose size is not this crate's to state, and a number
@@ -765,17 +732,15 @@ fn pending_retained_for(
     remote_request_id: &str,
 ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     let key_retention = pending_key_retained_for(network, method, remote_peer, remote_request_id)?;
-    // The two `Arc` pointees, in bytes and not merely as residuals. Both sizes
-    // are known here — they are this crate's own types — so naming them as
-    // opaque would be understating a figure that is available.
-    let shared = retained_claim(arc_allocation_bytes::<PendingFunding>()?, 1)?;
+    // The visible funded record has explicit bytes and one broad residual.
+    let shared = funded_record_retained::<PendingFunding>()?;
     key_retention
         .checked_scale(2)?
         .checked_add(shared)?
         // The effect's channel state is a library allocation whose size is not
         // this crate's to state, so it stays an honestly named residual rather
         // than a guess dressed as a measurement.
-        .checked_add(retained_claim(0, 1)?)
+        .checked_add(retained_claim(0)?)
     // The sweep node is *not* here. It is acquired as its own lease beside this
     // one and travels into the node it pays for, because a node's funding
     // cannot be a term of a claim released when the table entry is removed --
@@ -784,7 +749,7 @@ fn pending_retained_for(
 }
 
 fn pending_cancellation_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    retained_claim(arc_allocation_bytes::<PendingCancellation>()?, 1)
+    funded_record_retained::<PendingCancellation>()
 }
 
 /// Everything one installed realtime flow retains beyond its table node.
@@ -800,16 +765,16 @@ fn realtime_flow_retained(
     capability: usize,
     network: &str,
 ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    retained_claim(total_len([capability, network.len()])?, 2)
+    retained_claim(total_len([capability, network.len()])?)
     // The drain node is acquired as its own lease beside this one, for the
     // reason `pending_retained` gives: a node's funding cannot be a term of a
     // claim released when the table entry is removed.
 }
 
-// `cleanup_slot_claim` is gone, and what replaced it is not a better number but
-// a different owner. It charged `size_of::<T>()` and one residual per installed
-// entry against a shared-capacity `Vec`, which was wrong in two mechanical ways:
-// a `Vec`'s allocation is sized by capacity rather than length, so geometric
+// The cleanup charge names an owner rather than a shared buffer. Charging
+// `size_of::<T>()` and one residual per installed entry against a
+// shared-capacity `Vec` would be wrong in two mechanical ways: a `Vec`'s
+// allocation is sized by capacity rather than length, so geometric
 // growth retained slots no entry had paid for and extra residuals do not fund
 // missing bytes; and the per-entry funding was released when the entry left the
 // table, while the shared buffer went on living. Cleanup storage is now
@@ -817,8 +782,7 @@ fn realtime_flow_retained(
 // claim as a *separate* lease that travels into the node it pays for and is
 // released after that node is freed.
 //
-// The reason the charge is still taken at install time is unchanged and was
-// always the right half of the old design: a cleanup claim taken on the
+// The charge is taken at install time because a cleanup claim taken on the
 // disconnect path could be refused, and a disconnect path that cannot allocate
 // has no honest answer left -- it cannot decline to clean up. Charging when the
 // entry is installed makes the client pay in advance for its own removal.
@@ -1020,11 +984,10 @@ impl PendingCancellation {
         self.notify.notify_waiters();
     }
 
-    /// Synchronous read, for callers that no longer suspend.
+    /// Synchronous read, for callers that do not suspend.
     ///
-    /// The stream push used to race this against a bounded channel's
-    /// backpressure. There is no backpressure to race now, so the only question
-    /// left is the one this answers directly: has this operation already been
+    /// There is no backpressure to race against here, so the only question is
+    /// the one this answers directly: has this operation already been
     /// cancelled.
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
@@ -1361,9 +1324,8 @@ impl ClientHandle {
     /// and a shutdown that reports the control surface closed should have waited
     /// for the native halves rather than left them retiring behind it. Drop
     /// remains the backstop for the paths that cannot await.
-    /// Taken under one acquisition of the table, unlike the two-phase walk this
-    /// replaces: a flow opened between the old snapshot and the old removal
-    /// survived the drain and was never closed.
+    /// Taken under one acquisition of the table, so a flow opened part-way
+    /// through cannot survive the drain unclosed.
     /// Take every flow out, one detached node at a time.
     ///
     /// `pop_first_entry` rather than collect-the-keys-then-remove. The previous
@@ -1393,8 +1355,8 @@ impl ClientHandle {
     /// Queue one frame for this client's writer task.
     ///
     /// The refusal is returned rather than swallowed because the two ways this
-    /// can fail are not the same event, and they used to be flattened into the
-    /// same discarded `Err`. `Closed` means the connection is gone and the
+    /// can fail are not the same event. `Closed` means the connection is gone
+    /// and the
     /// registry will drop this handle shortly — nothing was owed to anyone.
     /// `Pressure` and `Claim` mean the frame was real, the client is still
     /// connected, and it will never see it. A caller with a peer waiting on the
@@ -1437,13 +1399,12 @@ impl ClientHandle {
 /// A one-shot pause for the channel pump, at the line between selecting a
 /// subscriber and building that subscriber's frame.
 ///
-/// That line is the finding. The fan-out used to clone a publisher-chosen
-/// payload and hand it to a mailbox with the registry's tables still held, so
-/// for the whole of one large frame a disconnect could not be recorded and a
-/// shutdown could not begin. A control that only checks the cursor method
-/// returns without the lock is checking the easy half; parking the pump *here*,
-/// with the frame not yet built, is the interval the old shape could not answer
-/// in.
+/// That line is the one that matters. Cloning a publisher-chosen payload into
+/// a mailbox with the registry's tables still held would mean that for the whole
+/// of one large frame a disconnect could not be recorded and a shutdown could
+/// not begin. Checking only that the cursor method returns without the lock
+/// checks the easy half; parking the pump *here*, with the frame not yet built,
+/// is the interval that matters.
 ///
 /// One pump and one only: both halves are taken on first use, so a second pump
 /// -- or the same pump's second subscriber -- runs straight through. The
@@ -1501,10 +1462,10 @@ pub struct ClientRegistry {
 struct RegistryInner {
     /// Every routing table this registry owns, under one acquisition.
     ///
-    /// This replaced a bare `Mutex<()>` fence beside five separately-locked
-    /// `DashMap`s. The fence made the multi-table operations atomic with respect
-    /// to each other, but the single-table readers bypassed it, so a reader
-    /// could see a claim installed and the client that owned it already gone.
+    /// One acquisition rather than a fence beside separately-locked maps. A
+    /// fence makes the multi-table operations atomic with respect to each other
+    /// but single-table readers bypass it, so a reader could see a claim
+    /// installed and the client that owned it already gone.
     /// There is one acquisition now, and no way to read one table without it.
     tables: Mutex<RegistryTables>,
     /// Where a control parks one channel pump, if one asked to.
@@ -1544,6 +1505,11 @@ struct RegistryInner {
     /// lifecycle under the tables lock remains the authority — this only tells
     /// an awaiting task when to go and look.
     closing: tokio::sync::Notify,
+    // The four never-reused process-local identity counters. Each hands out the
+    // value it read and moves on, so no two live records share one and a
+    // released identity is never handed out again. Exhaustion is not modelled:
+    // one `u64` per client, per outbound stream call, per inbound operation and
+    // per channel membership outlasts the process.
     next_id: AtomicU64,
     next_call_stream_id: AtomicU64,
     next_operation_id: AtomicU64,
@@ -1772,10 +1738,10 @@ struct Funded<T> {
 
 /// One channel's fan-out route, and the single owner of its lifecycle.
 ///
-/// Membership and liveness used to be two answers. `channel_subs` held a bare
-/// subscriber set, and whether a pump existed for it was implied by whoever
-/// happened to have been first — so a second client subscribing while the first
-/// was still installing was told it had succeeded, and if that install then
+/// Membership and liveness are one answer. Were they two — a bare subscriber
+/// set, with the existence of a pump implied by whoever happened to be first —
+/// a second client subscribing while the first was still installing would be
+/// told it had succeeded, and if that install then
 /// failed the first client unwound only *its own* membership. The second was
 /// left subscribed to a route that would never deliver a frame and that nothing
 /// would ever tear down.
@@ -1962,20 +1928,20 @@ impl RouteCancellation {
 /// owners get two leases; folding either into the route would return funding
 /// while the thing it paid for was still in use.
 fn route_ready_retained() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    retained_claim(arc_allocation_bytes::<RouteReady>()?, 1)
+    funded_record_retained::<RouteReady>()
 }
 
 /// One `FundedArc<RouteCancellation>` pointee, funded before it exists.
 fn route_cancellation_retained() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    retained_claim(arc_allocation_bytes::<RouteCancellation>()?, 1)
+    funded_record_retained::<RouteCancellation>()
 }
 
 /// What one subscriber must do next, decided under the tables lock.
 ///
-/// Returned instead of the old bare `bool`. `true` meant "you are first, install
-/// a pump" and `false` meant "you are done" — and that second answer was wrong
-/// whenever a route was still installing, because the client was told it had
-/// subscribed before anything could deliver to it.
+/// A named outcome rather than a bare `bool`. "You are first, install a pump"
+/// and "you are done" do not cover a route that is still installing: answering
+/// the second there tells the client it has subscribed before anything can
+/// deliver to it.
 pub(crate) enum ChannelJoin {
     /// This caller owns the install. Report to its client only after calling
     /// [`ClientRegistry::finish_channel_install`].
@@ -2095,11 +2061,6 @@ struct InstalledHandler {
 }
 
 /// The core registration behind an installed handler.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the live arm is the move-only exact registration and cleanup owner; boxing it \
-              would add an unaccounted allocation and separate ownership from its drop effect"
-)]
 enum HandlerToken {
     /// Core has published the handler, and this registry does not hold its
     /// registration yet — the few instructions between `commit_with` returning

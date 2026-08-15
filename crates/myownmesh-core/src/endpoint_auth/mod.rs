@@ -62,12 +62,12 @@ pub(crate) use task::{peer_proof_for_test, task_for_test, task_reusing_contribut
 pub(crate) use task::{
     AcceptedPeerHello, EndpointAuthTask, LocalIdentitySigner, PeerProofAcceptance,
 };
-// The signed framing is deliberately *not* re-exported. It used to be, so that
-// controls outside this module could rebuild the exact bytes it signs — but
-// rebuilding them meant restating the mesh, profile, Device pair and channel
-// binding, which is the substitution the task now exists to prevent. A control
-// that needs the peer's half asks `peer_proof_for_test` for it instead, and gets
-// bytes derived from the task's own context rather than from its own arguments.
+// The signed framing is deliberately *not* re-exported. Rebuilding the exact
+// bytes outside this module would mean restating the mesh, profile, Device pair
+// and channel binding, which is the substitution the task exists to prevent. A
+// control that needs the peer's half asks `peer_proof_for_test` for it instead,
+// and gets bytes derived from the task's own context rather than from its own
+// arguments.
 
 /// Domain tag for every endpoint-authentication transcript.
 ///
@@ -161,13 +161,12 @@ pub(crate) enum EndpointAuthError {
 /// lock, and none can terminalize anything — so an `Err` of this type says only
 /// that the value it was handed was refused.
 ///
-/// That separation is the whole point of the type. These causes used to be
-/// variants of [`EndpointAuthError`], whose documented meaning is "this attempt
-/// is over"; a caller holding one could not tell a dead task from an unparseable
-/// string, and neither could the compiler. Now the two senses are distinct
-/// types, so the mistake is not expressible: a setup refusal cannot be recorded
-/// as a terminal cause, cannot be returned from a transition, and cannot be
-/// compared against one.
+/// That separation is the whole point of the type. [`EndpointAuthError`] means
+/// "this attempt is over"; a value that could also carry a parse failure would
+/// leave a caller — and the compiler — unable to tell a dead task from an
+/// unparseable string. The two senses are distinct types, so the mistake is not
+/// expressible: a setup refusal cannot be recorded as a terminal cause, cannot
+/// be returned from a transition, and cannot be compared against one.
 ///
 /// A caller that refuses on one of these must still fail closed — the
 /// production paths drop the exact current peer or retire the exact current

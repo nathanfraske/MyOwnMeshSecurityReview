@@ -5,11 +5,12 @@
 //! for the life of the task, so a later caller cannot substitute a mesh, a
 //! Device identity, a profile, or a channel binding after the fact.
 //!
-//! The context also owns the one place canonical ordering is decided. The role
-//! is derived from the exact Device pair, never supplied, and the connector's
-//! endpoint-relative binding components are ordered by that derived role. A
-//! transport therefore cannot choose roles, and no caller can pick whichever
-//! ordering makes a signature verify.
+//! The context also owns the one place the role is decided: it is derived from
+//! the exact Device pair, never supplied. Canonical ordering of the connector's
+//! endpoint-relative binding components follows from that role and is applied
+//! once, in [`super::transcript::transcript_bytes`], where the bytes are
+//! actually framed. A transport therefore cannot choose roles, and no caller
+//! can pick whichever ordering makes a signature verify.
 
 use super::{EndpointAuthProfile, EndpointAuthSetupError, EndpointRole};
 use crate::connector::{EndpointAuthBinding, EndpointAuthBindingProfile};
@@ -134,24 +135,6 @@ impl EndpointAuthContext {
     pub(crate) fn matches(&self, mesh_context: &str, remote_device_id: &str) -> bool {
         self.mesh_context == mesh_context && self.expected_remote_device_id == remote_device_id
     }
-
-    /// The binding components in role-canonical order.
-    ///
-    /// Returns `(initiator_component, responder_component)`. Ordering is a pure
-    /// function of the derived role, so both endpoints compute the same pair
-    /// from their own endpoint-relative view and neither side chooses it.
-    pub(crate) fn canonical_binding_pair(&self) -> (&str, &str) {
-        match self.local_role {
-            EndpointRole::Initiator => (
-                self.binding.local_component(),
-                self.binding.remote_component(),
-            ),
-            EndpointRole::Responder => (
-                self.binding.remote_component(),
-                self.binding.local_component(),
-            ),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -179,23 +162,19 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc04b_context_derives_role_and_canonical_binding_order() {
+    fn v4_arc04b_context_derives_role_from_the_device_pair() {
         let initiator = context("device-a", "device-b");
         let responder = context("device-b", "device-a");
 
         assert_eq!(initiator.local_role(), EndpointRole::Initiator);
         assert_eq!(responder.local_role(), EndpointRole::Responder);
 
-        // Each endpoint sees its own components as local, yet both order the
-        // pair identically once the derived role is applied.
-        assert_eq!(
-            initiator.canonical_binding_pair(),
-            ("local-fp", "remote-fp")
-        );
-        assert_eq!(
-            responder.canonical_binding_pair(),
-            ("remote-fp", "local-fp")
-        );
+        // The components stay endpoint-relative here. Canonical ordering is
+        // applied once, inside `transcript::transcript_bytes`, which is where
+        // it is controlled: a second ordering helper on this type would be a
+        // parallel implementation of the same pure function that nothing signs.
+        assert_eq!(initiator.binding().local_component(), "local-fp");
+        assert_eq!(responder.binding().local_component(), "local-fp");
     }
 
     #[test]

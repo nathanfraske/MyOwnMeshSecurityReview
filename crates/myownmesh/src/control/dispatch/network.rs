@@ -18,8 +18,8 @@ use super::super::{ConnectionCancel, ControlState};
 use super::{funded, unknown_network, Answer};
 use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
 use crate::control::reply::{
-    prepare_reply_then, variable_operation_claim, FundedVariableReply, NetworkLifecycleSummary,
-    OperationReplyData, PreparedReply, PreparedText, VariableOperationPlan,
+    prepare_reply_then, FundedVariableReply, NetworkLifecycleSummary, OperationReplyData,
+    PreparedReply, ResponseOwner,
 };
 
 /// Join a fresh network through the live mesh, attach signaling,
@@ -31,17 +31,17 @@ use crate::control::reply::{
 pub(in crate::control) async fn network_add(
     state: &Arc<ControlState>,
     config: NetworkConfig,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     // Reject duplicates against the running registry. We rely on
     // the registry's two-key indexing — checking both the local
     // config id and the wire-level network id covers the user
     // trying to add the same network twice (under any alias).
     if state.registry.contains(&config.id) {
-        return plan.finish(Err(format!("config id '{}' already in use", config.id)));
+        return owner.finish(Err(format!("config id '{}' already in use", config.id)));
     }
     if state.registry.contains(&config.network_id) {
-        return plan.finish(Err(format!(
+        return owner.finish(Err(format!(
             "network id '{}' already joined under a different config",
             config.network_id
         )));
@@ -51,7 +51,7 @@ pub(in crate::control) async fn network_add(
     // network id, etc.) we want to know before we touch disk.
     let joined = match state.mesh.join(config.clone()).await {
         Ok(j) => j,
-        Err(e) => return plan.finish(Err(format!("join: {e}"))),
+        Err(e) => return owner.finish(Err(format!("join: {e}"))),
     };
 
     // Take a summary BEFORE handing ownership to the registry so we
@@ -68,10 +68,10 @@ pub(in crate::control) async fn network_add(
     // Attach the signaling driver(s) the network's config selects
     // (Nostr and/or mDNS).
     //
-    // Two outcomes that used to be one. `Ok(None)` means the outbound receiver
-    // was already taken — an in-process test driver holds it — and the network
-    // still works. `Err` means the attach itself was refused, which is a
-    // startup failure and is now reported as one: a joined network left
+    // Two outcomes, and they are not the same. `Ok(None)` means the outbound
+    // receiver was already taken — an in-process test driver holds it — and the
+    // network still works. `Err` means the attach itself was refused, which is a
+    // startup failure and is reported as one: a joined network left
     // installed with no signaling and no explanation would look identical to
     // the benign case from every later request's point of view.
     let drivers = {
@@ -80,7 +80,7 @@ pub(in crate::control) async fn network_add(
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
-                return plan.finish(Err(format!("signaling attach failed: {error}")));
+                return owner.finish(Err(format!("signaling attach failed: {error}")));
             }
         }
     };
@@ -94,7 +94,7 @@ pub(in crate::control) async fn network_add(
         let refusal_state = refused.state;
         drop(refused.drivers);
         let _ = refused.joined.shutdown().await;
-        return plan.finish(Err(format!(
+        return owner.finish(Err(format!(
             "network id is held by a runtime in {refusal_state:?} state"
         )));
     }
@@ -110,12 +110,12 @@ pub(in crate::control) async fn network_add(
     // but won't re-join on next daemon restart. Surface the disk
     // error to the caller so the GUI can show it.
     if let Err(e) = persist_network_add(&config) {
-        return plan.finish(Err(format!(
+        return owner.finish(Err(format!(
             "network joined but config.json save failed: {e}"
         )));
     }
 
-    plan.finish(Ok(OperationReplyData::Added(summary)))
+    owner.finish(Ok(OperationReplyData::Added(summary)))
 }
 
 /// Leave a live network and remove it from the on-disk config. The registry
@@ -138,17 +138,17 @@ pub(in crate::control) async fn network_remove(
     state: &Arc<ControlState>,
     key: &str,
     purge: bool,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
-    let result = network_remove_result(state, key, purge, &plan).await;
-    plan.finish(result.map(OperationReplyData::Removed))
+    let result = network_remove_result(state, key, purge, &owner).await;
+    owner.finish(result.map(OperationReplyData::Removed))
 }
 
 async fn network_remove_result(
     state: &Arc<ControlState>,
     key: &str,
     purge: bool,
-    _funding: &VariableOperationPlan,
+    _owner: &ResponseOwner,
 ) -> std::result::Result<String, String> {
     let key_owned = key.to_string();
     let ids = if let Some(joined) = state.registry.get(key) {
@@ -193,16 +193,16 @@ async fn network_remove_result(
 /// every layer reloads clean around the wipe.
 pub(in crate::control) async fn forget_all_networks(
     state: &Arc<ControlState>,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     let mut forgotten = Vec::new();
     for n in state.registry.summaries() {
         // `network_remove` resolves either alias; the config id is stable.
-        let _ = network_remove_result(state, &n.config_id, true, &plan).await;
+        let _ = network_remove_result(state, &n.config_id, true, &owner).await;
         forgotten.push(n.config_id);
     }
     schedule_daemon_exit();
-    plan.finish(Ok(OperationReplyData::Forgotten(forgotten)))
+    owner.finish(Ok(OperationReplyData::Forgotten(forgotten)))
 }
 
 /// Factory reset — return this device to a brand-new state. First quiesce every
@@ -216,12 +216,12 @@ pub(in crate::control) async fn forget_all_networks(
 /// re-persisting stale caches.
 pub(in crate::control) async fn factory_reset(
     state: &Arc<ControlState>,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     // Quiesce writers first: tearing each network down stops its engine driver
     // from writing a roster/state file back out while we're deleting the tree.
     for n in state.registry.summaries() {
-        let _ = network_remove_result(state, &n.config_id, true, &plan).await;
+        let _ = network_remove_result(state, &n.config_id, true, &owner).await;
     }
     let dir = match myownmesh_core::dirs::data_dir() {
         Ok(d) => d,
@@ -229,7 +229,7 @@ pub(in crate::control) async fn factory_reset(
             // Can't find the dir to wipe — still restart so we don't leave the
             // caller hanging on a half-done reset.
             schedule_daemon_exit();
-            return plan.finish(Err(format!("factory reset: resolve state dir: {e}")));
+            return owner.finish(Err(format!("factory reset: resolve state dir: {e}")));
         }
     };
     if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -240,7 +240,7 @@ pub(in crate::control) async fn factory_reset(
         }
     }
     schedule_daemon_exit();
-    plan.finish(Ok(OperationReplyData::Reset))
+    owner.finish(Ok(OperationReplyData::Reset))
 }
 
 /// Exit the daemon shortly after the current response flushes, so a fresh
@@ -269,14 +269,14 @@ pub(in crate::control) fn network_reconnect(
     state: &Arc<ControlState>,
     key: &str,
     peer: Option<String>,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     match state.registry.get(key) {
         Some(joined) => {
             joined.reconnect(peer);
-            plan.finish(Ok(OperationReplyData::Reconnecting(key.to_owned())))
+            owner.finish(Ok(OperationReplyData::Reconnecting(key.to_owned())))
         }
-        None => plan.finish(Err(format!("unknown network: {key}"))),
+        None => owner.finish(Err(format!("unknown network: {key}"))),
     }
 }
 
@@ -287,10 +287,9 @@ pub(in crate::control) fn network_reconnect(
 /// there is nothing to say and the loop ends. Every other result — including
 /// a refused or timed-out dial — is a reply.
 ///
-/// The residual the answer will occupy is admitted *before* the dial starts,
-/// which is why the lease and the plan are taken here rather than after the
-/// `select!`: a dial that succeeds must not then discover it has nowhere to
-/// report the success.
+/// The right to answer is taken *before* the dial starts, which is why the
+/// owner is acquired here rather than after the `select!`: a dial that succeeds
+/// must not then discover it has nowhere to report the success.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::control) async fn connect_peer(
     state: &Arc<ControlState>,
@@ -301,19 +300,16 @@ pub(in crate::control) async fn connect_peer(
     pin: bool,
     wait_ms: u64,
 ) -> Result<Option<Answer>> {
-    let lease = admission
-        .acquire_claim(variable_operation_claim())
-        .context("network connect result was not admitted")?;
-    let plan = FundedVariableReply::begin_operation(lease)
-        .map_err(|_| anyhow!("network operation lease did not match"))?;
+    let owner =
+        ResponseOwner::acquire(admission).context("network connect result was not admitted")?;
     let variable = tokio::select! {
         biased;
         () = cancel.cancelled() => return Ok(None),
-        result = connect_peer_funded(state, &network, &peer, pin, wait_ms, plan) => result,
+        result = connect_peer_funded(state, &network, &peer, pin, wait_ms, owner) => result,
     };
-    let output = AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, admission)
-        .context("network connect response line was not admitted")?;
-    Ok(Some((PreparedReply::Variable(variable), output)))
+    funded(PreparedReply::Variable(variable), admission)
+        .context("network connect response line was not admitted")
+        .map(Some)
 }
 
 /// The dial itself — the control-socket wrapper around
@@ -327,10 +323,10 @@ async fn connect_peer_funded(
     peer: &str,
     pin: bool,
     wait_ms: u64,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     let Some(joined) = state.registry.get(key) else {
-        return plan.finish(Err(format!("unknown network: {key}")));
+        return owner.finish(Err(format!("unknown network: {key}")));
     };
     let result = if pin || wait_ms > 0 {
         // Waited/pinned dial: resolves on ACTIVE (or the deadline). A
@@ -355,7 +351,7 @@ async fn connect_peer_funded(
     } else {
         joined.connect_peer(peer).await.map(|_| false)
     };
-    plan.finish(match result {
+    owner.finish(match result {
         Ok(active) => Ok(OperationReplyData::Connecting {
             peer: peer.to_owned(),
             network: key.to_owned(),
@@ -377,7 +373,7 @@ async fn connect_peer_funded(
 pub(in crate::control) async fn network_update(
     state: &Arc<ControlState>,
     config: NetworkConfig,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
 ) -> FundedVariableReply {
     // This is update, not add: the network must already be joined.
     let joined = match state
@@ -387,7 +383,7 @@ pub(in crate::control) async fn network_update(
     {
         Some(j) => j,
         None => {
-            return plan.finish(Err(format!(
+            return owner.finish(Err(format!(
                 "unknown network '{}' — join it with network_add first",
                 config.id
             )));
@@ -423,16 +419,16 @@ pub(in crate::control) async fn network_update(
         // connect, so a credential rotation reaches new connections without
         // tearing down the live ones (see `reconcile::apply_hot`).
         if let Err(e) = myownmesh_core::engine::reconcile::apply_hot(&net_state, config.clone()) {
-            return plan.finish(Err(format!("apply config: {e}")));
+            return owner.finish(Err(format!("apply config: {e}")));
         }
         drop(net_state);
         drop(joined);
         if let Err(e) = persist_network_update(&config) {
-            return plan.finish(Err(format!(
+            return owner.finish(Err(format!(
                 "config applied but config.json save failed: {e}"
             )));
         }
-        return plan.finish(Ok(OperationReplyData::UpdatedId {
+        return owner.finish(Ok(OperationReplyData::UpdatedId {
             id: config.id,
             restarted: false,
         }));
@@ -458,16 +454,16 @@ pub(in crate::control) async fn network_update(
     match state.registry.remove(&config.id).await {
         RemoveResult::Removed(Ok(())) => {}
         RemoveResult::Removed(Err(error)) => {
-            return plan.finish(Err(format!("old runtime teardown failed: {error}")));
+            return owner.finish(Err(format!("old runtime teardown failed: {error}")));
         }
         RemoveResult::AlreadyClosing(runtime) => {
-            return plan.finish(Err(format!(
+            return owner.finish(Err(format!(
                 "network update refused while teardown is already in progress ({runtime:?})"
             )));
         }
         RemoveResult::NotFound => {
             if let Some(runtime) = state.registry.state(&config.id) {
-                return plan.finish(Err(format!(
+                return owner.finish(Err(format!(
                     "network update refused while prior runtime is {runtime:?}"
                 )));
             }
@@ -518,7 +514,7 @@ pub(in crate::control) async fn network_update(
                     " — AND rollback failed; re-add it from the Networks tab".to_string()
                 }
             };
-            return plan.finish(Err(format!("rejoin with new config: {e}{rollback}")));
+            return owner.finish(Err(format!("rejoin with new config: {e}{rollback}")));
         }
     };
     let summary = NetworkLifecycleSummary {
@@ -535,7 +531,7 @@ pub(in crate::control) async fn network_update(
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
-                return plan.finish(Err(format!(
+                return owner.finish(Err(format!(
                     "signaling attach failed after update: {error}"
                 )));
             }
@@ -552,7 +548,7 @@ pub(in crate::control) async fn network_update(
         let refusal_state = refused.state;
         drop(refused.drivers);
         let _ = refused.joined.shutdown().await;
-        return plan.finish(Err(format!(
+        return owner.finish(Err(format!(
             "replacement runtime refused while predecessor is {refusal_state:?}"
         )));
     }
@@ -563,11 +559,11 @@ pub(in crate::control) async fn network_update(
     state.services.on_network_added(&config.id).await;
 
     if let Err(e) = persist_network_update(&config) {
-        return plan.finish(Err(format!(
+        return owner.finish(Err(format!(
             "network updated but config.json save failed: {e}"
         )));
     }
-    plan.finish(Ok(OperationReplyData::Updated(summary)))
+    owner.finish(Ok(OperationReplyData::Updated(summary)))
 }
 
 fn persist_network_add(net: &NetworkConfig) -> Result<()> {
@@ -735,9 +731,13 @@ pub(in crate::control) async fn capabilities_set(
         Ok(()) => Ok((reply, output)),
         Err(error) => {
             drop(output);
-            let text = PreparedText::rpc_advertise_error(&error, admission)
-                .context("capability-advert refusal text was not admitted")?;
-            funded(PreparedReply::Error(text), admission)
+            super::refused_text(
+                format!(
+                    "capabilities were not advertised; the node is still publishing its \
+                     previous ones: {error}"
+                ),
+                admission,
+            )
         }
     }
 }

@@ -459,16 +459,16 @@ impl<T> ResourceMailboxDelivery<T> {
     /// `SignalingInbound` is the same shape for a different reason: its payloads
     /// land in `apply_remote_sdp`, which takes an owned `String`, and
     /// `add_remote_candidate_observed`, which takes an owned
-    /// `LocalIceCandidate`. In both cases the alternative was worse — rebuild
+    /// `LocalIceCandidate`. In both cases the alternatives are worse — rebuild
     /// the public enum around interior mutability across every variant and
     /// construction site, or clone multi-kilobyte SDP bodies outside the claim
     /// that funded them. This is the narrower answer.
     ///
-    /// **`Output = ()` closes the return path, and only that.** The consuming
-    /// form rejected earlier was `FnOnce(T) -> R`, where `R` could be `T` or an
-    /// error containing `T`, so the value walked out through the signature
-    /// itself. Nothing returns here, and `retention` is dropped after the
-    /// future has *completed* rather than after it has been built.
+    /// **`Output = ()` closes the return path, and only that.** A consuming
+    /// form of `FnOnce(T) -> R`, where `R` could be `T` or an error containing
+    /// `T`, would let the value walk out through the signature itself. Nothing
+    /// returns here, and `retention` is dropped after the future has
+    /// *completed* rather than after it has been built.
     ///
     /// That is not a structural impossibility and must not be read as one: an
     /// effect is free to `spawn` the value onto another task, push it into a
@@ -543,14 +543,17 @@ pub fn prepare_resource_mailbox<T>(
 }
 
 impl<T> ResourceMailboxSender<T> {
-    /// Exact claim for the shared mailbox Arc allocation.
+    /// Claim for the shared mailbox record.
+    ///
+    /// The visible record bytes are charged directly. One broad residual covers
+    /// dependency-private allocation metadata; Arc control-block layout is not
+    /// a resource-protocol invariant.
     pub fn root_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-        let bytes = std::mem::size_of::<MailboxInner<T>>()
-            .checked_add(2 * std::mem::size_of::<usize>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(ResourceClaimArithmeticError::Overflow {
+        let bytes = u64::try_from(std::mem::size_of::<MailboxInner<T>>()).map_err(|_| {
+            ResourceClaimArithmeticError::Overflow {
                 dimension: ResourceClass::AccountedMemoryBytes,
-            })?;
+            }
+        })?;
         ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, bytes),
             (ResourceClass::CallbackOrScheduledWork, 1),

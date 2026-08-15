@@ -7,8 +7,6 @@
 //! listener, lives in the library, so an embedder (an iOS app, which can't
 //! spawn processes) runs the identical daemon in-process.
 
-use std::num::NonZeroUsize;
-
 use anyhow::{anyhow, Context, Result};
 
 /// Run the daemon in the foreground.
@@ -135,8 +133,7 @@ impl RealtimeFraming {
 /// for it is stated here, so core registers and frames what it is given rather
 /// than deriving values from a MIME name. That is the point: a profile that
 /// carried only `mime` would force core to know that `video/H264` implies
-/// 90 kHz, which fmtp lines are acceptable, and Annex-B framing — which is the
-/// hardcoded branch this replaces.
+/// 90 kHz, which fmtp lines are acceptable, and Annex-B framing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealtimeCodec {
@@ -309,62 +306,101 @@ struct ConnectorStartup {
 fn owner_selected_resource_port(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<myownmesh_core::ResourceProviderPort> {
-    fn finite(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Result<u64> {
-        let raw = lookup(name)
-            .ok_or_else(|| anyhow!("serve requires owner-selected environment value {name}"))?;
-        raw.parse::<u64>()
-            .map_err(|_| anyhow!("{name} must be a finite nonnegative integer"))
+    /// The configuration spelling of one dimension, paired with the dimension.
+    ///
+    /// Written out rather than derived from the `Debug` name: the wire spelling
+    /// of an operator-facing key is a contract, and deriving it would let a
+    /// rename inside core silently invalidate every deployment's configuration.
+    const DIMENSIONS: [(&str, myownmesh_core::ResourceClass); 11] = [
+        (
+            "accounted_memory_bytes",
+            myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        ),
+        ("queued_bytes", myownmesh_core::ResourceClass::QueuedBytes),
+        (
+            "socket_or_handle",
+            myownmesh_core::ResourceClass::SocketOrHandle,
+        ),
+        (
+            "native_transport_object",
+            myownmesh_core::ResourceClass::NativeTransportObject,
+        ),
+        (
+            "worker_or_task",
+            myownmesh_core::ResourceClass::WorkerOrTask,
+        ),
+        (
+            "callback_or_scheduled_work",
+            myownmesh_core::ResourceClass::CallbackOrScheduledWork,
+        ),
+        ("storage_bytes", myownmesh_core::ResourceClass::StorageBytes),
+        (
+            "storage_object",
+            myownmesh_core::ResourceClass::StorageObject,
+        ),
+        (
+            "relay_or_provider_allocation",
+            myownmesh_core::ResourceClass::RelayOrProviderAllocation,
+        ),
+        (
+            "parsing_or_cpu_work",
+            myownmesh_core::ResourceClass::ParsingOrCpuWork,
+        ),
+        (
+            "opaque_dependency_residual",
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        ),
+    ];
+
+    const NAME: &str = "MYOWNMESH_RESOURCE_GRANT";
+
+    let raw = lookup(NAME).ok_or_else(|| {
+        anyhow!(
+            "serve requires owner-selected environment value {NAME}, a comma-separated \
+             list of `dimension=value` naming every one of the {} dimensions",
+            DIMENSIONS.len()
+        )
+    })?;
+
+    let mut amounts: [Option<u64>; 11] = [None; 11];
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(anyhow!("{NAME} contains an empty entry"));
+        }
+        let (name, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow!("{NAME} entry `{entry}` is not `dimension=value`"))?;
+        let name = name.trim();
+        let index = DIMENSIONS
+            .iter()
+            .position(|(spelling, _)| *spelling == name)
+            .ok_or_else(|| anyhow!("{NAME} names unknown dimension `{name}`"))?;
+        if amounts[index].is_some() {
+            return Err(anyhow!("{NAME} names dimension `{name}` more than once"));
+        }
+        // Parsed as `u64` and nothing wider: an amount this type cannot hold is
+        // refused here rather than saturating into a grant the owner did not
+        // choose.
+        let amount = value.trim().parse::<u64>().map_err(|_| {
+            anyhow!("{NAME} dimension `{name}` must be a finite nonnegative integer")
+        })?;
+        amounts[index] = Some(amount);
     }
 
-    let provider_grant = myownmesh_core::ResourceClaim::try_from_entries([
-        (
-            myownmesh_core::ResourceClass::AccountedMemoryBytes,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_ACCOUNTED_MEMORY_BYTES")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::QueuedBytes,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_QUEUED_BYTES")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::SocketOrHandle,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_SOCKET_OR_HANDLE")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::NativeTransportObject,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::WorkerOrTask,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_WORKER_OR_TASK")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::CallbackOrScheduledWork,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_CALLBACK_OR_SCHEDULED_WORK")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::StorageBytes,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_STORAGE_BYTES")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::StorageObject,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_STORAGE_OBJECT")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::RelayOrProviderAllocation,
-            finite(
-                &mut lookup,
-                "MYOWNMESH_RESOURCE_RELAY_OR_PROVIDER_ALLOCATION",
-            )?,
-        ),
-        (
-            myownmesh_core::ResourceClass::ParsingOrCpuWork,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_PARSING_OR_CPU_WORK")?,
-        ),
-        (
-            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
-            finite(&mut lookup, "MYOWNMESH_RESOURCE_OPAQUE_DEPENDENCY_RESIDUAL")?,
-        ),
-    ])?;
+    // Every dimension, explicitly, including a deliberate zero. A grant that
+    // omitted one would be this daemon deciding how much of that resource the
+    // owner meant to give it, which is the decision this variable exists to
+    // take away from us.
+    let mut entries = [(myownmesh_core::ResourceClass::AccountedMemoryBytes, 0u64); 11];
+    for (slot, ((name, dimension), amount)) in
+        entries.iter_mut().zip(DIMENSIONS.into_iter().zip(amounts))
+    {
+        let amount = amount.ok_or_else(|| anyhow!("{NAME} does not name dimension `{name}`"))?;
+        *slot = (dimension, amount);
+    }
+
+    let provider_grant = myownmesh_core::ResourceClaim::try_from_entries(entries)?;
     let resources = myownmesh_core::ResourceProviderPort::new(
         myownmesh_core::FiniteResourceProvider::new(provider_grant),
     )?;
@@ -374,25 +410,7 @@ fn owner_selected_resource_port(
 fn connector_policy_from_lookup(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<ConnectorStartup> {
-    fn nonzero(
-        lookup: &mut impl FnMut(&str) -> Option<String>,
-        name: &'static str,
-    ) -> Result<NonZeroUsize> {
-        let raw = lookup(name).ok_or_else(|| {
-            anyhow!("connector-capable serve requires owner-selected environment value {name}")
-        })?;
-        raw.parse::<usize>()
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .ok_or_else(|| anyhow!("{name} must be a nonzero integer"))
-    }
     let resources = owner_selected_resource_port(&mut lookup)?;
-    let local_ceiling_mode = lookup("MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY").ok_or_else(|| {
-        anyhow!(
-            "connector-capable serve requires MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=none or enabled"
-        )
-    })?;
-    let local_ceiling_mode = local_ceiling_mode.trim().to_ascii_lowercase();
     let realtime_mode = lookup("MYOWNMESH_CONNECTOR_REALTIME_POLICY").ok_or_else(|| {
         anyhow!(
             "connector-capable serve requires owner-selected environment value MYOWNMESH_CONNECTOR_REALTIME_POLICY"
@@ -407,154 +425,22 @@ fn connector_policy_from_lookup(
             ))
         }
     };
-    // The third element is the ceiling the daemon may publish: `Some` only where
-    // the owner selected an enforced envelope, and read from the very values
-    // that envelope was built out of. Elastic deployments publish nothing,
-    // because there is nothing they could publish that anything would enforce.
-    let (callbacks, remote_candidates, owner_flow_ceiling) = match local_ceiling_mode.as_str() {
-        "none" => (
-            if realtime_enabled {
-                myownmesh_core::ConnectorCallbackPolicy::elastic_realtime()
-            } else {
-                myownmesh_core::ConnectorCallbackPolicy::elastic_data_only()
-            },
-            myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
-            None,
-        ),
-        "enabled" => {
-            let pending_candidate_items =
-                nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS")?;
-            let pending_candidate_content_bytes = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
-            )?;
-            let pending_candidate_duplicates = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
-            )?;
-            let pending_candidate_application_work = nonzero(
-                &mut lookup,
-                "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK",
-            )?;
-            let control_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY")?;
-            let endpoint_capacity =
-                nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY")?;
-            let control_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT")?;
-            let endpoint_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT")?;
-            let (service_weights, realtime, flow_ceiling) = if realtime_enabled {
-                let realtime_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT")?;
-                let max_realtime_unit_bytes =
-                    nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES")?;
-                let max_inbound_flows = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS",
-                )?;
-                let max_outbound_flows = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS",
-                )?;
-                let queue_capacity_per_flow = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW",
-                )?;
-                let max_inbound_fragment_bytes = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES",
-                )?;
-                let max_inbound_fragments_per_unit = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT",
-                )?;
-                let max_in_progress_units_per_flow = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
-                )?;
-                let max_inbound_accounted_bytes = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
-                )?;
-                let max_outbound_accounted_bytes = nonzero(
-                    &mut lookup,
-                    "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
-                )?;
-                let flows = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
-                    myownmesh_core::ConnectorRealtimeFlowCapacities::new(
-                        max_inbound_flows,
-                        max_outbound_flows,
-                        queue_capacity_per_flow,
-                    ),
-                    myownmesh_core::ConnectorRealtimeInboundLimits::new(
-                        max_inbound_fragment_bytes,
-                        max_inbound_fragments_per_unit,
-                        max_in_progress_units_per_flow,
-                    ),
-                    myownmesh_core::ConnectorRealtimeByteBudgets::new(
-                        max_inbound_accounted_bytes,
-                        max_outbound_accounted_bytes,
-                    ),
-                    myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
-                );
-                (
-                    myownmesh_core::ConnectorCallbackServiceWeights::new(
-                        control_weight,
-                        endpoint_weight,
-                        realtime_weight,
-                    ),
-                    myownmesh_core::RealtimeConnectorPolicy::enabled_with_local_ceiling(
-                        max_realtime_unit_bytes,
-                        flows,
-                    )?,
-                    // The same two values the envelope above enforces, so the
-                    // advert cannot drift from what refuses.
-                    Some(myownmesh::control::RealtimeFlowCeiling {
-                        max_inbound_flows: u64::try_from(max_inbound_flows.get())
-                            .context("MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS fits u64")?,
-                        max_outbound_flows: u64::try_from(max_outbound_flows.get())
-                            .context("MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS fits u64")?,
-                    }),
-                )
-            } else {
-                (
-                    myownmesh_core::ConnectorCallbackServiceWeights::data_only(
-                        control_weight,
-                        endpoint_weight,
-                    ),
-                    myownmesh_core::RealtimeConnectorPolicy::Disabled,
-                    None,
-                )
-            };
-            (
-                myownmesh_core::ConnectorCallbackPolicy::new(
-                    myownmesh_core::ConnectorCallbackMailboxCapacities::new(
-                        control_capacity,
-                        endpoint_capacity,
-                    ),
-                    service_weights,
-                    realtime,
-                )?,
-                myownmesh_core::PendingRemoteCandidatePolicy::new(
-                    pending_candidate_items,
-                    pending_candidate_content_bytes,
-                    pending_candidate_duplicates,
-                    pending_candidate_application_work,
-                ),
-                flow_ceiling,
-            )
-        }
-        _ => {
-            return Err(anyhow!(
-                "MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY must be none or enabled"
-            ))
-        }
+    // One connector shape: elastic, funded by the owner-selected provider. What
+    // bounds this daemon is that provider's finite grant, not a second set of
+    // locally configured counts beside it. The daemon therefore publishes no
+    // flow ceiling, because there is nothing it could publish that anything
+    // would enforce.
+    let callbacks = if realtime_enabled {
+        myownmesh_core::ConnectorCallbackPolicy::elastic_realtime()
+    } else {
+        myownmesh_core::ConnectorCallbackPolicy::elastic_data_only()
     };
-
     // Codec registration happens here, before any `PeerConnection` exists, and
     // wherever the connector can carry flows at all — which is exactly where
-    // realtime is enabled, with an owner ceiling or without one. An elastic
-    // connector registers its codecs and publishes no ceiling.
+    // realtime is enabled. The advert names the encodings.
     let realtime_registration = if realtime_enabled {
         let parsed = realtime_profile_from_lookup(&mut lookup)?;
-        let advert = realtime_advert_for(&parsed, owner_flow_ceiling);
+        let advert = realtime_advert_for(&parsed);
         Some((realtime_profile_into_core(parsed)?, advert))
     } else {
         // Refused, not ignored. A profile supplied to a daemon that cannot
@@ -571,7 +457,7 @@ fn connector_policy_from_lookup(
         None
     };
 
-    let webrtc = myownmesh_core::WebRtcConnectorProfile::new(callbacks, remote_candidates);
+    let webrtc = myownmesh_core::WebRtcConnectorProfile::new(callbacks);
     let (webrtc, realtime) = match realtime_registration {
         Some((profile, advert)) => (webrtc.with_realtime_profile(profile)?, advert),
         // Honestly unsupported: no codecs registered, so no flow can be carried,
@@ -595,10 +481,7 @@ fn connector_policy_from_lookup(
 /// Case is folded on `mime` for the same reason the startup validation folds
 /// it: `video/H264` and `video/h264` are one family, and listing both would
 /// invite a client to treat them as two.
-fn realtime_advert_for(
-    profile: &RealtimeProfile,
-    flow_ceiling: Option<myownmesh::control::RealtimeFlowCeiling>,
-) -> myownmesh::control::RealtimeAdvert {
+fn realtime_advert_for(profile: &RealtimeProfile) -> myownmesh::control::RealtimeAdvert {
     let mut seen = std::collections::HashSet::new();
     let encodings = profile
         .codecs
@@ -621,11 +504,7 @@ fn realtime_advert_for(
             channels: codec.channels,
         })
         .collect();
-    // The ceiling is passed in rather than read off the profile, because it is
-    // not the application's to state: it comes from the owner's enforced
-    // envelope, and is `None` for an elastic connector. Publishing a number
-    // nobody chose is the one thing this must not do.
-    myownmesh::control::RealtimeAdvert::registered(encodings, flow_ceiling)
+    myownmesh::control::RealtimeAdvert::registered(encodings)
 }
 
 async fn wait_for_shutdown_signal() {
@@ -662,45 +541,15 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const BASE_POLICY_KEYS: [&str; 13] = [
-        "MYOWNMESH_RESOURCE_ACCOUNTED_MEMORY_BYTES",
-        "MYOWNMESH_RESOURCE_QUEUED_BYTES",
-        "MYOWNMESH_RESOURCE_SOCKET_OR_HANDLE",
-        "MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT",
-        "MYOWNMESH_RESOURCE_WORKER_OR_TASK",
-        "MYOWNMESH_RESOURCE_CALLBACK_OR_SCHEDULED_WORK",
-        "MYOWNMESH_RESOURCE_STORAGE_BYTES",
-        "MYOWNMESH_RESOURCE_STORAGE_OBJECT",
-        "MYOWNMESH_RESOURCE_RELAY_OR_PROVIDER_ALLOCATION",
-        "MYOWNMESH_RESOURCE_PARSING_OR_CPU_WORK",
-        "MYOWNMESH_RESOURCE_OPAQUE_DEPENDENCY_RESIDUAL",
-        "MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY",
-        "MYOWNMESH_CONNECTOR_REALTIME_POLICY",
-    ];
-
-    const LOCAL_CEILING_KEYS: [&str; 8] = [
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS",
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES",
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES",
-        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK",
-        "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY",
-        "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY",
-        "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT",
-        "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT",
-    ];
-
-    const ENABLED_REALTIME_KEYS: [&str; 10] = [
-        "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT",
-        "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS",
-        "MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
-    ];
+    /// A complete grant naming every dimension, which is the only accepted
+    /// shape. Written out rather than generated from `DIMENSIONS`, so a
+    /// spelling change in the parser has to be made here too and cannot pass
+    /// by agreeing with itself.
+    const COMPLETE_GRANT: &str = "accounted_memory_bytes=1,queued_bytes=1,\
+         socket_or_handle=1,native_transport_object=1,worker_or_task=1,\
+         callback_or_scheduled_work=1,storage_bytes=1,storage_object=1,\
+         relay_or_provider_allocation=1,parsing_or_cpu_work=1,\
+         opaque_dependency_residual=1";
 
     /// The application-supplied profile half of the complete explicit vector.
     ///
@@ -722,42 +571,15 @@ mod tests {
         ]
     }"#;
 
-    fn fixture_values(realtime: &str, local_ceiling: bool) -> HashMap<&'static str, String> {
-        let mut values: HashMap<_, _> = BASE_POLICY_KEYS
-            .into_iter()
-            .map(|key| (key, "1".to_string()))
-            .collect();
-        values.insert(
-            "MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY",
-            if local_ceiling { "enabled" } else { "none" }.to_string(),
-        );
+    fn fixture_values(realtime: &str) -> HashMap<&'static str, String> {
+        let mut values = HashMap::new();
+        values.insert("MYOWNMESH_RESOURCE_GRANT", COMPLETE_GRANT.to_string());
         values.insert("MYOWNMESH_CONNECTOR_REALTIME_POLICY", realtime.to_string());
-        if local_ceiling {
-            values.extend(
-                LOCAL_CEILING_KEYS
-                    .into_iter()
-                    .map(|key| (key, "1".to_string())),
-            );
-        }
-        // The numeric flow and queue vector is read only where the owner
-        // selected an enforced ceiling; the elastic connector never looks at it.
-        if local_ceiling && realtime == "enabled" {
-            values.extend(
-                ENABLED_REALTIME_KEYS
-                    .into_iter()
-                    .map(|key| (key, "1".to_string())),
-            );
-            values.insert(
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
-                "2".to_string(),
-            );
-        }
         // The profile is added under exactly the condition that makes it
         // required, which is the same condition `connector_policy_from_lookup`
-        // uses to register it: realtime enabled, ceiling or no ceiling.
-        // Supplying it to a realtime-disabled daemon is a startup error there,
-        // not a harmless extra, so a fixture that always set it would make the
-        // other vectors invalid rather than complete.
+        // uses to register it. Supplying it to a realtime-disabled daemon is a
+        // startup error there, not a harmless extra, so a fixture that always
+        // set it would make the other vectors invalid rather than complete.
         if realtime == "enabled" {
             values.insert(
                 "MYOWNMESH_REALTIME_PROFILE",
@@ -767,87 +589,55 @@ mod tests {
         values
     }
 
+    /// Every way a grant can be wrong is refused, and the message names the
+    /// dimension at fault.
+    ///
+    /// One control rather than five, because they are one property: the grant
+    /// is the owner's statement of how much of their system this daemon may
+    /// take, and anything short of an exact statement has to be refused rather
+    /// than completed on their behalf. The five cases are the five ways a
+    /// string can fail to be that statement.
     #[test]
     fn connector_capable_serve_requires_every_provider_dimension() {
-        let mut values = fixture_values("disabled", false);
-        values.remove("MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT");
-        // See the note in `optional_local_ceiling_rejects_zero_...` for why this
-        // is `.err().expect(..)` and not `.expect_err(..)`.
-        let error = connector_policy_from_lookup(|name| values.get(name).cloned())
-            .err()
-            .expect("an omitted owner value is rejected");
-        assert!(error
-            .to_string()
-            .contains("MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT"));
-    }
-
-    #[test]
-    fn optional_local_ceiling_rejects_zero_instead_of_inventing_a_value() {
-        let mut values = fixture_values("disabled", true);
-        values.insert("MYOWNMESH_CONNECTOR_CONTROL_CAPACITY", "0".to_string());
         // `.err().expect(..)` rather than `.expect_err(..)`: the latter formats
         // the Ok value on failure and so would require `Debug` on
         // `ConnectorStartup`, which carries the live connector policy. Deriving
         // it to satisfy a test would put the whole policy — resource grants,
         // capacities, the registered codec set — one `{:?}` away from any log
         // line, to improve a message that only prints when this test fails.
-        let error = connector_policy_from_lookup(|name| values.get(name).cloned())
-            .err()
-            .expect("zero cannot become an optional local queue limit");
-        assert!(error.to_string().contains("must be a nonzero integer"));
-    }
-
-    #[test]
-    fn optional_local_ceiling_is_present_only_when_explicitly_selected() {
-        let values = fixture_values("enabled", true);
-        let ConnectorStartup { policy, realtime } =
+        let refused = |grant: &str| -> String {
+            let mut values = fixture_values("disabled");
+            values.insert("MYOWNMESH_RESOURCE_GRANT", grant.to_string());
             connector_policy_from_lookup(|name| values.get(name).cloned())
-                .expect("the complete explicit test vector is accepted");
-        assert!(policy.webrtc().callbacks().local_mailboxes().is_some());
-        assert!(policy
-            .webrtc()
-            .remote_candidates()
-            .local_ceiling()
-            .is_some());
-        assert!(matches!(
-            policy.webrtc().callbacks().realtime(),
-            myownmesh_core::RealtimeConnectorPolicy::Enabled(Some(_))
-        ));
-        // The advert describes the profile that was registered, not a default.
-        // This is what makes the profile half of the vector load-bearing: a
-        // build that accepted the vector and registered nothing would still
-        // satisfy the three assertions above, and would report `supported:
-        // false` with no encodings here.
-        assert!(realtime.supported);
-        // The ceiling published is the owner's own enforced envelope, per
-        // direction, and `ENABLED_REALTIME_KEYS` set both maxima to 1. Nothing
-        // here is derived from the application profile, and no aggregate is
-        // synthesised from the two.
-        assert_eq!(
-            realtime.flow_ceiling,
-            Some(myownmesh::control::RealtimeFlowCeiling {
-                max_inbound_flows: 1,
-                max_outbound_flows: 1,
-            })
+                .err()
+                .expect("an incomplete or malformed grant is rejected")
+                .to_string()
+        };
+
+        // Missing: the complete grant with one dimension dropped.
+        let without_native = COMPLETE_GRANT.replace("native_transport_object=1,", "");
+        assert!(
+            without_native != COMPLETE_GRANT,
+            "non-vacuity: the fixture grant really did name that dimension"
         );
-        // Both families, and only the fields that identify a family — the two
-        // fixture codecs differ in every one of them.
-        assert_eq!(
-            realtime.encodings,
-            vec![
-                myownmesh::control::RealtimeEncoding {
-                    kind: "video".to_string(),
-                    mime: "video/H264".to_string(),
-                    clock_rate: 90000,
-                    channels: 0,
-                },
-                myownmesh::control::RealtimeEncoding {
-                    kind: "audio".to_string(),
-                    mime: "audio/opus".to_string(),
-                    clock_rate: 48000,
-                    channels: 2,
-                },
-            ]
+        assert!(refused(&without_native).contains("native_transport_object"));
+
+        // Unknown, duplicate, malformed, and unrepresentable.
+        assert!(refused(&format!("{COMPLETE_GRANT},invented_dimension=1"))
+            .contains("invented_dimension"));
+        assert!(refused(&format!("{COMPLETE_GRANT},queued_bytes=2")).contains("queued_bytes"));
+        assert!(refused(&format!("{COMPLETE_GRANT},worker_or_task")).contains("worker_or_task"));
+        let overflowing = COMPLETE_GRANT.replace(
+            "accounted_memory_bytes=1",
+            "accounted_memory_bytes=18446744073709551616",
+        );
+        assert!(refused(&overflowing).contains("accounted_memory_bytes"));
+
+        // Non-vacuity for all five: the unmodified grant is accepted.
+        let values = fixture_values("disabled");
+        assert!(
+            connector_policy_from_lookup(|name| values.get(name).cloned()).is_ok(),
+            "the complete grant this control mutates must itself be accepted"
         );
     }
 
@@ -883,7 +673,7 @@ mod tests {
             ],
         };
 
-        let advert = realtime_advert_for(&profile, None);
+        let advert = realtime_advert_for(&profile);
         assert_eq!(
             advert.encodings.len(),
             1,
@@ -891,29 +681,25 @@ mod tests {
             advert.encodings
         );
         assert_eq!(advert.encodings[0].clock_rate, 90000);
-        // A registered profile with no owner ceiling publishes no ceiling. The
-        // number of families is not one, and neither is anything else here.
-        assert_eq!(advert.flow_ceiling, None);
     }
 
     /// The profile is required, and this vector's completeness is what carries
     /// the positive above.
     ///
-    /// Without this control, the profile could quietly become optional and
-    /// `optional_local_ceiling_is_present_only_when_explicitly_selected` would
-    /// keep passing — the local-ceiling assertions there do not depend on it.
-    /// So the same vector is run with exactly one thing removed, and the error
-    /// must name the variable an operator has to set.
+    /// Without this control, the profile could quietly become optional while
+    /// the positive elastic-realtime control kept passing. So the same vector
+    /// is run with exactly one thing removed, and the error must name the
+    /// variable an operator has to set.
     #[test]
     fn the_complete_vector_is_refused_without_its_application_profile() {
-        let mut values = fixture_values("enabled", true);
+        let mut values = fixture_values("enabled");
         assert!(
             values.remove("MYOWNMESH_REALTIME_PROFILE").is_some(),
             "the positive fixture must actually supply the profile, or this \
              control proves nothing"
         );
-        // See the note in `optional_local_ceiling_rejects_zero_...` for why this
-        // is `.err().expect(..)` and not `.expect_err(..)`.
+        // `.err().expect(..)` avoids requiring `Debug` on `ConnectorStartup`,
+        // whose successful value carries the live connector policy.
         let error = connector_policy_from_lookup(|name| values.get(name).cloned())
             .err()
             .expect("a connector that can carry flows must be told which codecs");
@@ -925,40 +711,32 @@ mod tests {
 
     #[test]
     fn elastic_data_only_connector_requires_no_cardinality_values() {
-        let values = fixture_values("disabled", false);
+        let values = fixture_values("disabled");
         let ConnectorStartup { policy, .. } =
             connector_policy_from_lookup(|name| values.get(name).cloned())
                 .expect("elastic data-only construction needs no cardinality limits");
-        assert!(policy.webrtc().callbacks().local_mailboxes().is_none());
-        assert!(policy
-            .webrtc()
-            .remote_candidates()
-            .local_ceiling()
-            .is_none());
         assert!(matches!(
             policy.webrtc().callbacks().realtime(),
             myownmesh_core::RealtimeConnectorPolicy::Disabled
         ));
     }
 
-    /// Codecs, no ceiling: the ordinary elastic deployment starts and registers.
+    /// The ordinary elastic deployment starts and registers its codecs.
     ///
-    /// Three things have to hold together, and each fails differently: the
-    /// connector is elastic, the codecs really were registered, and the advert
-    /// invents no ceiling to stand in for the one the owner declined to state.
+    /// Two things have to hold together, and each fails differently: the
+    /// connector is elastic, and the codecs really were registered.
     #[test]
-    fn elastic_realtime_connector_registers_codecs_and_publishes_no_ceiling() {
-        let values = fixture_values("enabled", false);
+    fn elastic_realtime_connector_registers_its_codecs() {
+        let values = fixture_values("enabled");
         let ConnectorStartup { policy, realtime } =
             connector_policy_from_lookup(|name| values.get(name).cloned())
                 .expect("elastic generic real-time construction needs no local count vector");
         assert!(matches!(
             policy.webrtc().callbacks().realtime(),
-            myownmesh_core::RealtimeConnectorPolicy::Enabled(None)
+            myownmesh_core::RealtimeConnectorPolicy::Enabled
         ));
         assert!(realtime.supported);
         assert_eq!(realtime.encodings.len(), 2);
-        assert_eq!(realtime.flow_ceiling, None);
     }
 
     /// The retired lane variables configure nothing, and are not quietly

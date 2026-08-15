@@ -116,24 +116,6 @@ lto = true
 opt-level = "s"
 strip = true
 
-# Full debuginfo is what makes a parallel debug build of this workspace run the
-# machine out of memory, not codegen. Each MSVC `link.exe` reads every `.pdb`
-# input for the crate it is linking and holds that graph resident; with a
-# `-j20`-wide build that is 13-16 linkers alive at once, and the workspace was
-# measured at ~12.2 GiB total on a 32 GiB box — enough to page.
-#
-# `line-tables-only` keeps exactly what a developer reads off a failure —
-# panic backtraces and test failure locations still name file and line — and
-# drops the type/variable/scope descriptions that a debugger needs but a
-# backtrace does not. Anyone who wants to step through code in a debugger can
-# still build with `RUSTFLAGS="-C debuginfo=2"` or a local profile override.
-#
-# `[profile.test]` deliberately does not appear here: Cargo defines the test
-# profile as inheriting from `dev`, so `cargo test` picks this up as-is and a
-# second copy would only be a place for the two to drift apart.
-[profile.dev]
-debug = "line-tables-only"
-
 # A debug daemon must still *stream*. `just dev` runs `target/debug/myownmesh`,
 # which used to push every media byte — DTLS-SRTP encryption, RTP packetization,
 # access-unit reassembly, control-socket framing — through opt-level 0. On a

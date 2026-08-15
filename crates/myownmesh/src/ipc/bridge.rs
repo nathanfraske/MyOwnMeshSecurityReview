@@ -14,25 +14,17 @@
 //!   to the claiming client rather than swallowed: a claim whose
 //!   handler was never installed would route nothing.
 //!
-//!   They used to be left in place forever, on the reasoning that a
-//!   re-claim would save the install. That was a real saving and it
-//!   was paid for in the wrong currency: each installed handler
-//!   holds its own retention in the network's gateway scope, and a
-//!   local client that claimed many methods and left could strand
-//!   all of it indefinitely. A handler still answers "no claim"
-//!   truthfully if invoked between the last unclaim and its
-//!   removal, so nothing depends on the two being simultaneous.
+//!   Each installed handler holds retention in the network's gateway scope,
+//!   so the last unclaim removes it. A handler invoked during removal still
+//!   answers "no claim" truthfully.
 //!
 //! - **Channel pumps** are owned by a route, not by a subscriber count. The
 //!   first subscribe creates the route and installs the pump; the last
 //!   unsubscribe retires the route, which cancels the pump and *joins* it, so
 //!   the unsubscribe returns only once the task has actually stopped.
 //!
-//!   It used to be left to notice: the task re-read the subscriber set each
-//!   iteration and exited when it found it empty. On a channel nobody is
-//!   publishing to there is no next iteration, so the pump was immortal in
-//!   exactly the case where it was useless — and `serve`, which waits on every
-//!   accepted task, would have waited for it forever.
+//!   Cancellation cannot depend on another published frame: a quiet channel
+//!   may have no next receive on which the pump could notice retirement.
 
 use myownmesh_core::application_gateway::GatewayRefusal;
 use myownmesh_core::channels::ChannelSubscription;
@@ -61,13 +53,9 @@ use myownmesh_core::{ResourceClaim, ResourceClass};
 /// already — the `(network, method)` pair is this crate's key, not core's.
 /// What one installed handler knows about itself, in one funded allocation.
 ///
-/// **One `Arc`, cloned by pointer, once per invocation.** The closure this
-/// replaces captured a [`ClaimKey`] and cloned it — two client-chosen string
-/// buffers — for every inbound call, before anything could refuse. The
-/// registration funded the key core stores and the per-call task claim funded
-/// the `RpcCall`; neither funded that third copy, and a remote peer chooses how
-/// many calls there are. A pointer clone is a scalar in the future's own layout,
-/// which core measures and funds itself.
+/// One `Arc`, cloned by pointer, once per invocation. The client-chosen key is
+/// retained here rather than copied for every inbound call. A pointer clone is
+/// a scalar in the future's own layout, which core measures and funds itself.
 ///
 /// **And the funding follows the last clone, not the registration.** A clone of
 /// this context can still be in flight after the method has been displaced and
@@ -89,20 +77,18 @@ impl HandlerContext {
         generation: HandlerGeneration,
         registry: &ClientRegistry,
     ) -> Result<myownmesh_core::FundedArc<Self>, GatewayRefusal> {
-        // The `Arc` pointee: this struct, the strong and weak counts beside it,
-        // and the two name buffers it owns. Three allocations named as
-        // residuals -- the `Arc` itself and one per string -- because a `String`
-        // reserves at least its length and the excess is the allocator's, not
-        // this code's to state.
+        // The visible record and the two name buffers it owns. One broad
+        // residual covers dependency-private allocation metadata rather than
+        // exposing Arc control-block or String allocator details as protocol
+        // invariants.
         let bytes = std::mem::size_of::<Self>()
-            .checked_add(2 * std::mem::size_of::<usize>())
-            .and_then(|bytes| bytes.checked_add(key.0.len()))
+            .checked_add(key.0.len())
             .and_then(|bytes| bytes.checked_add(key.1.len()))
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(GatewayRefusal::Malformed)?;
         let claim = ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, bytes),
-            (ResourceClass::OpaqueDependencyResidual, 3),
+            (ResourceClass::OpaqueDependencyResidual, 1),
         ])
         .map_err(|_| GatewayRefusal::Malformed)?;
         let retained = match registry.acquire_claim(claim) {
@@ -131,19 +117,6 @@ impl HandlerContext {
 /// is at its accounted concurrency. Collapsing them into one string would make
 /// a capacity problem look like a channel problem.
 #[derive(Debug, thiserror::Error)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "`Subscribe` is large only because it carries core's `ChannelError` \
-              inline, and that type's size is `ChannelError::Decode` structurally \
-              owning the `GatewayDelivery` and subscriber handle which fund the \
-              frame it describes. Boxing this arm would put an allocation on a \
-              refusal path -- the one moment the daemon has just been told it \
-              cannot have the resource it asked for -- and no admission has \
-              priced that allocation. Converting the inner error to something \
-              smaller at this seam would drop exactly the owners core keeps it \
-              large to hold. The size is the funding, so it stays inline and is \
-              stated here rather than removed"
-)]
 pub enum ChannelPumpError {
     #[error("channel subscription was refused: {0}")]
     Subscribe(myownmesh_core::ChannelError),
@@ -162,11 +135,11 @@ pub enum ChannelPumpError {
 /// can be asked of [`ServerOutView`] and the answer acted on before a byte is
 /// copied.
 ///
-/// The shape this replaces built the whole frame — cloning the peer id, the
-/// request id, the method and the peer-chosen payload — and then offered it to
-/// the mailbox. A client that had stopped reading, or a grant that was full,
-/// refused *after* the daemon had already copied whatever the peer sent, at
-/// whatever rate the peer chose to call.
+/// Building the frame first would mean cloning the peer id, the request id,
+/// the method and the peer-chosen payload before offering any of it to the
+/// mailbox, so a client that had stopped reading, or a full grant, would refuse
+/// *after* the daemon had copied whatever the peer sent, at whatever rate the
+/// peer chose to call.
 ///
 /// [`ServerOutView`]: crate::ipc::wire::ServerOutView
 struct RpcInboundBuilder<'a> {
@@ -372,9 +345,7 @@ async fn single_handler_call(
         match registry.commit_exact_single_pending(prepared, &call.from, &call.request_id) {
             Ok(filed) => filed,
             // The reason reaches the peer. Colliding coordinates, an owner
-            // that left, and a daemon out of capacity are three different
-            // things to be told, and this used to report all three as the
-            // first — sending a peer to fix coordinates that were fine.
+            // that left, and a daemon out of capacity are distinct failures.
             Err(reason) => return Err(reason.to_string()),
         };
     // A frame the owner's mailbox will not admit is reported to the
@@ -652,10 +623,8 @@ pub(crate) fn spawn_channel_pump(
         .map_err(ChannelPumpError::Task)?;
     let key = key.clone();
     // Handed back to the route, which is the only thing entitled to stop this
-    // task. Retiring the route cancels and *joins* through these two, so the
-    // pump's end is observed rather than assumed — the previous shape had no
-    // way to stop a pump at all and left it to spot an empty subscriber set on
-    // its next frame, which on a quiet channel is never.
+    // task. Retiring the route cancels and joins through these two, so a quiet
+    // channel does not keep the pump alive.
     let cancel = registry
         .route_cancellation()
         .map_err(ChannelPumpError::Task)?;
@@ -666,14 +635,8 @@ pub(crate) fn spawn_channel_pump(
 
 /// One channel pump's whole life, as its own function.
 ///
-/// Split out of [`spawn_channel_pump`] for the reason the RPC handler bodies are
-/// split from their registrations: reaching a `JoinedNetwork` means standing up
-/// the whole engine, and a control that had to do that in order to watch a
-/// fan-out would end up mirroring this loop instead of running it -- which is
-/// exactly how a fan-out control goes green against a copy while the production
-/// loop is still holding a lock. Everything above resolves the channel, funds
-/// the task and mints the route's cancellation; everything the pump *does* is
-/// here, and a control drives this directly with a subscription of its own.
+/// Everything in [`spawn_channel_pump`] resolves the channel, funds the task,
+/// and mints the route cancellation. This function owns the running fan-out.
 async fn run_channel_pump(
     mut sub: ChannelSubscription<Value>,
     key: ClaimKey,
@@ -723,10 +686,9 @@ async fn run_channel_pump(
                 // below -- the deep clone of a peer-controlled payload, the
                 // serialized measurement `send` takes, the provider
                 // acquisition and the mailbox insertion -- happens with no
-                // daemon lock held at all. Held, as it used to be, the whole
-                // fan-out's duration was a product the remote peer chose one
-                // factor of, and every disconnect, displacement, settlement,
-                // retirement and shutdown queued behind it.
+                // daemon lock held at all. Holding it for the whole fan-out
+                // would make the lock duration depend on peer-controlled work
+                // and block disconnect, settlement, retirement and shutdown.
                 //
                 // No snapshot vector either: `subscriber_after` resumes by
                 // client identity, so there is nothing to allocate per frame
@@ -746,11 +708,9 @@ async fn run_channel_pump(
                         crate::ipc::ChannelFanoutStep::End => break false,
                         crate::ipc::ChannelFanoutStep::Next { client, .. } => {
                             // The tables are released and the frame does not
-                            // exist yet: the exact interval the old fan-out
-                            // spent holding the registry. A control parks
-                            // here and asks the registry to record a
-                            // disconnect and begin closing while it is
-                            // parked. See
+                            // exist yet. A control parks here and asks the
+                            // registry to record a disconnect and begin
+                            // closing while it is parked. See
                             // [`ClientRegistry::park_fanout_after_selection`].
                             #[cfg(test)]
                             registry.pass_fanout_barrier().await;
@@ -887,10 +847,8 @@ pub fn notify_displaced(
 ///
 /// The first half of one transaction: every acquisition happens here, and what
 /// comes back publishes only if the daemon's own claim succeeds under the same
-/// lock. Nothing is installed on the network by calling this, so a caller that
-/// drops the result has installed nothing -- which is the difference between
-/// this and the `install_*` pair it replaced, where a refused claim left an
-/// orphan handler serving a client that was told it had failed.
+/// lock. Nothing is installed on the network by calling this, so dropping the
+/// result installs nothing.
 ///
 /// Takes the dispatcher rather than the `JoinedNetwork` it hangs off, because
 /// the dispatcher is all any of this needs. Narrowing it is what lets a control
@@ -928,12 +886,11 @@ mod tests {
     };
     use crate::ipc::clients::{ClientRegistry, HandlerMode, PendingKey, RegistrationError};
     use crate::ipc::wire::ServerOut;
-    // The shared real link. It was defined here, and moved to the crate root
-    // unchanged when the control dispatcher's streaming controls needed the
-    // same one: two copies of a two-peer handshake are two things free to
-    // drift, and a control passing against a link its sibling no longer builds
-    // is exactly the failure that would hide. Everything below calls what this
-    // module used to define.
+    // The shared real link, at the crate root because the control
+    // dispatcher's streaming controls need the same one: two copies of a
+    // two-peer handshake are two things free to drift, and a control passing
+    // against a link its sibling does not build is exactly the failure that
+    // would hide.
     use crate::test_link::{fresh_network, test_transport, two_peer_rpc};
     use myownmesh_core::engine::spawn_network;
     use myownmesh_core::identity::Identity;
@@ -943,9 +900,9 @@ mod tests {
 
     // Serialization lives on `crate::exclusive_connector_fixture`, which every
     // connector-consuming family in this binary shares. A mutex local to this
-    // module would only stop these three tests racing each other, which was
-    // never the problem: they draw on one process-global connector budget that
-    // `embedded` and `registry` draw on too.
+    // module would only stop these three tests racing each other; they draw on
+    // one process-global connector budget that `embedded` and `registry` draw
+    // on too.
 
     /// One engine and its real dispatcher, for the controls that need core to
     /// actually publish something rather than a stand-in.
@@ -992,9 +949,9 @@ mod tests {
     ///    `PreparedRegistration`, a real `commit_with` running the daemon's
     ///    claim under core's handlers lock, a real `OwnedMethodRegistration`.
     /// 2. A newcomer the daemon refuses publishes nothing, and `A` keeps its
-    ///    owner, its class *and* its generation. Under the old
-    ///    install-then-claim order the incumbent's handler had already been
-    ///    overwritten before the refusal was discovered.
+    ///    owner, its class *and* its generation. Under an install-then-claim
+    ///    order the incumbent's handler would already be overwritten by the
+    ///    time the refusal was discovered.
     /// 3. A call is started under `A`'s generation and parks at the real park
     ///    point — awaiting `A`'s `RpcRespond`. The barrier is `A`'s own mailbox
     ///    receiving the inbound frame, which cannot happen until the call has
@@ -1027,9 +984,7 @@ mod tests {
         let key = ("solo".to_string(), "infer".to_string());
 
         // ---- 1. A claims it single-shot, through the production path -------
-        let first = registry
-            .next_handler_generation()
-            .expect("a fresh daemon has generations left");
+        let first = registry.next_handler_generation();
         let prepared = prepare_handler_for_mode(&rpc, &key, first, HandlerMode::Single, &registry)
             .expect("the live gateway funds one synthetic handler");
         let displaced = registry
@@ -1040,9 +995,7 @@ mod tests {
         // ---- 2. a newcomer the daemon refuses changes nothing --------------
         let gone_id = gone.id;
         drop(registry.unregister(gone_id).expect("registered client"));
-        let refused = registry
-            .next_handler_generation()
-            .expect("a fresh daemon has generations left");
+        let refused = registry.next_handler_generation();
         let prepared =
             prepare_handler_for_mode(&rpc, &key, refused, HandlerMode::Stream, &registry)
                 .expect("funding a registration is not publishing it");
@@ -1092,9 +1045,7 @@ mod tests {
         );
 
         // ---- 4. B takes the method as a stream, mid-flight ------------------
-        let second = registry
-            .next_handler_generation()
-            .expect("a fresh daemon has generations left");
+        let second = registry.next_handler_generation();
         let prepared = prepare_handler_for_mode(&rpc, &key, second, HandlerMode::Stream, &registry)
             .expect("the live gateway funds the displacing handler");
         let displaced = registry
@@ -1782,39 +1733,15 @@ mod tests {
         drivers.shutdown().await;
     }
 
-    /// A large channel frame parks the *production* pump, and the registry
-    /// answers anyway.
-    ///
-    /// The F4 discriminator, and it drives [`run_channel_pump`] itself rather
-    /// than a copy of it. That distinction is the finding: the fan-out used to
-    /// clone a publisher-chosen payload and hand it to a mailbox with the
-    /// registry's tables still held, so a control that mirrors the loop can go
-    /// green against its own copy while the production loop is still holding the
-    /// lock.
-    ///
-    /// The barrier is installed on the registry and passed by the pump at the
-    /// exact line the review names: after `subscriber_after` has selected a
-    /// subscriber and released the tables, and before `ServerOut::ChannelInbound`
-    /// exists. While the pump is parked there — mid-frame, with a second
-    /// subscriber still unvisited — this asserts the two things the old shape
-    /// queued behind the frame: a disconnect is recorded and a shutdown begins.
-    ///
-    /// No duration is authority here; the two `timeout`s are failure detectors
-    /// only. The pump says when it has reached the line, the control says when
-    /// it may leave it, and the frame that then goes out is read off a real
-    /// mailbox. The payload is large so that the interval being asserted across
-    /// is a real clone and a real serialized measurement -- which is what the
-    /// old shape did with the tables held.
-    /// **Review control, blocker 2.** A subscriber whose writer mailbox refuses
+    /// A subscriber whose writer mailbox refuses
     /// costs no copy of the peer's payload; an admitted one costs exactly one.
     ///
     /// The defect this holds down is multiplication. One inbound frame becomes
     /// one owned `ServerOut` per subscriber, and the payload is a JSON tree a
     /// remote peer chose the size of, so building each copy before offering it
-    /// meant a full or disconnected subscriber refused an allocation that had
-    /// already been made — once per subscriber, at the peer's chosen rate.
-    /// Moving the fan-out off the registry lock fixed contention and did
-    /// nothing about this.
+    /// would mean a full or disconnected subscriber refusing an allocation
+    /// already made — once per subscriber, at the peer's chosen rate. Keeping
+    /// the fan-out off the registry lock answers contention, not this.
     ///
     /// Driven through the real pump rather than by calling the builder, because
     /// the property is about *where in the pump* the copy happens. A control
@@ -2037,10 +1964,10 @@ mod tests {
         // The pump holds a `WorkerOrTask` lease drawn from the binary-wide
         // daemon grant for as long as it is alive, and that grant is nine tasks
         // wide for the whole test binary. A control that returns while its pump
-        // is still running therefore lends that lease to whatever runs next —
-        // which is exactly how this control made the neighbouring fan-out
-        // control fail at nine of nine, for `WorkerOrTask` rather than for
-        // anything to do with fan-out. `begin_closing` is the pump's own
+        // is still running therefore lends that lease to whatever runs next,
+        // which fails the neighbouring fan-out control at nine of nine for
+        // `WorkerOrTask` rather than for anything to do with fan-out.
+        // `begin_closing` is the pump's own
         // cooperative exit, the same one production uses, and the driver
         // shutdown is awaited the way the neighbouring control awaits its own.
         registry.begin_closing();
@@ -2051,6 +1978,24 @@ mod tests {
         drop(port);
     }
 
+    /// A large channel frame parks the *production* pump, and the registry
+    /// answers anyway.
+    ///
+    /// It drives [`run_channel_pump`] itself rather than a copy of it, because a
+    /// control that mirrors the loop can go green against its own copy while the
+    /// production loop still holds the registry lock.
+    ///
+    /// The barrier is installed on the registry and passed by the pump at the
+    /// line that matters: after `subscriber_after` has selected a subscriber and
+    /// released the tables, and before `ServerOut::ChannelInbound` exists. While
+    /// the pump is parked there — mid-frame, with a second subscriber still
+    /// unvisited — a disconnect is recorded and a shutdown begins.
+    ///
+    /// No duration is authority here; the two `timeout`s are failure detectors
+    /// only. The pump says when it has reached the line, the control says when
+    /// it may leave it, and the frame that then goes out is read off a real
+    /// mailbox. The payload is large so that the interval being asserted across
+    /// is a real clone and a real serialized measurement.
     #[tokio::test]
     async fn v4_r2_daemon_a_large_channel_frame_does_not_hold_the_registry_while_it_fans_out() {
         let _fixture = crate::exclusive_connector_fixture().await;
@@ -2137,8 +2082,7 @@ mod tests {
             .expect("hang guard: the pump reaches its first subscriber")
             .expect("the pump signals from the fan-out barrier");
 
-        // Parked mid-frame, with the frame not yet built: the two things the old
-        // shape queued behind it.
+        // Parked mid-frame, with the frame not yet built.
         let removed = registry
             .unregister(second.id)
             .expect("a disconnect is recorded while a frame is mid-fan-out");

@@ -10,12 +10,8 @@
 //!
 //! No function here takes a `Request`. Each takes the fields its arm
 //! destructured, so nothing below the total match can be handed a variant it
-//! does not handle — the case the `unreachable!` arms used to stand for.
-//!
-//! This file used to also carry a second, all-`unreachable!` match over every
-//! variant, left behind when the real routing moved into the connection loop.
-//! It is gone: the loop's match is total, so the compiler enforces what that
-//! shell was standing in for.
+//! does not handle, and the connection loop's match over `Request` is total,
+//! so the compiler enforces that.
 
 use std::sync::Arc;
 
@@ -33,8 +29,7 @@ pub(super) mod updater;
 use super::{ConnectionCancel, ControlState};
 use crate::control::framing::{AdmittedLineOut, FrameAdmission, PreparedLineCapacity};
 use crate::control::reply::{
-    ControlOut, FundedVariableReply, OperationReplyData, PreparedReply, PreparedText,
-    VariableOperationPlan,
+    ControlOut, FundedVariableReply, OperationReplyData, PreparedReply, PreparedText, ResponseOwner,
 };
 
 /// One admitted answer: what to say, and the funding that lets it be said.
@@ -53,12 +48,9 @@ pub(in crate::control) type Answer = (PreparedReply, PreparedLineCapacity);
 
 /// Fund the line for a reply that is already decided.
 ///
-/// Most success paths fund *before* committing, which is the whole ordering
-/// property, and do not come through here. What does: refusals, which have
-/// nothing left to commit because the operation already failed, and the few
-/// answers that are pure reads of local state with nothing to commit at all.
-/// For both, measuring here is exactly the sequence `write_line` ran when
-/// these arms were inline, and no earlier.
+/// This measures and funds a decided answer through the same serialization path
+/// that `write_line` uses. It does not prove that any effect described by the
+/// answer preceded the final fallible line admission.
 pub(in crate::control) fn funded(
     reply: PreparedReply,
     admission: &FrameAdmission,
@@ -76,14 +68,25 @@ pub(in crate::control) fn refused(
     funded(PreparedReply::StaticError(message), admission)
 }
 
+/// Fund a refusal whose text this daemon formats.
+///
+/// The text is owned under the response owner this acquires, and is measured
+/// only by the writer's pass over the sealed reply.
+pub(in crate::control) fn refused_text(
+    message: String,
+    admission: &FrameAdmission,
+) -> Result<Answer> {
+    let text = PreparedText::acquiring(message, admission)
+        .context("control refusal text was not admitted")?;
+    funded(PreparedReply::Error(text), admission)
+}
+
 /// The refusal every network-scoped operation shares: no such joined network.
 pub(in crate::control) fn unknown_network(
     network: &str,
     admission: &FrameAdmission,
 ) -> Result<Answer> {
-    let text = PreparedText::unknown_network(network, admission)
-        .context("unknown-network refusal text was not admitted")?;
-    funded(PreparedReply::Error(text), admission)
+    refused_text(format!("unknown network: {network}"), admission)
 }
 
 /// One forwarded stream chunk, measured before the frame exists.
@@ -160,8 +163,6 @@ impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for Strea
     }
 
     fn build(self) -> crate::ipc::ServerOut {
-        #[cfg(test)]
-        STREAM_END_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
         crate::ipc::ServerOut::RpcCallStreamEnd {
             request_id: self.request_id.to_owned(),
             error: self.reason.into_owned(),
@@ -169,34 +170,8 @@ impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for Strea
     }
 }
 
-// Terminal frames constructed *on the constructing thread*. A refused write
-// must not move it: that is the whole claim of the pressure control below.
-//
-// Ordinary comments, not doc comments: rustdoc cannot document a macro
-// invocation, so `///` here is a doc comment attached to nothing and rustc
-// warns about it.
-//
-// Thread-local rather than a process-wide atomic, and that is the whole of the
-// observation's correctness. A shared counter made the reading un-attributable
-// in a full workspace run: every other daemon control that drives a stream to
-// its end builds terminal frames through this same builder, in parallel, so a
-// delta taken across one `send_building` was measuring the whole binary.
-// It read 3 where the control under test had built nothing.
-//
-// A thread-local restores attribution without weakening anything, because
-// `send_building` constructs *inline on its caller's thread* — it measures,
-// acquires, and only then calls `build`. So a build caused by the call under
-// test lands on the thread that made it, and a build caused by anything else
-// lands elsewhere and is correctly invisible. The control still asserts a
-// delta rather than an absolute zero: a test thread is reused, so what it
-// starts at is not this control's business.
-#[cfg(test)]
-thread_local! {
-    static STREAM_END_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn realtime_refusal(plan: VariableOperationPlan, refusal: RealtimeRefusal) -> FundedVariableReply {
-    plan.finish(Ok(OperationReplyData::RealtimeRefused {
+fn realtime_refusal(owner: ResponseOwner, refusal: RealtimeRefusal) -> FundedVariableReply {
+    owner.finish(Ok(OperationReplyData::RealtimeRefused {
         error: refusal.to_string(),
         code: refusal.code().to_owned(),
     }))
@@ -204,14 +179,13 @@ fn realtime_refusal(plan: VariableOperationPlan, refusal: RealtimeRefusal) -> Fu
 
 /// Open one realtime flow to a peer and issue the capability that names it.
 ///
-/// The parameters are the request's fields rather than the request, because
-/// this used to take a whole `Request` and re-match it under a
-/// `_ => unreachable!()`. A caller that got the variant wrong reached a panic;
-/// now it cannot compile.
+/// The parameters are the request's fields rather than the request, so a
+/// caller that gets the variant wrong cannot compile rather than reaching a
+/// runtime panic.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn realtime_flow_open(
     state: &Arc<ControlState>,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
     network: String,
     peer: String,
     flow_label: String,
@@ -223,11 +197,11 @@ pub(super) async fn realtime_flow_open(
     client_id: crate::ipc::ClientId,
     client_capability: String,
 ) -> FundedVariableReply {
-    let Some(owner) = state.clients.authenticate(client_id, &client_capability) else {
-        return plan.finish(Err("invalid local client authority".to_owned()));
+    let Some(client) = state.clients.authenticate(client_id, &client_capability) else {
+        return owner.finish(Err("invalid local client authority".to_owned()));
     };
     let Some(net) = state.registry.get(&network) else {
-        return plan.finish(Err(format!("unknown network: {network}")));
+        return owner.finish(Err(format!("unknown network: {network}")));
     };
     let chosen = flow_label.clone();
     let open = core_webrtc::WebRtcRealtimeFlowOpen {
@@ -239,53 +213,52 @@ pub(super) async fn realtime_flow_open(
         channels,
     };
     match net.open_webrtc_realtime(&peer, open).await {
-        Ok(flow) => match state.clients.install_realtime_flow(&owner, network, flow) {
-            Ok(capability) => plan.finish(Ok(OperationReplyData::RealtimeOpened {
+        Ok(flow) => match state.clients.install_realtime_flow(&client, network, flow) {
+            Ok(capability) => owner.finish(Ok(OperationReplyData::RealtimeOpened {
                 flow_label: chosen,
                 capability: capability.expose().to_owned(),
             })),
             Err(rejected) => {
                 let reason = rejected.reason.to_string();
                 let _ = net.close_realtime(rejected.flow).await;
-                plan.finish(Err(format!("realtime flow open refused: {reason}")))
+                owner.finish(Err(format!("realtime flow open refused: {reason}")))
             }
         },
-        Err(refusal) => realtime_refusal(plan, refusal),
+        Err(refusal) => realtime_refusal(owner, refusal),
     }
 }
 /// Close a realtime flow the client still holds a capability for.
 pub(super) async fn realtime_flow_close(
     state: &Arc<ControlState>,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
     client_id: crate::ipc::ClientId,
     client_capability: String,
     flow_capability: String,
 ) -> FundedVariableReply {
-    let Some(owner) = state.clients.authenticate(client_id, &client_capability) else {
-        return plan.finish(Err("invalid local client authority".to_owned()));
+    let Some(client) = state.clients.authenticate(client_id, &client_capability) else {
+        return owner.finish(Err("invalid local client authority".to_owned()));
     };
-    let Some(flow) = owner.take_realtime_flow(&flow_capability) else {
-        return plan.finish(Err("unknown flow_capability: it was never issued to this client, or the flow it named has already been closed".to_owned()));
+    let Some(flow) = client.take_realtime_flow(&flow_capability) else {
+        return owner.finish(Err("unknown flow_capability: it was never issued to this client, or the flow it named has already been closed".to_owned()));
     };
     let Some(net) = state.registry.get(flow.network()) else {
-        return plan.finish(Err(format!("unknown network: {}", flow.network())));
+        return owner.finish(Err(format!("unknown network: {}", flow.network())));
     };
     match flow.close_through(&net).await {
-        Ok(()) => plan.finish(Ok(OperationReplyData::Closed)),
-        Err(refusal) => realtime_refusal(plan, refusal),
+        Ok(()) => owner.finish(Ok(OperationReplyData::Closed)),
+        Err(refusal) => realtime_refusal(owner, refusal),
     }
 }
 
 /// Start a streaming RPC call and forward its chunks to the client's writer.
 ///
-/// Fields, not a `Request`: the let-else this replaced ended in
-/// `unreachable!`, which is a runtime claim about who calls it. The signature
-/// is now the same claim, checked.
+/// Fields, not a `Request`: the signature is the claim about who may call
+/// this, checked, rather than a runtime `unreachable!`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn rpc_call_stream_funded(
     state: &Arc<ControlState>,
     cancel: &ConnectionCancel,
-    plan: VariableOperationPlan,
+    owner: ResponseOwner,
     client_id: crate::ipc::ClientId,
     client_capability: String,
     network: String,
@@ -294,28 +267,25 @@ pub(super) async fn rpc_call_stream_funded(
     payload: serde_json::Value,
 ) -> FundedVariableReply {
     let Some(client) = state.clients.authenticate(client_id, &client_capability) else {
-        return plan.finish(Err("invalid local client authority".to_owned()));
+        return owner.finish(Err("invalid local client authority".to_owned()));
     };
     let Some(net) = state.registry.get(&network) else {
-        return plan.finish(Err(format!("unknown network: {network}")));
+        return owner.finish(Err(format!("unknown network: {network}")));
     };
-    let request_id = match state.clients.next_call_stream_id() {
-        Ok(id) => format!("ipc-stream-{id}"),
-        Err(refusal) => return plan.finish(Err(format!("rpc call stream refused: {refusal}"))),
-    };
+    let request_id = format!("ipc-stream-{}", state.clients.next_call_stream_id());
     let task = match state.clients.lease_task_retaining(request_id.len()) {
         Ok(task) => task,
-        Err(refusal) => return plan.finish(Err(format!("rpc call stream refused: {refusal}"))),
+        Err(refusal) => return owner.finish(Err(format!("rpc call stream refused: {refusal}"))),
     };
     let rpc = net.rpc();
     let call = tokio::select! {
         biased;
-        () = cancel.cancelled() => return plan.finish(Err("control connection closing".to_owned())),
+        () = cancel.cancelled() => return owner.finish(Err("control connection closing".to_owned())),
         result = rpc.call_stream(&peer, &method, payload) => result,
     };
     let mut rx = match call {
         Ok(rx) => rx,
-        Err(error) => return plan.finish(Err(error.to_string())),
+        Err(error) => return owner.finish(Err(error.to_string())),
     };
     let writer_tx = client.writer_tx.clone();
     let stream_owner = client.clone();
@@ -369,22 +339,13 @@ pub(super) async fn rpc_call_stream_funded(
             reason: crate::ipc::wire::TerminalReasonView::Clean,
         });
     });
-    plan.finish(Ok(OperationReplyData::RpcStreamStarted(request_id)))
+    owner.finish(Ok(OperationReplyData::RpcStreamStarted(request_id)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use myownmesh_core::{ResourceMailboxItem as _, ResourceMailboxItemBuilder as _};
-
-    /// Terminal frames this thread has constructed so far.
-    ///
-    /// Only ever meaningful as the two ends of a delta taken with no `.await`
-    /// between them, which is how the pressure control uses it. Read across a
-    /// suspension point it would be measuring a thread rather than a call.
-    fn builds() -> usize {
-        STREAM_END_BUILDS.with(std::cell::Cell::get)
-    }
 
     /// The borrowed mirrors must encode byte-for-byte as the frames they stand
     /// in for. If they ever diverge the mailbox admitted one frame and queued a
@@ -479,15 +440,13 @@ mod tests {
     /// private grant with nothing left after its own planning charge, so
     /// `send_building` gets past the closed check and is refused by the
     /// provider. The terminal is long and real, so what is being refused is a
-    /// frame worth refusing, and the build counter proves the refusal landed
-    /// before construction rather than after it.
+    /// frame worth refusing.
     ///
-    /// Everything from the first counter read to the last assertion runs with
-    /// no `.await` between, deliberately: [`builds`] counts this thread, and a
-    /// suspension in the middle would let the reading describe a thread rather
-    /// than this call. Nothing here is shared with another control — the grant
-    /// is private, and the counter is now per-thread — so the whole control is
-    /// safe to run in parallel with the rest of the binary.
+    /// What proves the refusal is the ledger, which is what the provider
+    /// already exposes to its owner: a refusal that had built its replacement
+    /// buffer first would have to charge for it, and the exact return to
+    /// baseline says nothing was taken. The grant is private to this control,
+    /// so that reading is this call's and no one else's.
     #[tokio::test]
     async fn v4_r5_daemon_a_pressured_writer_builds_no_replacement_terminal_buffer() {
         let scope = crate::test_application_scope();
@@ -503,7 +462,6 @@ mod tests {
 
         let (tx, _rx, provider, _port) = writer_over_grant(starved_grant());
         let baseline = provider.in_use();
-        let before = builds();
         let refusal = tx
             .send_building(StreamEndBuilder {
                 request_id: "ipc-stream-pressured",
@@ -518,14 +476,9 @@ mod tests {
             "the refusal is capacity, not closure: {refusal:?}"
         );
         assert_eq!(
-            builds(),
-            before,
-            "the refused terminal frame was never constructed"
-        );
-        assert_eq!(
             provider.in_use(),
             baseline,
-            "a refused admission returns the exact ledger baseline"
+            "a refused admission builds no replacement buffer and returns the exact baseline"
         );
         assert_eq!(
             terminal.reason(),
@@ -538,9 +491,9 @@ mod tests {
     /// inbox pop, through writer admission and serialization, and is released
     /// only when the write-side owner lets go.
     ///
-    /// This is the review's sentence, on a real two-peer link: the terminal is
-    /// funded by a real `SessionCapability` because a real session produced it,
-    /// not by an application scope standing in for one.
+    /// On a real two-peer link: the terminal is funded by a real
+    /// `SessionCapability` because a real session produced it, not by an
+    /// application scope standing in for one.
     ///
     /// `#[ignore]` is load-bearing. The readings are deltas on the daemon test
     /// binary's process-wide provider, which every other daemon control also
@@ -571,17 +524,15 @@ mod tests {
         let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id, drivers) =
             crate::test_link::two_peer_rpc("control-dispatch-terminal").await;
 
-        // Peer-chosen width. The finding is about text the far end sizes, so a
-        // short reason would leave nothing to observe.
+        // Peer-chosen width. The charge under control is text the far end
+        // sizes, so a short reason would leave nothing to observe.
         //
         // 32 KiB rather than 64: the data channel's `max_message_size` is
         // 65,536 bytes, and the terminal does not travel bare — it rides
         // inside an RPC envelope. A 64 KiB reason plus that framing exceeds
-        // the ceiling, so the old fixture was not a control over a wide
-        // terminal at all. It asked the link to carry something the link
-        // cannot carry, and the answer simply never arrived. Half the ceiling
-        // leaves the envelope room while staying far wider than anything a
-        // short-string bug could hide behind.
+        // the ceiling, so the link could not carry it and no answer would
+        // arrive. Half the ceiling leaves the envelope room while staying far
+        // wider than anything a short-string bug could hide behind.
         let reason = "q".repeat(32 * 1024);
         let handler_reason = reason.clone();
         myownmesh_core::rpc::Rpc::attach(&alice_state)

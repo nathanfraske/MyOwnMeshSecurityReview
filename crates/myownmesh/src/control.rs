@@ -63,9 +63,7 @@ use listener::{bind_listener, resolve_socket, verify_local_peer};
 /// have to agree on, and it is the part a client reimplements.
 mod wire;
 
-pub use wire::{
-    RealtimeAdvert, RealtimeEncoding, RealtimeFlowCeiling, RealtimePipeDirection, Request, Response,
-};
+pub use wire::{RealtimeAdvert, RealtimeEncoding, RealtimePipeDirection, Request, Response};
 
 /// Bytes on the wire and the admission that funds them: the JSON line reader,
 /// the binary realtime frame codec, and the one rule they share — nothing is
@@ -80,9 +78,9 @@ use framing::{
 
 /// What a reply *is*, as opposed to how many bytes it costs to write one: the
 /// sealed outbound envelope, the funded result shapes each domain answers with,
-/// and the exact line ceilings those shapes imply. Nothing in there performs an
-/// operation — the domain modules construct these values, and this module only
-/// says what one costs and how it encodes.
+/// and the one broad owner every answer is built under. Nothing in there
+/// performs an operation — the domain modules construct these values, and this
+/// module only says what one costs and how it encodes.
 mod reply;
 
 pub use framing::{
@@ -90,17 +88,17 @@ pub use framing::{
     RealtimeSendUnit, MAX_REALTIME_FLOW_LABEL_BYTES,
 };
 use reply::{
-    events_subscribed_line_ceiling, variable_operation_claim, ControlOut, FundedVariableReply,
-    PreparedReply, PreparedText,
+    events_subscribed_line_ceiling, ControlOut, FundedDiagnostic, FundedVariableReply,
+    PreparedReply, PreparedText, ResponseOwner,
 };
 
 /// Places a control can reach into `serve` without production having a branch.
 ///
 /// Empty outside `cfg(test)`, so in a release build this is a zero-sized value
-/// threaded through one call and compiled away. The alternative shapes were both
-/// worse: a process-global barrier races every other control in the binary, and
-/// a `cfg(test)`-only parameter on `serve` makes the public signature depend on
-/// the profile.
+/// threaded through one call and compiled away. It is per-`serve` rather than
+/// process-global so it cannot race another control in the same binary, and it
+/// is a field rather than a `cfg(test)` parameter so the public signature does
+/// not depend on the profile.
 #[derive(Default)]
 pub(crate) struct ControlHooks {
     /// Pauses one connection task at the instant before `EventsSubscribe`
@@ -332,10 +330,9 @@ where
     // Biased to the *write*, and this is the one place in this module where
     // cancellation is not polled first. The two are only ever both ready when
     // the socket would accept the line without blocking and the runtime is
-    // already closing — which is exactly the case the review requires an answer
-    // for: where the socket is writable, a pre-commit request receives its typed
-    // `Closing` refusal rather than a dropped connection. Polling cancellation
-    // first would make that answer a coin toss.
+    // already closing. Where the socket is writable, a pre-commit request
+    // receives its typed `Closing` refusal rather than a dropped connection;
+    // polling cancellation first would make that answer a coin toss.
     //
     // Terminality is unaffected, because the bias only decides a tie. A write
     // that cannot make progress returns `Pending`, cancellation is polled next
@@ -362,6 +359,25 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let reply = PreparedReply::StaticError(message);
+    write_line(writer, frames, cancel, ControlOut::Prepared(&reply)).await
+}
+
+/// Write one sealed operation reply: serialize it once, then say what became
+/// of the line.
+///
+/// The measure, the funding and the encode all belong to `write_line`, in that
+/// order; every arm that answers with an operation goes through here so none of
+/// them re-states the sequence.
+async fn write_variable<W>(
+    writer: &mut W,
+    frames: &FrameAdmission,
+    cancel: &ConnectionCancel,
+    variable: FundedVariableReply,
+) -> Result<Wrote>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let reply = PreparedReply::Variable(variable);
     write_line(writer, frames, cancel, ControlOut::Prepared(&reply)).await
 }
 
@@ -515,11 +531,8 @@ async fn serve_with_hooks(
     // someone had to invent at startup. An explicit value is an additional,
     // stricter policy layered on top; see [`FrameAdmission`].
     //
-    // `MYOWNMESH_IPC_STREAM_CAPACITY` used to be read here and is gone. It named
-    // a fixed item count for the inbound RPC stream queue, and that queue is a
-    // resource mailbox now: it has no item count to select, and an owner value
-    // that nothing could enforce is worse than the compatibility break of
-    // removing it.
+    // The inbound RPC stream queue takes no item count: it is a resource
+    // mailbox, bounded by the grant rather than by a configured depth.
     let json_line_bytes = optional_nonzero_bytes("MYOWNMESH_IPC_JSON_LINE_BYTES")?;
     let realtime_frame_bytes = optional_nonzero_bytes("MYOWNMESH_IPC_REALTIME_FRAME_BYTES")?;
     // The registry's own acquisition port, issued once for the whole control
@@ -693,11 +706,10 @@ async fn serve_with_hooks(
     //
     // 3. The drain itself. Every client's flows are closed and every handler it
     //    was the last claimant of is forgotten, through their own networks.
-    //    Closed rather than dropped, and the difference is no longer that
-    //    dropping releases nothing: a `RealtimeFlowHandle`'s own Drop performs
-    //    exact flow cleanup now. Explicit close is still the stronger of the
-    //    two, because it awaits the native retirement and can report what it
-    //    found, where Drop is the non-blocking backstop for the paths that
+    //    Closed rather than dropped. A `RealtimeFlowHandle`'s own Drop performs
+    //    exact flow cleanup, so both paths release; explicit close is the
+    //    stronger of the two because it awaits the native retirement and can
+    //    report what it found, where Drop is the non-blocking backstop for
     //    cannot await one. A shutdown that reports the control surface closed
     //    should have waited for the native halves rather than left them
     //    retiring behind it.
@@ -947,7 +959,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
         let admitted = match line.decode_request(&json_lines) {
             Ok(decoded) => decoded,
             Err(DecodeRefusal::Malformed(e)) => {
-                let text = PreparedText::json_parse_error(&e, &json_lines)
+                let text = PreparedText::acquiring(format!("parse: {e}"), &json_lines)
                     .context("parse refusal text was not admitted")?;
                 let resp = PreparedReply::Error(text);
                 match write_line(
@@ -963,7 +975,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Err(refusal @ DecodeRefusal::Admission(_)) => {
-                let text = PreparedText::decode_admission_error(&refusal, &json_lines)
+                let text = PreparedText::acquiring(refusal.to_string(), &json_lines)
                     .context("parse-admission refusal text was not admitted")?;
                 let resp = PreparedReply::Error(text);
                 match write_line(
@@ -992,15 +1004,9 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             request,
             _retention: decoded,
         } = admitted;
-        // One total match over `Request`, and deliberately no catch-all.
-        //
-        // This was a chain of three matches, each ending `other => other`, with
-        // an all-`unreachable!` router catching a remainder that was already
-        // empty. Every variant was handled here even then, but no single match
-        // could say so, so the compiler could not enforce it and a dead router
-        // stood in for the guarantee. A new operation is now a build failure at
-        // this match instead of a variant that compiles cleanly into reaching
-        // nothing.
+        // One total match over `Request`, and deliberately no catch-all, so a
+        // new operation is a build failure here rather than a variant that
+        // compiles cleanly into reaching nothing.
         //
         // The totality belongs here and the work does not: an arm decides which
         // owner serves the request, and the module named for that domain does
@@ -1053,8 +1059,11 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Ok(client) => client,
                     Err(refusal) => {
                         drop(output);
-                        let text = PreparedText::events_registration_error(&refusal, &json_lines)
-                            .context("events-subscribe refusal text was not admitted")?;
+                        let text = PreparedText::acquiring(
+                            format!("events subscribe refused: {refusal}"),
+                            &json_lines,
+                        )
+                        .context("events-subscribe refusal text was not admitted")?;
                         let resp = PreparedReply::Error(text);
                         match write_line(
                             &mut writer,
@@ -1138,8 +1147,10 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 let network = Retained::admit(network, lengths, &json_lines)?;
                 drop(decoded);
                 let Some(net) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
+                    let name: &str = &network;
+                    let text =
+                        PreparedText::acquiring(format!("unknown network: {name}"), &json_lines)
+                            .context("unknown-network refusal text was not admitted")?;
                     let resp = PreparedReply::Error(text);
                     match write_line(
                         &mut writer,
@@ -1154,8 +1165,11 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     }
                 };
                 let ack = PreparedReply::TraceSubscribed {
-                    network: PreparedText::copying(&network, &json_lines)
-                        .context("trace-subscribe response text was not admitted")?,
+                    network: {
+                        let name: &str = &network;
+                        PreparedText::acquiring(name.to_owned(), &json_lines)
+                            .context("trace-subscribe response text was not admitted")?
+                    },
                 };
                 let rx = net.state().subscribe_conn_trace();
                 // A trace client has no registry entry to be unregistered, so
@@ -1265,13 +1279,15 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 // its disconnect or on the runtime's close, whichever comes
                 // first.
                 let cancel = ConnectionCancel::owned_by(&state.clients, &pipe_owner);
-                // Borrowed, not cloned. The binding already owns this name and
-                // the lookup only reads it; the copy this used to take was a
-                // third live allocation of a client-chosen string, and removing
-                // it is a better answer than funding it.
+                // Borrowed, not cloned. The binding already owns this name
+                // and the lookup only reads it, so no third live allocation of
+                // a client-chosen string exists to be funded.
                 let Some(net) = state.registry.get(bound.network()) else {
-                    let text = PreparedText::unknown_network(bound.network(), &json_lines)
-                        .context("unknown-network refusal text was not admitted")?;
+                    let text = PreparedText::acquiring(
+                        format!("unknown network: {}", bound.network()),
+                        &json_lines,
+                    )
+                    .context("unknown-network refusal text was not admitted")?;
                     let resp = PreparedReply::Error(text);
                     match write_line(
                         &mut writer,
@@ -1317,8 +1333,15 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     RealtimePipeBinding::Inbound { peer, .. } => match net.realtime_inbound(peer) {
                         Some(stream) => Some(stream),
                         None => {
-                            let text = PreparedText::no_inbound_realtime_stream(peer, &json_lines)
-                                .context("realtime-stream refusal text was not admitted")?;
+                            let text = PreparedText::acquiring(
+                                format!(
+                                    "no inbound realtime stream for {peer}: the session is not \
+                                     current, or a live pipe already holds it — one inbound pipe \
+                                     per session, and the lease returns when that pipe ends"
+                                ),
+                                &json_lines,
+                            )
+                            .context("realtime-stream refusal text was not admitted")?;
                             let resp = PreparedReply::Error(text);
                             match write_line(
                                 &mut writer,
@@ -1478,14 +1501,11 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 clock_rate,
                 channels,
             } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("realtime operation result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("realtime operation lease did not match"))?;
                 let variable = dispatch::realtime_flow_open(
                     &state,
-                    plan,
+                    owner,
                     network,
                     peer,
                     flow_label,
@@ -1498,13 +1518,10 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("realtime response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("realtime response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("realtime response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -1514,26 +1531,20 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 client_capability,
                 flow_capability,
             } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("realtime operation result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("realtime operation lease did not match"))?;
                 let variable = dispatch::realtime_flow_close(
                     &state,
-                    plan,
+                    owner,
                     client_id,
                     client_capability,
                     flow_capability,
                 )
                 .await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("realtime response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("realtime response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("realtime response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -1546,15 +1557,12 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 method,
                 payload,
             } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("RPC stream setup result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("RPC stream setup lease did not match"))?;
                 let variable = dispatch::rpc_call_stream_funded(
                     &state,
                     &cancel,
-                    plan,
+                    owner,
                     client_id,
                     client_capability,
                     network,
@@ -1563,21 +1571,19 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     payload,
                 )
                 .await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("RPC stream setup response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("RPC stream setup response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("RPC stream setup response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::PeersList { network } => {
                 let Some(joined) = state.registry.get(&network) else {
-                    let text = PreparedText::unknown_network(&network, &json_lines)
-                        .context("PeersList lookup refusal text was not admitted")?;
+                    let text =
+                        PreparedText::acquiring(format!("unknown network: {network}"), &json_lines)
+                            .context("PeersList lookup refusal text was not admitted")?;
                     let reply = PreparedReply::Error(text);
                     match write_line(
                         &mut writer,
@@ -1591,40 +1597,17 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                         Wrote::Ended => break,
                     }
                 };
-                let staging = joined.plan_peers();
-                let membership = json_lines
-                    .acquire_claim(
-                        staging
-                            .membership_claim()
-                            .context("PeersList membership claim was not representable")?,
-                    )
-                    .context("PeersList membership staging was not admitted")?;
-                let plan = staging
-                    .stage(membership)
-                    .context("PeersList membership changed while it was staged")?;
-                let full_line_ceiling =
-                    AdmittedLineOut::peers_capacity(plan.encoded_line_ceiling())
-                        .context("PeersList response line capacity was not representable")?;
-                let work = json_lines
-                    .acquire_claim(plan.work_claim())
-                    .context("PeersList snapshot work was not admitted")?;
-                let typed = json_lines
-                    .acquire_claim(plan.typed_retention_claim())
-                    .context("PeersList typed snapshot was not admitted")?;
-                let peer_output = json_lines
-                    .acquire_claim(plan.output_retention_claim())
-                    .context("PeersList peer output was not admitted")?;
-                let peer_line = json_lines
-                    .acquire_claim(plan.line_claim())
-                    .context("PeersList raw array was not admitted")?;
-                let output = AdmittedLineOut::prepare_capacity(full_line_ceiling, &json_lines)
-                    .context("PeersList daemon response line was not admitted")?;
-                let peers = plan
-                    .commit(work, typed, peer_output, peer_line)
-                    .context("PeersList changed while its funded snapshot was built")?;
-                let line = AdmittedLineOut::encode_peers(peers, output)
-                    .context("PeersList response exceeded its measured ceiling")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("PeersList diagnostic snapshot was not admitted")?;
+                let reply = PreparedReply::Peers(FundedDiagnostic::new(joined.peers(), owner));
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Prepared(&reply),
+                )
+                .await?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -1860,110 +1843,74 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::NetworkReconnect { network, peer } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("network reconnect result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = dispatch::network::network_reconnect(&state, &network, peer, plan);
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network reconnect response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("network reconnect response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let variable = dispatch::network::network_reconnect(&state, &network, peer, owner);
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("network reconnect response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::NetworkAdd { config } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("network add result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = dispatch::network::network_add(&state, config, plan).await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network add response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("network add response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let variable = dispatch::network::network_add(&state, config, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("network add response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::NetworkRemove { network, purge } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("network remove result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
                 let variable =
-                    dispatch::network::network_remove(&state, &network, purge, plan).await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network remove response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("network remove response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    dispatch::network::network_remove(&state, &network, purge, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("network remove response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::NetworkUpdate { config } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("network update result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = dispatch::network::network_update(&state, config, plan).await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network update response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("network update response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let variable = dispatch::network::network_update(&state, config, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("network update response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::ForgetAllNetworks => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("network reset result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = dispatch::network::forget_all_networks(&state, plan).await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network reset response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("network reset response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let variable = dispatch::network::forget_all_networks(&state, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("network reset response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
             }
             Request::FactoryReset => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("network reset result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("network operation lease did not match"))?;
-                let variable = dispatch::network::factory_reset(&state, plan).await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("network reset response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("network reset response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let variable = dispatch::network::factory_reset(&state, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("network reset response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -2098,19 +2045,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
             Request::ServicesSet { services } => {
-                let lease = json_lines
-                    .acquire_claim(variable_operation_claim())
+                let owner = ResponseOwner::acquire(&json_lines)
                     .context("services-set result was not admitted")?;
-                let plan = FundedVariableReply::begin_operation(lease)
-                    .map_err(|_| anyhow::anyhow!("services-set lease did not match"))?;
-                let variable = dispatch::services::services_set(&state, services, plan).await;
-                let output =
-                    AdmittedLineOut::prepare_capacity(variable.exact_line_len()?, &json_lines)
-                        .context("services-set response line was not admitted")?;
-                let reply = PreparedReply::Variable(variable);
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("services-set response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
+                let variable = dispatch::services::services_set(&state, services, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("services-set response line was not admitted")?
+                {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -2439,11 +2380,11 @@ mod dispatch;
 /// separate questions and the selects are nested to keep them separate.
 ///
 /// Fairness is between the *sources*, and it is **explicit alternation** rather
-/// than randomness. The single select this replaces was biased with the
-/// per-client mailbox first, which is deterministic starvation rather than
-/// ordinary scheduling variance — a sustained sequence of IPC-routed frames
-/// keeps that branch continuously ready, so mesh events are never polled at all
-/// until the broadcast ring gives up and reports lag, and the lag report is then
+/// than randomness. One select with a fixed branch order is deterministic
+/// starvation rather than ordinary scheduling variance — a sustained sequence of
+/// IPC-routed frames keeps the first branch continuously ready, so mesh events
+/// are never polled at all until the broadcast ring gives up and reports lag,
+/// and the lag report is then
 /// the first the subscriber hears of events it should have been given.
 ///
 /// An unbiased select would fix the starvation and would only fix it
@@ -2654,12 +2595,10 @@ static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(No
 
 /// What a client may say on this socket, and what it may not.
 ///
-/// Renamed from `realtime_control_tests`, which had stopped being true of it:
-/// the frame round-trips it used to hold went to [`framing`] with the codec
-/// they exercise, and what is left is about the request vocabulary — an
-/// operation that must no longer parse, a variant that must not parse without
-/// the field its direction requires, and one that must round-trip exactly. None
-/// of those is about bytes.
+/// The request vocabulary, not the frame codec: an operation that must not
+/// parse, a variant that must not parse without the field its direction
+/// requires, and one that must round-trip exactly. Frame round-trips belong to
+/// [`framing`], with the codec they exercise.
 #[cfg(test)]
 mod request_wire_tests {
     use super::*;
@@ -2696,10 +2635,10 @@ mod request_wire_tests {
     /// for one variant of a sibling field". The direction-dependent rules are
     /// [`realtime_pipe_binding`]'s, and are asserted against it.
     ///
-    /// The outbound case is the finding: a pipe that accepted a `peer` would be
-    /// carrying a selector it re-resolves per unit, which is how a pipe whose
-    /// session had ended went on writing into the replacement's flow of the
-    /// same name.
+    /// The outbound case is the load-bearing one: a pipe that accepted a `peer`
+    /// would carry a selector it re-resolves per unit, so a pipe whose session
+    /// had ended could go on writing into the replacement's flow of the same
+    /// name.
     #[test]
     fn a_realtime_pipe_will_not_parse_without_its_session() {
         let unbound = r#"{"op":"realtime_pipe","direction":"outbound"}"#;
@@ -3053,10 +2992,9 @@ mod stream_cancellation_tests {
     /// A writer that never accepts a byte, and says so the first time it is
     /// asked to.
     ///
-    /// The blocked half of the control below used to be a `duplex` with a small
-    /// buffer and no reader, which blocks reliably and is still the wrong thing:
-    /// it makes a buffer size the authority for whether the control is testing
-    /// what it says it is. This owns readiness outright. `poll_write` never
+    /// A `duplex` with a small buffer and no reader would block reliably too,
+    /// and would make a buffer size the authority for whether the control tests
+    /// what it says it does. This owns readiness outright. `poll_write` never
     /// returns `Ready`, and it registers no waker, so nothing this writer does
     /// can ever wake the write arm — the only thing that can finish the future
     /// is the arm the control exists to prove.
@@ -3102,10 +3040,10 @@ mod stream_cancellation_tests {
 
     /// A continuously ready client mailbox cannot starve one mesh event.
     ///
-    /// The finding this pins is deterministic starvation, not scheduling
-    /// variance. The select this replaces was biased with the per-client mailbox
-    /// first, so a subscriber whose mailbox never went empty was never shown a
-    /// mesh event at all — until the broadcast ring gave up and reported lag,
+    /// The property is deterministic starvation, not scheduling variance. One
+    /// select biased with the per-client mailbox first would never show a mesh
+    /// event to a subscriber whose mailbox never went empty — not until the
+    /// broadcast ring gave up and reported lag,
     /// which is the subscriber being told about events instead of given them.
     ///
     /// Every source is loaded *before* the stream is started, so the whole
@@ -3113,13 +3051,13 @@ mod stream_cancellation_tests {
     /// scheduler: two client frames are already queued and one mesh event is
     /// already published when the first poll happens. The alternation begins on
     /// the client, so the only order this loop can produce is
-    /// `client, mesh, client` — and the shape it replaces can only produce
+    /// `client, mesh, client`, where a fixed-order select can only produce
     /// `client, client, mesh`, because the mailbox is ready every time it is
     /// asked. One assertion separates them, and neither a duration nor a service
     /// count appears in it.
     ///
-    /// The middle frame is the finding: the mesh event goes out while a client
-    /// frame is still queued and ready behind it.
+    /// The middle frame is the discriminating one: the mesh event goes out
+    /// while a client frame is still queued and ready behind it.
     #[tokio::test]
     async fn v4_r2_daemon_a_ready_client_mailbox_cannot_starve_a_mesh_event() {
         let clients = crate::ipc::ClientRegistry::default();
@@ -3130,7 +3068,8 @@ mod stream_cancellation_tests {
         let (mesh_tx, mesh_rx) = broadcast::channel::<myownmesh_core::events::MeshEvent>(4);
 
         // Loaded first, all of it. Past this line both sources are ready and
-        // stay ready, which is the condition the old shape starved under.
+        // stay ready, which is the condition a fixed-order select starves
+        // under.
         for channel in ["first", "second"] {
             client_tx
                 .send(crate::ipc::ServerOut::ChannelInbound {
@@ -3210,9 +3149,9 @@ mod stream_cancellation_tests {
     ///
     /// Nothing is published, and that is the point rather than an omission: the
     /// broadcast sender is held open for the whole run, so the stream's one
-    /// source is live and simply has nothing to say. The shape this replaces
-    /// does not fail an assertion below; it never reaches one, which is what the
-    /// hang guard exists to name. The control first polls the live stream to
+    /// source is live and simply has nothing to say. A stream that never ended
+    /// would not fail an assertion below; it would never reach one, which is
+    /// what the hang guard exists to name. The control first polls the live stream to
     /// `Pending` and only then closes the runtime, so `closing()`'s
     /// subscribe-before-read ordering is part of the witness rather than a
     /// property inferred from a close that happened before the stream began.
@@ -3425,16 +3364,8 @@ mod terminal_shutdown_tests {
     }
 
     fn connector_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
-        let capacity = NonZeroUsize::new(16).expect("fixture capacity is nonzero");
-        let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
-            myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
-            myownmesh_core::RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("fixture callback policy is consistent");
         let profile = myownmesh_core::WebRtcConnectorProfile::new(
-            callbacks,
-            myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
+            myownmesh_core::ConnectorCallbackPolicy::elastic_data_only(),
         );
         myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), profile)
     }
@@ -3523,7 +3454,6 @@ mod terminal_shutdown_tests {
             RealtimeAdvert {
                 supported: false,
                 encodings: Vec::new(),
-                flow_ceiling: None,
             },
             shutdown_rx,
             ControlHooks {
@@ -3620,8 +3550,8 @@ mod terminal_shutdown_tests {
     /// A live `EventsSubscribe` ends with the runtime, and `serve` returns
     /// having joined it and closed.
     ///
-    /// The ordinary terminal case, and the one the review names first. A
-    /// subscribed connection is parked in the stream loop with nothing to send
+    /// The ordinary terminal case. A subscribed connection is parked in the
+    /// stream loop with nothing to send
     /// it, which is the state a `serve` that returned on the shutdown signal
     /// alone would abandon: the socket would still be open, the client still in
     /// the registry, and the daemon would report itself closed while a
@@ -3658,7 +3588,6 @@ mod terminal_shutdown_tests {
             RealtimeAdvert {
                 supported: false,
                 encodings: Vec::new(),
-                flow_ceiling: None,
             },
             shutdown_rx,
             ControlHooks {
@@ -3807,7 +3736,6 @@ mod terminal_shutdown_tests {
             RealtimeAdvert {
                 supported: false,
                 encodings: Vec::new(),
-                flow_ceiling: None,
             },
             shutdown_rx,
             ControlHooks {
@@ -3964,7 +3892,6 @@ mod terminal_shutdown_tests {
             RealtimeAdvert {
                 supported: false,
                 encodings: Vec::new(),
-                flow_ceiling: None,
             },
             shutdown_rx,
             ControlHooks {
@@ -4065,267 +3992,5 @@ mod terminal_shutdown_tests {
             crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
             "no client, flow, handler, subscription, pending call or task lease remains"
         );
-    }
-}
-
-/// The variable state reply uses the same real governance engine on both
-/// sides of its admission gap. No semantic snapshot crosses that gap: pass
-/// zero quotes capacity, while commit remeasures the then-current state and
-/// either builds it once or refuses before cloning it.
-#[cfg(test)]
-mod variable_state_reply_tests {
-    use super::*;
-    use std::num::NonZeroUsize;
-
-    fn connector_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
-        let capacity = NonZeroUsize::new(16).expect("fixture capacity is nonzero");
-        let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
-            myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
-            myownmesh_core::RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("fixture callback policy is consistent");
-        let profile = myownmesh_core::WebRtcConnectorProfile::new(
-            callbacks,
-            myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
-        );
-        myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), profile)
-    }
-
-    fn network_config() -> myownmesh_core::NetworkConfig {
-        myownmesh_core::NetworkConfig {
-            id: "variable-state-control".to_owned(),
-            network_id: "variable-state-control".to_owned(),
-            label: "variable-state-control".to_owned(),
-            kind: Default::default(),
-            topology: myownmesh_core::TopologyMode::FullMesh,
-            signaling: Default::default(),
-            stun_servers: Vec::new(),
-            turn_servers: Vec::new(),
-            roster_path: None,
-            pinned_peers: Vec::new(),
-            auto_approve: true,
-        }
-    }
-
-    #[tokio::test]
-    async fn v4_r4_daemon_nonempty_governance_snapshot_pressure_and_drift_refuse_before_build() {
-        let _fixture = crate::exclusive_connector_fixture().await;
-        let mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
-            myownmesh_core::MeshConfig::default(),
-            Arc::new(myownmesh_core::Identity::ephemeral()),
-            connector_policy(),
-        )
-        .await
-        .expect("the real daemon mesh opens");
-        let scope = mesh
-            .local_application_resource_scope()
-            .expect("the daemon mesh exposes its application scope");
-        let joined = mesh
-            .join(network_config())
-            .await
-            .expect("the real network joins");
-
-        joined
-            .propose_transition(
-                myownmesh_core::TransitionVariant::RoleGrant {
-                    target: "first-absent-member".to_owned(),
-                    role: myownmesh_core::Role::Member,
-                },
-                None,
-            )
-            .await
-            .expect("an open network accepts a meaningful Member grant");
-
-        let plan = joined
-            .prepare_governance_snapshot(
-                scope
-                    .acquire(myownmesh_core::snapshot_planning_claim())
-                    .expect("the planning walk is funded"),
-            )
-            .await
-            .expect("the nonempty state is measurable");
-        let builds_before = joined.governance_snapshot_build_count_for_test();
-        let typed = scope
-            .acquire(plan.typed_retention_claim())
-            .expect("the quoted typed owner is funded");
-        let funded = plan
-            .commit(typed)
-            .await
-            .expect("an unchanged nonempty state commits");
-        assert_eq!(
-            joined.governance_snapshot_build_count_for_test(),
-            builds_before + 1,
-            "the authoritative funded snapshot is built exactly once"
-        );
-        assert!(
-            !funded.state().member_log.is_empty(),
-            "non-vacuity: the funded snapshot contains the real Member grant"
-        );
-        let variable = FundedVariableReply::Governance(funded);
-        let exact = variable
-            .exact_line_len()
-            .expect("the full wire is measurable");
-        let admission = FrameAdmission::new(scope.clone(), None);
-        let output = AdmittedLineOut::prepare_capacity(exact, &admission)
-            .expect("the full response line is admitted");
-        let reply = PreparedReply::Variable(variable);
-        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-            .expect("the nonempty compact wire matches its measurement");
-        assert_eq!(line.bytes().len(), exact);
-        let wire: serde_json::Value = serde_json::from_slice(&line.bytes()[..exact - 1])
-            .expect("the legacy compact response is valid JSON");
-        assert_eq!(wire["ok"], true);
-        assert!(!wire["data"]["state"]["member_log"]
-            .as_array()
-            .expect("member_log remains an array")
-            .is_empty());
-        drop((line, reply));
-
-        let stale = joined
-            .prepare_governance_snapshot(
-                scope
-                    .acquire(myownmesh_core::snapshot_planning_claim())
-                    .expect("the predecessor planning walk is funded"),
-            )
-            .await
-            .expect("the predecessor state is measurable");
-        let builds_before_refusal = joined.governance_snapshot_build_count_for_test();
-        let stale_lease = scope
-            .acquire(stale.typed_retention_claim())
-            .expect("the predecessor typed owner is funded");
-        joined
-            .propose_transition(
-                myownmesh_core::TransitionVariant::RoleGrant {
-                    target: format!("second-absent-member-{}", "z".repeat(4096)),
-                    role: myownmesh_core::Role::Member,
-                },
-                None,
-            )
-            .await
-            .expect("the second longer Member grant mutates authoritative state");
-        assert!(
-            stale.commit(stale_lease).await.is_err(),
-            "pass one refuses growth before cloning a successor into the stale grant"
-        );
-        assert_eq!(
-            joined.governance_snapshot_build_count_for_test(),
-            builds_before_refusal,
-            "stale growth refuses before the production snapshot builder"
-        );
-    }
-
-    /// Roster and governance planning is admitted before it walks state.
-    ///
-    /// The counters read here sit at the real traversal seams, so a refusal
-    /// that leaves them unchanged is a refusal that prevented the work rather
-    /// than one that reported it afterwards. Both planners take the planning
-    /// lease by value, which is what makes the walk unreachable without it:
-    /// the mismatched-lease leg proves that seal holds at run time too, and
-    /// the closing legs prove the counters move when the work really happens.
-    #[tokio::test]
-    async fn v4_r5_daemon_roster_and_governance_planning_pressure_precedes_state_traversal() {
-        let _fixture = crate::exclusive_connector_fixture().await;
-        let mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
-            myownmesh_core::MeshConfig::default(),
-            Arc::new(myownmesh_core::Identity::ephemeral()),
-            connector_policy(),
-        )
-        .await
-        .expect("the real daemon mesh opens");
-        let scope = mesh
-            .local_application_resource_scope()
-            .expect("the daemon mesh exposes its application scope");
-        let joined = mesh
-            .join(network_config())
-            .await
-            .expect("the real network joins");
-
-        // Non-vacuity: give both subsystems state worth walking, so a walk
-        // that does not happen is skipping something real.
-        joined
-            .propose_transition(
-                myownmesh_core::TransitionVariant::RoleGrant {
-                    target: "planning-pressure-member".to_owned(),
-                    role: myownmesh_core::Role::Member,
-                },
-                None,
-            )
-            .await
-            .expect("an open network accepts a meaningful Member grant");
-
-        let roster_before = joined.roster_state_traversal_count_for_test();
-        let governance_before = joined.governance_state_traversal_count_for_test();
-
-        let (starved, provider) = FrameAdmission::over_grant_probed(
-            myownmesh_core::FiniteResourceProvider::scope_planning_charge(),
-            None,
-        );
-        let baseline = provider.in_use();
-        assert!(
-            matches!(
-                starved.acquire_claim(myownmesh_core::snapshot_planning_claim()),
-                Err(framing::FrameRefusal::Resources(_))
-            ),
-            "a starved control connection is refused the planning residual"
-        );
-        assert_eq!(
-            (
-                joined.roster_state_traversal_count_for_test(),
-                joined.governance_state_traversal_count_for_test()
-            ),
-            (roster_before, governance_before),
-            "planning pressure refuses before either subsystem is walked"
-        );
-        assert_eq!(
-            provider.in_use(),
-            baseline,
-            "a refused planning acquisition returns the exact daemon ledger baseline"
-        );
-
-        let mismatched = scope
-            .acquire(myownmesh_core::ResourceClaim::single(
-                myownmesh_core::ResourceClass::AccountedMemoryBytes,
-                1,
-            ))
-            .expect("an unrelated claim is funded");
-        assert!(
-            joined.prepare_roster_snapshot(mismatched).is_err(),
-            "a lease for some other claim does not buy a roster walk"
-        );
-        assert_eq!(
-            joined.roster_state_traversal_count_for_test(),
-            roster_before,
-            "the mismatched lease is rejected before the roster is read"
-        );
-
-        let roster_plan = joined
-            .prepare_roster_snapshot(
-                scope
-                    .acquire(myownmesh_core::snapshot_planning_claim())
-                    .expect("the roster planning walk is funded"),
-            )
-            .expect("the admitted roster plan measures the roster");
-        assert_eq!(
-            joined.roster_state_traversal_count_for_test(),
-            roster_before + 1,
-            "one admitted roster plan walks the roster exactly once"
-        );
-        drop(roster_plan);
-
-        let governance_plan = joined
-            .prepare_governance_snapshot(
-                scope
-                    .acquire(myownmesh_core::snapshot_planning_claim())
-                    .expect("the governance planning walk is funded"),
-            )
-            .await
-            .expect("the admitted governance plan measures the state");
-        assert_eq!(
-            joined.governance_state_traversal_count_for_test(),
-            governance_before + 1,
-            "one admitted governance plan walks the state exactly once"
-        );
-        drop(governance_plan);
     }
 }

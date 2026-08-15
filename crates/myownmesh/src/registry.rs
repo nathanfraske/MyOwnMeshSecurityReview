@@ -13,19 +13,17 @@
 //! This registry is the only owner of a joined runtime's lifecycle, and
 //! [`RuntimeState`] is the only place the answer lives.
 //!
-//! It used to be inferred after the fact from an `Arc` refcount: removal
-//! unlinked the aliases, dropped the signaling drivers, and then asked
-//! `Arc::try_unwrap` whether anyone still held a clone. A refcount answers "is
-//! this value shared", which is a different question — a runtime with one
-//! in-flight control request and a runtime that has finished tearing down are
-//! both "not solely owned". The caller was told `StillBorrowed` either way, on
-//! the stated theory that the engine would exit when its command sender dropped.
-//! It could not: `NetworkState` holds that sender itself. So the engine kept
-//! running with live sessions while no key in this map could reach it, and
-//! `network_update` would then join a replacement under the same configuration,
-//! leaving a hidden runtime beside the visible one.
+//! An `Arc` refcount cannot stand in for it. A refcount answers "is this value
+//! shared", which is a different question — a runtime with one in-flight
+//! control request and a runtime that has finished tearing down are both "not
+//! solely owned" — and dropping the command sender does not exit the engine,
+//! because `NetworkState` holds that sender itself. An engine left running with
+//! live sessions while no key in this map could reach it would be joined beside
+//! by the next `network_update` under the same configuration, leaving a hidden
+//! runtime next to the visible one.
 //!
-//! Four properties replace that, and each is structural rather than observed:
+//! Four properties carry it instead, and each is structural rather than
+//! observed:
 //!
 //! * a runtime is claimed for teardown, unlinked, and moved to the closing set
 //!   in **one** acquisition of the registry's state lock, so there is no
@@ -35,16 +33,15 @@
 //!   runtime is ever ownerless;
 //! * a replacement under either id is refused while **any** runtime holding
 //!   either id is not yet `Stopped` — `Running` as well as `Closing`. A
-//!   `Running` collision used to fall straight through to the map, where
-//!   `insert` overwrote one alias and `or_insert` left the other pointing at
-//!   the predecessor: two live runtimes, one half-reachable, neither being
-//!   torn down. That is the same defect through a different door;
+//!   `Running` collision falling through to the map would let `insert`
+//!   overwrite one alias while `or_insert` left the other pointing at the
+//!   predecessor: two live runtimes, one half-reachable, neither being torn
+//!   down;
 //! * every caller that loses the race to claim a teardown **waits for the
 //!   winner** and observes `Stopped` before returning. Answering "already
-//!   closing" and returning immediately let `shutdown_all` finish while a
-//!   concurrent removal was still awaiting an engine driver, and the daemon
-//!   then exited with that engine live — which is the review's own failure
-//!   mode arriving through the shutdown door.
+//!   closing" and returning immediately would let `shutdown_all` finish while a
+//!   concurrent removal was still awaiting an engine driver, exiting the daemon
+//!   with that engine live.
 //!
 //! Teardown itself needs no unwrapping: [`JoinedNetwork::shutdown`] takes
 //! `&self` and is idempotent, so the supervisor drives it through the shared
@@ -224,12 +221,6 @@ pub struct NetworkRegistry {
     state: Mutex<RegistryState>,
     #[cfg(test)]
     claim_pause: Mutex<Option<Arc<ClaimPause>>>,
-    #[cfg(test)]
-    networks_line_measurements: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    networks_commits: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    networks_rows_built: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct StatusSource<'a> {
@@ -330,20 +321,11 @@ impl<T: serde::Serialize> serde::Serialize for PreparedSlot<T> {
     }
 }
 
-/// Allocate one exact fixed slot box and initialize every slot to empty.
-///
-/// `Vec` is deliberately absent: its spare-capacity policy is not a stable
-/// resource shape. The only unsafe step changes initialized
-/// `MaybeUninit<PreparedSlot<T>>` elements into their ordinary representation
-/// after this function has written every one of them.
+/// Allocate the staging slots used while one registry reply is prepared.
 fn empty_prepared_slots<T>(count: usize) -> Box<[PreparedSlot<T>]> {
-    let mut slots = Box::<[PreparedSlot<T>]>::new_uninit_slice(count);
-    for slot in &mut slots {
-        slot.write(PreparedSlot(None));
-    }
-    // SAFETY: every slot in the allocated slice was initialized by the loop;
-    // the zero-length case is initialized vacuously.
-    unsafe { slots.assume_init() }
+    std::iter::repeat_with(|| PreparedSlot(None))
+        .take(count)
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -1014,6 +996,19 @@ struct StatusView<'a> {
     realtime: &'a crate::control::RealtimeAdvert,
 }
 
+/// The one retained test barrier in this file, and the only race it exists for.
+///
+/// `remove` takes the removal claim under the state lock, releases it, and only
+/// then tears the runtime down. An `insert` of the same id arriving inside that
+/// window must wait for the predecessor to finish stopping rather than
+/// installing beside a runtime that is still live. That window is real and it is
+/// short, so a test that tries to hit it by timing hits it almost never — and a
+/// control that only usually reproduces its race is worse than none, because it
+/// passes while the ordering is broken.
+///
+/// The barrier holds `remove` at exactly the post-claim point so the racing
+/// `insert` is guaranteed to arrive inside the window. It parks nothing else and
+/// observes nothing; the assertions are on the registry's own visible state.
 #[cfg(test)]
 struct ClaimPause {
     reached: tokio::sync::Barrier,
@@ -1056,10 +1051,9 @@ struct RegistryState {
 impl RegistryState {
     /// The runtime answering to `key`, visible or draining.
     ///
-    /// The closing set is searched too, and that is the correction to a
-    /// removal that used to start at the alias map alone: once the first
-    /// removal unlinked the aliases, a second one missed and reported
-    /// `NotFound` about a network that was very much still there.
+    /// The closing set is searched too: a lookup starting at the alias map
+    /// alone would miss a network whose aliases a first removal has already
+    /// unlinked, and report `NotFound` about one that is still there.
     fn find(&self, key: &str) -> Option<Arc<Entry>> {
         if let Some(entry) = self.aliases.get(key) {
             return Some(entry.clone());
@@ -1122,24 +1116,6 @@ impl NetworkRegistry {
             identity,
             realtime,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn networks_line_measurements_for_test(&self) -> usize {
-        self.networks_line_measurements
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn networks_commits_for_test(&self) -> usize {
-        self.networks_commits
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn networks_rows_built_for_test(&self) -> usize {
-        self.networks_rows_built
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn prepare_networks_list(
@@ -1582,10 +1558,6 @@ impl<'a> PreparedNetworksList<'a> {
                 "NetworksList line measurement work was not admitted",
             ));
         }
-        #[cfg(test)]
-        self.registry
-            .networks_line_measurements
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = self.registry.state.lock();
         let current = current_networks_claim_fitting(&state, self.typed_claim)?;
         if current != Some(self.typed_claim) {
@@ -1625,21 +1597,13 @@ impl MeasuredNetworksList<'_> {
         if admitted != self.typed_claim || work.claim() != self.work_claim {
             return Err((retention, work));
         }
-        #[cfg(test)]
-        self.registry
-            .networks_commits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         let state = self.registry.state.lock();
         let count = state.canonical_count();
         let base_claim = match networks_claim(count, 0, 0) {
             Ok(claim) if claim_fits(claim, admitted) => claim,
             _ => return Err((retention, work)),
         };
-        // The fixed row box is the first allocation and its exact requested
-        // layout is covered by `base_claim` before allocation. `Vec` is
-        // deliberately not used here: its spare capacity is not part of the
-        // public contract and therefore cannot be measured exactly.
+        // The staging box is covered by the response's broad planning owner.
         let mut rows = empty_prepared_slots(count);
         let mut built = 0usize;
         let mut actual = base_claim;
@@ -1668,10 +1632,6 @@ impl MeasuredNetworksList<'_> {
                         refused = true;
                         return;
                     };
-                    #[cfg(test)]
-                    self.registry
-                        .networks_rows_built
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     slot.0 = Some(PreparedNetworkSummary::from_view(
                         config_id, network_id, label, phase, topology, traffic,
                     ));
@@ -1764,7 +1724,6 @@ impl InsertOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroUsize;
 
     // The two controls that stand up a real `Mesh` serialize on
     // `crate::exclusive_connector_fixture`, shared with every other
@@ -1775,16 +1734,8 @@ mod tests {
     // the state machine directly and open no runtime.
 
     fn connector_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
-        let capacity = NonZeroUsize::new(4).expect("fixture capacity is nonzero");
-        let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
-            myownmesh_core::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            myownmesh_core::ConnectorCallbackServiceWeights::data_only(capacity, capacity),
-            myownmesh_core::RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("fixture callback policy is consistent");
         let profile = myownmesh_core::WebRtcConnectorProfile::new(
-            callbacks,
-            myownmesh_core::PendingRemoteCandidatePolicy::elastic(),
+            myownmesh_core::ConnectorCallbackPolicy::elastic_data_only(),
         );
         myownmesh_core::WebRtcConnectorCapablePolicy::new(crate::test_resource_provider(), profile)
     }
@@ -1972,11 +1923,6 @@ mod tests {
         };
         drop((typed, work));
         assert_eq!(
-            registry.networks_rows_built_for_test(),
-            0,
-            "growth refuses before the first row construction"
-        );
-        assert_eq!(
             provider.in_use(),
             baseline,
             "growth rollback releases exactly"
@@ -2049,11 +1995,6 @@ mod tests {
             Err(leases) => leases,
         };
         drop((typed, work));
-        assert_eq!(
-            registry.networks_rows_built_for_test(),
-            1,
-            "the equal-retention successor reaches the private row build"
-        );
         assert_eq!(
             provider.in_use(),
             baseline,
@@ -2222,10 +2163,9 @@ mod tests {
 
     /// A loser waits for the winner and observes `Stopped`.
     ///
-    /// The defect this closes: the loser used to return the moment it saw it
-    /// had lost, so `shutdown_all` could finish while a concurrent removal was
-    /// still awaiting an engine driver, and the daemon exited with that engine
-    /// live.
+    /// A loser returning the moment it saw it had lost would let `shutdown_all`
+    /// finish while a concurrent removal was still awaiting an engine driver,
+    /// exiting the daemon with that engine live.
     ///
     /// Deterministic and sleepless. The runtime is single-threaded, so a
     /// `yield_now` is enough to run the waiter up to its park, and

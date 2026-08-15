@@ -28,7 +28,6 @@
 use std::alloc::Layout;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
@@ -77,10 +76,10 @@ pub enum RpcError {
     RequestIdUnavailable,
     /// The peer had no live promoted session when the call was filed.
     ///
-    /// Split out from [`Self::RequestIdUnavailable`], which used to answer for
-    /// it. The two want opposite responses: this one is ordinary and worth
-    /// retrying once a session establishes, and the other is a local draw
-    /// colliding and says nothing about the peer at all.
+    /// Distinct from [`Self::RequestIdUnavailable`] because the two want
+    /// opposite responses: this one is ordinary and worth retrying once a
+    /// session establishes, and the other is a local draw colliding and says
+    /// nothing about the peer at all.
     #[error("no live session for peer {0}")]
     SessionNotCurrent(String),
     /// The session's resource owner would not fund one more pending operation.
@@ -154,10 +153,10 @@ pub type RpcHandlerFuture =
 /// registry and invokes it after the registry lock is gone, so funding held by
 /// the map entry would be released the instant that entry was replaced — while
 /// the clone was still running. That is why the charge is not in
-/// [`HandlerEntry`]. But putting it *inside* this struct, as it used to be,
-/// bought the first property at the cost of the second: a lease among these
-/// fields is released by this value's own drop glue, which runs while the
-/// allocation is still there.
+/// [`HandlerEntry`]. Nor can it be a field *inside* this struct: that buys the
+/// first property at the cost of the second, because a lease among these fields
+/// is released by this value's own drop glue, which runs while the allocation is
+/// still there.
 ///
 /// [`FundedArc`] gives both. Every strong clone holds the same reservation, so
 /// the charge spans every invocation; and the token sits beside the pointer
@@ -302,58 +301,13 @@ pub(crate) struct SessionRpcState {
     /// charges its own node from its own `size_of`, so the two halves are read
     /// where each is knowable and cannot drift apart.
     pending: crate::resource::LeasedMap<String, PendingOp>,
-    /// How many pending effects *this* state has constructed.
-    ///
-    /// Counted at the one site that calls [`PendingShape::build`], so what a
-    /// control reads is production's own construction and not a stand-in the
-    /// control supplied — a closure the control wrote could only ever prove that
-    /// the control's own closure had not run.
-    ///
-    /// Per-state rather than a process-wide static, deliberately: controls run
-    /// concurrently in one process, and a global counter would make "nothing was
-    /// built" a statement about every test at once.
-    #[cfg(test)]
-    effects_built: usize,
-
-    /// How many routing strings this state has allocated.
-    ///
-    /// The counterpart of `effects_built` for blocker 2's property. A control
-    /// that only checked the refusal could not tell a plan that defers its
-    /// allocation from one that takes it and throws it away — both refuse, and
-    /// the refusal looks identical from outside. Counting the owning conversion
-    /// at the single site that performs it makes the difference observable:
-    /// under pressure this must not move.
-    ///
-    /// Counted where production allocates, for the same reason as
-    /// `effects_built` — a control that counted its own helper would prove only
-    /// that its helper had not run.
-    #[cfg(test)]
-    request_ids_owned: usize,
 }
 
 impl SessionRpcState {
     pub(crate) fn new() -> Self {
         Self {
             pending: crate::resource::LeasedMap::new(),
-            #[cfg(test)]
-            effects_built: 0,
-            #[cfg(test)]
-            request_ids_owned: 0,
         }
-    }
-
-    /// How many pending effects this state has constructed. Test-only; see the
-    /// field.
-    #[cfg(test)]
-    pub(crate) fn effects_built(&self) -> usize {
-        self.effects_built
-    }
-
-    /// How many routing strings this state has allocated. Test-only; see the
-    /// field.
-    #[cfg(test)]
-    pub(crate) fn request_ids_owned(&self) -> usize {
-        self.request_ids_owned
     }
 }
 
@@ -475,14 +429,12 @@ impl Drop for SessionRpcState {
 ///   funding half of what is retained.
 /// - **The peer name.** [`PendingCancellation`] copies it, because withdrawal
 ///   has to name the peer after the borrow that filed the entry is gone.
-/// - **The identity allocation.** [`PendingOpId`] is identity *over an
-///   allocation*, and that same allocation holds the operation's lease. One
-///   allocation however many clones exist, so it is charged once.
+/// - **The identity record.** [`PendingOpId`] names one shared funded record,
+///   and that same record holds the operation's lease.
 /// - **The cancellation state itself**, inline in the future or [`RpcStream`]
 ///   the caller holds.
-/// - **The effect.** A stream's inbox is an `Arc` whose size this module can
-///   take; a unary oneshot's inner allocation is opaque, so it is a residual
-///   and is named as one rather than guessed at in bytes.
+/// - **The effect.** A stream's inbox record is visible here; a unary
+///   oneshot's inner allocation remains dependency-private.
 ///
 /// `peer_bytes` and `class` are parameters rather than constants because the
 /// first is not knowable here and the second changes what is retained.
@@ -495,11 +447,12 @@ fn pending_operation_claim(
     let overflow = || ResourceClaimArithmeticError::Overflow {
         dimension: ResourceClass::AccountedMemoryBytes,
     };
-    // The identity's one allocation, shared by the map's clone and the caller's.
-    let identity = arc_allocation_bytes(Layout::new::<PendingOpMarker>())?;
-    // The effect's own allocation. Only one of the two is measurable from here.
+    // Visible record sizes are charged directly. One broad residual below
+    // covers shared-allocation metadata and dependency-private layout.
+    let identity = std::mem::size_of::<PendingOpMarker>();
+    // The stream record is visible here; the oneshot implementation is not.
     let effect = match class {
-        PendingClass::Stream => arc_allocation_bytes(Layout::new::<RpcStreamInbox>())?,
+        PendingClass::Stream => std::mem::size_of::<RpcStreamInbox>(),
         PendingClass::Single => 0,
     };
     let bytes = std::mem::size_of::<PendingOp>()
@@ -510,35 +463,27 @@ fn pending_operation_claim(
         // Twice: the map's key and the cancellation's copy.
         .and_then(|bytes| request_id_bytes.checked_mul(2)?.checked_add(bytes))
         .ok_or_else(overflow)?;
-    // Two request-id buffers when the id is named at all, one peer buffer when
-    // the peer is, the identity allocation, and the effect's — the last always
-    // one, whether or not its bytes above were measurable.
-    let allocations = u64::from(request_id_bytes > 0)
-        .checked_mul(2)
-        .and_then(|ids| ids.checked_add(u64::from(peer_bytes > 0)))
-        .and_then(|named| named.checked_add(2))
-        .ok_or(ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::OpaqueDependencyResidual,
-        })?;
+    // Peer-chosen retained bytes stay explicit. Arc control blocks, String
+    // allocation counts and dependency-private effect details are covered by
+    // one broad per-operation residual instead of allocator microstate.
     ResourceClaim::try_from_entries([
         (
             ResourceClass::AccountedMemoryBytes,
             u64::try_from(bytes).map_err(|_| overflow())?,
         ),
-        (ResourceClass::OpaqueDependencyResidual, allocations),
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
 }
 
 /// Why one locally-originated RPC operation was not filed.
 ///
-/// Three facts, kept apart because a caller acts differently on each and
-/// because two of them were previously reported as the third. Everything below
-/// used to answer `Option`, which `call` and `call_stream` turned into
-/// [`RpcError::RequestIdUnavailable`] — so a peer with no live session, and a
-/// resource owner that would not fund one more pending entry, were both
-/// reported as "no unused request id available". That sentence is false about
-/// both of them, and it points a reader at a 96-bit draw when the actual remedy
-/// is to wait for a session or to raise a grant.
+/// Three facts, kept apart because a caller acts differently on each. An
+/// `Option` here would collapse them into
+/// [`RpcError::RequestIdUnavailable`], reporting a peer with no live session
+/// and a resource owner that would not fund one more pending entry as "no
+/// unused request id available". That sentence is false about both, and it
+/// points a reader at a 96-bit draw when the actual remedy is to wait for a
+/// session or to raise a grant.
 #[derive(Debug)]
 pub(crate) enum RpcRegistrationRefusal {
     /// No live promoted session for this peer at the moment of filing. Nothing
@@ -573,8 +518,8 @@ pub(crate) enum RpcRegistrationRefusal {
 /// by whoever sent the frame. Charging encoded bytes would let an adversary pick
 /// the shape that maximises the gap. The retained figure is core's existing
 /// conservative structural bound for exactly this — the same one the mailbox
-/// charges — and its per-fragment allocation count is used for the same reason:
-/// one residual cannot honestly stand for an allocation count the sender picks.
+/// charges. One broad residual covers dependency-private allocation details;
+/// the peer-chosen retained size still scales with the payload.
 ///
 /// **The request id is charged twice, because two are retained.** A run that is
 /// admitted keeps one inside the `RpcCall` the handler is given, and a second
@@ -584,8 +529,8 @@ pub(crate) enum RpcRegistrationRefusal {
 /// like every other field here, so the gap was a peer-selected one.
 ///
 /// `WorkerOrTask` stays its own dimension: the spawned task is one task whatever
-/// the payload looks like. One residual is added on top of the measured tree's
-/// for the task's own future allocation.
+/// the payload looks like. One broad residual covers its dependency-private
+/// allocation details.
 ///
 /// `RpcCall::streaming` is not a parameter, because it retains nothing: it is a
 /// `bool` inside the `size_of::<RpcCall>()` already counted, and taking it here
@@ -601,8 +546,7 @@ pub(crate) fn handler_task_claim_for(
     let overflow = || ResourceClaimArithmeticError::Overflow {
         dimension: ResourceClass::AccountedMemoryBytes,
     };
-    // `request_id` twice: two buffers, two allocations. Passed as two entries
-    // rather than doubled afterwards so the residual count doubles with it.
+    // `request_id` twice because two buffers retain those bytes.
     let measure = strings_measure([from, request_id, request_id, method])
         .and_then(|strings| checked_measure_add(strings, mailbox_measure_serialized(payload)?))
         .map_err(|_| overflow())?;
@@ -610,19 +554,11 @@ pub(crate) fn handler_task_claim_for(
         .checked_add(measure.0)
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(overflow)?;
-    // The four string buffers — the peer name, the request id twice, and the
-    // method — and every fragment of the payload tree, plus one for the spawned
-    // task's own future.
-    let allocations = u64::try_from(measure.2)
-        .ok()
-        .and_then(|tree| tree.checked_add(1))
-        .ok_or(ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::OpaqueDependencyResidual,
-        })?;
+    // One broad residual covers the task record and dependency internals.
     ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
         (ResourceClass::WorkerOrTask, 1),
-        (ResourceClass::OpaqueDependencyResidual, allocations),
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
 }
 
@@ -658,34 +594,15 @@ impl HandlerEntry {
 }
 
 fn rpc_inner_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    let bytes = std::mem::size_of::<RpcInner>()
-        .checked_add(2 * std::mem::size_of::<usize>())
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(ResourceClaimArithmeticError::Overflow {
+    let bytes = u64::try_from(std::mem::size_of::<RpcInner>()).map_err(|_| {
+        ResourceClaimArithmeticError::Overflow {
             dimension: ResourceClass::AccountedMemoryBytes,
-        })?;
+        }
+    })?;
     ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
         (ResourceClass::OpaqueDependencyResidual, 1),
     ])
-}
-
-/// The bytes one `Arc<T>` allocation actually occupies.
-///
-/// Composed with [`Layout`] rather than summed from field sizes, because a sum
-/// silently drops padding. `Arc` lays the two counts down first and then the
-/// value at *its* alignment: a value needing 16-byte alignment on a 64-bit
-/// target forces padding after the counts that no `size_of` term names, and
-/// `pad_to_align` adds the tail the allocator is also handed. Both are real
-/// bytes, and a funding figure that omits them is short — the one direction it
-/// must never be.
-fn arc_allocation_bytes(value: Layout) -> Result<usize, ResourceClaimArithmeticError> {
-    Layout::new::<(AtomicUsize, AtomicUsize)>()
-        .extend(value)
-        .map(|(whole, _)| whole.pad_to_align().size())
-        .map_err(|_| ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::AccountedMemoryBytes,
-        })
 }
 
 /// The layout of what an `Arc<FundedRpcHandler<C>>` holds, with `C` inferred
@@ -717,14 +634,11 @@ enum CaptureFunding {
 /// What the installed entry retains, stated in the parts that are knowable in
 /// different places.
 ///
-/// **What this function can see, and charges:** the map key's buffer, the one
-/// `Arc` allocation that carries the identity, the lease, and the closure
-/// inline in its trailing field, and one residual per distinct allocation among
-/// them. The allocation is taken from its [`Layout`], so the padding a
-/// high-alignment closure forces after the reference counts is included; what
-/// is *not* modelled is the allocator's own rounding to a size class, which can
-/// only make the real figure larger. So this is a floor that names its terms,
-/// not a measurement of resident bytes.
+/// **What this function can see, and charges:** the map key's bytes and the
+/// funded registration record that carries the identity, lease, and closure
+/// inline. The closure's visible inline size is charged directly. One broad
+/// residual covers shared-allocation and dependency-private layout rather than
+/// turning allocator control-block details into an API invariant.
 ///
 /// **What it cannot see, and therefore does not pretend to contain:**
 /// `size_of::<F>()` is the closure struct, not its reach. A handler that
@@ -743,7 +657,7 @@ fn entry_retention_claim(
     captures: CaptureFunding,
     handler: Layout,
 ) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    let registration_allocation = arc_allocation_bytes(handler)?;
+    let registration_allocation = handler.size();
     let bytes = method
         .len()
         .checked_add(registration_allocation)
@@ -751,17 +665,11 @@ fn entry_retention_claim(
         .ok_or(ResourceClaimArithmeticError::Overflow {
             dimension: ResourceClass::AccountedMemoryBytes,
         })?;
-    // The key buffer when the method is named at all, plus exactly one for the
-    // registration itself — one, because the callable is the `Arc`'s trailing
-    // field rather than a `Box` beside it.
-    let allocations = u64::from(!method.is_empty()).checked_add(1).ok_or(
-        ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::OpaqueDependencyResidual,
-        },
-    )?;
+    // One broad residual covers the funded registration record and its method
+    // buffer's allocator-private details.
     let known = ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
-        (ResourceClass::OpaqueDependencyResidual, allocations),
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])?;
     match captures {
         CaptureFunding::Declared(claim) => known.checked_add(claim),
@@ -788,18 +696,11 @@ fn entry_retention_claim(
 /// chooses it. So the handle carries its own lease and releases it in its own
 /// `Drop`, and no drop-order relationship between the two owners is assumed.
 fn cleanup_handle_claim(method: &str) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    // `Arc<str>`: the two counts, then the bytes, in one allocation. `str` is
-    // align-1, so the name contributes its length and no padding.
-    let name = Layout::from_size_align(method.len(), 1).map_err(|_| {
-        ResourceClaimArithmeticError::Overflow {
+    // The name bytes are explicit; one residual covers the shared allocation.
+    let bytes =
+        u64::try_from(method.len()).map_err(|_| ResourceClaimArithmeticError::Overflow {
             dimension: ResourceClass::AccountedMemoryBytes,
-        }
-    })?;
-    let bytes = u64::try_from(arc_allocation_bytes(name)?).map_err(|_| {
-        ResourceClaimArithmeticError::Overflow {
-            dimension: ResourceClass::AccountedMemoryBytes,
-        }
-    })?;
+        })?;
     ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
         (ResourceClass::OpaqueDependencyResidual, 1),
@@ -985,12 +886,12 @@ impl RpcStreamInbox {
     /// — it did not encode, or its size is not expressible as a claim — which is
     /// a statement about the frame and not about the resource owner.
     ///
-    /// This used to answer `bool`, and the caller turned every `false` into "RPC
-    /// stream refused by resource owner". That sentence is true of one arm and
-    /// false of the other, and the arm it is false about is the one that means a
-    /// peer sent something this side could not admit. An untyped refusal does
-    /// not merely lose detail here; it reports a resource owner that refused
-    /// nothing.
+    /// An untyped `bool` would collapse the two, leaving a caller to turn every
+    /// `false` into "RPC stream refused by resource owner". That sentence is
+    /// true of one arm and false of the other, and the arm it is false about is
+    /// the one that means a peer sent something this side could not admit. An
+    /// untyped refusal does not merely lose detail here; it reports a resource
+    /// owner that refused nothing.
     pub(crate) fn push(
         &self,
         session: &crate::runtime::session_broker::SessionCapability,
@@ -1000,9 +901,9 @@ impl RpcStreamInbox {
 
         // Counted, not encoded: `mailbox_measure_serialized` serializes into a
         // length-counting writer, so a chunk this side may be about to refuse
-        // costs no allocation to measure. `serde_json::to_vec` built the whole
-        // encoding first — a peer-sized allocation taken before admission, which
-        // is the defect admission exists to prevent.
+        // costs no allocation to measure. Encoding first, with
+        // `serde_json::to_vec`, would take a peer-sized allocation before
+        // admission — the defect admission exists to prevent.
         //
         // All three figures, because for a `Value` they are three different
         // things and the sender picks the ratio between them: the tree's
@@ -1127,13 +1028,13 @@ impl RpcStreamInbox {
             }
             if let Some(StreamTerminal { reason, _retention }) = self.terminal.lock().take() {
                 // The lease leaves *with* the reason rather than being dropped
-                // here. This used to be the release point — `into_owned()` and
-                // the lease's destruction in one expression — which meant every
-                // caller past this line held peer-sized text that nothing was
-                // paying for, including the forwarder that had yet to measure it
-                // for a writer mailbox. Whoever receives this now decides when
-                // the funding ends, and an application that wants an ordinary
-                // `String` says so through `RpcStreamTerminal::into_reason`.
+                // here. Releasing it at this line — `into_owned()` and the
+                // lease's destruction in one expression — would leave every
+                // caller past it holding peer-sized text that nothing was paying
+                // for, including a forwarder that has yet to measure it for a
+                // writer mailbox. Whoever receives this decides when the funding
+                // ends, and an application that wants an ordinary `String` says
+                // so through `RpcStreamTerminal::into_reason`.
                 //
                 // A clean end carries no reason and no lease, and the `map`
                 // below drops both without constructing anything.
@@ -1181,23 +1082,19 @@ impl PendingEntry {
 /// someone else's oneshot with a body of its choosing, inject chunks into
 /// someone else's stream, or end it early.
 ///
-/// **What replaced the binding.** This record used to carry an `expect_from`
-/// device id, and settling compared it against the admitted dispatch's owner.
-/// It no longer does, because it no longer can be wrong: this value lives in a
+/// **What binds an operation to its owner.** This value lives in a
 /// [`SessionRpcState`], which is a field of one `PeerSessionState`. Reaching it
 /// at all requires the capability of that exact session, so an operation filed
 /// by one session is unreachable from any other — including a later session
 /// with the same peer over a freshly authenticated connector.
 ///
-/// That last case is the substantive change, not a restatement. The device
-/// binding deliberately *admitted* it: the same canonical device returning on a
-/// replacement connector was treated as a legitimate completion of a still-
-/// pending call. Session ownership does not, and must not — the replacement is
-/// a different session, its predecessor's pending operations were resolved when
-/// that session was retired, and there is nothing left for it to settle. Prose
-/// describing the old permission survived the change and is removed here rather
-/// than softened, because a comment that says a closed path is open is worse
-/// than no comment.
+/// That last case is why the record carries no `expect_from` device id. A
+/// device-id comparison would *admit* it: the same canonical device returning
+/// on a replacement connector would look like a legitimate completion of a
+/// still-pending call. Session ownership does not, and must not — the
+/// replacement is a different session, its predecessor's pending operations
+/// were resolved when that session was retired, and there is nothing left for
+/// it to settle.
 ///
 /// **Identity is not ownership.** `id` names *this* entry among every entry
 /// this process ever filed, and `effect` says what class of response it takes.
@@ -1240,9 +1137,9 @@ impl PendingOp {
 ///
 /// **A process-local ownership token — a local capability, and not a
 /// generation.** Holding this private value is what authorizes withdrawing
-/// *this* filed operation, so calling it "not an authority" was wrong: the
-/// capability is exactly what it is for. What it is not is any of the kinds of
-/// authority that would matter beyond this process. It is not network
+/// *this* filed operation: the capability is exactly what it is for. What it is
+/// not is any of the kinds of authority that would matter beyond this process.
+/// It is not network
 /// authority: it is never serialized, sent, advertised, or derived from
 /// anything a remote supplies, and no inbound path reads it. It is not durable
 /// authority: it lives and dies with the allocation, and nothing persists or
@@ -1272,20 +1169,19 @@ pub(crate) struct PendingOpId(crate::resource::FundedArc<PendingOpMarker>);
 
 /// The allocation [`PendingOpId`] is identity over.
 ///
-/// Empty, and the emptiness is the repair. The operation's lease used to live
-/// *in here*, which bought most of what was wanted — the map's entry, the
-/// caller's [`LocalRequest`], and an effect extracted for a send in flight all
-/// hold clones, so removing the map entry does not release the funding while an
-/// extracted sender is still on its way to being used — but it could not buy
-/// the last of it. A pointee is destroyed on the final *strong* drop, while the
-/// allocation it sits in survives for as long as any weak handle does. A lease
-/// inside the pointee therefore went back to the provider while the storage it
+/// Empty, and the emptiness is load-bearing. The operation's lease must not
+/// live *in here*. A pointee is destroyed on the final *strong* drop, while the
+/// allocation it sits in survives for as long as any weak handle does, so a
+/// lease inside the pointee would go back to the provider while the storage it
 /// was paying for was still there.
 ///
-/// So the funding moved out of the pointee and into the [`FundedArc`] holding
-/// it, which releases the claim only when every handle of either kind is gone.
-/// The identity still has to be an allocation — that is what makes `ptr_eq` a
-/// fact rather than a comparison of contents — and it is still exactly one
+/// The funding therefore lives in the [`FundedArc`] holding this marker, which
+/// releases the claim when the last funded strong handle is gone — and the
+/// map's entry, the caller's [`LocalRequest`], and an effect extracted for a
+/// send in flight all hold clones, so removing the map entry does not release
+/// the funding while an extracted sender is still on its way to being used. The
+/// identity still has to be an allocation — that is what makes `ptr_eq` a fact
+/// rather than a comparison of contents — and it is still exactly one
 /// allocation: a shared lease lives in the handle's own inline fields and adds
 /// no second record.
 ///
@@ -1336,13 +1232,13 @@ impl std::fmt::Debug for PendingOpId {
 /// value in flight rather than by the map. That is what the identity clone
 /// here is for; it is never read.
 ///
-/// **The two halves do not come apart.** This used to hand back a
-/// `(T, PendingOpId)` pair and ask, in a comment, that callers bind the second
-/// name rather than discard it — which is to say the funding outlived the
-/// effect by convention. It does not any more: the stream callers read through
-/// [`Self::value`], and the one caller that has to consume its effect goes
-/// through [`Extracted::answer`], which owns the whole struct across the send.
-/// `value` is declared before `_funding` so the drop order is structural too.
+/// **The two halves do not come apart.** A `(T, PendingOpId)` pair would leave
+/// the funding outliving the effect only by convention — a caller that bound
+/// the second name rather than discarding it. Here the stream callers read
+/// through [`Self::value`], and the one caller that has to consume its effect
+/// goes through [`Extracted::answer`], which owns the whole struct across the
+/// send. `value` is declared before `_funding` so the drop order is structural
+/// too.
 pub(crate) struct Extracted<T> {
     value: T,
     _funding: PendingOpId,
@@ -1446,10 +1342,10 @@ pub struct RpcStream {
 /// the same line [`RpcStreamChunk::value`] draws for a chunk.
 ///
 /// What it closes: a response body is a `serde_json::Value` tree and an error is
-/// a `String`, both sized by the peer, and both used to travel through the
-/// oneshot after the decoded frame that funded them had already been released.
-/// Between the send and the caller's `await` — an interval the caller controls —
-/// they were retained by nobody.
+/// a `String`, both sized by the peer. Sent through the oneshot on their own,
+/// they would travel after the decoded frame that funded them had already been
+/// released — retained by nobody between the send and the caller's `await`, an
+/// interval the caller controls.
 pub(crate) struct FundedRpcResult {
     result: Result<RpcResponse, String>,
     _retention: ResourceLease,
@@ -1516,10 +1412,10 @@ impl FundedRpcCallResult {
     /// here is being told something true.
     ///
     /// Feature-gated rather than `#[cfg(test)]` because the caller is another
-    /// crate's controls. That does make it a buildable surface, which is
-    /// acceptable in a way the tuple API was not: this one cannot be used to
-    /// separate a value from its funding — it is the constructor *of* the
-    /// funded owner, and everything it returns is still borrow-only.
+    /// crate's controls. That does make it a buildable surface, and it is a
+    /// safe one: it cannot be used to separate a value from its funding — it is
+    /// the constructor *of* the funded owner, and everything it returns is
+    /// still borrow-only.
     #[cfg(feature = "transport-lab")]
     pub fn transport_lab_funded(
         scope: &crate::resource::LocalApplicationResourceScope,
@@ -1551,8 +1447,9 @@ impl FundedRpcCallResult {
     }
 }
 
-/// What one settled single-shot result retains: the response body's tree, or
-/// the error text, and the allocations behind whichever it is.
+/// What one settled single-shot result retains: the response body's tree or
+/// error text, plus one broad residual for dependency-private allocation
+/// details.
 ///
 /// Measured from the inbound frame's own fields, before anything is copied out
 /// of them, on the same contract as [`handler_task_claim_for`].
@@ -1580,12 +1477,7 @@ pub(crate) fn single_response_claim(
         .ok_or_else(overflow)?;
     ResourceClaim::try_from_entries([
         (ResourceClass::AccountedMemoryBytes, bytes),
-        (
-            ResourceClass::OpaqueDependencyResidual,
-            u64::try_from(measure.2).map_err(|_| ResourceClaimArithmeticError::Overflow {
-                dimension: ResourceClass::OpaqueDependencyResidual,
-            })?,
-        ),
+        (ResourceClass::OpaqueDependencyResidual, 1),
     ])
 }
 
@@ -1661,22 +1553,22 @@ impl RpcStreamChunk {
 ///
 /// The streaming twin of [`FundedRpcResult`], and it exists for the same reason
 /// on a longer path. A stream-end error is text the *peer* chose the length of.
-/// [`RpcStreamInbox`] funds it on arrival and holds it, but taking the terminal
-/// used to convert it to an owned `String` and drop the lease in the same
-/// expression — so from that instant the text was live in a forwarding task
-/// with no owner, and the writer mailbox that would eventually pay for it did
-/// not measure until after the allocation already existed.
+/// [`RpcStreamInbox`] funds it on arrival and holds it. Taking the terminal must
+/// not convert it to an owned `String` and drop the lease in the same
+/// expression: from that instant the text would be live in a forwarding task
+/// with no owner, and the writer mailbox that eventually pays for it does not
+/// measure until after the allocation already exists.
 ///
 /// This keeps the two together. The reason is readable by borrow for as long as
 /// core or a forwarder owns the value, so it can be measured, admitted and
 /// encoded while still funded, and the claim goes back when this wrapper does.
 ///
-/// **Converting out is still allowed, and is the public boundary.** An
-/// application receiving an error wants a `String`, not a resource wrapper it
-/// must hold forever; [`Self::into_reason`] is that conversion and
-/// [`RpcStream::recv`] performs it. What changed is that the conversion now
-/// happens where the value becomes the application's, rather than several
-/// owners earlier — a forwarder is not at that boundary until it has forwarded.
+/// **Converting out is allowed, and is the public boundary.** An application
+/// receiving an error wants a `String`, not a resource wrapper it must hold
+/// forever; [`Self::into_reason`] is that conversion and [`RpcStream::recv`]
+/// performs it. The conversion belongs where the value becomes the
+/// application's, not several owners earlier — a forwarder is not at that
+/// boundary until it has forwarded.
 pub struct RpcStreamTerminal {
     reason: std::borrow::Cow<'static, str>,
     /// Held, never read. `None` is not "unfunded" — it is "nothing variable to
@@ -1843,19 +1735,18 @@ impl RpcStream {
 /// The pending-operation surface.
 ///
 /// These are the only ways to reach the `pending` map, and they take a request
-/// id and a class — nothing more. They used to additionally take the canonical
-/// device the frame was authenticated as, and compare it against a device bound
-/// onto each entry, because the map was network-global and a request id alone
-/// was therefore an authority: any authenticated peer that learned another's
-/// in-flight id could settle that peer's call.
+/// id and a class — nothing more. They take no authenticated device to compare
+/// against, and need none.
 ///
-/// **That check is gone because what it defended is now structural.** This map
-/// is a field of one `PeerSessionState`, reached only through the capability of
-/// that exact promoted session, so an operation filed by one session is not
-/// merely refused to another — it is unreachable from it. There is no argument
-/// a caller could pass that would widen the set of entries these methods can
-/// see, which is a stronger statement than any comparison, and one that cannot
-/// be got wrong by a caller passing the wrong device.
+/// **What a device comparison would defend is structural here.** This map is a
+/// field of one `PeerSessionState`, reached only through the capability of that
+/// exact promoted session, so an operation filed by one session is not merely
+/// refused to another — it is unreachable from it. There is no argument a
+/// caller could pass that would widen the set of entries these methods can see,
+/// which is a stronger statement than any comparison, and one that cannot be
+/// got wrong by a caller passing the wrong device. A network-global map would
+/// make a request id an authority on its own: any authenticated peer that
+/// learned another's in-flight id could settle that peer's call.
 ///
 /// **Guard discipline.** The containing session record gives each operation
 /// exclusive access to the leased map. It decides and extracts there, then
@@ -1883,14 +1774,14 @@ impl SessionRpcState {
     /// call before this one writes. The identity is minted around the lease, so
     /// an entry is never observable without one.
     ///
-    /// The order is the whole point, and it is the one the review named. Every
-    /// caller used to build its effect first — `Rpc::call` its `oneshot`,
-    /// `Rpc::call_stream` its `Arc<RpcStreamInbox>` — and hand the finished
-    /// value in. The claim then named allocations that already existed, so a
-    /// refusal could not refuse them: the peer-sized work was done before the
-    /// owner was asked, and "no capacity" arrived after the capacity had been
-    /// spent. Acquiring first and building from the shape afterwards makes the
-    /// refusal real. On any arm below, nothing was built.
+    /// The order is the whole point. A caller that built its effect first —
+    /// `Rpc::call` its `oneshot`, `Rpc::call_stream` its `Arc<RpcStreamInbox>`
+    /// — and handed the finished value in would leave the claim naming
+    /// allocations that already existed, so a refusal could not refuse them:
+    /// the peer-sized work would be done before the owner was asked, and "no
+    /// capacity" would arrive after the capacity had been spent. Acquiring
+    /// first and building from the shape afterwards makes the refusal real. On
+    /// any arm below, nothing was built.
     ///
     /// The class is not a parameter: it is [`PendingShape::CLASS`], read off the
     /// same impl that builds the entry, so the claim this filing is funded under
@@ -1910,10 +1801,6 @@ impl SessionRpcState {
         let funded = self.reserve_filing(request_id, peer, session, S::CLASS)?;
         // Past every refusal. The effect is built here and nowhere earlier.
         let (effect, caller) = S::build();
-        #[cfg(test)]
-        {
-            self.effects_built += 1;
-        }
         Ok((self.commit_filing(funded, effect), caller))
     }
 
@@ -2004,10 +1891,6 @@ impl SessionRpcState {
         // built. Everything that could refuse this filing has already run and
         // declined to, so no path reaches here having allocated and then failed.
         let request_id = request_id.to_owned();
-        #[cfg(test)]
-        {
-            self.request_ids_owned += 1;
-        }
         self.pending
             .insert(
                 request_id.clone(),
@@ -2294,15 +2177,15 @@ impl RpcInner {
     /// never fail would be the one most likely to.
     /// Takes the funded handle as an argument rather than as a receiver.
     ///
-    /// This used to be `self: &Arc<Self>`, because it has to put a second
-    /// handle on the dispatcher into the `PreparedRegistration` it returns and
-    /// a plain `&self` cannot produce one. The allocation is now held by
-    /// [`FundedArc`], and a custom smart pointer cannot be a receiver on
+    /// A free function over the handle rather than a method, because it has to
+    /// put a second handle on the dispatcher into the `PreparedRegistration` it
+    /// returns and a plain `&self` cannot produce one. The allocation is held
+    /// by [`FundedArc`], and a custom smart pointer cannot be a receiver on
     /// stable — so the handle arrives as a parameter and is cloned through
     /// `FundedArc::clone`, which adds a holder to the same reservation. No raw
     /// `Arc` is reachable at any point: reconstructing one here would be an
-    /// unfunded alias of an allocation whose whole repair was that every
-    /// handle carries its share of the claim.
+    /// unfunded alias of an allocation every handle of which carries its share
+    /// of the claim.
     fn prepare_entry(
         inner: &crate::resource::FundedArc<Self>,
         method: &str,
@@ -2675,13 +2558,10 @@ pub struct OwnedMethodRegistration {
     /// Weak: a registration outliving its dispatcher must not keep the
     /// dispatcher, its handlers, or their funding alive.
     ///
-    /// Funded, though. A raw `Weak` keeps the *allocation* alive after the last
-    /// strong handle has destroyed the value inside it — that is what makes a
-    /// later `upgrade` able to answer `None` rather than fault — so a registration
-    /// outliving its dispatcher was holding accounted storage the provider had
-    /// already been told was free. [`FundedWeak`] holds a share of the
-    /// dispatcher's claim for exactly as long as it holds that storage, and
-    /// releases it on the last handle of either kind.
+    /// A [`FundedWeak`] does not retain the dispatcher's claim. It upgrades the
+    /// value only together with a live funded strong owner, so an outliving
+    /// registration can observe retirement without keeping the dispatcher or
+    /// its funding alive.
     ///
     /// [`FundedWeak`]: crate::resource::FundedWeak
     inner: crate::resource::FundedWeak<RpcInner>,
@@ -2759,12 +2639,9 @@ impl Rpc {
                     .map_err(|_| crate::application_gateway::GatewayRefusal::Malformed)?,
             )
             .map_err(crate::application_gateway::GatewayRefusal::Pressure)?;
-        // The allocation's claim rides in the handle rather than in the pointee.
-        // Inside, it would be destroyed on the final strong drop while the
-        // storage lived on for any weak observer — telling the provider the
-        // dispatcher's memory was free while a live `FundedWeak` could still
-        // reach it. Here it goes back only when every handle of either kind is
-        // gone.
+        // The allocation's claim rides in the funded strong handle rather than
+        // in the pointee. Weak registrations can observe retirement but cannot
+        // keep the dispatcher or its claim alive.
         let candidate = crate::resource::FundedArc::new(
             RpcInner {
                 network: Arc::downgrade(network),
@@ -3049,10 +2926,10 @@ impl Rpc {
         // what the failure path withdraws.
         //
         // The channel is created *inside* the filing, past the session's
-        // funding of it. Built out here, as it used to be, the pending claim
-        // named an allocation that already existed and a refusal could not
-        // refuse it — the caller had already paid for what it was about to be
-        // told it could not have. The shape is what says "unary" once: the
+        // funding of it. Built out here, the pending claim would name an
+        // allocation that already existed and a refusal could not refuse it —
+        // the caller would have paid for what it was about to be told it could
+        // not have. The shape is what says "unary" once: the
         // class the claim is derived from and the entry that gets stored both
         // come from `Unary` and cannot disagree.
         let network = self.inner.network.upgrade().ok_or(RpcError::NetworkDown)?;
@@ -3183,13 +3060,14 @@ impl Rpc {
     /// establishment — so advertising before any peer exists is not a lost
     /// advertisement, and the embedder is never expected to call this again to
     /// repair one.
-    /// **Answers whether the advertisement was committed**, which it did not
-    /// used to. Both ways this can fail were silent returns: a network already
-    /// down, and a resource owner that would not fund retaining the encoded
-    /// advert. The second is the one that mattered — the embedder was told
-    /// nothing, `capabilities()` kept answering the *previous* value, and every
-    /// session established afterwards was sent that stale value indefinitely.
-    /// An advertisement that did not take is not a slow advertisement.
+    /// **Answers whether the advertisement was committed.** Both ways this can
+    /// fail would otherwise be silent returns: a network already down, and a
+    /// resource owner that would not fund retaining the encoded advert. The
+    /// second is the one that matters — the embedder would be told nothing,
+    /// `capabilities()` would keep answering the *previous* value, and every
+    /// session established afterwards would be sent that stale value
+    /// indefinitely. An advertisement that did not take is not a slow
+    /// advertisement.
     ///
     /// `Ok` means the value is stored and is what a later session will be sent.
     /// The fan-out to peers already holding one is a funded command queued for
@@ -3561,14 +3439,6 @@ mod tests {
             "the peer name the cancellation copies is retained once"
         );
 
-        // And the two string allocations are named as residuals, not only sized.
-        assert_eq!(
-            longer_id.amount(ResourceClass::OpaqueDependencyResidual)
-                - base.amount(ResourceClass::OpaqueDependencyResidual),
-            2,
-            "two request-id buffers are two allocations"
-        );
-
         let stream = pending_operation_claim(0, 0, PendingClass::Stream)
             .expect("the streaming pending claim is representable");
         assert!(
@@ -3854,12 +3724,8 @@ mod tests {
             .expect("the session funds the incumbent")
             .request_id;
 
-        // A second local call collides on that exact id. Driven through the
-        // prepared form production uses, so what is observed is the production
-        // arm: the filing builds its own effect from the shape, and whether it
-        // built one is a fact about production rather than about a closure this
-        // control wrote.
-        let built_before = pending.effects_built();
+        // A second local call collides on that exact id through the prepared
+        // form production uses.
         let refusal = match pending.claim_request_id_prepared::<Streaming>(
             &request_id.clone(),
             "peer-under-test",
@@ -3868,19 +3734,6 @@ mod tests {
             Ok(_) => panic!("an already-owned request id is never claimed twice"),
             Err(refusal) => refusal,
         };
-        // The colliding call built nothing at all. This is the stronger form of
-        // what this control used to assert: it checked that the effect came
-        // back unconsumed, which was the best available answer while the caller
-        // had to construct one before asking. Now the occupancy test is reached
-        // before the constructor, so there is no effect to hand back and none
-        // to consume — a collision costs the challenger nothing and the
-        // incumbent nothing.
-        assert_eq!(
-            pending.effects_built(),
-            built_before,
-            "a colliding claim never runs its effect constructor, so the retry \
-             is free and nothing was allocated to be handed back"
-        );
         assert!(
             matches!(refusal, RpcRegistrationRefusal::RequestIdCollision),
             "and it is told the id collided — not that the session was gone or \
@@ -3907,171 +3760,6 @@ mod tests {
             response.body,
             serde_json::json!("mine"),
             "and its own caller receives its own response"
-        );
-    }
-
-    /// A filing the session will not fund builds nothing.
-    ///
-    /// The property the prepared form exists for, on the arm that matters most.
-    /// A collision is cheap to refuse and always was; capacity is the one a
-    /// peer can drive. While the caller constructed its own effect first, the
-    /// pending claim named an allocation that already existed — so "no
-    /// capacity" was answered *after* the capacity had been spent, and a
-    /// refusal could not refuse the work it was refusing.
-    ///
-    /// Observed by production's own constructor rather than by a size: the one
-    /// site that calls [`PendingShape::build`] counts, and the count is the
-    /// whole assertion. A control that instead compared provider figures would
-    /// pass against a build that allocated and then released, and one that
-    /// watched a closure it supplied itself would only ever prove something
-    /// about that closure.
-    ///
-    /// The positive half runs first. Without it a session that refused
-    /// everything would satisfy the negative on its own, and this control would
-    /// pass against a filing path that had stopped working.
-    #[tokio::test]
-    async fn a_refused_filing_never_builds_its_effect() {
-        let session =
-            crate::runtime::session_broker::session_for_test(crate::runtime::runtime_for_test());
-        let mut pending = SessionRpcState::new();
-        let peer = "peer-under-test";
-
-        // Positive: an affordable filing does run its constructor, and hands
-        // back exactly the half it built.
-        let (_filed, mut rx) = pending
-            .claim_request_id_prepared::<Unary>(&fixed_width_id(0), peer, &session)
-            .expect("the fixture session funds one pending operation");
-        assert_eq!(
-            pending.effects_built(),
-            1,
-            "non-vacuity: a funded filing builds its effect"
-        );
-        assert!(
-            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "and the caller's half is the live end of what was filed — empty, \
-             not closed, so the sender the filing kept is the one it built"
-        );
-
-        // Fill the rest of the grant. Bounded so a fixture that funded
-        // everything fails as an assertion rather than as a test that never
-        // returns.
-        let mut filed = Vec::new();
-        for index in 1..4096u32 {
-            match pending.claim_request_id(
-                &fixed_width_id(index),
-                peer,
-                &session,
-                PendingEntry::Single(oneshot::channel().0),
-            ) {
-                Ok(request) => filed.push(request),
-                Err(_) => break,
-            }
-        }
-        assert!(
-            filed.len() < 4095,
-            "the fixture session's grant is finite, so filling it must end in a \
-             refusal"
-        );
-
-        // The baseline the negatives must not move. Read here rather than
-        // assumed to be the positive's `1`: the fill above goes through the
-        // test-only `claim_request_id`, which is handed an already-built entry
-        // and so constructs nothing and counts nothing. Reading the counter
-        // keeps this control correct whichever path the fill takes.
-        let built_before = pending.effects_built();
-
-        // The same baseline for blocker 2's allocation. A refusal that had
-        // already built the routing string would be indistinguishable from this
-        // one by its refusal alone — both return the same variant — so the
-        // counter is what separates "refused before allocating" from "refused
-        // after allocating and threw the allocation away".
-        let ids_owned_before = pending.request_ids_owned();
-
-        // Negative, unary: the constructor is never reached.
-        let refusal =
-            match pending.claim_request_id_prepared::<Unary>(&fixed_width_id(9000), peer, &session)
-            {
-                Ok(_) => panic!("the filled session funds no further operation"),
-                Err(refusal) => refusal,
-            };
-        assert!(
-            matches!(refusal, RpcRegistrationRefusal::ResourceUnavailable(_)),
-            "and it is refused for capacity, which is the arm this control is \
-             about — a collision or an unrepresentable claim would prove \
-             nothing about peer-driven work"
-        );
-        assert_eq!(
-            pending.effects_built(),
-            built_before,
-            "a filing the session will not fund never runs its effect \
-             constructor, so the allocation the refusal is about never happened"
-        );
-        assert_eq!(
-            pending.request_ids_owned(),
-            ids_owned_before,
-            "and it never builds the routing string either: the id is drawn and \
-             encoded on the stack, the claim is priced from its constant width, \
-             and the owning allocation waits behind every refusal"
-        );
-
-        // Negative, streaming: the same pressure, the heavier effect. Both
-        // arms are needed because they are two constructors behind two call
-        // sites — `call` builds a `oneshot`, `call_stream` builds an
-        // `Arc<RpcStreamInbox>` — and only one of them is the shared inbox a
-        // stream would then have to be told to drop.
-        let refusal = match pending.claim_request_id_prepared::<Streaming>(
-            &fixed_width_id(9001),
-            peer,
-            &session,
-        ) {
-            Ok(_) => panic!("the filled session funds no further stream either"),
-            Err(refusal) => refusal,
-        };
-        assert!(
-            matches!(refusal, RpcRegistrationRefusal::ResourceUnavailable(_)),
-            "for capacity, on this arm too"
-        );
-        assert_eq!(
-            pending.effects_built(),
-            built_before,
-            "and a refused stream allocates no inbox — the arm where the effect \
-             is a shared allocation and not a channel half"
-        );
-        assert_eq!(
-            pending.request_ids_owned(),
-            ids_owned_before,
-            "nor its routing string, on this arm either"
-        );
-
-        // The positive half of the same property, which is what stops the two
-        // assertions above from passing vacuously: if the plan never allocated
-        // at all the counter could not move, and a control that only watched it
-        // stay still would be satisfied by a filing that had quietly stopped
-        // working. Release one operation's worth of grant and file again.
-        //
-        // Releasing it takes both steps, and dropping the caller's handle is the
-        // lesser of them. `PendingOpId` is a `FundedArc`, so the filing left two
-        // clones of one reservation — the caller's `LocalRequest` and the map's
-        // entry — and the grant goes back only when the last is gone. Dropping
-        // the handle alone leaves the entry, its node and its clone all live, so
-        // nothing is freed and the retry below is refused for exactly the
-        // capacity it was supposed to have been given. The entry is therefore
-        // withdrawn through production's own path, which is also the honest
-        // one: `abandon_local_request` is what a real caller uses when its send
-        // fails, and it matches on the identity, so this releases the operation
-        // this control filed rather than whichever entry happened to be under
-        // that key.
-        let released = filed.pop().expect("the fill filed at least one operation");
-        pending.abandon_local_request(&released);
-        drop(released);
-        let (_readmitted, _rx) = pending
-            .claim_request_id_prepared::<Unary>(&fixed_width_id(9002), peer, &session)
-            .expect("the released grant funds one more operation");
-        assert_eq!(
-            pending.request_ids_owned(),
-            ids_owned_before + 1,
-            "a filing that *is* funded does build exactly one routing string, \
-             so the stillness above is the refusal's doing and not the counter's"
         );
     }
 

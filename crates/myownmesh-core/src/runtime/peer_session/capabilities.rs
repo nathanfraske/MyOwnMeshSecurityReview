@@ -60,28 +60,6 @@ impl RetainedAdvert {
         serde_json::from_slice(&retained.encoded).ok()
     }
 
-    /// The retained bytes themselves, borrowed.
-    ///
-    /// For a caller that must **measure** this advertisement without paying for
-    /// it, and then copy exactly what it measured. [`Self::decoded`] cannot
-    /// serve that: it allocates a `CapabilityAdvert` whose nested
-    /// `serde_json::Value` has no exactly derivable retention — the map, vector
-    /// and string capacities behind it are serde_json's and std's business, not
-    /// a function of these bytes — so a plan that measured through it would be
-    /// quoting a number it could not stand behind.
-    ///
-    /// These bytes are canonical: [`Self::replace`] produced them with
-    /// `encode_exact` at a counted length, so they are compact, escape-correct
-    /// and byte-for-byte what the decoded value would re-encode to. A caller may
-    /// therefore copy them verbatim into a response instead of round-tripping
-    /// through the typed form, and the wire result is identical.
-    ///
-    /// Borrowed, never handed out owned: the lease that paid for them belongs to
-    /// the session, and the borrow ends with the session record's own lender.
-    pub(crate) fn encoded(&self) -> Option<&[u8]> {
-        Some(&self.held.as_ref()?.encoded)
-    }
-
     /// Record what the peer advertised over this session, replacing any earlier
     /// advertisement it made over the same one.
     ///
