@@ -573,7 +573,16 @@ mod tests {
 
         // Peer-chosen width. The finding is about text the far end sizes, so a
         // short reason would leave nothing to observe.
-        let reason = "q".repeat(64 * 1024);
+        //
+        // 32 KiB rather than 64: the data channel's `max_message_size` is
+        // 65,536 bytes, and the terminal does not travel bare — it rides
+        // inside an RPC envelope. A 64 KiB reason plus that framing exceeds
+        // the ceiling, so the old fixture was not a control over a wide
+        // terminal at all. It asked the link to carry something the link
+        // cannot carry, and the answer simply never arrived. Half the ceiling
+        // leaves the envelope room while staying far wider than anything a
+        // short-string bug could hide behind.
+        let reason = "q".repeat(32 * 1024);
         let handler_reason = reason.clone();
         myownmesh_core::rpc::Rpc::attach(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
@@ -590,15 +599,29 @@ mod tests {
         let provider = crate::test_resource_ledger();
         let baseline = provider.in_use().amount(Amb);
 
-        let mut stream = bob_rpc
-            .call_stream(
+        // The three link-facing awaits in this control are bounded separately,
+        // each with its own message. Unbounded, a stall here does not fail the
+        // control — it hangs the CI step that selects this test by exact name,
+        // and because those exact-name helpers deliberately run without
+        // `--nocapture`, the hang produces no output at all to diagnose from.
+        // A named panic per stage is the difference between a silent job that
+        // burns its whole limit and one line saying where the link stopped.
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            bob_rpc.call_stream(
                 alice_id.public_id(),
                 "terminal_only",
                 serde_json::json!("go"),
-            )
-            .await
-            .expect("the real link opens the stream");
-        let terminal = match stream.recv_funded().await {
+            ),
+        )
+        .await
+        .expect("the peer's stream opens within ten seconds")
+        .expect("the real link opens the stream");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv_funded())
+                .await
+                .expect("the peer's terminal arrives within ten seconds");
+        let terminal = match received {
             Some(Err(terminal)) => terminal,
             _ => panic!("the handler ends this stream with its error text"),
         };
@@ -688,7 +711,9 @@ mod tests {
         );
 
         drop((tx, rx, stream));
-        drivers.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), drivers.shutdown())
+            .await
+            .expect("both engine drivers end within ten seconds");
     }
 
     /// A grant large enough for the mailbox and nothing else.
