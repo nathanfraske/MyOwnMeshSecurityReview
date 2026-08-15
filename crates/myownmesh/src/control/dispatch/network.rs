@@ -280,6 +280,18 @@ pub(in crate::control) fn network_reconnect(
     }
 }
 
+/// One client-requested dial, exactly as the request stated it.
+///
+/// A carrier for the fields the `Connect` arm destructured. `wait_ms` is the
+/// client's own bound on how long it will wait for an answer; it is not
+/// resource authority and creates or releases nothing.
+pub(in crate::control) struct ConnectPeer {
+    pub network: String,
+    pub peer: String,
+    pub pin: bool,
+    pub wait_ms: u64,
+}
+
 /// Deliberately dial one peer on a joined network, and answer.
 ///
 /// The `Option` is the truthful shape for an operation the connection can
@@ -290,16 +302,18 @@ pub(in crate::control) fn network_reconnect(
 /// The right to answer is taken *before* the dial starts, which is why the
 /// owner is acquired here rather than after the `select!`: a dial that succeeds
 /// must not then discover it has nowhere to report the success.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::control) async fn connect_peer(
     state: &Arc<ControlState>,
     admission: &FrameAdmission,
     cancel: &ConnectionCancel,
-    network: String,
-    peer: String,
-    pin: bool,
-    wait_ms: u64,
+    connect: ConnectPeer,
 ) -> Result<Option<Answer>> {
+    let ConnectPeer {
+        network,
+        peer,
+        pin,
+        wait_ms,
+    } = connect;
     let owner =
         ResponseOwner::acquire(admission).context("network connect result was not admitted")?;
     let variable = tokio::select! {

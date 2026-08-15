@@ -13,12 +13,12 @@ struct MailboxEntry<T> {
 /// The shared mailbox state, as it sits inside the funded allocation.
 ///
 /// The root lease is deliberately **not** a field here. `root_claim()` prices
-/// the shared allocation itself, and a lease living in the pointee is destroyed
-/// with the pointee — which happens on the final *strong* drop, while the
-/// allocation survives for as long as any weak handle does. The provider would
-/// be told that storage was free while it still existed. The claim therefore
-/// rides in [`FundedArc`], which releases it only once every handle of either
-/// kind is gone.
+/// the shared allocation itself, so its owner is [`FundedArc`]: one shared
+/// lease held beside the pointee rather than inside it, released on the final
+/// strong drop, and observed weakly through a weak funding pointer — which is
+/// what makes `upgrade` all-or-nothing and what keeps a weak-only handle from
+/// retaining any part of this claim. Nothing reachable from inside the pointee
+/// can clone that owner or extend what it funds.
 struct MailboxInner<T> {
     queue: Mutex<LeasedQueue<MailboxEntry<T>>>,
     ready: tokio::sync::Notify,

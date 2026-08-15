@@ -17,7 +17,7 @@ mod binding;
 mod handoff;
 mod incarnation;
 
-pub(crate) use binding::{EndpointAuthBinding, EndpointAuthBindingProfile};
+pub(crate) use binding::EndpointAuthBinding;
 #[cfg(test)]
 pub(crate) use handoff::{counted_handoff_for_test, handoff_for_test};
 pub(crate) use handoff::{ConnectedChannelHandoff, ConnectedChannelRetention};

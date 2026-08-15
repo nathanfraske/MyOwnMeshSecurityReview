@@ -376,7 +376,7 @@ A signaling account, ICE username, DTLS certificate not bound to the Device ID, 
 **Selected alternatives (Arc 04).** The requirements above are unchanged; this records which permitted alternative is in force and how it is composed.
 
 - *Exact connected channel or channel exporter*: the **channel** alternative was selected, and it is satisfied by composition rather than by any single term. The peer-agreed cryptographic binding term is both endpoints' DTLS certificate fingerprints in role-canonical order. **The fingerprint pair alone does not establish exact-channel binding** — reused certificates make it non-session-unique. Exactness of the overall promotion comes from two further parts: the two fresh bilateral contributions, which bind the transcript to *this attempt*; and the non-transferable, connector-incarnation-owned handoff and capability, which bind the promotion to *this live connector*. The RFC 5705 exporter alternative is **deferred**: it is implemented in `webrtc-dtls` but unreachable, since `DTLSConn.state` and `RTCDtlsTransport::conn()` are both crate-private, so reaching it would require vendoring a third dependency while vendored-tree integrity remains an open gate.
-- *Negotiated cryptographic profile*: realised as a closed single-variant selection (`EndpointAuthProfile::V1Ed25519Dtls`), **derived** from the connector's closed binding profile and bound into the transcript as a signed length-prefixed field. The requirement is met by construction rather than by runtime agreement: no other inhabitant exists, so no caller and no peer can select anything weaker. The one peer-facing input is the `endpoint_auth_v1` advertisement, and it is a **fail-closed compatibility precondition, not a weaker-profile negotiation**: it decides only whether an attempt begins at all. A peer that omits it is refused with a typed incompatible-profile cause before any transcript is assembled and before any signature is produced or verified, so there is no fallback, no downgrade path, no free-form profile string, and no third outcome. That refusal belongs to the setup vocabulary rather than the attempt-terminal one — the gate runs on the inbound Hello before the attempt is reached, so it terminalizes nothing, and what fails the connection closed is the handler's own drop of the exact current peer. Because the selected profile is itself a signed transcript field, an advertisement can never widen or replace what the transcript commits to.
+- *Negotiated cryptographic profile*: realised as a closed single-variant selection (`EndpointAuthProfile::V1Ed25519Dtls`), **fixed** by the protocol and taken in `context`, and bound into the transcript as its own signed length-prefixed field. The requirement is met by construction rather than by runtime agreement: no other inhabitant exists, so no caller and no peer can select anything weaker. The one peer-facing input is the `endpoint_auth_v1` advertisement, and it is a **fail-closed compatibility precondition, not a weaker-profile negotiation**: it decides only whether an attempt begins at all. A peer that omits it is refused with a typed incompatible-profile cause before any transcript is assembled and before any signature is produced or verified, so there is no fallback, no downgrade path, no free-form profile string, and no third outcome. That refusal belongs to the setup vocabulary rather than the attempt-terminal one — the gate runs on the inbound Hello before the attempt is reached, so it terminalizes nothing, and what fails the connection closed is the handler's own drop of the exact current peer. Because the selected profile is itself a signed transcript field, an advertisement can never widen or replace what the transcript commits to.
 - *Residual, and it is load-bearing*: because the binding term is not session-unique, replay across channels is prevented by the two per-attempt CSPRNG contributions, and transfer or survival of an already-issued capability is prevented by exact connector-incarnation ownership. Ownership does not make an otherwise-valid signature invalid, and the binding does not separate sessions — neither mechanism substitutes for the other.
 
 ### 7.2 Promotion transition
@@ -623,11 +623,15 @@ The resource interface must provide equivalent responsibilities to:
 ResourceProvider
     acquire(ResourceClaim, ResourceAuthorityClass)
         -> ResourceLease
-         | move-only PendingDemand
          | ResourcePressure(ResourceClass)
          | ResourceUnavailable(ResourceClass)
-    request_retirement(exact owner of a reclaimable lease)
-        -> owner notification only
+    transition(live lease, ResourceClaim, ResourceAuthorityClass)
+        -> the held claim is replaced exactly, or the transition fails
+           and the lease keeps what it already held
+    release(exact owner, after that owner's cleanup)
+        -> the exact charge returns to the grant
+    retain_after_failed_cleanup(exact owner)
+        -> the exact charge stays charged, with no live lease behind it
 
 ResourceClaim
     finite quantities by ResourceClass
@@ -650,6 +654,8 @@ ResourceClass
 ```
 
 A claim may combine several resource classes. An admitted object's count emerges from the claims and current provider grant. There is no `unlimited` sentinel. Admission is always fallible.
+
+Those four are the whole basal operation set. Retaining a pending demand and requesting retirement from a reclaimable owner are **optional provider extensions**: a provider may offer either, the properties below constrain it when it does, and nothing in basal MyOwnMesh may require, assume, or depend on either being present. The basal interface above is immediate-only: it gives a non-fitting acquisition nowhere to wait, so under it — and so under the shipped provider — such an acquisition is answered at once with typed pressure. A provider that adds the pending-demand extension may retain the demand instead, on the terms P4 states.
 
 The process resource root owns the process grant. Each Mesh runtime receives an AttributionChildScope for accounting, not a new grant. Attempt, candidate, session, and flow owners receive descendant leases. Creating another scope cannot multiply capacity.
 
@@ -761,15 +767,13 @@ What P6 forbids is claimant control over the root structure itself. No claimant-
 
 **Hostile-ingress progress is a separate contract.** P6 says nothing about whether a hostile or misbehaving ingress can delay or starve other work. Progress under hostile ingress is governed by the separate ingress progress and backpressure contract: bounded pre-authentication work, typed backpressure to the producer, and refusal naming an unavailable resource dimension. Neither contract is evidence for the other, and a control for one must not be reported against the other.
 
-Pending-demand cardinality, selection order, and rotation are concrete provider policy. The provider implementation selects them, and any policy preserving P1 through P8 is conforming. No other component may depend on a particular selection order or rotation rule, and conformance tests must assert the properties rather than the schedule.
+Where a provider retains pending demand at all, its cardinality, selection order, and rotation are concrete provider policy. The provider implementation selects them, and any policy preserving P1 through P8 is conforming. No other component may depend on a particular selection order or rotation rule, and conformance tests must assert the properties rather than the schedule.
 
-The provider shipped with basal MyOwnMesh implements the degenerate policy of this kind: shared and work-conserving, with no weights, quotas, reserved shares, or partitions; unused process capacity borrowable across child scopes; and no pending demand at all, so there is no selection order and no rotation to specify. Replacing that policy is a provider decision, not a semantic change.
-
-**The shipped provider implements no scheduler.** It is immediate: a demand the remaining grant cannot cover is refused at once with typed, dimension-named pressure. It holds no pending demands, performs no arbitration, keeps no rotation or reclaim cursor, and runs no cooperative-reclaim path. Subdividing attribution therefore cannot manufacture turns, because there are no turns.
+The provider shipped with basal MyOwnMesh implements neither extension. It is immediate and work-conserving: a claim the remaining grant cannot cover is refused at once with typed, dimension-named pressure. There are no weights, quotas, reserved shares, or partitions; unused process capacity is borrowable across child scopes; and it holds no pending demand, performs no arbitration, keeps no rotation or reclaim cursor, and runs no cooperative-reclaim path, so there is no selection order and no rotation to specify. Subdividing attribution cannot manufacture turns for a root, because there are no turns. Replacing that policy is a provider decision, not a semantic change.
 
 P6 remains basal and unchanged. An AttributionChildScope is not redefined as a FairnessRoot, and P6 is not relaxed to a per-scope guarantee. P6 constrains any provider that does schedule; it is not discharged by a provider that never defers, and no P6 conformance is claimed here. The shipped provider's standing under P1 through P5, P7, and P8 is asserted only where separately supported and is not implied by this paragraph.
 
-When the selected demand cannot fit, the provider may request retirement from an exact owner whose lease contract declares that lease reclaimable. Reclaimability is a property of the owner contract, not a provider decision; the shipped policy treats `Speculative` leases as the reclaimable class. The provider does not release, revoke, replace, or reuse those claims. The notified owner performs cleanup and releases through lease Drop. If cleanup cannot be proven, the owner explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth.
+Under a provider that implements the retirement extension, a request may go to an exact owner whose lease contract declares that lease reclaimable. Reclaimability is a property of the owner contract, not a provider decision. The provider does not release, revoke, replace, or reuse those claims: the notified owner performs cleanup and releases through lease Drop, or, where cleanup cannot be proven, explicitly transfers the exact charge into failed-cleanup retention. No timer creates, releases, or expires resource truth. Under the shipped provider no such request exists, and the same two outcomes — exact release on Drop after cleanup, or exact retention after failed cleanup — are the only ways a charge ever leaves a lease.
 
 No scheduling or cooperative retirement model guarantees later admission against nonreclaimable admitted pressure, an ignored retirement request, or capacity retained after failed cleanup. A policy that gives cleanup authority the first pending-demand opportunity does not thereby manufacture capacity, and it is not a promise that cleanup can start without its exact claim.
 

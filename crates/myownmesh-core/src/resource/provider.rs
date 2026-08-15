@@ -916,12 +916,6 @@ mod finite {
         claim: ResourceClaim,
     }
 
-    #[derive(Clone, Copy, Debug)]
-    struct PreparedReservationId {
-        id: u64,
-        reused: bool,
-    }
-
     #[derive(Debug)]
     struct State {
         grant: ResourceClaim,
@@ -929,12 +923,9 @@ mod finite {
         retained_after_failed_cleanup: ResourceClaim,
         poisoned: Option<ResourceClass>,
         provider_authority: Option<Arc<ResourceScopeIdentity>>,
-        next_reservation_id: Option<u64>,
-        free_reservation_ids: BTreeSet<u64>,
+        next_reservation_id: u64,
         reservations: BTreeMap<u64, Reservation>,
         scopes: BTreeSet<ResourceScopeId>,
-        #[cfg(test)]
-        fail_reservation_id_allocation: bool,
         #[cfg(test)]
         scripted_pressure: VecDeque<ResourceClass>,
     }
@@ -959,12 +950,9 @@ mod finite {
                     retained_after_failed_cleanup: ResourceClaim::ZERO,
                     poisoned: None,
                     provider_authority: None,
-                    next_reservation_id: Some(1),
-                    free_reservation_ids: BTreeSet::new(),
+                    next_reservation_id: 1,
                     reservations: BTreeMap::new(),
                     scopes: BTreeSet::new(),
-                    #[cfg(test)]
-                    fail_reservation_id_allocation: false,
                     #[cfg(test)]
                     scripted_pressure: VecDeque::new(),
                 })),
@@ -1025,11 +1013,6 @@ mod finite {
         #[cfg(test)]
         pub(crate) fn script_pressure(&self, dimension: ResourceClass) {
             self.lock_state().scripted_pressure.push_back(dimension);
-        }
-
-        #[cfg(test)]
-        pub(crate) fn fail_reservation_id_allocation_for_test(&self, fail: bool) {
-            self.lock_state().fail_reservation_id_allocation = fail;
         }
 
         #[cfg(test)]
@@ -1172,37 +1155,23 @@ mod finite {
             }))
         }
 
-        fn allocate_reservation_id(
-            state: &mut State,
-        ) -> Result<PreparedReservationId, ResourceUnavailable> {
-            #[cfg(test)]
-            if state.fail_reservation_id_allocation {
-                return Err(ResourceUnavailable::ProviderInvariant {
-                    dimension: ResourceClass::OpaqueDependencyResidual,
-                });
-            }
-            if let Some(id) = state.free_reservation_ids.pop_first() {
-                return Ok(PreparedReservationId { id, reused: true });
-            }
-            let id = state
-                .next_reservation_id
-                .ok_or(ResourceUnavailable::ProviderInvariant {
-                    dimension: ResourceClass::OpaqueDependencyResidual,
-                })?;
-            state.next_reservation_id = id.checked_add(1);
-            Ok(PreparedReservationId { id, reused: false })
-        }
-
-        fn rollback_reservation_id(state: &mut State, prepared: PreparedReservationId) {
-            if prepared.reused {
-                state.free_reservation_ids.insert(prepared.id);
-            } else {
-                state.next_reservation_id = Some(prepared.id);
-            }
-        }
-
-        fn release_reservation_id(state: &mut State, id: u64) {
-            state.free_reservation_ids.insert(id);
+        /// Name one live reservation, for as long as it is live.
+        ///
+        /// Monotonic and never reused. The identity is handed out under the
+        /// same lock acquisition that inserts the reservation, and a released
+        /// identity is never handed out again, so no holder of a stale
+        /// identity can name a reservation a later admission took over.
+        /// Both failures here are internal invariant failures rather than
+        /// admission outcomes: exhausting `u64` reservation identities in one
+        /// process cannot happen, and if the counter ever did wrap it would
+        /// hand a live reservation's name to a second one, which is not a
+        /// condition any caller can be told about truthfully.
+        fn allocate_reservation_id(state: &mut State) -> u64 {
+            let id = state.next_reservation_id;
+            state.next_reservation_id = id
+                .checked_add(1)
+                .expect("reservation identities are exhausted; the provider can no longer name a live reservation uniquely");
+            id
         }
     }
 
@@ -1275,24 +1244,31 @@ mod finite {
             {
                 return Err(pressure);
             }
-            let prepared = Self::allocate_reservation_id(&mut state)?;
             if !state.scopes.insert(scope_id) {
-                Self::rollback_reservation_id(&mut state, prepared);
                 Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
                 return Err(ResourceUnavailable::ProviderInvariant {
                     dimension: ResourceClass::OpaqueDependencyResidual,
                 });
             }
-            state.reservations.insert(
-                prepared.id,
-                Reservation {
-                    scope_id,
-                    authority,
-                    claim,
-                },
+            // Taken past every refusal, so no identity is minted for a
+            // reservation that is not about to exist.
+            let id = Self::allocate_reservation_id(&mut state);
+            assert!(
+                state
+                    .reservations
+                    .insert(
+                        id,
+                        Reservation {
+                            scope_id,
+                            authority,
+                            claim,
+                        },
+                    )
+                    .is_none(),
+                "reservation identities are never reused, so this insertion cannot displace a live reservation"
             );
             state.in_use = next;
-            Ok(prepared.id)
+            Ok(id)
         }
 
         fn release_scope(
@@ -1343,27 +1319,25 @@ mod finite {
             {
                 return Err(pressure);
             }
-            let prepared = Self::allocate_reservation_id(&mut state)?;
-            if state
-                .reservations
-                .insert(
-                    prepared.id,
-                    Reservation {
-                        scope_id,
-                        authority,
-                        claim,
-                    },
-                )
-                .is_some()
-            {
-                Self::rollback_reservation_id(&mut state, prepared);
-                Self::poison(&mut state, ResourceClass::OpaqueDependencyResidual);
-                return Err(ResourceUnavailable::ProviderInvariant {
-                    dimension: ResourceClass::OpaqueDependencyResidual,
-                });
-            }
+            // Taken past every refusal, so no identity is minted for a
+            // reservation that is not about to exist.
+            let id = Self::allocate_reservation_id(&mut state);
+            assert!(
+                state
+                    .reservations
+                    .insert(
+                        id,
+                        Reservation {
+                            scope_id,
+                            authority,
+                            claim,
+                        },
+                    )
+                    .is_none(),
+                "reservation identities are never reused, so this insertion cannot displace a live reservation"
+            );
             state.in_use = next;
-            Ok(prepared.id)
+            Ok(id)
         }
 
         fn transition(
@@ -1462,7 +1436,6 @@ mod finite {
                 return;
             };
             state.reservations.remove(&reservation_id);
-            Self::release_reservation_id(&mut state, reservation_id);
             state.in_use = next;
         }
 
@@ -1513,7 +1486,6 @@ mod finite {
                 }
             };
             state.reservations.remove(&reservation_id);
-            Self::release_reservation_id(&mut state, reservation_id);
             state.retained_after_failed_cleanup = retained;
             state.in_use = next;
             Ok(claim)
@@ -1667,27 +1639,6 @@ mod tests {
         ));
         assert_eq!(provider.in_use(), baseline);
         assert_eq!(provider.active_scopes(), 1);
-        assert_eq!(provider.active_reservations(), 0);
-    }
-
-    #[test]
-    fn reservation_id_failure_consumes_nothing() {
-        let provider = DeterministicGrantProvider::new(claim(&[
-            (ResourceClass::QueuedBytes, 1),
-            (ResourceClass::OpaqueDependencyResidual, 3),
-        ]));
-        let port = ResourceProviderPort::new(provider.clone()).expect("process scope");
-        let baseline = provider.in_use();
-        provider.fail_reservation_id_allocation_for_test(true);
-        assert!(matches!(
-            port.acquire(
-                &port.process_scope(),
-                ResourceAuthorityClass::Admitted,
-                ResourceClaim::single(ResourceClass::QueuedBytes, 1),
-            ),
-            Err(ResourceUnavailable::ProviderInvariant { .. })
-        ));
-        assert_eq!(provider.in_use(), baseline);
         assert_eq!(provider.active_reservations(), 0);
     }
 

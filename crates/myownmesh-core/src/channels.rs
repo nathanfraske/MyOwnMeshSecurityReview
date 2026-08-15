@@ -273,18 +273,24 @@ where
             })
     }
 
-    /// Subscribe to inbound messages on this channel. The returned receiver
-    /// owns a distinct resource-backed mailbox; pressure and loss are surfaced
-    /// rather than hidden behind a shared ring.
+    /// Subscribe to inbound messages on this channel.
+    ///
+    /// The subscription holds a funded shared handle to its own gateway-side
+    /// subscriber rather than a borrow of a shared ring: that subscriber's
+    /// retention stays charged for as long as the handle lives, dropping the
+    /// subscription unsubscribes it, and pressure and lag are surfaced as
+    /// [`ChannelError`] rather than hidden.
     #[expect(
         clippy::result_large_err,
         reason = "one error type serves the whole channel surface, and its size \
                   comes entirely from `ChannelError::Decode`, which must keep \
-                  owning the delivery and subscriber handle that fund the frame \
-                  it describes. Boxing the `Err` here would charge an allocation \
-                  to a path that never builds that variant and never allocates, \
-                  and a second error type would let the funded one be converted \
-                  away at the seam"
+                  owning the funded `GatewayDelivery` whose frame it failed to \
+                  decode — that delivery is the only thing it retains, and it is \
+                  what keeps the undecodable bytes charged for as long as the \
+                  error describes them. Boxing the `Err` here would charge an \
+                  allocation to a path that never builds that variant and never \
+                  allocates, and a second error type would let the funded one be \
+                  converted away at the seam"
     )]
     pub fn subscribe(&self) -> Result<ChannelSubscription<T>, ChannelError> {
         let subscriber = self

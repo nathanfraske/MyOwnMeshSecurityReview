@@ -213,8 +213,8 @@ pub(crate) enum EndpointAuthSetupError {
 ///
 /// A closed enum rather than a caller string: the profile is bound into the
 /// transcript so a peer cannot negotiate one profile and prove another. The
-/// value is derived in [`context`] from the connector's closed binding profile,
-/// never supplied by the engine or by a peer.
+/// value is fixed by this protocol and taken in [`context`], never supplied by
+/// the engine or by a peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EndpointAuthProfile {
     /// Ed25519 device signatures over a DTLS-fingerprint-bound transcript.

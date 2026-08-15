@@ -6,7 +6,7 @@ Own fresh mutual Device authentication for one exact connected channel. The conn
 
 Ownership is narrower than "endpoint authentication" as a whole, and the split matters because three other owners are involved on every attempt:
 
-- **This owner** holds the exchange state machine (`EndpointAuthTask`), the closed profile (`EndpointAuthProfile`, derived in `context` from the connector's binding profile), the signed transcript framing (`transcript`), both refusal vocabularies (`EndpointAuthSetupError` and `EndpointAuthError`), and the two frame-intake operations `EndpointAuthTask::accept_peer_hello` and `EndpointAuthTask::accept_peer_proof`. It is the sole issuer of `AuthenticatedChannelCapability`.
+- **This owner** holds the exchange state machine (`EndpointAuthTask`), the closed profile (`EndpointAuthProfile`, fixed in `context`), the signed transcript framing (`transcript`), both refusal vocabularies (`EndpointAuthSetupError` and `EndpointAuthError`), and the two frame-intake operations `EndpointAuthTask::accept_peer_hello` and `EndpointAuthTask::accept_peer_proof`. It is the sole issuer of `AuthenticatedChannelCapability`.
 - **The connector** supplies the channel-binding term and nothing else. `EndpointAuthBinding::webrtc_certificate_fingerprints` is read from the connector worker's live native session; this owner never reads SDP, a certificate, or a key.
 - **The engine handshake path** (`engine::handshake::on_hello`, `on_auth_response`) owns the wire frames, the peer registry effects, and the fail-closed corroboration after promotion. It calls the two intake operations; it does not decide authentication.
 - **The engine `DataChannelOpen` arm** owns the refusal-and-cleanup path when the binding supplier has nothing to supply. See "Fail-closed binding supply" below.
@@ -33,7 +33,7 @@ Exactly two operations take peer-supplied bytes, and each answers a closed outco
 
 ## Closed profile and the compatibility precondition
 
-The profile is a closed single-variant enum, `EndpointAuthProfile::V1Ed25519Dtls`, **derived** in `context` from the connector's closed `EndpointAuthBindingProfile`. It is never supplied by the engine and never by a peer.
+The profile is a closed single-variant enum, `EndpointAuthProfile::V1Ed25519Dtls`, **fixed** in `context` and committed inside the signed transcript as its own profile tag, alongside — not folded into — the Arc-04 domain tag that leads the transcript. It is never supplied by the engine and never by a peer.
 
 `negotiate_profile` resolves what to prove under from the peer's advertised `features`, and despite its name it is not a negotiation: advertising `endpoint_auth_v1` is how a peer states it speaks the one closed profile, not how it chooses among alternatives. There is no second inhabitant, no fallback, and no third outcome. Absence is `EndpointAuthSetupError::IncompatibleProfile`, refused **before** any proof work — no transcript is assembled, no signature is produced or verified, and no capability can be minted. Treat the advertisement as a fail-closed compatibility precondition against pre-Arc-04 peers, never as a profile-selection input a peer could steer.
 

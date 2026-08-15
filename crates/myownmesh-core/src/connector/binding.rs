@@ -5,25 +5,9 @@
 //! endpoint-authentication roles or byte ordering: those belong to the endpoint
 //! authentication owner, which derives the role from its own context.
 //!
-//! The type is closed on purpose. There is no free-form string constructor and
-//! no open extension point, so a future exporter or pairing profile is added as
-//! a named variant here rather than by smuggling bytes through this one.
-
-/// The closed set of connector binding profiles.
-///
-/// One variant per proof a connector can actually supply. Adding a profile is
-/// a deliberate edit here, and the selected profile is what the endpoint
-/// authentication transcript binds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EndpointAuthBindingProfile {
-    /// The two endpoint DTLS certificate fingerprints of one WebRTC channel.
-    ///
-    /// The accepted residual is stated exactly: this pair defeats a terminating
-    /// signaling-path MITM because each terminated leg presents a different
-    /// certificate. It is not session-unique, does not cover the DTLS key
-    /// exchange, and is not an RFC 5705 exporter.
-    WebRtcDtlsCertificateFingerprintPair,
-}
+//! The type is closed on purpose. There is no free-form constructor and no open
+//! extension point, so a future exporter or pairing binding is added as a named
+//! constructor here rather than by smuggling bytes through this one.
 
 /// One closed, non-serializable connector binding.
 ///
@@ -34,7 +18,6 @@ pub(crate) enum EndpointAuthBindingProfile {
 /// and in particular no transport — chooses the ordering that the transcript
 /// commits to.
 pub(crate) struct EndpointAuthBinding {
-    profile: EndpointAuthBindingProfile,
     local_component: String,
     remote_component: String,
 }
@@ -42,11 +25,16 @@ pub(crate) struct EndpointAuthBinding {
 impl EndpointAuthBinding {
     /// Supply the accepted WebRTC certificate-fingerprint pair.
     ///
-    /// This is the only constructor, it names its profile rather than accepting
-    /// one, and it takes the two components separately so neither the caller
-    /// nor the transport can pre-order them. Both components must be present:
-    /// a missing local or remote fingerprint yields no binding at all rather
-    /// than a binding with an empty side.
+    /// This is the only constructor, it names the material it accepts rather
+    /// than taking a caller-chosen kind, and it takes the two components
+    /// separately so neither the caller nor the transport can pre-order them.
+    /// Both components must be present: a missing local or remote fingerprint
+    /// yields no binding at all rather than a binding with an empty side.
+    ///
+    /// The accepted residual is stated exactly: this pair defeats a terminating
+    /// signaling-path MITM because each terminated leg presents a different
+    /// certificate. It is not session-unique, does not cover the DTLS key
+    /// exchange, and is not an RFC 5705 exporter.
     pub(crate) fn webrtc_certificate_fingerprints(
         local_component: &str,
         remote_component: &str,
@@ -55,15 +43,9 @@ impl EndpointAuthBinding {
             return None;
         }
         Some(Self {
-            profile: EndpointAuthBindingProfile::WebRtcDtlsCertificateFingerprintPair,
             local_component: local_component.to_owned(),
             remote_component: remote_component.to_owned(),
         })
-    }
-
-    /// The closed profile this binding supplies.
-    pub(crate) fn profile(&self) -> EndpointAuthBindingProfile {
-        self.profile
     }
 
     /// The component belonging to this endpoint.
@@ -85,17 +67,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v4_arc04b_binding_requires_both_components_and_names_its_profile() {
+    fn v4_arc04b_binding_requires_both_components() {
         assert!(EndpointAuthBinding::webrtc_certificate_fingerprints("", "remote").is_none());
         assert!(EndpointAuthBinding::webrtc_certificate_fingerprints("local", "").is_none());
 
         let binding = EndpointAuthBinding::webrtc_certificate_fingerprints("local", "remote")
             .expect("both components present");
 
-        assert_eq!(
-            binding.profile(),
-            EndpointAuthBindingProfile::WebRtcDtlsCertificateFingerprintPair
-        );
         assert_eq!(binding.local_component(), "local");
         assert_eq!(binding.remote_component(), "remote");
     }

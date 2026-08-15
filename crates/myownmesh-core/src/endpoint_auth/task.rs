@@ -798,10 +798,11 @@ impl EndpointAuthTask {
 ///
 /// For lifecycle controls that need a real task on a real handoff and do not
 /// exercise the exchange itself. It bundles only construction: a fixed
-/// documented identity pair, the closed WebRTC binding profile, and a fixture
-/// signer. It exposes no contribution, no proof, no exchange state, no
-/// capability, and no provenance, and it is crate-private and test-only, so it
-/// cannot become a production path.
+/// documented identity pair, the fixed endpoint-authentication profile with a
+/// WebRTC certificate-fingerprint binding, and a fixture signer. It exposes no
+/// contribution, no proof, no exchange state, no capability, and no provenance,
+/// and it is crate-private and test-only, so it cannot become a production
+/// path.
 ///
 /// The identity pair is fixed deliberately — seeds 1 and 2, encoded exactly as
 /// the crate encodes Device IDs — so no fixture can vary the cryptographic

@@ -502,27 +502,44 @@ pub async fn serve(
     shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     serve_with_hooks(
-        mesh,
-        registry,
-        services,
+        ControlSurface {
+            mesh,
+            registry,
+            services,
+            realtime,
+        },
         custom,
-        realtime,
         shutdown,
         ControlHooks::default(),
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn serve_with_hooks(
+/// The joined state one `serve` answers from, and the advert it reports.
+///
+/// These four are fixed for the whole life of the listener and are read by
+/// every connection it accepts, which is why they arrive together: no
+/// connection may be handed a subset of them, and none of the four is
+/// per-connection.
+struct ControlSurface {
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
-    custom: Option<PathBuf>,
     realtime: RealtimeAdvert,
+}
+
+async fn serve_with_hooks(
+    surface: ControlSurface,
+    custom: Option<PathBuf>,
     mut shutdown: broadcast::Receiver<()>,
     hooks: ControlHooks,
 ) -> Result<()> {
+    let ControlSurface {
+        mesh,
+        registry,
+        services,
+        realtime,
+    } = surface;
     // Both are optional, and absence is not absence of a bound. Nothing a
     // connection retains is held without a lease -- a frame's growth funded per
     // step at the capacity that step requests, the fixed read window funded in
@@ -1503,17 +1520,19 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("realtime operation result was not admitted")?;
-                let variable = dispatch::realtime_flow_open(
+                let variable = dispatch::realtime::flow_open(
                     &state,
                     owner,
-                    network,
-                    peer,
-                    flow_label,
-                    direction,
-                    rtp_kind,
-                    mime,
-                    clock_rate,
-                    channels,
+                    dispatch::realtime::FlowOpen {
+                        network,
+                        peer,
+                        flow_label,
+                        direction,
+                        rtp_kind,
+                        mime,
+                        clock_rate,
+                        channels,
+                    },
                     client_id,
                     client_capability,
                 )
@@ -1533,7 +1552,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("realtime operation result was not admitted")?;
-                let variable = dispatch::realtime_flow_close(
+                let variable = dispatch::realtime::flow_close(
                     &state,
                     owner,
                     client_id,
@@ -1559,16 +1578,18 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("RPC stream setup result was not admitted")?;
-                let variable = dispatch::rpc_call_stream_funded(
+                let variable = dispatch::rpc::call_stream_funded(
                     &state,
                     &cancel,
                     owner,
+                    dispatch::rpc::StreamCall {
+                        network,
+                        peer,
+                        method,
+                        payload,
+                    },
                     client_id,
                     client_capability,
-                    network,
-                    peer,
-                    method,
-                    payload,
                 )
                 .await;
                 match write_variable(&mut writer, &json_lines, &cancel, variable)
@@ -1927,10 +1948,12 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     &state,
                     &json_lines,
                     &cancel,
-                    network,
-                    peer,
-                    pin,
-                    wait_ms,
+                    dispatch::network::ConnectPeer {
+                        network,
+                        peer,
+                        pin,
+                        wait_ms,
+                    },
                 )
                 .await?
                 else {
@@ -2137,11 +2160,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     &json_lines,
                     client_id,
                     client_capability,
-                    network,
-                    peer,
-                    method,
-                    request_id,
-                    operation_id,
+                    dispatch::rpc::FiledCall {
+                        network,
+                        peer,
+                        method,
+                        request_id,
+                        operation_id,
+                    },
                     ok,
                     error,
                 )
@@ -2168,11 +2193,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     &json_lines,
                     client_id,
                     client_capability,
-                    network,
-                    peer,
-                    method,
-                    request_id,
-                    operation_id,
+                    dispatch::rpc::FiledCall {
+                        network,
+                        peer,
+                        method,
+                        request_id,
+                        operation_id,
+                    },
                     payload,
                 )
                 .await?;
@@ -2198,11 +2225,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     &json_lines,
                     client_id,
                     client_capability,
-                    network,
-                    peer,
-                    method,
-                    request_id,
-                    operation_id,
+                    dispatch::rpc::FiledCall {
+                        network,
+                        peer,
+                        method,
+                        request_id,
+                        operation_id,
+                    },
                     error,
                 )
                 .await?;
@@ -3446,14 +3475,16 @@ mod terminal_shutdown_tests {
             .expect("the inserted network is visible");
         let services = ServiceManager::new(near_mesh.clone(), networks.clone());
         let serving = tokio::spawn(serve_with_hooks(
-            near_mesh,
-            networks.clone(),
-            services,
-            Some(socket.clone()),
-            RealtimeAdvert {
-                supported: false,
-                encodings: Vec::new(),
+            ControlSurface {
+                mesh: near_mesh,
+                registry: networks.clone(),
+                services,
+                realtime: RealtimeAdvert {
+                    supported: false,
+                    encodings: Vec::new(),
+                },
             },
+            Some(socket.clone()),
             shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: None,
@@ -3580,14 +3611,16 @@ mod terminal_shutdown_tests {
         let networks = NetworkRegistry::new();
         let services = ServiceManager::new(mesh.clone(), networks.clone());
         let serving = tokio::spawn(serve_with_hooks(
-            mesh,
-            networks,
-            services,
-            Some(socket.clone()),
-            RealtimeAdvert {
-                supported: false,
-                encodings: Vec::new(),
+            ControlSurface {
+                mesh,
+                registry: networks,
+                services,
+                realtime: RealtimeAdvert {
+                    supported: false,
+                    encodings: Vec::new(),
+                },
             },
+            Some(socket.clone()),
             shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: None,
@@ -3728,14 +3761,16 @@ mod terminal_shutdown_tests {
         let networks = NetworkRegistry::new();
         let services = ServiceManager::new(mesh.clone(), networks.clone());
         let serving = tokio::spawn(serve_with_hooks(
-            mesh,
-            networks,
-            services,
-            Some(socket.clone()),
-            RealtimeAdvert {
-                supported: false,
-                encodings: Vec::new(),
+            ControlSurface {
+                mesh,
+                registry: networks,
+                services,
+                realtime: RealtimeAdvert {
+                    supported: false,
+                    encodings: Vec::new(),
+                },
             },
+            Some(socket.clone()),
             shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: None,
@@ -3884,14 +3919,16 @@ mod terminal_shutdown_tests {
         let networks = NetworkRegistry::new();
         let services = ServiceManager::new(mesh.clone(), networks.clone());
         let serving = tokio::spawn(serve_with_hooks(
-            mesh,
-            networks,
-            services,
-            Some(socket.clone()),
-            RealtimeAdvert {
-                supported: false,
-                encodings: Vec::new(),
+            ControlSurface {
+                mesh,
+                registry: networks,
+                services,
+                realtime: RealtimeAdvert {
+                    supported: false,
+                    encodings: Vec::new(),
+                },
             },
+            Some(socket.clone()),
             shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: Some(barrier),

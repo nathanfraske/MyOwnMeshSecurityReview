@@ -13,7 +13,7 @@
 //! can pick whichever ordering makes a signature verify.
 
 use super::{EndpointAuthProfile, EndpointAuthSetupError, EndpointRole};
-use crate::connector::{EndpointAuthBinding, EndpointAuthBindingProfile};
+use crate::connector::EndpointAuthBinding;
 
 /// The fixed facts one task authenticates under.
 ///
@@ -37,10 +37,11 @@ impl EndpointAuthContext {
     /// connector's own supplied material, already fail-closed on a missing
     /// component.
     ///
-    /// The profile is **derived here** from the closed binding profile, not
-    /// supplied. A connector states what it can prove; endpoint authentication
-    /// decides what that means. No caller — engine included — selects profile
-    /// semantics, so a peer cannot cause a weaker variant to be chosen.
+    /// The profile is **fixed here**, not supplied. A connector states what it
+    /// can prove; endpoint authentication decides what that means, and what it
+    /// decides is the one closed profile this build authenticates under. No
+    /// caller — engine included — selects profile semantics, so a peer cannot
+    /// cause a weaker variant to be chosen.
     ///
     /// Empty identifiers are refused here rather than deeper in transcript
     /// framing, so an attempt cannot exist with a field that would produce an
@@ -57,7 +58,6 @@ impl EndpointAuthContext {
         expected_remote_device_id: &str,
         binding: EndpointAuthBinding,
     ) -> Result<Self, EndpointAuthSetupError> {
-        let profile = Self::profile_for(binding.profile());
         if mesh_context.is_empty()
             || local_device_id.is_empty()
             || expected_remote_device_id.is_empty()
@@ -74,23 +74,10 @@ impl EndpointAuthContext {
             mesh_context: mesh_context.to_owned(),
             local_device_id: local_device_id.to_owned(),
             expected_remote_device_id: expected_remote_device_id.to_owned(),
-            profile,
+            profile: EndpointAuthProfile::V1Ed25519Dtls,
             binding,
             local_role,
         })
-    }
-
-    /// The endpoint-authentication profile implied by a connector binding.
-    ///
-    /// This mapping is owned here, in endpoint authentication, precisely so it
-    /// cannot be influenced from outside: a new connector binding profile must
-    /// be given its meaning by an edit to this function.
-    fn profile_for(binding_profile: EndpointAuthBindingProfile) -> EndpointAuthProfile {
-        match binding_profile {
-            EndpointAuthBindingProfile::WebRtcDtlsCertificateFingerprintPair => {
-                EndpointAuthProfile::V1Ed25519Dtls
-            }
-        }
     }
 
     pub(crate) fn mesh_context(&self) -> &str {
@@ -148,17 +135,6 @@ mod tests {
 
     fn context(local: &str, remote: &str) -> EndpointAuthContext {
         EndpointAuthContext::new("mesh-1", local, remote, binding()).expect("non-empty identifiers")
-    }
-
-    #[test]
-    fn v4_arc04b_profile_is_derived_from_the_binding_not_supplied() {
-        let context = context("device-a", "device-b");
-
-        assert_eq!(
-            context.binding().profile(),
-            crate::connector::EndpointAuthBindingProfile::WebRtcDtlsCertificateFingerprintPair
-        );
-        assert_eq!(context.profile(), EndpointAuthProfile::V1Ed25519Dtls);
     }
 
     #[test]
