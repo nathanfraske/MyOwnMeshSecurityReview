@@ -67,7 +67,7 @@ fn vouch(id: &str, label: &str) -> RosterEntriesMessage {
             granted_by: String::new(),
         }],
         // No governance log on this gossip — exercises the membership-only path
-        // (and the `#[serde(default)]` skew an older peer's reply would take).
+        // without relying on a missing-field compatibility default.
         transitions: Vec::new(),
         // No signed member log either — the closed-net guard must still refuse.
         member_log: Vec::new(),
@@ -100,6 +100,22 @@ async fn roster_membership_authority_gate() {
     .await
     .expect("spawn alice (closed)");
 
+    // Seed the ordinary roster while the fixture is still Open. Production
+    // correctly refuses manufacturing unknown Closed members through this API;
+    // moving these fixture approvals earlier keeps that policy intact.
+    alice
+        .approve_roster(bob.public_id(), "bob")
+        .await
+        .expect("seed bob while open");
+    alice
+        .approve_roster(carol.public_id(), "carol")
+        .await
+        .expect("seed carol while open");
+    assert!(
+        rostered(&alice, bob.public_id()) && rostered(&alice, carol.public_id()),
+        "the unsigned Open roster seeds are genuinely present before the Closed authority gate"
+    );
+
     // Stand the network up as `closed` with Bob=Member, Carol=Controller.
     // (In production this state is reached via the signed open→closed
     // transition + role grants; here we set it directly to isolate the
@@ -111,14 +127,6 @@ async fn roster_membership_authority_gate() {
         gov.roles
             .insert(carol.public_id().to_string(), Role::Controller);
     }
-    alice
-        .approve_roster(bob.public_id(), "bob")
-        .await
-        .expect("seed bob");
-    alice
-        .approve_roster(carol.public_id(), "carol")
-        .await
-        .expect("seed carol");
 
     // (a) A MEMBER (Bob) gossips a brand-new id → MUST be refused.
     governance::on_roster_entries(

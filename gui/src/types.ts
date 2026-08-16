@@ -142,7 +142,7 @@ export interface MeshConfigSnapshot {
   [key: string]: unknown;
 }
 
-// ---- infrastructure services (relay / signaling / STUN / TURN) -------
+// ---- infrastructure services (signaling / STUN / TURN) ---------------
 //
 // Device-level service hosting. The *config* shapes mirror
 // `myownmesh_core::config::ServicesConfig` (the write shape sent into
@@ -152,11 +152,6 @@ export interface MeshConfigSnapshot {
 
 export interface NodeServiceConfig {
   enabled: boolean;
-}
-
-export interface RelayServiceConfig {
-  enabled: boolean;
-  max_fanout: number;
 }
 
 /** Flood-protection limits for the self-hosted signaling relay. `0`
@@ -203,7 +198,6 @@ export interface TurnServiceConfig {
 export interface ServicesConfig {
   /** Mesh participation. Off = pure-infrastructure box. */
   node: NodeServiceConfig;
-  relay: RelayServiceConfig;
   signaling: SignalingServerConfig;
   stun: StunServiceConfig;
   turn: TurnServiceConfig;
@@ -229,12 +223,6 @@ export interface EndpointReport {
   activity?: RelayStatsSnapshot | null;
 }
 
-export interface RelayReport {
-  enabled: boolean;
-  networks: number;
-  max_fanout: number;
-}
-
 export interface NodeReport {
   enabled: boolean;
   /** Networks joined as a node (0 in pure-infrastructure mode). */
@@ -243,7 +231,6 @@ export interface NodeReport {
 
 export interface ServicesReport {
   node: NodeReport;
-  relay: RelayReport;
   signaling: EndpointReport;
   stun: EndpointReport;
   turn: EndpointReport;
@@ -291,7 +278,6 @@ export function tierName(t: ConnectionTier): string {
 export interface CapabilityAdvert {
   tags: string[];
   app_version: string | null;
-  max_connections: number | null;
   extra: unknown;
 }
 
@@ -432,14 +418,9 @@ export interface AuthorizedPeer {
    *  field exists on every roster entry so the same on-disk shape
    *  works for `open` (everyone is `member`, the field is unused)
    *  and `closed` networks (the field gates roster-edit authority).
-   *
-   *  Optional in the wire shape — entries written before
-   *  `network_state_v1` shipped don't carry the field and the GUI
-   *  treats `undefined` as `"member"`. See
-   *  [`docs/NETWORK-TYPES.md`](../../docs/NETWORK-TYPES.md). On a
-   *  `closed` network the engine enforces this via the signed
+   *  On a `closed` network the engine enforces this via the signed
    *  transition log; on an `open` network it's a cosmetic tag. */
-  role?: Role;
+  role: Role;
 }
 
 // ---- governance (closed networks) ------------------------------------
@@ -575,11 +556,6 @@ export interface NetworkSummary {
   label: string;
   phase: MeshPhase;
   topology: TopologyMode;
-  /** Optional governance kind. Field is intentionally optional so a
-   *  pre-`network_state_v1` daemon can return the same JSON shape
-   *  without emitting the field; the GUI treats `undefined` as
-   *  `"open"`. */
-  kind?: NetworkKind;
 }
 
 /** What to show the human for a network. Mirrors MyOwnLLM's pattern:
@@ -690,12 +666,15 @@ export type DropReason =
 export type PeerEvent =
   | { kind: "sighted"; network_id: string; device_id: string }
   | {
+      // No `capabilities`: authentication happens before the peer's session is
+      // promoted, so nothing has yet received what the peer offers. It arrives
+      // on `capabilities_changed`, and `PeerInfo.capabilities` is null until
+      // then.
       kind: "authenticated";
       network_id: string;
       device_id: string;
       label: string;
       verification_code: string;
-      capabilities: CapabilityAdvert;
       rostered: boolean;
     }
   | { kind: "approved"; network_id: string; device_id: string; label: string }

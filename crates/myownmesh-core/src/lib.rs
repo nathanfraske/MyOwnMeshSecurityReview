@@ -56,7 +56,7 @@
 //! - [`protocol`] — wire format: `hello` / `auth_response` / `approve`
 //!   / `deny` / `ping` / `pong` / `shelve` / `unshelve` /
 //!   `capabilities_update` / generic RPC frames. See `docs/PROTOCOL.md`.
-//! - [`topology`] selectors — Ring (default), Star, FullMesh.
+//! - [`topology`] selectors — FullMesh (default), Ring, Star.
 //! - [`transport`] — webrtc-rs wrapper; one [`PeerSession`](transport::PeerSession)
 //!   per peer with an event mpsc the engine drains.
 //! - [`engine`] — connection engine: hello state machine, heartbeat,
@@ -68,16 +68,34 @@
 //!
 //! # Trust model
 //!
-//! Each device owns a long-lived ed25519 keypair. The `hello`
-//! handshake commits both sides to a shared nonce; the
-//! `auth_response` is an ed25519 signature over
-//! `SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id ||
-//! channel_binding`. Domain separation prevents a signature obtained
-//! for one protocol step from being replayed in another, and the
-//! `channel_binding` — the DTLS certificate fingerprint of the channel
-//! the handshake runs over — ties the proven identity to *this*
-//! transport, so a man-in-the-middle on the (unauthenticated) signaling
-//! path can't relay the handshake across two DTLS legs it terminates.
+//! Each device owns a long-lived ed25519 keypair. Both sides send a
+//! `hello` carrying an independently drawn 32-byte contribution; the
+//! `auth_response` is an ed25519 signature over the endpoint-auth
+//! transcript, whose fields are length-prefixed under
+//! `ENDPOINT_AUTH_DOMAIN_TAG`: the mesh context, the fixed crypto
+//! profile, the signer's role, both device IDs, both contributions, and
+//! both endpoints' DTLS certificate fingerprints — every paired field
+//! in role-canonical order, so the two sides derive identical bytes.
+//! Each side verifies its own half as well as the peer's, so a proof is
+//! mutual rather than one-directional.
+//!
+//! Domain separation prevents a signature obtained for one protocol step
+//! from being replayed in another. Binding both fingerprints ties the
+//! proven identity to *this* transport, so a man-in-the-middle on the
+//! (unauthenticated) signaling path can't relay the handshake across two
+//! DTLS legs it terminates — it would have to present its own
+//! certificate to each leg.
+//!
+//! A certificate fingerprint is **not** a session-unique exporter,
+//! though: two channels between the same pair reusing the same
+//! certificates carry the same value. Replay across channels is
+//! prevented by the per-attempt contributions, and transfer of an
+//! already-issued capability is prevented by connector-incarnation
+//! ownership — not by the fingerprints.
+//!
+//! This is a hard cutover. Endpoint authentication has one transcript and no
+//! feature-negotiated fallback: a mismatched profile fails authentication
+//! rather than negotiating down, so a downgrade is not attacker-selectable.
 //!
 //! A user-visible 6-char verification code lets a human
 //! eyeball-confirm the handshake over voice/video at first-meeting
@@ -107,11 +125,10 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
-#[cfg(feature = "legacy-v1")]
-pub mod legacy_v1;
 pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
+pub mod realtime;
 pub mod resource;
 pub mod roster;
 pub mod rpc;
@@ -124,14 +141,21 @@ pub mod verification;
 
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, RelayServiceConfig,
-    ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig,
-    TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
+    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, ServicesConfig,
+    SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode,
+    TurnCredential, TurnServer, TurnServiceConfig,
 };
 pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;
+/// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
+/// it answers the same question under a different contract: measured before it
+/// is built, and refusable at four separate points.
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
+/// The real-link fixture owner, exported at the root for the same reason the
+/// fixture exists: the controls that need it live in another crate.
+#[cfg(feature = "transport-lab")]
+pub use handle::TransportLabPromotedPeer;
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
 pub use network_state::{
@@ -140,8 +164,15 @@ pub use network_state::{
 };
 pub use protocol::CapabilityAdvert;
 pub use resource::{
-    FiniteResourceProvider, ProcessResourceRoot, ReclaimResult, ResourceAuthorityClass,
-    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourcePressure,
+    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim,
+    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
+    serialized_mailbox_item_claim_as, FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap,
+    LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
+    PreparedResourceMailbox, ProcessResourceRoot, ResourceAuthorityClass, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
+    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
+    ResourceMailboxItemBuilder, ResourceMailboxItemError, ResourceMailboxPlanningError,
+    ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender, ResourcePressure,
     ResourceProvider, ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
     ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
     RESOURCE_CLASS_COUNT,
@@ -149,36 +180,31 @@ pub use resource::{
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
-    connector_resource_structural_claims, ConnectorCallbackMailboxCapacities,
-    ConnectorCallbackPolicy, ConnectorCallbackPolicyError, ConnectorCallbackServiceWeights,
-    ConnectorRealtimeByteBudgets, ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-    ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
-    ConnectorResourceStructuralClaims, EnabledRealtimeConnectorPolicy, MeshConnectorResourceReport,
-    MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, RealtimeQueueOverflowRule,
-    WebRtcConnectorCapablePolicy,
+    connector_resource_structural_claims, ConnectorCallbackPolicy, ConnectorResourceOwnerPort,
+    ConnectorResourceOwnerReport, ConnectorResourceStructuralClaims, MeshConnectorResourceReport,
+    MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
+pub use runtime::session_broker::session_reservation_planning_claim;
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 #[cfg(feature = "transport-lab")]
 pub use transport::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant,
+    transport_lab_remote_description_fixture_grant, TransportLabCallbackGrant,
+    TransportLabCallbackWorkload, TransportLabRealtimeWorkload,
 };
-#[cfg(feature = "legacy-media")]
-#[allow(
-    deprecated,
-    reason = "these are the explicit deprecated legacy-media compatibility exports"
-)]
-pub use transport::{LegacyWebRtcMediaProfile, LegacyWebRtcMediaProfileError};
+/// Every realtime name at the crate root is `WebRtc`-qualified.
+///
+/// The generic realtime vocabulary lives in [`realtime`] and names no codec, no
+/// media kind and no RTP fact; everything that does is a property of the WebRTC
+/// provider and says so in its own name. There is no unqualified spelling and no
+/// compatibility alias — a caller names the qualified type or does not compile.
 pub use transport::{
-    PendingRemoteCandidatePolicy, WebRtcConnectorProfile, WebRtcConnectorProfileError,
+    WebRtcConnectorProfile, WebRtcConnectorProfileError, WebRtcRealtimeCodec,
+    WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming, WebRtcRealtimeInboundArrival,
+    WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit, WebRtcRealtimeProfile,
+    WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };
-
-/// Domain-separation tag prefixed to every signed handshake payload.
-/// A signature obtained for one protocol step cannot be replayed in
-/// another (e.g. a different version of MyOwnMesh, or any other product
-/// that signs ed25519 challenges).
-pub const SIGN_DOMAIN_TAG: &str = "myownmesh-mesh-auth-v1:";
 
 /// App-id used to derive the Trystero room handle. Two MyOwnMesh peers
 /// with the same `network_id` and the same app-id meet in the same
@@ -187,9 +213,7 @@ pub const SIGN_DOMAIN_TAG: &str = "myownmesh-mesh-auth-v1:";
 /// downstream forks can isolate their fleet.
 pub const TRYSTERO_APP_ID: &str = "myownmesh-cloud-mesh-v1";
 
-/// Wire-protocol version. Stays at 1 across additive changes (new
-/// optional fields, new message kinds); a v1 receiver getting an
-/// unknown message kind silently drops it. Bump only when an existing
-/// message's wire shape changes incompatibly — finer-grained
-/// capability negotiation happens in [`protocol::features`].
+/// Wire-protocol version for the one current alpha profile. A receiver refuses
+/// any kind this build does not implement; there is no feature-negotiated or
+/// mixed-version fallback. Bump when the closed profile's wire shape changes.
 pub const PROTOCOL_VERSION: u32 = 1;

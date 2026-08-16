@@ -156,13 +156,16 @@ async fn roster_persists_on_mutual_approve_then_gossips() {
     // membership to active peers.
     let carol_id = Arc::new(Identity::ephemeral());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    a2.cmd_tx
-        .send(NetworkCmd::ApproveRoster {
-            device_id: carol_id.public_id().to_string(),
-            label: "carol".into(),
-            reply: tx,
-        })
-        .expect("queue approve");
+    assert!(
+        a2.cmd_tx
+            .send(NetworkCmd::ApproveRoster {
+                device_id: carol_id.public_id().to_string(),
+                label: "carol".into(),
+                reply: tx,
+            })
+            .is_ok(),
+        "queue approve"
+    );
     rx.await.expect("approve reply").expect("approve ok");
 
     // Bob has no direct link to Carol; he must converge on her purely

@@ -81,8 +81,12 @@ async fn main() {
 
     let alice_chan: Channel<ChatLine> = Channel::new("chat".into(), alice_net.clone());
     let bob_chan: Channel<ChatLine> = Channel::new("chat".into(), bob_net.clone());
-    let mut bob_sub = bob_chan.subscribe();
-    let mut alice_sub = alice_chan.subscribe();
+    let mut bob_sub = bob_chan
+        .subscribe()
+        .expect("Bob's live channel admits its subscription");
+    let mut alice_sub = alice_chan
+        .subscribe()
+        .expect("Alice's live channel admits its subscription");
 
     // Alice sends to Bob.
     alice_chan
@@ -95,7 +99,7 @@ async fn main() {
         .await
         .unwrap();
     let msg = bob_sub.recv().await.unwrap().unwrap();
-    println!("BOB ◀── {}", msg.body.text);
+    println!("BOB ◀── {}", msg.body().text);
 
     // Bob replies.
     bob_chan
@@ -108,7 +112,7 @@ async fn main() {
         .await
         .unwrap();
     let msg = alice_sub.recv().await.unwrap().unwrap();
-    println!("ALICE ◀── {}", msg.body.text);
+    println!("ALICE ◀── {}", msg.body().text);
 
     // Give the broker a moment to settle before we tear down.
     tokio::time::sleep(Duration::from_millis(100)).await;

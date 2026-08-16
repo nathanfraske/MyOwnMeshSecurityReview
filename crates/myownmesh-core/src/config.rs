@@ -2,10 +2,8 @@
 //! lives here so any caller (binary, library embedder, tests) shares
 //! the same parse / default behavior.
 //!
-//! Schema versioning: a single `version` field on the root. v1 is
-//! current; additive changes (new optional fields, new networks)
-//! don't bump the version. Field-shape-breaking changes will bump and
-//! ship a migration in this module.
+//! Schema versioning uses one exact hard-alpha `version` field. This build
+//! refuses any other version rather than migrating or guessing compatibility.
 
 use std::path::PathBuf;
 
@@ -13,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::identity::DeviceId;
+use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 
 /// Flood-protection limits for the self-hosted signaling relay. Defined
 /// in the signaling crate (its natural home) and re-used here so the
@@ -235,17 +234,14 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub label: String,
     /// Initial governance kind for this network. Open is the
-    /// default and matches the engine's behaviour through every
-    /// release before `network_state_v1` shipped. Closed sets up
+    /// default. Closed sets up
     /// the per-network signed state log so the founder
     /// self-elects as `Owner` on first attach. Silent is Open
     /// governance plus two connection-behaviour changes — no
     /// auto-dial on presence (co-present peers surface as `Sighted`
     /// without a WebRTC session until an explicit `connect_peer` or
     /// an inbound offer) and no roster gossip — for a shared open
-    /// mesh where every connection is deliberate. Configs written
-    /// by older builds parse via #[serde(default)] without an
-    /// explicit field.
+    /// mesh where every connection is deliberate.
     ///
     /// At runtime, the *authoritative* kind is the one in the
     /// signed [`crate::NetworkState`] log; this field is only the
@@ -404,9 +400,6 @@ pub struct ServicesConfig {
     /// Whether this device participates as a regular mesh node. On by
     /// default; turn off for a pure-infrastructure box.
     pub node: NodeServiceConfig,
-    /// Frozen LegacyV1 ordinary-member application relay configuration.
-    /// Normal V4 startup rejects `enabled: true`.
-    pub relay: RelayServiceConfig,
     pub signaling: SignalingServerConfig,
     pub stun: StunServiceConfig,
     pub turn: TurnServiceConfig,
@@ -416,8 +409,7 @@ pub struct ServicesConfig {
 /// configured networks and participates as a peer. Enabled by default;
 /// disable it to run a **pure-infrastructure box** that only hosts
 /// signaling / STUN / TURN (advertising itself purely as an edge /
-/// ingress-egress point) without joining any network itself. Frozen LegacyV1
-/// ordinary-member forwarding requires node participation.
+/// ingress-egress point) without joining any network itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NodeServiceConfig {
@@ -428,22 +420,6 @@ impl Default for NodeServiceConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
-}
-
-/// Frozen LegacyV1 mesh-member application routing. When explicitly enabled
-/// by a LegacyV1 runtime, this device forwards typed-channel traffic between
-/// roster members on the reserved `__mesh_relay__/v1` channel. Forwarding is roster-gated: a
-/// frame is only relayed when both the sender and the destination are
-/// approved peers of this device.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct RelayServiceConfig {
-    /// Off by default. Retaining this compatibility behavior is explicit.
-    pub enabled: bool,
-    /// Ceiling on how many distinct destinations a single inbound frame
-    /// may fan out to in broadcast mode. 0 (the default) = unlimited. A
-    /// guard against one chatty peer turning the relay into an amplifier.
-    pub max_fanout: u32,
 }
 
 /// Self-hosted signaling server: a minimal Nostr-compatible relay
@@ -609,28 +585,280 @@ impl Default for MeshConfig {
     }
 }
 
-/// Forward-migrate an older on-disk config to the current shape.
-/// v1 → v2: `Ring` becomes [`TopologyMode::FullMesh`]. The v1 "ring"
-/// never shaped connections — it only shelved app frames, so every v1
-/// network genuinely ran a full mesh; from v2, `Ring` names the real
-/// shaped ring, and a network only runs it by choosing it. Idempotent,
-/// and a no-op for configs already at the current version.
-fn migrate(mut cfg: MeshConfig) -> MeshConfig {
-    if cfg.version < 2 {
-        for net in &mut cfg.networks {
-            if matches!(net.topology, TopologyMode::Ring { .. }) {
-                net.topology = TopologyMode::FullMesh;
+fn require_current_version(cfg: MeshConfig) -> Result<MeshConfig> {
+    if cfg.version != CONFIG_VERSION {
+        return Err(Error::Config(format!(
+            "config version {} is not the current hard-alpha version {}",
+            cfg.version, CONFIG_VERSION
+        )));
+    }
+    Ok(cfg)
+}
+
+/// One deliberately opaque reservation for the loader-owned parsed config.
+///
+/// Serde defaults can expand a short source into arbitrarily many owned fields
+/// as repeatable families grow, so neither source-byte ratios nor a fixed floor
+/// truthfully price the resulting allocator graph. The owner therefore names
+/// that graph as one broader dependency residual, acquired before parsing and
+/// held for exactly as long as the finished [`MeshConfig`]. It also covers the
+/// allocation-free serde traversal used to measure the compact encoding before
+/// the caller acquires its output buffer; no loader work is performed after the
+/// residual owner is released.
+fn config_loader_residual_claim() -> ResourceClaim {
+    ResourceClaim::single(ResourceClass::OpaqueDependencyResidual, 1)
+}
+
+/// The one parse-and-quarantine decision, shared by [`MeshConfig::load`] and
+/// [`PreparedConfigLoad::commit`].
+///
+/// Shared rather than duplicated so the two entry points cannot drift: the
+/// quarantine, the fail-safe default and the version refusal are one behaviour
+/// with two callers, and a second copy would be a second source of truth for
+/// what a corrupt config means.
+fn parse_or_quarantine(raw: &str, path: &std::path::Path) -> Result<MeshConfig> {
+    // Corrupt config (power cut mid-write on an appliance, or a
+    // hand-edit gone wrong) → quarantine + defaults, loudly. A
+    // parse error here used to stop the daemon from starting at
+    // all — the worst brick, since embedders (NanoKVM, AllMyStuff)
+    // re-add their networks over the control socket and rewrite
+    // this file on their own once the daemon is up. Defaults are
+    // fail-safe: no networks joined, no services exposed.
+    match serde_json::from_str::<MeshConfig>(raw) {
+        Ok(cfg) => require_current_version(cfg),
+        Err(e) => {
+            let kept = crate::persist::quarantine(path);
+            tracing::error!(
+                path = %path.display(),
+                quarantined = ?kept,
+                "config file is corrupt ({e}) — starting from \
+                 defaults; the previous contents were kept at the \
+                 quarantine path for hand-recovery"
+            );
+            Ok(MeshConfig::default())
+        }
+    }
+}
+
+/// Where a prepared load will get its bytes.
+enum PreparedConfigSource {
+    /// No file. The plan will produce [`MeshConfig::default`] and reads
+    /// nothing.
+    Missing,
+    /// An **already-open** handle and the length the plan was measured
+    /// against. Opened during planning rather than at commit so the bytes that
+    /// get read are the bytes that were measured, not whatever a later `open`
+    /// would find.
+    Present { file: std::fs::File, len: u64 },
+}
+
+/// A measured, funded-but-not-yet-performed config load.
+///
+/// **Nothing is parsed and no config exists yet.** Planning opens the file and
+/// measures it; it allocates no `MeshConfig` and no raw buffer. That is what
+/// lets a caller decide whether it may afford the load *before* the load
+/// happens, and what makes a refusal provably free of any read, parse or
+/// snapshot construction.
+///
+/// **Core keeps the file semantics; the caller keeps the admission decision.**
+/// There is deliberately no scope or provider parameter here and no acquisition
+/// inside: the caller acquires against [`Self::loader_residual_claim`] and
+/// [`Self::load_work_claim`], then hands both leases to [`Self::commit`]. Once
+/// committed, the funded owner can measure its compact width before the caller
+/// acquires output capacity. Quarantine, the fail-safe default and the version
+/// refusal stay in this crate, where they are already the one source of truth.
+///
+/// Move-only, and there is no accessor for the handle. A plan is a single
+/// permission to perform one load.
+#[must_use = "a prepared load has opened the config file and must be committed or dropped"]
+pub struct PreparedConfigLoad {
+    source: PreparedConfigSource,
+    /// Kept because quarantine needs the path, and the plan may be the only
+    /// thing still holding it by the time a corrupt parse is discovered.
+    path: PathBuf,
+    loader_residual_claim: ResourceClaim,
+    load_work_claim: ResourceClaim,
+}
+
+/// One config, and the funding that keeps it.
+///
+/// Value before lease: the config is destroyed first and its funding released
+/// after, so the claim never describes memory that has already gone — nor is it
+/// released while the value it pays for is still standing.
+///
+/// Borrowed access only. There is no method handing the `MeshConfig` out on its
+/// own, because a caller holding one would have a config whose funding had been
+/// released with the owner around it.
+pub struct FundedMeshConfig {
+    value: MeshConfig,
+    _loader_residual: ResourceLease,
+}
+
+impl FundedMeshConfig {
+    pub fn get(&self) -> &MeshConfig {
+        &self.value
+    }
+
+    /// Exact compact JSON width, counted without constructing an output buffer.
+    pub fn compact_encoded_len(&self) -> Result<usize> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "config width overflow")
+                })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
-        cfg.version = 2;
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, &self.value)?;
+        Ok(count.0)
     }
-    cfg
+}
+
+impl PreparedConfigLoad {
+    /// The broader dependency represented by the parsed config.
+    ///
+    /// This names the allocator graph serde constructs and the allocation-free
+    /// compact-width traversal performed while that graph is owned. Raw input
+    /// bytes and parsing CPU remain separately and mechanically charged by
+    /// [`Self::load_work_claim`], which ends when the load finishes.
+    pub const fn loader_residual_claim(&self) -> ResourceClaim {
+        self.loader_residual_claim
+    }
+
+    /// What performing the load costs *while it happens*, and not afterwards.
+    ///
+    /// The raw text and the parsed config exist at the same moment: the config
+    /// is built from a buffer that is still there. A plan that priced only the
+    /// result would underfund exactly that peak. This is the other half — the
+    /// raw buffer's bytes, the parse work, and the plan's own path — and
+    /// [`Self::commit`] releases it before returning, so the transient cost is
+    /// charged for the interval it is actually incurred in.
+    ///
+    /// The path is here rather than in the retention because it dies with the
+    /// load: nothing beyond `commit` can reach it, and the parsed config does
+    /// not hold it.
+    pub const fn load_work_claim(&self) -> ResourceClaim {
+        self.load_work_claim
+    }
+
+    /// Read, parse and retain, now that the retention is funded.
+    ///
+    /// The read is bounded by the length measured during planning, and a file
+    /// that **grew** since then is refused *before* anything is parsed or
+    /// quarantined — a file being rewritten underneath us is not a corrupt
+    /// file, and treating it as one would quarantine a perfectly good config
+    /// that simply arrived mid-write.
+    ///
+    /// Everything else is exactly [`MeshConfig::load`]'s behaviour, because it
+    /// is literally the same function: complete-read corrupt files are
+    /// quarantined and fall back to defaults, and a config whose version is not
+    /// current is refused.
+    /// Takes **both** leases because both costs are real at different times:
+    /// `work_lease` covers the raw buffer and the parse while they exist, and
+    /// is released here once the buffer is gone; `loader_residual` covers the
+    /// config and travels out inside the returned owner.
+    pub fn commit(
+        self,
+        loader_residual: ResourceLease,
+        work_lease: ResourceLease,
+    ) -> Result<FundedMeshConfig> {
+        use std::io::Read;
+
+        // The leases have to be *these* leases. `ResourceLease::claim` is public,
+        // so without this the prepare-then-acquire discipline would be a
+        // convention a caller could simply not follow: two unrelated leases, or
+        // two zero ones, would buy a `FundedMeshConfig` whose funding describes
+        // something else. Checked before the file is read, before anything is
+        // parsed, and before a default is constructed, so a caller that gets this
+        // wrong has still caused no work.
+        //
+        // Both leases are dropped on the way out, which returns their capacity to
+        // whatever they were taken from. That is the only sound thing to do with
+        // them: they are not this plan's, so they cannot be handed back as this
+        // plan's, and holding them would strand capacity on a refusal.
+        if loader_residual.claim() != self.loader_residual_claim {
+            return Err(Error::Config(
+                "config loader residual was not taken for this plan's exact residual claim"
+                    .to_string(),
+            ));
+        }
+        if work_lease.claim() != self.load_work_claim {
+            return Err(Error::Config(
+                "config load lease was not taken for this plan's load work claim".to_string(),
+            ));
+        }
+
+        // Named rather than reached through `self`, so the path can be released
+        // deliberately below rather than at the end of this call — after the
+        // charge that covers it has already gone back.
+        let PreparedConfigLoad {
+            source,
+            path,
+            loader_residual_claim: _,
+            load_work_claim: _,
+        } = self;
+
+        let value = match source {
+            PreparedConfigSource::Missing => MeshConfig::default(),
+            PreparedConfigSource::Present { file, len } => {
+                // One byte past the measurement: enough to *detect* growth,
+                // never enough to read an unbounded file.
+                //
+                // Reserved up front, at exactly the capacity `load_work_claim`
+                // priced. `String::new()` would start empty and grow
+                // geometrically toward the same size, asking the allocator for
+                // capacity nobody had funded — and doing so *before* the growth
+                // refusal below could fire.
+                let capacity = usize::try_from(len)
+                    .ok()
+                    .and_then(|measured| measured.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::Config(format!("config {} is too large to read", path.display()))
+                    })?;
+                let mut raw = String::with_capacity(capacity);
+                file.take(len.saturating_add(1))
+                    .read_to_string(&mut raw)
+                    .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+                if raw.len() as u64 > len {
+                    return Err(Error::Config(format!(
+                        "config {} grew past its measured {len} bytes while being read",
+                        path.display()
+                    )));
+                }
+                let parsed = parse_or_quarantine(&raw, &path)?;
+                // The buffer's bytes go back before the charge for them does,
+                // and both go back before this call returns: the peak where the
+                // text and the config are both alive is exactly the interval
+                // `work_lease` was acquired for.
+                drop(raw);
+                parsed
+            }
+        };
+        // The plan's own path is the second allocation `load_work_claim` funds,
+        // and it goes back before the charge for it does — the same order the
+        // raw buffer follows above.
+        drop(path);
+        drop(work_lease);
+        Ok(FundedMeshConfig {
+            value,
+            _loader_residual: loader_residual,
+        })
+    }
 }
 
 impl MeshConfig {
     /// Load the config from the default location. Missing file
     /// returns [`MeshConfig::default`] — embedders should call
     /// `save()` afterward if they want the file to exist.
+    ///
+    /// Unfunded, and kept that way for embedders that have no resource scope.
+    /// A caller that must fund the retention before it happens uses
+    /// [`MeshConfig::prepare_load`] instead; both share one parse.
     pub fn load() -> Result<Self> {
         let path = crate::dirs::config_path()?;
         if !path.exists() {
@@ -638,41 +866,115 @@ impl MeshConfig {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
-        // Corrupt config (power cut mid-write on an appliance, or a
-        // hand-edit gone wrong) → quarantine + defaults, loudly. A
-        // parse error here used to stop the daemon from starting at
-        // all — the worst brick, since embedders (NanoKVM, AllMyStuff)
-        // re-add their networks over the control socket and rewrite
-        // this file on their own once the daemon is up. Defaults are
-        // fail-safe: no networks joined, no services exposed.
-        let cfg: MeshConfig = match serde_json::from_str(&raw) {
-            Ok(c) => c,
-            Err(e) => {
-                let kept = crate::persist::quarantine(&path);
-                tracing::error!(
-                    path = %path.display(),
-                    quarantined = ?kept,
-                    "config file is corrupt ({e}) — starting from \
-                     defaults; the previous contents were kept at the \
-                     quarantine path for hand-recovery"
-                );
-                return Ok(Self::default());
+        parse_or_quarantine(&raw, &path)
+    }
+
+    /// Measure a config load without performing it.
+    ///
+    /// Opens and stats the file — so the plan is measured against the same
+    /// handle it will later read — and computes what the parsed config will
+    /// cost. It allocates no config and no raw buffer, and parses nothing, so a
+    /// caller that refuses on the resulting claim has provably performed no
+    /// read, no parse and no construction.
+    ///
+    /// It does allocate one thing: the path it opened, which the plan keeps
+    /// because quarantine needs it. That allocation is priced into
+    /// [`PreparedConfigLoad::load_work_claim`] and released inside `commit`
+    /// before that lease is. It is unfunded between here and the caller's
+    /// acquisition, necessarily — the plan is what tells the caller what to
+    /// acquire.
+    ///
+    /// The broader residual covers defaults because
+    /// absent fields expand to defaults and the input's own length says nothing
+    /// about that expansion.
+    pub fn prepare_load() -> Result<PreparedConfigLoad> {
+        let path = crate::dirs::config_path()?;
+        let source = match std::fs::File::open(&path) {
+            Ok(file) => {
+                let len = file
+                    .metadata()
+                    .map_err(|e| Error::Config(format!("stat {}: {e}", path.display())))?
+                    .len();
+                PreparedConfigSource::Present { file, len }
             }
+            // Absent is the ordinary first-run case, not a failure: the plan
+            // will produce defaults, and the loader residual names their
+            // allocator graph without pretending the absent file sized it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PreparedConfigSource::Missing,
+            Err(e) => return Err(Error::Config(format!("open {}: {e}", path.display()))),
         };
-        if cfg.version > CONFIG_VERSION {
-            return Err(Error::Config(format!(
-                "config version {} is from a newer build (this one expects v{})",
-                cfg.version, CONFIG_VERSION
-            )));
-        }
-        Ok(migrate(cfg))
+
+        let raw_bytes = match &source {
+            PreparedConfigSource::Missing => 0,
+            PreparedConfigSource::Present { len, .. } => usize::try_from(*len).map_err(|_| {
+                Error::Config(format!(
+                    "config {} is larger than this address space",
+                    path.display()
+                ))
+            })?,
+        };
+        let too_large = || Error::Config(format!("config {} is too large to plan", path.display()));
+        // Serde's finished allocator graph is intentionally not inferred from
+        // source bytes. The broader residual is acquired before parsing and
+        // remains coupled to the resulting config through its final width walk.
+        let loader_residual_claim = config_loader_residual_claim();
+
+        let not_representable =
+            || Error::Config("config planning claim is not representable".to_string());
+
+        // What is spent to get there: the raw text's buffer, alive at the same
+        // moment as the config built from them, and the work of parsing it.
+        // Released by `commit` rather than carried for the value's lifetime.
+        //
+        // `raw_bytes + 1`, not `raw_bytes`, and the extra byte is not a
+        // rounding habit: the read deliberately asks for one byte past the
+        // measurement so that growth is *detectable*, and `commit` reserves
+        // exactly that much up front. Pricing only `raw_bytes` would leave the
+        // detection byte unfunded — and a buffer that had to grow to hold it
+        // would request unpriced capacity before the growth refusal it exists
+        // to trigger could fire.
+        let read_capacity = raw_bytes.checked_add(1).ok_or_else(too_large)?;
+        // The plan holds a path, and a path is an allocation like any other. It
+        // is charged here rather than to the retention because it dies with the
+        // load: `commit` releases it just before it releases this lease, and a
+        // plan that is never committed drops it with the plan.
+        //
+        // Capacity, not length, because capacity is what the allocator is
+        // holding; the work claim must cover the path's actual reservation.
+        //
+        // **The window this does not cover, stated rather than implied.** The
+        // path exists from the moment `prepare_load` derives it, which is before
+        // the caller can possibly hold a lease for it: the plan is what tells
+        // them what to acquire. That is inherent to letting the caller acquire —
+        // it is one path allocation, bounded by the config directory, and it is
+        // funded for the whole interval in which any funding exists at all.
+        let planning_bytes = read_capacity
+            .checked_add(path.capacity())
+            .ok_or_else(too_large)?;
+        let planning_bytes_u64 = u64::try_from(planning_bytes).map_err(|_| not_representable())?;
+        let parse_work_u64 = u64::try_from(read_capacity).map_err(|_| not_representable())?;
+        let load_work_claim = ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, planning_bytes_u64),
+            // Work scales with the text that is parsed, and the path is not
+            // parsed — so this stays the read capacity rather than following the
+            // bytes above.
+            (ResourceClass::ParsingOrCpuWork, parse_work_u64),
+            // The raw buffer and the plan's path: two allocations, two
+            // residuals.
+            (ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+        .map_err(|_| not_representable())?;
+
+        Ok(PreparedConfigLoad {
+            source,
+            path,
+            loader_residual_claim,
+            load_work_claim,
+        })
     }
 
     /// Persist to the default location. Pretty-printed JSON for
     /// easy hand-editing; the file isn't on a hot path.
-    ///
-    /// (Migrations live in [`migrate`], applied on every load; the
-    /// next save writes the migrated shape at [`CONFIG_VERSION`].)
     pub fn save(&self) -> Result<()> {
         let path = crate::dirs::config_path()?;
         let parent = path.parent().ok_or_else(|| {
@@ -697,7 +999,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_v1_with_defaults() {
+    fn default_is_current_with_defaults() {
         let cfg = MeshConfig::default();
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(cfg.auto_update.enabled);
@@ -718,34 +1020,12 @@ mod tests {
     }
 
     #[test]
-    fn v1_config_ring_migrates_to_full_mesh() {
-        let mut cfg = MeshConfig {
+    fn old_hard_alpha_config_is_refused_not_migrated() {
+        let old = MeshConfig {
             version: 1,
             ..Default::default()
         };
-        let mut net = NetworkConfig::from_network_id("n1", "net-one");
-        net.topology = TopologyMode::Ring { n_preferred: None };
-        cfg.networks.push(net);
-        let mut chosen = NetworkConfig::from_network_id("n2", "net-two");
-        chosen.topology = TopologyMode::Star {
-            hub: "hub-id".into(),
-        };
-        cfg.networks.push(chosen);
-
-        let migrated = migrate(cfg);
-        assert_eq!(migrated.version, CONFIG_VERSION);
-        assert_eq!(
-            migrated.networks[0].topology,
-            TopologyMode::FullMesh,
-            "a v1 ring was a full mesh in practice — load it as one"
-        );
-        assert!(
-            matches!(migrated.networks[1].topology, TopologyMode::Star { .. }),
-            "deliberately-chosen modes migrate untouched"
-        );
-        // Idempotent: running the migration again changes nothing.
-        let again = migrate(migrated.clone());
-        assert_eq!(again, migrated);
+        assert!(require_current_version(old).is_err());
     }
 
     #[test]
@@ -867,7 +1147,6 @@ mod tests {
         // A fresh device IS a node by default; the hosted services are
         // all opt-in.
         assert!(s.node.enabled);
-        assert!(!s.relay.enabled);
         assert!(!s.signaling.enabled);
         assert!(!s.stun.enabled);
         assert!(!s.turn.enabled);
@@ -880,27 +1159,6 @@ mod tests {
         assert!(s.signaling.limits.max_event_rate > 0);
         // TURN bandwidth is unlimited until configured.
         assert_eq!(s.turn.max_bps_per_connection, 0);
-    }
-
-    #[test]
-    fn node_defaults_on_for_old_configs() {
-        // A config written before the `node` toggle existed must still
-        // behave as a node (the field is #[serde(default)] → enabled).
-        let json = r#"{ "version": 1, "services": {}, "networks": [] }"#;
-        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.services.node.enabled);
-    }
-
-    #[test]
-    fn config_without_services_field_parses() {
-        // A config.json written by a build that predates the services
-        // block must still load — the field is #[serde(default)].
-        let json = r#"{
-            "version": 1,
-            "networks": []
-        }"#;
-        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.services, ServicesConfig::default());
     }
 
     #[test]

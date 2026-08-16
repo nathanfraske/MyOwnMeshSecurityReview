@@ -158,6 +158,6 @@ If you're maintaining a fork that publishes its own releases:
    your release feed.
 2. Set `MYOWNMESH_TRYSTERO_APP_ID` to a fork-specific app id so
    your peers land in their own signaling rooms.
-3. Update `SIGN_DOMAIN_TAG` in `crates/myownmesh-core/src/lib.rs`
-   if you want signature non-interop with upstream peers (default
-   is `"myownmesh-mesh-auth-v1:"`).
+3. Update `ENDPOINT_AUTH_DOMAIN_TAG` in
+   `crates/myownmesh-core/src/endpoint_auth/mod.rs` if the fork must use a
+   deliberately incompatible endpoint-authentication transcript domain.

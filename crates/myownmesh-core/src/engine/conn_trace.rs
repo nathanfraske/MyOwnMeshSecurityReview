@@ -119,8 +119,6 @@ fn tier_kind(t: &ConnectionTier) -> &'static str {
         ConnectionTier::WakeProbe => "wake_probe",
         ConnectionTier::IceWatchdog { .. } => "ice_watchdog",
         ConnectionTier::IceRestart { .. } => "ice_restart",
-        ConnectionTier::Rehandshake { .. } => "rehandshake",
-        ConnectionTier::RoomRejoin { .. } => "room_rejoin",
         ConnectionTier::StopStart => "stop_start",
     }
 }
@@ -379,13 +377,6 @@ mod tests {
                 since: Instant::now()
             }),
             "ice_watchdog"
-        );
-        assert_eq!(
-            tier_kind(&ConnectionTier::Rehandshake {
-                attempt: 1,
-                next_at: Instant::now()
-            }),
-            "rehandshake"
         );
         assert_eq!(tier_kind(&ConnectionTier::StopStart), "stop_start");
     }

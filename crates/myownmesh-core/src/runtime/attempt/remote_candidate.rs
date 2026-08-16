@@ -10,7 +10,6 @@ use crate::resource::{
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 const REMOTE_CANDIDATE_DIGEST_BYTES: u64 = 32;
@@ -101,64 +100,16 @@ pub(crate) fn remote_candidate_digest_retention_aggregate_claim(
     ])
 }
 
-/// Explicit optional limit on submissions observed by one candidate attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MaxCumulativeRemoteCandidateSubmissions(NonZeroU64);
-
-impl MaxCumulativeRemoteCandidateSubmissions {
-    pub(crate) const fn new(value: NonZeroU64) -> Self {
-        Self(value)
-    }
-}
-
-/// Explicit optional limit on candidate content observed by one attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MaxCumulativeRemoteCandidateContentBytes(NonZeroU64);
-
-impl MaxCumulativeRemoteCandidateContentBytes {
-    pub(crate) const fn new(value: NonZeroU64) -> Self {
-        Self(value)
-    }
-}
-
-/// Explicit optional limit on applications performed by one attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MaxCumulativeRemoteCandidateApplications(NonZeroU64);
-
-impl MaxCumulativeRemoteCandidateApplications {
-    pub(crate) const fn new(value: NonZeroU64) -> Self {
-        Self(value)
-    }
-}
-
-/// Optional local wrappers around provider-backed admission.
-///
-/// These values are never inferred and have no defaults. The provider remains
-/// the resource authority even when a local wrapper is present.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteCandidateLocalCeilings {
-    pub(crate) submissions: Option<MaxCumulativeRemoteCandidateSubmissions>,
-    pub(crate) content_bytes: Option<MaxCumulativeRemoteCandidateContentBytes>,
-    pub(crate) applications: Option<MaxCumulativeRemoteCandidateApplications>,
-}
-
-impl RemoteCandidateLocalCeilings {
-    pub(crate) const fn new(
-        submissions: Option<MaxCumulativeRemoteCandidateSubmissions>,
-        content_bytes: Option<MaxCumulativeRemoteCandidateContentBytes>,
-        applications: Option<MaxCumulativeRemoteCandidateApplications>,
-    ) -> Self {
-        Self {
-            submissions,
-            content_bytes,
-            applications,
-        }
-    }
-
-    pub(crate) const fn none() -> Self {
-        Self::new(None, None, None)
-    }
-}
+// Three optional cumulative ceilings used to stand here — submissions, content
+// bytes and native applications — together with the wrapper that carried them
+// and the counters that fed them. All of it is gone.
+//
+// They were optional because the provider was always the authority; they were
+// *only* ever set from the connector's owner-selected candidate policy, and
+// that policy no longer exists. What remains is what did the real refusing all
+// along: an exact `ResourceClaim` for the digest work, one for the retention,
+// and one for each native application, each acquired against the owner's real
+// grant and released when the attempt retires.
 
 /// Borrowed connector-neutral candidate content.
 #[derive(Clone, Copy, Debug)]
@@ -236,26 +187,23 @@ pub(crate) struct RemoteCandidateView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteCandidateLocalCeiling {
-    Submissions,
-    ContentBytes,
-    Applications,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteCandidateTerminalReason {
     Provider(ResourceUnavailable),
-    LocalCeiling(RemoteCandidateLocalCeiling),
-    OwnerRefused,
     AccountingInexact,
     Retired,
 }
 
+/// What the owner decides once it has seen the digest.
+///
+/// A third answer used to stand here — `Refuse` — for an owner that had looked
+/// at its own cumulative candidate budget and declined. There is no such budget
+/// any more, so nothing can produce that answer: an owner either recognises the
+/// digest or does not, and what refuses a candidate it does not recognise is
+/// the provider, one line below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteCandidateDigestDecision {
     Retain,
     Duplicate,
-    Refuse,
 }
 
 pub(crate) enum RemoteCandidateAdmission {
@@ -269,14 +217,10 @@ pub(crate) enum RemoteCandidateAdmissionError {
     InputLengthOverflow,
     #[error("the resource provider refused remote candidate work: {0}")]
     Provider(#[from] ResourceUnavailable),
-    #[error("the remote candidate attempt reached {0:?}")]
-    LocalCeiling(RemoteCandidateLocalCeiling),
     #[error("the remote candidate attempt is terminal: {0:?}")]
     Terminal(RemoteCandidateTerminalReason),
     #[error("remote candidate validation refused the submission before hashing")]
     ValidationRefused,
-    #[error("the remote candidate owner refused the submission after hashing")]
-    OwnerRefused,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -287,8 +231,6 @@ pub(crate) enum RemoteCandidateApplyError {
     NotRetained,
     #[error("the resource provider refused remote candidate application: {0}")]
     Provider(#[from] ResourceUnavailable),
-    #[error("the remote candidate attempt reached {0:?}")]
-    LocalCeiling(RemoteCandidateLocalCeiling),
 }
 
 #[derive(Clone)]
@@ -370,16 +312,12 @@ enum AttemptStatus {
 
 struct RemoteCandidateAttemptState {
     status: AttemptStatus,
-    cumulative_submissions: u64,
-    cumulative_content_bytes: u64,
-    cumulative_applications: u64,
     retained: BTreeMap<RemoteCandidateId, Arc<Mutex<RetainedRemoteCandidateState>>>,
 }
 
 struct RemoteCandidateAttemptInner {
     identity: RemoteCandidateAttemptIdentity,
     resources: ConnectorWorkResourceScope,
-    ceilings: RemoteCandidateLocalCeilings,
     state: Mutex<RemoteCandidateAttemptState>,
 }
 
@@ -393,22 +331,15 @@ pub(crate) struct RemoteCandidateAttempt {
 }
 
 impl RemoteCandidateAttempt {
-    pub(crate) fn new(
-        resources: ConnectorWorkResourceScope,
-        ceilings: RemoteCandidateLocalCeilings,
-    ) -> Self {
+    pub(crate) fn new(resources: ConnectorWorkResourceScope) -> Self {
         Self {
             inner: Arc::new(RemoteCandidateAttemptInner {
                 identity: RemoteCandidateAttemptIdentity {
                     marker: Arc::new(()),
                 },
                 resources,
-                ceilings,
                 state: Mutex::new(RemoteCandidateAttemptState {
                     status: AttemptStatus::Active,
-                    cumulative_submissions: 0,
-                    cumulative_content_bytes: 0,
-                    cumulative_applications: 0,
                     retained: BTreeMap::new(),
                 }),
             }),
@@ -423,9 +354,8 @@ impl RemoteCandidateAttempt {
     #[cfg(test)]
     pub(crate) fn restart(&mut self) {
         let resources = self.inner.resources.clone();
-        let ceilings = self.inner.ceilings;
         self.retire();
-        *self = Self::new(resources, ceilings);
+        *self = Self::new(resources);
     }
 
     pub(crate) fn retire(&self) {
@@ -461,7 +391,6 @@ impl RemoteCandidateAttempt {
         before_digest: impl FnOnce() -> bool,
         after_digest: impl FnOnce([u8; 32]) -> RemoteCandidateDigestDecision,
     ) -> Result<RemoteCandidateAdmission, RemoteCandidateAdmissionError> {
-        let content_bytes = input.content_bytes()?;
         let digest_work_bytes = input.digest_work_bytes()?;
         let mut state = self.lock_state();
         if let AttemptStatus::Terminal(reason) = state.status {
@@ -492,37 +421,8 @@ impl RemoteCandidateAttempt {
                 drop(work_lease);
                 return Ok(RemoteCandidateAdmission::Duplicate);
             }
-            RemoteCandidateDigestDecision::Refuse => {
-                drop(work_lease);
-                Self::terminalize(&mut state, RemoteCandidateTerminalReason::OwnerRefused);
-                return Err(RemoteCandidateAdmissionError::OwnerRefused);
-            }
             RemoteCandidateDigestDecision::Retain => {}
         }
-        let next_submissions = match self.inner.ceilings.submissions {
-            Some(limit) if state.cumulative_submissions >= limit.0.get() => {
-                drop(work_lease);
-                return Err(
-                    self.local_terminal(&mut state, RemoteCandidateLocalCeiling::Submissions)
-                );
-            }
-            Some(_) => state.cumulative_submissions + 1,
-            None => state.cumulative_submissions,
-        };
-        let next_content = match self.inner.ceilings.content_bytes {
-            Some(limit) => match state.cumulative_content_bytes.checked_add(content_bytes) {
-                Some(next) if next <= limit.0.get() => next,
-                Some(_) | None => {
-                    drop(work_lease);
-                    return Err(
-                        self.local_terminal(&mut state, RemoteCandidateLocalCeiling::ContentBytes)
-                    );
-                }
-            },
-            None => state.cumulative_content_bytes,
-        };
-        self.enforce_submission_ceilings(&mut state, next_submissions, next_content)?;
-
         let retained_claim = remote_candidate_digest_retention_aggregate_claim(1)
             .map_err(|_| RemoteCandidateAdmissionError::InputLengthOverflow)?;
         let retained_lease = match self
@@ -546,8 +446,6 @@ impl RemoteCandidateAttempt {
             lease: Some(retained_lease),
         }));
         state.retained.insert(candidate_id.clone(), retained);
-        state.cumulative_submissions = next_submissions;
-        state.cumulative_content_bytes = next_content;
         drop(work_lease);
 
         Ok(RemoteCandidateAdmission::Retained(OwnedRemoteCandidate {
@@ -556,40 +454,6 @@ impl RemoteCandidateAttempt {
             candidate_id,
             armed: true,
         }))
-    }
-
-    fn enforce_submission_ceilings(
-        &self,
-        state: &mut RemoteCandidateAttemptState,
-        next_submissions: u64,
-        next_content: u64,
-    ) -> Result<(), RemoteCandidateAdmissionError> {
-        if self
-            .inner
-            .ceilings
-            .submissions
-            .is_some_and(|limit| next_submissions > limit.0.get())
-        {
-            return Err(self.local_terminal(state, RemoteCandidateLocalCeiling::Submissions));
-        }
-        if self
-            .inner
-            .ceilings
-            .content_bytes
-            .is_some_and(|limit| next_content > limit.0.get())
-        {
-            return Err(self.local_terminal(state, RemoteCandidateLocalCeiling::ContentBytes));
-        }
-        Ok(())
-    }
-
-    fn local_terminal(
-        &self,
-        state: &mut RemoteCandidateAttemptState,
-        ceiling: RemoteCandidateLocalCeiling,
-    ) -> RemoteCandidateAdmissionError {
-        Self::terminalize(state, RemoteCandidateTerminalReason::LocalCeiling(ceiling));
-        RemoteCandidateAdmissionError::LocalCeiling(ceiling)
     }
 
     fn terminalize(state: &mut RemoteCandidateAttemptState, reason: RemoteCandidateTerminalReason) {
@@ -684,21 +548,6 @@ impl OwnedRemoteCandidate {
         if !matches!(attempt_state.status, AttemptStatus::Active) {
             return Err(RemoteCandidateApplyError::StaleAttempt);
         }
-        let next_applications = match attempt.ceilings.applications {
-            Some(limit) if attempt_state.cumulative_applications >= limit.0.get() => {
-                RemoteCandidateAttempt::terminalize(
-                    &mut attempt_state,
-                    RemoteCandidateTerminalReason::LocalCeiling(
-                        RemoteCandidateLocalCeiling::Applications,
-                    ),
-                );
-                return Err(RemoteCandidateApplyError::LocalCeiling(
-                    RemoteCandidateLocalCeiling::Applications,
-                ));
-            }
-            Some(_) => attempt_state.cumulative_applications + 1,
-            None => attempt_state.cumulative_applications,
-        };
         let Some(retained) = attempt_state.retained.get(&self.candidate_id).cloned() else {
             return Err(RemoteCandidateApplyError::NotRetained);
         };
@@ -726,7 +575,6 @@ impl OwnedRemoteCandidate {
             .take()
             .ok_or(RemoteCandidateApplyError::NotRetained)?;
         attempt_state.retained.remove(&self.candidate_id);
-        attempt_state.cumulative_applications = next_applications;
         self.armed = false;
         drop(retained_state);
         drop(attempt_state);
@@ -856,7 +704,6 @@ mod tests {
 
     fn fixture(
         grant: ResourceClaim,
-        ceilings: RemoteCandidateLocalCeilings,
     ) -> (
         FiniteResourceProvider,
         ConnectorResourceOwnerPort,
@@ -876,7 +723,7 @@ mod tests {
         let connector = permit
             .reserve_connector_candidate(ConnectorCandidateResourceClaim::exact_connector_floor())
             .expect("the explicit grant admits the connector candidate");
-        let attempt = RemoteCandidateAttempt::new(connector.work_resource_scope(), ceilings);
+        let attempt = RemoteCandidateAttempt::new(connector.work_resource_scope());
         (provider, owner, connector, lifetime, attempt)
     }
 
@@ -897,8 +744,7 @@ mod tests {
             .expect("fixture work is measurable");
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, work, queued);
-        let (provider, _owner, _connector, _lifetime, attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant);
         let saw_work = std::cell::Cell::new(false);
 
         let candidate = attempt
@@ -918,8 +764,7 @@ mod tests {
         let input = candidate_input();
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, 0, queued);
-        let (provider, _owner, _connector, _lifetime, attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant);
         let digest_called = std::cell::Cell::new(false);
 
         let first = attempt.admit_with_before_digest(input, || {
@@ -955,8 +800,7 @@ mod tests {
         let grant = test_grant(1, work, queued)
             .checked_sub(ResourceClaim::single(ResourceClass::QueuedBytes, queued))
             .expect("the refusal fixture removes only queued-byte capacity");
-        let (provider, _owner, _connector, _lifetime, attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant);
         let baseline_storage = provider.in_use().amount(ResourceClass::StorageObject);
 
         let error = match attempt.admit(input) {
@@ -983,8 +827,7 @@ mod tests {
             .expect("fixture work is measurable");
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, work, queued);
-        let (provider, _owner, _connector, _lifetime, attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant);
         let baseline_storage = provider.in_use().amount(ResourceClass::StorageObject);
         let candidate = attempt
             .admit(input)
@@ -1012,8 +855,7 @@ mod tests {
             .expect("fixture work is measurable");
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, work, queued);
-        let (provider, _owner, _connector, _lifetime, attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant);
         let candidate = attempt
             .admit(input)
             .expect("the explicit provider grant admits the candidate");
@@ -1030,8 +872,7 @@ mod tests {
             .expect("fixture work is measurable");
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, work, queued);
-        let (provider, _owner, _connector, _lifetime, mut attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, _connector, _lifetime, mut attempt) = fixture(grant);
         let candidate = attempt
             .admit(input)
             .expect("the explicit provider grant admits the candidate");
@@ -1046,35 +887,38 @@ mod tests {
         ));
     }
 
+    /// The grant is the ceiling, and it is attempt-scoped.
+    ///
+    /// This used to state an explicit one-submission local ceiling and check
+    /// that the second submission was refused against it. There is no local
+    /// ceiling to state now, so the same property is proven the only way it can
+    /// still be reached: a provider funded for exactly one retained candidate
+    /// admits one and refuses the next, and the refusal leaves the accounting
+    /// exactly where the first submission left it rather than charging for work
+    /// it did not keep.
     #[test]
-    fn arc03_remote_candidate_local_ceiling_is_explicit_and_attempt_scoped() {
+    fn arc03_remote_candidate_retention_is_bounded_by_the_grant_and_attempt_scoped() {
         let input = RemoteCandidateInput::candidate_only(b"candidate");
         let work = input
             .digest_work_bytes()
             .expect("fixture work is measurable");
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, work, queued);
-        let ceilings = RemoteCandidateLocalCeilings::new(
-            Some(MaxCumulativeRemoteCandidateSubmissions::new(
-                NonZeroU64::new(1).expect("one is nonzero"),
-            )),
-            None,
-            None,
-        );
-        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant, ceilings);
+        let (provider, _owner, _connector, _lifetime, attempt) = fixture(grant);
         let first = attempt
             .admit(input)
             .expect("the explicit first submission is admitted");
-        drop(first);
-        let baseline = provider.in_use();
+        assert_eq!(provider.in_use().amount(ResourceClass::QueuedBytes), queued);
 
-        assert_eq!(
+        assert!(matches!(
             attempt.admit(input).err(),
-            Some(RemoteCandidateAdmissionError::LocalCeiling(
-                RemoteCandidateLocalCeiling::Submissions
-            ))
-        );
-        assert_eq!(provider.in_use(), baseline);
+            Some(RemoteCandidateAdmissionError::Provider(_))
+        ));
+        // The refusal is terminal for this attempt, so what it had retained is
+        // released rather than half-kept behind a grant that cannot cover the
+        // next submission.
+        assert_eq!(provider.in_use().amount(ResourceClass::QueuedBytes), 0);
+        drop(first);
     }
 
     #[test]
@@ -1085,8 +929,7 @@ mod tests {
             .expect("fixture work is measurable");
         let queued = REMOTE_CANDIDATE_DIGEST_BYTES;
         let grant = test_grant(1, work, queued);
-        let (provider, _owner, connector, lifetime, attempt) =
-            fixture(grant, RemoteCandidateLocalCeilings::none());
+        let (provider, _owner, connector, lifetime, attempt) = fixture(grant);
         let first = attempt
             .admit_with_digest_decision(input, || true, |_| RemoteCandidateDigestDecision::Retain)
             .expect("the exact retention grant admits one unique candidate");

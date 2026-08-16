@@ -13,7 +13,14 @@ impl ConnectorCallbackClass {
     pub(super) fn for_event(event: &TransportEvent) -> Self {
         match event {
             TransportEvent::Message(_) => Self::EndpointData,
-            TransportEvent::AudioSample(_) | TransportEvent::VideoSample(_) => Self::Realtime,
+            // `Realtime` has no callback mailbox, so classing a unit this way
+            // makes the general callback route fail *closed* — `emit_inner`
+            // answers `WrongOwnerPath` rather than dropping it on the control
+            // lane uncapped, where a media flood would displace ICE and
+            // peer-state events. Real-time units take `emit_realtime`, which
+            // is charged, observed and gated; this is the backstop for a route
+            // that should never be taken.
+            TransportEvent::RealtimeUnit(_) => Self::Realtime,
             _ => Self::Control,
         }
     }
@@ -93,8 +100,9 @@ impl CallbackProducerClaims {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CallbackProducerOverload {
-    #[cfg(any(test, feature = "transport-lab"))]
-    LocalPolicyRequired,
+    // The two "the policy states no ceiling" refusals are gone with the policy
+    // surface that could omit one. A lab fixture now hands its four numbers in
+    // by value, so there is no absent-ceiling state left to report.
     PayloadSizeUnrepresentable {
         class: ConnectorCallbackClass,
     },
@@ -287,38 +295,70 @@ impl CallbackProducerOwner {
 
     /// Build a finite provider for the raw transport-lab compatibility API.
     ///
-    /// This path exists only outside the engine-owned connector. It requires
-    /// explicit local mailbox ceilings and derives its finite grant from those
-    /// ceilings plus the exact callback record shapes. It does not select a
-    /// production policy or create a basal product-object limit.
+    /// This path exists only outside the engine-owned connector, and its four
+    /// numbers come from the **fixture that calls it**, not from a policy type.
+    /// They used to arrive as owner-selected local ceilings on
+    /// `ConnectorCallbackPolicy`, which made a lab-only need look like a
+    /// production configuration surface and put four numbers in every
+    /// deployment's vocabulary to serve one test path. The numbers themselves
+    /// are unchanged and so is the arithmetic below; only who states them moved.
+    /// It does not select a production policy or create a basal product-object
+    /// limit.
+    ///
+    /// **Each class is funded from its own stated ceiling, at both phases.**
+    /// Control and endpoint data both carry payload bytes into
+    /// [`callback_phase_claim`], which charges `QueuedBytes` on the queued
+    /// phase, so a grant that funds only one class funds neither reliably — the
+    /// provider is a single pool and whichever class draws first decides whether
+    /// the other is refused. That is not a hypothetical: this path previously
+    /// derived its whole byte grant from an endpoint frame maximum and control
+    /// ICE candidates were admitted out of it, so removing that maximum left the
+    /// grant with zero `QueuedBytes` and every gathered candidate was refused.
+    ///
+    /// One ceiling shared by both classes would be the same defect in a softer
+    /// form — the grant would carry `max(control, endpoint)` for each and the
+    /// generously-sized class would pay for the other — so the two are stated
+    /// and applied separately. The reserved lifecycle deliveries are funded at
+    /// their real payload of zero rather than at either ceiling, because payload
+    /// surplus reserved for callbacks that carry no payload is exactly the
+    /// undeclared pool this whole repair exists to remove.
     #[cfg(any(test, feature = "transport-lab"))]
-    pub(super) fn for_local_lab_policy(
-        policy: ConnectorCallbackPolicy,
+    pub(super) fn for_local_lab_grant(
+        grant: TransportLabCallbackGrant,
     ) -> std::result::Result<Self, CallbackProducerOverload> {
-        let mailboxes = policy
-            .local_mailboxes()
-            .ok_or(CallbackProducerOverload::LocalPolicyRequired)?;
         let class = ConnectorCallbackClass::Control;
-        let control_slots = u64::try_from(mailboxes.control().get())
+        let control_slots = u64::try_from(grant.control_slots.get())
             .map_err(|_| CallbackProducerOverload::PayloadSizeUnrepresentable { class })?;
-        let endpoint_slots = u64::try_from(mailboxes.endpoint_data().get())
+        let endpoint_slots = u64::try_from(grant.endpoint_slots.get())
             .map_err(|_| CallbackProducerOverload::PayloadSizeUnrepresentable { class })?;
+
+        // The two numbers this path cannot infer, one per class. A fixture that
+        // mints its own provider states the largest payload it will fund for
+        // each; core picks neither, and neither class's limit is borrowed to
+        // stand in for the other's.
+        let control_payload = u64::try_from(grant.control_payload_bytes.get())
+            .map_err(|_| CallbackProducerOverload::PayloadSizeUnrepresentable { class })?;
+        let endpoint_payload = u64::try_from(grant.endpoint_payload_bytes.get()).map_err(|_| {
+            CallbackProducerOverload::PayloadSizeUnrepresentable {
+                class: ConnectorCallbackClass::EndpointData,
+            }
+        })?;
 
         let structural = CallbackProducerClaims::structural_only();
         let control = structural.for_class(ConnectorCallbackClass::Control);
         let endpoint = structural.for_class(ConnectorCallbackClass::EndpointData);
-        let control_slot = callback_phase_claim(control.queued, 0, true)
+        // Queued *and* executing, summed rather than maxed, because the native
+        // pump reaches both at once: a callback that has converted its payload
+        // holds the executing lease while the handoff behind it takes a queued
+        // one. Control carries payload bytes like any other queued class — a
+        // local ICE candidate is converted to JSON and queued, and those bytes
+        // are charged against `QueuedBytes` on the queued phase.
+        let control_slot = callback_phase_claim(control.queued, control_payload, true)
             .and_then(|queued| {
-                callback_phase_claim(control.executing, 0, false)
+                callback_phase_claim(control.executing, control_payload, false)
                     .and_then(|executing| queued.checked_add(executing))
             })
             .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?;
-        let endpoint_payload =
-            u64::try_from(crate::engine::MAX_ENDPOINT_FRAME_BYTES).map_err(|_| {
-                CallbackProducerOverload::PayloadSizeUnrepresentable {
-                    class: ConnectorCallbackClass::EndpointData,
-                }
-            })?;
         let endpoint_slot = callback_phase_claim(endpoint.queued, endpoint_payload, true)
             .and_then(|queued| {
                 callback_phase_claim(endpoint.executing, endpoint_payload, false)
@@ -328,6 +368,18 @@ impl CallbackProducerOwner {
                 class: ConnectorCallbackClass::EndpointData,
                 error,
             })?;
+        // The reserved lifecycle deliveries are funded at the payload they
+        // actually carry, which is none, and componentwise-maxed exactly as
+        // `reserve_lifecycle_delivery` reserves them. Handing them the control
+        // ceiling instead would be payload surplus for callbacks that never
+        // carry a payload — a pool five candidates deep that nothing declared,
+        // sitting where a real control admission could quietly draw on it.
+        let lifecycle_slot = callback_phase_claim(control.queued, 0, true)
+            .and_then(|queued| {
+                callback_phase_claim(control.executing, 0, false)
+                    .and_then(|executing| componentwise_max_claim(queued, executing))
+            })
+            .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?;
         let containers = scale_claim(
             callback_mailbox_container_claim()
                 .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?,
@@ -335,18 +387,13 @@ impl CallbackProducerOwner {
         )
         .map_err(|error| CallbackProducerOverload::ClaimArithmetic { class, error })?;
 
-        // Reserved open and close plus the three independently pending
-        // observations: renegotiation, ICE state, and peer-connection state.
-        const LIFECYCLE_SLOTS: u64 = 5;
-        let control_and_lifecycle_slots = control_slots.checked_add(LIFECYCLE_SLOTS).ok_or(
-            CallbackProducerOverload::ClaimArithmetic {
-                class,
-                error: crate::resource::ResourceClaimArithmeticError::Overflow {
-                    dimension: crate::resource::ResourceClass::CallbackOrScheduledWork,
-                },
-            },
-        )?;
-        let callback_claims = scale_claim(control_slot, control_and_lifecycle_slots)
+        let lifecycle_slots = u64::try_from(grant.observation_slots.get())
+            .map_err(|_| CallbackProducerOverload::PayloadSizeUnrepresentable { class })?;
+        let callback_claims = scale_claim(control_slot, control_slots)
+            .and_then(|claim| {
+                scale_claim(lifecycle_slot, lifecycle_slots)
+                    .and_then(|lifecycle| claim.checked_add(lifecycle))
+            })
             .and_then(|claim| {
                 scale_claim(endpoint_slot, endpoint_slots)
                     .and_then(|endpoint| claim.checked_add(endpoint))
@@ -358,7 +405,7 @@ impl CallbackProducerOwner {
         // live reservation. Include both scopes, both mailbox reservations,
         // every local queue/lifecycle reservation, and one executing callback.
         let reservation_records = 2_u64
-            .checked_add(LIFECYCLE_SLOTS)
+            .checked_add(lifecycle_slots)
             .and_then(|value| value.checked_add(control_slots))
             .and_then(|value| value.checked_add(endpoint_slots))
             .and_then(|value| value.checked_add(1))
@@ -412,6 +459,36 @@ impl CallbackProducerOwner {
             claims,
         }
     }
+}
+
+/// What one raw transport-lab fixture funds, stated by that fixture.
+///
+/// Four numbers and no policy: slot counts per class and the largest single
+/// payload the fixture will fund per class. Both payload figures are required
+/// together because a grant that funds one class out of the other's budget is
+/// the cross-funding defect this whole path was repaired for — an endpoint
+/// frame maximum standing in for an ICE candidate's bytes left `QueuedBytes`
+/// empty and refused every gathered candidate.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug)]
+pub struct TransportLabCallbackGrant {
+    pub control_slots: NonZeroUsize,
+    pub endpoint_slots: NonZeroUsize,
+    pub control_payload_bytes: NonZeroUsize,
+    pub endpoint_payload_bytes: NonZeroUsize,
+    /// Lifecycle deliveries this fixture funds: the reserved open and close,
+    /// plus however many of the three independently pending observations —
+    /// renegotiation, ICE state, peer-connection state — it will actually
+    /// produce.
+    ///
+    /// Stated rather than fixed at five, because a lifecycle delivery is funded
+    /// at a payload of zero and is therefore pure count capacity. A fixture that
+    /// reserves two and is granted five is holding three unattributed callback
+    /// slots in the same pool a control-class or endpoint insert draws from —
+    /// which is exactly how a control asserting "the next insert is refused"
+    /// gets it admitted instead, out of capacity nothing declared and nothing
+    /// consumes.
+    pub observation_slots: NonZeroUsize,
 }
 
 #[cfg(any(test, feature = "transport-lab"))]
@@ -568,34 +645,41 @@ pub(super) fn connector_construction_claims() -> std::result::Result<
 /// each local mailbox slot in both its queued and executing forms, plus one
 /// executing native-track callback for every track surface declared by the
 /// temporary compatibility profile. Production grants remain owner supplied.
+///
+/// The two payload ceilings arrive as arguments rather than being read off the
+/// policy here, and that is deliberate. This function has no way to refuse: its
+/// error type is claim arithmetic, so a missing ceiling could only become a
+/// silent zero — which is precisely the underfunding being repaired. The caller
+/// resolves them from the profile and refuses by name when one is absent, so
+/// there is no path on which a declared mailbox is funded for no payload.
 #[cfg(any(test, feature = "transport-lab"))]
 pub(super) fn connector_fixture_operation_claims(
-    policy: ConnectorCallbackPolicy,
+    slots: Option<(NonZeroUsize, NonZeroUsize)>,
     native_realtime_surfaces: usize,
+    control_payload: u64,
+    endpoint_payload: u64,
 ) -> std::result::Result<
     Vec<crate::resource::ResourceClaim>,
     crate::resource::ResourceClaimArithmeticError,
 > {
-    let Some(mailboxes) = policy.local_mailboxes() else {
+    let Some((control_slots, endpoint_slots)) = slots else {
         return Ok(Vec::new());
     };
     let structural = CallbackProducerClaims::structural_only();
     let mut claims = Vec::new();
 
     let control = structural.for_class(ConnectorCallbackClass::Control);
-    for _ in 0..mailboxes.control().get() {
-        claims.push(callback_phase_claim(control.queued, 0, true)?);
-        claims.push(callback_phase_claim(control.executing, 0, false)?);
+    for _ in 0..control_slots.get() {
+        claims.push(callback_phase_claim(control.queued, control_payload, true)?);
+        claims.push(callback_phase_claim(
+            control.executing,
+            control_payload,
+            false,
+        )?);
     }
 
     let endpoint = structural.for_class(ConnectorCallbackClass::EndpointData);
-    let endpoint_payload =
-        u64::try_from(crate::engine::MAX_ENDPOINT_FRAME_BYTES).map_err(|_| {
-            crate::resource::ResourceClaimArithmeticError::Overflow {
-                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
-            }
-        })?;
-    for _ in 0..mailboxes.endpoint_data().get() {
+    for _ in 0..endpoint_slots.get() {
         claims.push(callback_phase_claim(
             endpoint.queued,
             endpoint_payload,
@@ -666,7 +750,6 @@ impl CallbackWorkLease {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CallbackMailboxInsertErrorKind {
     Closed,
-    LocalItemCeiling,
     MissingLease,
     WrongClass,
     WrongPhase,
@@ -692,18 +775,18 @@ impl CallbackMailboxInsertError {
     }
 }
 
-/// One resource-backed callback mailbox with no basal item ceiling.
+/// One resource-backed callback mailbox with no item ceiling at all.
 ///
 /// Every queued value must arrive with a live queued-phase callback lease.
 /// The queue uses a linked representation so it does not retain unaccounted
 /// spare capacity. Each event record, its two queue links, and one allocator
-/// residual are part of that value's queued claim. An optional local item
-/// ceiling can further restrict a deployment, but provider pressure remains
-/// authoritative.
+/// residual are part of that value's queued claim, so provider pressure is not
+/// merely authoritative — it is the whole of the bound. The optional per-class
+/// slot count an owner could once state is gone: it could only refuse a
+/// callback the owner's real grant had already funded.
 pub(super) struct ResourceBackedCallbackMailbox {
     class: ConnectorCallbackClass,
     queue: SyncMutex<std::collections::LinkedList<QueuedTransportEvent>>,
-    local_item_ceiling: Option<std::num::NonZeroUsize>,
     ready: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
     _container_lease: crate::resource::ResourceLease,
@@ -717,7 +800,6 @@ impl CallbackProducerOwner {
     pub(super) fn create_mailbox(
         &self,
         class: ConnectorCallbackClass,
-        local_item_ceiling: Option<std::num::NonZeroUsize>,
         ready: Arc<tokio::sync::Notify>,
     ) -> std::result::Result<Arc<ResourceBackedCallbackMailbox>, CallbackProducerOverload> {
         let claim = callback_mailbox_container_claim()
@@ -731,7 +813,6 @@ impl CallbackProducerOwner {
         Ok(Arc::new(ResourceBackedCallbackMailbox {
             class,
             queue: SyncMutex::new(std::collections::LinkedList::new()),
-            local_item_ceiling,
             ready,
             closed: AtomicBool::new(false),
             _container_lease: lease,
@@ -769,15 +850,6 @@ impl ResourceBackedCallbackMailbox {
         let mut queue = self.queue.lock();
         if self.closed.load(Ordering::Acquire) {
             return Err(refusal(CallbackMailboxInsertErrorKind::Closed, event));
-        }
-        if self
-            .local_item_ceiling
-            .is_some_and(|ceiling| queue.len() >= ceiling.get())
-        {
-            return Err(refusal(
-                CallbackMailboxInsertErrorKind::LocalItemCeiling,
-                event,
-            ));
         }
         queue.push_back(event);
         drop(queue);
@@ -1243,26 +1315,26 @@ pub(super) struct ConnectorCallbackScheduler {
 }
 
 impl ConnectorCallbackScheduler {
+    /// One quantum per ready class, and real-time only when the policy admits
+    /// real-time work at all.
+    ///
+    /// The owner-selected weights this used to read are gone. What they were
+    /// configuring — which class runs next and for how long — is a property of
+    /// the rotation rather than of a deployment: every ready class gets one
+    /// turn, an empty class is skipped rather than waited on, and the cursor
+    /// advances, so service stays fair and work-conserving without a number for
+    /// an owner to state or for this file and the rotation to disagree about. A
+    /// disabled real-time policy scores zero, which is how a class that cannot
+    /// exist is skipped rather than given a turn that finds nothing.
     pub(super) fn new(policy: ConnectorCallbackPolicy) -> Self {
-        let weights = policy.local_service_weights().map_or_else(
-            || {
-                [
-                    1,
-                    1,
-                    usize::from(matches!(
-                        policy.realtime(),
-                        RealtimeConnectorPolicy::Enabled(_)
-                    )),
-                ]
-            },
-            |weights| {
-                [
-                    weights.control().get(),
-                    weights.endpoint_data().get(),
-                    weights.realtime().map_or(0, NonZeroUsize::get),
-                ]
-            },
-        );
+        let weights = [
+            1,
+            1,
+            usize::from(matches!(
+                policy.realtime(),
+                RealtimeConnectorPolicy::Enabled
+            )),
+        ];
         Self {
             weights,
             cursor: 0,
@@ -1558,6 +1630,14 @@ mod provider_tests {
         );
     }
 
+    /// A refusal hands the exact value and its lease back to the producer.
+    ///
+    /// The refusal this used to exercise was an owner-selected item ceiling,
+    /// which no longer exists — there is no count in front of a mailbox any
+    /// more, only the provider claim each queued callback already carries. The
+    /// property the control was really about outlives it: whatever a mailbox
+    /// refuses, it refuses by returning, so no producer is left waiting and no
+    /// lease is stranded inside a queue that did not take the value.
     #[test]
     fn resource_backed_mailbox_refuses_without_hiding_a_producer() {
         let claims = CallbackProducerClaims::structural_only();
@@ -1565,7 +1645,6 @@ mod provider_tests {
         let mailbox = owner
             .create_mailbox(
                 ConnectorCallbackClass::Control,
-                NonZeroUsize::new(1),
                 Arc::new(tokio::sync::Notify::new()),
             )
             .expect("container is admitted before allocation");
@@ -1580,7 +1659,12 @@ mod provider_tests {
                 callback_work: Some(first_work),
             })
             .unwrap_or_else(|_| panic!("first callback enters the mailbox"));
+        assert!(matches!(
+            mailbox.try_take().map(|queued| queued.event),
+            Some(TransportEvent::LocalIceCandidate(None))
+        ));
 
+        mailbox.close();
         let second_work = owner
             .try_admit(ConnectorCallbackClass::Control, 0)
             .expect("second callback is admitted before insertion");
@@ -1590,18 +1674,10 @@ mod provider_tests {
                 observation: None,
                 callback_work: Some(second_work),
             })
-            .expect_err("the explicit local ceiling refuses the exact value");
-        assert_eq!(
-            refused.kind(),
-            CallbackMailboxInsertErrorKind::LocalItemCeiling
-        );
+            .expect_err("a closed mailbox refuses the exact value");
+        assert_eq!(refused.kind(), CallbackMailboxInsertErrorKind::Closed);
         assert!(refused.into_event().callback_work.is_some());
-        assert!(matches!(
-            mailbox.try_take().map(|queued| queued.event),
-            Some(TransportEvent::LocalIceCandidate(None))
-        ));
 
-        mailbox.close();
         assert!(mailbox.is_closed());
         assert!(mailbox.is_empty());
     }
@@ -1613,7 +1689,6 @@ mod provider_tests {
         let mailbox = owner
             .create_mailbox(
                 ConnectorCallbackClass::Control,
-                None,
                 Arc::new(tokio::sync::Notify::new()),
             )
             .expect("mailbox is admitted");
@@ -1652,33 +1727,45 @@ mod provider_tests {
         ));
     }
 
+    /// Every admitted class gets its turn, and a class the policy admits no
+    /// work for gets none.
+    ///
+    /// The owner-selected weights this used to drive are gone, so what is under
+    /// test is the rotation itself: one quantum each, in order, round-robin. The
+    /// data-only leg is the discriminating half — a scheduler that gave the
+    /// real-time class a turn on a connector that will never produce a real-time
+    /// callback would spend a third of its rotation finding nothing, which is
+    /// exactly what the zero weight prevents.
     #[test]
-    fn weighted_scheduler_bounds_service_opportunity_for_every_admitted_class() {
-        fn nonzero(value: usize) -> NonZeroUsize {
-            NonZeroUsize::new(value).expect("test weight is nonzero")
-        }
-
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                nonzero(1),
-                nonzero(1),
-            ),
-            crate::runtime::attempt::ConnectorCallbackServiceWeights::new(
-                nonzero(2),
-                nonzero(3),
-                nonzero(1),
-            ),
-            RealtimeConnectorPolicy::enabled(),
-        )
-        .expect("fixture callback policy is valid");
-        let mut scheduler = ConnectorCallbackScheduler::new(policy);
+    fn the_scheduler_serves_every_admitted_class_and_skips_the_one_that_is_disabled() {
+        let mut scheduler =
+            ConnectorCallbackScheduler::new(ConnectorCallbackPolicy::elastic_realtime());
         let mut delivered = [0; 3];
         for _ in 0..6 {
             let class = scheduler.current();
             delivered[class.index()] += 1;
             scheduler.delivered(class);
         }
-        assert_eq!(delivered, [2, 3, 1]);
+        assert_eq!(
+            delivered,
+            [2, 2, 2],
+            "an enabled real-time policy rotates through all three classes evenly"
+        );
+
+        let mut data_only =
+            ConnectorCallbackScheduler::new(ConnectorCallbackPolicy::elastic_data_only());
+        let mut delivered = [0; 3];
+        for _ in 0..6 {
+            let class = data_only.current();
+            delivered[class.index()] += 1;
+            data_only.delivered(class);
+        }
+        assert_eq!(
+            delivered,
+            [3, 3, 0],
+            "and a data-only policy never offers a turn to the class it admits \
+             no work for"
+        );
 
         scheduler.cursor = ConnectorCallbackClass::Control.index();
         scheduler.remaining = scheduler.weights[scheduler.cursor];

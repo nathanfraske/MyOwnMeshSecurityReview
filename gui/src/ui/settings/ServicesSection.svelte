@@ -117,8 +117,8 @@
   <h3>Hosted services</h3>
   <p class="intro">
     This device can be any combination of a mesh node and hosted
-    infrastructure — relay, signaling, STUN, TURN. Each service runs in
-    the local daemon and is advertised to peers so they can discover and
+    infrastructure — signaling, STUN, TURN. Each service runs in the
+    local daemon and is advertised to peers so they can discover and
     adopt it, which is what makes a fully self-hosted, internet-isolated
     network practical.
   </p>
@@ -150,48 +150,15 @@
       <p class="svc-hint">
         Whether this device participates as a regular mesh member, joining
         its configured networks. Turn off to run a pure-infrastructure box
-        that only hosts the services below — the relay needs node
-        participation, so it goes idle when this is off.
+        that only hosts the services below.
       </p>
     </div>
 
-    <!-- Relay --------------------------------------------------------- -->
-    <div class="card">
-      <div class="card-head">
-        <label class="toggle">
-          <input
-            type="checkbox"
-            bind:checked={draft.relay.enabled}
-            onchange={markDirty}
-          />
-          <span class="svc-name">Relay</span>
-        </label>
-        <span class="status {report.relay.enabled ? 'on' : 'off'}">
-          {report.relay.enabled
-            ? `routing ${report.relay.networks} network${report.relay.networks === 1 ? "" : "s"}`
-            : "off"}
-        </span>
-      </div>
-      <p class="svc-hint">
-        Forwards traffic between roster members so peers that can each
-        reach this device, but not each other, can still talk — a router /
-        ingress / egress hub. Roster-gated on both ends.
-      </p>
-      {#if draft.relay.enabled}
-        <div class="fields">
-          <label class="field">
-            <span>Max broadcast fan-out</span>
-            <input
-              type="number"
-              min="0"
-              bind:value={draft.relay.max_fanout}
-              oninput={markDirty}
-            />
-            <span class="unit">0 = unlimited</span>
-          </label>
-        </div>
-      {/if}
-    </div>
+    <!-- There is no Relay card. It toggled forwarding of other members'
+         application payload through this device, which no longer exists:
+         peers talk endpoint to endpoint, and a peer that cannot reach
+         another directly uses TURN below, which relays packets without
+         ever holding an application frame. -->
 
     <!-- Signaling ----------------------------------------------------- -->
     <div class="card">

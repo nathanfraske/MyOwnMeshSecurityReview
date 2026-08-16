@@ -34,17 +34,13 @@ pub struct AuthorizedPeer {
     pub label: String,
     /// Unix-seconds timestamp of approval. Informational.
     pub approved_at: u64,
-    /// Authority tier within this network's governance. Defaults to
-    /// [`Role::Member`] so rosters written before the
-    /// `network_state_v1` feature shipped keep loading cleanly — and
-    /// so open networks (where the field is cosmetic) don't need to
-    /// stamp every entry.
+    /// Authority tier within this network's governance. Current-profile roster
+    /// entries always state it explicitly; open networks use `Member`.
     ///
     /// Source of truth for *enforced* authority on a closed network
     /// is the `roles` map on [`crate::NetworkState`] — this field is
     /// the locally-cached projection for fast peer-row rendering.
     /// They are kept in sync by the engine on every signed transition.
-    #[serde(default)]
     pub role: crate::network_state::Role,
 }
 
@@ -450,10 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn old_roster_without_role_field_parses_with_member_default() {
-        // Schema before `network_state_v1` shipped. Loading it must
-        // keep working — `role` defaults to Member via #[serde(default)]
-        // and the existing peer keeps its `approved_at` intact.
+    fn old_hard_alpha_roster_without_role_is_refused() {
         let old_json = r#"{
             "version": 1,
             "network_id": "net-a",
@@ -461,13 +454,7 @@ mod tests {
                 { "device_id": "peer1", "label": "Old laptop", "approved_at": 1700000000 }
             ]
         }"#;
-        let r: Roster = serde_json::from_str(old_json).unwrap();
-        assert_eq!(r.authorized_devices.len(), 1);
-        let p = &r.authorized_devices[0];
-        assert_eq!(p.device_id, "peer1");
-        assert_eq!(p.label, "Old laptop");
-        assert_eq!(p.approved_at, 1700000000);
-        assert_eq!(p.role, crate::network_state::Role::Member);
+        assert!(serde_json::from_str::<Roster>(old_json).is_err());
     }
 
     #[test]

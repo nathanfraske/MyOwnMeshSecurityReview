@@ -5,12 +5,18 @@
 //! The pre-active phases are:
 //!
 //!   1. `hello` — each side announces its claimed Device ID, a random
-//!      nonce, a verification code, and an optional capabilities
-//!      blob. Sent immediately on channel open.
-//!   2. `auth_response` — each side returns the other's nonce signed
-//!      with its own private key. Receiving a valid signature
-//!      authenticates that the sender owns the keypair matching its
-//!      claimed Device ID.
+//!      nonce, a verification code, and its supported feature ids.
+//!      Sent immediately on channel open. It carries no application
+//!      capability advertisement: a Hello is admitted before any
+//!      session exists, so a blob here would be attacker-controlled
+//!      application metadata arriving ahead of the boundary that
+//!      admits application payload. See [`handshake::HelloMessage`].
+//!   2. `auth_response` — each side returns its proof over the one
+//!      domain-separated endpoint-auth transcript. That transcript binds the
+//!      mesh context and profile, signer role, both Device IDs, both fresh
+//!      contributions, and both certificate fingerprints. Receiving a valid
+//!      proof authenticates the peer's key while binding it to this exact
+//!      endpoint-auth context; a nonce-only signature is not accepted.
 //!
 //! After mutual auth verification, the receiver side either
 //! auto-accepts (peer is in the roster) or queues the request for
@@ -26,10 +32,12 @@
 //!   - Application data over typed user-defined channels (see
 //!     [`crate::events`])
 //!
-//! Forward compat: a receiver getting an unknown `kind` silently
-//! drops the frame. Peers gate optional traffic per-peer via
-//! [`features`] capability negotiation so older peers aren't bombed
-//! with frames they'll discard.
+//! The frame set is closed. A receiver getting a `kind` this build
+//! does not implement refuses it — the frame fails to deserialize and
+//! reaches no handler — so there is no revision-tolerance to rely on.
+//! There is no optional feature negotiation or mixed-version mode in this
+//! alpha. `hello.features` carries only the closed endpoint-authentication
+//! profile required before any post-active frame is admitted.
 
 pub mod features;
 pub mod governance;
@@ -56,11 +64,185 @@ pub use topology::{ShelveMessage, UnshelveMessage};
 
 use serde::{Deserialize, Serialize};
 
+/// Exactly how many bytes `value`'s compact JSON encoding occupies, counted
+/// without building it.
+///
+/// **Why counting is not the same as encoding and measuring.** A retained buffer
+/// has to be funded before it exists, or the acquisition it is supposed to be
+/// gated by happens after the allocation it was gating — and every refusal path
+/// pays for a buffer it then throws away. Counting first makes the refusal free:
+/// under pressure, a stale session, or a closed gateway, nothing was built.
+///
+/// The count is exact rather than an upper bound. It is produced by the same
+/// serializer, over the same borrowed value, that
+/// [`encode_json_exact`] then runs — so a claim taken for this number funds
+/// precisely the buffer that follows, with nothing rounded up to be safe.
+///
+/// `None` for a value that will not serialize, and for one whose encoding would
+/// not fit in a `usize`. Both are refusals rather than panics: this counts
+/// application- and peer-supplied values.
+///
+/// **Private, and generic only inside this module.** "Counting is free" is a
+/// claim about the `Serialize` impl being walked, not about this writer: a
+/// hand-written impl may allocate, or do arbitrary work, while it writes. The
+/// two shapes below are derived over crate-owned types, so the property is
+/// checkable by reading them. Exposing the generic form would let a future
+/// caller pass a type nobody checked and escape the guarantee silently, so
+/// callers reach it through the concrete wrappers instead.
+fn encoded_json_len<T>(value: &T) -> Option<usize>
+where
+    T: Serialize + ?Sized,
+{
+    struct CountingWriter(usize);
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "encoded length exceeds the addressable range",
+                )
+            })?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
+/// Encode `value` into one allocation of exactly `len` bytes.
+///
+/// One allocation and no growth: the buffer is created at the counted size, so
+/// there is no doubling as it fills and no second buffer when it is boxed. That
+/// is what makes "the claim funds this allocation" a statement about a single
+/// object rather than about a peak.
+///
+/// `None` if the encoding does not come out at exactly `len`. A mismatch would
+/// mean the value changed between counting and encoding, and installing a buffer
+/// of one size under a lease taken for another is the defect this whole pattern
+/// exists to prevent — so it is refused rather than reconciled.
+///
+/// Private for the same reason as [`encoded_json_len`], and it must stay paired
+/// with it: the two have to walk the same impl for the count to describe the
+/// buffer.
+fn encode_json_exact<T>(value: &T, len: usize) -> Option<Box<[u8]>>
+where
+    T: Serialize + ?Sized,
+{
+    let mut buffer = Vec::with_capacity(len);
+    serde_json::to_writer(&mut buffer, value).ok()?;
+    (buffer.len() == len).then(|| buffer.into_boxed_slice())
+}
+
+/// First-stage classification obtained from the small leading JSON tag only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameAdmission {
+    Protocol,
+    Application,
+}
+
+/// What this side owes when a frame of this kind cannot be carried.
+///
+/// Read from the same bounded leading tag as [`FrameAdmission`], and read there
+/// for the same reason: the path that most needs the answer is the one where the
+/// frame was *never decoded*. A frame the resource owner will not fund is
+/// refused before its bytes are parsed, so a receiver that wants to distinguish
+/// "lost one datagram" from "stranded a caller" cannot ask the decoded message —
+/// asking it would mean parsing exactly the payload the refusal exists to avoid
+/// parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailurePolicy {
+    /// Dropping this frame settles nothing and strands nobody. Nothing local is
+    /// waiting on it, and the sender's contract for it is best-effort, so the
+    /// loss is the whole of the damage and the session carries on.
+    DropFrame,
+    /// This frame is the completion something local is waiting for, or is
+    /// itself a delivery contract. Dropping it leaves that waiter with nothing
+    /// else coming — the peer has already sent its one answer — so the session
+    /// that could not carry it ends, and the ending is what resolves the waiter.
+    EndSession,
+}
+
+/// A frame's admission phase and its failure policy, both from the leading tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClassifiedFrame {
+    pub(crate) admission: FrameAdmission,
+    pub(crate) on_failure: FailurePolicy,
+}
+
+/// Parse only the canonical leading `kind` envelope emitted by this protocol.
+///
+/// Mixed-version support is intentionally absent. A peer that reorders the tag
+/// behind attacker-controlled payload is malformed rather than making the
+/// classifier scan or deserialize that payload before admission.
+///
+/// **The failure policy defaults to [`FailurePolicy::EndSession`]**, including
+/// for a kind that is in the closed set but not named below and for one that is
+/// not in it at all. That is the fail-closed direction here: ending a session
+/// this side could not serve is the existing behaviour of every refusal site, so
+/// an unnamed kind keeps it, and only a kind proved to strand nobody is
+/// downgraded. A default of `DropFrame` would silently make some future
+/// completion-bearing variant lose its caller.
+pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
+    const PREFIX: &[u8] = br#"{"kind":""#;
+    const MAX_KIND_BYTES: usize = 32;
+    let rest = bytes.strip_prefix(PREFIX)?;
+    let end = rest
+        .iter()
+        .take(MAX_KIND_BYTES + 1)
+        .position(|byte| *byte == b'"')?;
+    if end > MAX_KIND_BYTES {
+        return None;
+    }
+    let kind = std::str::from_utf8(&rest[..end]).ok()?;
+    Some(match kind {
+        // The four pre-admission frames. Their policy is never read: they are
+        // handled before any session exists, so there is none to end. Named
+        // `EndSession` anyway rather than given a third variant meaning
+        // "inapplicable", which would be a value every consumer had to handle
+        // and no consumer could act on.
+        "hello" | "auth_response" | "approve" | "deny" => ClassifiedFrame {
+            admission: FrameAdmission::Protocol,
+            on_failure: FailurePolicy::EndSession,
+        },
+        // The one best-effort application delivery. A plain `Channel` frame
+        // carries no sequence, is acknowledged by nobody, and resolves no local
+        // wait: `MeshMessage::Channel` is delivered to whatever subscribers
+        // exist and forgotten. Its acknowledged counterpart is `ChannelSeq`,
+        // which is *not* named here — a sender retains that one until it is
+        // acked, so losing it silently is a hole in the contract this side
+        // publishes.
+        //
+        // This is the kind a peer can make expensive at will, and so the one a
+        // peer could otherwise use to end a session on demand by sending
+        // payload the owner will not fund. Backpressure is not a reason to
+        // destroy a session that is working.
+        "channel" => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::DropFrame,
+        },
+        _ => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
+        },
+    })
+}
+
 /// Tagged union of every wire frame the mesh transport carries.
-/// Receivers match on `kind`; unknown kinds are silently dropped on
-/// deserialize via the `Unknown` catch-all variant so we can decode
-/// the rest of an incoming stream even when a sender emits a frame
-/// from a future protocol revision.
+///
+/// The set is closed. There is no catch-all variant and no
+/// `serde(other)`, so a frame whose `kind` is not one of these fails
+/// to deserialize and is refused before any handler sees it. That is
+/// the point rather than an omission: tolerating a kind this build
+/// does not implement is mixed-version operation, which this protocol
+/// no longer offers. Frames are discrete, so refusing one costs
+/// nothing but that frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MeshMessage {
@@ -78,7 +260,7 @@ pub enum MeshMessage {
     RpcStreamChunk(RpcStreamChunkMessage),
     RpcStreamEnd(RpcStreamEndMessage),
 
-    // -- closed-network governance (gated by `network_state_v1`) --
+    // -- closed-network governance --
     /// Sender's snapshot of the network's governance state.
     /// Broadcast on ACTIVE; receivers compare against their own to
     /// detect drift.
@@ -93,7 +275,7 @@ pub enum MeshMessage {
     /// containing the signers the proposer had so far.
     NetworkStateSplit(NetworkStateSplitMessage),
 
-    // -- roster gossip (gated by `network_state_v1`) --
+    // -- roster gossip --
     /// Merkle-root summary of the sender's roster. Triggers a
     /// `RosterRequest` from receivers whose root disagrees.
     RosterSummary(RosterSummaryMessage),
@@ -117,16 +299,16 @@ pub enum MeshMessage {
         payload: serde_json::Value,
     },
 
-    // -- reliable channel delivery (gated by `reliable_channels_v1`) --
+    // -- reliable channel delivery --
     /// A channel frame under the acknowledged-delivery contract: one
-    /// entry of the sender's per-peer outbox stream. `stream` is minted
-    /// once per outbox lifetime (a fresh daemon run = a fresh stream) so
-    /// the receiver can tell a retransmit from a reset; `seq` is
-    /// strictly increasing within a stream. Receivers deliver exactly
+    /// entry of the sender's per-session reliable stream. `stream` is
+    /// minted once per promoted session (a fresh session = a fresh
+    /// stream) so the receiver can tell a retransmit from a reset; `seq`
+    /// is strictly increasing within a stream. Receivers deliver exactly
     /// once (dropping seqs at or below their high-water mark), then
-    /// acknowledge cumulatively with [`Self::ChannelAck`]. Senders keep
-    /// each entry queued — across session rebuilds — until acked or its
-    /// TTL lapses. See `engine::reliable`.
+    /// acknowledge cumulatively with [`Self::ChannelAck`]. Senders retain
+    /// each entry for the life of the session that queued it, until it is
+    /// acked or that session ends. See `engine::reliable`.
     ChannelSeq {
         stream: u64,
         seq: u64,
@@ -140,24 +322,195 @@ pub enum MeshMessage {
         stream: u64,
         up_to: u64,
     },
+}
 
-    /// Unknown frame from a future protocol revision. Captured here
-    /// so the receiver's deserializer doesn't fail the whole stream
-    /// — the engine forwards Unknown frames as `Diag` events but
-    /// otherwise ignores them.
-    #[serde(other)]
-    Unknown,
+/// [`MeshMessage::ChannelSeq`] with its two owned fields borrowed.
+///
+/// **Why a mirror instead of the variant.** Building the variant means owning
+/// its fields: a `String` copied out of the caller's channel name, and the
+/// payload moved in. A reliable send has to know the frame's exact encoded size
+/// *before* it acquires the capacity to retain it, and constructing the variant
+/// to find that out allocates on every path — including the ones that then
+/// refuse. This serializes from what the caller already has.
+///
+/// **It must encode byte-identically, and that is pinned by a control.** The
+/// tag is written first and then the fields in declaration order, which is
+/// exactly what `#[serde(tag = "kind")]` does for the variant, and the tag
+/// string is the `rename_all = "snake_case"` form of its name. Anything that
+/// changes `ChannelSeq`'s shape without changing this produces frames a peer
+/// cannot read, so [`tests::borrowed_channel_seq_encodes_exactly_like_the_variant`]
+/// fails on that change rather than shipping it.
+#[derive(Serialize)]
+pub(crate) struct BorrowedChannelSeq<'a> {
+    kind: &'static str,
+    stream: u64,
+    seq: u64,
+    channel: &'a str,
+    payload: &'a serde_json::Value,
+}
+
+impl<'a> BorrowedChannelSeq<'a> {
+    pub(crate) fn new(
+        stream: u64,
+        seq: u64,
+        channel: &'a str,
+        payload: &'a serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: "channel_seq",
+            stream,
+            seq,
+            channel,
+            payload,
+        }
+    }
+
+    /// Exactly how many bytes this frame will occupy on the wire, without
+    /// building it.
+    ///
+    /// Free of allocation because of what it walks: four scalars and two
+    /// borrows, all with derived or serde_json's own `Serialize`. The payload is
+    /// a `Value` the caller already owns, and writing one out neither copies it
+    /// nor builds an intermediate.
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        encoded_json_len(self)
+    }
+
+    /// The frame, in one allocation of exactly `len` bytes.
+    pub(crate) fn encode_exact(&self, len: usize) -> Option<Box<[u8]>> {
+        encode_json_exact(self, len)
+    }
+}
+
+impl CapabilityAdvert {
+    /// Exactly how many bytes this advertisement encodes to, without building
+    /// it.
+    ///
+    /// The shape is closed and its `Serialize` is derived, so the walk is a
+    /// `Vec<String>`, an `Option<String>` and a `Value` — no impl of anyone's
+    /// choosing runs here, which is what makes "counting costs nothing" a
+    /// property of this type rather than a hope about the caller's.
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        encoded_json_len(self)
+    }
+
+    /// The advertisement, in one allocation of exactly `len` bytes.
+    pub(crate) fn encode_exact(&self, len: usize) -> Option<Box<[u8]>> {
+        encode_json_exact(self, len)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The borrowed frame is the wire frame, byte for byte.
+    ///
+    /// This is what lets a reliable send count its size from borrowed fields and
+    /// then encode the bytes it actually puts on the wire from the same value.
+    /// If the two ever diverge, peers get a frame they cannot read — so the
+    /// comparison is over the whole encoding, not over its length, and the
+    /// values below exercise the parts most likely to drift: a channel name
+    /// needing escapes, and a payload that is a nested tree rather than a scalar.
     #[test]
-    fn unknown_kind_decodes_as_unknown_variant() {
+    fn borrowed_channel_seq_encodes_exactly_like_the_variant() {
+        let channel = "chat/\"room\"\n1";
+        let payload = serde_json::json!({
+            "nested": ["a", 1, true, null],
+            "unicode": "ü\u{1F600}",
+        });
+
+        let owned = serde_json::to_vec(&MeshMessage::ChannelSeq {
+            stream: 9,
+            seq: 4_294_967_297,
+            channel: channel.to_string(),
+            payload: payload.clone(),
+        })
+        .expect("the owned variant serializes");
+        let mirror = BorrowedChannelSeq::new(9, 4_294_967_297, channel, &payload);
+        let borrowed = serde_json::to_vec(&mirror).expect("the borrowed mirror serializes");
+
+        assert_eq!(
+            String::from_utf8_lossy(&borrowed),
+            String::from_utf8_lossy(&owned),
+            "the borrowed mirror must produce the exact frame the variant does"
+        );
+        assert_eq!(
+            mirror.encoded_len(),
+            Some(owned.len()),
+            "counting must agree with encoding, since the claim is taken from the count"
+        );
+    }
+
+    #[test]
+    fn bounded_leading_tag_classifies_without_parsing_application_payload() {
+        // Every payload below is unparseable JSON, and every answer is
+        // nonetheless exact: the classifier reads the tag and stops. That is
+        // the property both fields depend on, since the frame whose policy
+        // matters most is the one whose bytes are never decoded.
+        assert_eq!(
+            classify_frame(br#"{"kind":"hello","payload":[}}"#),
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Protocol,
+                on_failure: FailurePolicy::EndSession,
+            })
+        );
+        assert_eq!(
+            classify_frame(br#"{"kind":"channel","payload":[}}"#),
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Application,
+                on_failure: FailurePolicy::DropFrame,
+            })
+        );
+        assert_eq!(classify_frame(br#"{"payload":[],"kind":"hello"}"#), None);
+    }
+
+    /// Only the best-effort delivery is droppable, and the acknowledged one is
+    /// not.
+    ///
+    /// The discrimination the policy exists for, at the level it is decided.
+    /// `channel` and `channel_seq` share a prefix, a shape and a payload field;
+    /// they differ in that a `ChannelSeq` sender retains its frame until this
+    /// side acknowledges it. A policy that read the shape rather than the tag —
+    /// or that matched on a prefix — would give both the same answer, and one of
+    /// those answers is a silent hole in an acknowledged-delivery contract.
+    #[test]
+    fn only_the_best_effort_channel_frame_is_droppable() {
+        let policy = |raw: &str| {
+            classify_frame(raw.as_bytes())
+                .expect("a canonical envelope classifies")
+                .on_failure
+        };
+        assert_eq!(
+            policy(r#"{"kind":"channel","x":1}"#),
+            FailurePolicy::DropFrame
+        );
+        for completion_bearing in [
+            r#"{"kind":"channel_seq","x":1}"#,
+            r#"{"kind":"channel_ack","x":1}"#,
+            r#"{"kind":"rpc_response","x":1}"#,
+            r#"{"kind":"rpc_stream_chunk","x":1}"#,
+            r#"{"kind":"rpc_stream_end","x":1}"#,
+        ] {
+            assert_eq!(
+                policy(completion_bearing),
+                FailurePolicy::EndSession,
+                "a frame something local is waiting on is never silently lost: \
+                 {completion_bearing}"
+            );
+        }
+        // And the fail-closed default: a kind this build does not implement is
+        // not a licence to drop frames quietly.
+        assert_eq!(
+            policy(r#"{"kind":"definitely_not_a_real_kind","x":1}"#),
+            FailurePolicy::EndSession
+        );
+    }
+
+    #[test]
+    fn unknown_kind_is_refused() {
         let raw = r#"{"kind":"definitely_not_a_real_kind","whatever":1}"#;
-        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        assert!(matches!(msg, MeshMessage::Unknown));
+        assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
     }
 
     #[test]
@@ -168,10 +521,7 @@ mod tests {
             label: "Laptop".into(),
             nonce: "noncexyz".into(),
             verification_code: "abc123".into(),
-            capabilities: None,
-            max_connections: None,
-            features: vec!["ring_topology".into()],
-            app_version: Some("0.1.0".into()),
+            features: vec![Feature::ENDPOINT_AUTH_V1.into()],
         });
         let s = serde_json::to_string(&msg).unwrap();
         let back: MeshMessage = serde_json::from_str(&s).unwrap();
@@ -272,19 +622,13 @@ mod tests {
     }
 
     #[test]
-    fn old_peer_drops_governance_frame_as_unknown() {
-        // A v0 peer (no `network_state_v1` flag) receiving one of
-        // these frames just sees an Unknown variant — its dispatch
-        // loop logs and drops without errors. The sender side gates
-        // emission on the peer's advertised features, but receivers
-        // belt-and-braces handle the case.
+    fn a_governance_kind_this_build_implements_decodes_and_a_future_one_is_refused() {
+        // A supported peer decodes this exact frame.
         let raw = r#"{"kind":"network_state_propose","proposal_id":"x","variant":{"kind":"role_grant","target":"a","role":"member"},"proposer":"b","created_at":0,"signature":"s"}"#;
         let msg: MeshMessage = serde_json::from_str(raw).unwrap();
         assert!(matches!(msg, MeshMessage::NetworkStatePropose(_)));
-        // And the inverse — a future kind a v1 doesn't know about
-        // still hits Unknown.
+        // The inverse fails closed: there is no mixed-version live fallback.
         let raw_future = r#"{"kind":"network_state_some_future_thing","whatever":1}"#;
-        let msg: MeshMessage = serde_json::from_str(raw_future).unwrap();
-        assert!(matches!(msg, MeshMessage::Unknown));
+        assert!(serde_json::from_str::<MeshMessage>(raw_future).is_err());
     }
 }

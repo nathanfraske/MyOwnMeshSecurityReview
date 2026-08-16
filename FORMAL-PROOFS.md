@@ -336,6 +336,14 @@ Assume fresh endpoint challenges and channel binding. Replaying a control transc
 
 The endpoint-authentication transcript commits to channel-specific material and fresh endpoint contributions. A transcript for `c1` fails exact binding or freshness verification on `c2`.
 
+#### Implementation note
+
+The theorem and its premise are unchanged. This records only which disjunct the Arc 04 implementation relies on, because the two are not equally load-bearing there.
+
+The channel-specific material selected is the pair of DTLS certificate fingerprints. A certificate fingerprint is not session-unique: if `c1` and `c2` are between the same device pair and reuse the same certificates, the binding term is identical on both, and the *binding* disjunct alone would not refuse the replay. **The freshness disjunct therefore carries the theorem in that implementation**, via the two per-attempt contributions.
+
+Separately, and outside the scope of this theorem, transfer or survival of an already-issued capability across a channel replacement is prevented by connector-incarnation ownership. That is not a strengthening of the binding term: ownership does not make an otherwise-valid signature invalid. Should a true RFC 5705 exporter later replace the fingerprint term, the binding disjunct would become independently sufficient and the two refusal causes should be distinguishable.
+
 ## 8. No durable route identity is required
 
 ### Theorem 8.1. Route-identifier independence

@@ -263,52 +263,6 @@ impl PreAuthAttemptPermit {
             connected_claim: claim.connected,
         }))
     }
-
-    /// Acquire one connector candidate through the process provider's fair,
-    /// work-conserving speculative admission path.
-    ///
-    /// The attempt transition is not held across the wait. If retirement wins
-    /// while the provider demand is pending, the newly granted reservation is
-    /// dropped before a capability can be published.
-    pub(crate) async fn reserve_connector_candidate_cooperatively(
-        &self,
-        claim: ConnectorCandidateResourceClaim,
-    ) -> Result<
-        Option<(
-            ConnectorCandidateCapability,
-            crate::resource::ResourceReclaimSubscription,
-        )>,
-        crate::resource::ResourceUnavailable,
-    > {
-        {
-            let Ok(_transition) = self.attempt.transition.lock() else {
-                return Ok(None);
-            };
-            if !self.attempt.active.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-        }
-        let (reservation, reclaim_subscription) = self
-            .resource_scope
-            .reserve_cooperatively(claim.opening)
-            .await?;
-        let Ok(_transition) = self.attempt.transition.lock() else {
-            drop(reservation);
-            return Ok(None);
-        };
-        if !self.attempt.active.load(Ordering::Acquire) {
-            drop(reservation);
-            return Ok(None);
-        }
-        Ok(Some((
-            ConnectorCandidateCapability {
-                attempt: Arc::clone(&self.attempt),
-                reservation,
-                connected_claim: claim.connected,
-            },
-            reclaim_subscription,
-        )))
-    }
 }
 
 /// Admit one single-candidate attempt at the exact Arc 03 connector floor.

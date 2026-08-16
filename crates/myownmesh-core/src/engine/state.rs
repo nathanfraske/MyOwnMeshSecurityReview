@@ -5,57 +5,80 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
-use parking_lot::{Mutex, RwLock};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tracing::trace;
-
-use crate::channels::RawChannelFrame;
 use crate::config::{NetworkConfig, TopologyMode};
 use crate::error::{Error, Result};
 use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
 use crate::identity::Identity;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::resource::{
-    MeshRuntimeResourceScope, NetworkInstanceResourceScope, ProcessResourceRoot, ResourceReport,
+    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
+    LocalApplicationResourceScope, MeshRuntimeResourceScope, NetworkInstanceResourceScope,
+    ProcessResourceRoot, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxReceiver, ResourceMailboxSender,
+    ResourceReport,
 };
 use crate::roster::Roster;
-use crate::rpc::RpcInner;
+use crate::runtime::session_broker::SessionBroker;
 use crate::topology::Topology;
-use crate::transport::webrtc::{AudioSample, VideoSample};
+use crate::transport::webrtc::{
+    RealtimeDirection, RealtimeFlowError, RealtimeFlowName, RealtimeFlowRemains,
+    RealtimeFlowSetIdentity, RealtimeFlowSpec, RealtimeRecvUnit, RealtimeSendUnit,
+    SessionRealtimeFlows,
+};
 use crate::transport::{LocalIceCandidate, Transport};
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, watch};
+
+use super::peer_registry::{PeerOwnerToken, PeerRegistry};
+
+/// See a closed flow's native half retired, whichever half it had.
+///
+/// A free function rather than a method, and the only place the engine waits on
+/// either kind of retirement, so there is exactly one account of what closing a
+/// flow costs. Two would be two things that can disagree about which half a
+/// flow had.
+///
+/// The two arms are asymmetric because the ownership is. **Outbound** removal
+/// belongs to the pump, which is the only holder of the sender and the peer
+/// connection: closing the flow drops its queue, the pump wakes, removes its
+/// own track and completes the lease. The engine does not remove anything here
+/// — it waits for the removal to have happened. **Inbound** has no pump-side
+/// owner for the transceiver, so the engine stops it directly against the
+/// identity it takes out of the retirement the close handed back.
+///
+/// A dropped sender on the outbound lease is completion, not failure: it means
+/// the pump is gone, and a pump that is gone has already run its exit. There is
+/// nothing left to wait for and nothing a retry could learn, so the error is
+/// discarded rather than surfaced as a close failure the caller cannot act on.
+///
+/// Awaits, so every caller is outside the fence before it runs. Nothing here is
+/// retried, timed or generation-checked.
+async fn retire_realtime_remains(
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+    remains: RealtimeFlowRemains,
+) {
+    match remains {
+        RealtimeFlowRemains::Inbound(mut retirement) => {
+            // Taken rather than dropped: this caller is going to await the
+            // receipt, and the retirement must not also submit one of its own
+            // behind it. Dropping it instead would still retire the
+            // transceiver — it would just do it without telling anybody.
+            let identity = retirement.take_for_explicit_close();
+            worker.close_inbound_realtime_transceiver(&identity).await;
+        }
+        RealtimeFlowRemains::Outbound(completed) => {
+            let _ = completed.await;
+        }
+        // A flow whose native half never came up, or one whose pump has already
+        // taken the cleanup because the flow set was dropped rather than closed.
+        RealtimeFlowRemains::None => {}
+    }
+}
 
 use super::conn_trace::ConnTrace;
-use super::connection::PeerConnection;
 use super::scheduler::{
     RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS, RELAY_RESCUE_MIN_INTERVAL_MS,
 };
-
-/// One assembled video access unit from a peer's track lane, as the
-/// embedder-facing subscription surfaces it.
-#[derive(Debug, Clone)]
-#[cfg_attr(
-    not(feature = "legacy-media"),
-    allow(dead_code, reason = "frozen legacy-media compatibility value")
-)]
-pub struct InboundVideoSample {
-    /// The authenticated peer the unit arrived from.
-    pub from: String,
-    pub sample: VideoSample,
-}
-
-/// One audio frame from a peer's track lane, as the engine's
-/// subscribers receive it (tagged with the sending peer).
-#[derive(Debug, Clone)]
-#[cfg_attr(
-    not(feature = "legacy-media"),
-    allow(dead_code, reason = "frozen legacy-media compatibility value")
-)]
-pub struct InboundAudioSample {
-    /// Sending peer's device id.
-    pub from: String,
-    pub sample: AudioSample,
-}
 
 /// Bookkeeping for an offerer-side reconnect intent. When we drop a peer we
 /// were the *offerer* for (a recoverable `IceFailed`), we keep one of these
@@ -102,8 +125,21 @@ fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
 /// reconfiguration use this serialized path. Connector events remain on their
 /// bounded per-worker runtime path and do not enter this enum.
 pub enum NetworkCmd {
-    /// Stop the engine and tear down all peer sessions.
-    Shutdown,
+    /// A session was just minted for this exact owner.
+    ///
+    /// Enqueued synchronously by the registry fence at the moment of promotion,
+    /// and handled here so the work happens after every fence lock is released.
+    /// It carries the exact owner rather than a device id: a replacement
+    /// resolves to a different token, so a command cannot be applied to a
+    /// session that did not mint it.
+    ///
+    /// Emitted once per session, on the call that minted it — never on reuse and
+    /// never on a refusal. A promotion the provider refuses mints nothing and
+    /// announces nothing; the later operation that finally promotes is the one
+    /// that announces.
+    ReplayCapabilities {
+        owner: super::peer_registry::PeerOwnerToken,
+    },
     /// Switch the topology selector at runtime.
     SetTopology(TopologyMode),
     /// Approve a peer into the roster (and emit the approve frame).
@@ -128,8 +164,8 @@ pub enum NetworkCmd {
     /// signaling + renegotiate ICE with every peer); `peer == Some(id)`
     /// reconnects just that one peer. Nothing is torn down and no `Leave` is
     /// announced, so peers keep their sessions and app-level state — this is
-    /// the gentle recovery the GUI's refresh / reconnect controls drive
-    /// instead of the old `NetworkRemove` + `NetworkAdd`. See
+    /// the gentle recovery the GUI's refresh / reconnect controls drive, in
+    /// place of a `NetworkRemove` + `NetworkAdd` pair. See
     /// [`super::network_watch::reconnect_all_in_place`].
     Reconnect { peer: Option<String> },
     /// Deliberately dial exactly one signaling-discovered peer as the
@@ -150,35 +186,20 @@ pub enum NetworkCmd {
         /// When present, resolved once the peer reaches ACTIVE (or
         /// with the reason on a terminal failure). `None` preserves
         /// the fire-and-forget contract.
-        reply: Option<oneshot::Sender<Result<()>>>,
+        reply: Option<ConnectWaiterRegistration>,
     },
-    /// Open the lowest free media lane of `kind` toward `peer`,
-    /// resolving with the lane id. The explicit twin of the
-    /// write-time auto-open.
-    #[cfg(feature = "legacy-media")]
-    MediaLaneOpen {
-        peer: String,
-        kind: crate::transport::webrtc::LaneKind,
-        reply: oneshot::Sender<Result<u8>>,
-    },
-    /// Close an open media lane (idempotent) — the track is removed
-    /// and the next renegotiation drops its m-line send side.
-    #[cfg(feature = "legacy-media")]
-    MediaLaneClose {
-        peer: String,
-        kind: crate::transport::webrtc::LaneKind,
-        lane: u8,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Queue a channel frame for acknowledged delivery (see
-    /// [`super::reliable`]): parked until the peer's link is up,
-    /// retransmitted across session rebuilds, resolved on the peer's
-    /// cumulative ack (or with an error at TTL / terminal failure).
+    /// Retain a channel frame for acknowledged delivery under the peer's
+    /// current session (see [`super::reliable`]), resolved on the peer's
+    /// cumulative acknowledgement.
+    ///
+    /// Refused outright, with the reason, when the peer has no live session or
+    /// when the provider will not fund retaining the frame. There is no deadline to expire against and
+    /// no ceiling to be backpressured by: an entry ends when it is acknowledged
+    /// or when its session does, and both are events, not guesses.
     SendChannelReliable {
         peer: String,
         channel: String,
         payload: serde_json::Value,
-        ttl_ms: Option<u64>,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Send a [`crate::protocol::MeshMessage::Channel`] frame to
@@ -202,16 +223,26 @@ pub enum NetworkCmd {
         reply: oneshot::Sender<Result<()>>,
     },
     /// Push a new capabilities advert to every active peer.
-    BroadcastCapabilities {
-        caps: CapabilityAdvert,
-        reply: oneshot::Sender<usize>,
-    },
+    ///
+    /// Fire-and-forget, and deliberately so: it replaced a variant that carried
+    /// a `oneshot::Sender<usize>` for the caller to wait on. A oneshot nobody
+    /// reads is still an allocation the command retains and the mailbox funds,
+    /// and `Rpc::advertise`'s documented answer is its local commit rather than
+    /// how many peers the push reached — so the reply channel was charged for on
+    /// every advertisement and read on none.
+    ///
+    /// Fire-and-forget, but not unaccounted: the resource mailbox funds the
+    /// payload, its node, and the scheduled work, and the driver's own lifecycle
+    /// owns the running of it. That is the difference between this and the
+    /// detached task it replaces, which was scheduled work no owner had funded
+    /// and no shutdown could wait for.
+    FanoutCapabilities { caps: CapabilityAdvert },
     // ---- governance (closed networks) ----
     /// Float a new signed transition. The engine signs with the
     /// local identity, persists the proposal to the governance
     /// state's pending list, and broadcasts a
     /// `NetworkStatePropose` to every active peer that supports
-    /// `network_state_v1`. Reply carries the new proposal id so
+    /// the current closed governance profile. Reply carries the new proposal id so
     /// the caller can correlate acks.
     ProposeTransition {
         variant: crate::network_state::TransitionVariant,
@@ -261,6 +292,129 @@ pub enum NetworkCmd {
     },
 }
 
+impl ResourceMailboxItem for NetworkCmd {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = match self {
+            Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
+            Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
+            Self::ApproveRoster {
+                device_id, label, ..
+            } => strings_measure([device_id.as_str(), label.as_str()])?,
+            Self::RemoveRoster { device_id, .. } | Self::ConnectPeer { device_id, .. } => {
+                strings_measure([device_id.as_str()])?
+            }
+            Self::DropPeer { device_id, reason } => {
+                let reason = match reason {
+                    DropReason::TransportError { message } => Some(message.as_str()),
+                    DropReason::Denied
+                    | DropReason::IceFailed
+                    | DropReason::AuthFailed
+                    | DropReason::UserLeft
+                    | DropReason::TopologyPruned
+                    | DropReason::HeartbeatTimeout => None,
+                };
+                strings_measure([Some(device_id.as_str()), reason].into_iter().flatten())?
+            }
+            Self::Reconnect { peer } => strings_measure(peer.iter().map(String::as_str))?,
+            Self::SendChannelReliable {
+                peer,
+                channel,
+                payload,
+                ..
+            }
+            | Self::SendChannelFrame {
+                peer,
+                channel,
+                payload,
+                ..
+            } => checked_measure_add(
+                strings_measure([peer.as_str(), channel.as_str()])?,
+                mailbox_measure_serialized(payload)?,
+            )?,
+            Self::BroadcastChannelFrame {
+                channel, payload, ..
+            } => checked_measure_add(
+                strings_measure([channel.as_str()])?,
+                mailbox_measure_serialized(payload)?,
+            )?,
+            Self::SendRpcRequest { peer, request, .. } => checked_measure_add(
+                strings_measure([peer.as_str()])?,
+                mailbox_measure_serialized(request)?,
+            )?,
+            Self::FanoutCapabilities { caps } => mailbox_measure_serialized(caps)?,
+            Self::ProposeTransition {
+                variant, mfa_code, ..
+            } => checked_measure_add(
+                mailbox_measure_serialized(variant)?,
+                strings_measure(mfa_code.iter().map(String::as_str))?,
+            )?,
+            Self::SignProposal {
+                proposal_id,
+                mfa_code,
+                ..
+            } => checked_measure_add(
+                strings_measure([proposal_id.as_str()])?,
+                strings_measure(mfa_code.iter().map(String::as_str))?,
+            )?,
+            Self::DenyProposal { proposal_id, .. }
+            | Self::WithdrawProposal { proposal_id, .. }
+            | Self::SpawnSplit { proposal_id, .. } => strings_measure([proposal_id.as_str()])?,
+        };
+        // Channel/Arc-backed effects are opaque dependency allocations, not OS
+        // sockets or handles. The payload walk above counts its own allocations;
+        // this adds only allocations retained by reply/cancellation effects.
+        let effect_allocations = match self {
+            // No reply, no cancellation, no channel: nothing to fund past the
+            // payload the walk above already measured.
+            Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
+            Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
+            Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
+            Self::ApproveRoster { .. }
+            | Self::RemoveRoster { .. }
+            | Self::SendChannelReliable { .. }
+            | Self::SendChannelFrame { .. }
+            | Self::BroadcastChannelFrame { .. }
+            | Self::SendRpcRequest { .. }
+            | Self::ProposeTransition { .. }
+            | Self::SignProposal { .. }
+            | Self::DenyProposal { .. }
+            | Self::WithdrawProposal { .. }
+            | Self::SpawnSplit { .. }
+            | Self::GovernanceSnapshot { .. } => 1,
+        };
+        let allocations = measure.2.checked_add(effect_allocations).ok_or(
+            ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::OpaqueDependencyResidual,
+            },
+        )?;
+        mailbox_retained_claim::<Self>(measure.0, measure.1, allocations)
+    }
+}
+
+pub struct ConnectWaiterRegistration {
+    pub(super) id: u64,
+    pub(super) reply: oneshot::Sender<Result<()>>,
+    pub(super) cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(super) struct ConnectWaitCancellation<'a> {
+    pub(super) state: &'a NetworkState,
+    pub(super) device_id: String,
+    pub(super) id: u64,
+    pub(super) cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) armed: bool,
+}
+
+impl Drop for ConnectWaitCancellation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.cancel_connect_waiter(&self.device_id, self.id);
+        }
+    }
+}
+
 /// Inbound signaling messages from the signaling task.
 #[derive(Debug)]
 pub enum SignalingInbound {
@@ -297,212 +451,30 @@ impl SignalingInbound {
     }
 }
 
-/// Narrow owner of the current peer set.
-///
-/// Callers can take owned read snapshots, but only this registry can install,
-/// replace, remove, or retire peers. Every ownership exit explicitly ends the
-/// connector worker even when another task retains an external
-/// `Arc<PeerConnection>`.
-pub(super) struct PeerRegistry {
-    peers: DashMap<String, PeerRegistryEntry>,
-    mutation: Mutex<()>,
-}
-
-struct PeerRegistryEntry {
-    peer: Arc<PeerConnection>,
-    installation: Arc<()>,
-}
-
-/// Unforgeable process-local identity for one installed peer owner.
-///
-/// This is carried by delayed engine work so a timer or callback created for
-/// peer A cannot mutate or remove replacement peer B under the same device id.
-/// It is not authentication, application, or durable mesh authority.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct PeerOwnerToken {
-    peer: Arc<PeerConnection>,
-    installation: Arc<()>,
-}
-
-impl PeerOwnerToken {
-    pub(crate) fn device_id(&self) -> &str {
-        &self.peer.device_id
-    }
-}
-
-impl Default for PeerRegistry {
-    fn default() -> Self {
-        Self {
-            peers: DashMap::new(),
-            mutation: Mutex::new(()),
-        }
-    }
-}
-
-impl PeerRegistry {
-    pub(super) fn get(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
-        self.peers
-            .get(device_id)
-            .map(|entry| Arc::clone(&entry.value().peer))
-    }
-
-    pub(super) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
-        self.peers.get(device_id).map(|entry| PeerOwnerToken {
-            peer: Arc::clone(&entry.value().peer),
-            installation: Arc::clone(&entry.value().installation),
-        })
-    }
-
-    pub(super) fn get_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
-        self.peers.get(owner.device_id()).and_then(|entry| {
-            Arc::ptr_eq(&entry.value().installation, &owner.installation)
-                .then(|| Arc::clone(&entry.value().peer))
-        })
-    }
-
-    /// Run one synchronous effect only while `owner` is still the installed
-    /// peer. Registry replacement and removal take the same mutation lock, so
-    /// the effect cannot cross from an accepted callback for peer A into a
-    /// replacement peer B that reused the same device id.
-    pub(super) fn with_current<R>(
-        &self,
-        owner: &PeerOwnerToken,
-        effect: impl FnOnce(&Arc<PeerConnection>) -> R,
-    ) -> Option<R> {
-        let _mutation = self.mutation.lock();
-        let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
-            return None;
-        }
-        Some(effect(&current.value().peer))
-    }
-
-    pub(super) fn contains_key(&self, device_id: &str) -> bool {
-        self.peers.contains_key(device_id)
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.peers.len()
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.peers.is_empty()
-    }
-
-    /// Snapshot peer owners without duplicating registry keys. The peer already
-    /// owns its device id, so value-oriented scans need one `Arc` clone only.
-    pub(super) fn values_snapshot(&self) -> Vec<Arc<PeerConnection>> {
-        self.peers
-            .iter()
-            .map(|entry| Arc::clone(&entry.value().peer))
-            .collect()
-    }
-
-    /// Build one output vector from an `Arc`-only snapshot. The DashMap guards
-    /// are released before the callback can take a peer-state lock. This avoids
-    /// the old key clones without introducing a registry-to-peer lock order.
-    pub(super) fn collect_map<T>(
-        &self,
-        mut map: impl FnMut(&PeerConnection) -> Option<T>,
-    ) -> Vec<T> {
-        self.values_snapshot()
-            .into_iter()
-            .filter_map(|peer| map(peer.as_ref()))
-            .collect()
-    }
-
-    /// Visit an `Arc`-only snapshot after releasing every DashMap guard.
-    pub(super) fn visit(&self, mut visit: impl FnMut(&PeerConnection)) {
-        for peer in self.values_snapshot() {
-            visit(peer.as_ref());
-        }
-    }
-
-    pub(super) fn count_where(&self, mut predicate: impl FnMut(&PeerConnection) -> bool) -> usize {
-        self.values_snapshot()
-            .into_iter()
-            .filter(|peer| predicate(peer.as_ref()))
-            .count()
-    }
-
-    /// Snapshot only registry keys for topology code that does not need peer
-    /// state or connector ownership.
-    pub(super) fn device_ids_snapshot(&self) -> Vec<String> {
-        self.peers.iter().map(|entry| entry.key().clone()).collect()
-    }
-
-    pub(super) fn install(&self, peer: Arc<PeerConnection>) -> Option<Arc<PeerConnection>> {
-        let device_id = peer.device_id.clone();
-        let _mutation = self.mutation.lock();
-        if self
-            .peers
-            .get(&device_id)
-            .is_some_and(|current| Arc::ptr_eq(&current.value().peer, &peer))
-        {
-            return None;
-        }
-        if peer.registry_retired() {
-            return None;
-        }
-        let replaced = self
-            .peers
-            .insert(
+impl ResourceMailboxItem for SignalingInbound {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = match self {
+            Self::PeerAnnounced { device_id } | Self::PeerLeft { device_id } => {
+                strings_measure([device_id.as_str()])?
+            }
+            Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
+                strings_measure([device_id.as_str(), sdp.as_str()])?
+            }
+            Self::Candidate {
                 device_id,
-                PeerRegistryEntry {
-                    peer,
-                    installation: Arc::new(()),
-                },
-            )
-            .map(|entry| entry.peer);
-        if let Some(replaced) = replaced.as_ref() {
-            replaced.retire_connector();
-        }
-        replaced
-    }
-
-    pub(super) fn remove(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
-        let _mutation = self.mutation.lock();
-        let (_, entry) = self.peers.remove(device_id)?;
-        let peer = entry.peer;
-        peer.retire_connector();
-        Some(peer)
-    }
-
-    pub(super) fn remove_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
-        let _mutation = self.mutation.lock();
-        let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
-            return None;
-        }
-        drop(current);
-        let (_, entry) = self.peers.remove(owner.device_id())?;
-        let peer = entry.peer;
-        peer.retire_connector();
-        Some(peer)
-    }
-
-    /// Remove every current owner after retiring its connector worker.
-    /// Returned peers let shutdown close sessions after map ownership ends.
-    pub(super) fn retire_all(&self) -> Vec<Arc<PeerConnection>> {
-        let _mutation = self.mutation.lock();
-        let retired: Vec<_> = self
-            .peers
-            .iter()
-            .map(|entry| Arc::clone(&entry.value().peer))
-            .collect();
-        for peer in &retired {
-            peer.retire_connector();
-        }
-        self.peers.clear();
-        retired
-    }
-}
-
-impl Drop for PeerRegistry {
-    fn drop(&mut self) {
-        let retired = self.retire_all();
-        drop(retired);
+                candidate,
+            } => strings_measure(
+                [
+                    Some(device_id.as_str()),
+                    Some(candidate.candidate.as_str()),
+                    candidate.sdp_mid.as_deref(),
+                    candidate.username_fragment.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            )?,
+        };
+        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
     }
 }
 
@@ -535,22 +507,60 @@ pub enum SignalingOutbound {
     },
 }
 
+impl ResourceMailboxItem for SignalingOutbound {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = match self {
+            Self::Announce | Self::Leave => (0, 0, 0),
+            Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
+                strings_measure([device_id.as_str(), sdp.as_str()])?
+            }
+            Self::Candidate {
+                device_id,
+                candidate,
+            } => strings_measure(
+                [
+                    Some(device_id.as_str()),
+                    Some(candidate.candidate.as_str()),
+                    candidate.sdp_mid.as_deref(),
+                    candidate.username_fragment.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            )?,
+        };
+        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+    }
+}
+
 /// The shared state for a single joined network. Every long-lived
 /// subsystem (driver loop, channels, rpc, handle) holds an
-/// `Arc<NetworkState>`. Internally everything uses non-blocking
-/// concurrent primitives (DashMap, RwLock, broadcast) so callers
-/// don't serialize on a single lock.
+/// `Arc<NetworkState>`. Independent ownership domains use their own narrow
+/// locks and notification points rather than one process-wide state lock.
 pub struct NetworkState {
     pub network_id: String,
     pub identity: Arc<Identity>,
     pub transport: Transport,
     resource_scope: NetworkInstanceResourceScope,
+    local_resources: LocalApplicationResourceScope,
+    /// The one owner of session promotion for this network instance.
+    ///
+    /// `None` when the process owner installed no resource provider. That is
+    /// fail-closed: there is no post-authentication capacity to reserve, so no
+    /// session promotes and no application operation runs. It is deliberately
+    /// not a compatibility mode — nothing falls back to a peer string.
+    ///
+    /// `pub(super)` so the engine's own send path can hand it to the fence, and
+    /// no wider: promotion itself happens inside the registry mutation lock,
+    /// which is the only place the policy conjunct is true of an installation
+    /// rather than of a device id. Nothing outside the engine can reach it, and
+    /// there is no public accessor.
+    pub(crate) session_broker: Option<SessionBroker>,
 
     pub config: RwLock<NetworkConfig>,
     pub topology: RwLock<TopologyMode>,
     pub topology_impl: RwLock<Box<dyn Topology>>,
 
-    pub(super) peers: PeerRegistry,
+    pub(crate) peers: PeerRegistry,
     pub roster: RwLock<Roster>,
     /// Signed governance state — kind + role assignments + the
     /// append-only signed transition log + pending proposals.
@@ -562,31 +572,28 @@ pub struct NetworkState {
     /// `~/.myownmesh/mesh/states/{network_id}.json` (per-network,
     /// 0600 on Unix). Loaded once on construction; the engine
     /// persists after every signed transition that lands.
-    pub governance_state: RwLock<crate::network_state::NetworkState>,
+    pub governance_state: Arc<RwLock<crate::network_state::NetworkState>>,
     pub current_phase: RwLock<MeshPhase>,
 
     pub events_tx: broadcast::Sender<MeshEvent>,
-    pub channel_subscribers: DashMap<String, broadcast::Sender<RawChannelFrame>>,
-    /// Fan-out for assembled video access units arriving on peers'
-    /// track lanes. One broadcast per network (subscribers filter by
-    /// `from`); kept shallow — video is a freshness stream, a lagging
-    /// subscriber loses old frames, never delays new ones.
-    pub(crate) video_subscribers: broadcast::Sender<InboundVideoSample>,
-    /// Fan-out for audio frames arriving on peers' audio lanes —
-    /// deeper than video's (audio frames are tiny and a dropped one
-    /// is an audible tick), still bounded so a lagging subscriber
-    /// sheds the oldest instead of growing a backlog.
-    pub(crate) audio_subscribers: broadcast::Sender<InboundAudioSample>,
-    pub rpc: RwLock<Option<Arc<RpcInner>>>,
+    pub(crate) application_gateway: crate::application_gateway::ApplicationGateway,
 
-    pub signaling_tx: mpsc::UnboundedSender<SignalingOutbound>,
-    pub signaling_inbound_tx: mpsc::UnboundedSender<SignalingInbound>,
-    pub cmd_tx: mpsc::UnboundedSender<NetworkCmd>,
+    pub signaling_tx: ResourceMailboxSender<SignalingOutbound>,
+    pub signaling_inbound_tx: ResourceMailboxSender<SignalingInbound>,
+    pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
 
     /// Receiving end of `signaling_tx` — held here so callers can
     /// drain it via [`Self::take_signaling_outbound_rx`] when they
     /// bring up their signaling task.
-    signaling_outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<SignalingOutbound>>>,
+    signaling_outbound_rx: Mutex<Option<ResourceMailboxReceiver<SignalingOutbound>>>,
+    /// Controls that do not run an engine driver still need the command
+    /// mailbox to be live: session promotion announces on it, and a closed
+    /// receiver truthfully means the driver is gone. Parking the receiver in
+    /// the state models an unread queue without turning it into a dead queue.
+    #[cfg(test)]
+    parked_command_receiver: Mutex<Option<ResourceMailboxReceiver<NetworkCmd>>>,
+    shutdown_requested: std::sync::atomic::AtomicBool,
+    shutdown_ready: tokio::sync::Notify,
 
     /// Offerer-side reconnect intents (see [`ReconnectIntent`]). Keyed by
     /// device id; an entry lives from the moment we drop a peer we owe an
@@ -613,25 +620,6 @@ pub struct NetworkState {
     /// durable record, so a restart recomputes the same verdict.
     pub self_evicted: std::sync::atomic::AtomicBool,
 
-    /// Acked-delivery outboxes, one per peer with frames pending (see
-    /// [`super::reliable`]). Driver-serial like all engine state; the
-    /// mutex guards snapshot readers only.
-    pub(crate) reliable_out: Mutex<std::collections::HashMap<String, super::reliable::Outbox>>,
-
-    /// Receive-side high-water marks for acked delivery, one per peer
-    /// that has sent us `channel_seq` frames.
-    pub(crate) reliable_in: Mutex<std::collections::HashMap<String, super::reliable::InboundMark>>,
-
-    /// Routed-frame dedup ring: `(origin, frame id)` pairs already
-    /// delivered/forwarded, so flood cross-paths and retransmits are
-    /// dropped at the door. Bounded at
-    /// [`super::routing::ROUTING_SEEN_CAPACITY`].
-    #[allow(
-        dead_code,
-        reason = "RTM-001 retains legacy forwarding state until that compatibility surface is dispositioned"
-    )]
-    pub(crate) routing_seen: Mutex<std::collections::VecDeque<(String, u64)>>,
-
     /// Per-network traffic accounting (see [`super::traffic`]) —
     /// written from the frame chokepoints, read by the status surface.
     pub traffic: super::traffic::TrafficCounters,
@@ -640,7 +628,8 @@ pub struct NetworkState {
     /// `connect_peer_wait` contract). Resolved on the mutual-approve
     /// transition; failed on terminal drops and shutdown.
     pub(crate) connect_waiters:
-        Mutex<std::collections::HashMap<String, Vec<oneshot::Sender<Result<()>>>>>,
+        Mutex<std::collections::HashMap<String, Vec<ConnectWaiterRegistration>>>,
+    next_connect_waiter: std::sync::atomic::AtomicU64,
 
     /// Last time we reflected a peer's announce with one of our
     /// own. Rate-limited so a room with N peers all reacting to
@@ -657,6 +646,98 @@ pub struct NetworkState {
     /// the heartbeat pings they already send) for several consecutive
     /// ticks, clear once when it resolves. See `heartbeat::watch_clock_skew`.
     pub clock_skew_watch: Mutex<super::heartbeat::ClockSkewWatch>,
+
+    /// Controls only: how many reliable acknowledgements this runtime has
+    /// *attempted* to send.
+    ///
+    /// Incremented immediately before the send in `reliable::on_channel_seq_admitted`,
+    /// so it counts the decision to acknowledge rather than a completed write —
+    /// the same reading as [`crate::transport::diag::PeerDiag::hellos_sent`],
+    /// and for the same reason. The lab fixture has no remote peer, so no write
+    /// there can complete; a control measuring completions could not tell an
+    /// acknowledgement this node refused to send from one it sent into a link
+    /// with no far end, which is exactly the distinction the acceptance rule is
+    /// about.
+    ///
+    /// It is test observation and nothing else. Nothing admits, accounts,
+    /// retains or refuses on this value, and it does not exist in a production
+    /// build.
+    #[cfg(test)]
+    pub(crate) channel_ack_attempts: std::sync::atomic::AtomicU64,
+
+    /// Controls only: one action to run at the instant every exact-session
+    /// retirement site has captured its `(owner, witness)` and has not yet
+    /// retired anything.
+    ///
+    /// It exists for one property, which cannot be observed from outside the
+    /// engine at all: that retirement names the session that failed rather than
+    /// whichever session holds the device id when it runs. Driving a refusal and
+    /// then replacing the session afterwards does not test that — a retirement
+    /// keyed by device id passes it too. The replacement has to land *inside*
+    /// the window, and this is the only point at which a control can put it
+    /// there without a race of its own.
+    ///
+    /// One shot: it is taken before it is run, so a staged action fires for the
+    /// first refusal that reaches a barrier and never for a later one. A control
+    /// that stages it and observes it did not fire has learned that its refusal
+    /// never reached the retirement it was aimed at, which is worth as much as
+    /// the positive observation.
+    ///
+    /// Constraints on what may be staged, both of which every use below honours:
+    /// it runs on the engine's own thread with no registry lock held, so it may
+    /// promote or file state through the ordinary registry entry points; and it
+    /// may not await, because these sites are not all async.
+    ///
+    /// Test observation and staging only. Nothing admits, accounts, retains or
+    /// refuses on it, and it does not exist in a production build.
+    #[cfg(test)]
+    pub(crate) exact_retirement_barrier: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+
+    /// The park an armed control puts at the RPC reply's send boundary.
+    ///
+    /// Sibling of the barrier above and there for the same kind of reason: the
+    /// property is about what happens *during* an operation, and no control can
+    /// reach the inside of a spawned run from outside it. Revoking before the
+    /// run starts and revoking after it finishes are both easy and neither is
+    /// the case the finding names.
+    ///
+    /// Test observation and staging only. Nothing admits, accounts, retains or
+    /// refuses on it, and it does not exist in a production build.
+    #[cfg(test)]
+    pub(crate) rpc_send_boundary: RpcSendBoundary,
+
+    /// The instant between a handler run's fenced start and the embedder's
+    /// closure being entered.
+    ///
+    /// The other half of the same problem `rpc_send_boundary` solves, at the
+    /// other end of the run. A control asserting that a *started* run cannot be
+    /// un-started has to deliver revocation after the start commits and before
+    /// the closure is called, and that window is otherwise two adjacent
+    /// statements with nothing between them.
+    ///
+    /// The same type, because it is the same mechanism and a second one could
+    /// drift from it. Test observation and staging only; it does not exist in a
+    /// production build.
+    #[cfg(test)]
+    pub(crate) rpc_handler_start_boundary: RpcSendBoundary,
+
+    /// One action to run inside a handler run's start, between its early
+    /// validity read and the fenced commit.
+    ///
+    /// A staged **synchronous** action rather than a park, because that instant
+    /// is inside a synchronous decision: the run is not a future there, it is a
+    /// function that has not returned yet, and there is nothing for an async
+    /// boundary to hold. What a control needs to do there is act — revoke — and
+    /// acting is exactly what a `FnOnce` can do.
+    ///
+    /// It is reached through the production call path rather than by a control
+    /// calling the fenced begin itself. That distinction is the whole point: a
+    /// control that called `begin` directly could observe the refusal and prove
+    /// nothing about whether `on_rpc_request`'s spawned arm honours it.
+    ///
+    /// Test staging only, and it does not exist in a production build.
+    #[cfg(test)]
+    pub(crate) rpc_handler_precommit_action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 
     /// Force-reconnect handle for the signaling driver, stashed by
     /// [`crate::engine::signaling_bridge::attach_nostr`] once the
@@ -721,11 +802,12 @@ impl NetworkState {
         transport: Transport,
     ) -> Result<(
         Arc<Self>,
-        mpsc::UnboundedReceiver<SignalingInbound>,
-        mpsc::UnboundedReceiver<NetworkCmd>,
+        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<NetworkCmd>,
     )> {
         let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope)
+        let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
+        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources)
     }
 
     /// Construct state below an existing Mesh runtime observation scope.
@@ -735,16 +817,18 @@ impl NetworkState {
         identity: Arc<Identity>,
         transport: Transport,
         mesh_scope: &MeshRuntimeResourceScope,
+        local_resources: &LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        mpsc::UnboundedReceiver<SignalingInbound>,
-        mpsc::UnboundedReceiver<NetworkCmd>,
+        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<NetworkCmd>,
     )> {
         Self::new_in_resource_scope(
             config,
             identity,
             transport,
             mesh_scope.network_instance_scope(),
+            local_resources.child()?,
         )
     }
 
@@ -754,10 +838,11 @@ impl NetworkState {
         identity: Arc<Identity>,
         transport: Transport,
         resource_scope: NetworkInstanceResourceScope,
+        local_resources: LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        mpsc::UnboundedReceiver<SignalingInbound>,
-        mpsc::UnboundedReceiver<NetworkCmd>,
+        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<NetworkCmd>,
     )> {
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
@@ -772,12 +857,38 @@ impl NetworkState {
         // The config field only seeds new networks at first attach.
         let governance_state = {
             let mut s = crate::network_state::load(&config.network_id)?;
-            if s.transitions.is_empty() && s.kind == crate::network_state::NetworkKind::Open {
-                // Brand-new state log — adopt the config's initial
-                // kind. (For the open default, this is a no-op; for
-                // Closed, the engine emits the founder-self-election
-                // transition on first ACTIVE.)
-                s.kind = config.kind;
+            if s.transitions.is_empty() {
+                // A brand-new Closed log must establish its signed founder
+                // basis before the peer registry becomes usable. Deferring
+                // genesis until first ACTIVE is circular: ACTIVE now requires
+                // positive membership in this projection.
+                if s.kind == crate::network_state::NetworkKind::Closed
+                    || config.kind == crate::network_state::NetworkKind::Closed
+                {
+                    // The signed log replays from Open, so genesis is expressed
+                    // as a transition rather than as a pre-mutated kind field.
+                    s.kind = crate::network_state::NetworkKind::Open;
+                    let variant = crate::network_state::TransitionVariant::KindChange {
+                        to: crate::network_state::NetworkKind::Closed,
+                    };
+                    let transition = crate::network_state::Transition {
+                        at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        signatures: vec![crate::network_state::sign_transition(
+                            &config.network_id,
+                            &variant,
+                            identity.signing_key(),
+                        )],
+                        signers: vec![identity.public_id().to_string()],
+                        variant,
+                    };
+                    s = crate::network_state::apply_transition(s, &transition);
+                    crate::network_state::save(&s)?;
+                } else {
+                    s.kind = config.kind;
+                }
             }
             s
         };
@@ -791,10 +902,6 @@ impl NetworkState {
             .unwrap_or_else(|| config.topology.clone());
         let topology_impl = crate::topology::from_mode(&effective_topology);
         let (events_tx, _) = broadcast::channel(256);
-        // Shallow: at 30 fps a depth of 16 is half a second of slack —
-        // beyond that a slow consumer should lose frames, not delay them.
-        let (video_subscribers, _) = broadcast::channel(16);
-        let (audio_subscribers, _) = broadcast::channel(64);
         // Deep enough to ride out a transition storm (a sleep/wake
         // fan-out re-handshaking every peer) without the watcher lagging;
         // lossy past that, with a `lagged` marker surfaced to the stream.
@@ -802,40 +909,58 @@ impl NetworkState {
         let conn_trace_force_on = std::env::var("MYOWNMESH_CONN_TRACE")
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false);
-        let (signaling_tx, signaling_outbound_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (signaling_inbound_tx, signaling_inbound_rx) = mpsc::unbounded_channel();
+        let (signaling_tx, signaling_outbound_rx) =
+            crate::resource::resource_mailbox(local_resources.child()?)?;
+        let (cmd_tx, cmd_rx) = crate::resource::resource_mailbox(local_resources.child()?)?;
+        let (signaling_inbound_tx, signaling_inbound_rx) =
+            crate::resource::resource_mailbox(local_resources.child()?)?;
+        let session_broker = transport.session_broker();
+        let governance_state = Arc::new(RwLock::new(governance_state));
+        let local_device_id = identity.public_id().to_string();
         let state = Arc::new(Self {
             network_id: config.network_id.clone(),
             identity,
             transport,
             resource_scope,
+            session_broker,
             config: RwLock::new(config.clone()),
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
-            peers: PeerRegistry::default(),
+            peers: PeerRegistry::new(Arc::clone(&governance_state), local_device_id),
             roster: RwLock::new(roster),
-            governance_state: RwLock::new(governance_state),
+            governance_state,
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
-            channel_subscribers: DashMap::new(),
-            video_subscribers,
-            audio_subscribers,
-            rpc: RwLock::new(None),
+            application_gateway: crate::application_gateway::ApplicationGateway::new(
+                local_resources.clone(),
+            ),
+            local_resources,
             signaling_tx,
             signaling_inbound_tx,
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
+            #[cfg(test)]
+            parked_command_receiver: Mutex::new(None),
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             sticky_peers: Mutex::new(pinned),
             self_evicted: std::sync::atomic::AtomicBool::new(false),
-            reliable_out: Mutex::new(std::collections::HashMap::new()),
-            reliable_in: Mutex::new(std::collections::HashMap::new()),
-            routing_seen: Mutex::new(std::collections::VecDeque::new()),
             traffic: super::traffic::TrafficCounters::default(),
             connect_waiters: Mutex::new(std::collections::HashMap::new()),
+            next_connect_waiter: std::sync::atomic::AtomicU64::new(1),
             last_reactive_announce_at: Mutex::new(None),
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
+            #[cfg(test)]
+            channel_ack_attempts: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            exact_retirement_barrier: Mutex::new(None),
+            #[cfg(test)]
+            rpc_send_boundary: RpcSendBoundary::default(),
+            #[cfg(test)]
+            rpc_handler_start_boundary: RpcSendBoundary::default(),
+            #[cfg(test)]
+            rpc_handler_precommit_action: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
@@ -843,6 +968,12 @@ impl NetworkState {
             conn_trace_tx,
             conn_trace_force_on,
         });
+        // The registry announces a newly minted session on this same queue, so
+        // the driver handles it once every fence lock has been released. Bound
+        // here because this is the one place that owns both the registry and the
+        // queue; the registry cannot construct it and the driver cannot reach
+        // inside the fence.
+        state.peers.bind_promotion_sink(state.cmd_tx.clone());
         Ok((state, signaling_inbound_rx, cmd_rx))
     }
 
@@ -852,6 +983,300 @@ impl NetworkState {
         self.resource_scope.peer_connection_scope()
     }
 
+    pub(crate) fn local_application_resource_scope(&self) -> Result<LocalApplicationResourceScope> {
+        Ok(self.local_resources.child()?)
+    }
+
+    /// Reached by every exact-session retirement site, after it has captured the
+    /// owner and witness it will retire under and before it retires anything.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist. Under test it runs whatever a control staged with
+    /// [`stage_exact_retirement_barrier`](Self::stage_exact_retirement_barrier),
+    /// once, and never re-enters: the action is taken out from under the lock
+    /// before it is called, so an action that itself reached a retirement site
+    /// would find the barrier already empty rather than recurse.
+    pub(crate) fn reach_exact_retirement_barrier(&self) {
+        #[cfg(test)]
+        {
+            let staged = self.exact_retirement_barrier.lock().take();
+            if let Some(staged) = staged {
+                staged();
+            }
+        }
+    }
+
+    /// Stage the one action the next retirement site will run in its capture →
+    /// retire window. See [`exact_retirement_barrier`](Self::exact_retirement_barrier).
+    #[cfg(test)]
+    pub(crate) fn stage_exact_retirement_barrier(&self, staged: impl FnOnce() + Send + 'static) {
+        let displaced = self
+            .exact_retirement_barrier
+            .lock()
+            .replace(Box::new(staged));
+        assert!(
+            displaced.is_none(),
+            "a control staged a second retirement barrier over one that never fired"
+        );
+    }
+
+    /// Whether the staged action is still waiting, i.e. no retirement site has
+    /// been reached since it was staged.
+    #[cfg(test)]
+    pub(crate) fn exact_retirement_barrier_pending(&self) -> bool {
+        self.exact_retirement_barrier.lock().is_some()
+    }
+
+    /// The point in an RPC handler run at which the reply is about to reach the
+    /// wire, and the last point at which revocation can still take it back.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist. Under test, and only while a control has armed it, a run that
+    /// reaches here parks until that control releases it — which is what lets a
+    /// control revoke the authority *while the send is in flight* rather than
+    /// before it starts or after it finished. Those are the two states an
+    /// unassisted control can reach, and neither is the one the finding is
+    /// about.
+    ///
+    /// No timer is involved on either side. The park ends when the control
+    /// releases it or when the run is cancelled, and the cancellation is what
+    /// the control observes.
+    pub(crate) async fn reach_rpc_send_boundary(&self) {
+        #[cfg(test)]
+        self.rpc_send_boundary.reach().await;
+    }
+
+    /// The point in an RPC handler run at which the start has committed under
+    /// the registry fence and the embedder's closure has not yet been called.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist. Under test, and only while a control has armed it, a run that
+    /// reaches here parks until that control releases it — which is what lets a
+    /// control revoke the authority in the one instant the contract is about:
+    /// after the start is committed, before the closure is entered.
+    ///
+    /// What must be observed there is that the closure is entered anyway,
+    /// exactly once, because the start was already ordered before that
+    /// revocation. Everything the run does *afterwards* is still cancelled by
+    /// the witness, which is the other half of the same assertion.
+    pub(crate) async fn reach_rpc_handler_start_boundary(&self) {
+        #[cfg(test)]
+        self.rpc_handler_start_boundary.reach().await;
+    }
+
+    /// The point inside a handler run's start, after its early validity read and
+    /// before the fenced commit.
+    ///
+    /// In a production build this is an empty function over a field that does
+    /// not exist, called with nothing staged, and it compiles away. Under test
+    /// it runs whatever a control staged, exactly once — which is how a control
+    /// revokes *in that instant* rather than before or after it.
+    ///
+    /// Taken rather than borrowed, so one staging fires once. A second run
+    /// reaching the same point finds nothing and proceeds, which is what makes
+    /// "the action was consumed" a usable non-vacuity check for the control that
+    /// staged it.
+    pub(crate) fn reach_rpc_handler_precommit_point(&self) {
+        #[cfg(test)]
+        if let Some(staged) = self.rpc_handler_precommit_action.lock().take() {
+            staged();
+        }
+    }
+
+    /// Stage the action the next handler run will perform at its pre-commit
+    /// point.
+    #[cfg(test)]
+    pub(crate) fn stage_rpc_handler_precommit_action(
+        &self,
+        staged: impl FnOnce() + Send + 'static,
+    ) {
+        let displaced = self
+            .rpc_handler_precommit_action
+            .lock()
+            .replace(Box::new(staged));
+        assert!(
+            displaced.is_none(),
+            "a control staged a second handler pre-commit action over one that never fired"
+        );
+    }
+
+    /// Whether the staged action is still waiting — i.e. no handler run has
+    /// reached its pre-commit point since it was staged.
+    ///
+    /// The non-vacuity half. A control asserting "the closure was never entered"
+    /// has to know the run got as far as the point that refused it; without
+    /// this, the same assertion passes for a run that never started.
+    #[cfg(test)]
+    pub(crate) fn rpc_handler_precommit_action_pending(&self) -> bool {
+        self.rpc_handler_precommit_action.lock().is_some()
+    }
+}
+
+/// A control-armed park at the RPC send boundary, and the record of what
+/// happened to every run that reached it.
+///
+/// The three counters are what make the observation causal rather than
+/// circumstantial. `entered` says a run got as far as the boundary at all —
+/// without it, "no frame was sent" is equally true of a run that never started.
+/// `abandoned` is written by a guard living *inside* the parked future, so it is
+/// incremented by the cancellation itself: a run whose task is dropped at the
+/// boundary records that fact as it unwinds, and the task lease held beside it
+/// is released in the same drop. `passed` is the post-boundary effect, and it
+/// staying at zero is the assertion.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RpcSendBoundary {
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicUsize,
+    passed: std::sync::atomic::AtomicUsize,
+    abandoned: std::sync::atomic::AtomicUsize,
+    finished: std::sync::atomic::AtomicUsize,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// Records, on drop, that the run holding it left the boundary without passing
+/// it — which for a parked run means its task was cancelled here.
+#[cfg(test)]
+struct RpcSendBoundaryVisit<'a> {
+    boundary: &'a RpcSendBoundary,
+    passed: bool,
+}
+
+#[cfg(test)]
+impl Drop for RpcSendBoundaryVisit<'_> {
+    fn drop(&mut self) {
+        if !self.passed {
+            self.boundary
+                .abandoned
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+impl RpcSendBoundary {
+    async fn reach(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Unarmed is the whole of production and the whole of every other
+        // control: one load and a return, with nothing to park on.
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        // Subscribed *before* the arrival is announced. A control that released
+        // the boundary the instant it saw the arrival would otherwise race a
+        // notification against a subscription that had not happened yet, and
+        // `Notify` does not keep one for a waiter that is not yet waiting.
+        let release = self.release.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
+
+        let mut visit = RpcSendBoundaryVisit {
+            boundary: self,
+            passed: false,
+        };
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.reached.notify_waiters();
+        release.await;
+        visit.passed = true;
+        self.passed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Park every run that reaches the boundary from here on.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Let every currently parked run continue past the boundary.
+    ///
+    /// The other exit, and the one a control needs when the point of the
+    /// control is what happens *after* the boundary rather than instead of it:
+    /// revoke while the run is parked, then release, and observe what the run
+    /// does with an authority that ended while it was standing still.
+    ///
+    /// `notify_waiters` rather than `notify_one`, and it wakes only runs already
+    /// parked — a run that arrives later parks as usual, because arming is not
+    /// undone by releasing. That is what keeps one release from silently
+    /// disarming the boundary for every run after it.
+    pub(crate) fn release(&self) {
+        self.release.notify_waiters();
+    }
+
+    /// A future that resolves when a run arrives at the boundary.
+    ///
+    /// Handed out as a future rather than polled for, so a control can subscribe
+    /// before it delivers the frame and cannot miss the arrival.
+    pub(crate) fn arrival(&self) -> tokio::sync::futures::Notified<'_> {
+        self.reached.notified()
+    }
+
+    /// How many runs reached the boundary.
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many runs got past it — the post-boundary effect.
+    pub(crate) fn passed(&self) -> usize {
+        self.passed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many runs were dropped while parked on it.
+    pub(crate) fn abandoned(&self) -> usize {
+        self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many handler tasks have finished **and released their lease**.
+    ///
+    /// The one that answers "the task ended", as against
+    /// [`Self::abandoned`], which answers "the run left the boundary". Those are
+    /// not the same instant: the boundary guard is dropped inside the run
+    /// future, and the task's own epilogue — the task lease among it — runs
+    /// afterwards. A control that read `abandoned` and concluded the lease was
+    /// released would be racing that epilogue.
+    ///
+    /// See [`RpcRunEpilogue`] for why this is ordered after the lease and not
+    /// merely near it.
+    pub(crate) fn finished(&self) -> usize {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Records one handler task's end, **after** that task's lease has been
+/// released.
+///
+/// The ordering is the whole value of this type and it is structural, not
+/// hopeful: locals drop in reverse declaration order, so the spawned run
+/// declares this guard *before* it rebinds `_task_lease`. The lease is therefore
+/// released first and this increment happens strictly afterwards — which makes
+/// the count an observation of "the task is gone and has stopped costing its
+/// owner", rather than of "the run stopped running", which is an earlier and
+/// weaker fact.
+///
+/// Test-only. It exists because task completion is otherwise unobservable from
+/// outside a spawned task: a cancelled run sends nothing, and its absence is
+/// equally true of a run that never started.
+#[cfg(test)]
+pub(crate) struct RpcRunEpilogue(std::sync::Arc<NetworkState>);
+
+#[cfg(test)]
+impl RpcRunEpilogue {
+    pub(crate) fn new(state: std::sync::Arc<NetworkState>) -> Self {
+        Self(state)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RpcRunEpilogue {
+    fn drop(&mut self) {
+        self.0
+            .rpc_send_boundary
+            .finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl NetworkState {
     /// Read observations for this live joined network instance.
     pub fn resource_report(&self) -> ResourceReport {
         self.resource_scope.report()
@@ -862,8 +1287,45 @@ impl NetworkState {
     /// calls return `None`.
     pub fn take_signaling_outbound_rx(
         self: &Arc<Self>,
-    ) -> Option<mpsc::UnboundedReceiver<SignalingOutbound>> {
+    ) -> Option<ResourceMailboxReceiver<SignalingOutbound>> {
         self.signaling_outbound_rx.lock().take()
+    }
+
+    /// Keep an otherwise undriven fixture's command receiver alive until the
+    /// fixture state drops. A production driver always owns this receiver.
+    #[cfg(test)]
+    pub(crate) fn park_command_receiver_for_test(
+        &self,
+        receiver: ResourceMailboxReceiver<NetworkCmd>,
+    ) {
+        let replaced = self.parked_command_receiver.lock().replace(receiver);
+        assert!(
+            replaced.is_none(),
+            "a fixture parks its command receiver once"
+        );
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown_ready.notify_waiters();
+        self.cmd_tx.close();
+        self.signaling_inbound_tx.close();
+    }
+
+    pub(crate) async fn wait_for_shutdown(&self) {
+        loop {
+            let notified = self.shutdown_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Remember that we owe `device_id` a fresh offer after a recoverable
@@ -1117,116 +1579,587 @@ impl NetworkState {
         self.log_diag(DiagLevel::Info, "phase", format!("{prev:?} → {next:?}"));
     }
 
-    /// Subscribe to a named user channel. Returns a fresh
-    /// broadcast::Receiver every call; the engine fan-outs each
-    /// inbound channel frame to all subscribers.
-    pub fn subscribe_channel(&self, name: &str) -> broadcast::Receiver<RawChannelFrame> {
-        if let Some(tx) = self.channel_subscribers.get(name) {
-            tx.subscribe()
-        } else {
-            let (tx, rx) = broadcast::channel(256);
-            self.channel_subscribers.insert(name.to_string(), tx);
-            rx
+    /// Open one realtime flow on `peer`'s current session, native half included.
+    ///
+    /// Takes an already-validated connector spec: the provider's own
+    /// configuration is parsed and refused at the public boundary, before any
+    /// session is resolved, so an unusable request never reaches the fence and
+    /// the engine never inspects what a provider's vocabulary means.
+    ///
+    /// **This is the only realtime operation that resolves a Device selector,
+    /// and it resolves it exactly once.** `peer` names an installation to look
+    /// up; everything that authorizes the open is produced inside the fence at
+    /// the moment of use. From the first line onwards the operation carries the
+    /// [`PeerOwnerToken`] that resolution produced, and phase 3 and the
+    /// abandonment path re-enter the fence with *that* rather than with the
+    /// name — so a replacement landing mid-open fails a pointer check instead of
+    /// being resolved to and quietly committed onto.
+    ///
+    /// A resolution failure is reported as `SessionNotCurrent` rather than a
+    /// distinct "no such peer" — an unknown selector, a replaced installation
+    /// and an unpromoted peer are the same fact from the caller's side, and
+    /// separating them would leak peer-existence to a caller that has proved
+    /// nothing.
+    ///
+    /// Three phases, because the fence is a synchronous lock that connector
+    /// replacement also takes and the native operations await. Nothing is held
+    /// across an await, and nothing is trusted across one either — the handle
+    /// carried through phase 2 grants nothing, and phase 3 re-proves the same
+    /// facts rather than assuming they survived.
+    ///
+    /// 1. **In the fence:** claim the label, capture the exact flow record it
+    ///    produced, and for an inbound flow mint the track identity and bind it,
+    ///    so the claim and the binding are one atomic step. That ordering is
+    ///    what removes the start window: any track that can arrive under that
+    ///    identity has a binding before the transceiver carrying it exists.
+    ///    Capture the worker and the flow-set identity, then release.
+    /// 2. **No locks:** create the native transceiver or track.
+    /// 3. **Back in the fence, against the same owner:** prove it is the same
+    ///    flow set, then attach the outbound track. An inbound flow has nothing
+    ///    left to commit.
+    ///
+    /// The flow-set check in phase 3 is not redundant with having carried the
+    /// owner. The owner proves the installation is the one this open started
+    /// against; the flow set proves the *session* is, which is the finer
+    /// question and the one the committed track actually belongs to. Same window
+    /// as the one the arrivals stream check closes, one call earlier.
+    ///
+    /// Answers a [`crate::realtime::RealtimeFlowHandle`], and only from facts
+    /// captured inside the fence: the owner, the flow-set identity and the flow
+    /// record. The name travels in it as a wire coordinate. Nothing in the
+    /// handle can be re-derived afterwards from a selector, which is the whole
+    /// difference from the coordinate-based API it replaces.
+    ///
+    /// Every refusal releases both halves: the flow and its label through the
+    /// fence, the native object through the connector. Nothing is retried and
+    /// nothing is timed.
+    /// Takes `&Arc<Self>` rather than `&self` for one reason: the handle this
+    /// mints closes its flow when it is dropped, and the only honest way to
+    /// reach this engine from a `Drop` that owns nothing is a weak reference to
+    /// it. Downgrading requires the `Arc`, and every caller already has one.
+    pub(crate) async fn open_realtime_negotiated(
+        self: &Arc<Self>,
+        peer: &str,
+        spec: RealtimeFlowSpec,
+    ) -> std::result::Result<crate::realtime::RealtimeFlowHandle, crate::realtime::RealtimeRefusal>
+    {
+        let encoding = spec.encoding.clone();
+        // The one resolution. Everything after this names the installation it
+        // produced, never the bytes it was produced from.
+        let Some(owner) = self.peers.owner(peer) else {
+            return Err(crate::realtime::RealtimeRefusal::SessionNotCurrent);
+        };
+
+        // Phase 1.
+        let (name, flow, worker, flow_set, identity, validity) = self
+            .with_owned_realtime_flows_and_worker(&owner, |session, flows, live, worker| {
+                let inbound = spec.direction == RealtimeDirection::Inbound;
+                let name = flows.open(session, Some(live), spec)?;
+                // Taken from the record `open` just filed, not from the name it
+                // spells, and taken here so it exists before anything below can
+                // release the fence. A handle built from a later lookup would
+                // name whatever held the name at that later moment, which is the
+                // defect this whole path exists to remove.
+                let Some(flow) = flows.flow_identity(&name) else {
+                    let _ = flows.close(session, Some(live), &name);
+                    return Err(RealtimeFlowError::FlowRefused);
+                };
+                let identity = if inbound {
+                    // Minted by the connector, not here. The identity is a
+                    // connector-scoped allocation and the engine has no scope to
+                    // fund one; asking for it is all this side does.
+                    let Ok(identity) = worker.mint_inbound_realtime_identity() else {
+                        let _ = flows.close(session, Some(live), &name);
+                        return Err(RealtimeFlowError::FlowRefused);
+                    };
+                    // Minted here and moved into the flow, so from the bind
+                    // onwards the flow — not this function, and not a later
+                    // caller who remembers — is what owes the transceiver its
+                    // retirement.
+                    //
+                    // It can refuse, and refusing here is the point: the
+                    // retirement's cleanup is funded at this moment, so a
+                    // connector that could not afford to retire the transceiver
+                    // never negotiates one. The flow and its name go back the
+                    // same way a refused bind returns them.
+                    let retirement = match worker.inbound_realtime_retirement(Arc::clone(&identity))
+                    {
+                        Ok(retirement) => retirement,
+                        Err(_) => {
+                            let _ = flows.close(session, Some(live), &name);
+                            return Err(RealtimeFlowError::FlowRefused);
+                        }
+                    };
+                    // A bind that fails leaves a flow holding a name against a
+                    // negotiation that will never happen, so the name goes back
+                    // now rather than at the next open that collides with it.
+                    if let Err(error) = flows.bind_inbound(
+                        session,
+                        Some(live),
+                        &name,
+                        Arc::clone(&identity),
+                        retirement,
+                    ) {
+                        let _ = flows.close(session, Some(live), &name);
+                        return Err(error);
+                    }
+                    Some(identity)
+                } else {
+                    None
+                };
+                Ok((
+                    name,
+                    flow,
+                    Arc::clone(worker),
+                    flows.identity(),
+                    identity,
+                    session.validity_witness(),
+                ))
+            })?;
+
+        // Phase 2. Branching on the minted identity rather than re-deriving the
+        // direction: the two must not be able to disagree.
+        let native = tokio::select! {
+            biased;
+            () = validity.revoked() => Err(crate::error::Error::Transport(
+                "the session authorizing this realtime open was revoked".into(),
+            )),
+            native = async {
+                match identity.as_ref() {
+                    Some(identity) => worker
+                        .open_inbound_realtime_transceiver(identity, &encoding)
+                        .await
+                        .map(|()| None),
+                    None => worker
+                        .open_outbound_realtime_track(&encoding)
+                        .await
+                        .map(Some),
+                }
+            } => native,
+        };
+        let Ok(mut track) = native else {
+            // The connector cleaned up its own failed construction; what is
+            // left is the flow, its name, and — for an inbound open — a
+            // binding to an identity nothing will ever present.
+            self.abandon_realtime_open(&owner, &flow_set, &name).await;
+            return Err(crate::realtime::RealtimeRefusal::FlowRefused);
+        };
+
+        // Phase 3. The track is taken from `track` only on the path that
+        // attaches it, so whatever remains afterwards is a native object this
+        // side still owns and must release.
+        let committed = self.with_owned_realtime_flows(&owner, |session, flows, live| {
+            if !flows.is_same(&flow_set) {
+                return Err(RealtimeFlowError::SessionNotCurrent);
+            }
+            match track.take() {
+                Some(outbound) => flows
+                    .attach_outbound(session, Some(live), &name, outbound)
+                    .map_err(|(error, outbound)| {
+                        track = Some(outbound);
+                        error
+                    }),
+                // Inbound: bound in phase 1, so there is nothing to commit and
+                // nothing that could half-commit.
+                None => Ok(()),
+            }
+        });
+
+        if let Some(outbound) = track {
+            worker.close_outbound_realtime_track(outbound).await;
+        }
+        match committed {
+            // Built only now, and only from values phase 1 captured under the
+            // fence: the owner that resolution produced, the flow set that
+            // answered, and the record `open` filed. None of the three is
+            // re-derivable from the selector this call was given.
+            Ok(()) => Ok(crate::realtime::RealtimeFlowHandle::new(
+                owner,
+                flow_set,
+                flow,
+                name,
+                Arc::downgrade(self),
+            )),
+            Err(error) => {
+                // Ordered so the caller does not return before the transceiver
+                // is retired. If the flow set is still ours, `abandon` closed
+                // the flow and the close handed the retirement back, so it has
+                // already been retired and awaited. If it is not ours, the flow
+                // died with the set that owned it — and its retirement went
+                // with it, which submits, but fire-and-forget. This awaits the
+                // same retirement through the identity minted in phase 1, and
+                // the claim makes the two the same single stop.
+                if !self.abandon_realtime_open(&owner, &flow_set, &name).await {
+                    if let Some(identity) = identity.as_ref() {
+                        worker.close_inbound_realtime_transceiver(identity).await;
+                    }
+                }
+                Err(error.into())
+            }
         }
     }
 
-    /// Engine-side dispatch: route an inbound channel frame to
-    /// the matching subscribers. Silently drops when no
-    /// subscribers are registered for the named channel.
-    pub fn dispatch_channel_frame(&self, name: &str, from: &str, payload: serde_json::Value) {
-        if let Some(tx) = self.channel_subscribers.get(name) {
-            let frame = RawChannelFrame {
-                from: from.to_string(),
-                payload,
-            };
-            let _ = tx.send(frame);
-        } else {
-            trace!(channel = name, "no subscriber for channel frame");
+    /// Hand one unit to the outbound flow a handle names.
+    ///
+    /// Takes the connector's unit, already converted at the public boundary:
+    /// the engine moves bytes between a handle and a flow and never reads what a
+    /// unit carries.
+    ///
+    /// **Borrows the handle and resolves nothing.** The fence is entered with
+    /// the installation the flow was opened on, then the handle's two identities
+    /// are proved against the set that answered. A caller whose session has been
+    /// replaced, or whose label has been closed and reopened, is refused here.
+    /// Resolving by name instead would enqueue into the successor's flow of the
+    /// same name and tell nobody, because nothing on this path is acknowledged
+    /// per unit.
+    pub(crate) fn send_realtime(
+        &self,
+        handle: &crate::realtime::RealtimeFlowHandle,
+        unit: RealtimeSendUnit,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        self.with_owned_realtime_flows(handle.owner(), |session, flows, live| {
+            Self::handle_names_live_flow(flows, handle)?;
+            flows.send(session, Some(live), handle.name(), unit)
+        })
+        .map_err(Into::into)
+    }
+
+    /// Close one flow and retire the native half it was standing on.
+    ///
+    /// The mirror of [`Self::open_realtime_negotiated`], and async for the same
+    /// reason: releasing a transceiver or a sender awaits, and the fence is a
+    /// synchronous lock. Phase 1 closes the flow and carries out both the exact
+    /// worker and whatever the flow still owned; phase 2 retires it with no
+    /// lock held.
+    ///
+    /// **Whole-connector retirement is deliberately not relied on.** The same
+    /// worker may host a replacement session, so a flow's native half can
+    /// outlive the flow while the connector it belongs to stays perfectly
+    /// healthy. Retiring per flow is the only thing that tracks the flow's own
+    /// lifetime.
+    ///
+    /// The label is released at the end of phase 1, so a re-open can claim it
+    /// before the stop lands. That is safe rather than merely tolerated: the
+    /// new flow mints its own identity and `close` has already removed the old
+    /// one from the bindings table, so a track arriving on the stale
+    /// transceiver has nothing to attach to and is refused. What it still costs
+    /// until phase 2 finishes is an m-line and bandwidth — which is why the
+    /// caller awaits this rather than being told the flow is gone while it is
+    /// not.
+    /// **Consumes the handle**, because a close is the end of the thing the
+    /// handle names. Taking it by value is what makes "closed twice" and "closed
+    /// then sent on" unrepresentable rather than merely refused, and it is why
+    /// closing A cannot close B after an immediate reuse of A's label: the
+    /// identities travelled with the handle, and B's flow is a different record.
+    pub(crate) async fn close_realtime_negotiated(
+        &self,
+        mut handle: crate::realtime::RealtimeFlowHandle,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        // Before anything, and unconditionally. This call is the close, so the
+        // handle's own drop-close must not run behind it — on the success path
+        // it would be a second close of a record this one removed, and on the
+        // refusal path there is nothing to close: every way this refuses is a
+        // way the flow was already not ours.
+        handle.disarm();
+        let (worker, remains) = self.with_owned_realtime_flows_and_worker(
+            handle.owner(),
+            |session, flows, live, worker| {
+                Self::handle_names_live_flow(flows, &handle)?;
+                let remains = flows.close(session, Some(live), handle.name())?;
+                Ok((Arc::clone(worker), remains))
+            },
+        )?;
+        retire_realtime_remains(&worker, remains).await;
+        Ok(())
+    }
+
+    /// Close the flow an abandoned handle named, telling nobody.
+    ///
+    /// The drop half of [`Self::close_realtime_negotiated`], and deliberately
+    /// only its phase 1. Phase 2 is an await this cannot perform and does not
+    /// need to: `close` hands back a [`RealtimeFlowRemains`], and both of its
+    /// arms retire what they hold when they are dropped — which is what happens
+    /// to the value below. The difference between this and an explicit close is
+    /// therefore the acknowledgement, not the retirement.
+    ///
+    /// Every refusal is discarded, because each one means the flow is already
+    /// gone: a stale owner, a session that has been replaced, a label closed and
+    /// reopened. There is no caller left to tell, and nothing here to undo.
+    pub(crate) fn abandon_realtime_flow(&self, handle: &crate::realtime::RealtimeFlowHandle) {
+        // Dropped, not ignored: this value *is* the retirement, and naming it
+        // is how that reads as the retirement happening rather than as a result
+        // being thrown away.
+        drop(
+            self.with_owned_realtime_flows(handle.owner(), |session, flows, live| {
+                Self::handle_names_live_flow(flows, handle)?;
+                flows.close(session, Some(live), handle.name())
+            }),
+        );
+    }
+
+    /// Whether that handle still names a usable flow.
+    ///
+    /// Borrows rather than consumes: asking is not using, and a caller that
+    /// learns `false` still has to drop its handle, which costs nothing.
+    pub(crate) fn realtime_is_current(&self, handle: &crate::realtime::RealtimeFlowHandle) -> bool {
+        self.with_owned_realtime_flows(handle.owner(), |session, flows, live| {
+            Self::handle_names_live_flow(flows, handle)?;
+            Ok(flows.is_current(session, Some(live), handle.name()))
+        })
+        .unwrap_or(false)
+    }
+
+    /// Deliver one inbound realtime unit onto the flow it names.
+    ///
+    /// The connector half resolved which flow the track belongs to and
+    /// assembled the unit; this half proves the flow set is still one this
+    /// engine may write to. Both halves are needed and neither substitutes for
+    /// the other: a binding table says *which* flow, and only the fence says
+    /// *whether* — the exact owner installation, the current session, and a
+    /// freshly acquired live incarnation, all under the mutation lock the
+    /// replacement path also takes.
+    ///
+    /// Synchronous throughout. Nothing here awaits, so the currency proof and
+    /// the enqueue are one step against connector replacement rather than two
+    /// with a window between them.
+    ///
+    /// Every failure drops the unit and releases its payload reservation, and
+    /// does so without a branch: the delivery moves into the closure, so a fence
+    /// that refuses before running it drops it, and `deliver_inbound` drops it
+    /// itself when the flow is gone or when it carries no lease. Answers whether
+    /// the unit was taken — `false` for a stale owner, an ended session, an
+    /// absent flow, or an unaccounted delivery, which are one fact to the
+    /// connector: it has nothing left to do either way.
+    ///
+    /// **The delivery is carried whole and never split here.** Its three parts
+    /// include a payload lease, which is a `transport::webrtc` type and stays
+    /// one: an engine holding a bare lease could release the bytes' accounting
+    /// separately from the unit they belong to, and there is no reason for this
+    /// layer to be able to. What crosses is one opaque value that either lands
+    /// on a flow or is dropped intact.
+    pub(crate) fn deliver_realtime_unit(
+        &self,
+        owner: &PeerOwnerToken,
+        delivery: crate::transport::webrtc::RealtimeInboundDelivery,
+    ) -> bool {
+        self.peers
+            .with_live_session_flow(
+                owner,
+                self.session_broker.as_ref(),
+                &self.network_id,
+                move |_session, flows, _live| flows.deliver_inbound(delivery),
+            )
+            .unwrap_or(false)
+    }
+
+    /// Claim the inbound stream of `peer`'s current session.
+    ///
+    /// `None` covers both "no live session" and "already claimed", for the same
+    /// reason every other operation collapses resolution failures: the caller
+    /// has proved nothing, so it learns only that it does not have the stream.
+    ///
+    /// Synchronous on purpose. The claim happens inside the fence, and the
+    /// reader it produces borrows nothing from the flow set, so the caller
+    /// leaves the lock behind before it ever awaits.
+    pub(crate) fn claim_realtime_inbound(
+        &self,
+        peer: &str,
+    ) -> Option<crate::realtime::RealtimeInboundStream> {
+        let reader = self
+            .with_realtime_flows(peer, |_session, flows, _live| Ok(flows.inbound_arrivals()))
+            .ok()
+            .flatten()?;
+        // Only the reader crosses. The selector did its work resolving the
+        // session here and has nothing left to say: the reader already names the
+        // one queue that session's flow set owns, so carrying the bytes along
+        // would be a second copy of a binding the handle already has.
+        Some(crate::realtime::RealtimeInboundStream::new(reader))
+    }
+
+    /// The next unit to arrive on any inbound flow of that session.
+    ///
+    /// **Nothing is held, and no fence is entered.** The reader takes whole
+    /// units from the one queue its own flow set owns, so there is nothing left
+    /// for a fence to establish: the unit was funded, retained and handed over
+    /// by that set, and no session but that one can put anything into it.
+    ///
+    /// That is what makes this a single step rather than a loop. Awaiting a
+    /// *name* and resolving it afterwards left a window a replacement could land
+    /// in — the same bytes name a different flow on a different session, and the
+    /// fence would resolve the replacement quite correctly and hand back a real
+    /// unit belonging to something else. There is no name to resolve here.
+    ///
+    /// `None` is terminal and means the session ended: the flow set was dropped,
+    /// so its queue was, so the reader is done. There is no retirement event to
+    /// consume; a caller that gets `None` closes.
+    ///
+    /// What leaves this bridge is a copy of the label's bytes, made once. The
+    /// leased label stays inside the connector, because a consumer holding one
+    /// would be an untracked holder of the session's lease — and the copy is
+    /// taken in the form the caller publishes, so the name is not allocated
+    /// twice on the way out.
+    pub(crate) async fn next_realtime_arrival(
+        &self,
+        inbound: &crate::realtime::RealtimeInboundStream,
+    ) -> Option<(Vec<u8>, RealtimeRecvUnit)> {
+        let (label, unit) = inbound.reader().next().await?;
+        Some((label.name().as_bytes().to_vec(), unit))
+    }
+
+    /// The worker-lending fence, entered against an owner the caller already
+    /// holds.
+    ///
+    /// **No selector is resolved here, and there is no variant that does.**
+    /// [`Self::with_realtime_flows`] is the only realtime fence that turns a
+    /// Device name into whichever installation answers to it now, and only two
+    /// operations may do that: opening a flow, and claiming a session's inbound
+    /// stream. Everything with a native half enters here instead, with the
+    /// installation the operation started against, so a replacement fails a
+    /// pointer check rather than being resolved to.
+    fn with_owned_realtime_flows_and_worker<T>(
+        &self,
+        owner: &PeerOwnerToken,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+            &Arc<crate::transport::WebRtcConnectorWorker>,
+        ) -> std::result::Result<T, RealtimeFlowError>,
+    ) -> std::result::Result<T, RealtimeFlowError> {
+        self.peers
+            .with_live_session_flow_and_worker(
+                owner,
+                self.session_broker.as_ref(),
+                &self.network_id,
+                effect,
+            )
+            .unwrap_or(Err(RealtimeFlowError::SessionNotCurrent))
+    }
+
+    /// The flow-set-only fence, entered against an owner the caller already
+    /// holds.
+    ///
+    /// The synchronous twin of [`Self::with_owned_realtime_flows_and_worker`],
+    /// for the send path — which must not await and has no native half to reach.
+    fn with_owned_realtime_flows<T>(
+        &self,
+        owner: &PeerOwnerToken,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+        ) -> std::result::Result<T, RealtimeFlowError>,
+    ) -> std::result::Result<T, RealtimeFlowError> {
+        self.peers
+            .with_live_session_flow(
+                owner,
+                self.session_broker.as_ref(),
+                &self.network_id,
+                effect,
+            )
+            .unwrap_or(Err(RealtimeFlowError::SessionNotCurrent))
+    }
+
+    /// Prove a handle still names a live flow, inside a fence already entered.
+    ///
+    /// Two questions, both against identity and neither against bytes.
+    ///
+    /// The flow set names the **exact promoted session**. The owner the fence
+    /// was entered with names the installation, and those are not the same
+    /// statement: one installation promotes one session today — the entry
+    /// admits a single endpoint-auth task, that task a single capability, and
+    /// promotion consumes it — but that is a property of the promotion path,
+    /// not of this one. Asking the direct question costs a pointer comparison
+    /// and does not have to be revisited when the promotion path changes.
+    ///
+    /// The flow record rules out a **replacement flow inside the same session**,
+    /// which the flow-set check cannot see at all: closing a name and reopening
+    /// it changes neither the session nor the set, only the record.
+    ///
+    /// Both refusals are `SessionNotCurrent`, which is the honest answer in both
+    /// cases and deliberately the same one. A caller holding a stale handle has
+    /// no live flow, and telling it *why* would report on a flow it has no
+    /// standing to learn about — the one that took the name.
+    fn handle_names_live_flow(
+        flows: &SessionRealtimeFlows,
+        handle: &crate::realtime::RealtimeFlowHandle,
+    ) -> std::result::Result<(), RealtimeFlowError> {
+        if !flows.is_same(handle.flow_set()) || !flows.is_same_flow(handle.name(), handle.flow()) {
+            return Err(RealtimeFlowError::SessionNotCurrent);
         }
+        Ok(())
     }
 
-    /// Subscribe to assembled video access units from every peer on
-    /// this network (filter by [`InboundVideoSample::from`]). Lagging
-    /// loses old frames, never delays new ones — video is freshness.
-    #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility facade")]
-    #[cfg(feature = "legacy-media")]
-    pub fn subscribe_video(&self) -> broadcast::Receiver<InboundVideoSample> {
-        self.video_subscribers.subscribe()
+    /// Close a flow whose native half never came up, releasing its label and
+    /// retiring whatever the flow still owned.
+    ///
+    /// Answers whether it did the retiring, so a caller holding its own handle
+    /// on the native object knows not to retire it a second time.
+    ///
+    /// `false` also covers the case where the fence no longer resolves the same
+    /// flow set. The flow and its label went with the session that owned them —
+    /// which is the state this was trying to reach — but the native half did
+    /// not, so the caller still has work to do.
+    ///
+    /// Enters against the **owner the open resolved**, never the selector it was
+    /// given. Cleaning up after a failed open by re-resolving a Device name
+    /// would be the same defect as sending by one: the flow this is trying to
+    /// release belongs to a particular installation, and a replacement that has
+    /// since taken the name is not it. The flow-set check below then narrows
+    /// that installation to the exact session.
+    async fn abandon_realtime_open(
+        &self,
+        owner: &PeerOwnerToken,
+        flow_set: &RealtimeFlowSetIdentity,
+        name: &RealtimeFlowName,
+    ) -> bool {
+        let closed =
+            self.with_owned_realtime_flows_and_worker(owner, |session, flows, live, worker| {
+                if !flows.is_same(flow_set) {
+                    return Err(RealtimeFlowError::SessionNotCurrent);
+                }
+                let remains = flows.close(session, Some(live), name)?;
+                Ok((Arc::clone(worker), remains))
+            });
+        let Ok((worker, remains)) = closed else {
+            return false;
+        };
+        retire_realtime_remains(&worker, remains).await;
+        true
     }
 
-    /// Engine-side dispatch: fan an assembled access unit out to the
-    /// video subscribers. Silently drops with none registered.
-    pub(crate) fn dispatch_video(&self, from: &str, sample: VideoSample) {
-        let _ = self.video_subscribers.send(InboundVideoSample {
-            from: from.to_string(),
-            sample,
-        });
-    }
-
-    /// Write one encoded H.264 access unit (Annex-B) onto the video
-    /// lane to `peer`. `duration` paces the RTP clock (1/fps). Errors
-    /// when the peer is unknown or its session isn't established;
-    /// writes on a lane the peer never consumes are simply discarded
-    /// by the far side.
-    #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility facade")]
-    #[cfg(feature = "legacy-media")]
-    pub async fn send_video_sample(
+    /// Resolve a Device selector to its live session and flow set, once.
+    ///
+    /// **The only realtime fence that resolves a name, and it has exactly one
+    /// caller left**: claiming a session's inbound stream, which is a fresh
+    /// question about whoever is current rather than an operation on something
+    /// already open. (Opening a flow resolves too, but resolves for itself and
+    /// keeps the owner, because it has two more fence acquisitions to make and
+    /// must make them against the same installation.)
+    ///
+    /// The resolution rule is stated once, here: no live session means
+    /// `SessionNotCurrent`, and the fence — not the caller — supplies both the
+    /// session and the freshly acquired incarnation.
+    fn with_realtime_flows<T>(
         &self,
         peer: &str,
-        lane: u8,
-        data: bytes::Bytes,
-        duration: std::time::Duration,
-    ) -> Result<()> {
-        let flow = {
-            let Some(p) = self.peers.get(peer) else {
-                return Err(Error::Network(format!("peer not found: {peer}")));
-            };
-            p.realtime_flow_ports()
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+        ) -> std::result::Result<T, RealtimeFlowError>,
+    ) -> std::result::Result<T, RealtimeFlowError> {
+        let Some(owner) = self.peers.owner(peer) else {
+            return Err(RealtimeFlowError::SessionNotCurrent);
         };
-        let (session, capability) = flow
-            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
-        session.send_video(&capability, lane, data, duration).await
-    }
-
-    /// Subscribe to audio frames from every peer on this network
-    /// (filter by [`InboundAudioSample::from`]). Lagging loses old
-    /// frames, never delays new ones — live audio is freshness too.
-    #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility facade")]
-    #[cfg(feature = "legacy-media")]
-    pub fn subscribe_audio(&self) -> broadcast::Receiver<InboundAudioSample> {
-        self.audio_subscribers.subscribe()
-    }
-
-    /// Engine-side dispatch: fan an audio frame out to the audio
-    /// subscribers. Silently drops with none registered.
-    pub(crate) fn dispatch_audio(&self, from: &str, sample: AudioSample) {
-        let _ = self.audio_subscribers.send(InboundAudioSample {
-            from: from.to_string(),
-            sample,
-        });
-    }
-
-    /// Write one encoded Opus frame onto the audio lane to `peer`.
-    /// `duration` is the frame length (20 ms canonically) — it paces
-    /// the RTP clock. Same contract as [`Self::send_video_sample`].
-    #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility facade")]
-    #[cfg(feature = "legacy-media")]
-    pub async fn send_audio_sample(
-        &self,
-        peer: &str,
-        lane: u8,
-        data: bytes::Bytes,
-        duration: std::time::Duration,
-    ) -> Result<()> {
-        let flow = {
-            let Some(p) = self.peers.get(peer) else {
-                return Err(Error::Network(format!("peer not found: {peer}")));
-            };
-            p.realtime_flow_ports()
-        };
-        let (session, capability) = flow
-            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
-        session.send_audio(&capability, lane, data, duration).await
+        self.peers
+            .with_live_session_flow(
+                &owner,
+                self.session_broker.as_ref(),
+                &self.network_id,
+                effect,
+            )
+            .unwrap_or(Err(RealtimeFlowError::SessionNotCurrent))
     }
 
     /// Send a channel frame to one peer via the command queue.
@@ -1245,7 +2178,7 @@ impl NetworkState {
                 payload,
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped reply".into()))?
     }
@@ -1256,49 +2189,17 @@ impl NetworkState {
         &self,
         channel: &str,
         payload: serde_json::Value,
-    ) -> usize {
+    ) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
+        self.cmd_tx
             .send(NetworkCmd::BroadcastChannelFrame {
                 channel: channel.to_string(),
                 payload,
                 reply,
             })
-            .is_err()
-        {
-            return 0;
-        }
-        rx.await.unwrap_or(0)
-    }
-
-    /// Send an RPC request to one peer. Lower-level than the
-    /// `Rpc` facade; `Rpc::call` builds the request, registers
-    /// the pending entry, and then calls this.
-    pub async fn send_rpc_request(&self, peer: &str, request: RpcRequestMessage) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(NetworkCmd::SendRpcRequest {
-                peer: peer.to_string(),
-                request,
-                reply,
-            })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
-            .map_err(|_| Error::Network("engine dropped reply".into()))?
-    }
-
-    /// Broadcast a capabilities update to every active peer.
-    pub async fn broadcast_capabilities(&self, caps: CapabilityAdvert) -> usize {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(NetworkCmd::BroadcastCapabilities { caps, reply })
-            .is_err()
-        {
-            return 0;
-        }
-        rx.await.unwrap_or(0)
+            .map_err(|_| Error::Network("engine dropped broadcast reply".into()))
     }
 
     /// Persist `device_id` into the per-network roster. Does NOT
@@ -1312,11 +2213,20 @@ impl NetworkState {
 
     /// Synchronous roster commit used by an already-serialized runtime owner.
     ///
-    /// The public compatibility operation remains async, but the underlying
-    /// roster mutation and file replacement contain no await point. Arc 03
+    /// The public facade remains async, but the underlying roster mutation and
+    /// file replacement contain no await point. The admitted handshake path
     /// uses this form while holding the exact peer-installation fence so a
     /// replacement cannot land between owner validation and persistence.
     pub(super) fn approve_roster_now(&self, device_id: &str, label: &str) -> Result<()> {
+        if !super::governance::current_policy_admits(
+            &self.governance_state.read(),
+            self.identity.public_id(),
+            device_id,
+        ) {
+            return Err(Error::Network(
+                "Closed membership requires a signed governance grant".into(),
+            ));
+        }
         // Defense in depth behind the handshake's eviction gate: on a
         // closed network a device the signed state evicted can't be
         // rostered by ANY path — not mutual-ACTIVE persistence, not a
@@ -1374,63 +2284,60 @@ impl NetworkState {
     /// should treat the snapshot as instantaneous and re-fetch
     /// for fresh data.
     pub fn peer_snapshot(&self) -> Vec<crate::handle::PeerInfo> {
-        self.peers.collect_map(|peer| {
-            let device_id = peer.device_id.clone();
-            let data = peer.snapshot();
-            let pubkey = crate::signing::pubkey_part(&device_id);
-            let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
-            Some(crate::handle::PeerInfo {
-                device_id: device_id.clone(),
-                status: data.status,
-                tier: data.tier,
-                rtt_ms: data.rtt_ms,
-                clock_skew_ms: data.clock_skew_ms,
-                label: data.label,
-                capabilities: data.capabilities,
-                local_shelved: data.local_shelved,
-                remote_shelved: data.remote_shelved,
-                authenticated: data.authenticated,
-                device_suffix,
-                verification_code_received: data.verification_code_received,
-                verification_code_sent: data.verification_code_sent,
-                local_approve_sent: data.local_approve_sent,
-                remote_approve_seen: data.remote_approve_seen,
-                needs_turn: data.needs_turn,
-                local_candidates: data.diag.local_candidates,
-                remote_candidates: data.diag.remote_candidates,
-                selected_pair: data.selected_pair,
-            })
-        })
+        self.peers
+            .collect_map(|peer| Some(peer.with_peer_view(Self::peer_info_from_view)))
     }
 
-    /// Per-peer detail. Returns `None` if the peer is not in the
-    /// engine's map.
-    pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {
-        let peer = self.peers.get(device_id)?;
-        let data = peer.snapshot();
-        let pubkey = crate::signing::pubkey_part(device_id);
-        let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
-        Some(crate::handle::PeerInfo {
-            device_id: device_id.to_string(),
+    /// Build one [`crate::handle::PeerInfo`] from a single coherent observation.
+    ///
+    /// Both public snapshot paths go through here, so they cannot drift and
+    /// neither can pair a stale advert with fresh state — the view's session and
+    /// data halves were read together.
+    ///
+    /// Reads exactly the fields `PeerInfo` publishes. The shape this replaces
+    /// went through `PeerStateSnapshot`, which cloned the whole `PeerDiag` so
+    /// that two of its counters could be projected and the rest discarded; the
+    /// wire result is identical and the clone is gone.
+    fn peer_info_from_view(view: super::connection::PeerView<'_>) -> crate::handle::PeerInfo {
+        let data = view.data;
+        let pubkey = crate::signing::pubkey_part(view.device_id);
+        crate::handle::PeerInfo {
+            device_id: view.device_id.to_string(),
             status: data.status,
             tier: data.tier,
             rtt_ms: data.rtt_ms,
             clock_skew_ms: data.clock_skew_ms,
-            label: data.label,
-            capabilities: data.capabilities,
+            label: data.label.clone(),
+            capabilities: view.session.and_then(|app| app.capabilities()),
             local_shelved: data.local_shelved,
             remote_shelved: data.remote_shelved,
             authenticated: data.authenticated,
-            device_suffix,
-            verification_code_received: data.verification_code_received,
-            verification_code_sent: data.verification_code_sent,
+            device_suffix: crate::identity::display_suffix(pubkey.as_bytes()),
+            verification_code_received: data.verification_code_received.clone(),
+            verification_code_sent: data.verification_code_sent.clone(),
             local_approve_sent: data.local_approve_sent,
             remote_approve_seen: data.remote_approve_seen,
-            needs_turn: data.needs_turn,
-            local_candidates: data.diag.local_candidates,
-            remote_candidates: data.diag.remote_candidates,
+            needs_turn: data.no_turn_diag_emitted,
+            // Cloned because `IceCandidateStats` is not `Copy`. It is five
+            // `u32`s with no heap under them, so the clone is the copy the
+            // compiler would have made — and still strictly less than the shape
+            // this replaced, which cloned the whole `PeerDiag` to project two
+            // of its fields.
+            local_candidates: data.diag.local_candidates.clone(),
+            remote_candidates: data.diag.remote_candidates.clone(),
             selected_pair: data.selected_pair,
-        })
+        }
+    }
+
+    /// Plan a funded peers snapshot.
+    /// Per-peer detail. Returns `None` if the peer is not in the
+    /// engine's map.
+    pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {
+        Some(
+            self.peers
+                .get(device_id)?
+                .with_peer_view(Self::peer_info_from_view),
+        )
     }
 
     /// Tear down every active peer session. Called from the
@@ -1443,16 +2350,21 @@ impl NetworkState {
             }
         }
         drop(retired);
-        // Nothing outlives the engine: parked connect waits and queued
-        // reliable sends resolve with the truth instead of hanging.
+        // Nothing outlives the engine: parked connect waits resolve with the
+        // truth instead of hanging.
+        //
+        // Queued reliable sends need no pass of their own here, and that is the
+        // point of moving them. `retire_and_close` above drops each peer's
+        // promoted session, which drops the record that retained them, which
+        // resolves every waiting caller — before this function even reaches the
+        // connect waiters. A separate shutdown sweep would be a second place
+        // that has to remember, and the one that is forgotten is the one that
+        // leaves a caller hanging.
         let waiting: Vec<String> = self.connect_waiters.lock().keys().cloned().collect();
         for peer in waiting {
             self.resolve_connect_waiters(&peer, Some("network shut down"));
         }
-        let queued: Vec<String> = self.reliable_out.lock().keys().cloned().collect();
-        for peer in queued {
-            super::reliable::fail_peer(self, &peer, "network shut down");
-        }
+        self.application_gateway.close();
     }
 
     /// Broadcast a graceful departure so peers drop our session immediately
@@ -1463,7 +2375,9 @@ impl NetworkState {
     /// emit this *before* dropping the signaling driver and give it a brief
     /// moment to reach the relays.
     pub fn announce_departure(&self) {
-        let _ = self.signaling_tx.send(SignalingOutbound::Leave);
+        if let Err(error) = self.signaling_tx.send(SignalingOutbound::Leave) {
+            tracing::warn!(error = %error.into_admission_error(), "departure announcement was refused");
+        }
     }
 
     /// Queue an in-place reconnect on the engine driver — redial signaling and
@@ -1475,7 +2389,9 @@ impl NetworkState {
     /// [`NetworkCmd::Reconnect`] so it's serialized with every other per-peer
     /// mutation. See [`super::network_watch::reconnect_all_in_place`].
     pub fn reconnect(&self, peer: Option<String>) {
-        let _ = self.cmd_tx.send(NetworkCmd::Reconnect { peer });
+        if let Err(error) = self.cmd_tx.send(NetworkCmd::Reconnect { peer }) {
+            tracing::warn!(error = %error.into_admission_error(), "reconnect command was refused");
+        }
     }
 
     /// Queue a deliberate offerer-side dial of exactly one peer on the engine
@@ -1485,11 +2401,13 @@ impl NetworkState {
     /// like [`Self::reconnect`]; the work runs on the driver via
     /// [`NetworkCmd::ConnectPeer`]. Backs [`crate::JoinedNetwork::connect_peer`].
     pub fn connect_peer(&self, device_id: &str) {
-        let _ = self.cmd_tx.send(NetworkCmd::ConnectPeer {
+        if let Err(error) = self.cmd_tx.send(NetworkCmd::ConnectPeer {
             device_id: device_id.to_string(),
             sticky: false,
             reply: None,
-        });
+        }) {
+            tracing::warn!(error = %error.into_admission_error(), peer = %device_id, "connect command was refused");
+        }
     }
 
     /// Deliberately dial one peer and resolve when the link reaches
@@ -1500,27 +2418,44 @@ impl NetworkState {
     /// caller's own timeout.
     pub async fn connect_peer_wait(&self, device_id: &str, sticky: bool) -> Result<()> {
         let (reply, rx) = oneshot::channel();
+        let id = self
+            .next_connect_waiter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cmd_tx
             .send(NetworkCmd::ConnectPeer {
                 device_id: device_id.to_string(),
                 sticky,
-                reply: Some(reply),
+                reply: Some(ConnectWaiterRegistration {
+                    id,
+                    reply,
+                    cancelled: Arc::clone(&cancelled),
+                }),
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped the connect wait".into()))?
+            .map_err(|error| error.into_admission_error())?;
+        let mut cancellation = ConnectWaitCancellation {
+            state: self,
+            device_id: device_id.to_string(),
+            id,
+            cancelled,
+            armed: true,
+        };
+        let result = rx
+            .await
+            .map_err(|_| Error::Network("engine dropped the connect wait".into()))?;
+        cancellation.armed = false;
+        result
     }
 
-    /// Queue a frame for acknowledged delivery to `peer` — see
-    /// [`NetworkCmd::SendChannelReliable`] for the contract. Resolves on
-    /// the peer's ack; errs on TTL expiry, outbox backpressure, or
-    /// terminal peer failure.
+    /// Retain a frame for acknowledged delivery to `peer` — see
+    /// [`NetworkCmd::SendChannelReliable`] for the contract. Resolves on the
+    /// peer's cumulative acknowledgement; errs on refusal at submission, or when
+    /// the session retaining it ends before the peer acknowledges.
     pub async fn send_channel_reliable(
         &self,
         peer: &str,
         channel: &str,
         payload: serde_json::Value,
-        ttl_ms: Option<u64>,
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
@@ -1528,10 +2463,9 @@ impl NetworkState {
                 peer: peer.to_string(),
                 channel: channel.to_string(),
                 payload,
-                ttl_ms,
                 reply,
             })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+            .map_err(|error| error.into_admission_error())?;
         rx.await
             .map_err(|_| Error::Network("engine dropped the reliable send".into()))?
     }
@@ -1541,72 +2475,8 @@ impl NetworkState {
     /// topology experiment) compares across configurations.
     pub fn traffic_snapshot(&self) -> super::traffic::TrafficSnapshot {
         let mut snap = self.traffic.snapshot();
-        snap.reliable_pending = super::reliable::pending_total(self) as u64;
+        snap.reliable_pending = self.peers.reliable_pending_total() as u64;
         snap
-    }
-
-    /// Open the lowest free media lane of `kind` toward `peer`.
-    #[cfg(feature = "legacy-media")]
-    pub(crate) async fn media_lane_open(
-        &self,
-        peer: &str,
-        kind: crate::transport::webrtc::LaneKind,
-    ) -> Result<u8> {
-        let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(NetworkCmd::MediaLaneOpen {
-                peer: peer.to_string(),
-                kind,
-                reply,
-            })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped the lane open".into()))?
-    }
-
-    /// Close a media lane toward `peer` (idempotent).
-    #[cfg(feature = "legacy-media")]
-    pub(crate) async fn media_lane_close(
-        &self,
-        peer: &str,
-        kind: crate::transport::webrtc::LaneKind,
-        lane: u8,
-    ) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(NetworkCmd::MediaLaneClose {
-                peer: peer.to_string(),
-                kind,
-                lane,
-                reply,
-            })
-            .map_err(|_| Error::Network("engine command queue closed".into()))?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped the lane close".into()))?
-    }
-
-    #[cfg(feature = "legacy-media")]
-    #[allow(
-        deprecated,
-        reason = "this exact method is the temporary legacy media finalization boundary"
-    )]
-    pub(crate) async fn media_lanes_finalize(&self, peer: &str) -> Result<usize> {
-        let owner = self
-            .peers
-            .owner(peer)
-            .ok_or_else(|| Error::Network(format!("peer not found: {peer}")))?;
-        let flow = self
-            .peers
-            .get_if_current(&owner)
-            .and_then(|entry| entry.realtime_flow_ports())
-            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
-        let finalized = flow.0.finalize_suspended_lanes(&flow.1).await;
-        if finalized != 0 {
-            if let Some(entry) = self.peers.get_if_current(&owner) {
-                entry.state.write().media_reneg_pending = true;
-            }
-        }
-        Ok(finalized)
     }
 
     /// Whether `device_id` has a standing dial (config pin or runtime
@@ -1638,13 +2508,34 @@ impl NetworkState {
     pub(crate) fn register_connect_waiter(
         &self,
         device_id: &str,
-        reply: oneshot::Sender<Result<()>>,
+        waiter: ConnectWaiterRegistration,
     ) {
-        self.connect_waiters
-            .lock()
+        let mut waiters = self.connect_waiters.lock();
+        if waiter.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        waiters
             .entry(device_id.to_string())
             .or_default()
-            .push(reply);
+            .push(waiter);
+    }
+
+    fn cancel_connect_waiter(&self, device_id: &str, id: u64) {
+        let mut waiters = self.connect_waiters.lock();
+        if let Some(peer_waiters) = waiters.get_mut(device_id) {
+            peer_waiters.retain(|waiter| waiter.id != id);
+            if peer_waiters.is_empty() {
+                waiters.remove(device_id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn connect_waiter_count_for_test(&self, device_id: &str) -> usize {
+        self.connect_waiters
+            .lock()
+            .get(device_id)
+            .map_or(0, Vec::len)
     }
 
     /// Resolve every waiter parked on `device_id`. `error == None`
@@ -1652,12 +2543,12 @@ impl NetworkState {
     pub(crate) fn resolve_connect_waiters(&self, device_id: &str, error: Option<&str>) {
         let waiters = self.connect_waiters.lock().remove(device_id);
         let Some(waiters) = waiters else { return };
-        for w in waiters {
+        for waiter in waiters {
             let result = match error {
                 None => Ok(()),
                 Some(e) => Err(Error::Network(format!("connect {device_id}: {e}"))),
             };
-            let _ = w.send(result);
+            let _ = waiter.reply.send(result);
         }
     }
 
@@ -1699,7 +2590,7 @@ pub(crate) fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod arc03_peer_registry_tests {
     use super::*;
-    use crate::engine::connection::PeerStatus;
+    use crate::engine::connection::{PeerConnection, PeerStatus};
     use std::hint::black_box;
     use std::time::{Duration, Instant};
 
@@ -1898,15 +2789,23 @@ mod arc03_peer_registry_tests {
 
             let old_started = Instant::now();
             for _ in 0..rounds {
+                // The shape this harness exists to measure against: materialize a
+                // keyed pair for every peer, then filter. Its cost is one id clone
+                // per peer whether or not the peer survives the filter, plus the
+                // intermediate vector. Reconstructed from `values_snapshot` rather
+                // than read out of the map directly — the registry key *is* the
+                // peer's device id, so cloning the field is the same work as
+                // cloning the key, and the comparison stays honest without the
+                // benchmark reaching into registry internals.
                 let snapshot: Vec<(String, Arc<PeerConnection>)> = registry
-                    .peers
-                    .iter()
-                    .map(|entry| (entry.key().clone(), Arc::clone(&entry.value().peer)))
+                    .values_snapshot()
+                    .into_iter()
+                    .map(|peer| (peer.device_id.clone(), peer))
                     .collect();
                 let active: Vec<String> = snapshot
                     .into_iter()
                     .filter(|(_, peer)| peer.state.read().status == PeerStatus::Active)
-                    .map(|(key, _)| key.clone())
+                    .map(|(key, _)| key)
                     .collect();
                 assert_eq!(active.len(), count, "legacy scan output cardinality");
                 black_box(active);

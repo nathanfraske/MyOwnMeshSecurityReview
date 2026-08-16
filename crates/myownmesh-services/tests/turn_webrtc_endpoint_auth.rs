@@ -8,20 +8,14 @@ use myownmesh_core::config::{
     TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
+use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
-#[allow(
-    deprecated,
-    reason = "this import is used only by the frozen legacy media negative control"
-)]
-use myownmesh_core::transport::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackMailboxCapacities,
-    ConnectorCallbackPolicy, ConnectorCallbackServiceWeights, FiniteResourceProvider, MeshEvent,
-    PeerEvent, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy, ResourceProviderPort,
-    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackPolicy,
+    FiniteResourceProvider, MeshEvent, PeerEvent, ResourceProviderPort,
+    TransportLabCallbackWorkload, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -52,13 +46,32 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
     let four = std::num::NonZeroUsize::new(4)
         .expect("the four-connector fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
-    let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::new(callback, callback),
-        ConnectorCallbackServiceWeights::data_only(callback, callback),
-        RealtimeConnectorPolicy::Disabled,
-    )
-    .expect("fixture data-only callback policy is valid");
-    let webrtc = WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic());
+    // This fixture mints its own finite provider via
+    // `transport_lab_connector_fixture_grant`, so it has to state the largest
+    // payload it will fund for each callback class — nothing else can derive
+    // the byte grant, and a callback class funded for no payload is what left
+    // gathered ICE candidates refused for want of `QueuedBytes`.
+    //
+    // Both are fixture numbers chosen here and stated here. Deliberately *not*
+    // the signaling frame limit used for the candidate and SDP envelopes below:
+    // that limit belongs to another layer, and a borrowed number that happens to
+    // be large enough is exactly how the original underfunding stayed invisible.
+    // Control covers one gathered ICE candidate's JSON; endpoint data covers the
+    // handshake frames this two-peer scenario exchanges.
+    let control_payload_ceiling =
+        std::num::NonZeroUsize::new(4_096).expect("the fixture control payload ceiling is nonzero");
+    let endpoint_payload_ceiling = std::num::NonZeroUsize::new(16_384)
+        .expect("the fixture endpoint payload ceiling is nonzero");
+    let callback_workload = TransportLabCallbackWorkload {
+        control_slots: callback,
+        endpoint_slots: callback,
+        control_payload_bytes: u64::try_from(control_payload_ceiling.get())
+            .expect("the fixture control payload ceiling fits u64"),
+        endpoint_payload_bytes: u64::try_from(endpoint_payload_ceiling.get())
+            .expect("the fixture endpoint payload ceiling fits u64"),
+        realtime: None,
+    };
+    let webrtc = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
     let connectors = std::num::NonZeroU64::new(
         u64::try_from(four.get()).expect("fixture connector count fits u64"),
     )
@@ -101,13 +114,45 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
         frame_bytes,
     )
     .expect("fixture remote-SDP claims are representable");
-    let profiles = vec![webrtc; four.get()];
+    // The grant is priced against four identical connector profiles, and the
+    // policy the fixture actually installs is that same profile. Clone for the
+    // pricing slice so the one profile stays owned here for the policy below.
+    let profiles = vec![webrtc.clone(); four.get()];
     let mesh_scopes =
         std::num::NonZeroU64::new(4).expect("the two-scenario fixture Mesh scope count is nonzero");
-    let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes)
+    // Gateway parsing capacity, which none of the grants above price: they cover
+    // building connectors and moving signaling through them, while this covers
+    // turning one inbound frame into a `serde_json::Value` tree. It is added
+    // here, at the full-engine owner that runs a real handshake, rather than
+    // inside `transport_lab_connector_fixture_grant` — that helper prices
+    // transport construction and has no business naming what the application
+    // gateway may allocate.
+    //
+    // Two simultaneous claims per connector, both with a named holder: the
+    // peer's `Hello` retains its claim for the connection's whole life, and one
+    // further protocol or application frame is being parsed at any moment.
+    //
+    // This fixture's own frame size, not borrowed from the signaling frame limit
+    // used for the candidate and SDP envelopes above, and the claim itself comes
+    // from the gateway rather than being restated here. It funds a parse and
+    // gates nothing on the wire.
+    const JSON_FRAME_BYTES: usize = 8 * 1024;
+    const JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
+    let json_input_work =
+        myownmesh_core::application_gateway::json_input_work_claim(JSON_FRAME_BYTES)
+            .expect("the fixture JSON input claim is representable")
+            .checked_scale(
+                connectors
+                    .get()
+                    .checked_mul(JSON_CLAIMS_PER_CONNECTOR)
+                    .expect("the fixture JSON claim count is representable"),
+            )
+            .expect("the fixture JSON input capacity is representable");
+    let grant = transport_lab_connector_fixture_grant(&profiles, mesh_scopes, callback_workload)
         .expect("fixture structural and callback claims are representable")
         .checked_add(candidate_workload)
         .and_then(|claim| claim.checked_add(remote_descriptions))
+        .and_then(|claim| claim.checked_add(json_input_work))
         .expect("the fixture provider grant is representable");
     let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
         .expect("the fixture provider accounts for its process scope");
@@ -162,7 +207,7 @@ async fn receive_string(
             tokio::select! {
                 message = channel.recv() => {
                     if let Some(Ok(message)) = message {
-                        return (message.from, message.body);
+                        return (message.from().to_string(), message.body().clone());
                     }
                 }
                 event = events.recv(), if std::env::var_os("MYOWNMESH_ARC03_DEBUG_EVENTS").is_some() => {
@@ -217,10 +262,6 @@ async fn wait_for_reported_relay_pair(peers: [(&myownmesh_core::engine::NetworkS
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(
-    deprecated,
-    reason = "this exact test proves TURN cannot bypass the frozen legacy media admission boundary"
-)]
 async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
     let observed_at = std::time::Instant::now();
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
@@ -300,8 +341,10 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
 
     let alice_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&alice));
     let bob_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&bob));
-    let mut alice_receive = alice_channel.subscribe();
-    let mut bob_receive = bob_channel.subscribe();
+    let mut alice_receive = alice_channel
+        .subscribe()
+        .expect("alice subscription admitted");
+    let mut bob_receive = bob_channel.subscribe().expect("bob subscription admitted");
 
     alice_channel
         .send_to(bob_id.public_id(), &"alice-over-turn".to_string())
@@ -325,13 +368,8 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     );
 
     let positive_close_at = std::time::Instant::now();
-    alice
-        .cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Alice shutdown reaches its driver");
-    bob.cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Bob shutdown reaches its driver");
+    alice.request_shutdown();
+    bob.request_shutdown();
     alice_driver.await.expect("Alice driver shuts down cleanly");
     bob_driver.await.expect("Bob driver shuts down cleanly");
     if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
@@ -343,12 +381,16 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     drop((alice, bob));
     tokio::task::yield_now().await;
 
-    // Negative controls on the same real TURN service. A relay-selected and
+    // Negative control on the same real TURN service: a relay-selected and
     // endpoint-authenticated channel without mutual application admission
-    // cannot send endpoint data. The codec-neutral data-only profile also
-    // cannot acquire the frozen legacy-media surface merely because TURN was
-    // selected. The latter is a profile-exclusion control, not a separate
-    // real-time admission control.
+    // cannot send endpoint data.
+    //
+    // A second control used to sit here, proving a data-only profile could not
+    // acquire the fixed video/audio lane surface merely because TURN was
+    // selected. That was a profile-exclusion control over a surface that no
+    // longer exists — there is no lane to open and no media entry point on this
+    // path — so it is gone rather than restated against realtime flows, which
+    // are reached through `JoinedNetwork` and not from an engine handle.
     let carol_id = Arc::new(Identity::ephemeral());
     let dave_id = Arc::new(Identity::ephemeral());
     let (carol, carol_driver) = spawn_network(
@@ -392,36 +434,9 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         .send_to(dave_id.public_id(), &"must-not-send".to_string())
         .await
         .expect_err("relay selection cannot bypass session admission");
-    carol
-        .send_video_sample(
-            dave_id.public_id(),
-            0,
-            b"must-not-send".to_vec().into(),
-            Duration::from_millis(1),
-        )
-        .await
-        .expect_err("relay selection cannot add legacy media to a data-only profile");
-    let (lane_reply, lane_result) = tokio::sync::oneshot::channel();
-    carol
-        .cmd_tx
-        .send(NetworkCmd::MediaLaneOpen {
-            peer: dave_id.public_id().to_string(),
-            kind: LaneKind::Video,
-            reply: lane_reply,
-        })
-        .expect("negative lane request reaches the engine");
-    lane_result
-        .await
-        .expect("engine returns the negative lane result")
-        .expect_err("a data-only profile cannot open a legacy media lane");
 
-    carol
-        .cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Carol shutdown reaches its driver");
-    dave.cmd_tx
-        .send(NetworkCmd::Shutdown)
-        .expect("Dave shutdown reaches its driver");
+    carol.request_shutdown();
+    dave.request_shutdown();
     carol_driver.await.expect("Carol driver shuts down cleanly");
     dave_driver.await.expect("Dave driver shuts down cleanly");
     drop((carol, dave));

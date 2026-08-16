@@ -1,5 +1,5 @@
-//! WebRTC peer connection wrapper. Bridges webrtc-rs's callback-
-//! driven API to one bounded mailbox per connector worker.
+//! WebRTC peer connection wrapper. Bridges webrtc-rs's callback-driven
+//! API to one bounded mailbox per connector worker.
 //!
 //! Lifecycle per peer:
 //!
@@ -32,10 +32,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::Semaphore;
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
+use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
@@ -52,11 +52,11 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
-#[cfg(any(test, feature = "legacy-media"))]
-use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
-#[cfg(any(test, feature = "legacy-media"))]
-use webrtc::rtp_transceiver::RTCPFeedback;
+use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::{RTCRtpTransceiver, RTCRtpTransceiverInit};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -64,13 +64,11 @@ use webrtc::track::track_remote::TrackRemote;
 use crate::error::{Error, Result};
 use crate::resource::{
     ObservationLease, PeerConnectionResourceScope, PreAuthResourceFamily, ProcessResourceRoot,
-    ResourceMeasurement, ResourceReclaimSubscription, ResourceUnavailable, ResourceUse,
+    ResourceMeasurement, ResourceUnavailable, ResourceUse,
 };
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness, ConnectorCallbackPolicy,
     ConnectorCandidateCapability, ConnectorResourceOwnerReport, ConnectorWorkResourceScope,
-    EnabledRealtimeConnectorPolicy, MaxCumulativeRemoteCandidateApplications,
-    MaxCumulativeRemoteCandidateContentBytes, MaxCumulativeRemoteCandidateSubmissions,
     MeshConnectorResourceReport, MeshConnectorResourceScope,
     OwnedRemoteCandidate as ElasticRemoteCandidateLease, RealtimeConnectorPolicy,
     RemoteCandidateAdmission as ElasticRemoteCandidateAdmission,
@@ -78,7 +76,7 @@ use crate::runtime::attempt::{
     RemoteCandidateApplyError as ElasticRemoteCandidateApplyError,
     RemoteCandidateAttempt as ElasticRemoteCandidateAttempt,
     RemoteCandidateDigestDecision as ElasticRemoteCandidateDigestDecision,
-    RemoteCandidateInput as ElasticRemoteCandidateInput, RemoteCandidateLocalCeilings,
+    RemoteCandidateInput as ElasticRemoteCandidateInput,
     RemoteCandidateTerminalReason as ElasticRemoteCandidateTerminalReason,
     WebRtcConnectorCapablePolicy,
 };
@@ -86,17 +84,129 @@ use crate::runtime::attempt::{
 use super::ice::build_rtc_configuration;
 
 mod callback;
+/// The callback grant a scope-less lab connector states for itself.
+///
+/// Published only where a scope-less connector can be built at all. Production
+/// never names it: a production connector has a real work scope and acquires
+/// against the owner's provider, so there is nothing for it to state.
+#[cfg(feature = "transport-lab")]
+pub use callback::TransportLabCallbackGrant;
 mod cleanup;
 mod h264;
-mod media;
+mod inbound;
 mod policy;
+mod provider;
 mod realtime;
+mod session_flow;
+/// The application-facing WebRTC realtime vocabulary.
+///
+/// Public, and public *here* rather than in `crate::realtime`, because every
+/// one of these carries something only a negotiated RTP clock makes readable.
+/// The basal module holds what is true of any flow; this holds what is true of
+/// a WebRTC one, and [`crate::JoinedNetwork`]'s `*_webrtc_realtime` methods are
+/// where the two meet.
+///
+/// The four DTOs come from [`provider`] and the RTP kind from [`session_flow`],
+/// which is a split worth stating: the kind is a *negotiation* primitive the
+/// flow machinery selects capabilities with, so it lives beside that machinery
+/// and is published from there; the DTOs exist only to cross the application
+/// boundary and have no business inside the flow set.
+pub use provider::{
+    WebRtcRealtimeFlowOpen, WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit,
+    WebRtcRealtimeOutboundUnit,
+};
+/// The connector's own short spelling of the profile.
+///
+/// Private, so it changes nothing for a caller. It exists because the public
+/// name is qualified for the benefit of code that can see more than one
+/// provider, and this module can see exactly one.
+///
+/// Only the profile. The other four qualified types above are constructed by
+/// the daemon and validated by `RealtimeProfile::new`; nothing in the connector
+/// names them outside the module that defines them, so importing them here
+/// would be four names that document an expectation rather than a use.
+use session_flow::RealtimeProfile;
+pub use session_flow::WebRtcRtpKind;
+/// The application's real-time configuration, and only that.
+///
+/// One of two public re-exports from this module. `crates/myownmesh` is a
+/// separate crate, so the daemon cannot name anything `pub(crate)` here — but
+/// the only thing it needs to name is the profile it parsed at startup. These
+/// five types are inert plain data plus one validating constructor: they carry
+/// no session, no incarnation, no label and no port, so publishing them hands
+/// out no authority. Everything that *is* authority stays in the `pub(crate)`
+/// list below.
+///
+/// **Published under qualified names, and that is not cosmetic.** A codec, a
+/// framing strategy, an RTCP feedback mechanism and the profile that holds them
+/// are WebRTC facts; an unqualified `RealtimeProfile` at the crate root reads as
+/// *the* realtime profile, which invites an application to treat it as the
+/// generic layer's concept and a second provider to believe it must fit into it.
+/// There is no unqualified public spelling and no compatibility alias — a caller
+/// updates the name or does not compile, which is the only signal strong enough
+/// to relocate a concept.
+///
+/// Aliased rather than renamed at the definition because inside the connector
+/// there is nothing to disambiguate from: `RealtimeProfile` is unambiguous in a
+/// module that has no other kind of profile, and the qualification is only owed
+/// to callers who see it next to other providers' vocabularies.
+pub use session_flow::{
+    RealtimeCodec as WebRtcRealtimeCodec, RealtimeFlowName,
+    RealtimeFraming as WebRtcRealtimeFraming, RealtimeProfile as WebRtcRealtimeProfile,
+    RealtimeProfileError as WebRtcRealtimeProfileError,
+    RealtimeRtcpFeedback as WebRtcRealtimeRtcpFeedback,
+};
+/// The per-session flow vocabulary, and nothing else from that module.
+///
+/// A re-export rather than `pub(crate) mod`: the engine stores the flow set in
+/// the promoted-session bundle and converts the rest at its DTO boundary, but
+/// `RealtimeFlow` and `RealtimeFlowPort` must stay unreachable from outside the
+/// connector. Widening the module would have exposed both.
+pub(crate) use session_flow::{
+    RealtimeDirection, RealtimeEncoding, RealtimeFlowError, RealtimeFlowIdentity,
+    RealtimeFlowLabel, RealtimeFlowRemains, RealtimeFlowSetIdentity, RealtimeFlowSpec,
+    RealtimeInboundArrivals, RealtimeRecvUnit, RealtimeSendUnit, RealtimeTrackIdentity,
+    SessionRealtimeFlows,
+};
+mod unit_assembly;
 use callback::*;
 use cleanup::*;
 use h264::*;
-pub use media::*;
+/// The session-gated inbound pump, and nothing public.
+///
+/// Private because there is no application vocabulary here to publish: an
+/// inbound track's destination and framing are both facts this side
+/// established, so nothing an application names is involved.
+use inbound::*;
 pub use policy::*;
 use realtime::*;
+/// Private, not added to the `pub(crate)` re-export above, and deliberately so.
+///
+/// All four are connector-internal: the binding table decides which flow a
+/// negotiated track may attach to, the port handle is a pump's non-owning claim
+/// on an already-open flow, the unit policy is how a flow's framing reaches it,
+/// and the leased wake is the funded block a pump parks on. Re-exporting any of
+/// them would put it in the engine's vocabulary, and the engine has no business
+/// naming a demux table it must not write to — still less a route to a flow's
+/// accounting that skips the session gate. A private `use` makes them nameable
+/// here and in this module's children — which is exactly the connector — and
+/// nowhere else.
+///
+/// That reach is the whole reason `LeasedWake` is listed. `session_flow`
+/// re-exports it at connector visibility, but a re-export is reachable by path
+/// rather than by a sibling's `use super::*`: the inbound pump's owner names the
+/// type in a field, and this line is what puts it in the namespace that
+/// sibling globs.
+///
+/// `RealtimeInboundAttachment` is deliberately absent even though this module
+/// uses one. `on_track` never writes the name: it binds the value `admit`
+/// returns and destructures it into the pump's owner. Importing a type only to
+/// leave it unwritten is an import that documents an intention rather than a
+/// dependency, and it goes stale silently the moment the intention changes.
+use session_flow::{
+    LeasedWake, RealtimeFlowPortHandle, RealtimeInboundBindings, RealtimeUnitPolicy,
+};
+use unit_assembly::*;
 
 /// Interface-name prefixes for virtual / container / overlay networks
 /// whose host addresses can never be reached by a remote peer. Gathering
@@ -190,10 +300,1374 @@ pub enum TransportEvent {
     /// place (fresh offer, same DTLS fingerprint). Coalesced by the
     /// engine per peer, so a burst of lane changes costs one offer.
     RenegotiationNeeded,
-    /// One assembled access unit from the peer's video track lane.
-    VideoSample(VideoSample),
-    /// One encoded audio frame from the peer's audio track lane.
-    AudioSample(AudioSample),
+    /// One assembled unit from a negotiated inbound real-time flow.
+    ///
+    /// The one inbound real-time crossing, reusing this queue rather than a
+    /// second channel: two inbound paths would be two things that can stall
+    /// independently, and an ordering between them to reason about.
+    ///
+    /// Codec-opaque and authority-free. It carries a label, a timestamp, a
+    /// marker and bytes — no session reference, no capability, no peer
+    /// identity. The admission decision was made before this existed, by
+    /// matching the negotiated track against a binding this side established;
+    /// an event that reached the engine cannot grant what the connector
+    /// already refused.
+    RealtimeUnit(RealtimeInboundDelivery),
+}
+
+/// One inbound realtime unit in transit from the connector to the engine.
+///
+/// Codec-opaque and authority-free by construction. Every field is private, so
+/// nothing outside this crate can read the label back, reach the unit, or hold
+/// the payload reservation — and nothing inside it can build one of these
+/// except the connector's own inbound path.
+///
+/// It rides the existing inbound event stream rather than a second channel:
+/// one inbound path means one thing that can stall, and no ordering to reason
+/// about between two. Which of that stream's sources feeds it — the realtime
+/// flow queue or a callback mailbox — decides how it is charged and capped, and
+/// is settled at the emit site rather than here.
+///
+/// The label is demux data, not a handle. It names a flow *within one session*,
+/// and the engine resolves that session at the fence before it delivers — so a
+/// unit that arrives for a session that has since gone is dropped, and its
+/// payload reservation is released with it rather than stranded.
+pub struct RealtimeInboundDelivery {
+    label: RealtimeFlowLabel,
+    unit: RealtimeRecvUnit,
+    /// Attached by the queue, then moved out with the unit and never released
+    /// separately: whoever takes the unit takes responsibility for the bytes it
+    /// occupies, and a delivery dropped undelivered releases them by dropping
+    /// this.
+    ///
+    /// `Option` because the queue is what mints it. `enqueue_checked` validates
+    /// the output reservation against its own registry, key and liveness before
+    /// converting it to a lease, so a delivery that arrived holding one would
+    /// mean either that conversion happened early and unvalidated, or that a
+    /// second lease is about to be attached and the bytes counted twice.
+    ///
+    /// The property this gives up at the constructor is regained downstream:
+    /// nothing but `enqueue_checked` puts one of these on the event stream, and
+    /// it attaches before it queues. A delivery reaching the engine without a
+    /// lease did not come through the accounting path at all.
+    payload: Option<RealtimePayloadLease>,
+}
+
+/// Written out rather than derived, and it redacts.
+///
+/// [`TransportEvent`] is `Debug`, so this has to be — but a derive would print
+/// the payload, and the payload is the peer's media. A unit that reaches a log
+/// or a panic message is application content leaving the process through a
+/// diagnostic channel that nothing audits. What is printed instead is what a
+/// diagnostic actually needs: which flow it was for, how many bytes it carried,
+/// and whether it is still holding a lease for them.
+///
+/// The byte count is not content. It is already visible to the resource owner
+/// that admitted the unit, so reporting it here discloses nothing that side of
+/// the boundary did not already account for.
+impl std::fmt::Debug for RealtimeInboundDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeInboundDelivery")
+            .field("label", &self.label)
+            .field("bytes", &self.unit.data.len())
+            .field("leased", &self.payload.is_some())
+            .finish()
+    }
+}
+
+impl RealtimeInboundDelivery {
+    /// Bind an assembled unit to the flow the connector's binding table
+    /// resolved for the track it arrived on.
+    pub(crate) fn new(label: RealtimeFlowLabel, unit: RealtimeRecvUnit) -> Self {
+        Self {
+            label,
+            unit,
+            payload: None,
+        }
+    }
+
+    /// **Controls only.** A delivery for `name` that never passed the
+    /// accounting path.
+    ///
+    /// The engine's unaccounted-delivery negative needs exactly one thing that
+    /// production cannot produce: a delivery naming a live flow while carrying
+    /// no payload lease. It is named for that, rather than reached by widening
+    /// [`RealtimeFlowLabel::mint`] — a caller able to mint could make a *real*
+    /// label outside admission, which is the opposite of what this proves.
+    ///
+    /// What is unaccounted is the **payload**. The label itself takes a real
+    /// lease, against a control-only elastic scope created once here, because
+    /// there is no such thing as an unleased label and a fixture that faked one
+    /// would be proving something about a shape that cannot exist. That is also
+    /// why the scope is never retired: a fixture label may outlive the control
+    /// that made it.
+    /// `pub(crate)`, matching [`RealtimeRecvUnit`]'s own visibility. The
+    /// engine's lab control is in this crate, so that is the whole audience;
+    /// a `pub` signature naming a `pub(crate)` type would be a private
+    /// interface, and widening the unit to reach for `pub` would publish an
+    /// inbound unit type nothing outside core has any use for.
+    ///
+    /// Gated on **both**, because its one caller is. The engine's negative is a
+    /// `#[tokio::test]` that is itself `cfg(feature = "transport-lab")`, so
+    /// `test` alone leaves this uncalled in a default-feature test build and
+    /// the lab feature alone leaves it uncallable in a library build. The
+    /// conjunction is the exact audience.
+    ///
+    /// The helper it calls stays plain `cfg(test)` on purpose: that one has a
+    /// second caller in this module's own controls, which do not need the lab.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn unaccounted_for_test(name: &RealtimeFlowName, unit: RealtimeRecvUnit) -> Self {
+        Self::new(control_label_for_test(name), unit)
+    }
+
+    /// How many payload bytes this delivery carries.
+    ///
+    /// Read at callback admission, which charges the delivery against the
+    /// pump's class budget. Borrowing rather than consuming, because admission
+    /// happens before the decision to take the event. Read from the unit rather
+    /// than the lease, so it answers the same before and after attachment.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.unit.data.len()
+    }
+
+    /// Take custody of the lease the queue minted for this delivery.
+    ///
+    /// Refuses a second attachment rather than overwriting, and hands the
+    /// refused lease back so it is released rather than stranded. Overwriting
+    /// would drop a live lease silently and leave the bytes it accounted for
+    /// charged to nothing.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the Err is the refused lease itself, returned by value so the caller drops it and the bytes it accounted for are released. Boxing it would allocate on the refusal path, and any smaller error would mean this fn keeps the lease it just declined — stranding exactly the accounting the refusal exists to prevent"
+    )]
+    fn attach(
+        &mut self,
+        payload: RealtimePayloadLease,
+    ) -> std::result::Result<(), RealtimePayloadLease> {
+        if self.payload.is_some() {
+            return Err(payload);
+        }
+        self.payload = Some(payload);
+        Ok(())
+    }
+
+    /// The lease, for the dequeue-time transition from queued to delivered.
+    fn payload_mut(&mut self) -> Option<&mut RealtimePayloadLease> {
+        self.payload.as_mut()
+    }
+
+    /// The flow this arrival is bound to, borrowed.
+    ///
+    /// Every question a flow set asks before it accepts an arrival — is there
+    /// such a flow, is it inbound, is there capacity for a node — is a question
+    /// about this label, and none of them needs the delivery taken apart. A
+    /// borrowed answer is what lets those refusals happen while the delivery is
+    /// still whole, so a refused arrival drops its unit and its payload lease
+    /// together instead of releasing one while the other is still standing.
+    fn label(&self) -> &RealtimeFlowLabel {
+        &self.label
+    }
+}
+
+/// A real leased label for a control, over a scope that is never retired.
+///
+/// One shared elastic registry for every fixture label in the crate. Controls
+/// and lab harnesses need labels that are *real* — minted at admission, holding
+/// a real lease — without owning a session to mint them from, and a per-call
+/// provider stack would be both slower and a second thing to keep in step.
+///
+/// The scope is created once and deliberately leaked. A fixture label can be
+/// retained by a queued event that outlives the control that made it, so tying
+/// the scope to any one control's lifetime would retire it under a live lease.
+#[cfg(test)]
+fn control_label_for_test(name: &RealtimeFlowName) -> RealtimeFlowLabel {
+    static CONTROL_REGISTRY: std::sync::OnceLock<Arc<RealtimeFlowRegistry>> =
+        std::sync::OnceLock::new();
+    let registry = CONTROL_REGISTRY.get_or_init(|| {
+        let (registry, resources) =
+            RealtimeFlowRegistry::elastic_for_control(elastic_control_grant());
+        std::mem::forget(resources);
+        registry
+    });
+    RealtimeFlowLabel::mint(name.clone(), registry)
+        .expect("the control grant admits one fixture label")
+}
+
+/// The grant every elastic control registry in this crate stands on.
+///
+/// **Two halves, and only one of them is a number anyone chose.** The
+/// structural half is `explicit_test_grant(1, 1)` — the same mechanical
+/// derivation the rest of the fixtures use, covering the process cleanup
+/// infrastructure, one Mesh scope and one connector candidate with its
+/// operation and reservation bookkeeping. That is what
+/// [`RealtimeFlowRegistry::elastic_for_control`] actually builds, so listing
+/// its dimensions by hand meant omitting whichever one nobody thought of; a
+/// missing `SocketOrHandle` was exactly that.
+///
+/// The second half is deliberate headroom for the real-time leases the elastic
+/// controls take — labels, profiles, flows, output and queued bytes, ready
+/// records and packet work. It is generous on purpose and states nothing about
+/// policy: an elastic control is about what the path *charges*, not about where
+/// it stops, and the controls that care about stopping derive their own grant
+/// exactly from the claim under test.
+///
+/// **The entries are the six dimensions the real-time claim constructors in
+/// `realtime.rs` actually name**, not a list of the ones that happened to be
+/// needed when it was written — the two byte-denominated classes
+/// (`AccountedMemoryBytes` for retention, `QueuedBytes` for what
+/// `queue_claim` charges) and the four counted ones. A dimension omitted here
+/// is not a smaller grant, it is a zero, so the way this goes wrong is a
+/// control failing on a class nobody thought to list. Re-derive by grepping
+/// `ResourceClass::` in `realtime.rs` if a claim gains a term.
+#[cfg(test)]
+fn elastic_control_grant() -> crate::resource::ResourceClaim {
+    crate::runtime::attempt::explicit_test_grant(1, 1)
+        .checked_add(
+            crate::resource::ResourceClaim::try_from_entries([
+                (
+                    crate::resource::ResourceClass::AccountedMemoryBytes,
+                    1 << 24,
+                ),
+                (crate::resource::ResourceClass::QueuedBytes, 1 << 24),
+                (crate::resource::ResourceClass::WorkerOrTask, 64),
+                (crate::resource::ResourceClass::CallbackOrScheduledWork, 64),
+                (crate::resource::ResourceClass::ParsingOrCpuWork, 64),
+                (
+                    crate::resource::ResourceClass::OpaqueDependencyResidual,
+                    4_096,
+                ),
+            ])
+            .expect("the elastic control headroom is representable"),
+        )
+        .expect("the elastic control grant is representable")
+}
+
+/// A connector work scope granted exactly `identities` track identities and
+/// `completion_cells` retirement completion cells.
+///
+/// Two counts rather than one, because the two are held by different things and
+/// the controls take them in different combinations — the losing-retirer control
+/// holds one completion cell and no identity at all. Pairing them would hand
+/// that control an identity nothing in it holds, and capacity a control does not
+/// consume is what stops its refusals from meaning anything.
+///
+/// Each count counts *reservations*, and each is charged as one: the claim plus
+/// the record the provider keeps for it. Summing the claims and charging once
+/// would leave the records unfunded without changing any claim, so the shortfall
+/// would belong to no term here and surface only as an unrelated-looking refusal.
+///
+/// At module level rather than inside `mod tests` because the session-flow
+/// controls need it too, and a second copy over there could only match this one
+/// by luck. The retention comes back with the scope: dropping the candidate
+/// would retire the reservation the scope draws from, and a control that
+/// discarded it would be minting against a dead provider.
+#[cfg(test)]
+fn identity_test_scope(
+    identities: u64,
+    completion_cells: u64,
+) -> (
+    ConnectorCandidateCapability,
+    AttemptLifetime,
+    ConnectorWorkResourceScope,
+) {
+    let per_identity = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+        RealtimeTrackIdentity::mint_claim().expect("the identity claim is representable"),
+    )
+    .expect("the fixture identity reservation charge is representable");
+    let per_completion_cell = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+        RealtimeRetirementSignal::mint_claim().expect("the completion claim is representable"),
+    )
+    .expect("the fixture completion reservation charge is representable");
+    let reservation_work = (0..identities)
+        .map(|_| per_identity)
+        .chain((0..completion_cells).map(|_| per_completion_cell))
+        .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+            total.checked_add(claim)
+        })
+        .expect("the fixture reservation grant is representable");
+    let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
+        .checked_add(reservation_work)
+        .expect("the fixture provider grant is representable");
+    let port = crate::resource::ResourceProviderPort::new(
+        crate::resource::FiniteResourceProvider::new(grant),
+    )
+    .expect("the fixture grant accounts for its process scope");
+    let mesh = crate::runtime::attempt::ConnectorResourceOwnerPort::new(port)
+        .issue_mesh_scope()
+        .expect("the fixture grant accounts for its Mesh scope");
+    let (permit, lifetime, claim) = crate::runtime::attempt::admit_single_connector_candidate(
+        crate::runtime::runtime_for_test(),
+        mesh,
+    );
+    let candidate = permit
+        .reserve_connector_candidate(claim)
+        .expect("the fixture grant admits its connector candidate");
+    let work_scope = candidate.work_resource_scope();
+    (candidate, lifetime, work_scope)
+}
+
+/// One negotiated native track for an outbound session flow.
+///
+/// Opaque to the engine on purpose: it is created by the connector, carried
+/// across one await by the engine's negotiation phase, and handed either to
+/// [`SessionRealtimeFlows::attach_outbound`] or straight back to the connector
+/// for release. The engine can do nothing else with one — it holds no session,
+/// no label and no capability, so possession authorizes nothing.
+///
+/// It carries the connector's own liveness handle alongside the track because
+/// the pump needs both and they must not be able to drift: the incarnation is
+/// the single authoritative source for whether this connector is still live,
+/// and pairing it with the track here means a pump cannot be constructed
+/// holding one without the other.
+pub(crate) struct RealtimeOutboundTrack {
+    track: Arc<TrackLocalStaticSample>,
+    /// The only handle the peer connection accepts for detaching this track.
+    ///
+    /// Dropping it detaches nothing: `remove_track` is what flips the
+    /// transceiver's direction and stops the sender, and until it runs the
+    /// connection still holds and still offers to send on this m-line.
+    sender: Arc<RTCRtpSender>,
+    /// Held so whoever owns this value can actually retire it. Removal needs
+    /// the connection, not just the sender, so carrying one without the other
+    /// would make this type look retirable when it is not.
+    pc: Arc<RTCPeerConnection>,
+    /// The exact connector this track was negotiated on.
+    incarnation: Arc<WebRtcConnectorIncarnation>,
+}
+
+impl RealtimeOutboundTrack {
+    /// Detach this track from its connection.
+    ///
+    /// Consuming, because a detached track must not be detachable again. The
+    /// pump is the single owner and calls this on **every** exit, so there is
+    /// no second caller to race with.
+    async fn retire(self) {
+        if let Err(error) = self.pc.remove_track(&self.sender).await {
+            warn!(?error, "detaching an outbound realtime track");
+        }
+    }
+}
+
+/// A flow's promise that its native half has actually been retired.
+///
+/// Completed by the pump after `remove_track` returns, so an awaiting close ack
+/// means "the sender is gone", not "someone has been asked to remove it".
+///
+/// **Awaiting it is optional and that is the design.** The pump retires
+/// unconditionally on every exit; this only reports when it finished. An
+/// explicit close takes the receiver and awaits it outside the fence, so the
+/// daemon's ack is truthful. An implicit session drop takes nothing and awaits
+/// nothing — the queue dies with the flow set, the pump wakes on that, retires,
+/// and completes into a receiver nobody holds. That is why the drop case needs
+/// no engine hook and no async `Drop`: the cleanup owner is the pump either
+/// way, and only the *reporting* differs.
+pub(crate) type RealtimeNativeRetired = tokio::sync::oneshot::Receiver<()>;
+
+/// The connector's view of the **current** session's inbound realtime wiring.
+///
+/// Two facts, held together because they are only ever meaningful together: the
+/// session's binding table, and the transceivers this side created against the
+/// tokens on it. Splitting them would allow a transceiver record to outlive the
+/// table that gives its token meaning.
+///
+/// Shared by the worker, which writes it during negotiation, and the `on_track`
+/// callback, which reads it when a track arrives.
+pub(super) struct RealtimeSessionTracks {
+    /// The current session's table, **weakly**.
+    ///
+    /// Weak is the correctness property, not hygiene. The table's whole job is
+    /// to stop admitting media the moment its session ends; a strong reference
+    /// here would keep it alive past the `PromotedSession` that owns the flows
+    /// it names, leaving a table that still resolves tokens to labels in a flow
+    /// set that no longer exists. A failed upgrade is the answer we want, and
+    /// it arrives without anything having to be told.
+    bindings: SyncMutex<std::sync::Weak<RealtimeInboundBindings>>,
+    /// Transceivers created here, each against the token the fence bound before
+    /// the transceiver existed.
+    ///
+    /// A node-leased queue rather than a `Vec`, and the difference is exactness
+    /// rather than taste. A `Vec` owns one shared capacity: removing an element
+    /// gives back nothing, so a per-record charge released at `forget` would
+    /// claim a release the allocator never made, and a growth that reallocated
+    /// would move bytes nobody was charged for. One node per entry makes
+    /// "recorded" and "one funded allocation" the same event, and makes removal
+    /// a release the provider can be told about truthfully.
+    negotiated: SyncMutex<crate::resource::LeasedQueue<RealtimeNegotiatedTrack>>,
+}
+
+/// One transceiver this side created for a realtime flow.
+///
+/// It stays on the list from the moment it is created until its stop has
+/// *completed*, and the two states are distinguished by `claimed` rather than by
+/// presence. That is two properties at once, and neither survives if the record
+/// is simply removed when someone decides to retire it:
+///
+/// - **Exactly one retirer.** Three parties can reach the same transceiver — an
+///   explicit close, the pump that was feeding it, and the install that replaces
+///   a session — and `claimed` is what makes the second and third arrivals
+///   no-ops instead of a second `stop` on a stopped transceiver.
+/// - **Classification survives retirement.** `on_track` decides whether a track
+///   is realtime-owned by looking this list up. A record removed at the start of
+///   a retirement would make a track arriving during it look like a track this
+///   side never negotiated — a track the peer named — when in fact it is one we
+///   solicited and are in the middle of taking back.
+pub(super) type NativeTransceiverStopFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+/// Owner-private stop boundary for one negotiated inbound transceiver.
+///
+/// It exists for one reason: a stop that *refuses* is the case the claim
+/// retention below is built for, and a real `RTCRtpTransceiver` cannot be made
+/// to refuse on demand. Production wraps the dependency's transceiver and does
+/// nothing else; a control supplies a twin whose stop reports a failure that has
+/// no other way to be reached.
+///
+/// **The demux question is asked through this trait but is never answered by
+/// it.** `matches_native` takes the dependency's own `Arc` and compares it
+/// against the dependency's own `Arc`, so the identity a track is classified by
+/// is still the pointer to a transceiver this side created — unforgeable,
+/// unnameable by the peer, absent from SDP. The port allocation is deliberately
+/// *not* the identity: comparing these trait-object `Arc`s would make the wrapper
+/// the key, which is one indirection away from the property this whole boundary
+/// exists to hold.
+pub(super) trait NativeRealtimeTransceiverPort: Send + Sync {
+    fn stop(&self) -> NativeTransceiverStopFuture<'_>;
+
+    /// Whether the track that just arrived is carried by *this* transceiver.
+    fn matches_native(&self, transceiver: &Arc<RTCRtpTransceiver>) -> bool;
+}
+
+/// The production port: the dependency's transceiver and nothing added.
+struct WebRtcNativeTransceiverPort {
+    transceiver: Arc<RTCRtpTransceiver>,
+}
+
+impl NativeRealtimeTransceiverPort for WebRtcNativeTransceiverPort {
+    fn stop(&self) -> NativeTransceiverStopFuture<'_> {
+        Box::pin(async {
+            self.transceiver.stop().await.map_err(|error| {
+                Error::Transport(format!("inbound realtime transceiver stop: {error}"))
+            })
+        })
+    }
+
+    fn matches_native(&self, transceiver: &Arc<RTCRtpTransceiver>) -> bool {
+        Arc::ptr_eq(&self.transceiver, transceiver)
+    }
+}
+
+struct RealtimeNegotiatedTrack {
+    identity: Arc<RealtimeTrackIdentity>,
+    transceiver: Arc<dyn NativeRealtimeTransceiverPort>,
+    retirement: RealtimeRetirement,
+    /// This transceiver's own exact claim, held for as long as the transceiver
+    /// is on the peer connection.
+    ///
+    /// Separate from everything the *flow* funds, and deliberately so: the flow's
+    /// label, port and map node are logical objects whose lifetime ends at the
+    /// close, while this names a native object that is still on the connection
+    /// after the close returns and until a `stop` has completed. Charging it to
+    /// the flow would release it at the wrong moment and would double-bill the
+    /// session-flow port besides.
+    ///
+    /// `Option` because the claim is *moved into the claim that stops it* — the
+    /// same reason the transceiver is: the right to release it goes with the
+    /// right to stop it, so there is no path that releases a claim for a
+    /// transceiver it did not retire.
+    native: Option<crate::resource::ResourceLease>,
+}
+
+/// What the **native half** of one negotiated inbound transceiver costs, for
+/// exactly as long as the native object exists.
+///
+/// Two claims fund a negotiated track, not one, because they have two different
+/// lifetimes and two different release conditions:
+///
+/// - The **record node** is `LeasedQueue::<RealtimeNegotiatedTrack>::entry_claim()`,
+///   acquired beside this one and released when the record is forgotten. It is
+///   not derived here, and deliberately: the container states its own node cost,
+///   so nothing outside it ever writes a node size that could drift from the
+///   type.
+/// - **This claim** covers what survives until a `stop` completes, and only
+///   that. Its release is an observation about the native world; the node's is
+///   an observation about this table. Merging them would tie one to the other's
+///   evidence.
+///
+/// Derived from the wrapper allocation this call site actually creates:
+///
+/// - **Bytes:** `size_of::<WebRtcNativeTransceiverPort>()` plus the counter pair
+///   of the `Arc` it lives in — the content of that one block, stated exactly.
+///   The record's own bytes are the node's business, not this claim's, and the
+///   transceiver's are not a number Rust can state at all.
+/// - **Residual, four:** the wrapper `Arc` block itself, then the dependency's
+///   transceiver, its RTP receiver, and the media description it adds to the
+///   local session. The wrapper is counted honestly as an allocation rather than
+///   folded into the bytes above; the other three have no exposed size, and all
+///   four are what a completed `stop` gives back.
+/// - **Scheduled work, one:** the receiver's read activity. A `recvonly`
+///   transceiver is not inert — it goes on running after an implicit teardown —
+///   and it is exactly what `stop` retires.
+///
+/// Nothing here names the flow, the label, the port or the map node. Those are
+/// the logical session-flow objects, they are charged where they are allocated,
+/// and a transceiver outliving its flow is precisely why the two must not share
+/// one claim.
+fn negotiated_inbound_transceiver_claim() -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let counters = std::mem::size_of::<usize>().checked_mul(2).ok_or(
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let bytes = std::mem::size_of::<WebRtcNativeTransceiverPort>()
+        .checked_add(counters)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+        (crate::resource::ResourceClass::CallbackOrScheduledWork, 1),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 4),
+    ])
+}
+
+/// What one record on this table's node-leased queue costs.
+///
+/// One line, and it exists so no caller ever writes the node's size: the
+/// container is the single calibration point for its own representation.
+fn negotiated_inbound_record_claim() -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    crate::resource::LeasedQueue::<RealtimeNegotiatedTrack>::entry_claim()
+}
+
+/// Who stops one native object, and what everyone else is told.
+///
+/// Deliberately holds no native object of its own. The two hard parts of this
+/// are the claim and the completion, and neither has anything to do with what is
+/// being stopped — keeping them separate is what lets a control exercise the
+/// race directly instead of standing up a peer connection to reach it.
+/// One retirement attempt's terminal state, and the charge for saying so.
+///
+/// **It states that the attempt ended, not that the transceiver stopped.** Those
+/// came apart the moment a refused stop and a refused cleanup submission both
+/// became outcomes this connector survives: in either case the native object is
+/// still there, its charge has moved to failed-cleanup retention, and no further
+/// attempt will be made. A waiter still has to be released — it is waiting to
+/// find out whether the work is over, not whether it succeeded — so the cell
+/// carries exactly that and nothing a caller could mistake for success.
+///
+/// Waiters take `()` deliberately. Every party that can park here is one that
+/// would do the same thing with either answer: an explicit close returns to its
+/// caller, a superseding install moves to the next record. Handing them an
+/// outcome would be handing them a decision none of them makes.
+///
+/// **A flag plus a wake, not a channel.** Completion is a *state*: a waiter that
+/// arrives after the stop has already finished must still see it, which a bare
+/// notification cannot promise. A `watch` would give that, but a `watch` is two
+/// allocations this module would then be funding — the sender's `Arc` and the
+/// channel's own shared state — and the second is not a size Rust will state.
+/// An `AtomicBool` read before and after registering gives the same guarantee in
+/// one allocation whose bytes are exact.
+///
+/// **The funding must outlive every waiter, and the allocation too.** Every
+/// claimant and every waiter holds a handle to this cell and any of them can
+/// outlive the table's record, so a lease held by the record would tell the
+/// provider this allocation was gone while a loser was still parked on it. That
+/// is why the funding is not on the record — and keeping it *inside* this
+/// struct would only move the problem: a lease among these fields is released
+/// by this value's own drop glue, while the allocation is still there.
+///
+/// [`FundedArc`] answers both at once. Every handle shares the one reservation,
+/// so the charge spans every waiter; and the token sits beside the pointer, so
+/// it is released only after the allocation is genuinely gone.
+struct RealtimeRetirementSignal {
+    /// Flips once the responsibility has been *discharged*.
+    done: AtomicBool,
+    /// Wakes everyone parked, exactly once, after `done` is already `true`.
+    wake: tokio::sync::Notify,
+}
+
+impl RealtimeRetirementSignal {
+    /// Exactly what one completion cell costs.
+    fn mint_claim() -> std::result::Result<
+        crate::resource::ResourceClaim,
+        crate::resource::ResourceClaimArithmeticError,
+    > {
+        let counters = std::mem::size_of::<usize>().checked_mul(2).ok_or(
+            crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            },
+        )?;
+        let bytes = std::mem::size_of::<Self>()
+            .checked_add(counters)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            })?;
+        // Two residuals: this `Arc` block, and the `Notify` wait list the
+        // dependency grows on demand and whose size it does not expose.
+        crate::resource::ResourceClaim::try_from_entries([
+            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+    }
+
+    fn mint(lease: crate::resource::ResourceLease) -> crate::resource::FundedArc<Self> {
+        crate::resource::FundedArc::new(
+            Self {
+                done: AtomicBool::new(false),
+                wake: tokio::sync::Notify::new(),
+            },
+            lease,
+        )
+        .expect("an admitted completion-cell lease may be shared")
+    }
+
+    /// Announce that the retirement attempt has ended, however it ended.
+    ///
+    /// The flag is set *before* the wake, so a waiter that races the wake finds
+    /// the state already true on its recheck rather than parking on a
+    /// notification that has been and gone.
+    fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+struct RealtimeRetirement {
+    /// Whether someone has already taken responsibility.
+    claimed: bool,
+    /// What everyone else is told once that responsibility is discharged.
+    ///
+    /// Single ownership decides who acts; this decides what the others learn. A
+    /// caller that loses the claim must not return as though the work were done
+    /// — on an explicit close that return is the daemon's acknowledgement, and
+    /// answering while the winner's attempt is still outstanding would let a
+    /// reopen on the same label race a transceiver still offering to receive. So
+    /// a loser waits here instead of no-opping.
+    ///
+    /// Whoever takes the claim owes this announcement on **every** path that
+    /// ends the attempt, including the ones that end it without stopping
+    /// anything. A claimant that returned without announcing would leave every
+    /// later loser parked on a completion nobody is left to make.
+    done: crate::resource::FundedArc<RealtimeRetirementSignal>,
+}
+
+/// What a won claim carries out of the lock: the right to stop this one thing,
+/// the obligation to announce that it is stopped, and the exact claim that
+/// answers for it until then.
+struct RealtimeTrackClaim {
+    identity: Arc<RealtimeTrackIdentity>,
+    transceiver: Arc<dyn NativeRealtimeTransceiverPort>,
+    done: crate::resource::FundedArc<RealtimeRetirementSignal>,
+    /// Taken out of the record with the claim, so the transceiver's own charge
+    /// travels with the one party that may retire it.
+    ///
+    /// `None` only for a record negotiated before this claim existed, which
+    /// production cannot produce — every recorded transceiver is recorded with
+    /// its lease — and which is therefore a release of nothing rather than a
+    /// branch anyone has to reason about.
+    native: Option<crate::resource::ResourceLease>,
+}
+
+impl RealtimeRetirement {
+    fn new(signal: crate::resource::ResourceLease) -> Self {
+        Self {
+            claimed: false,
+            done: RealtimeRetirementSignal::mint(signal),
+        }
+    }
+
+    /// Take responsibility, or find out who already has.
+    ///
+    /// `Ok` is the claim and comes with the cell to announce on. `Err` is a
+    /// subscription to the winner's announcement — not a refusal, and never to
+    /// be treated as "already done". Both arms are the same allocation, which is
+    /// what makes a loser's wait and a winner's announcement the same fact.
+    fn claim(
+        &mut self,
+    ) -> std::result::Result<
+        crate::resource::FundedArc<RealtimeRetirementSignal>,
+        crate::resource::FundedArc<RealtimeRetirementSignal>,
+    > {
+        if self.claimed {
+            return Err(self.done.clone());
+        }
+        self.claimed = true;
+        Ok(self.done.clone())
+    }
+}
+
+/// One negotiated inbound transceiver's retirement, owned by whatever holds the
+/// flow it belongs to.
+///
+/// **It submits on drop, and that is the whole point.** An explicit close takes
+/// the submission out and awaits the receipt. Every other way a flow ends —
+/// policy revocation, peer replacement, shutdown, the promoted session simply
+/// going — reaches only this drop, and starting nothing here would leave an `m`
+/// line, a `recvonly` transceiver and its read activity on a connector that may
+/// well go on hosting another session. The superseding install does sweep
+/// those, but only when a *next* session is promoted, so on a connector that
+/// hosts no further session such a leak would have no end.
+///
+/// **Exactly-once is the existing claim, not a new flag.** Four parties can
+/// reach one transceiver — an explicit close, the pump that was feeding it, the
+/// install that supersedes the session, and now this drop — and all four go
+/// through `RealtimeRetirement::claim`. Whichever arrives first is the only one
+/// that attempts a stop, and the claim carries the *outcome* through as well: an
+/// attempt that ends without stopping the transceiver announces itself as ended
+/// so no later party is left waiting, moves the native charge into failed-cleanup
+/// retention rather than releasing it, and leaves the record in place so an
+/// arriving track is still classified as one this side solicited. Exactly one
+/// attempt, and no path that quietly pretends it worked.
+///
+/// The table is held **weakly**, for the same reason the bindings are: a
+/// remainder must not keep a connector's track table alive past the connector.
+/// A failed upgrade means the whole peer connection is already gone, which
+/// retires every transceiver on it — so there is nothing left to submit.
+///
+/// **Nothing here depends on a runtime being present.** The submission goes to
+/// the process cleanup executor, which owns its own thread and its own runtime,
+/// through a port that is a synchronous send. A destructor running during an
+/// unwind, on a bare thread, or after the local runtime has already gone reaches
+/// exactly the same executor as one running inside a task. That is the whole
+/// reason the port is carried rather than looked up: by the time this drops
+/// there is nobody left to ask.
+pub(crate) struct RealtimeInboundRetirement {
+    identity: Arc<RealtimeTrackIdentity>,
+    /// The submission, taken by an explicit close that will await the receipt
+    /// itself. `None` afterwards, so the drop below submits nothing and the two
+    /// paths cannot both enqueue for one transceiver.
+    tracks: Option<std::sync::Weak<RealtimeSessionTracks>>,
+    /// Where a retirement goes to be performed.
+    submission: crate::runtime::attempt::ConnectorCleanupSubmissionPort,
+    /// This retirement's queue slot, acquired when the flow was bound rather
+    /// than when it ended.
+    ///
+    /// Reserve-before-need, and the timing is the point: a submission that had
+    /// to acquire at drop time could be refused at the one moment its caller has
+    /// no way to react and no way to report. Paying for the slot up front turns
+    /// "can this connector afford to clean up?" into a question answered while
+    /// the flow is still being opened, where a refusal is an ordinary refusal.
+    ///
+    /// `None` once submitted or once taken by an explicit close, which is what
+    /// makes the slot fund exactly one submission.
+    slot: Option<crate::resource::ResourceLease>,
+}
+
+impl RealtimeInboundRetirement {
+    /// Take the submission for a caller that will retire the transceiver itself
+    /// and await the receipt.
+    ///
+    /// Disarms the drop, so an explicit close is still the single submitter on
+    /// its own path. The token comes back because the caller needs it to name
+    /// what it is closing.
+    pub(crate) fn take_for_explicit_close(&mut self) -> Arc<RealtimeTrackIdentity> {
+        self.tracks = None;
+        // The queue slot goes back with it. An explicit close runs the
+        // retirement on the caller's own task and queues nothing, so holding a
+        // slot for a submission that will never be made would charge this
+        // connector for an empty seat.
+        self.slot = None;
+        Arc::clone(&self.identity)
+    }
+
+    /// Which token this retirement is for, for controls that need to say *which*
+    /// transceiver a close handed back.
+    ///
+    /// Read-only and test-only on purpose: production has no reason to ask,
+    /// because every production path either takes the submission or drops it.
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &Arc<RealtimeTrackIdentity> {
+        &self.identity
+    }
+
+    /// Whether this retirement will still submit when it is dropped.
+    ///
+    /// The observable half of the exactly-once property: a close that took the
+    /// submission must leave this `false`, so a control can tell "the drop was
+    /// disarmed" from "the drop happened to find nothing".
+    #[cfg(test)]
+    pub(crate) fn submits_on_drop(&self) -> bool {
+        self.tracks.is_some()
+    }
+}
+
+impl Drop for RealtimeInboundRetirement {
+    fn drop(&mut self) {
+        let Some(tracks) = self
+            .tracks
+            .take()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            // Either an explicit close took the submission, or the connector
+            // that owned the transceiver is gone and took it along.
+            return;
+        };
+        let Some(slot) = self.slot.take() else {
+            // The slot and the table are set and cleared together, so this is
+            // unreachable; if it were reached, submitting without the slot the
+            // job is funded by would be the one thing worse than not
+            // submitting, because it would queue work this connector never paid
+            // for.
+            warn!("an inbound realtime retirement reached its drop with no submission slot");
+            return;
+        };
+        let identity = Arc::clone(&self.identity);
+        let failed = Arc::clone(&tracks);
+        let failed_identity = Arc::clone(&identity);
+        // Synchronous. The executor owns the thread and the runtime that will
+        // await this future, so nothing here needs one — which is what makes the
+        // implicit-teardown path work from an unwind, from a bare thread, and
+        // from a runtime that is itself shutting down.
+        let submitted = self.submission.submit_subordinate(
+            slot,
+            Box::pin(async move { tracks.stop_claimed(&identity).await }),
+            Box::new(|| {}),
+            Box::new(move |reason| {
+                // The executor refused or died, so this transceiver will not be
+                // stopped by anyone. Nothing observed the native object go, so
+                // its exact charge is moved to the provider's failed-cleanup
+                // retention rather than released — the same conservative
+                // direction the connector's own close takes, and for the same
+                // reason: an unprovable release is not a release.
+                warn!(
+                    %reason,
+                    "the process cleanup executor refused an inbound realtime retirement"
+                );
+                failed.retain_after_failed_submission(&failed_identity);
+            }),
+        );
+        // A refused submission retains the job in this answer, and dropping the
+        // answer drops the job and runs the failure callback above. Explicit
+        // rather than implicit so the retention is not an accident of where a
+        // value happened to fall out of scope.
+        drop(submitted);
+    }
+}
+
+/// Wait for the caller who won a claim to finish trying.
+///
+/// Returns when the winning attempt is over, whichever way it went. It is not a
+/// success signal and nothing downstream treats it as one.
+///
+/// Check, register, recheck — the standard shape, and it is the reason the flag
+/// and the wake are separate. Registering before the second read is what makes a
+/// completion that lands in between impossible to miss; reading before
+/// registering is what makes a completion that already happened return
+/// immediately. Neither alone is sufficient and this is not a retry loop: it
+/// goes round only when a spurious wake arrives.
+async fn await_retirement(done: crate::resource::FundedArc<RealtimeRetirementSignal>) {
+    loop {
+        if done.is_done() {
+            return;
+        }
+        let notified = done.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if done.is_done() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+impl Default for RealtimeSessionTracks {
+    fn default() -> Self {
+        Self {
+            bindings: SyncMutex::new(std::sync::Weak::new()),
+            negotiated: SyncMutex::new(crate::resource::LeasedQueue::new()),
+        }
+    }
+}
+
+impl RealtimeSessionTracks {
+    /// Point at a newly promoted session's table, replacing any previous one,
+    /// and retire everything the old session left behind.
+    ///
+    /// **Retire, not clear.** The old records' tokens were bound in a table that
+    /// died with its session, so none of them will ever admit a track again —
+    /// but the transceivers are still on the peer connection, still `recvonly`,
+    /// and dropping the records would leave nothing able to name them. That is
+    /// the leak for the case with no other owner at all: a flow whose transceiver
+    /// was created and whose track never arrived has no pump, so the pump's own
+    /// cleanup never runs and this is the only sweep that reaches it.
+    ///
+    /// Claimed synchronously, stopped asynchronously. The claim is what makes
+    /// this disjoint from an old pump racing the same edge — whichever gets
+    /// there first is the only one that stops — and it happens under the same
+    /// lock acquisition that replaces the table, so there is no window in which
+    /// a record is neither this install's responsibility nor its previous
+    /// owner's. The records stay on the list until their stops complete, so a
+    /// late track arriving on one is still classified as realtime-owned and
+    /// refused for the reason it was actually refused for.
+    fn install(self: &Arc<Self>, bindings: std::sync::Weak<RealtimeInboundBindings>) {
+        // Order matters only in that both are replaced before anything can
+        // observe a half-installed pair; each lock is taken and released on its
+        // own, and `on_track` reads them in the opposite order, so no caller
+        // can hold one while waiting on the other.
+        *self.bindings.lock() = bindings;
+        // Claimed *and* taken in one locked pass. Marking here and re-claiming
+        // on the task would find every record already claimed and stop nothing,
+        // so the transceiver comes out with the claim rather than being looked
+        // up again from a token whose record now says someone else owns it.
+        let superseded: Vec<RealtimeTrackClaim> = {
+            let mut negotiated = self.negotiated.lock();
+            negotiated
+                .iter_mut()
+                .filter_map(|track| {
+                    let done = track.retirement.claim().ok()?;
+                    Some(RealtimeTrackClaim {
+                        identity: Arc::clone(&track.identity),
+                        transceiver: Arc::clone(&track.transceiver),
+                        done,
+                        // Taken, not cloned: a lease is move-only, and the
+                        // sweep that wins the claim is the party that will
+                        // answer for this charge.
+                        native: track.native.take(),
+                    })
+                })
+                .collect()
+        };
+        if superseded.is_empty() {
+            return;
+        }
+        let tracks = Arc::clone(self);
+        // Fire and forget, and only here. Nobody is acknowledging a superseded
+        // session's teardown, so there is no answer whose truthfulness depends
+        // on waiting; an explicit close is the opposite and awaits.
+        tokio::spawn(async move {
+            for claim in superseded {
+                tracks.stop_owned(claim).await;
+            }
+        });
+    }
+
+    /// The current table, if its session is still alive.
+    fn current(&self) -> Option<Arc<RealtimeInboundBindings>> {
+        self.bindings.lock().upgrade()
+    }
+
+    /// Record one transceiver this side created, together with the two claims
+    /// that answer for it.
+    ///
+    /// Both leases arrive already acquired, because both acquisitions happen
+    /// *before* the transceiver exists: a connector that cannot fund the record
+    /// or the native object must refuse to create one rather than create it and
+    /// then discover it cannot pay.
+    ///
+    /// `record` funds the queue node and is released when the record is
+    /// forgotten. `signal` funds the completion cell and is released when the
+    /// last claimant or waiter drops it, which can be later. `native` funds the
+    /// wrapper and the dependency's own objects and is released only when a
+    /// `stop` has completed. Three leases and not a sum, because those are three
+    /// different moments proved by three different observations.
+    ///
+    /// The identity's own lease is not among them: it was acquired where the
+    /// identity was minted, before this table ever saw it, and it lives inside
+    /// that allocation.
+    fn record(
+        &self,
+        identity: Arc<RealtimeTrackIdentity>,
+        transceiver: Arc<dyn NativeRealtimeTransceiverPort>,
+        record: crate::resource::ResourceLease,
+        signal: crate::resource::ResourceLease,
+        native: crate::resource::ResourceLease,
+    ) {
+        self.negotiated.lock().push(
+            RealtimeNegotiatedTrack {
+                identity,
+                transceiver,
+                retirement: RealtimeRetirement::new(signal),
+                native: Some(native),
+            },
+            record,
+        );
+    }
+
+    /// The token a track arriving on `transceiver` was negotiated against.
+    ///
+    /// **Pointer identity against a transceiver this side created**, which is
+    /// the strongest form the demux key can take: the peer cannot produce one,
+    /// cannot name one, and nothing about it appears in SDP.
+    ///
+    /// If a future `webrtc` release stopped handing `on_track` the same `Arc`
+    /// the connection stores, this answers `None` and the track is dropped.
+    /// That is the intended degradation — a refusal, never a misattachment.
+    /// The obvious fallback, comparing MIDs, is deliberately absent: a MID is a
+    /// string that appears in SDP, and reintroducing it as a key is exactly the
+    /// property this token was minted to remove.
+    /// Answers for a retiring record as readily as for a live one. The question
+    /// it exists to settle is "did this side create this transceiver for a
+    /// realtime flow", and the answer to that does not change when someone
+    /// starts stopping it.
+    /// Asked through the port, answered by the native pointer. A port is a stop
+    /// boundary and never a key: `matches_native` compares the dependency's own
+    /// `Arc` against the one `on_track` was handed, so what identifies a track
+    /// is unchanged by the wrapper existing. A control's twin holds no native
+    /// transceiver and therefore matches nothing, which is the right answer —
+    /// a fixture record must never be able to claim a real arriving track.
+    fn resolve(&self, transceiver: &Arc<RTCRtpTransceiver>) -> Option<Arc<RealtimeTrackIdentity>> {
+        // Bound rather than chained: iterating this queue may merge its two
+        // chains, which is a change to the representation and therefore takes
+        // `&mut`. The guard has to be a named place for that borrow to be taken
+        // from.
+        let mut negotiated = self.negotiated.lock();
+        negotiated
+            .iter()
+            .find(|track| track.transceiver.matches_native(transceiver))
+            .map(|track| Arc::clone(&track.identity))
+    }
+
+    /// Whether this table would still classify a track negotiated against
+    /// `identity` as one this side solicited.
+    ///
+    /// The record-presence half of [`Self::resolve`], which is the half a
+    /// control can reach: the other half compares against a real
+    /// `Arc<RTCRtpTransceiver>`, and only a live peer connection can produce
+    /// one. Same lookup, same lock, same list — so a record this answers `false`
+    /// for is one `resolve` could not find either.
+    #[cfg(test)]
+    fn classifies(&self, identity: &Arc<RealtimeTrackIdentity>) -> bool {
+        let mut negotiated = self.negotiated.lock();
+        negotiated
+            .iter()
+            .any(|track| Arc::ptr_eq(&track.identity, identity))
+    }
+
+    /// The drop-safe retirement owner for one token this table will negotiate.
+    ///
+    /// Minted before the transceiver exists and handed to the flow, so the flow
+    /// carries its own retirement from the moment it has one to carry. Every way
+    /// that flow can end therefore ends with a submission, rather than only the
+    /// one way that remembered to make it.
+    ///
+    /// It arrives complete: the port it will submit through and the queue slot
+    /// that submission is funded by are both fixed here, while there is still a
+    /// caller able to hear a refusal.
+    fn retirement(
+        self: &Arc<Self>,
+        identity: Arc<RealtimeTrackIdentity>,
+        submission: crate::runtime::attempt::ConnectorCleanupSubmissionPort,
+        slot: crate::resource::ResourceLease,
+    ) -> RealtimeInboundRetirement {
+        RealtimeInboundRetirement {
+            identity,
+            tracks: Some(Arc::downgrade(self)),
+            submission,
+            slot: Some(slot),
+        }
+    }
+
+    /// Drop one record, once its transceiver really is stopped.
+    ///
+    /// Called from exactly one place and only on a completed stop, because the
+    /// record is what classifies an arriving track and a transceiver that is
+    /// still there must stay classifiable.
+    ///
+    /// The node goes with it, and that is a real release rather than a
+    /// bookkeeping one: one entry is one allocation here, so removing it hands
+    /// its exact claim back to the provider at the moment the memory is freed.
+    fn forget(&self, identity: &Arc<RealtimeTrackIdentity>) {
+        self.negotiated
+            .lock()
+            .retain(|track| !Arc::ptr_eq(&track.identity, identity));
+    }
+
+    /// Retire one token's transceiver, and do not return until the attempt is
+    /// over.
+    ///
+    /// The whole retirement path, and the only one. Four parties reach it — an
+    /// explicit close, the pump that was feeding the flow, the install that
+    /// supersedes the session, and a dropped [`RealtimeInboundRetirement`] — and
+    /// none can know which of the others got there first, so the answer comes
+    /// from the record rather than from an ordering rule each of them has to
+    /// remember.
+    ///
+    /// All three outcomes end with the retirement **settled** by the time this
+    /// returns: the caller that wins the claim attempts the stop, a caller that
+    /// loses waits for the winner, and a caller that finds no record at all is
+    /// looking at a retirement that already completed and was forgotten. That
+    /// uniformity is what makes it safe for the daemon to acknowledge a close as
+    /// soon as this returns.
+    ///
+    /// **Settled is not the same as stopped**, and the difference is deliberate
+    /// rather than hidden. A stop the dependency refuses leaves the transceiver
+    /// in place, its charge in failed-cleanup retention, and its record on this
+    /// table so an arriving track is still classified correctly. What a caller
+    /// learns is that nothing further will be attempted — which is the honest
+    /// answer, and the only one that keeps a close from hanging on a refusal
+    /// nobody can retry.
+    async fn stop_claimed(&self, identity: &Arc<RealtimeTrackIdentity>) {
+        // Claimed under the lock, stopped outside it: `stop` awaits and the
+        // record list is guarded by a sync mutex.
+        let claim = {
+            let mut negotiated = self.negotiated.lock();
+            let Some(track) = negotiated
+                .iter_mut()
+                .find(|track| Arc::ptr_eq(&track.identity, identity))
+            else {
+                // No record: already stopped and forgotten.
+                return;
+            };
+            match track.retirement.claim() {
+                Ok(done) => Ok(RealtimeTrackClaim {
+                    identity: Arc::clone(identity),
+                    transceiver: Arc::clone(&track.transceiver),
+                    done,
+                    // Moves with the claim, so the winner is the only party
+                    // that can release or retain it. A loser waits for the
+                    // winner's announcement and holds nothing.
+                    native: track.native.take(),
+                }),
+                Err(waiting) => Err(waiting),
+            }
+        };
+        match claim {
+            Ok(claim) => self.stop_owned(claim).await,
+            Err(waiting) => await_retirement(waiting).await,
+        }
+    }
+
+    /// Give up on retiring one transceiver, keeping its charge counted.
+    ///
+    /// The end of the only path that cannot be completed: the cleanup executor
+    /// refused or died, so nothing will ever run this record's `stop`. The
+    /// record is claimed exactly as a real retirement would claim it — so a
+    /// party that later reaches the same token finds it taken rather than
+    /// starting a stop that has already been abandoned — and its exact charge
+    /// goes to the provider's failed-cleanup retention instead of being
+    /// released.
+    ///
+    /// **The attempt is announced as ended**, and that is not a claim that the
+    /// transceiver stopped — nothing here stops anything. The completion cell
+    /// states that the retirement attempt reached a terminal outcome, which is
+    /// all any waiter needs and all any waiter is told. Leaving it unannounced
+    /// would park every later loser forever: this claim is the winning attempt,
+    /// so nobody else will ever announce, and a `stop_claimed` arriving
+    /// afterwards would wait on a completion that cannot come.
+    ///
+    /// Announced **after** the charge is retained, so a waiter released by it
+    /// cannot observe the accounting mid-transition.
+    ///
+    /// The record stays on the list. Classification survives an abandoned
+    /// retirement for the same reason it survives a running one: a track
+    /// arriving on that transceiver is still one this side negotiated, and this
+    /// transceiver is demonstrably still there.
+    fn retain_after_failed_submission(&self, identity: &Arc<RealtimeTrackIdentity>) {
+        let mut negotiated = self.negotiated.lock();
+        let Some(track) = negotiated
+            .iter_mut()
+            .find(|track| Arc::ptr_eq(&track.identity, identity))
+        else {
+            return;
+        };
+        let Ok(done) = track.retirement.claim() else {
+            // Someone else owns this retirement and will finish it — and will
+            // announce it. Their claim carries the charge, so there is nothing
+            // here to retain and nothing here to say.
+            return;
+        };
+        if let Some(native) = track.native.take() {
+            let _ = native.retain_after_failed_cleanup();
+        }
+        done.finish();
+    }
+
+    /// Finish a retirement whose claim the caller already holds.
+    ///
+    /// Taking the claim by value is what says the right to stop came with it:
+    /// there is no path here that looks a token up and stops whatever it finds.
+    ///
+    /// **Removal is success-only.** A record is what makes an arriving track
+    /// classifiable as one this side negotiated, and a stop that *refused* has
+    /// left the transceiver on the peer connection — still `recvonly`, still
+    /// able to deliver. Deleting the record there would strip the classification
+    /// off a live transceiver and turn its next track into one this side appears
+    /// never to have solicited. So a failed stop keeps the record, and keeps its
+    /// node charged, for the same reason it keeps the native claim: nothing
+    /// observed the object go.
+    ///
+    /// The retained record stays *claimed*, so no later party starts a second
+    /// stop on it. There is no second retirement owner and no retry.
+    async fn stop_owned(&self, claim: RealtimeTrackClaim) {
+        let RealtimeTrackClaim {
+            identity,
+            transceiver,
+            done,
+            native,
+        } = claim;
+        let stopped = transceiver.stop().await;
+        match stopped {
+            // The stop returned, so the native object it named is gone and its
+            // charge is released here — after the stop, never before it. A
+            // release ahead of the stop would let the next admission be granted
+            // capacity this connector had not actually given back yet.
+            Ok(()) => drop(native),
+            Err(ref error) => {
+                // The flow is going away regardless, and a teardown is not worth
+                // failing over a stop that refused — but the charge must not be
+                // released, because nothing observed the native object go. It
+                // moves to the provider's failed-cleanup retention instead,
+                // where it stays counted against this process and is never
+                // handed out again. Conservative in exactly the direction the
+                // rest of this connector's cleanup is: an unprovable release is
+                // treated as no release.
+                warn!(%error, "stopping a negotiated inbound realtime transceiver");
+                if let Some(native) = native {
+                    let _ = native.retain_after_failed_cleanup();
+                }
+            }
+        }
+        // Announced either way, because what this states is that the *attempt*
+        // has ended — not that the transceiver stopped. A loser that parked on
+        // this must be released whichever way the winner's stop went; leaving it
+        // parked on a refusal would wedge an explicit close forever, which is a
+        // worse answer than an honest one.
+        done.finish();
+        if stopped.is_ok() {
+            // Last, and only here, so the record stays resolvable for the whole
+            // of the stop — and permanently if the stop refused.
+            self.forget(&identity);
+        }
+    }
+}
+
+/// The RTP transceiver primitive one encoding negotiates.
+///
+/// A total map, and the only place this module turns the application's declared
+/// media kind into the library's. It reads no MIME name.
+fn native_codec_type(kind: WebRtcRtpKind) -> RTPCodecType {
+    match kind {
+        WebRtcRtpKind::Audio => RTPCodecType::Audio,
+        WebRtcRtpKind::Video => RTPCodecType::Video,
+    }
+}
+
+/// The declared media kind a negotiated track carries.
+///
+/// The inverse of [`native_codec_type`], for the admission comparison. The
+/// library's enum is `non_exhaustive` in practice — it carries an
+/// `Unspecified` — and anything that is neither audio nor video is mapped to
+/// `None` rather than guessed: an unspecified kind matches no binding, and a
+/// track that matches no binding is dropped.
+fn native_rtp_kind(kind: RTPCodecType) -> Option<WebRtcRtpKind> {
+    match kind {
+        RTPCodecType::Audio => Some(WebRtcRtpKind::Audio),
+        RTPCodecType::Video => Some(WebRtcRtpKind::Video),
+        _ => None,
+    }
+}
+
+/// Drain one outbound session flow onto its negotiated native track, and retire
+/// that track when the flow ends.
+///
+/// **The pump is the single owner of the native half.** It holds the track, the
+/// sender and the connection, and on *every* exit — closed queue, retired
+/// connector, failed write — it awaits `remove_track` before returning. Nothing
+/// else may detach, so there is no double-remove to prevent and no flag to keep
+/// in step.
+///
+/// That ownership is what closes the implicit case as well as the explicit one.
+/// Dropping a `SessionRealtimeFlows` with live flows drops their queues; each
+/// pump wakes on that, retires its track, and completes. No async `Drop` is
+/// needed anywhere, and session retirement does not have to be distinguished
+/// from an application close — the pump cannot tell them apart and does not
+/// need to.
+///
+/// Dropping the sender `Arc` is **not** a detach. `remove_track` is what flips
+/// the transceiver direction and stops the sender
+/// (`peer_connection/mod.rs:1786-1791` in the vendored crate); until it runs the
+/// connection still offers to send on that m-line. An earlier version of this
+/// pump held the sender as `_sender` and returned, which retired nothing.
+///
+/// Two rechecks per unit, and both are needed:
+///
+/// - the queue upgrade, which is the **session** check. The queue is owned by
+///   the flow, the flow by the flow set, the flow set by `PromotedSession`, so
+///   a failed upgrade means the session that authorized this flow is gone.
+///   Nothing else has to be consulted, and nothing else could be — the pump
+///   runs outside the registry fence and cannot take it.
+/// - `is_active`, which is the **connector** check. A connector can retire
+///   while its session is still promoted, and writing to a retired
+///   connector's track would push bytes through a transport this side has
+///   already given up.
+///
+/// The write itself happens here rather than under the fence because it awaits,
+/// and the fence is a sync mutex that connector replacement also takes.
+///
+/// Private, matching its parameter. `RealtimeOutboundPump` is `pub(super)` in
+/// the flow module — visible exactly within the connector — so a `pub(super)`
+/// here would have published a function whose argument type its own audience
+/// could not name. Module privacy already reaches the one caller,
+/// `attach_outbound`, which is a descendant of this module; nothing wider ever
+/// needed it, and narrowing the function is the fix rather than widening the
+/// pump, which would hand out a way to write to a flow's queue.
+fn spawn_outbound_realtime_pump(
+    pump: session_flow::RealtimeOutboundPump,
+    track: RealtimeOutboundTrack,
+    retired: tokio::sync::oneshot::Sender<()>,
+) {
+    tokio::spawn(async move {
+        // One exit point, so "retire on every exit" is structural rather than a
+        // rule each `return` has to remember. The inner block produces nothing;
+        // everything after it runs however it ended.
+        let incarnation = Arc::clone(&track.incarnation);
+        let native = Arc::clone(&track.track);
+        async {
+            loop {
+                match pump.next() {
+                    session_flow::RealtimePumpStep::Unit(unit) => {
+                        // Checked per unit rather than once at attach. A pump
+                        // that proved liveness only when it started would keep
+                        // writing for as long as the application kept feeding
+                        // it.
+                        if !incarnation.is_active() {
+                            return;
+                        }
+                        if native
+                            .write_sample(&Sample {
+                                data: unit.data,
+                                duration: unit.pace,
+                                ..Default::default()
+                            })
+                            .await
+                            .is_err()
+                        {
+                            // The native track is gone. Ending is the whole
+                            // response; the retirement below still runs.
+                            return;
+                        }
+                    }
+                    // Nothing queued on a live flow is idle, not closed. Park.
+                    session_flow::RealtimePumpStep::Empty => pump.ready().await,
+                    // Terminal. The flow, and so the session, is gone. This is
+                    // the implicit case too: a dropped flow set drops the
+                    // queue, which lands here.
+                    session_flow::RealtimePumpStep::Closed => return,
+                }
+            }
+        }
+        .await;
+        // However that ended, the native half goes back. `retire` consumes the
+        // track, so this cannot run twice.
+        track.retire().await;
+        // Last, and only after the detach has completed, so a waiting closer
+        // that observes this has observed a finished retirement rather than a
+        // scheduled one. Nobody may be waiting — implicit drop has no closer —
+        // and that is why the error is discarded.
+        let _ = retired.send(());
+    });
 }
 
 /// Exact process-local identity for one WebRTC connector worker.
@@ -203,6 +1677,15 @@ pub enum TransportEvent {
 pub(crate) struct WebRtcConnectorIncarnation {
     active: AtomicBool,
     retired: watch::Sender<bool>,
+    /// The transport-independent identity for this same incarnation.
+    ///
+    /// Owned here rather than replacing this type, so the WebRTC worker keeps
+    /// its native retirement plumbing while endpoint authentication and any
+    /// other downstream owner name only the generic identity. The generic token
+    /// carries identity alone: this type stays the single authoritative source
+    /// of whether the connector is still live, so there is no second liveness
+    /// flag that could disagree with `active`.
+    generic: Arc<crate::connector::ConnectorIncarnation>,
 }
 
 impl WebRtcConnectorIncarnation {
@@ -211,12 +1694,18 @@ impl WebRtcConnectorIncarnation {
         Self {
             active: AtomicBool::new(true),
             retired,
+            generic: crate::connector::ConnectorIncarnation::new(),
         }
     }
 
     fn retire(&self) {
         self.active.store(false, Ordering::Release);
         self.retired.send_replace(true);
+    }
+
+    /// The transport-independent identity for this exact incarnation.
+    pub(crate) fn generic(&self) -> &Arc<crate::connector::ConnectorIncarnation> {
+        &self.generic
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -251,6 +1740,28 @@ pub struct WebRtcConnectorEvent {
     _callback_work: Option<CallbackWorkLease>,
 }
 
+impl WebRtcConnectorEvent {
+    /// Whether this is the data-channel-open callback. **Controls only.**
+    ///
+    /// A control that must hand the *genuine* native open event to the
+    /// production engine arm has to recognise it without consuming it first —
+    /// `accept_event` takes the event by value, so classifying through that
+    /// would spend the very event the control needs to deliver. Read-only, and
+    /// it exposes no payload: the answer is a bool, and the event's resources
+    /// and its incarnation stay unreachable.
+    ///
+    /// Gated to match its only caller: the live pre-open fixture, which is
+    /// gated on `transport-lab` alone. `test` is deliberately not part of the
+    /// condition — gating on `test` alone would leave this with no caller in a
+    /// default-feature test build, and requiring `test` as well would leave the
+    /// fixture without it in the feature-only build another crate's controls
+    /// compile against.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn is_data_channel_open(&self) -> bool {
+        matches!(self.event, TransportEvent::DataChannelOpen)
+    }
+}
+
 /// Resource ownership retained while the engine handles one accepted native
 /// callback. The fields are intentionally opaque outside this module.
 pub(crate) struct AcceptedWebRtcConnectorEventResources {
@@ -278,38 +1789,31 @@ struct QueuedTransportEvent {
 }
 
 impl QueuedTransportEvent {
+    #[expect(
+        clippy::result_large_err,
+        reason = "same by-value refusal as [`RealtimeDelivery::attach`], which this forwards to: both arms hand the reservation back intact — the second-attachment arm and the wrong-event-kind arm alike — so a refusal releases rather than strands. Boxing would allocate on the refusal path"
+    )]
     fn attach_realtime_reservation(
         &mut self,
         reservation: RealtimePayloadLease,
     ) -> std::result::Result<(), RealtimePayloadLease> {
         match &mut self.event {
-            TransportEvent::VideoSample(sample) => {
-                sample._reservation = Some(reservation);
-                Ok(())
-            }
-            TransportEvent::AudioSample(sample) => {
-                sample._reservation = Some(reservation);
-                Ok(())
-            }
+            // Refuses a second attachment rather than overwriting: overwriting
+            // would drop a live lease silently and leave the bytes it accounted
+            // for charged to nothing, whereas handing the lease back means a
+            // double attachment releases rather than strands.
+            TransportEvent::RealtimeUnit(delivery) => delivery.attach(reservation),
             _ => Err(reservation),
         }
     }
 }
 
-fn callback_payload_limit(
-    policy: ConnectorCallbackPolicy,
-    class: ConnectorCallbackClass,
-) -> Option<usize> {
-    match class {
-        ConnectorCallbackClass::Control => None,
-        ConnectorCallbackClass::EndpointData => Some(crate::engine::MAX_ENDPOINT_FRAME_BYTES),
-        ConnectorCallbackClass::Realtime => match policy.realtime() {
-            RealtimeConnectorPolicy::Disabled => None,
-            RealtimeConnectorPolicy::Enabled(Some(enabled)) => Some(enabled.max_unit_bytes().get()),
-            RealtimeConnectorPolicy::Enabled(None) => None,
-        },
-    }
-}
+// A per-class callback payload limit used to be looked up here. Control and
+// endpoint data never had one, and the real-time class had one only when the
+// owner had stated a unit-byte ceiling. That ceiling is gone, so the lookup
+// could only ever answer "no limit" and the two callers that consulted it are
+// simpler without it. Every callback is still admitted at its actual payload
+// size against the provider immediately below where this check used to stand.
 
 #[derive(Clone)]
 struct ConnectorEventMailboxes {
@@ -354,8 +1858,13 @@ impl ConnectorEventMailboxes {
         let class = ConnectorCallbackClass::for_event(&event);
         let (payload_bytes, retained_slack) = match &event {
             TransportEvent::Message(bytes) => (bytes.len(), 0),
-            TransportEvent::VideoSample(sample) => (sample.data.len(), 0),
-            TransportEvent::AudioSample(sample) => (sample.data.len(), 0),
+            // The payload lease it carries bounds *registry* retention; this
+            // bounds the callback pump's own class budget, which is what
+            // decides whether the event is admitted to the callback queue at
+            // all. Two ceilings over two different resources, so leaving this
+            // at zero would not avoid a double count — it would let real-time
+            // units bypass the callback ceiling that bounds them.
+            TransportEvent::RealtimeUnit(delivery) => (delivery.payload_bytes(), 0),
             TransportEvent::LocalIceCandidate(candidate) => {
                 let Some(sizes) = candidate_callback_sizes(candidate) else {
                     return Err(ConnectorCallbackInsertResult::PolicyRefused);
@@ -393,9 +1902,6 @@ impl ConnectorEventMailboxes {
                         CallbackMailboxInsertErrorKind::Closed => {
                             ConnectorCallbackInsertResult::ReceiverClosed
                         }
-                        CallbackMailboxInsertErrorKind::LocalItemCeiling => {
-                            ConnectorCallbackInsertResult::Overloaded
-                        }
                         CallbackMailboxInsertErrorKind::MissingLease
                         | CallbackMailboxInsertErrorKind::WrongClass
                         | CallbackMailboxInsertErrorKind::WrongPhase => {
@@ -416,12 +1922,10 @@ struct ConnectorEventSink {
     events: ConnectorEventMailboxes,
     realtime_flows: Arc<RealtimeFlowRegistry>,
     resource_scope: Option<PeerConnectionResourceScope>,
-    realtime_delivery: Arc<AtomicBool>,
     attempt_liveness: Option<AttemptLiveness>,
     candidate_promoted: Arc<AtomicBool>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     callback_violation_reported: Arc<AtomicBool>,
-    callback_policy: ConnectorCallbackPolicy,
     callback_producer: CallbackProducerOwner,
     operation_fence: Arc<ConnectorOperationFence>,
     close_owner: Option<Weak<ConnectorCloseOwner>>,
@@ -452,15 +1956,6 @@ fn callback_admission_error(context: &'static str, error: CallbackProducerOverlo
     }
 }
 
-fn realtime_flow_admission_error(context: &'static str, error: RealtimeFlowDropReason) -> Error {
-    match error {
-        RealtimeFlowDropReason::ResourceUnavailable(unavailable) => {
-            Error::ResourceUnavailable(unavailable)
-        }
-        other => Error::Transport(format!("{context}: {other:?}")),
-    }
-}
-
 impl ConnectorEventSink {
     fn begin_native_callback_operation(
         &self,
@@ -484,19 +1979,9 @@ impl ConnectorEventSink {
         Ok(work)
     }
 
-    fn open_inbound_realtime_flow_checked(
-        &self,
-    ) -> std::result::Result<RealtimeFlowPort, RealtimeFlowDropReason> {
-        self.realtime_flows.open_inbound_flow_checked()
-    }
-
     #[cfg(test)]
     fn open_inbound_realtime_flow(&self) -> Option<RealtimeFlowPort> {
         self.realtime_flows.open_inbound_flow()
-    }
-
-    fn open_outbound_realtime_flow(&self) -> Option<RealtimeFlowPort> {
-        self.realtime_flows.open_outbound_flow()
     }
 
     fn observe_realtime_payload(&self, payload_bytes: usize) -> Option<ObservationLease> {
@@ -523,12 +2008,22 @@ impl ConnectorEventSink {
         let Some(_operation) = self.operation_fence.try_enter() else {
             return true;
         };
-        if !self.realtime_delivery.load(Ordering::Acquire) || !self.callback_gate.is_active() {
+        if !self.callback_gate.is_active() {
             return true;
         }
         let payload_bytes = match &event {
-            TransportEvent::VideoSample(sample) => sample.data.len(),
-            TransportEvent::AudioSample(sample) => sample.data.len(),
+            // The route a real-time unit must take. Down here it is charged
+            // against the real-time class, observed as media quarantine, and
+            // gated by the operation fence above — all of which the general
+            // callback route loses.
+            //
+            // What authorizes the unit is not checked here and deliberately
+            // never was a flag: `flow` is a port on a flow the promoted session
+            // opened, and a unit can only reach this call if a track attached to
+            // a binding that session established. A connector with no promoted
+            // session has no flow to pass, so there is nothing for a boolean to
+            // add.
+            TransportEvent::RealtimeUnit(delivery) => delivery.payload_bytes(),
             _ => return false,
         };
         let observation = self.observe_realtime_payload(payload_bytes);
@@ -560,7 +2055,6 @@ impl ConnectorEventSink {
 
     async fn try_emit_data_channel(&self, event: TransportEvent) -> ConnectorCallbackInsertResult {
         if matches!(event, TransportEvent::DataChannelClosed) {
-            self.realtime_delivery.store(false, Ordering::Release);
             self.operation_fence.begin_close();
             self.realtime_flows.retire();
             return self
@@ -588,7 +2082,6 @@ impl ConnectorEventSink {
     }
 
     fn retire_after_callback_violation(&self) {
-        self.realtime_delivery.store(false, Ordering::Release);
         self.operation_fence.begin_close();
         self.realtime_flows.retire();
         self.events
@@ -668,11 +2161,23 @@ impl ConnectorEventSink {
             }
             event => event,
         };
+        // Refused here rather than at the mailbox lookup below, which would
+        // reach the same answer only after admitting callback work and taking
+        // an observation for it. A real-time unit on the general route is a
+        // routing error in every state — it must enter through an exact
+        // `RealtimeFlowPort`, because a connector-wide mailbox would let one
+        // flow consume or reorder another flow's admitted queue — so nothing
+        // should be charged on the way to saying so.
+        if matches!(&event, TransportEvent::RealtimeUnit(_)) {
+            return ConnectorCallbackInsertResult::WrongOwnerPath;
+        }
         let callback_class = ConnectorCallbackClass::for_event(&event);
         let (payload_bytes, retained_slack) = match &event {
             TransportEvent::Message(bytes) => (bytes.len(), 0),
-            TransportEvent::VideoSample(sample) => (sample.data.len(), 0),
-            TransportEvent::AudioSample(sample) => (sample.data.len(), 0),
+            // Same reasoning as the other admission site: charged here as well
+            // as against its payload lease, because the two bound different
+            // resources.
+            TransportEvent::RealtimeUnit(delivery) => (delivery.payload_bytes(), 0),
             TransportEvent::LocalIceCandidate(candidate) => {
                 let Some(sizes) = candidate_callback_sizes(candidate) else {
                     return ConnectorCallbackInsertResult::PolicyRefused;
@@ -681,23 +2186,6 @@ impl ConnectorEventSink {
             }
             _ => (0, 0),
         };
-        if matches!(
-            &event,
-            TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_)
-        ) && !self.realtime_delivery.load(Ordering::Acquire)
-        {
-            return ConnectorCallbackInsertResult::PolicyRefused;
-        }
-        let payload_limit = callback_payload_limit(self.callback_policy, callback_class);
-        if let Some(limit) = payload_limit.filter(|limit| payload_bytes > *limit) {
-            warn!(
-                payload_bytes,
-                limit,
-                callback_class = ?callback_class,
-                "dropping oversized connector callback payload"
-            );
-            return ConnectorCallbackInsertResult::PolicyRefused;
-        }
         let callback_work = match self.callback_producer.try_admit_with_accounted_slack(
             callback_class,
             payload_bytes,
@@ -715,9 +2203,7 @@ impl ConnectorEventSink {
         };
         let family = match &event {
             TransportEvent::Message(_) => PreAuthResourceFamily::FrameBytes,
-            TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_) => {
-                PreAuthResourceFamily::MediaQuarantine
-            }
+            TransportEvent::RealtimeUnit(_) => PreAuthResourceFamily::MediaQuarantine,
             _ => PreAuthResourceFamily::ConnectorSpecificWork,
         };
         let observation = self.resource_scope.as_ref().map(|scope| {
@@ -764,9 +2250,6 @@ impl ConnectorEventSink {
                 CallbackMailboxInsertErrorKind::Closed => {
                     ConnectorCallbackInsertResult::ReceiverClosed
                 }
-                CallbackMailboxInsertErrorKind::LocalItemCeiling => {
-                    ConnectorCallbackInsertResult::Overloaded
-                }
                 CallbackMailboxInsertErrorKind::MissingLease
                 | CallbackMailboxInsertErrorKind::WrongClass
                 | CallbackMailboxInsertErrorKind::WrongPhase => {
@@ -786,7 +2269,6 @@ pub(crate) struct WebRtcConnectorEventReceiver {
     attempt_lifetime: Option<AttemptLifetime>,
     remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
     close_owner: Option<Arc<ConnectorCloseOwner>>,
-    reclaim: Option<ResourceReclaimSubscription>,
     data_channel_open_committed: bool,
     data_channel_closed: bool,
     operation_fence: Arc<ConnectorOperationFence>,
@@ -997,27 +2479,11 @@ impl WebRtcConnectorEventReceiver {
             {
                 return None;
             }
-            if self
-                .reclaim
-                .as_ref()
-                .is_some_and(ResourceReclaimSubscription::is_requested)
-            {
-                if let Some(close_owner) = self.close_owner.as_ref() {
-                    close_owner.start();
-                }
-                return None;
-            }
             let queued = tokio::select! {
                 biased;
                 _ = self.retirement.changed() => {
                     if let Some(close) = self.expose_recorded_close() {
                         return Some(close);
-                    }
-                    return None;
-                },
-                _ = wait_for_optional_reclaim(self.reclaim.as_ref()) => {
-                    if let Some(close_owner) = self.close_owner.as_ref() {
-                        close_owner.start();
                     }
                     return None;
                 },
@@ -1092,13 +2558,6 @@ async fn wait_for_optional_retirement(retirement: &mut Option<watch::Receiver<bo
         Some(retirement) => {
             let _ = retirement.changed().await;
         }
-        None => std::future::pending::<()>().await,
-    }
-}
-
-async fn wait_for_optional_reclaim(reclaim: Option<&ResourceReclaimSubscription>) {
-    match reclaim {
-        Some(reclaim) => reclaim.requested().await,
         None => std::future::pending::<()>().await,
     }
 }
@@ -1240,15 +2699,13 @@ struct CandidateObservationLease {
 struct PendingRemoteCandidateQueue {
     entries: std::collections::LinkedList<PendingRemoteCandidate>,
     container_observation: Option<ObservationLease>,
-    budget: Arc<PendingRemoteCandidateBudget>,
 }
 
 impl PendingRemoteCandidateQueue {
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
+    fn new() -> Self {
         Self {
             entries: std::collections::LinkedList::new(),
             container_observation: None,
-            budget: Arc::new(PendingRemoteCandidateBudget::new(policy)),
         }
     }
 
@@ -1318,15 +2775,11 @@ impl PendingRemoteCandidateQueue {
         attempt: Arc<RemoteCandidateAttemptIdentity>,
         resource_scope: &PeerConnectionResourceScope,
     ) -> PendingRemoteCandidateQueuePush {
-        let Some(content_bytes) = candidate_content_bytes(&candidate) else {
-            self.budget.poison();
+        if candidate_content_bytes(&candidate).is_none() {
             return PendingRemoteCandidateQueuePush::Refused;
-        };
-        let Some(reservation) = self.budget.reserve(content_bytes) else {
-            return PendingRemoteCandidateQueuePush::Refused;
-        };
+        }
         let mut pending = PendingRemoteCandidate::observe(candidate, attempt, resource_scope);
-        pending._queue_reservation = Some(reservation);
+        pending._queue_reservation = Some(PendingRemoteCandidateReservation::default());
         self.entries.push_back(pending);
         let measurement = queue_container_resource_measurement(&self.entries);
         match self.container_observation.as_mut() {
@@ -1409,125 +2862,29 @@ enum PendingRemoteCandidateQueuePush {
     Retired,
 }
 
-#[derive(Debug)]
-struct PendingRemoteCandidateBudgetState {
-    items: usize,
-    content_bytes: usize,
-    duplicate_submissions: usize,
-    application_work: usize,
-    accounting_poisoned: bool,
-}
+// A four-dimensional owner-selected candidate budget used to stand here: unique
+// items, cumulative content bytes, duplicate submissions and native application
+// work, each with its own ceiling, its own counter, and a shared poison flag.
+// All of it is gone.
+//
+// Every one of those counters shadowed an exact claim the candidate path
+// already takes: the queue wrapper, the retained strings, the queued content
+// bytes and the digest node are each admitted against the process provider at
+// their real size, and the native application is admitted against the elastic
+// attempt. A second count in front of those could only refuse a candidate the
+// owner's real grant would have funded, in units the owner never chose — and
+// the poison flag existed only to stop the shadow arithmetic being read after
+// it had gone wrong, which is not a condition that can arise once nothing keeps
+// the shadow.
 
-#[derive(Debug)]
-struct PendingRemoteCandidateBudget {
-    policy: PendingRemoteCandidatePolicy,
-    state: SyncMutex<PendingRemoteCandidateBudgetState>,
-}
-
-impl PendingRemoteCandidateBudget {
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
-        Self {
-            policy,
-            state: SyncMutex::new(PendingRemoteCandidateBudgetState {
-                items: 0,
-                content_bytes: 0,
-                duplicate_submissions: 0,
-                application_work: 0,
-                accounting_poisoned: false,
-            }),
-        }
-    }
-
-    fn reserve(
-        self: &Arc<Self>,
-        content_bytes: usize,
-    ) -> Option<PendingRemoteCandidateReservation> {
-        let Some(local) = self.policy.local_ceiling() else {
-            return Some(PendingRemoteCandidateReservation {
-                budget: Arc::clone(self),
-                application: None,
-            });
-        };
-        let mut state = self.state.lock();
-        if state.accounting_poisoned {
-            return None;
-        }
-        let Some(remaining_content) = local
-            .max_content_bytes()
-            .get()
-            .checked_sub(state.content_bytes)
-        else {
-            state.accounting_poisoned = true;
-            return None;
-        };
-        if state.items >= local.max_unique_items().get() || content_bytes > remaining_content {
-            return None;
-        }
-        let items = state.items + 1;
-        let Some(bytes) = state.content_bytes.checked_add(content_bytes) else {
-            state.accounting_poisoned = true;
-            return None;
-        };
-        state.items = items;
-        state.content_bytes = bytes;
-        Some(PendingRemoteCandidateReservation {
-            budget: Arc::clone(self),
-            application: None,
-        })
-    }
-
-    fn poison(&self) {
-        self.state.lock().accounting_poisoned = true;
-    }
-
-    fn record_duplicate(&self) -> bool {
-        let Some(local) = self.policy.local_ceiling() else {
-            return true;
-        };
-        let mut state = self.state.lock();
-        if state.accounting_poisoned {
-            return false;
-        }
-        if state.duplicate_submissions >= local.max_duplicate_submissions().get() {
-            return false;
-        }
-        let duplicates = state.duplicate_submissions + 1;
-        state.duplicate_submissions = duplicates;
-        true
-    }
-
-    fn reserve_application_work(&self) -> bool {
-        let Some(local) = self.policy.local_ceiling() else {
-            return true;
-        };
-        let mut state = self.state.lock();
-        if state.accounting_poisoned {
-            return false;
-        }
-        if state.application_work >= local.max_application_work().get() {
-            return false;
-        }
-        let work = state.application_work + 1;
-        state.application_work = work;
-        true
-    }
-
-    #[cfg(test)]
-    fn report(&self) -> (usize, usize, usize, usize, bool) {
-        let state = self.state.lock();
-        (
-            state.items,
-            state.content_bytes,
-            state.duplicate_submissions,
-            state.application_work,
-            state.accounting_poisoned,
-        )
-    }
-}
-
-#[derive(Debug)]
+/// What a queued candidate keeps once it has reached native application.
+///
+/// It no longer reserves anything at queue time — the queue's own leases do
+/// that — so an unapplied candidate carries the default. The one thing it still
+/// owns is the elastic attempt's post-application ownership, which the envelope
+/// retains for the life of the attempt.
+#[derive(Debug, Default)]
 struct PendingRemoteCandidateReservation {
-    budget: Arc<PendingRemoteCandidateBudget>,
     application: Option<crate::runtime::attempt::ApplyingRemoteCandidate>,
 }
 
@@ -1685,20 +3042,14 @@ struct RemoteCandidateAttemptEnvelope {
 }
 
 impl RemoteCandidateAttemptEnvelope {
-    fn new(
-        policy: PendingRemoteCandidatePolicy,
-        work_resources: ConnectorWorkResourceScope,
-    ) -> Self {
-        let elastic_attempt = ElasticRemoteCandidateAttempt::new(
-            work_resources.clone(),
-            elastic_remote_candidate_ceilings(policy),
-        );
+    fn new(work_resources: ConnectorWorkResourceScope) -> Self {
+        let elastic_attempt = ElasticRemoteCandidateAttempt::new(work_resources.clone());
         Self {
             attempt: Arc::new(RemoteCandidateAttemptIdentity::default()),
             elastic_attempt,
             work_resources,
             remote_description_set: false,
-            pending: PendingRemoteCandidateQueue::new(policy),
+            pending: PendingRemoteCandidateQueue::new(),
             seen: std::collections::BTreeSet::new(),
             retained_reservations: std::collections::LinkedList::new(),
             remote_ice_credentials: None,
@@ -1707,10 +3058,7 @@ impl RemoteCandidateAttemptEnvelope {
         }
     }
 
-    fn new_provisional(
-        policy: PendingRemoteCandidatePolicy,
-        work_resources: ConnectorWorkResourceScope,
-    ) -> Result<Self> {
+    fn new_provisional(work_resources: ConnectorWorkResourceScope) -> Result<Self> {
         let root_lease = work_resources
             .acquire(
                 crate::resource::ResourceAuthorityClass::Speculative,
@@ -1723,7 +3071,7 @@ impl RemoteCandidateAttemptEnvelope {
                 )?,
             )
             .map_err(Error::from)?;
-        let mut replacement = Self::new(policy, work_resources);
+        let mut replacement = Self::new(work_resources);
         replacement.provisional_root_lease = Some(root_lease);
         Ok(replacement)
     }
@@ -1754,17 +3102,13 @@ impl RemoteCandidateAttemptEnvelope {
             sdp_mline_index: candidate.sdp_mline_index,
             username_fragment: candidate.username_fragment.as_deref().map(str::as_bytes),
         };
-        let Some(content_bytes) = candidate_content_bytes(&candidate) else {
-            self.pending.budget.poison();
+        if candidate_content_bytes(&candidate).is_none() {
             self.retire();
             return (PendingRemoteCandidateQueuePush::Refused, None);
-        };
+        }
         let mut kind = None;
         let mut binding = None;
-        let mut local_reservation = None;
         let seen = &self.seen;
-        let duplicate_budget = Arc::clone(&self.pending.budget);
-        let unique_budget = Arc::clone(&self.pending.budget);
         let admitted = self.elastic_attempt.admit_with_digest_decision(
             elastic_input,
             || {
@@ -1776,16 +3120,9 @@ impl RemoteCandidateAttemptEnvelope {
             },
             |digest| {
                 if seen.contains(&digest) {
-                    if duplicate_budget.record_duplicate() {
-                        ElasticRemoteCandidateDigestDecision::Duplicate
-                    } else {
-                        ElasticRemoteCandidateDigestDecision::Refuse
-                    }
-                } else if let Some(reservation) = unique_budget.reserve(content_bytes) {
-                    local_reservation = Some(reservation);
-                    ElasticRemoteCandidateDigestDecision::Retain
+                    ElasticRemoteCandidateDigestDecision::Duplicate
                 } else {
-                    ElasticRemoteCandidateDigestDecision::Refuse
+                    ElasticRemoteCandidateDigestDecision::Retain
                 }
             },
         );
@@ -1854,9 +3191,7 @@ impl RemoteCandidateAttemptEnvelope {
             Arc::clone(&self.attempt),
             resource_scope,
             &self.work_resources,
-            local_reservation
-                .take()
-                .expect("retained candidate owns its pre-retention local reservation"),
+            PendingRemoteCandidateReservation::default(),
             elastic_lease,
         );
         if result == PendingRemoteCandidateQueuePush::Queued {
@@ -1908,15 +3243,10 @@ impl RemoteCandidateAttemptEnvelope {
             .retain_remote_restart_migratable_candidates(credentials);
 
         for pending in &mut self.pending.entries {
-            let Some(content_bytes) = candidate_content_bytes(&pending.candidate) else {
-                self.retire();
-                self.pending.budget.poison();
-                return false;
-            };
-            let Some(reservation) = self.pending.budget.reserve(content_bytes) else {
+            if candidate_content_bytes(&pending.candidate).is_none() {
                 self.retire();
                 return false;
-            };
+            }
             let input = ElasticRemoteCandidateInput {
                 candidate: pending.candidate.candidate.as_bytes(),
                 sdp_mid: pending.candidate.sdp_mid.as_deref().map(str::as_bytes),
@@ -1943,7 +3273,7 @@ impl RemoteCandidateAttemptEnvelope {
                 return false;
             };
             pending.attempt = Arc::clone(&self.attempt);
-            pending._queue_reservation = Some(reservation);
+            pending._queue_reservation = Some(PendingRemoteCandidateReservation::default());
             pending._elastic_lease = Some(elastic_lease);
             self.seen.insert(digest);
         }
@@ -1962,58 +3292,49 @@ struct ProvisionalRemoteCandidateAttempt {
     envelope: RemoteCandidateAttemptEnvelope,
 }
 
-fn elastic_remote_candidate_ceilings(
-    policy: PendingRemoteCandidatePolicy,
-) -> RemoteCandidateLocalCeilings {
-    let Some(policy) = policy.local_ceiling() else {
-        return RemoteCandidateLocalCeilings::none();
-    };
-    let unique = u64::try_from(policy.max_unique_items().get())
-        .expect("usize candidate item ceiling fits u64 on supported platforms");
-    let duplicates = u64::try_from(policy.max_duplicate_submissions().get())
-        .expect("usize duplicate ceiling fits u64 on supported platforms");
-    // The two optional wrappers remain independently enforced below the
-    // primitive. If their sum cannot be represented, omit the redundant
-    // aggregate ceiling instead of panicking or inventing a smaller bound.
-    let submissions = unique
-        .checked_add(duplicates)
-        .and_then(std::num::NonZeroU64::new);
-    let content = std::num::NonZeroU64::new(
-        u64::try_from(policy.max_content_bytes().get())
-            .expect("usize candidate content ceiling fits u64 on supported platforms"),
-    )
-    .expect("candidate content ceiling is nonzero");
-    let applications = std::num::NonZeroU64::new(
-        u64::try_from(policy.max_application_work().get())
-            .expect("usize candidate application ceiling fits u64 on supported platforms"),
-    )
-    .expect("candidate application ceiling is nonzero");
-    RemoteCandidateLocalCeilings::new(
-        submissions.map(MaxCumulativeRemoteCandidateSubmissions::new),
-        Some(MaxCumulativeRemoteCandidateContentBytes::new(content)),
-        Some(MaxCumulativeRemoteCandidateApplications::new(applications)),
-    )
+// The owner's four candidate ceilings used to be translated here into the
+// elastic attempt's optional cumulative ceilings. Both ends of that translation
+// are gone: there is no owner ceiling to read, and the primitive no longer
+// carries an optional one to write. What the attempt enforces is what it always
+// enforced without them — an exact claim per submission, per digest node, and
+// per native application.
+
+/// The candidate work one raw candidate-state control intends to fund.
+///
+/// Not a policy and not a ceiling: nothing reads these two numbers at run time.
+/// They size the fixture's *grant*, so a control that says "one candidate of
+/// this many content bytes" gets a provider that can fund exactly that and
+/// refuses the next one — which is the only mechanism left that can refuse a
+/// candidate, and therefore the one these controls have to exercise.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct RemoteCandidateFixtureWork {
+    unique: u64,
+    content: u64,
+}
+
+#[cfg(test)]
+impl RemoteCandidateFixtureWork {
+    fn new(unique: usize, content: usize) -> Self {
+        Self {
+            unique: u64::try_from(unique).expect("fixture candidate count fits u64"),
+            content: u64::try_from(content).expect("fixture candidate content fits u64"),
+        }
+    }
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_scope(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
 ) -> ConnectorWorkResourceScope {
-    elastic_remote_candidate_test_scope_with_additional(
-        policy,
-        crate::resource::ResourceClaim::ZERO,
-    )
+    elastic_remote_candidate_test_scope_with_additional(work, crate::resource::ResourceClaim::ZERO)
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_scope_with_restart_overlap(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
 ) -> ConnectorWorkResourceScope {
-    let local = policy
-        .local_ceiling()
-        .expect("raw candidate-state tests declare an explicit local fixture ceiling");
-    let unique =
-        u64::try_from(local.max_unique_items().get()).expect("fixture candidate count fits u64");
+    let unique = work.unique;
     let reservation_records = unique
         .checked_add(1)
         .expect("fixture restart reservation records fit");
@@ -2030,22 +3351,22 @@ fn elastic_remote_candidate_test_scope_with_restart_overlap(
             ))
         })
         .expect("fixture restart overlap claim is representable");
-    elastic_remote_candidate_test_scope_with_additional(policy, overlap)
+    elastic_remote_candidate_test_scope_with_additional(work, overlap)
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_scope_with_additional(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
     additional: crate::resource::ResourceClaim,
 ) -> ConnectorWorkResourceScope {
     let (_provider, _owner, _candidate, _lifetime, work_scope) =
-        elastic_remote_candidate_test_resources_with_additional(policy, additional);
+        elastic_remote_candidate_test_resources_with_additional(work, additional);
     work_scope
 }
 
 #[cfg(test)]
 fn elastic_remote_candidate_test_resources_with_additional(
-    policy: PendingRemoteCandidatePolicy,
+    work: RemoteCandidateFixtureWork,
     additional: crate::resource::ResourceClaim,
 ) -> (
     crate::resource::FiniteResourceProvider,
@@ -2054,13 +3375,7 @@ fn elastic_remote_candidate_test_resources_with_additional(
     AttemptLifetime,
     ConnectorWorkResourceScope,
 ) {
-    let policy = policy
-        .local_ceiling()
-        .expect("raw candidate-state tests declare an explicit local fixture ceiling");
-    let unique =
-        u64::try_from(policy.max_unique_items().get()).expect("fixture candidate count fits u64");
-    let content = u64::try_from(policy.max_content_bytes().get())
-        .expect("fixture candidate content fits u64");
+    let RemoteCandidateFixtureWork { unique, content } = work;
     let parsing = content
         .checked_add(crate::runtime::attempt::REMOTE_CANDIDATE_MAX_DIGEST_OVERHEAD_BYTES)
         .expect("fixture parsing work fits");
@@ -2121,27 +3436,23 @@ struct RemoteCandidateState {
 }
 
 impl RemoteCandidateState {
-    fn with_resources(
-        policy: PendingRemoteCandidatePolicy,
-        work_resources: ConnectorWorkResourceScope,
-    ) -> Self {
+    fn with_resources(work_resources: ConnectorWorkResourceScope) -> Self {
         Self {
-            current: RemoteCandidateAttemptEnvelope::new(policy, work_resources),
+            current: RemoteCandidateAttemptEnvelope::new(work_resources),
             provisional: None,
         }
     }
 
     #[cfg(test)]
-    fn new(policy: PendingRemoteCandidatePolicy) -> Self {
-        Self::with_resources(policy, elastic_remote_candidate_test_scope(policy))
+    fn new(work: RemoteCandidateFixtureWork) -> Self {
+        Self::with_resources(elastic_remote_candidate_test_scope(work))
     }
 
     #[cfg(test)]
-    fn new_with_restart_overlap(policy: PendingRemoteCandidatePolicy) -> Self {
-        Self::with_resources(
-            policy,
-            elastic_remote_candidate_test_scope_with_restart_overlap(policy),
-        )
+    fn new_with_restart_overlap(work: RemoteCandidateFixtureWork) -> Self {
+        Self::with_resources(elastic_remote_candidate_test_scope_with_restart_overlap(
+            work,
+        ))
     }
 
     fn admission_target(&mut self) -> &mut RemoteCandidateAttemptEnvelope {
@@ -2188,12 +3499,9 @@ impl RemoteCandidateState {
                     .to_string(),
             ));
         }
-        let policy = self.current.pending.budget.policy;
         let retiring = Arc::clone(&self.current.attempt);
-        let replacement = RemoteCandidateAttemptEnvelope::new_provisional(
-            policy,
-            self.current.work_resources.clone(),
-        )?;
+        let replacement =
+            RemoteCandidateAttemptEnvelope::new_provisional(self.current.work_resources.clone())?;
         self.current.retire();
         let replacement_attempt = Arc::clone(&replacement.attempt);
         self.provisional = Some(ProvisionalRemoteCandidateAttempt {
@@ -2354,11 +3662,8 @@ impl RemoteCandidateState {
             });
         }
 
-        let policy = self.current.pending.budget.policy;
-        let mut replacement = RemoteCandidateAttemptEnvelope::new_provisional(
-            policy,
-            self.current.work_resources.clone(),
-        )?;
+        let mut replacement =
+            RemoteCandidateAttemptEnvelope::new_provisional(self.current.work_resources.clone())?;
         replacement.remote_ice_credentials = Some(credentials.clone());
         replacement.remote_description_in_flight = true;
         let migrated =
@@ -2647,7 +3952,6 @@ enum ConnectorAuthorityState {
 struct ConnectorOwnership {
     incarnation: Arc<WebRtcConnectorIncarnation>,
     authority: Arc<SyncMutex<ConnectorAuthorityState>>,
-    realtime_delivery: Arc<AtomicBool>,
     operation_fence: Arc<ConnectorOperationFence>,
     work_resource_scope: ConnectorWorkResourceScope,
     candidate_promoted: Arc<AtomicBool>,
@@ -2658,7 +3962,6 @@ struct ConnectorOwnership {
 impl ConnectorOwnership {
     fn admitted(
         candidate: ConnectorCandidateCapability,
-        realtime_delivery: Arc<AtomicBool>,
         operation_fence: Arc<ConnectorOperationFence>,
         work_resource_scope: ConnectorWorkResourceScope,
         candidate_promoted: Arc<AtomicBool>,
@@ -2671,7 +3974,6 @@ impl ConnectorOwnership {
                 candidate,
                 liveness: attempt,
             })),
-            realtime_delivery,
             operation_fence,
             work_resource_scope,
             candidate_promoted,
@@ -2686,34 +3988,54 @@ impl ConnectorOwnership {
         }
         match (&*self.authority.lock(), &event.event) {
             (ConnectorAuthorityState::Retired { .. }, _) => false,
+            // Application bytes and real-time units are both refused before the
+            // channel is connected, and for the same reason: neither can be
+            // authorized by anything this state holds. The real-time arm is
+            // structurally unreachable — a unit exists only for a flow a
+            // promoted session opened, and promotion cannot happen before
+            // `Connected` — and it is written out rather than folded into the
+            // liveness arm below so that reachability is a property of this
+            // match rather than an inference about a caller.
             (
                 ConnectorAuthorityState::Awaiting { liveness, .. },
-                TransportEvent::Message(_)
-                | TransportEvent::VideoSample(_)
-                | TransportEvent::AudioSample(_),
+                TransportEvent::Message(_) | TransportEvent::RealtimeUnit(_),
             ) => {
                 let _ = liveness;
                 false
             }
             (ConnectorAuthorityState::Awaiting { liveness, .. }, _) => liveness.is_active(),
             (ConnectorAuthorityState::Promoting, _) => false,
-            (
-                ConnectorAuthorityState::Connected,
-                TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_),
-            ) => self.realtime_delivery.load(Ordering::Acquire),
             (ConnectorAuthorityState::Connected, _) => true,
         }
     }
 
+    /// Whether `task` is the endpoint-authentication owner for this exact
+    /// connector incarnation.
+    ///
+    /// Two conjuncts, and both are load-bearing. The WebRTC liveness flag is
+    /// this adapter's own retirement state; the identity comparison is made
+    /// against the transport-independent identity, because that is the only one
+    /// the task holds. The task names a `ConnectorIncarnation` and knows nothing
+    /// about WebRTC — the translation belongs on this side of the boundary, not
+    /// in `endpoint_auth`, and `belongs_to` stays an exact identity check rather
+    /// than being widened to accept a transport type.
     fn owns_endpoint_auth(&self, task: &crate::endpoint_auth::EndpointAuthTask) -> bool {
-        self.incarnation.is_active() && task.belongs_to(&self.incarnation)
+        self.incarnation.is_active() && task.belongs_to(self.incarnation.generic())
     }
 
-    fn owns_realtime_flow(
+    /// This worker's transport-independent connector identity, but only while
+    /// the connector is still live.
+    ///
+    /// Both conjuncts, from their one authoritative source each: the identity is
+    /// the incarnation's, and the liveness is `is_active`, which this type owns.
+    /// A retired worker answers `None`, so a promotion cannot name a connector
+    /// that has already gone.
+    pub(crate) fn live_connector_incarnation(
         &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-    ) -> bool {
-        capability.belongs_to(&self.incarnation)
+    ) -> Option<&Arc<crate::connector::ConnectorIncarnation>> {
+        self.incarnation
+            .is_active()
+            .then(|| self.incarnation.generic())
     }
 
     fn enter_operation(&self) -> Result<ConnectorOwnedOperationPermit> {
@@ -2735,7 +4057,6 @@ impl ConnectorOwnership {
     }
 
     fn begin_close(&self) {
-        self.realtime_delivery.store(false, Ordering::Release);
         self.operation_fence.begin_close();
     }
 
@@ -2924,6 +4245,54 @@ struct ConnectorOwnedOperationPermit {
     _resources: crate::resource::ResourceLease,
 }
 
+/// Connector send authority taken at one instant and spent at a later one.
+///
+/// A caller that must decide "may this send happen?" under a lock it cannot
+/// hold across an await takes this value there, and awaits the send afterwards.
+/// The permit inside is the whole authority: it is acquired before the decision
+/// and held until the send resolves, so the connector cannot close in between.
+///
+/// This is deliberately *not* `send_owned` with a later await. `send_owned`
+/// enters the fence at await time, which is too late for such a caller — the
+/// close may already have committed — and it also cancels on retirement.
+/// Retirement is not close: `WebRtcConnectorIncarnation::retire` only flips the
+/// active flag and the retirement watch, and cleanup runs it *before* draining
+/// the operation fence (`cleanup::run`), so a send that watched retirement
+/// would abort in exactly the window this permit exists to protect. The native
+/// session is untouched until `native.close()`, which the drain orders after
+/// this permit drops.
+pub(crate) struct StartedConnectorSend {
+    session: Arc<PeerSession>,
+    /// The authority itself. Dropping this value — including by dropping the
+    /// send future before it resolves — releases the connector to close, which
+    /// is the cancellation contract every other permit holder here has.
+    ///
+    /// Named without an underscore because `send` really does read it: the
+    /// permit's drop point is the invariant, so it is spelled out rather than
+    /// left to whatever the enclosing value's capture happens to imply.
+    permit: ConnectorOwnedOperationPermit,
+}
+
+impl StartedConnectorSend {
+    /// Spend the authority taken at `begin_send`.
+    ///
+    /// No fence re-entry and no retirement watch: re-entering could fail after
+    /// a close began, which would discard an authority already granted, and
+    /// watching retirement would cancel a send the fence has promised to wait
+    /// for.
+    ///
+    /// The permit is bound and dropped explicitly around the await. Moving
+    /// `self` into the future would already keep it alive, but that is an
+    /// inference about capture; the whole close-drain invariant rests on this
+    /// one lifetime, so it is written where a reader checks it.
+    pub(crate) async fn send(self, data: Bytes) -> Result<usize> {
+        let Self { session, permit } = self;
+        let sent = session.send(data).await;
+        drop(permit);
+        sent
+    }
+}
+
 fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeasurement {
     let (logical_bytes, _) = measured_sum([
         candidate.candidate.len(),
@@ -3030,15 +4399,111 @@ impl EndpointAuthHandoff {
         }
     }
 
-    pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
-        Arc::ptr_eq(&self.incarnation, incarnation)
+    // No accessors for the incarnation or the borrowed capability. This type is
+    // now a one-way staging step: a connector builds it and immediately moves it
+    // into its transport-independent form. Endpoint authentication inspects and
+    // validates the *generic* handoff, so exposing a WebRTC-shaped identity or
+    // capability borrow here would only offer a second, transport-specific way
+    // to reach facts that already have one owner.
+
+    // Deliberately no `take`/`restore` of the bare capability. Promotion moves
+    // the *whole* handoff, because this type is what carries the connector
+    // incarnation and the close owner, and its `Drop` is what re-retains the
+    // connected claim until native close succeeds. Extracting the capability
+    // alone would strip that retention, so an authenticated capability dropped
+    // on retirement or on a refused install would release the claim early.
+
+    /// Move this handoff into its transport-independent form.
+    ///
+    /// The whole ownership triple moves together: the capability, the generic
+    /// identity for this exact incarnation, and this close owner as the
+    /// retention obligation. Nothing is copied and nothing is left behind — the
+    /// consumed WebRTC handoff drops with no capability, so the claim is
+    /// retained exactly once, by the generic handoff's `Drop`, through this same
+    /// close owner.
+    ///
+    /// Returns `None` only if the capability was already moved out — the same
+    /// condition under which this handoff's own `Drop` retains nothing.
+    pub(crate) fn into_generic(mut self) -> Option<crate::connector::ConnectedChannelHandoff> {
+        let capability = self.capability.take()?;
+        Some(crate::connector::ConnectedChannelHandoff::new(
+            capability,
+            Arc::clone(self.incarnation.generic()),
+            self.close_owner.generic_retention(),
+        ))
     }
+}
+
+/// One fixture task over a WebRTC handoff, for the connector lifecycle
+/// controls.
+///
+/// Those controls exercise retirement, replacement, and admission around a
+/// task; they do not exercise the exchange. This converts the handoff to its
+/// generic form and defers to the endpoint-authentication fixture constructor,
+/// so the cryptographic context is defined in exactly one place rather than
+/// re-stated at every call site.
+#[cfg(test)]
+fn task_from_handoff(handoff: EndpointAuthHandoff) -> crate::endpoint_auth::EndpointAuthTask {
+    crate::endpoint_auth::task_for_test(
+        handoff
+            .into_generic()
+            .expect("a freshly built handoff still carries its capability"),
+    )
+}
+
+/// The same conversion, forcing this endpoint's contribution to a prior value.
+///
+/// Only the same-certificate replay control needs it, to build the one case the
+/// freshness rule prevents. See `endpoint_auth::task_reusing_contribution_for_test`.
+#[cfg(test)]
+fn task_from_handoff_reusing(
+    handoff: EndpointAuthHandoff,
+    local_contribution: &str,
+) -> crate::endpoint_auth::EndpointAuthTask {
+    crate::endpoint_auth::task_reusing_contribution_for_test(
+        handoff
+            .into_generic()
+            .expect("a freshly built handoff still carries its capability"),
+        crate::endpoint_auth::LocalContribution::reuse_for_test(local_contribution),
+    )
 }
 
 impl Drop for EndpointAuthHandoff {
     fn drop(&mut self) {
         if let Some(capability) = self.capability.take() {
             self.close_owner.retain_connected_claim(capability);
+        }
+    }
+}
+
+/// One component of the endpoint-authentication channel binding this connector
+/// can be made to withhold. **Controls only.**
+///
+/// A live native link whose data channel is open always presents both DTLS
+/// fingerprints, so the condition the production supplier fails closed on —
+/// half a pair — cannot be reached by driving the stack. Naming the component
+/// here is what lets the two missing-side controls be exact twins that differ in
+/// one value, rather than one control that proves "something was missing".
+///
+/// The whole withheld-binding surface is gated on `transport-lab` as well as
+/// `test`, because the only thing that can arm it is the live two-connector
+/// fixture, and that needs a real WebRTC link. Gating it on `test` alone leaves
+/// every item here uncalled in a default-feature test build.
+#[cfg(all(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WithheldBindingComponent {
+    Local,
+    Remote,
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+impl WithheldBindingComponent {
+    /// The armed marker for this component. Never zero: zero is "withholding
+    /// nothing", which is the state every connector is constructed in.
+    fn marker(self) -> u8 {
+        match self {
+            Self::Local => 1,
+            Self::Remote => 2,
         }
     }
 }
@@ -3053,8 +4518,26 @@ pub(crate) struct WebRtcConnectorWorker {
     ownership: ConnectorOwnership,
     remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
     close_owner: Arc<ConnectorCloseOwner>,
+    /// The flow registry this worker's sessions open against.
+    ///
+    /// Retained here rather than reached through `close_owner`, which already
+    /// holds a handle for teardown. A teardown owner that also handed out live
+    /// registries for constructing new things would carry two jobs that can
+    /// disagree about which is authoritative during a close.
+    realtime_flows: Arc<RealtimeFlowRegistry>,
     resource_scope: PeerConnectionResourceScope,
     _transport_observation: ObservationLease,
+    /// Which single binding component this connector withholds from its own
+    /// supplier. **Controls only**, compiled out of production entirely.
+    ///
+    /// Withhold-only and monotonic: there is no operation that supplies a
+    /// component, restores one, or names both, so a fixture can remove material
+    /// the live link genuinely stated and can never inject material it did not.
+    /// That direction is the safety property — a seam that could supply a
+    /// fingerprint would be the substitution this whole boundary exists to
+    /// refuse, dressed as a test helper.
+    #[cfg(all(test, feature = "transport-lab"))]
+    withheld_binding_component: std::sync::atomic::AtomicU8,
 }
 
 struct AdmittedConnectorOwnership {
@@ -3065,11 +4548,350 @@ struct AdmittedConnectorOwnership {
     resource_scope: PeerConnectionResourceScope,
     work_resource_scope: ConnectorWorkResourceScope,
     transport_observation: ObservationLease,
-    remote_candidate_policy: PendingRemoteCandidatePolicy,
-    reclaim: ResourceReclaimSubscription,
+}
+
+/// The session side of the realtime flow binding.
+///
+/// Placed here rather than in `runtime::session_broker` so the session type
+/// stays transport-independent: it never names a WebRTC incarnation, and this
+/// module already knows both vocabularies.
+///
+/// `is_current_on` answers **identity only**, and that is not a gap. The
+/// liveness half is carried by how the caller obtains its argument: the only
+/// production source of an incarnation to pass here is
+/// [`WebRtcConnectorWorker::live_connector_incarnation`], which yields `None`
+/// once the connector is retired. So a retired connector cannot produce an
+/// argument for this call at all, and the pair of conjuncts holds without the
+/// session caching a liveness flag that could disagree with the connector.
+impl session_flow::RealtimeSessionBinding for crate::runtime::session_broker::SessionCapability {
+    fn is_current_on(&self, incarnation: &Arc<crate::connector::ConnectorIncarnation>) -> bool {
+        self.belongs_to(incarnation)
+    }
 }
 
 impl WebRtcConnectorWorker {
+    /// Reserve exact finite work against this connector's attempt owner before
+    /// parsing an endpoint protocol frame.
+    pub(crate) fn reserve_attempt_work(
+        &self,
+        claim: crate::resource::ResourceClaim,
+    ) -> std::result::Result<crate::resource::ResourceLease, crate::resource::ResourceUnavailable>
+    {
+        self.ownership
+            .work_resource_scope
+            .acquire(crate::resource::ResourceAuthorityClass::Speculative, claim)
+    }
+
+    /// Build the flow set one promoted session owns.
+    ///
+    /// The engine calls this at promotion and stores the result beside the
+    /// capability, so the set is bound to the exact worker the session was
+    /// promoted from. Constructing it here is what keeps `RealtimeFlowRegistry`
+    /// unnameable by the engine — the opaque set is the only thing that crosses.
+    pub(crate) fn new_session_flows(&self) -> session_flow::SessionRealtimeFlows {
+        let flows = session_flow::SessionRealtimeFlows::new(
+            Arc::clone(&self.realtime_flows),
+            self.session.realtime_profile.clone(),
+        );
+        // Point the connector's `on_track` handler at this session's table, and
+        // at no other. Installed here rather than by the engine because the
+        // engine must not name `RealtimeInboundBindings` at all — this accessor
+        // is the one place both vocabularies are already in scope.
+        //
+        // Weak, so the table cannot outlive the `PromotedSession` about to own
+        // this set: when that drops, the upgrade in `on_track` fails and an
+        // arriving track is refused, with nothing having to be told.
+        self.session
+            .realtime_tracks
+            .install(flows.inbound_bindings());
+        flows
+    }
+
+    /// Whether this connector may still do native realtime work, and the
+    /// profile that says what it may do.
+    ///
+    /// One helper for the two conjuncts every method below opens with, so the
+    /// order cannot drift between them: the connector is still live, and the
+    /// application registered the family being asked for. The second is the
+    /// **registered-profile selection** rule — core has no opinion about
+    /// codecs, only about whether this one was offered, so an unregistered
+    /// family is refused here rather than negotiated and then found
+    /// unframeable at admission.
+    fn realtime_negotiation_guard(&self, encoding: &RealtimeEncoding) -> Result<()> {
+        if !self.ownership.incarnation.is_active() {
+            return Err(Error::Transport(
+                "connector retired before realtime negotiation".to_string(),
+            ));
+        }
+        let registered = self
+            .session
+            .realtime_profile
+            .as_ref()
+            .is_some_and(|profile| profile.profile().admits_encoding(encoding).is_some());
+        if !registered {
+            return Err(Error::Transport(
+                "realtime encoding names no registered capability".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create the receive-only transceiver an inbound session flow attaches to.
+    ///
+    /// `identity` is minted and **already bound** by the engine's fence before
+    /// this is called. That ordering is the whole design: the transceiver that
+    /// could carry a track is created against a token that already resolves, so
+    /// no track can arrive ahead of its binding and no start-of-flow media is
+    /// lost to a race.
+    ///
+    /// This does not drive renegotiation. Adding a transceiver raises
+    /// `RenegotiationNeeded`, which the engine already coalesces into one
+    /// offer; a second path here would be a second offer for the same change.
+    ///
+    /// **Funded before it is created.** The transceiver's own claim is acquired
+    /// from this connector's work scope ahead of the native call, so a connector
+    /// out of capacity refuses to add an `m` line rather than adding one and
+    /// then failing to account for it. Reserve-before-allocate, the same
+    /// ordering every other native allocation on this connector uses; the lease
+    /// is released only when a completed `stop` proves the object is gone.
+    pub(crate) async fn open_inbound_realtime_transceiver(
+        &self,
+        identity: &Arc<RealtimeTrackIdentity>,
+        encoding: &RealtimeEncoding,
+    ) -> Result<()> {
+        // Held across the whole call so a close cannot commit underneath a
+        // half-created transceiver.
+        let _operation = self.ownership.enter_operation()?;
+        self.realtime_negotiation_guard(encoding)?;
+        // Before the native call, and dropped by every `?` between here and the
+        // record below — so a refused guard, a refused provider or a failed
+        // `add_transceiver_from_kind` all leave this connector charged for
+        // nothing.
+        //
+        // Two independent claims because they end at two different moments: the
+        // record's node when the record is forgotten, the native half when a
+        // `stop` has completed. A failed cleanup retains the second while the
+        // first is still released normally, which is only expressible if they
+        // were never one number.
+        let record_claim = negotiated_inbound_record_claim()
+            .map_err(|error| Error::Transport(format!("inbound realtime record claim: {error}")))?;
+        let signal_claim = RealtimeRetirementSignal::mint_claim().map_err(|error| {
+            Error::Transport(format!("inbound realtime completion claim: {error}"))
+        })?;
+        let native_claim = negotiated_inbound_transceiver_claim().map_err(|error| {
+            Error::Transport(format!("inbound realtime transceiver claim: {error}"))
+        })?;
+        // A session with no connector reservation behind it cannot fund a native
+        // object, and refusing is the only honest answer: creating one anyway
+        // would put an unaccounted `m` line on the connection, which is the
+        // defect this claim exists to make impossible.
+        let Some(work_scope) = self.session.work_resource_scope.as_ref() else {
+            return Err(Error::Transport(
+                "inbound realtime negotiation has no connector work scope to fund a transceiver"
+                    .to_string(),
+            ));
+        };
+        // `Admitted`, not `Speculative`: a negotiated transceiver belongs to a
+        // promoted session and is not candidate work that may be reclaimed
+        // underneath the media it is carrying.
+        let record_lease = work_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                record_claim,
+            )
+            .map_err(Error::ResourceUnavailable)?;
+        let signal_lease = work_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                signal_claim,
+            )
+            .map_err(Error::ResourceUnavailable)?;
+        let native_lease = work_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                native_claim,
+            )
+            .map_err(Error::ResourceUnavailable)?;
+        let transceiver = self
+            .session
+            .pc
+            .add_transceiver_from_kind(
+                native_codec_type(encoding.kind()),
+                Some(RTCRtpTransceiverInit {
+                    // Receive only. A sendrecv transceiver would offer to send
+                    // on a flow the application opened to receive, advertising
+                    // a direction nothing here will ever write to.
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    send_encodings: Vec::new(),
+                }),
+            )
+            .await
+            .map_err(|error| {
+                Error::Transport(format!("inbound realtime add_transceiver: {error}"))
+            })?;
+        self.session.realtime_tracks.record(
+            Arc::clone(identity),
+            Arc::new(WebRtcNativeTransceiverPort { transceiver }),
+            record_lease,
+            signal_lease,
+            native_lease,
+        );
+        Ok(())
+    }
+
+    /// Mint the exact identity one inbound flow will be negotiated against.
+    ///
+    /// Here rather than in the engine, and fallible for the same reason the
+    /// retirement is: the allocation is funded from this connector's work scope,
+    /// and the acquisition happens before the allocation exists. An engine that
+    /// minted its own would be allocating a connector-scoped object it has no
+    /// scope to pay for.
+    ///
+    /// The lease goes inside the identity, so it follows every holder — the
+    /// binding, the retirement, a claim taken during a sweep — rather than
+    /// ending when whichever of them happens to be dropped first goes.
+    pub(crate) fn mint_inbound_realtime_identity(&self) -> Result<Arc<RealtimeTrackIdentity>> {
+        let Some(work_scope) = self.session.work_resource_scope.as_ref() else {
+            return Err(Error::Transport(
+                "inbound realtime negotiation has no connector work scope to fund an identity"
+                    .to_string(),
+            ));
+        };
+        let claim = RealtimeTrackIdentity::mint_claim().map_err(|error| {
+            Error::Transport(format!("inbound realtime identity claim: {error}"))
+        })?;
+        let lease = work_scope
+            .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
+            .map_err(Error::ResourceUnavailable)?;
+        Ok(RealtimeTrackIdentity::mint(lease))
+    }
+
+    /// Release a transceiver whose commit fence refused.
+    ///
+    /// Safe for a token that never recorded one — the engine calls this on
+    /// paths where negotiation may not have got that far, and a caller should
+    /// not have to know which. Answers nothing for the same reason: there is no
+    /// action left for the caller either way.
+    /// It is also the retirement path for a token handed back by
+    /// `SessionRealtimeFlows::close`, which is the ordinary case rather than the
+    /// exceptional one. Both go through the same claim, so a close racing the
+    /// pump that was feeding the same flow cannot stop one transceiver twice.
+    pub(crate) async fn close_inbound_realtime_transceiver(
+        &self,
+        identity: &Arc<RealtimeTrackIdentity>,
+    ) {
+        self.session.realtime_tracks.stop_claimed(identity).await;
+    }
+
+    /// The retirement this connector will honour for one token, for the flow
+    /// that is about to be bound to it.
+    ///
+    /// Handed to the flow rather than kept here, because the flow is what knows
+    /// when the transceiver stops being wanted — and a flow can stop being
+    /// wanted without anyone calling anything, which is exactly the case this
+    /// exists for. Minting it here is what keeps the engine out of the track
+    /// table: it names a token and receives an owner, and never learns what
+    /// stopping one involves.
+    ///
+    /// **Fallible, because the cleanup it promises is paid for here.** The
+    /// retirement's queue slot on the process cleanup executor is acquired now,
+    /// against this connector's work scope, so that the submission it will make
+    /// later — from a destructor, with no caller to tell — cannot be refused for
+    /// want of capacity. A connector that cannot afford to clean the flow up
+    /// refuses to open it, which is the only ordering under which "every way
+    /// this flow ends retires its transceiver" is a statement about resources
+    /// rather than a hope.
+    pub(crate) fn inbound_realtime_retirement(
+        &self,
+        identity: Arc<RealtimeTrackIdentity>,
+    ) -> Result<RealtimeInboundRetirement> {
+        let Some(work_scope) = self.session.work_resource_scope.as_ref() else {
+            return Err(Error::Transport(
+                "inbound realtime binding has no connector work scope to fund a retirement"
+                    .to_string(),
+            ));
+        };
+        let slot_claim = crate::runtime::attempt::cleanup_job_claim().map_err(|error| {
+            Error::Transport(format!("inbound realtime retirement slot claim: {error}"))
+        })?;
+        let slot = work_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                slot_claim,
+            )
+            .map_err(Error::ResourceUnavailable)?;
+        Ok(self.session.realtime_tracks.retirement(
+            identity,
+            work_scope.cleanup_submission().clone(),
+            slot,
+        ))
+    }
+
+    /// Create and attach the native sender for an outbound session flow.
+    ///
+    /// The track's MIME is the one the application registered, taken from the
+    /// encoding rather than from a constant: this module has no codec table and
+    /// must not acquire one.
+    pub(crate) async fn open_outbound_realtime_track(
+        &self,
+        encoding: &RealtimeEncoding,
+    ) -> Result<RealtimeOutboundTrack> {
+        let _operation = self.ownership.enter_operation()?;
+        self.realtime_negotiation_guard(encoding)?;
+        let track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: encoding.mime().to_string(),
+                clock_rate: encoding.clock_rate(),
+                channels: encoding.channels(),
+                ..Default::default()
+            },
+            // Ids the peer never routes on. Inbound demux is by the transceiver
+            // this side created, never by a name off the wire, so these exist
+            // for traces and for the library's own bookkeeping.
+            format!("flow-{}", encoding.mime()),
+            "myownmesh".to_string(),
+        ));
+        let sender = self
+            .session
+            .pc
+            .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .map_err(|error| Error::Transport(format!("outbound realtime add_track: {error}")))?;
+        Ok(RealtimeOutboundTrack {
+            track,
+            sender,
+            // Carried on the track rather than looked up at retirement time,
+            // because the pump that ends up owning this has no worker to ask.
+            pc: Arc::clone(&self.session.pc),
+            incarnation: Arc::clone(&self.ownership.incarnation),
+        })
+    }
+
+    /// Release a track the commit fence refused.
+    ///
+    /// Taken by value: a released track must not be attachable afterwards, and
+    /// consuming it is what makes that structural rather than a rule.
+    ///
+    /// This exists for exactly one case — negotiation succeeded and the fence
+    /// then refused, so the caller is holding a track that was never attached
+    /// and therefore has no pump and no completion lease. Once
+    /// `attach_outbound` accepts, the pump is the only owner and this path is
+    /// unreachable for that track.
+    pub(crate) async fn close_outbound_realtime_track(&self, track: RealtimeOutboundTrack) {
+        track.retire().await;
+    }
+
+    /// This worker's transport-independent connector identity, while live.
+    ///
+    /// Forwards to the ownership that actually holds the incarnation, so there
+    /// is one implementation of the identity-and-liveness pair rather than two
+    /// that could drift.
+    pub(crate) fn live_connector_incarnation(
+        &self,
+    ) -> Option<&Arc<crate::connector::ConnectorIncarnation>> {
+        self.ownership.live_connector_incarnation()
+    }
+
     fn admitted(
         session: PeerSession,
         raw: TransportEventReceiver,
@@ -3083,13 +4905,10 @@ impl WebRtcConnectorWorker {
             resource_scope,
             work_resource_scope,
             transport_observation,
-            remote_candidate_policy,
-            reclaim,
         } = admitted;
         let attempt_retirement = attempt_liveness.subscribe_retirement();
         let session = Arc::new(session);
         let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::with_resources(
-            remote_candidate_policy,
             work_resource_scope,
         )));
         if !close_owner.attach_remote_candidates(Arc::clone(&remote_candidates)) {
@@ -3104,6 +4923,8 @@ impl WebRtcConnectorWorker {
                 "real-time registry owner installation was refused".to_string(),
             ));
         }
+        // Cloned before `raw` moves into the receiver below.
+        let realtime_flows = Arc::clone(&raw.realtime_flows);
         let receiver = WebRtcConnectorEventReceiver {
             ownership: ownership.clone(),
             retirement: ownership.incarnation.subscribe_retirement(),
@@ -3112,7 +4933,6 @@ impl WebRtcConnectorWorker {
             attempt_lifetime: Some(attempt_lifetime),
             remote_candidates: Arc::clone(&remote_candidates),
             close_owner: Some(Arc::clone(&close_owner)),
-            reclaim: Some(reclaim),
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -3121,29 +4941,64 @@ impl WebRtcConnectorWorker {
             Self {
                 session,
                 ownership,
+                realtime_flows,
                 remote_candidates,
                 close_owner,
                 resource_scope,
                 _transport_observation: transport_observation,
+                #[cfg(all(test, feature = "transport-lab"))]
+                withheld_binding_component: std::sync::atomic::AtomicU8::new(0),
             },
             receiver,
         ))
     }
 
-    /// Consume an event only when it came from this still-active worker.
+    /// Consume an event only when it came from this still-active worker, and —
+    /// for a real-time unit — only while this session still owns a binding
+    /// table for it to have come from.
+    ///
+    /// Two questions, asked by the two owners that can actually answer them.
+    /// `ownership.accepts` answers the connector one: same incarnation, still
+    /// live, past the states in which nothing can be authorized. It cannot
+    /// answer the second, because the session's binding table is not the
+    /// connector's to know about — a connector stays `Connected` across the
+    /// whole life of a peer connection, including after a promoted session's
+    /// table has died with it.
+    ///
+    /// The second is asked here because this is the first point that holds
+    /// both. A `RealtimeUnit` exists only for a flow some session opened, so
+    /// once `realtime_tracks.current()` is `None` there is no live table that
+    /// unit could belong to: it was minted against a table that has since been
+    /// dropped, or against a session this worker no longer serves. Refusing it
+    /// here means the refusal lands *before* delivery and before any
+    /// consumer-side work or accounting is charged for it. The connector-side
+    /// flow and output leases the unit already carries are not undone by that —
+    /// they were taken when the unit was assembled and are simply released when
+    /// the refused event drops, which is the same path any dropped unit takes.
+    ///
+    /// Deliberately not the callback-work lease: that a callback was afforded
+    /// says the provider had capacity, not that the event is authorized, and
+    /// reading capacity as authority is how a resource decision becomes a
+    /// security one.
     pub(crate) fn accept_event(
         &self,
         event: WebRtcConnectorEvent,
     ) -> Option<AcceptedWebRtcConnectorEvent> {
-        self.ownership
-            .accepts(&event)
-            .then_some(AcceptedWebRtcConnectorEvent {
-                event: event.event,
-                resources: AcceptedWebRtcConnectorEventResources {
-                    _queue_observation: event._queue_observation,
-                    _callback_work: event._callback_work,
-                },
-            })
+        if !self.ownership.accepts(&event) {
+            return None;
+        }
+        if matches!(&event.event, TransportEvent::RealtimeUnit(_))
+            && self.session.realtime_tracks.current().is_none()
+        {
+            return None;
+        }
+        Some(AcceptedWebRtcConnectorEvent {
+            event: event.event,
+            resources: AcceptedWebRtcConnectorEventResources {
+                _queue_observation: event._queue_observation,
+                _callback_work: event._callback_work,
+            },
+        })
     }
 
     #[cfg(test)]
@@ -3289,38 +5144,6 @@ impl WebRtcConnectorWorker {
             .await
     }
 
-    /// Temporary LegacyV1/test entry point. V4 ingress uses `apply_remote_sdp`
-    /// so native parsing cannot precede provider admission.
-    #[cfg(all(test, feature = "legacy-v1"))]
-    pub(crate) async fn apply_remote_description(
-        &self,
-        description: RTCSessionDescription,
-    ) -> Result<RemoteDescriptionApplyReport> {
-        let _operation = self.ownership.enter_operation()?;
-        if !self.ownership.incarnation.is_active() {
-            return Err(Error::Transport("connector worker is retired".to_string()));
-        }
-        let _work_observation = observe_inexact_item(
-            &self.resource_scope,
-            PreAuthResourceFamily::ConnectorSpecificWork,
-            1,
-            0,
-        );
-        let work_resources = self
-            .remote_candidates
-            .lock()
-            .admission_target()
-            .work_resources
-            .clone();
-        let credentials = sdp_ice_credentials_owned(
-            &description.sdp,
-            description.sdp.capacity(),
-            &work_resources,
-        )?;
-        self.apply_remote_description_owned(description, credentials)
-            .await
-    }
-
     /// Apply remote SDP, transfer queue ownership into the async drain, and
     /// apply every retained candidate through the connector-private raw API.
     /// The caller must retain the exact connector operation permit.
@@ -3439,11 +5262,7 @@ impl WebRtcConnectorWorker {
                 "remote candidate does not match the exact current ICE attempt".to_string(),
             ));
         }
-        let Some(budget) = pending
-            ._queue_reservation
-            .as_ref()
-            .map(|reservation| Arc::clone(&reservation.budget))
-        else {
+        if pending._queue_reservation.is_none() {
             self.remote_candidates
                 .lock()
                 .retire_attempt(&pending.attempt);
@@ -3451,16 +5270,11 @@ impl WebRtcConnectorWorker {
                 "remote candidate reached production application without queue ownership"
                     .to_string(),
             ));
-        };
-        if !budget.reserve_application_work() {
-            self.remote_candidates
-                .lock()
-                .retire_attempt(&pending.attempt);
-            return Err(Error::Transport(
-                "remote-candidate application work exceeded the owner-selected ICE-attempt envelope"
-                    .to_string(),
-            ));
         }
+        // What refuses the native application below is the elastic attempt's own
+        // claim for it. The owner-selected application-work count that used to
+        // be checked here is gone: it could only refuse an apply the owner's
+        // grant would have funded.
         let _ice_observation =
             observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::IceWork, 1, 0);
         let PendingRemoteCandidate {
@@ -3550,6 +5364,18 @@ impl WebRtcConnectorWorker {
         observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::Task, 1, 1)
     }
 
+    /// Take send authority now for a send awaited later.
+    ///
+    /// Synchronous on purpose: the caller is under a lock, or about to take
+    /// one, and needs the connector's answer before it decides. Acquiring here
+    /// rather than at await time is the whole point — see `StartedConnectorSend`.
+    pub(crate) fn begin_send(&self) -> Result<StartedConnectorSend> {
+        Ok(StartedConnectorSend {
+            session: Arc::clone(&self.session),
+            permit: self.ownership.enter_operation()?,
+        })
+    }
+
     pub(crate) async fn send_owned(&self, data: Bytes) -> Result<usize> {
         let _operation = self.ownership.enter_operation()?;
         await_until_connector_retirement(
@@ -3600,127 +5426,70 @@ impl WebRtcConnectorWorker {
         .flatten()
     }
 
+    /// Supply the accepted channel binding for this exact live connector.
+    ///
+    /// This is the WebRTC adapter's whole contribution to endpoint
+    /// authentication: it reads its own two native fingerprints and hands them
+    /// over as endpoint-relative components. It selects no role, applies no
+    /// canonical ordering, and states nothing about what the pair proves —
+    /// those belong to the endpoint authentication owner.
+    ///
+    /// Fail-closed: a missing local or missing remote fingerprint yields no
+    /// binding, so a caller cannot proceed with half a pair.
+    pub(crate) async fn endpoint_auth_binding(
+        &self,
+    ) -> Option<crate::connector::EndpointAuthBinding> {
+        let local = self.local_fingerprint().await?;
+        let remote = self.remote_fingerprint().await?;
+        // Controls only, compiled out of production. Both genuine components
+        // have been read by this point and are discarded unread when one is
+        // withheld — the refusal is the absence of a component, never a blank
+        // or defaulted one, so the constructor below is never reached with an
+        // empty string and no fallback value exists anywhere on this path.
+        //
+        // The gate is exactly the one on the field and the helper below. It has
+        // to be: a build where those are absent and this line is present would
+        // not compile at all.
+        #[cfg(all(test, feature = "transport-lab"))]
+        self.refuse_withheld_binding_component_for_test()?;
+        crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(&local, &remote)
+    }
+
+    /// Arm this connector to withhold one binding component. **Controls only.**
+    ///
+    /// Set-only and monotonic: there is no clearing operation, so an armed
+    /// connector stays armed for its whole life and the positive twin has to be
+    /// a fixture that was never armed rather than the same one disarmed. That
+    /// keeps the twins genuinely independent — a control cannot arrange the
+    /// failure, observe it, and then arrange the success on the same connector.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn withhold_binding_component_for_test(&self, component: WithheldBindingComponent) {
+        self.withheld_binding_component
+            .store(component.marker(), Ordering::Release);
+    }
+
+    /// `None` when a component is withheld, so the caller's `?` refuses.
+    ///
+    /// Returns `Some(())` and nothing else: this cannot hand back material, only
+    /// stop material that was genuinely read from being assembled into a pair.
+    #[cfg(all(test, feature = "transport-lab"))]
+    fn refuse_withheld_binding_component_for_test(&self) -> Option<()> {
+        (self.withheld_binding_component.load(Ordering::Acquire) == 0).then_some(())
+    }
+
     pub(crate) fn awaiting_answer(&self) -> bool {
         self.ownership.incarnation.is_active() && self.session.awaiting_answer()
     }
 
-    pub(crate) fn owns_realtime_flow(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-    ) -> bool {
-        self.ownership.owns_realtime_flow(capability)
-    }
-
-    #[cfg(any(test, feature = "legacy-media"))]
-    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
-    pub(crate) async fn open_media_lane(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-        kind: LaneKind,
-    ) -> Result<u8> {
-        let _operation = self.ownership.enter_operation()?;
-        if !self.owns_realtime_flow(capability) {
-            return Err(Error::Transport(
-                "real-time flow capability does not own this connector".to_string(),
-            ));
-        }
-        await_until_connector_retirement(
-            self.ownership.incarnation.subscribe_retirement(),
-            self.session.open_media_lane(kind),
-        )
-        .await
-        .ok_or_else(|| Error::Transport("connector worker retired during lane open".to_string()))?
-    }
-
-    #[cfg(any(test, feature = "legacy-media"))]
-    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
-    pub(crate) async fn close_media_lane(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-        kind: LaneKind,
-        lane: u8,
-    ) -> Result<()> {
-        let _operation = self.ownership.enter_operation()?;
-        if !self.owns_realtime_flow(capability) {
-            return Err(Error::Transport(
-                "real-time flow capability does not own this connector".to_string(),
-            ));
-        }
-        await_until_connector_retirement(
-            self.ownership.incarnation.subscribe_retirement(),
-            self.session.close_media_lane(kind, lane),
-        )
-        .await
-        .ok_or_else(|| Error::Transport("connector worker retired during lane close".to_string()))?
-    }
-
-    #[cfg(any(test, feature = "legacy-media"))]
-    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
-    pub(crate) async fn send_video(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-        lane: u8,
-        data: Bytes,
-        duration: Duration,
-    ) -> Result<()> {
-        let _operation = self.ownership.enter_operation()?;
-        if !self.owns_realtime_flow(capability) {
-            return Err(Error::Transport(
-                "real-time flow capability does not own this connector".to_string(),
-            ));
-        }
-        await_until_connector_retirement(
-            self.ownership.incarnation.subscribe_retirement(),
-            self.session.send_video(lane, data, duration),
-        )
-        .await
-        .ok_or_else(|| Error::Transport("connector worker retired during video send".to_string()))?
-    }
-
-    #[cfg(any(test, feature = "legacy-media"))]
-    #[allow(dead_code, reason = "frozen legacy-media compatibility operation")]
-    pub(crate) async fn send_audio(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-        lane: u8,
-        data: Bytes,
-        duration: Duration,
-    ) -> Result<()> {
-        let _operation = self.ownership.enter_operation()?;
-        if !self.owns_realtime_flow(capability) {
-            return Err(Error::Transport(
-                "real-time flow capability does not own this connector".to_string(),
-            ));
-        }
-        await_until_connector_retirement(
-            self.ownership.incarnation.subscribe_retirement(),
-            self.session.send_audio(lane, data, duration),
-        )
-        .await
-        .ok_or_else(|| Error::Transport("connector worker retired during audio send".to_string()))?
-    }
-
-    #[cfg(any(test, feature = "legacy-media", feature = "transport-lab"))]
-    #[allow(
-        dead_code,
-        reason = "this explicit event is used only by the deprecated legacy-media deployment owner"
-    )]
-    pub(crate) async fn finalize_suspended_lanes(
-        &self,
-        capability: &crate::connector::ConnectorRealtimeFlowCapability,
-    ) -> usize {
-        let Ok(_operation) = self.ownership.enter_operation() else {
-            return 0;
-        };
-        if !self.owns_realtime_flow(capability) {
-            return 0;
-        }
-        await_until_connector_retirement(
-            self.ownership.incarnation.subscribe_retirement(),
-            self.session.finalize_suspended_lanes(),
-        )
-        .await
-        .unwrap_or(0)
+    /// The role this connector's peer connection was opened for.
+    ///
+    /// Fixed when the session is constructed and never recomputed. A caller
+    /// deciding whether it may offer on an existing connection has to ask the
+    /// connection, not re-derive a role from identifiers: identifier ordering
+    /// describes which side would *open* a connection that does not exist yet,
+    /// and is not a fact about one that does.
+    pub(crate) fn role(&self) -> Role {
+        self.session.role()
     }
 
     pub(crate) fn signaling_state(&self) -> RTCSignalingState {
@@ -3810,39 +5579,79 @@ impl WebRtcConnectorWorker {
         }
     }
 
+    /// Fence this connector for an open that must never be authenticated over.
+    ///
+    /// The caller has already decided that nothing can be proved about this
+    /// channel — the connector could not state its endpoint-auth binding — so
+    /// the channel must not merely go unpromoted, it must be closed, and the
+    /// connector's finite claim must be held until that close is observed to
+    /// have succeeded.
+    ///
+    /// The order is load-bearing and is the whole reason this is a method
+    /// rather than two calls at the call site:
+    ///
+    /// 1. `confirm_data_channel_open()` first. On a live connector this takes
+    ///    the connected claim and hands back a handoff; dropping that handoff
+    ///    immediately is the *normal* Connected path's `Drop`, which returns the
+    ///    claim to the close owner's conservative retention and starts the
+    ///    close. The brief promotion exists for exactly that reason — to return
+    ///    the claim to connected retention rather than to use the channel. No
+    ///    task is built, no capability escapes, and nothing is ever sent: the
+    ///    handoff is dropped in the same expression that produced it.
+    /// 2. `close_owner.start()` second, unconditionally. `retain_connected_claim`
+    ///    already started the close on the path above, so this is an idempotent
+    ///    second call there. It is not redundant: when `confirm` answers
+    ///    `Rejected` — a connector already stale or retired, so there is no
+    ///    handoff to drop — this is the only thing that starts a close owner, and
+    ///    the refusal must still start exactly one.
+    ///
+    /// Never retire before confirming. `retire()` would fence the operation
+    /// before `confirm` could take the claim, so the claim would sit outside
+    /// the close owner's retention and the connector would be torn down with a
+    /// claim nobody was holding conservatively.
+    ///
+    /// This makes no statement about certificates, exporters, or any keying
+    /// material: it is ownership and cleanup only.
+    pub(crate) fn refuse_data_channel_open(&self) {
+        drop(self.confirm_data_channel_open());
+        self.close_owner.start();
+    }
+
     /// Revoke callback acceptance and release every connector-owned candidate.
     pub(crate) fn retire(&self) {
         self.close_owner.retire_local();
     }
 
-    pub(crate) fn admit_legacy_realtime_flow(
-        &self,
-        task: &crate::endpoint_auth::EndpointAuthTask,
-    ) -> Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>> {
-        let _operation = self.ownership.enter_operation().ok()?;
-        if !self.owns_endpoint_auth(task)
-            || !self.ownership.incarnation.is_active()
-            || !self.session.realtime_enabled()
-        {
-            return None;
-        }
-        let resources = self
-            .ownership
-            .work_resource_scope
-            .acquire(
-                crate::resource::ResourceAuthorityClass::Admitted,
-                crate::connector::realtime_flow_capability_claim().ok()?,
-            )
-            .ok()?;
-        self.ownership
-            .realtime_delivery
-            .store(true, Ordering::Release);
-        Some(Arc::new(
-            crate::connector::ConnectorRealtimeFlowCapability::new(
-                Arc::clone(&self.ownership.incarnation),
-                resources,
-            ),
-        ))
+    /// Install this connector's native-close hold point. **Controls only.**
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn install_native_close_gate_for_test(&self) -> NativeCloseGateHandle {
+        self.close_owner.install_native_close_gate_for_test()
+    }
+
+    /// Commit this connector's operation close fence, and nothing else.
+    /// **Controls only.**
+    ///
+    /// Deliberately narrower than every production path that closes a fence:
+    /// it does not retire the incarnation, does not start the close owner, and
+    /// touches no session, promotion, or governance state. That is the whole
+    /// point — it isolates "this connector will accept no further operations"
+    /// from "this peer lost its authority", which production always causes
+    /// together and which a caller must never confuse.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn begin_close_for_test(&self) {
+        self.ownership.begin_close();
+    }
+
+    /// How many connected claims this connector's close owner is holding in
+    /// conservative retention right now. **Controls only.**
+    ///
+    /// Non-zero means the claim has been taken but not released: the close has
+    /// not yet reported success, or reported failure and is retaining it. Zero
+    /// after a successful close is the release; zero before any promotion is
+    /// simply that no claim has moved into retention yet.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn retained_connected_claims_for_test(&self) -> usize {
+        self.close_owner.retained_connected_claims_for_test()
     }
 
     pub(crate) fn owns_endpoint_auth(&self, task: &crate::endpoint_auth::EndpointAuthTask) -> bool {
@@ -3890,8 +5699,6 @@ impl LocalIceCandidate {
 #[derive(Clone)]
 pub struct Transport {
     api: Arc<webrtc::api::API>,
-    #[cfg(any(test, feature = "legacy-media"))]
-    legacy_media_api: Arc<SyncMutex<Option<Arc<webrtc::api::API>>>>,
     runtime: crate::runtime::RuntimeIncarnation,
     ice_transport_policy: RTCIceTransportPolicy,
     connector_resource_scope: Option<MeshConnectorResourceScope>,
@@ -3903,13 +5710,27 @@ pub struct Transport {
 struct PeerOpenOwnership {
     resource_scope: Option<PeerConnectionResourceScope>,
     work_resource_scope: Option<ConnectorWorkResourceScope>,
-    realtime_delivery: Arc<AtomicBool>,
     attempt_liveness: Option<AttemptLiveness>,
     candidate_promoted: Arc<AtomicBool>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     callback_policy: ConnectorCallbackPolicy,
+    /// The explicit callback grant a scope-less lab connector mints its own
+    /// provider from.
+    ///
+    /// Present only on the lab entry points, and only because they are the one
+    /// way to build a connector with no connector work scope at all. A
+    /// production connector always carries a scope and acquires against it, so
+    /// there is nothing here for a deployment to state — and nothing core
+    /// could invent on its behalf: the fixture names its own numbers.
+    #[cfg(any(test, feature = "transport-lab"))]
+    local_lab_callback_grant: Option<callback::TransportLabCallbackGrant>,
     operation_fence: Arc<ConnectorOperationFence>,
-    legacy_media_profile: Option<LegacyWebRtcMediaProfile>,
+    /// The application's registered codecs, carried through to the session so
+    /// a flow set can resolve framing without re-reading the connector profile.
+    ///
+    /// Unlike its two neighbours this is not `Copy`, so it is cloned once here
+    /// rather than being read out of the profile at each use.
+    realtime_profile: Option<RealtimeProfile>,
     close_owner: Option<Arc<ConnectorCloseOwner>>,
 }
 
@@ -4114,91 +5935,74 @@ impl Drop for ConstructedConnectorResult {
     }
 }
 
-#[cfg(any(test, feature = "legacy-media"))]
-fn legacy_media_codecs() -> Vec<(RTCRtpCodecParameters, RTPCodecType)> {
-    let feedback = vec![
-        RTCPFeedback {
-            typ: "goog-remb".to_string(),
-            parameter: String::new(),
-        },
-        RTCPFeedback {
-            typ: "ccm".to_string(),
-            parameter: "fir".to_string(),
-        },
-        RTCPFeedback {
-            typ: "nack".to_string(),
-            parameter: String::new(),
-        },
-        RTCPFeedback {
-            typ: "nack".to_string(),
-            parameter: "pli".to_string(),
-        },
-    ];
-    let mut codecs = vec![(
-        RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_string(),
-                clock_rate: 48_000,
-                channels: 2,
-                sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
-                rtcp_feedback: Vec::new(),
-            },
-            payload_type: 111,
-            ..Default::default()
-        },
-        RTPCodecType::Audio,
-    )];
-    for (payload_type, sdp_fmtp_line) in [
-        (
-            102,
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
-        ),
-        (
-            127,
-            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f",
-        ),
-        (
-            125,
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-        ),
-        (
-            108,
-            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f",
-        ),
-        (
-            123,
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032",
-        ),
-    ] {
-        codecs.push((
-            RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_H264.to_string(),
-                    clock_rate: 90_000,
-                    channels: 0,
-                    sdp_fmtp_line: sdp_fmtp_line.to_string(),
-                    rtcp_feedback: feedback.clone(),
+/// The application's registered codecs, translated into what the transport
+/// library wants.
+///
+/// A total translation, not a selection: every registration is passed
+/// through, in the order supplied. Deployed H.264 is five entries agreeing on
+/// MIME, clock rate and channels and differing only in payload type and
+/// fmtp — all five must reach the media engine, because the offer advertises
+/// all five and the answerer picks one. Registering fewer would silently
+/// narrow what a peer can choose.
+///
+/// Nothing here reads a MIME name. This is the whole of core's knowledge of
+/// the application's codecs: copy the fields across and register them.
+fn realtime_media_codecs(
+    profile: &RealtimeProfile,
+) -> Vec<(
+    webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters,
+    RTPCodecType,
+)> {
+    use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
+    use webrtc::rtp_transceiver::RTCPFeedback;
+
+    profile
+        .codecs()
+        .iter()
+        .map(|codec| {
+            (
+                RTCRtpCodecParameters {
+                    capability: RTCRtpCodecCapability {
+                        mime_type: codec.mime.clone(),
+                        clock_rate: codec.clock_rate,
+                        channels: codec.channels,
+                        sdp_fmtp_line: codec.fmtp.clone(),
+                        rtcp_feedback: codec
+                            .rtcp_feedback
+                            .iter()
+                            .map(|feedback| RTCPFeedback {
+                                typ: feedback.mechanism.clone(),
+                                parameter: feedback.parameter.clone(),
+                            })
+                            .collect(),
+                    },
+                    payload_type: codec.payload_type,
+                    ..Default::default()
                 },
-                payload_type,
-                ..Default::default()
-            },
-            RTPCodecType::Video,
-        ));
-    }
-    codecs
+                // `codec.kind` is already a `WebRtcRtpKind`, so a `from` around
+                // it would be an identity conversion. Matching the value
+                // directly keeps the total map — every variant names its
+                // `RTPCodecType`, so adding one is a compile error here —
+                // without the round trip.
+                match codec.kind {
+                    WebRtcRtpKind::Audio => RTPCodecType::Audio,
+                    WebRtcRtpKind::Video => RTPCodecType::Video,
+                },
+            )
+        })
+        .collect()
 }
 
-#[cfg(any(test, feature = "legacy-media"))]
-fn build_legacy_media_api() -> Result<webrtc::api::API> {
+fn build_realtime_media_api(profile: &RealtimeProfile) -> Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
-    for (codec, kind) in legacy_media_codecs() {
+    for (codec, kind) in realtime_media_codecs(profile) {
         media_engine.register_codec(codec, kind).map_err(|error| {
-            Error::Transport(format!("register frozen legacy media codec: {error}"))
+            Error::Transport(format!("register application real-time codec: {error}"))
         })?;
     }
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)
-        .map_err(|error| Error::Transport(format!("register legacy interceptors: {error}")))?;
+        .map_err(|error| Error::Transport(format!("register real-time interceptors: {error}")))?;
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_interface_filter(Box::new(|name: &str| !is_virtual_interface(name)));
     setting_engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| !is_link_local_ip(&ip)));
@@ -4267,8 +6071,6 @@ impl Transport {
         );
         Ok(Self {
             api: Arc::new(api),
-            #[cfg(any(test, feature = "legacy-media"))]
-            legacy_media_api: Arc::new(SyncMutex::new(None)),
             runtime: crate::runtime::RuntimeIncarnation::new(),
             ice_transport_policy: RTCIceTransportPolicy::All,
             connector_resource_scope: None,
@@ -4300,7 +6102,47 @@ impl Transport {
         let root = ProcessResourceRoot::global();
         root.install_resource_provider(policy.resources())?;
         let scope = root.issue_mesh_connector_scope()?;
-        Ok(self.with_connector_resource_scope(scope, policy.webrtc()))
+        let profile = policy.webrtc().clone();
+        // Codec registration is a property of the media engine a peer
+        // connection is built from, so the application's profile has to be
+        // installed here, before any connection exists. There is no later
+        // point at which a codec can be added, and therefore no point at
+        // which core could fall back to a list of its own.
+        let installed = match profile.realtime() {
+            Some(realtime) => self.with_realtime_media_api(realtime)?,
+            None => self,
+        };
+        Ok(installed.with_connector_resource_scope(scope, profile))
+    }
+
+    /// Replace the data-only media engine with one carrying exactly the
+    /// codecs the application registered.
+    ///
+    /// Exactly those and no others: `MediaEngine::default()` starts empty, so
+    /// what the profile lists is the complete negotiable set. A codec core
+    /// was never told about cannot be offered, which is what makes inbound
+    /// admission answerable by "did the application register this family"
+    /// rather than by recognising a name.
+    fn with_realtime_media_api(mut self, profile: &RealtimeProfile) -> Result<Self> {
+        self.api = Arc::new(build_realtime_media_api(profile)?);
+        Ok(self)
+    }
+
+    /// Install the Session Broker for this transport's runtime, if the process
+    /// owner selected a resource provider.
+    ///
+    /// `None` when no provider is installed, and that is fail-closed by
+    /// construction: without a provider there is no post-authentication capacity
+    /// to reserve, so no session can be promoted and no application operation
+    /// can run. A connector-capable policy is what installs one.
+    ///
+    /// The runtime is taken from this transport rather than minted fresh: it
+    /// must be the same incarnation the connector's channel capabilities are
+    /// bound to, or every promotion would refuse on runtime mismatch.
+    pub(crate) fn session_broker(&self) -> Option<crate::runtime::session_broker::SessionBroker> {
+        self.connector_resource_scope.as_ref().map(|scope| {
+            crate::runtime::session_broker::SessionBroker::new(self.runtime.clone(), scope.clone())
+        })
     }
 
     pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
@@ -4336,15 +6178,16 @@ impl Transport {
         stun: &[crate::config::StunServer],
         turn: &[crate::config::TurnServer],
         callback_policy: ConnectorCallbackPolicy,
+        callback_grant: callback::TransportLabCallbackGrant,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         let mut config = build_rtc_configuration(stun, turn);
         config.ice_transport_policy = self.ice_transport_policy;
-        self.open_peer_with_config(role, config, callback_policy)
+        self.open_peer_with_config(role, config, callback_policy, callback_grant)
             .await
     }
 
-    /// Open the engine-owned connector wrapper around the existing WebRTC
-    /// machinery. Arc 03 keeps the old transport behavior inside this owner.
+    /// Open the engine-owned connector wrapper around the WebRTC machinery.
+    /// Transport behaviour lives inside this owner.
     pub(crate) async fn open_connector_peer(
         &self,
         role: Role,
@@ -4356,7 +6199,13 @@ impl Transport {
             .connector_resource_scope
             .clone()
             .ok_or(Error::ConnectorPolicyRequired)?;
-        let webrtc_profile = self.webrtc_profile.ok_or(Error::ConnectorPolicyRequired)?;
+        // Borrowed, not moved: the profile stopped being `Copy` when it took
+        // on the application's codec registrations, and it is read again after
+        // the construction task is spawned.
+        let webrtc_profile = self
+            .webrtc_profile
+            .as_ref()
+            .ok_or(Error::ConnectorPolicyRequired)?;
         let transport_observation = observe_inexact_item(
             &resource_scope,
             PreAuthResourceFamily::TransportObject,
@@ -4367,12 +6216,9 @@ impl Transport {
         config.ice_transport_policy = self.ice_transport_policy;
         let (permit, attempt_lifetime, claim) =
             admit_single_connector_candidate(self.runtime.clone(), resource_owner.clone());
-        let (mut candidate, reclaim_subscription) = permit
-            .reserve_connector_candidate_cooperatively(claim)
-            .await?
-            .ok_or_else(|| {
-                Error::Transport("connector attempt retired before admission".to_string())
-            })?;
+        let mut candidate = permit.reserve_connector_candidate(claim).ok_or_else(|| {
+            Error::Transport("connector attempt retired before admission".to_string())
+        })?;
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .map_err(|error| Error::Transport(error.to_string()))?;
@@ -4381,8 +6227,6 @@ impl Transport {
         let construction_work_resource_scope = work_resource_scope.clone();
         let transport = self.clone();
         let construction_scope = resource_scope.clone();
-        let realtime_delivery = Arc::new(AtomicBool::new(false));
-        let construction_realtime_delivery = Arc::clone(&realtime_delivery);
         let candidate_promoted = Arc::new(AtomicBool::new(false));
         let construction_candidate_promoted = Arc::clone(&candidate_promoted);
         let construction_liveness = liveness.clone();
@@ -4392,7 +6236,6 @@ impl Transport {
         let operation_fence = Arc::new(ConnectorOperationFence::default());
         let ownership = ConnectorOwnership::admitted(
             candidate,
-            Arc::clone(&realtime_delivery),
             Arc::clone(&operation_fence),
             work_resource_scope.clone(),
             Arc::clone(&candidate_promoted),
@@ -4405,9 +6248,15 @@ impl Transport {
         );
         let mut outer_cleanup = StartConnectorCleanupOnDrop::new(Arc::clone(&close_owner));
         let construction_close_owner = Arc::clone(&close_owner);
-        let construction_reclaim = reclaim_subscription.clone();
-        let reclaim_scope_id = work_resource_scope.scope_id();
         let (construction_tx, construction_rx) = oneshot::channel();
+        // The profile answer the construction task needs, taken before it is
+        // spawned. It is `Copy`, so the task owns it and the profile itself
+        // never crosses into the task.
+        let construction_callback_policy = webrtc_profile.callbacks();
+        // Cloned rather than taken by reference: the profile itself still never
+        // crosses into the task, and the codec list is registration data the
+        // session keeps for the lifetime of the connection anyway.
+        let construction_realtime_profile = webrtc_profile.realtime().cloned();
         let construction_task = AbortConstructionOnDrop(tokio::spawn(async move {
             let construction = transport.open_peer_with_config_observed(
                 role,
@@ -4415,27 +6264,18 @@ impl Transport {
                 PeerOpenOwnership {
                     resource_scope: Some(construction_scope),
                     work_resource_scope: Some(construction_work_resource_scope),
-                    realtime_delivery: construction_realtime_delivery,
                     attempt_liveness: Some(construction_liveness),
                     candidate_promoted: construction_candidate_promoted,
                     callback_gate: construction_incarnation,
-                    callback_policy: webrtc_profile.callbacks(),
+                    callback_policy: construction_callback_policy,
+                    #[cfg(any(test, feature = "transport-lab"))]
+                    local_lab_callback_grant: None,
                     operation_fence,
-                    legacy_media_profile: webrtc_profile.legacy_media_internal(),
+                    realtime_profile: construction_realtime_profile,
                     close_owner: Some(Arc::clone(&construction_close_owner)),
                 },
             );
-            tokio::pin!(construction);
-            let result = tokio::select! {
-                result = &mut construction => result,
-                _ = construction_reclaim.requested() => {
-                    Err(Error::ResourceUnavailable(
-                        ResourceUnavailable::ReclaimRequested {
-                            scope_id: reclaim_scope_id,
-                        },
-                    ))
-                }
-            };
+            let result = construction.await;
             match result {
                 Ok((session, events)) if result_liveness.is_active() => {
                     let _ = construction_tx.send(Ok(ConstructedConnectorResult::new(
@@ -4485,8 +6325,6 @@ impl Transport {
                 resource_scope,
                 work_resource_scope,
                 transport_observation,
-                remote_candidate_policy: webrtc_profile.remote_candidates(),
-                reclaim: reclaim_subscription,
             },
         );
         if admitted.is_ok() {
@@ -4504,6 +6342,7 @@ impl Transport {
         role: Role,
         config: RTCConfiguration,
         callback_policy: ConnectorCallbackPolicy,
+        callback_grant: callback::TransportLabCallbackGrant,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         self.open_peer_with_config_observed(
             role,
@@ -4511,13 +6350,13 @@ impl Transport {
             PeerOpenOwnership {
                 resource_scope: None,
                 work_resource_scope: None,
-                realtime_delivery: Arc::new(AtomicBool::new(false)),
                 attempt_liveness: None,
                 candidate_promoted: Arc::new(AtomicBool::new(true)),
                 callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
                 callback_policy,
+                local_lab_callback_grant: Some(callback_grant),
                 operation_fence: Arc::new(ConnectorOperationFence::default()),
-                legacy_media_profile: None,
+                realtime_profile: None,
                 close_owner: None,
             },
         )
@@ -4533,34 +6372,17 @@ impl Transport {
         let PeerOpenOwnership {
             resource_scope,
             work_resource_scope,
-            realtime_delivery,
             attempt_liveness,
             candidate_promoted,
             callback_gate,
             callback_policy,
+            #[cfg(any(test, feature = "transport-lab"))]
+            local_lab_callback_grant,
             operation_fence,
-            legacy_media_profile,
+            realtime_profile,
             close_owner,
         } = ownership;
-        #[cfg(any(test, feature = "legacy-media"))]
-        let api = if legacy_media_profile.is_some() {
-            let mut legacy_api = self.legacy_media_api.lock();
-            if legacy_api.is_none() {
-                *legacy_api = Some(Arc::new(build_legacy_media_api()?));
-            }
-            legacy_api.as_ref().cloned().ok_or_else(|| {
-                Error::Transport(
-                    "legacy media API owner lost the value installed under its lock".to_string(),
-                )
-            })?
-        } else {
-            Arc::clone(&self.api)
-        };
-        #[cfg(not(any(test, feature = "legacy-media")))]
-        let api = {
-            debug_assert!(legacy_media_profile.is_none());
-            Arc::clone(&self.api)
-        };
+        let api = Arc::clone(&self.api);
         if let Some(owner) = close_owner.as_ref() {
             owner.mark_native_allocation_started();
         }
@@ -4636,24 +6458,25 @@ impl Transport {
                     CallbackProducerClaims::structural_only(),
                 ),
                 #[cfg(any(test, feature = "transport-lab"))]
-                None => CallbackProducerOwner::for_local_lab_policy(callback_policy).map_err(
-                    |error| {
+                None => {
+                    let grant = local_lab_callback_grant.ok_or_else(|| {
+                        Error::Transport(
+                            "a scope-less lab connector must state its own callback grant"
+                                .to_string(),
+                        )
+                    })?;
+                    CallbackProducerOwner::for_local_lab_grant(grant).map_err(|error| {
                         Error::Transport(format!(
                             "raw transport callback resource policy is unavailable: {error:?}"
                         ))
-                    },
-                )?,
+                    })?
+                }
                 #[cfg(not(any(test, feature = "transport-lab")))]
                 None => return Err(Error::ConnectorPolicyRequired),
             };
             let callback_ready = Arc::new(tokio::sync::Notify::new());
-            let local_mailboxes = callback_policy.local_mailboxes();
             let control = callback_producer
-                .create_mailbox(
-                    ConnectorCallbackClass::Control,
-                    local_mailboxes.map(|mailboxes| mailboxes.control()),
-                    Arc::clone(&callback_ready),
-                )
+                .create_mailbox(ConnectorCallbackClass::Control, Arc::clone(&callback_ready))
                 .map_err(|error| {
                     callback_admission_error(
                         "control callback mailbox resource admission failed",
@@ -4663,7 +6486,6 @@ impl Transport {
             let endpoint_data = callback_producer
                 .create_mailbox(
                     ConnectorCallbackClass::EndpointData,
-                    local_mailboxes.map(|mailboxes| mailboxes.endpoint_data()),
                     Arc::clone(&callback_ready),
                 )
                 .map_err(|error| {
@@ -4690,14 +6512,32 @@ impl Transport {
                             error,
                         )
                     })?;
-            let (realtime_resources, realtime_local_ceiling) = match callback_policy.realtime() {
-                RealtimeConnectorPolicy::Disabled => (None, None),
-                RealtimeConnectorPolicy::Enabled(local_ceiling) => {
-                    (work_resource_scope.clone(), local_ceiling)
-                }
+            let realtime_resources = match callback_policy.realtime() {
+                RealtimeConnectorPolicy::Disabled => None,
+                RealtimeConnectorPolicy::Enabled => work_resource_scope.clone(),
             };
-            let realtime_flows =
-                RealtimeFlowRegistry::new(realtime_resources, realtime_local_ceiling);
+            let realtime_flows = RealtimeFlowRegistry::new(realtime_resources);
+            // The application's codecs become a shared, leased record here —
+            // once, against this connector's own work scope — and every session
+            // promoted on this connector then holds a pointer to it. Deep-
+            // cloning the codec vector per promotion, both `String`s per codec
+            // and every feedback entry, would be retention nothing pays for.
+            //
+            // Refusal is ordinary and fails the connector rather than the
+            // session: registering codecs whose retention nothing accounted for
+            // is the state this exists to make unreachable.
+            let realtime_profile = match realtime_profile {
+                Some(profile) => Some(
+                    session_flow::LeasedRealtimeProfile::mint(profile, &realtime_flows).map_err(
+                        |_| {
+                            Error::Transport(
+                                "connector resources refused the real-time profile".to_string(),
+                            )
+                        },
+                    )?,
+                ),
+                None => None,
+            };
             let lifecycle = Arc::new(ConnectorLifecycleOwner::with_reserved_lifecycle_work(
                 reserved_open_work,
                 reserved_close_work,
@@ -4712,79 +6552,27 @@ impl Transport {
                 },
                 realtime_flows: Arc::clone(&realtime_flows),
                 resource_scope: resource_scope.clone(),
-                realtime_delivery,
                 attempt_liveness,
                 candidate_promoted,
                 callback_gate: Arc::clone(&callback_gate),
                 callback_violation_reported: Arc::new(AtomicBool::new(false)),
-                callback_policy,
                 callback_producer,
                 operation_fence: Arc::clone(&operation_fence),
                 close_owner: callback_close_owner,
             };
             let data_channel = Arc::new(SyncMutex::new(None::<Arc<RTCDataChannel>>));
 
+            // Built before the callbacks so the `on_track` handler and the
+            // session share one object rather than two that could diverge.
+            let realtime_tracks = Arc::new(RealtimeSessionTracks::default());
+
             register_callbacks(
                 &pc,
                 &event_sink,
                 &data_channel,
                 resource_scope.clone(),
-                legacy_media_profile,
+                Arc::clone(&realtime_tracks),
             );
-
-            // Generic real-time ownership creates no native tracks. The
-            // explicit legacy H.264 and Opus profile is the only source of
-            // compatibility lanes and pre-provisioned tracks.
-            let media_lanes = legacy_media_profile
-                .map(|profile| profile.max_lanes_per_kind().get())
-                .unwrap_or(0);
-            let mut video_tracks: Vec<Option<LaneSlot>> = vec![None; media_lanes];
-            let mut audio_tracks: Vec<Option<LaneSlot>> = vec![None; media_lanes];
-            let mut outbound_realtime_flows = std::collections::BTreeMap::new();
-            if let Some(profile) = legacy_media_profile {
-                if !realtime_flows.is_enabled() {
-                    return Err(Error::Transport(
-                        "legacy WebRTC media profile requires generic real-time ownership"
-                            .to_string(),
-                    ));
-                }
-                for (kind, preprovisioned) in [
-                    (LaneKind::Video, profile.preprovisioned_video_lanes()),
-                    (LaneKind::Audio, profile.preprovisioned_audio_lanes()),
-                ] {
-                    for lane in 0..preprovisioned {
-                        let key = (kind == LaneKind::Video, lane as u8);
-                        let flow =
-                            realtime_flows
-                                .open_outbound_flow_checked()
-                                .map_err(|error| {
-                                    realtime_flow_admission_error(
-                                        "pre-provisioned compatibility flow admission failed",
-                                        error,
-                                    )
-                                })?;
-                        outbound_realtime_flows.insert(key, flow);
-                        let _operation = operation_fence.try_enter().ok_or_else(|| {
-                            Error::Transport(
-                                "connector close fence committed during track construction"
-                                    .to_string(),
-                            )
-                        })?;
-                        let track = make_media_track(kind, lane as u8);
-                        attach_track(
-                            &pc,
-                            &track,
-                            resource_scope.as_ref(),
-                            work_resource_scope.as_ref(),
-                        )
-                        .await?;
-                        match kind {
-                            LaneKind::Video => video_tracks[lane] = Some(LaneSlot::Open(track)),
-                            LaneKind::Audio => audio_tracks[lane] = Some(LaneSlot::Open(track)),
-                        }
-                    }
-                }
-            }
 
             // Offerer creates the data channel synchronously so the
             // resulting SDP includes it. Answerer waits for the
@@ -4818,20 +6606,12 @@ impl Transport {
             let session = PeerSession {
                 pc,
                 data_channel,
-                video_tracks: std::sync::Mutex::new(video_tracks),
-                audio_tracks: std::sync::Mutex::new(audio_tracks),
-                max_lanes: media_lanes,
-                legacy_media_profile,
-                events_tx: event_sink,
-                outbound_realtime_flows: SyncMutex::new(outbound_realtime_flows),
-                lane_operations: Mutex::new(()),
-                #[cfg(test)]
-                fail_next_track_attach: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_next_track_remove: AtomicBool::new(false),
+                realtime_profile,
+                realtime_tracks,
+                _events_tx: event_sink,
                 callback_gate,
                 role,
-                resource_scope,
+                _resource_scope: resource_scope,
                 work_resource_scope,
             };
             Ok((
@@ -4943,11 +6723,8 @@ fn register_callbacks(
     events_tx: &ConnectorEventSink,
     data_channel: &Arc<SyncMutex<Option<Arc<RTCDataChannel>>>>,
     resource_scope: Option<PeerConnectionResourceScope>,
-    legacy_media_profile: Option<LegacyWebRtcMediaProfile>,
+    realtime_tracks: Arc<RealtimeSessionTracks>,
 ) {
-    let remote_tracks = Arc::new(SyncMutex::new(
-        std::collections::HashSet::<(bool, u8)>::new(),
-    ));
     // Local ICE candidate gathered — ship via signaling.
     {
         let tx = events_tx.clone();
@@ -5124,14 +6901,12 @@ fn register_callbacks(
         }));
     }
 
-    // A peer track lane went live — pump its RTP until the track
-    // (i.e. the connection) ends: video into assembled access units,
-    // audio straight through (one Opus frame per packet).
+    // A negotiated inbound real-time track went live — pump its RTP until the
+    // flow it feeds ends, or the track (i.e. the connection) does.
     {
         let tx = events_tx.clone();
         let task_scope = resource_scope.clone();
-        let remote_tracks = Arc::clone(&remote_tracks);
-        let media_profile = legacy_media_profile;
+        let session_tracks = Arc::clone(&realtime_tracks);
         let callback_observation = observe_inexact_item_if(
             resource_scope.as_ref(),
             PreAuthResourceFamily::Callback,
@@ -5153,7 +6928,7 @@ fn register_callbacks(
                     }
                 };
             let tx = tx.clone();
-            let remote_tracks = Arc::clone(&remote_tracks);
+            let session_tracks = Arc::clone(&session_tracks);
             let task_observation =
                 observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
             Box::pin(async move {
@@ -5164,61 +6939,69 @@ fn register_callbacks(
                 if !tx.callback_gate.is_active() {
                     return;
                 }
-                let Some(profile) = media_profile else {
-                    tx.structural_violation(
-                        "media track presented without a compatibility provider",
-                    );
+
+                // **Classified by transceiver identity, and by nothing else.**
+                // A track that arrived on a transceiver *this side* created for
+                // a realtime flow is realtime-owned, permanently and regardless
+                // of what has happened to the session since. A track on any
+                // other transceiver is one the peer opened the m-line for, and
+                // there is nothing here it can be attached to: a destination is
+                // a fact this side established at bind time, so a track we did
+                // not solicit has none.
+                //
+                // Every refusal below drops the track and returns. None of them
+                // calls `structural_violation` or `retire_after_callback_
+                // violation`: a track we did not offer is the peer doing
+                // something we simply do not accept, not this connector having
+                // broken its own invariants, and tearing the connection down
+                // would let a peer end a session by offering one unsolicited
+                // track.
+                let Some(identity) = session_tracks.resolve(&transceiver) else {
+                    trace!("dropping a track on a transceiver this side did not negotiate");
                     return;
                 };
-                let key = {
-                    let mut admitted = remote_tracks.lock();
-                    match admit_legacy_track_shape(
-                        track.kind(),
-                        &track.codec().capability.mime_type,
-                        &track.id(),
-                        profile,
-                        &mut admitted,
-                    ) {
-                        Ok(key) => key,
-                        Err(reason) => {
-                            drop(admitted);
-                            tx.structural_violation(reason);
-                            return;
-                        }
-                    }
+                // Our transceiver, but the session that gave its token meaning
+                // is gone. Refused, and deliberately not passed on.
+                let Some(bindings) = session_tracks.current() else {
+                    return;
                 };
-                let (_, lane) = key;
-                let flow = match tx.open_inbound_realtime_flow_checked() {
-                    Ok(flow) => flow,
-                    Err(error) => {
-                        remote_tracks.lock().remove(&key);
-                        warn!(
-                            ?error,
-                            "compatibility media track was refused by its real-time resource owner"
-                        );
-                        tx.retire_after_callback_violation();
-                        return;
-                    }
+                // An unspecified kind is not guessed at: it matches no binding,
+                // and a track matching no binding is dropped.
+                let Some(kind) = native_rtp_kind(track.kind()) else {
+                    return;
                 };
-                let owner = LegacyInboundTrackOwner {
-                    task_observation,
-                    registration: LegacyRemoteTrackRegistration {
-                        remote_tracks,
-                        track_key: key,
+                let capability = &track.codec().capability;
+                let Some(attachment) = bindings.admit(
+                    &identity,
+                    kind,
+                    &capability.mime_type,
+                    capability.clock_rate,
+                    capability.channels,
+                ) else {
+                    // Our transceiver, a shape we did not open the flow for —
+                    // or one whose flow has since closed. Attaching would feed
+                    // a decoder configured for something else.
+                    return;
+                };
+                // No second flow open here, and that is the point of the weak
+                // port handle the admission carried. The
+                // application already opened this flow and it already holds the
+                // one active-flow lease it is entitled to; taking a second for
+                // the same flow would halve the configured capacity and let a
+                // refusal land on a flow whose open had already succeeded.
+                tokio::spawn(pump_session_flow_track(
+                    track,
+                    tx,
+                    SessionInboundTrackOwner {
+                        task_observation,
+                        port: attachment.port,
+                        end: attachment.end,
+                        tracks: Arc::clone(&session_tracks),
+                        identity,
+                        label: attachment.label,
+                        policy: attachment.policy,
                     },
-                    flow,
-                    transceiver: Arc::clone(&transceiver),
-                    lane,
-                };
-                match track.kind() {
-                    RTPCodecType::Video => {
-                        tokio::spawn(pump_video_track(track, tx, owner));
-                    }
-                    RTPCodecType::Audio => {
-                        tokio::spawn(pump_audio_track(track, tx, owner));
-                    }
-                    _ => unreachable!("track kind was classified above"),
-                }
+                ));
             })
         }));
     }
@@ -5287,12 +7070,6 @@ fn install_data_channel_handlers(
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let _keep_callback_observation = &callback_observation;
             let payload_bytes = msg.data.len();
-            if callback_payload_limit(tx.callback_policy, ConnectorCallbackClass::EndpointData)
-                .is_some_and(|limit| payload_bytes > limit)
-            {
-                tx.retire_after_callback_violation();
-                return Box::pin(async {});
-            }
             let callback_work = match tx.begin_native_callback_operation_with_payload(
                 ConnectorCallbackClass::EndpointData,
                 payload_bytes,
@@ -5420,9 +7197,6 @@ fn pair_state_str(s: webrtc::ice::candidate::CandidatePairState) -> String {
     .to_string()
 }
 
-/// One peer's WebRTC session — peer connection, application data
-/// channel, the provisioned pool of video + audio track lanes (see
-/// [`MEDIA_LANES`]), and transport-level event sink.
 /// Extract the DTLS fingerprint (`a=fingerprint:<hash> <value>`) from an SDP
 /// blob and lowercase it for stable comparison. This is endpoint-authentication
 /// binding and diagnostic input. ICE restart detection uses the exact effective
@@ -6323,53 +8097,47 @@ fn sdp_ice_credentials_owned(
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<SyncMutex<Option<Arc<RTCDataChannel>>>>,
-    /// Lifecycle-managed lane slots, index = lane id. `None` = lane
-    /// never opened or explicitly finalized; see [`LaneSlot`] for the
-    /// open/suspended split. Slot count is fixed at
-    /// [`PeerSession::max_lanes`] so ids stay stable; a std Mutex
-    /// because holders only clone the Arc out (never held across an
-    /// await).
-    #[cfg_attr(
-        not(any(test, feature = "legacy-media")),
-        allow(dead_code, reason = "frozen legacy-media compatibility state")
-    )]
-    video_tracks: std::sync::Mutex<Vec<Option<LaneSlot>>>,
-    #[cfg_attr(
-        not(any(test, feature = "legacy-media")),
-        allow(dead_code, reason = "frozen legacy-media compatibility state")
-    )]
-    audio_tracks: std::sync::Mutex<Vec<Option<LaneSlot>>>,
-    /// Device lane ceiling (see [`resolve_media_lanes`]).
-    #[cfg_attr(
-        not(any(test, feature = "legacy-media")),
-        allow(dead_code, reason = "frozen legacy-media compatibility state")
-    )]
-    max_lanes: usize,
-    legacy_media_profile: Option<LegacyWebRtcMediaProfile>,
-    events_tx: ConnectorEventSink,
-    /// Codec-neutral flow owners used by the WebRTC compatibility adapter.
-    /// The `(is_video_adapter, lane)` key never leaves this adapter.
-    #[cfg_attr(
-        not(any(test, feature = "legacy-media")),
-        allow(dead_code, reason = "frozen legacy-media compatibility state")
-    )]
-    outbound_realtime_flows: SyncMutex<std::collections::BTreeMap<(bool, u8), RealtimeFlowPort>>,
-    #[cfg_attr(
-        not(any(test, feature = "legacy-media")),
-        allow(dead_code, reason = "frozen legacy-media compatibility state")
-    )]
-    lane_operations: Mutex<()>,
-    #[cfg(test)]
-    fail_next_track_attach: AtomicBool,
-    #[cfg(test)]
-    fail_next_track_remove: AtomicBool,
+    /// The application's registered codecs, retained past media-engine
+    /// construction.
+    ///
+    /// The API build asks "what do I register"; binding an inbound flow asks
+    /// "which framing does this family want". Re-deriving the second from the
+    /// first is not possible — the media engine keeps no framing — so the
+    /// profile is held rather than consumed.
+    ///
+    /// Leased and shared: this is the connector's one charged copy, and a
+    /// promoted session's flow set holds a pointer to the same record rather
+    /// than a deep clone of it.
+    realtime_profile: Option<session_flow::LeasedRealtimeProfile>,
+    /// The current session's inbound realtime wiring, shared with the
+    /// `on_track` callback that reads it when a track arrives.
+    realtime_tracks: Arc<RealtimeSessionTracks>,
+    /// Retention, not a send path. Every native handler installed on this peer
+    /// connection holds its own clone of the sink and reports through that one;
+    /// nothing reads this field. It exists so the mailboxes, the callback
+    /// producer's reserved lifecycle work, and the close owner outlive the last
+    /// native handler rather than the other way round — a dependency callback
+    /// that fires while its owner is being torn down must find a live sink to
+    /// be refused by, not a freed one.
+    _events_tx: ConnectorEventSink,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     role: Role,
-    #[cfg_attr(
-        not(any(test, feature = "legacy-media")),
-        allow(dead_code, reason = "frozen legacy-media compatibility state")
-    )]
-    resource_scope: Option<PeerConnectionResourceScope>,
+    /// The observation scope this session's pre-authentication measurements are
+    /// attributed to. Held rather than read: the accountant is reference
+    /// counted, so keeping a clone for exactly the session's lifetime is what
+    /// keeps the scope from being torn down while a native callback can still
+    /// observe into it.
+    _resource_scope: Option<PeerConnectionResourceScope>,
+    /// The connector work scope every lease under this session was acquired
+    /// from. `ResourceScope` deregisters itself from the provider when its last
+    /// clone drops, so this clone is what keeps the scope registered for as
+    /// long as the session can still acquire — and what releases it exactly
+    /// when the session goes.
+    ///
+    /// Read as well as held, now that a negotiated inbound transceiver is funded
+    /// from it. `None` is the fixture shape — a session stood up without a
+    /// connector reservation behind it — and it refuses native realtime
+    /// negotiation rather than performing it unfunded.
     work_resource_scope: Option<ConnectorWorkResourceScope>,
 }
 
@@ -6455,12 +8223,19 @@ impl PeerSession {
     /// peer's presented certificate against the `a=fingerprint:` in the SDP it
     /// received, so on an un-intercepted channel a peer's
     /// [`Self::remote_fingerprint`] equals its counterpart's
-    /// `local_fingerprint`. The auth handshake folds this value into the signed
-    /// ed25519 payload (see [`crate::signing::handshake_payload`]) so a
+    /// `local_fingerprint`. The auth handshake folds this value — together
+    /// with [`Self::remote_fingerprint`], so the transcript commits to the
+    /// pair rather than to the signer alone — into the signed Arc 04
+    /// endpoint-auth transcript (see [`crate::endpoint_auth`]), so a
     /// signaling-path man-in-the-middle — which must present its own
     /// certificate on each leg it terminates — is detected: the victim's
     /// observed remote fingerprint no longer matches the one the real peer
     /// signed. `None` before the local description is set.
+    ///
+    /// A fingerprint identifies the certificate, not the session, so this is
+    /// not a session-unique exporter and does not separate two channels that
+    /// reuse the same certificates; per-attempt contributions and
+    /// connector-incarnation ownership carry that.
     pub async fn local_fingerprint(&self) -> Option<String> {
         sdp_fingerprint(&self.pc.local_description().await?.sdp)
     }
@@ -6729,9 +8504,29 @@ impl PeerSession {
     }
 }
 
+/// The real-time work one lab fixture intends to fund, stated by the fixture.
+///
+/// These numbers used to be read off the owner's real-time ceilings, which is
+/// how a fixture could stay silent about what it was going to do and still get
+/// a grant. There are no ceilings to read now, so a fixture that wants a
+/// real-time envelope says how much of it: nothing is derived from a policy and
+/// nothing is defaulted, because a grant core picked would be a ceiling core
+/// picked, one indirection later.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug)]
+pub struct TransportLabRealtimeWorkload {
+    pub inbound_flows: usize,
+    pub outbound_flows: usize,
+    pub queued_units_per_flow: usize,
+    pub in_progress_units_per_inbound_flow: usize,
+    pub fragments_per_unit: usize,
+    pub max_fragment_bytes: usize,
+    pub max_unit_bytes: usize,
+}
+
 #[cfg(any(test, feature = "transport-lab"))]
 fn realtime_fixture_provider_grant(
-    local: crate::runtime::attempt::EnabledRealtimeConnectorPolicy,
+    workload: TransportLabRealtimeWorkload,
 ) -> Result<crate::resource::ResourceClaim> {
     use crate::resource::FiniteResourceProvider;
 
@@ -6749,26 +8544,35 @@ fn realtime_fixture_provider_grant(
         Ok(())
     }
 
-    let flows = local.flows();
-    let inbound_flows = flows.max_inbound_active_flows().get();
-    let outbound_flows = flows.max_outbound_active_flows().get();
+    let inbound_flows = workload.inbound_flows;
+    let outbound_flows = workload.outbound_flows;
     let total_flows = inbound_flows
         .checked_add(outbound_flows)
         .ok_or_else(|| Error::Transport("fixture flow total overflowed".to_string()))?;
     let queue_slots = total_flows
-        .checked_mul(flows.queue_capacity_per_flow().get())
+        .checked_mul(workload.queued_units_per_flow)
         .ok_or_else(|| Error::Transport("fixture queue-slot total overflowed".to_string()))?;
     let inbound_units = inbound_flows
-        .checked_mul(flows.max_in_progress_units_per_flow().get())
+        .checked_mul(workload.in_progress_units_per_inbound_flow)
         .ok_or_else(|| Error::Transport("fixture assembly total overflowed".to_string()))?;
     let fragments = inbound_units
-        .checked_mul(flows.max_inbound_fragments_per_unit().get())
+        .checked_mul(workload.fragments_per_unit)
         .ok_or_else(|| Error::Transport("fixture fragment total overflowed".to_string()))?;
 
     let mut grant = crate::resource::ResourceClaim::ZERO;
     for _ in 0..total_flows {
         add_lease(&mut grant, RealtimeFlowRegistry::flow_claim()?)?;
         add_lease(&mut grant, RealtimeFlowRegistry::ready_claim()?)?;
+        // One label per flow, sized by the longest name the frame can carry.
+        // The fixture cannot know what an application will call its flows, and
+        // a grant derived from a shorter guess would refuse opens the policy
+        // itself admits.
+        add_lease(
+            &mut grant,
+            session_flow::RealtimeFlowLabel::mint_claim(
+                crate::realtime::MAX_REALTIME_FLOW_LABEL_BYTES,
+            )?,
+        )?;
     }
     for _ in 0..inbound_flows {
         add_lease(&mut grant, RealtimeFlowRegistry::native_read_claim()?)?;
@@ -6779,35 +8583,74 @@ fn realtime_fixture_provider_grant(
     for _ in 0..fragments {
         add_lease(
             &mut grant,
-            RealtimeFlowRegistry::ordered_fragment_claim(flows.max_inbound_fragment_bytes().get())?,
+            RealtimeFlowRegistry::ordered_fragment_claim(workload.max_fragment_bytes)?,
         )?;
     }
     for _ in 0..queue_slots {
         add_lease(
             &mut grant,
-            RealtimeFlowRegistry::output_claim(local.max_unit_bytes().get())?,
+            RealtimeFlowRegistry::output_claim(workload.max_unit_bytes)?,
         )?;
         add_lease(
             &mut grant,
-            RealtimeFlowRegistry::queue_claim(local.max_unit_bytes().get())?,
+            RealtimeFlowRegistry::queue_claim(workload.max_unit_bytes)?,
         )?;
     }
-    add_lease(
-        &mut grant,
-        RealtimeFlowRegistry::pre_auth_work_claim(flows.max_pre_auth_content_bytes().get())?,
-    )?;
+    // One packet-work lease per inbound pump, because each holds exactly one
+    // for the duration of the packet it is classifying and releases it before
+    // reading the next.
+    //
+    // Sized by the largest payload either inbound shape can present: a
+    // fragmented unit is bounded per fragment, a whole-payload unit by the unit
+    // ceiling, and the pump takes this lease before it knows which shape it
+    // holds. Taking the larger of the two is what keeps the lab grant from
+    // refusing work the policy actually admits.
+    let max_packet_bytes = workload.max_fragment_bytes.max(workload.max_unit_bytes);
+    for _ in 0..inbound_flows {
+        add_lease(
+            &mut grant,
+            RealtimeFlowRegistry::session_packet_work_claim(max_packet_bytes)?,
+        )?;
+    }
     Ok(grant)
+}
+
+/// The callback work one lab fixture intends to fund, stated by the fixture.
+///
+/// The per-class payload ceilings used to be read off the profile's mailbox
+/// capacities, and a profile that declared mailboxes without stating what they
+/// could carry was refused here. Neither the capacities nor the ceilings exist
+/// any more, so the fixture states its own two numbers — the largest payload it
+/// will fund per class — and this function derives nothing.
+///
+/// The two are stated separately on purpose. One number shared by both classes
+/// funds each at `max(control, endpoint)`, so the generously-sized class pays
+/// for the other; and a limit borrowed from another layer — a signaling or
+/// endpoint frame maximum standing in for an ICE candidate's bytes — is how the
+/// original underfunding stayed invisible until every gathered candidate was
+/// refused for want of `QueuedBytes`.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug)]
+pub struct TransportLabCallbackWorkload {
+    pub control_slots: std::num::NonZeroUsize,
+    pub endpoint_slots: std::num::NonZeroUsize,
+    pub control_payload_bytes: u64,
+    pub endpoint_payload_bytes: u64,
+    /// The real-time envelope this fixture funds, if it opens any flows.
+    pub realtime: Option<TransportLabRealtimeWorkload>,
 }
 
 /// Derive a finite resource grant for an explicit transport-lab fixture.
 ///
-/// The caller supplies the exact connector profiles and concurrent Mesh scope
-/// count exercised by the fixture. This function selects no production value
-/// and is unavailable without the `transport-lab` feature.
+/// The caller supplies the exact connector profiles, the concurrent Mesh scope
+/// count, and the callback and real-time work each connector will actually do.
+/// This function selects no production value and is unavailable without the
+/// `transport-lab` feature.
 #[cfg(any(test, feature = "transport-lab"))]
 pub fn transport_lab_connector_fixture_grant(
     profiles: &[WebRtcConnectorProfile],
     mesh_scope_count: std::num::NonZeroU64,
+    workload: TransportLabCallbackWorkload,
 ) -> Result<crate::resource::ResourceClaim> {
     use crate::resource::FiniteResourceProvider;
 
@@ -6866,24 +8709,11 @@ pub fn transport_lab_connector_fixture_grant(
             )?;
         }
 
-        let native_realtime_surfaces = profile
-            .legacy_media_internal()
-            .map(|legacy| {
-                legacy
-                    .max_lanes_per_kind()
-                    .get()
-                    .checked_mul(2)
-                    .ok_or_else(|| {
-                        Error::Transport(
-                            "fixture native real-time callback surface overflowed".to_string(),
-                        )
-                    })
-            })
-            .transpose()?
-            .unwrap_or(0);
         for callback_claim in callback::connector_fixture_operation_claims(
-            profile.callbacks(),
-            native_realtime_surfaces,
+            Some((workload.control_slots, workload.endpoint_slots)),
+            0,
+            workload.control_payload_bytes,
+            workload.endpoint_payload_bytes,
         )
         .map_err(|error| {
             Error::Transport(format!(
@@ -6898,36 +8728,29 @@ pub fn transport_lab_connector_fixture_grant(
             )?;
         }
 
-        if let RealtimeConnectorPolicy::Enabled(Some(local)) = profile.callbacks().realtime() {
+        if let (RealtimeConnectorPolicy::Enabled, Some(realtime)) =
+            (profile.callbacks().realtime(), workload.realtime)
+        {
             add(
                 &mut grant,
-                realtime_fixture_provider_grant(local)?,
+                realtime_fixture_provider_grant(realtime)?,
                 "connector real-time fixture envelope",
             )?;
         }
 
-        if profile.legacy_media_internal().is_some() {
-            let outbound_flow_ceiling = match profile.callbacks().realtime() {
-                RealtimeConnectorPolicy::Enabled(Some(local)) => {
-                    local.flows().max_outbound_active_flows().get()
-                }
-                RealtimeConnectorPolicy::Disabled | RealtimeConnectorPolicy::Enabled(None) => {
-                    return Err(Error::Transport(
-                        "fixture legacy profile lacks its validated outbound flow ceiling"
-                            .to_string(),
-                    ));
-                }
-            };
-            for _ in 0..outbound_flow_ceiling {
-                add(
-                    &mut grant,
-                    FiniteResourceProvider::reservation_charge_for_test(
-                        media::legacy_rtcp_drain_claim()?,
-                    )
-                    .map_err(Error::from)?,
-                    "legacy RTCP drain",
-                )?;
-            }
+        // The connector's one shared, leased copy of the application's codecs.
+        // Charged per profile that registers any, and only once each: a
+        // promotion clones the pointer rather than the codecs.
+        if let Some(realtime) = profile.realtime() {
+            add(
+                &mut grant,
+                FiniteResourceProvider::reservation_charge_for_test(
+                    session_flow::LeasedRealtimeProfile::mint_claim(realtime)
+                        .map_err(Error::from)?,
+                )
+                .map_err(Error::from)?,
+                "connector real-time profile record",
+            )?;
         }
     }
     Ok(grant)
@@ -7077,10 +8900,12 @@ pub fn transport_lab_remote_description_fixture_grant(
 #[cfg(test)]
 pub(crate) fn one_mesh_connector_fixture_grant(
     profiles: &[WebRtcConnectorProfile],
+    workload: TransportLabCallbackWorkload,
 ) -> Result<crate::resource::ResourceClaim> {
     transport_lab_connector_fixture_grant(
         profiles,
         std::num::NonZeroU64::new(1).expect("one Mesh fixture scope is nonzero"),
+        workload,
     )
 }
 
@@ -7091,11 +8916,7 @@ mod tests {
         FiniteResourceProvider, ProcessResourceRoot, ResourceFamilyReport, ResourceProviderPort,
         PRE_AUTH_RESOURCE_FAMILY_COUNT,
     };
-    use crate::runtime::attempt::{
-        ConnectorCallbackServiceWeights, ConnectorRealtimeByteBudgets,
-        ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy,
-        ConnectorRealtimeInboundLimits, ConnectorResourceOwnerPort,
-    };
+    use crate::runtime::attempt::ConnectorResourceOwnerPort;
     use std::future::Future;
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll, Waker};
@@ -7103,6 +8924,92 @@ mod tests {
     // Explicit fixture input shared by the native loopback controls. It is
     // not a production default or an operational sufficiency claim.
     const NATIVE_LOOPBACK_CALLBACK_CAPACITY: usize = 32;
+
+    // The largest single payload the fixtures below will fund, per class.
+    // Explicit because the raw transport-lab path mints its own finite provider
+    // from the policy and has nothing else to derive a byte grant from, and
+    // separate per class so neither pays for the other. Both are fixture
+    // numbers and state no product limit.
+    //
+    // Control covers one gathered ICE candidate's JSON — an SDP candidate line
+    // plus its `sdpMid`, `sdpMLineIndex` and ufrag envelope. Endpoint covers the
+    // small application payloads these controls send.
+    const FIXTURE_CONTROL_PAYLOAD_CEILING: usize = 4_096;
+    const FIXTURE_ENDPOINT_PAYLOAD_CEILING: usize = 4_096;
+
+    /// The callback grant for a fixture whose connector funds itself.
+    ///
+    /// Every fixture that reaches `CallbackProducerOwner::for_local_lab_grant`
+    /// goes through here, so no fixture can silently rely on one class's byte
+    /// grant paying for another's. Fixtures that install a real connector
+    /// resource scope need none of this: they draw on a provider they did not
+    /// mint, and state nothing.
+    fn lab_callback_grant(
+        control: NonZeroUsize,
+        endpoint_data: NonZeroUsize,
+    ) -> callback::TransportLabCallbackGrant {
+        lab_callback_grant_exact(
+            control,
+            endpoint_data,
+            FIXTURE_CONTROL_PAYLOAD_CEILING,
+            FIXTURE_ENDPOINT_PAYLOAD_CEILING,
+            lab_observation_slots(),
+        )
+    }
+
+    /// Every lifecycle delivery the general fixtures can produce: the reserved
+    /// open and close, plus renegotiation, ICE state and peer-connection state.
+    fn lab_observation_slots() -> NonZeroUsize {
+        NonZeroUsize::new(5).expect("the fixture lifecycle slot count is nonzero")
+    }
+
+    /// The same grant, with every number the control cares about stated by the
+    /// control.
+    ///
+    /// A control that asserts the *next* insert is refused cannot use the
+    /// general grant above. That one funds each class at a 4 KiB payload ceiling
+    /// and five lifecycle deliveries at a payload of zero, and a fixture reserves
+    /// only two of those five. What is left over is real capacity in exactly the
+    /// two dimensions an insert spends — spare `QueuedBytes` under the class
+    /// ceiling, and spare count from the unreserved lifecycle slots — sitting in
+    /// the same pool the insert draws from. So the insert that was supposed to
+    /// be refused is admitted out of capacity nothing declared and nothing
+    /// consumes, and the control passes while proving the opposite of its name.
+    ///
+    /// Callers here state the exact payload each class will queue and the exact
+    /// number of lifecycle deliveries they will reserve, so the pool is empty at
+    /// the moment the refusal is asserted.
+    fn lab_callback_grant_exact(
+        control: NonZeroUsize,
+        endpoint_data: NonZeroUsize,
+        control_payload_bytes: usize,
+        endpoint_payload_bytes: usize,
+        observation_slots: NonZeroUsize,
+    ) -> callback::TransportLabCallbackGrant {
+        callback::TransportLabCallbackGrant {
+            control_slots: control,
+            endpoint_slots: endpoint_data,
+            control_payload_bytes: NonZeroUsize::new(control_payload_bytes)
+                .expect("the fixture control payload size is nonzero"),
+            endpoint_payload_bytes: NonZeroUsize::new(endpoint_payload_bytes)
+                .expect("the fixture endpoint payload size is nonzero"),
+            observation_slots,
+        }
+    }
+
+    /// The same numbers as [`lab_callback_grant`], for the fixture-grant helper.
+    fn lab_callback_workload(capacity: NonZeroUsize) -> TransportLabCallbackWorkload {
+        let grant = lab_callback_grant(capacity, capacity);
+        TransportLabCallbackWorkload {
+            control_slots: grant.control_slots,
+            endpoint_slots: grant.endpoint_slots,
+            control_payload_bytes: u64::try_from(grant.control_payload_bytes.get())
+                .expect("the fixture control payload ceiling fits u64"),
+            endpoint_payload_bytes: u64::try_from(grant.endpoint_payload_bytes.get())
+                .expect("the fixture endpoint payload ceiling fits u64"),
+            realtime: None,
+        }
+    }
 
     fn test_resource_owner(
         max_active_candidates: usize,
@@ -7114,58 +9021,24 @@ mod tests {
         let connector_grant = transport_lab_connector_fixture_grant(
             &profiles,
             std::num::NonZeroU64::new(1).expect("the fixture Mesh scope count is nonzero"),
+            lab_callback_workload(
+                NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero"),
+            ),
         )
         .expect("fixture connector and callback claims are representable");
-        // Several frozen compatibility controls acquire one independently
-        // owned real-time capability per fixture connector. Keep that test
-        // authority separate from the codec-neutral connector profile.
-        let compatibility_grant = FiniteResourceProvider::reservation_charge_for_test(
-            crate::connector::realtime_flow_capability_claim()
-                .expect("the compatibility capability claim is representable"),
-        )
-        .expect("the compatibility reservation charge is representable")
-        .checked_scale(max_active_candidates.get() as u64)
-        .expect("the fixture compatibility grant is representable");
-        let grant = connector_grant
-            .checked_add(compatibility_grant)
-            .expect("the complete fixture grant is representable");
-        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(connector_grant))
             .expect("fixture provider accounts for its process scope");
         crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider)
             .issue_mesh_scope()
             .expect("fixture process owner issues one explicit Mesh scope")
     }
 
-    fn test_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
-        let callback_capacity =
-            NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                callback_capacity,
-                callback_capacity,
-            ),
-            ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("fixture callback policy is valid");
-        WebRtcConnectorProfile::new(callbacks, PendingRemoteCandidatePolicy::elastic())
+    fn test_webrtc_profile(_callback_capacity: usize) -> WebRtcConnectorProfile {
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only())
     }
 
     fn test_generic_realtime_webrtc_profile(_callback_capacity: usize) -> WebRtcConnectorProfile {
-        WebRtcConnectorProfile::new(
-            explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16),
-            PendingRemoteCandidatePolicy::elastic(),
-        )
-    }
-
-    fn test_legacy_realtime_webrtc_profile(callback_capacity: usize) -> WebRtcConnectorProfile {
-        let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
-        test_generic_realtime_webrtc_profile(callback_capacity)
-            .with_legacy_webrtc_media(
-                LegacyWebRtcMediaProfile::h264_opus(one, 0, 0)
-                    .expect("fixture legacy provider is structurally valid"),
-            )
-            .expect("fixture real-time policy admits the explicit legacy provider")
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
     }
 
     fn close_owner_fixture(
@@ -7202,10 +9075,93 @@ mod tests {
         (connected, lifetime)
     }
 
+    /// A native-close hold point for controls, built on stored state.
+    ///
+    /// `Notify` is the wrong primitive for this seam. `TestNativeClosePort`
+    /// records its call *synchronously*, before the future it returns is ever
+    /// polled, so the call counter goes up while the close is still short of the
+    /// hold point. A control that keys off that counter can therefore release in
+    /// the window between "call recorded" and "close actually parked", and
+    /// `notify_waiters` stores nothing: a release landing in that window is
+    /// dropped and the control waits forever instead of failing.
+    ///
+    /// Both halves here are `watch` channels, which carry their value rather
+    /// than only waking whoever is already parked. A release published before
+    /// the close parks is still observed, and an entry published before the
+    /// control looks is still counted, so no scheduling order can lose either
+    /// signal. This mirrors the production-side `NativeCloseGate` for the same
+    /// reason.
+    struct TestNativeCloseGate {
+        /// How many closes have reached the hold point. A `watch` rather than a
+        /// bare counter so a control can await the first entry deterministically
+        /// instead of spinning on a load.
+        entries: watch::Sender<usize>,
+        /// The stored permit. Held closes proceed once this is `true`.
+        open: watch::Sender<bool>,
+    }
+
+    impl TestNativeCloseGate {
+        fn new() -> Arc<Self> {
+            let (entries, _entries_receiver) = watch::channel(0usize);
+            let (open, _open_receiver) = watch::channel(false);
+            Arc::new(Self { entries, open })
+        }
+
+        /// Record this entry, then park until a control opens the gate.
+        ///
+        /// The subscription is taken *before* the entry is published, so a
+        /// control that observes the entry is observing a close that is already
+        /// able to see the release. The permit is stored regardless, so the
+        /// ordering here is belt and braces rather than the correctness
+        /// argument.
+        async fn hold(&self) {
+            let mut open = self.open.subscribe();
+            self.entries.send_modify(|count| *count += 1);
+            loop {
+                // The borrow is released before the await: holding a `watch`
+                // guard across a suspension point would block every sender.
+                if *open.borrow() {
+                    return;
+                }
+                if open.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        /// How many closes have reached the hold point.
+        fn entries(&self) -> usize {
+            *self.entries.borrow()
+        }
+
+        /// Park until at least one close has reached the hold point.
+        ///
+        /// Resolves on the entry itself rather than by polling a counter.
+        /// Callers bound it with a deadline so a close that never arrives fails
+        /// the control rather than hanging it.
+        async fn wait_for_entry(&self) {
+            let mut entries = self.entries.subscribe();
+            loop {
+                if *entries.borrow() > 0 {
+                    return;
+                }
+                if entries.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        /// Let every held close proceed. Idempotent, and the permit is stored,
+        /// so this can never be published too early to be observed.
+        fn open(&self) {
+            self.open.send_replace(true);
+        }
+    }
+
     enum TestNativeCloseResult {
         Success,
         Error,
-        Gate(Arc<tokio::sync::Notify>),
+        Gate(Arc<TestNativeCloseGate>),
     }
 
     struct TestNativeClosePort {
@@ -7223,7 +9179,7 @@ mod tests {
                         "injected native close failure".to_string(),
                     )),
                     TestNativeCloseResult::Gate(gate) => {
-                        gate.notified().await;
+                        gate.hold().await;
                         Ok(())
                     }
                 }
@@ -7276,42 +9232,47 @@ mod tests {
         )
     }
 
-    fn test_pending_candidate_policy() -> PendingRemoteCandidatePolicy {
-        test_pending_candidate_policy_for(&[])
+    fn test_candidate_fixture_work() -> RemoteCandidateFixtureWork {
+        test_candidate_fixture_work_for(&[])
     }
 
-    fn test_pending_candidate_policy_for(
+    fn test_candidate_fixture_work_for(
         additional_inputs: &[LocalIceCandidate],
-    ) -> PendingRemoteCandidatePolicy {
+    ) -> RemoteCandidateFixtureWork {
         let candidate_bytes = std::iter::once(observed_candidate())
             .chain(additional_inputs.iter().cloned())
             .filter_map(|candidate| candidate_content_bytes(&candidate))
             .max()
-            .and_then(NonZeroUsize::new)
             .expect("fixture candidate has nonzero representable content");
-        PendingRemoteCandidatePolicy::new(
-            NonZeroUsize::new(1).expect("fixture item ceiling is nonzero"),
-            candidate_bytes,
-            NonZeroUsize::new(1).expect("fixture duplicate ceiling is nonzero"),
-            NonZeroUsize::new(1).expect("fixture work ceiling is nonzero"),
-        )
+        RemoteCandidateFixtureWork::new(1, candidate_bytes)
     }
 
     fn test_remote_candidate_state() -> RemoteCandidateState {
-        RemoteCandidateState::new(test_pending_candidate_policy())
+        RemoteCandidateState::new(test_candidate_fixture_work())
     }
 
     /// Build a finite test provider from the local fixture envelope. This is
     /// test accounting only. It is not a product cardinality or a production
     /// policy value.
     fn test_realtime_resource_scope(
-        local: EnabledRealtimeConnectorPolicy,
+        workload: TransportLabRealtimeWorkload,
     ) -> ConnectorWorkResourceScope {
+        // One control profile per fixture registry, charged here rather than in
+        // the shared envelope helper: the envelope describes flows, and which
+        // profile a fixture registers is this module's fact.
+        let profile_claim = FiniteResourceProvider::reservation_charge_for_test(
+            session_flow::LeasedRealtimeProfile::mint_claim(
+                &session_flow::control_realtime_profile(),
+            )
+            .expect("the control profile claim is representable"),
+        )
+        .expect("the control profile reservation is representable");
         let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
             .checked_add(
-                realtime_fixture_provider_grant(local)
+                realtime_fixture_provider_grant(workload)
                     .expect("fixture real-time envelope is representable"),
             )
+            .and_then(|grant| grant.checked_add(profile_claim))
             .expect("fixture provider grant is representable");
 
         let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
@@ -7327,68 +9288,437 @@ mod tests {
         candidate.work_resource_scope()
     }
 
-    fn test_realtime_registry(policy: ConnectorCallbackPolicy) -> Arc<RealtimeFlowRegistry> {
-        match policy.realtime() {
-            RealtimeConnectorPolicy::Disabled => RealtimeFlowRegistry::new(None, None),
-            RealtimeConnectorPolicy::Enabled(Some(local)) => {
-                RealtimeFlowRegistry::new(Some(test_realtime_resource_scope(local)), Some(local))
-            }
-            RealtimeConnectorPolicy::Enabled(None) => {
-                panic!("an elastic real-time test must supply its exact provider fixture")
-            }
+    /// A real connector work scope granted exactly `transceivers` negotiated
+    /// inbound transceivers and `slots` retirement queue slots, and nothing
+    /// else.
+    ///
+    /// The two are counted separately rather than paired because the controls
+    /// use them separately, and a control that was handed headroom it does not
+    /// consume cannot state a refusal: spare slot capacity would satisfy a
+    /// transceiver acquisition that was supposed to be refused.
+    ///
+    /// **Exact rather than generous, because the observable is the provider.**
+    /// These controls state what the native retirement path charges and what it
+    /// gives back, and both readings come from asking this provider what is
+    /// still held. A grant with headroom would let "released" and "retained
+    /// after a failed cleanup" look the same from outside.
+    ///
+    /// The candidate and its lifetime come back with the scope because both must
+    /// outlive it: dropping the candidate would release the reservation the work
+    /// scope draws from, and the control would then be measuring a torn-down
+    /// connector rather than a live one.
+    fn realtime_native_test_scope(
+        transceivers: u64,
+        slots: u64,
+        identities: u64,
+    ) -> (
+        FiniteResourceProvider,
+        ConnectorResourceOwnerPort,
+        crate::runtime::attempt::MeshConnectorResourceScope,
+        ConnectorCandidateCapability,
+        AttemptLifetime,
+        ConnectorWorkResourceScope,
+    ) {
+        // One recorded transceiver is three independent reservations — its queue
+        // node, its completion cell, and its native half — and each is charged
+        // on its own, because a reservation is the unit the provider bills.
+        // Adding the three claims first and charging the sum once looks
+        // equivalent and is not: it funds one bookkeeping record where three are
+        // taken, and the grant is then short by two records that no claim here
+        // names. Granting their sum would also let a control pass while any two
+        // of the three were confused for each other, which is the other defect
+        // these grants are derived to catch.
+        let per_transceiver = [
+            negotiated_inbound_record_claim().expect("the fixture record claim is representable"),
+            RealtimeRetirementSignal::mint_claim()
+                .expect("the fixture completion claim is representable"),
+            negotiated_inbound_transceiver_claim()
+                .expect("the fixture transceiver claim is representable"),
+        ]
+        .into_iter()
+        .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+            total.checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(claim)
+                    .expect("the fixture transceiver reservation charge is representable"),
+            )
+        })
+        .expect("the fixture per-transceiver grant is representable");
+        let per_slot = FiniteResourceProvider::reservation_charge_for_test(
+            crate::runtime::attempt::cleanup_job_claim()
+                .expect("the fixture retirement-slot claim is representable"),
+        )
+        .expect("the fixture retirement-slot reservation charge is representable");
+        let per_identity = FiniteResourceProvider::reservation_charge_for_test(
+            RealtimeTrackIdentity::mint_claim().expect("the identity claim is representable"),
+        )
+        .expect("the fixture identity reservation charge is representable");
+        let native_work = (0..transceivers)
+            .map(|_| per_transceiver)
+            .chain((0..slots).map(|_| per_slot))
+            .chain((0..identities).map(|_| per_identity))
+            .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+                total.checked_add(claim)
+            })
+            .expect("the fixture native-work grant is representable");
+        let grant = crate::runtime::attempt::explicit_test_grant(1, 1)
+            .checked_add(native_work)
+            .expect("the fixture provider grant is representable");
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone())
+            .expect("the fixture grant accounts for its process scope");
+        let owner = ConnectorResourceOwnerPort::new(port);
+        let mesh = owner
+            .issue_mesh_scope()
+            .expect("the fixture grant accounts for its Mesh scope");
+        let (permit, lifetime, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), mesh.clone());
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("the fixture grant admits its connector candidate");
+        let work_scope = candidate.work_resource_scope();
+        (provider, owner, mesh, candidate, lifetime, work_scope)
+    }
+
+    /// How many cleanup jobs this process owner has ever been handed, in any
+    /// state.
+    ///
+    /// The sum, rather than one counter, because a submitted job moves queued →
+    /// active → completed and a refused one lands in failed, so no single
+    /// counter can be read at an arbitrary moment and mean "was it submitted".
+    ///
+    /// **Not an immediate monotone reading, and a control must not treat it as
+    /// one.** The four counters are separate atomics moved at separate moments
+    /// by the executor's own thread, so the sum has two windows where it is
+    /// momentarily wrong in both directions: the dequeue decrements `queued`
+    /// before the task it spawns increments `active`, which reads one *short*,
+    /// and a finishing task increments `completed` before it decrements
+    /// `active`, which reads one *long*. Both are handoffs rather than states,
+    /// and neither is observable once the executor has settled — no counter
+    /// moves again unless something else is submitted.
+    ///
+    /// So a control asserting "the drop submitted exactly one" waits for the
+    /// executor to settle — nothing queued, nothing active — and reads this
+    /// then, where it is exact and stable. Reading it immediately after the
+    /// drop is what made this control fail intermittently rather than a fact
+    /// about the submission, which is synchronous and has already happened by
+    /// the time the destructor returns.
+    fn submitted_cleanup_jobs(owner: &ConnectorResourceOwnerPort) -> u64 {
+        let cleanup = owner.report().cleanup;
+        let live = u64::try_from(cleanup.queued_jobs)
+            .and_then(|queued| Ok(queued + u64::try_from(cleanup.active_jobs)?))
+            .expect("fixture job counts fit u64");
+        live + cleanup.completed_jobs + cleanup.failed_jobs
+    }
+
+    /// A negotiated transceiver whose stop answers on demand. **Controls only.**
+    ///
+    /// The one thing a real `RTCRtpTransceiver` cannot be asked to do is refuse
+    /// to stop, and a refused stop is precisely the case the claim retention
+    /// exists for. Everything else about it is deliberately inert.
+    ///
+    /// `matches_native` answers `false` unconditionally, and that is a safety
+    /// property rather than a stub: a fixture record must never be able to claim
+    /// a track that arrived on a transceiver this side really created. The twin
+    /// can therefore be recorded in a live table without becoming reachable from
+    /// `on_track` at all.
+    struct TestRealtimeTransceiverPort {
+        stops: Arc<AtomicUsize>,
+        refuse: bool,
+    }
+
+    impl NativeRealtimeTransceiverPort for TestRealtimeTransceiverPort {
+        fn stop(&self) -> NativeTransceiverStopFuture<'_> {
+            self.stops.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if self.refuse {
+                    return Err(Error::Transport(
+                        "injected inbound realtime transceiver stop failure".to_string(),
+                    ));
+                }
+                Ok(())
+            })
+        }
+
+        fn matches_native(&self, _transceiver: &Arc<RTCRtpTransceiver>) -> bool {
+            false
         }
     }
 
+    /// Record one transceiver twin against `tracks`, funded exactly as
+    /// production funds one.
+    ///
+    /// Returns the token it was recorded under and the counter its stop
+    /// increments, so a control can say both "the stop ran" and "the stop ran
+    /// once".
+    fn record_test_transceiver(
+        tracks: &Arc<RealtimeSessionTracks>,
+        scope: &ConnectorWorkResourceScope,
+        refuse: bool,
+    ) -> (Arc<RealtimeTrackIdentity>, Arc<AtomicUsize>) {
+        // Acquired separately, exactly as production acquires them, so a control
+        // can watch one come back while the others do not.
+        let record = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                negotiated_inbound_record_claim().expect("the record claim is representable"),
+            )
+            .expect("the fixture grant funds this record's node");
+        let signal = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                RealtimeRetirementSignal::mint_claim()
+                    .expect("the completion claim is representable"),
+            )
+            .expect("the fixture grant funds this record's completion cell");
+        let native = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                negotiated_inbound_transceiver_claim()
+                    .expect("the transceiver claim is representable"),
+            )
+            .expect("the fixture grant funds this transceiver");
+        let identity = RealtimeTrackIdentity::mint_for_test(scope);
+        let stops = Arc::new(AtomicUsize::new(0));
+        tracks.record(
+            Arc::clone(&identity),
+            Arc::new(TestRealtimeTransceiverPort {
+                stops: Arc::clone(&stops),
+                refuse,
+            }),
+            record,
+            signal,
+            native,
+        );
+        (identity, stops)
+    }
+
+    /// One retirement minted the way production mints one, against a real work
+    /// scope.
+    ///
+    /// Not a shortcut around the funding: the slot is acquired from `scope`
+    /// exactly as [`WebRtcConnectorWorker::inbound_realtime_retirement`] acquires
+    /// it, so a control that exhausts the grant sees the same refusal production
+    /// would.
+    fn test_inbound_retirement(
+        tracks: &Arc<RealtimeSessionTracks>,
+        identity: &Arc<RealtimeTrackIdentity>,
+        scope: &ConnectorWorkResourceScope,
+    ) -> RealtimeInboundRetirement {
+        let slot = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                crate::runtime::attempt::cleanup_job_claim()
+                    .expect("the retirement slot claim is representable"),
+            )
+            .expect("the fixture grant funds this retirement's queue slot");
+        tracks.retirement(
+            Arc::clone(identity),
+            scope.cleanup_submission().clone(),
+            slot,
+        )
+    }
+
+    /// A registry over a provider funded for exactly the stated workload.
+    ///
+    /// The workload used to be an owner ceiling the registry then enforced, so
+    /// a control could be refused either by the ceiling or by the provider and
+    /// the two were sized together. Only the provider refuses now, and this
+    /// states what it is funded for — so a control that expects a refusal gets
+    /// one from the only thing that can still give it.
+    fn test_realtime_registry(workload: TransportLabRealtimeWorkload) -> Arc<RealtimeFlowRegistry> {
+        RealtimeFlowRegistry::new(Some(test_realtime_resource_scope(workload)))
+    }
+
     fn test_realtime_registry_with_observer(
-        policy: ConnectorCallbackPolicy,
+        workload: TransportLabRealtimeWorkload,
         observer: Arc<dyn RealtimeFlowObserver>,
     ) -> Arc<RealtimeFlowRegistry> {
-        let RealtimeConnectorPolicy::Enabled(Some(local)) = policy.realtime() else {
-            panic!("an observed real-time test requires an explicit local fixture envelope");
-        };
         RealtimeFlowRegistry::with_observer(
-            Some(test_realtime_resource_scope(local)),
-            Some(local),
+            Some(test_realtime_resource_scope(workload)),
             Some(observer),
         )
     }
 
-    fn test_callback_policy(capacity: NonZeroUsize) -> ConnectorCallbackPolicy {
-        let unit_bytes = b"video-fixture".len();
-        let flow_domains = 2usize;
-        let accounted_bytes = unit_bytes
-            .checked_mul(capacity.get())
-            .and_then(|bytes| bytes.checked_mul(flow_domains))
-            .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(NonZeroUsize::new)
-            .expect("fixture retained-byte envelope is representable and nonzero");
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(
-                NonZeroUsize::new(flow_domains).expect("fixture has two flow kinds"),
-                NonZeroUsize::new(flow_domains).expect("fixture has two flow kinds"),
-                capacity,
-            ),
-            ConnectorRealtimeInboundLimits::new(
-                NonZeroUsize::new(unit_bytes).expect("fixture unit is nonempty"),
-                NonZeroUsize::new(1).expect("fixture uses complete units"),
-                NonZeroUsize::new(1).expect("fixture uses one in-progress unit"),
-                NonZeroUsize::new(1).expect("fixture admits one pre-authentication packet"),
-                NonZeroUsize::new(unit_bytes).expect("fixture packet is nonempty"),
-            ),
-            ConnectorRealtimeByteBudgets::new(accounted_bytes, accounted_bytes),
-            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
-        );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(
-            NonZeroUsize::new(unit_bytes).expect("fixture unit is nonempty"),
-            flows,
+    /// A work scope funded for exactly the listed claims and nothing else.
+    ///
+    /// The shared workload grant cannot state scarcity for one claim. It funds
+    /// every claim a flow of that shape *could* take — a native read per inbound
+    /// flow, an assembly and its fragments per in-progress unit, a packet work
+    /// lease per pump — and those claims overlap in the dimensions that matter:
+    /// a fragment and a packet work both spend `ParsingOrCpuWork`, a native read
+    /// and an output both spend `CallbackOrScheduledWork`. So a control that
+    /// funds one of a thing and expects the second to be refused is instead
+    /// afforded it out of capacity granted for work the control never does, and
+    /// the refusal it asserts is unreachable. Scarcity has to be built for the
+    /// claim under test or it is not scarcity at all.
+    ///
+    /// Callers enumerate every claim the control actually takes, including the
+    /// ones an open quietly needs — a flow is its own record *and* a separate
+    /// `LeasedMap` node — so the grant is a statement about the control rather
+    /// than about whatever slack a shape-derived envelope happened to leave.
+    /// Everything an exact-grant fixture has to keep alive for its refusals to
+    /// mean anything.
+    ///
+    /// A work scope does not own the things that were charged to build it. The
+    /// candidate holds the connector-opening reservation, and the Mesh scope
+    /// token behind it holds the owner, which owns the cleanup executor and the
+    /// infrastructure lease that executor took. Let any of them drop and the
+    /// provider gets that capacity back — so a control that then asserts "the
+    /// next acquisition is refused" is asking a pool that has quietly been
+    /// refilled with whatever its own setup returned.
+    ///
+    /// That is not hypothetical: an earlier version of this helper returned the
+    /// scope alone, dropping the candidate and the attempt lifetime as it
+    /// returned. The released `CallbackOrScheduledWork` — one from the executor
+    /// infrastructure, one from the cleanup job inside the opening claim — is
+    /// exactly what was paying for the output reservations three controls
+    /// expected to be refused. Holding this guard for the length of the control
+    /// is what makes the ledger add up.
+    struct ExactRealtimeGrant {
+        _owner: ConnectorResourceOwnerPort,
+        _candidate: ConnectorCandidateCapability,
+        _attempt: AttemptLifetime,
+    }
+
+    fn exact_realtime_work_scope(
+        claims: impl IntoIterator<Item = crate::resource::ResourceClaim>,
+    ) -> (ConnectorWorkResourceScope, ExactRealtimeGrant) {
+        // The base is every record this scope reserves, and the guard below is
+        // what keeps each of them reserved.
+        //
+        // `issue_mesh_scope` calls `cleanup_executor.prepare`, so the executor
+        // starts and takes its infrastructure lease eagerly, at Mesh issuance
+        // rather than at the first cleanup job. It has to be funded. What it
+        // must *not* do is come back: that lease and the opening claim are held
+        // for as long as the owner and the candidate live, which is why both
+        // travel out of here in `ExactRealtimeGrant` instead of dying with this
+        // function.
+        //
+        // `explicit_test_grant` is deliberately not the base. It adds a spare
+        // `connector_operation_claim` per fixture candidate — one
+        // `ParsingOrCpuWork`, the only dimension a retained fragment competes
+        // for — which nothing here ever holds.
+        let structural = crate::runtime::attempt::connector_resource_structural_claims();
+        let mut grant = FiniteResourceProvider::scope_record_charge_for_test()
+            .checked_add(FiniteResourceProvider::scope_record_charge_for_test())
+            .expect("the fixture scope records are representable")
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(
+                    structural.process_infrastructure(),
+                )
+                .expect("the cleanup infrastructure charge is representable"),
+            )
+            .expect("the fixture infrastructure grant is representable")
+            .checked_add(
+                FiniteResourceProvider::child_scope_with_reservation_charge_for_test(
+                    structural.connector_opening(),
+                )
+                .expect("the connector opening charge is representable"),
+            )
+            .expect("the exact fixture base grant is representable");
+        for claim in claims {
+            grant = grant
+                .checked_add(
+                    FiniteResourceProvider::reservation_charge_for_test(claim)
+                        .expect("the fixture reservation charge is representable"),
+                )
+                .expect("the exact fixture grant is representable");
+        }
+        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+            .expect("the exact grant accounts for its process scope");
+        let owner = ConnectorResourceOwnerPort::new(provider);
+        let mesh = owner
+            .issue_mesh_scope()
+            .expect("the exact grant accounts for its Mesh scope and cleanup executor");
+        let (permit, attempt, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), mesh);
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("the exact grant admits its connector candidate");
+        let scope = candidate.work_resource_scope();
+        (
+            scope,
+            ExactRealtimeGrant {
+                _owner: owner,
+                _candidate: candidate,
+                _attempt: attempt,
+            },
         )
-        .expect("fixture real-time envelope is internally consistent");
-        ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            ConnectorCallbackServiceWeights::new(capacity, capacity, capacity),
-            realtime,
+    }
+
+    /// A registry on an exact grant, with the guard the caller must hold.
+    ///
+    /// Returned as a pair rather than hidden inside the registry so that
+    /// dropping the guard early is something a caller has to write down.
+    fn exact_realtime_registry(
+        claims: impl IntoIterator<Item = crate::resource::ResourceClaim>,
+    ) -> (Arc<RealtimeFlowRegistry>, ExactRealtimeGrant) {
+        let (scope, grant) = exact_realtime_work_scope(claims);
+        (RealtimeFlowRegistry::new(Some(scope)), grant)
+    }
+
+    fn exact_realtime_registry_with_observer(
+        claims: impl IntoIterator<Item = crate::resource::ResourceClaim>,
+        observer: Arc<dyn RealtimeFlowObserver>,
+    ) -> (Arc<RealtimeFlowRegistry>, ExactRealtimeGrant) {
+        let (scope, grant) = exact_realtime_work_scope(claims);
+        (
+            RealtimeFlowRegistry::with_observer(Some(scope), Some(observer)),
+            grant,
         )
-        .expect("fixture callback policy is valid")
+    }
+
+    /// Exactly what one `open_inbound_flow` or `open_outbound_flow` acquires.
+    ///
+    /// Two, not one and not three: the flow's own record, and the registry map
+    /// node it is filed under — an independent `LeasedMap` allocation with its
+    /// own lifetime. A grant naming only the first funds half of an open and
+    /// refuses the open itself, which reads as the control's own refusal and is
+    /// not one.
+    ///
+    /// The ready obligation is deliberately *not* here. `open_flow_checked`
+    /// does not take one — a ready lease is acquired by `enqueue`, when a unit
+    /// actually becomes serviceable. Funding it at open hands the pool a spare
+    /// `CallbackOrScheduledWork`, which is the dimension an output reservation
+    /// is scarce in, so the reservation a control expects to be refused gets
+    /// paid for by a lease that open never took. Controls that enqueue add one
+    /// `ready_claim` per unit they enqueue, beside the queue claims.
+    fn exact_realtime_open_claims() -> [crate::resource::ResourceClaim; 2] {
+        [
+            RealtimeFlowRegistry::flow_claim().expect("the flow claim is representable"),
+            RealtimeFlowRegistry::flow_map_node_claim()
+                .expect("the flow map node claim is representable"),
+        ]
+    }
+
+    /// The one real-time payload the shared callback fixture is sized for.
+    ///
+    /// `test_realtime_workload` funds its unit, its fragment and its queued
+    /// bytes from this exact length, so a control that emits any *other* payload
+    /// through that fixture is either refused for want of capacity or silently
+    /// given slack the fixture never funded. Both are arrangement failures
+    /// wearing the costume of a result, which is why there is one constant
+    /// rather than a literal at each site.
+    const FIXTURE_REALTIME_PAYLOAD: &[u8] = b"realtime-unit";
+
+    /// The real-time workload the shared callback fixture funds.
+    ///
+    /// Sized from [`FIXTURE_REALTIME_PAYLOAD`] for the same reason the ceilings
+    /// it replaces were: a control that emits any *other* payload through this
+    /// fixture is either refused for want of capacity or silently handed slack
+    /// the fixture never funded, and both are arrangement failures wearing the
+    /// costume of a result.
+    fn test_realtime_workload(capacity: NonZeroUsize) -> TransportLabRealtimeWorkload {
+        let unit_bytes = FIXTURE_REALTIME_PAYLOAD.len();
+        TransportLabRealtimeWorkload {
+            inbound_flows: 2,
+            outbound_flows: 2,
+            queued_units_per_flow: capacity.get(),
+            in_progress_units_per_inbound_flow: 1,
+            fragments_per_unit: 1,
+            max_fragment_bytes: unit_bytes,
+            max_unit_bytes: unit_bytes,
+        }
     }
 
     fn retained_realtime_bytes(state: &RealtimeFlowRegistryState) -> usize {
@@ -7407,7 +9737,6 @@ mod tests {
         let work_resource_scope = candidate.work_resource_scope();
         ConnectorOwnership::admitted(
             candidate,
-            Arc::new(AtomicBool::new(false)),
             Arc::new(ConnectorOperationFence::default()),
             work_resource_scope,
             Arc::new(AtomicBool::new(false)),
@@ -7415,50 +9744,39 @@ mod tests {
         )
     }
 
-    fn test_realtime_capability(
-        ownership: &ConnectorOwnership,
-    ) -> crate::connector::ConnectorRealtimeFlowCapability {
-        let resources = ownership
-            .work_resource_scope
-            .acquire(
-                crate::resource::ResourceAuthorityClass::Admitted,
-                crate::connector::realtime_flow_capability_claim()
-                    .expect("fixture capability claim is representable"),
-            )
-            .expect("fixture provider admits one compatibility capability");
-        crate::connector::ConnectorRealtimeFlowCapability::new(
-            Arc::clone(&ownership.incarnation),
-            resources,
-        )
-    }
-
     fn test_event_mailboxes(capacity: usize) -> (ConnectorEventMailboxes, TransportEventReceiver) {
         let capacity =
             std::num::NonZeroUsize::new(capacity).expect("fixture callback capacity is nonzero");
-        test_event_mailboxes_with_policy(test_callback_policy(capacity))
+        test_event_mailboxes_with_workload(capacity, test_realtime_workload(capacity))
     }
 
-    fn test_event_mailboxes_with_policy(
-        policy: ConnectorCallbackPolicy,
+    fn test_event_mailboxes_with_workload(
+        capacity: NonZeroUsize,
+        realtime: TransportLabRealtimeWorkload,
     ) -> (ConnectorEventMailboxes, TransportEventReceiver) {
-        let capacities = policy
-            .local_mailboxes()
-            .expect("fixture callback mailboxes are explicit");
-        let callback_producer = CallbackProducerOwner::for_local_lab_policy(policy)
-            .expect("fixture callback resources are derivable from its local policy");
-        let realtime_flows = test_realtime_registry(policy);
+        test_event_mailboxes_with_grant(lab_callback_grant(capacity, capacity), realtime)
+    }
+
+    /// The same fixture, on a callback grant the control states itself.
+    ///
+    /// Only the controls that assert a refusal need this. Everything else is
+    /// better served by the general grant, which funds enough slack that an
+    /// arrangement step cannot fail for a reason the control was not written to
+    /// be about.
+    fn test_event_mailboxes_with_grant(
+        grant: callback::TransportLabCallbackGrant,
+        realtime: TransportLabRealtimeWorkload,
+    ) -> (ConnectorEventMailboxes, TransportEventReceiver) {
+        let callback_producer = CallbackProducerOwner::for_local_lab_grant(grant)
+            .expect("fixture callback resources are derivable from its stated grant");
+        let realtime_flows = test_realtime_registry(realtime);
         let callback_ready = Arc::new(tokio::sync::Notify::new());
         let control = callback_producer
-            .create_mailbox(
-                ConnectorCallbackClass::Control,
-                Some(capacities.control()),
-                Arc::clone(&callback_ready),
-            )
+            .create_mailbox(ConnectorCallbackClass::Control, Arc::clone(&callback_ready))
             .expect("fixture control mailbox is admitted");
         let endpoint_data = callback_producer
             .create_mailbox(
                 ConnectorCallbackClass::EndpointData,
-                Some(capacities.endpoint_data()),
                 Arc::clone(&callback_ready),
             )
             .expect("fixture endpoint mailbox is admitted");
@@ -7486,7 +9804,9 @@ mod tests {
                 callback_ready,
                 callback_failed: false,
                 realtime_flows,
-                scheduler: ConnectorCallbackScheduler::new(policy),
+                scheduler: ConnectorCallbackScheduler::new(
+                    ConnectorCallbackPolicy::elastic_realtime(),
+                ),
                 control_cursor: ConnectorControlSourceCursor::default(),
             },
         )
@@ -7494,20 +9814,18 @@ mod tests {
 
     fn test_event_sink(
         events: ConnectorEventMailboxes,
-        policy: ConnectorCallbackPolicy,
+        realtime: TransportLabRealtimeWorkload,
         resource_scope: Option<PeerConnectionResourceScope>,
     ) -> ConnectorEventSink {
         let callback_producer = events.callback_producer.clone();
         ConnectorEventSink {
             events,
-            realtime_flows: test_realtime_registry(policy),
+            realtime_flows: test_realtime_registry(realtime),
             resource_scope,
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
             attempt_liveness: None,
             candidate_promoted: Arc::new(AtomicBool::new(true)),
             callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
             callback_violation_reported: Arc::new(AtomicBool::new(false)),
-            callback_policy: policy,
             callback_producer,
             operation_fence: Arc::new(ConnectorOperationFence::default()),
             close_owner: None,
@@ -7516,196 +9834,38 @@ mod tests {
 
     fn test_event_sink_for_receiver(
         events: ConnectorEventMailboxes,
-        policy: ConnectorCallbackPolicy,
+        realtime: TransportLabRealtimeWorkload,
         resource_scope: Option<PeerConnectionResourceScope>,
         receiver: &TransportEventReceiver,
     ) -> ConnectorEventSink {
-        let mut sink = test_event_sink(events, policy, resource_scope);
+        let mut sink = test_event_sink(events, realtime, resource_scope);
         sink.realtime_flows = Arc::clone(&receiver.realtime_flows);
         sink
     }
 
-    struct LegacyPeerOwnerGuard {
-        close_owner: Arc<ConnectorCloseOwner>,
-        _lifetime: AttemptLifetime,
-    }
-
-    impl Drop for LegacyPeerOwnerGuard {
-        fn drop(&mut self) {
-            self.close_owner.start();
-        }
-    }
-
-    async fn open_explicit_legacy_media_peer(
-        transport: &Transport,
-        role: Role,
-        fixture_unit_bytes: NonZeroUsize,
-    ) -> Result<(PeerSession, TransportEventReceiver, LegacyPeerOwnerGuard)> {
-        let mut config = build_rtc_configuration(&[], &[]);
-        config.ice_transport_policy = transport.ice_transport_policy;
-        let legacy_profile = LegacyWebRtcMediaProfile::h264_opus(
-            NonZeroUsize::new(MEDIA_LANES).expect("legacy test lane ceiling is nonzero"),
-            PRE_PROVISIONED_LANES,
-            PRE_PROVISIONED_LANES,
-        )
-        .expect("legacy test profile is structurally valid");
-        let required_flows = legacy_profile
-            .max_lanes_per_kind()
-            .get()
-            .checked_mul(2)
-            .expect("fixture legacy video and audio flow count is representable");
-        let fixture_accounted_bytes = fixture_unit_bytes.get().checked_mul(2).ok_or_else(|| {
-            Error::Transport("fixture real-time byte envelope overflowed".to_string())
-        })?;
-        let realtime = explicit_realtime_callback_policy(
-            fixture_unit_bytes.get(),
-            required_flows,
-            1,
-            fixture_unit_bytes.get(),
-            1,
-            fixture_accounted_bytes,
-        )
-        .realtime();
-        let callback_capacity = NonZeroUsize::new(NATIVE_LOOPBACK_CALLBACK_CAPACITY)
-            .expect("native loopback callback capacity is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                callback_capacity,
-                callback_capacity,
-            ),
-            ConnectorCallbackServiceWeights::new(
-                NonZeroUsize::new(1).expect("fixture control weight is nonzero"),
-                NonZeroUsize::new(1).expect("fixture endpoint weight is nonzero"),
-                NonZeroUsize::new(1).expect("fixture real-time weight is nonzero"),
-            ),
-            realtime,
-        )
-        .expect("native loopback callback policy is valid");
-        let profile = WebRtcConnectorProfile::new(callbacks, test_pending_candidate_policy())
-            .with_legacy_webrtc_media(legacy_profile)
-            .expect("fixture real-time ownership admits its exact legacy lanes");
-        let grant = one_mesh_connector_fixture_grant(&[profile])?;
-        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))?;
-        let resource_owner = ConnectorResourceOwnerPort::new(provider)
-            .issue_mesh_scope()
-            .map_err(|error| Error::Transport(format!("legacy fixture Mesh scope: {error}")))?;
-        let (permit, lifetime, claim) = admit_single_connector_candidate(
-            crate::runtime::runtime_for_test(),
-            resource_owner.clone(),
-        );
-        let mut candidate = permit
-            .reserve_connector_candidate_checked(claim)?
-            .ok_or_else(|| Error::Transport("legacy fixture attempt retired".to_string()))?;
-        let work_resource_scope = candidate.work_resource_scope();
-        let attempt_liveness = candidate.liveness();
-        let cleanup_capability = candidate
-            .issue_cleanup_capability()
-            .map_err(|error| Error::Transport(format!("legacy fixture cleanup owner: {error}")))?;
-        let realtime_delivery = Arc::new(AtomicBool::new(true));
-        let candidate_promoted = Arc::new(AtomicBool::new(true));
-        let operation_fence = Arc::new(ConnectorOperationFence::default());
-        let callback_gate = Arc::new(WebRtcConnectorIncarnation::new());
-        let ownership = ConnectorOwnership::admitted(
-            candidate,
-            Arc::clone(&realtime_delivery),
-            Arc::clone(&operation_fence),
-            work_resource_scope.clone(),
-            Arc::clone(&candidate_promoted),
-            Arc::clone(&callback_gate),
-        );
-        let close_owner = ConnectorCloseOwner::new(ownership, resource_owner, cleanup_capability);
-        let (session, events) = transport
-            .open_peer_with_config_observed(
-                role,
-                config,
-                PeerOpenOwnership {
-                    resource_scope: None,
-                    work_resource_scope: Some(work_resource_scope),
-                    realtime_delivery,
-                    attempt_liveness: Some(attempt_liveness),
-                    candidate_promoted,
-                    callback_gate,
-                    callback_policy: profile.callbacks(),
-                    operation_fence,
-                    legacy_media_profile: Some(legacy_profile),
-                    close_owner: Some(Arc::clone(&close_owner)),
-                },
-            )
-            .await?;
-        Ok((
-            session,
-            events,
-            LegacyPeerOwnerGuard {
-                close_owner,
-                _lifetime: lifetime,
-            },
-        ))
-    }
-
-    fn explicit_callback_policy(
-        capacity: usize,
-        control_weight: usize,
-        endpoint_data_weight: usize,
-        realtime_weight: usize,
-        realtime: RealtimeConnectorPolicy,
-    ) -> ConnectorCallbackPolicy {
-        let capacity =
-            std::num::NonZeroUsize::new(capacity).expect("fixture callback capacity is nonzero");
-        ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
-            ConnectorCallbackServiceWeights::new(
-                std::num::NonZeroUsize::new(control_weight)
-                    .expect("fixture control weight is nonzero"),
-                std::num::NonZeroUsize::new(endpoint_data_weight)
-                    .expect("fixture endpoint-data weight is nonzero"),
-                std::num::NonZeroUsize::new(realtime_weight)
-                    .expect("fixture real-time weight is nonzero"),
-            ),
-            realtime,
-        )
-        .expect("fixture callback policy is valid")
-    }
-
-    fn explicit_realtime_callback_policy(
+    /// The real-time work one control funds, in the shape the grant needs.
+    ///
+    /// This replaces a helper that built an owner ceiling out of the same six
+    /// numbers. They meant "refuse past here" and now mean "fund exactly this",
+    /// which is the same arithmetic pointed at the only thing left that can
+    /// refuse. The per-unit fragment count stays at the value these controls
+    /// were written against.
+    fn explicit_realtime_workload(
         max_unit_bytes: usize,
         max_active_flows_per_domain: usize,
         queue_capacity_per_flow: usize,
         max_inbound_fragment_bytes: usize,
         max_in_progress_units_per_flow: usize,
-        max_accounted_bytes: usize,
-    ) -> ConnectorCallbackPolicy {
-        let nonzero = |value, name| {
-            std::num::NonZeroUsize::new(value)
-                .unwrap_or_else(|| panic!("fixture {name} must be nonzero"))
-        };
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(
-                nonzero(max_active_flows_per_domain, "inbound flow count"),
-                nonzero(max_active_flows_per_domain, "outbound flow count"),
-                nonzero(queue_capacity_per_flow, "per-flow queue capacity"),
-            ),
-            ConnectorRealtimeInboundLimits::new(
-                nonzero(max_inbound_fragment_bytes, "fragment limit"),
-                nonzero(MAX_AU_PARTS, "compatibility per-unit fragment count"),
-                nonzero(
-                    max_in_progress_units_per_flow,
-                    "per-flow in-progress unit limit",
-                ),
-                nonzero(1, "pre-auth packet limit"),
-                nonzero(max_accounted_bytes, "pre-auth content-byte limit"),
-            ),
-            ConnectorRealtimeByteBudgets::new(
-                nonzero(max_accounted_bytes, "inbound accounted-byte limit"),
-                nonzero(max_accounted_bytes, "outbound accounted-byte limit"),
-            ),
-            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
-        );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(
-            nonzero(max_unit_bytes, "unit limit"),
-            flows,
-        )
-        .expect("fixture real-time policy can carry one guarded assembly");
-        explicit_callback_policy(1, 1, 1, 1, realtime)
+    ) -> TransportLabRealtimeWorkload {
+        TransportLabRealtimeWorkload {
+            inbound_flows: max_active_flows_per_domain,
+            outbound_flows: max_active_flows_per_domain,
+            queued_units_per_flow: queue_capacity_per_flow,
+            in_progress_units_per_inbound_flow: max_in_progress_units_per_flow,
+            fragments_per_unit: 2_048,
+            max_fragment_bytes: max_inbound_fragment_bytes,
+            max_unit_bytes,
+        }
     }
 
     #[derive(Default)]
@@ -7739,24 +9899,63 @@ mod tests {
         }
     }
 
+    /// A leased label for one fixture flow.
+    ///
+    /// The controls in this module care *which* flow a delivery is on rather
+    /// than what its name spells, so they keep naming flows by number — but
+    /// what they get back is a real minted label over a shared elastic control
+    /// registry, because a hand-built label is not the shape production ever
+    /// produces. Two calls with the same number compare equal, which is what
+    /// the demultiplexing assertions rely on.
+    ///
+    /// It stands on the crate's shared control scope, which is deliberately
+    /// never retired: a fixture label can be retained by a queued event that
+    /// outlives the control that made it.
+    fn test_label(number: u8) -> RealtimeFlowLabel {
+        control_label_for_test(
+            &RealtimeFlowName::new(format!("flow-{number}").into_bytes())
+                .expect("a fixture name is within the frame bound"),
+        )
+    }
+
+    /// The raw name a fixture flow is opened under, before any session has
+    /// accepted it and minted a lease for it.
+    fn fixture_flow_name() -> RealtimeFlowName {
+        RealtimeFlowName::new(b"fixture-flow".to_vec())
+            .expect("the fixture name is within the frame bound")
+    }
+
+    /// One inbound delivery shaped exactly as the session pump builds one: a
+    /// label this side minted and an opaque unit, with no lease attached —
+    /// the queue mints that at enqueue.
+    fn test_realtime_event(label: u8, timestamp: u32, data: &'static [u8]) -> TransportEvent {
+        TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
+            test_label(label),
+            RealtimeRecvUnit {
+                timestamp,
+                marker: true,
+                data: Bytes::from_static(data),
+            },
+        ))
+    }
+
     async fn assert_callback_class_has_independent_capacity(
         first: TransportEvent,
         second: TransportEvent,
     ) {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
+        let policy = test_realtime_workload(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         assert!(sink.emit(first).await);
         let mut retained_flow = None;
         match second {
-            event @ (TransportEvent::AudioSample(_) | TransportEvent::VideoSample(_)) => {
-                let payload_bytes = match &event {
-                    TransportEvent::AudioSample(sample) => sample.data.len(),
-                    TransportEvent::VideoSample(sample) => sample.data.len(),
-                    _ => unreachable!(),
+            event @ TransportEvent::RealtimeUnit(_) => {
+                let TransportEvent::RealtimeUnit(delivery) = &event else {
+                    unreachable!("the arm matched a real-time unit");
                 };
+                let payload_bytes = delivery.payload_bytes();
                 let flow = sink
                     .open_inbound_realtime_flow()
                     .expect("fixture admits one exact real-time flow");
@@ -7783,30 +9982,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03_control_and_audio_callback_capacity_are_independent() {
+    async fn v4_arc03_control_and_realtime_callback_capacity_are_independent() {
+        // The payload the shared policy is sized for. A longer one would be
+        // refused as oversize before the two classes were ever compared, and
+        // this control would report a capacity conclusion it had not reached.
         assert_callback_class_has_independent_capacity(
             TransportEvent::DataChannelOpen,
-            TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 0,
-                lane: 0,
-                data: Bytes::from_static(b"audio-fixture"),
-                _reservation: None,
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn v4_arc03_control_and_video_callback_capacity_are_independent() {
-        assert_callback_class_has_independent_capacity(
-            TransportEvent::DataChannelOpen,
-            TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 0,
-                key: true,
-                lane: 0,
-                data: Bytes::from_static(b"video-fixture"),
-                _reservation: None,
-            }),
+            test_realtime_event(0, 0, FIXTURE_REALTIME_PAYLOAD),
         )
         .await;
     }
@@ -7814,7 +9996,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_endpoint_data_and_realtime_callback_capacity_are_independent() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
+        let policy = test_realtime_workload(
             std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
         );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
@@ -7822,52 +10004,55 @@ mod tests {
             sink.emit(TransportEvent::Message(Bytes::from_static(b"data")))
                 .await
         );
-        let audio_flow = sink
+        let first_flow = sink
             .open_inbound_realtime_flow()
-            .expect("fixture admits the audio compatibility flow");
-        let audio = TransportEvent::AudioSample(AudioSample {
-            rtp_timestamp: 0,
-            lane: 0,
-            data: Bytes::from_static(b"audio"),
-            _reservation: None,
-        });
-        let audio_reservation = audio_flow
+            .expect("fixture admits the first real-time flow");
+        let first_reservation = first_flow
             .reserve_output(5)
-            .expect("fixture reserves the audio unit");
-        assert!(sink.emit_realtime(&audio_flow, audio, audio_reservation));
+            .expect("fixture reserves the first unit");
+        assert!(sink.emit_realtime(
+            &first_flow,
+            test_realtime_event(0, 0, b"first"),
+            first_reservation
+        ));
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_ok());
-        let video_flow = sink
+        let second_flow = sink
             .open_inbound_realtime_flow()
-            .expect("fixture admits the video compatibility flow");
-        let video = TransportEvent::VideoSample(VideoSample {
-            rtp_timestamp: 0,
-            key: true,
-            lane: 0,
-            data: Bytes::from_static(b"video"),
-            _reservation: None,
-        });
-        let video_reservation = video_flow
+            .expect("fixture admits the second real-time flow");
+        let second_reservation = second_flow
             .reserve_output(5)
-            .expect("fixture reserves the video unit");
-        assert!(sink.emit_realtime(&video_flow, video, video_reservation));
+            .expect("fixture reserves the second unit");
+        assert!(sink.emit_realtime(
+            &second_flow,
+            test_realtime_event(1, 0, b"secnd"),
+            second_reservation
+        ));
         assert!(receiver.try_recv().is_ok());
     }
 
     #[tokio::test]
     async fn v4_arc03i_close_supersedes_prequeued_endpoint_data_without_hidden_producers() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        const PREQUEUED: &[u8] = b"before-close";
+        // Exactly one endpoint payload of the prequeued size, and no spare
+        // control bytes or unreserved lifecycle slots for the overload below to
+        // be admitted out of.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                PREQUEUED.len(),
+                NonZeroUsize::new(2).expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
+        );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(
-            sink.emit_data_channel(TransportEvent::Message(Bytes::from_static(b"before-close")))
+            sink.emit_data_channel(TransportEvent::Message(Bytes::from_static(PREQUEUED)))
                 .await
         );
         assert_eq!(
@@ -7898,15 +10083,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03i_open_and_close_do_not_depend_on_control_mailbox_capacity() {
+    async fn v4_arc03i_open_and_close_remain_ordered_with_other_callbacks_queued() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        let (events, mut receiver) = test_event_mailboxes_with_workload(one, policy);
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(sink.emit(TransportEvent::LocalIceCandidate(None)).await);
@@ -7939,7 +10119,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_close_supersedes_an_uncommitted_open_exactly_once() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert_eq!(
@@ -7964,15 +10144,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03i_candidate_and_gathering_overload_retires_the_connector() {
+    async fn v4_arc03i_candidate_overload_retires_the_connector() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        let candidate_bytes = candidate_content_bytes(&observed_candidate())
+            .expect("the fixture candidate has representable content");
+        // Exactly one candidate's worth of control `QueuedBytes`, endpoint
+        // starved to a byte, and no unreserved lifecycle slot — so the second
+        // candidate meets an empty pool.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                candidate_bytes,
+                1,
+                NonZeroUsize::new(2).expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
+        );
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(
@@ -7981,9 +10170,22 @@ mod tests {
             ))
             .await
         );
+        // The second candidate rather than the gathering-complete signal this
+        // used to use. Completion carries no payload at all, and the only bound
+        // that could have refused a zero-byte control callback was the deleted
+        // item ceiling: a pool cannot refuse something that costs nothing, and
+        // the smallest grant the other class can be given is still one whole
+        // slot. A second real candidate is refused on its own `QueuedBytes`,
+        // which keeps the claim — a candidate that cannot be queued reports
+        // overload rather than vanishing, and the connector retires — pointed at
+        // the thing that still refuses.
         assert!(
-            !sink.emit(TransportEvent::LocalIceCandidate(None)).await,
-            "gathering completion reports overload instead of disappearing"
+            !sink
+                .emit(TransportEvent::LocalIceCandidate(
+                    Some(observed_candidate())
+                ))
+                .await,
+            "an unqueueable candidate reports overload instead of disappearing"
         );
         assert_eq!(
             receiver.lifecycle.phase(),
@@ -7998,7 +10200,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03i_renegotiation_and_state_observations_are_coalesced() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(sink.emit(TransportEvent::RenegotiationNeeded).await);
@@ -8035,7 +10237,7 @@ mod tests {
     #[test]
     fn v4_arc03i_first_structural_violation_retires_once() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         sink.structural_violation("first fixture violation");
@@ -8062,7 +10264,7 @@ mod tests {
             }))
         );
         let (events, receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let mut sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         sink.close_owner = Some(Arc::downgrade(&close_owner));
 
@@ -8092,7 +10294,7 @@ mod tests {
         );
         let ownership = close_owner.ownership.clone();
         let (events, raw) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let mut sink = test_event_sink_for_receiver(events, policy, None, &raw);
         sink.close_owner = Some(Arc::downgrade(&close_owner));
         let mut receiver = WebRtcConnectorEventReceiver {
@@ -8103,7 +10305,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: Some(Arc::clone(&close_owner)),
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -8136,7 +10337,7 @@ mod tests {
         );
 
         let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(NonZeroUsize::new(1).expect("one is nonzero"));
+        let policy = test_realtime_workload(NonZeroUsize::new(1).expect("one is nonzero"));
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         for _ in 0..32 {
             let NativeDataChannelAdmission::Violation(reason) =
@@ -8161,13 +10362,8 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03f_close_fence_rejects_callback_invoked_after_close_commit() {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("data-only fixture policy is valid");
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let policy = test_realtime_workload(one);
+        let (events, mut receiver) = test_event_mailboxes_with_workload(one, policy);
         let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
 
         assert!(
@@ -8191,27 +10387,23 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03g_close_retires_realtime_before_forced_realtime_dispatch() {
-        let policy = explicit_realtime_callback_policy(8, 1, 2, 8, 1, 16);
-        let (events, mut raw) = test_event_mailboxes_with_policy(policy);
+        let policy = explicit_realtime_workload(8, 1, 2, 8, 1);
+        let (events, mut raw) = test_event_mailboxes_with_workload(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+            policy,
+        );
         let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
             crate::runtime::runtime_for_test(),
         );
         let ownership = admitted_ownership(candidate);
-        ownership.realtime_delivery.store(true, Ordering::Release);
         let mut sink = test_event_sink_for_receiver(events, policy, None, &raw);
         sink.operation_fence = Arc::clone(&ownership.operation_fence);
-        sink.realtime_delivery = Arc::clone(&ownership.realtime_delivery);
         sink.callback_gate = Arc::clone(&ownership.incarnation);
 
         let flow = sink
             .open_inbound_realtime_flow()
             .expect("fixture admits one inbound flow");
-        let queued = TransportEvent::AudioSample(AudioSample {
-            rtp_timestamp: 1,
-            lane: 0,
-            data: Bytes::from_static(b"queued"),
-            _reservation: None,
-        });
+        let queued = test_realtime_event(0, 1, b"queued");
         let queued_reservation = flow
             .reserve_output(6)
             .expect("queued unit reserves its exact bytes");
@@ -8228,12 +10420,7 @@ mod tests {
         );
         assert!(sink.emit_realtime(
             &flow,
-            TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 2,
-                lane: 0,
-                data: Bytes::from_static(b"later"),
-                _reservation: None,
-            }),
+            test_realtime_event(0, 2, b"later"),
             invoked_after_close,
         ));
         {
@@ -8251,7 +10438,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: true,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -8269,13 +10455,8 @@ mod tests {
     fn v4_arc03_scheduler_gives_each_ready_class_a_bounded_service_turn() {
         let capacity = 3;
         let (events, mut receiver) = test_event_mailboxes(capacity);
-        receiver.scheduler = ConnectorCallbackScheduler::new(explicit_callback_policy(
-            capacity,
-            2,
-            1,
-            1,
-            RealtimeConnectorPolicy::enabled(),
-        ));
+        receiver.scheduler =
+            ConnectorCallbackScheduler::new(ConnectorCallbackPolicy::elastic_realtime());
         for candidate in ["candidate-1", "candidate-2", "candidate-3"] {
             events
                 .try_insert_for_test(
@@ -8304,23 +10485,22 @@ mod tests {
             .expect("zero-byte fixture unit is admitted");
         assert!(realtime_flow.enqueue(
             QueuedTransportEvent {
-                event: TransportEvent::VideoSample(VideoSample {
-                    rtp_timestamp: 0,
-                    key: true,
-                    lane: 0,
-                    data: Bytes::new(),
-                    _reservation: None,
-                }),
+                event: test_realtime_event(0, 0, b""),
                 observation: None,
                 callback_work: None,
             },
             reservation,
         ));
 
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(TransportEvent::LocalIceCandidate(_))
-        ));
+        // One quantum per ready class, so the rotation visits each ready class
+        // once before returning to control. The leading pair of control
+        // deliveries this used to assert was the owner-selected service weight
+        // for that class; with the weights gone every class scores one, and the
+        // property the control is named for is the rotation itself: each ready
+        // class gets a turn, and the two control deliveries at the end are the
+        // work-conserving half — an empty class is skipped rather than waited
+        // on, so control is served again immediately instead of the rotation
+        // stalling on the two classes that have drained.
         assert!(matches!(
             receiver.try_recv(),
             Ok(TransportEvent::LocalIceCandidate(_))
@@ -8331,7 +10511,11 @@ mod tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::VideoSample(_))
+            Ok(TransportEvent::RealtimeUnit(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(TransportEvent::LocalIceCandidate(_))
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -8352,10 +10536,7 @@ mod tests {
                     label: "Lifecycle fixture".to_string(),
                     nonce: "nonce".to_string(),
                     verification_code: "code".to_string(),
-                    capabilities: None,
-                    max_connections: None,
                     features: Vec::new(),
-                    app_version: None,
                 },
             ))
             .expect("fixture Hello serializes"),
@@ -8448,7 +10629,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -8479,7 +10659,7 @@ mod tests {
     #[test]
     fn v4_arc03_observer_panic_cannot_poison_realtime_resource_ownership() {
         let registry = test_realtime_registry_with_observer(
-            explicit_realtime_callback_policy(16, 1, 1, 16, 1, 32),
+            explicit_realtime_workload(16, 1, 1, 16, 1),
             Arc::new(PanickingRealtimeObserver) as Arc<dyn RealtimeFlowObserver>,
         );
         let first = registry
@@ -8494,70 +10674,86 @@ mod tests {
     }
 
     #[test]
+    /// Two flows queue independently, and one exhausting the grant does not
+    /// take capacity from the other.
+    ///
+    /// The bound used to be a per-flow queue count, and the control drove one
+    /// flow into it. There is no count now, so the fixture funds exactly two
+    /// queued units across two flows and the third reservation is refused by
+    /// the provider — which is the same shape of refusal aimed at the thing
+    /// that actually still refuses.
     fn v4_arc03_realtime_flows_have_independent_bounded_queues() {
-        let policy = explicit_realtime_callback_policy(16, 2, 1, 16, 2, 32);
+        // Two flows, two queued units, and nothing else. The shared envelope
+        // cannot state this: it funds a native read per inbound flow and an
+        // assembly per in-progress unit, and both spend the same
+        // `CallbackOrScheduledWork` an output reservation does, so the third
+        // reservation below is afforded out of capacity for work this control
+        // never performs.
+        let unit_bytes = 5usize;
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            claims.extend(exact_realtime_open_claims());
+            claims.push(
+                RealtimeFlowRegistry::output_claim(unit_bytes)
+                    .expect("the output claim is representable"),
+            );
+            claims.push(
+                RealtimeFlowRegistry::queue_claim(unit_bytes)
+                    .expect("the queued-byte claim is representable"),
+            );
+            claims.push(
+                RealtimeFlowRegistry::queued_event_node_claim()
+                    .expect("the queue node claim is representable"),
+            );
+            // The ready obligation belongs to the enqueue, not to the open.
+            claims.push(
+                RealtimeFlowRegistry::ready_claim().expect("the ready claim is representable"),
+            );
+        }
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = test_realtime_registry_with_observer(
-            policy,
+        let (registry, _grant) = exact_realtime_registry_with_observer(
+            claims,
             observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
-        let video = registry
+        let first = registry
             .open_inbound_flow()
             .expect("first flow is admitted");
-        let audio = registry
+        let second = registry
             .open_inbound_flow()
             .expect("second flow is admitted");
 
-        let video_unit = |timestamp| {
-            TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: timestamp,
-                key: false,
-                lane: 0,
-                data: Bytes::from_static(b"video"),
-                _reservation: None,
-            })
-        };
-        let audio_unit = TransportEvent::AudioSample(AudioSample {
-            rtp_timestamp: 1,
-            lane: 0,
-            data: Bytes::from_static(b"audio"),
-            _reservation: None,
-        });
-
-        assert!(video.enqueue(
+        assert!(first.enqueue(
             QueuedTransportEvent {
-                event: video_unit(1),
+                event: test_realtime_event(0, 1, b"first"),
                 observation: None,
                 callback_work: None,
             },
-            video.reserve_output(5).expect("video unit is reserved"),
+            first.reserve_output(5).expect("first unit is reserved"),
         ));
-        assert!(video.enqueue(
+        assert!(second.enqueue(
             QueuedTransportEvent {
-                event: video_unit(2),
+                event: test_realtime_event(1, 1, b"secnd"),
                 observation: None,
                 callback_work: None,
             },
-            video
-                .reserve_output(5)
-                .expect("full-queue unit is still measured before refusal"),
+            second.reserve_output(5).expect("second unit is reserved"),
         ));
-        assert!(audio.enqueue(
-            QueuedTransportEvent {
-                event: audio_unit,
-                observation: None,
-                callback_work: None,
-            },
-            audio.reserve_output(5).expect("audio unit is reserved"),
-        ));
+        assert!(
+            first.reserve_output(5).is_none(),
+            "the grant funds two queued units, and the third is refused"
+        );
 
         assert!(matches!(
             registry.try_recv().map(|queued| queued.event),
-            Some(TransportEvent::VideoSample(sample)) if sample.rtp_timestamp == 1
+            Some(TransportEvent::RealtimeUnit(delivery))
+                if delivery.label == test_label(0)
+                    && delivery.unit.timestamp == 1
         ));
         assert!(matches!(
             registry.try_recv().map(|queued| queued.event),
-            Some(TransportEvent::AudioSample(sample)) if sample.rtp_timestamp == 1
+            Some(TransportEvent::RealtimeUnit(delivery))
+                if delivery.label == test_label(1)
+                    && delivery.unit.timestamp == 1
         ));
         assert!(registry.try_recv().is_none());
         let state = registry.state.lock();
@@ -8568,48 +10764,46 @@ mod tests {
             matches!(
                 observation,
                 RealtimeFlowObservation::Drop {
-                    reason: RealtimeFlowDropReason::FlowQueueFull,
+                    reason: RealtimeFlowDropReason::ResourceUnavailable(_),
                     ..
                 }
             )
         }));
     }
 
+    // A control asserting that inbound saturation cannot consume the outbound
+    // slot used to live here. Its premise was the owner-selected per-domain flow
+    // partition, and that partition is gone: what funds a flow now is one pooled
+    // provider grant with no domain in it, so a second inbound open legitimately
+    // spends what a fixture intended for an outbound flow. No choice of grant
+    // size restores the guarantee — a pool cannot express a partition — and
+    // rebuilding one out of per-domain scopes would be reintroducing the policy
+    // under a new name. The property is not weakened here, it no longer exists.
+
+    /// The bytes follow the delivery, whole, into whatever holds it next.
+    ///
+    /// This used to move the lease by *cloning* it, when the payload owner was
+    /// an `Arc`, and asserted the bytes stayed charged until the last of several
+    /// owners went away. There is no last-of-several now, and no way to reach
+    /// the lease at all: the delivery has no accessor that hands its parts back,
+    /// so the only thing a downstream holder can be given is the whole value.
+    ///
+    /// That is what this proves, and it is the strongest statement the shape
+    /// admits: moving the delivery downstream moves the charge with it — the
+    /// place it came from releases nothing — and the bytes come back exactly
+    /// when the downstream holder drops it. A control that took the delivery
+    /// apart to watch one part would be exercising an escape production does not
+    /// have.
     #[test]
-    fn v4_arc03f_inbound_and_outbound_flow_slots_cannot_starve_each_other() {
-        let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
-        let registry = test_realtime_registry(policy);
-
-        let inbound = registry
-            .open_inbound_flow()
-            .expect("the inbound quarantine owns its slot");
-        assert!(registry.open_inbound_flow().is_none());
-        let outbound = registry
-            .open_outbound_flow()
-            .expect("inbound saturation cannot consume the outbound slot");
-        assert!(registry.open_outbound_flow().is_none());
-
-        drop(inbound);
-        assert!(registry.open_inbound_flow().is_some());
-        drop(outbound);
-        assert!(registry.open_outbound_flow().is_some());
-    }
-
-    #[test]
-    fn v4_arc03f_realtime_bytes_follow_payload_clones_through_downstream_queues() {
-        let policy = explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16);
+    fn v4_arc03f_realtime_bytes_follow_the_payload_owner_through_downstream_queues() {
+        let policy = explicit_realtime_workload(8, 1, 1, 8, 1);
         let registry = test_realtime_registry(policy);
         let flow = registry
             .open_inbound_flow()
             .expect("fixture inbound flow is admitted");
         assert!(flow.enqueue(
             QueuedTransportEvent {
-                event: TransportEvent::AudioSample(AudioSample {
-                    rtp_timestamp: 1,
-                    lane: 0,
-                    data: Bytes::from_static(b"owned"),
-                    _reservation: None,
-                }),
+                event: test_realtime_event(0, 1, b"owned"),
                 observation: None,
                 callback_work: None,
             },
@@ -8618,19 +10812,32 @@ mod tests {
 
         let queued = registry.try_recv().expect("queued payload is serviceable");
         assert_eq!(retained_realtime_bytes(&registry.state.lock()), 5);
-        let TransportEvent::AudioSample(sample) = queued.event else {
-            panic!("fixture receives its audio unit");
+        let TransportEvent::RealtimeUnit(delivery) = queued.event else {
+            panic!("fixture receives its real-time unit");
         };
-        let downstream_clone = sample.clone();
-        drop(sample);
-        assert_eq!(retained_realtime_bytes(&registry.state.lock()), 5);
-        drop(downstream_clone);
+        assert!(
+            format!("{delivery:?}").contains("leased: true"),
+            "non-vacuity: the delivery really is holding the payload owner, so \
+             the release below is caused by dropping it rather than by there \
+             being nothing to release"
+        );
+
+        // Downstream: the delivery moves on as one value, which is the only way
+        // it can move at all.
+        let downstream = vec![delivery];
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            5,
+            "the charge travelled with the delivery instead of being released \
+             where it came from"
+        );
+        drop(downstream);
         assert_eq!(retained_realtime_bytes(&registry.state.lock()), 0);
     }
 
     #[tokio::test]
     async fn v4_arc03f_complete_realtime_unit_has_no_wall_clock_expiry() {
-        let policy = explicit_realtime_callback_policy(16, 1, 2, 16, 1, 32);
+        let policy = explicit_realtime_workload(16, 1, 2, 16, 1);
         let observer = Arc::new(TestRealtimeObserver::default());
         let registry = test_realtime_registry_with_observer(
             policy,
@@ -8639,12 +10846,7 @@ mod tests {
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         assert!(flow.enqueue(
             QueuedTransportEvent {
-                event: TransportEvent::AudioSample(AudioSample {
-                    rtp_timestamp: 7,
-                    lane: 0,
-                    data: Bytes::from_static(b"stale"),
-                    _reservation: None,
-                }),
+                event: test_realtime_event(0, 7, b"stale"),
                 observation: None,
                 callback_work: None,
             },
@@ -8668,82 +10870,109 @@ mod tests {
             .any(|observation| { matches!(observation, RealtimeFlowObservation::Drop { .. }) }));
     }
 
+    /// A byte claim is taken before the bytes are recorded, so a refusal leaves
+    /// the accounting exactly where it was.
+    ///
+    /// Most of what this control used to assert was ceiling arithmetic — that a
+    /// unit ceiling was consulted before a fragment ceiling, that the next byte
+    /// was refused at a connector aggregate, that an oversized output and an
+    /// oversized fragment were rejected on sight. None of those checks exist:
+    /// there is no unit ceiling, no aggregate, and no oversize refusal standing
+    /// in front of the claim. The claim *is* the admission.
+    ///
+    /// What survives is the ordering the name states, and it is the part that
+    /// actually protects the accounting: the provider is asked first, and the
+    /// domain's retained-byte total moves only if the answer was yes. A refused
+    /// fragment and a refused output each leave the total untouched, which is
+    /// what makes a refusal safe to retry rather than a silent leak.
     #[test]
     fn v4_arc03_realtime_byte_claims_precede_fragment_and_output_retention() {
-        let policy = explicit_realtime_callback_policy(4, 1, 1, 4, 1, 8);
-        let registry = test_realtime_registry(policy);
+        let bytes = 4usize;
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::assembly_claim()
+                    .expect("the assembly claim is representable"),
+                RealtimeFlowRegistry::ordered_fragment_claim(bytes)
+                    .expect("the ordered fragment claim is representable"),
+                RealtimeFlowRegistry::output_claim(bytes)
+                    .expect("the output claim is representable"),
+            ]),
+        );
         let flow = registry.open_inbound_flow().expect("flow is admitted");
-        let mut assembly = flow.begin_unit().expect("first unit is admitted");
-        assert!(flow.begin_unit().is_none(), "in-progress limit is exact");
-        assert!(assembly.retain_fragment(4));
+        let mut assembly = flow.begin_unit().expect("the funded unit is admitted");
+
+        assert!(assembly.retain_ordered_fragment(bytes));
+        assert_eq!(retained_realtime_bytes(&registry.state.lock()), bytes);
         assert!(
-            !assembly.retain_fragment(3),
-            "unit ceiling is checked first"
+            !assembly.retain_ordered_fragment(bytes),
+            "the grant funds one retained fragment, and the second is refused"
         );
-        let concurrent_output = flow
-            .reserve_output(4)
-            .expect("one complete output fits beside the guarded input");
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            bytes,
+            "the refused fragment retained nothing: the claim came first, so the \
+             total is exactly where the successful fragment left it"
+        );
+
+        let output = flow
+            .reserve_output(bytes)
+            .expect("the funded output is admitted beside the guarded input");
+        assert_eq!(retained_realtime_bytes(&registry.state.lock()), bytes * 2);
         assert!(
-            flow.reserve_output(1).is_none(),
-            "the next byte is refused at the connector aggregate"
+            flow.reserve_output(bytes).is_none(),
+            "the grant funds one output reservation, and the second is refused"
         );
-        drop(concurrent_output);
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            bytes * 2,
+            "and the refused output retained nothing either"
+        );
+
+        drop(output);
         drop(assembly);
-
-        let first_output = flow.reserve_output(4).expect("first output is admitted");
-        let second_output = flow
-            .reserve_output(4)
-            .expect("the exact aggregate ceiling is admitted");
-        assert!(flow.reserve_output(1).is_none());
-        drop(first_output);
-        drop(second_output);
-        assert!(
-            flow.reserve_output(5).is_none(),
-            "oversized output is refused"
-        );
-
-        let mut oversized_fragment = flow.begin_unit().expect("unit slot was released");
-        assert!(!oversized_fragment.retain_fragment(5));
-        drop(oversized_fragment);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
         assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
         assert_eq!(state.accounting_poisoned_by_domain, [false, false]);
     }
 
+    /// How many fragments one unit may retain is a funding question now.
+    ///
+    /// It used to be a `fragments_per_unit` ceiling the assembler counted
+    /// against. That number is gone, and what stops an unbounded fragment
+    /// stream is that each retained fragment holds an exact claim for as long as
+    /// the assembly lives: fund one and the second is refused, and the refusal
+    /// is the provider's rather than a counter's. Still structural in the sense
+    /// the name claims — no timer, no cumulative tally, and the capacity comes
+    /// back exactly when the assembly drops.
+    ///
+    /// The grant is enumerated rather than shaped, because the shared envelope
+    /// funds a packet-work lease per inbound pump and a fragment and a packet
+    /// work both spend `ParsingOrCpuWork`. Under that envelope the second
+    /// fragment is afforded out of pump capacity this control never uses.
     #[test]
     fn v4_arc03f_realtime_fragment_count_is_structurally_bounded() {
-        let nonzero = |value| NonZeroUsize::new(value).expect("fixture value is nonzero");
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(nonzero(1), nonzero(1), nonzero(1)),
-            ConnectorRealtimeInboundLimits::new(
-                nonzero(4),
-                nonzero(1),
-                nonzero(1),
-                nonzero(1),
-                nonzero(4),
-            ),
-            ConnectorRealtimeByteBudgets::new(nonzero(8), nonzero(4)),
-            crate::runtime::attempt::RealtimeQueueOverflowRule::DropNewest,
+        let fragment_bytes = 1usize;
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::assembly_claim()
+                    .expect("the assembly claim is representable"),
+                RealtimeFlowRegistry::ordered_fragment_claim(fragment_bytes)
+                    .expect("the ordered fragment claim is representable"),
+            ]),
         );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(nonzero(4), flows)
-            .expect("fixture can hold one guarded input and output");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                nonzero(1),
-                nonzero(1),
-            ),
-            ConnectorCallbackServiceWeights::new(nonzero(1), nonzero(1), nonzero(1)),
-            realtime,
-        )
-        .expect("fixture callback policy is valid");
-        let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let mut assembly = flow.begin_unit().expect("unit is admitted");
 
-        assert!(assembly.retain_fragment(1));
-        assert!(!assembly.retain_fragment(1));
-        assert_eq!(retained_realtime_bytes(&registry.state.lock()), 1);
+        assert!(assembly.retain_ordered_fragment(fragment_bytes));
+        assert!(
+            !assembly.retain_ordered_fragment(fragment_bytes),
+            "the grant funds one retained fragment, and the second is refused"
+        );
+        assert_eq!(
+            retained_realtime_bytes(&registry.state.lock()),
+            fragment_bytes
+        );
 
         drop(assembly);
         let state = registry.state.lock();
@@ -8752,9 +10981,25 @@ mod tests {
         assert!(realtime_accounting_is_clean(&state));
     }
 
+    /// Damaged local accounting is contained to the domain that suffered it.
+    ///
+    /// This used to assert that corruption *failed closed*: the damaged domain
+    /// was pinned to the owner's byte ceiling, so every later admission was
+    /// refused against a number the registry had invented for itself. There is
+    /// no ceiling to pin it to now, and — more to the point — nothing for the
+    /// registry to refuse against: what admits real-time work is the provider,
+    /// whose accounting is exact and entirely unaffected by a local counter
+    /// going wrong. Refusing here would mean refusing work the provider has
+    /// already funded, on the strength of a number this registry itself knows is
+    /// untrustworthy.
+    ///
+    /// What survives is the containment, which is the part that was ever this
+    /// registry's to promise: the damaged domain stops reporting a figure rather
+    /// than reporting a wrong one, and the independent domain is untouched and
+    /// still admits work.
     #[test]
-    fn v4_arc03_realtime_accounting_corruption_fails_closed() {
-        let policy = explicit_realtime_callback_policy(4, 1, 1, 4, 1, 8);
+    fn v4_arc03_realtime_accounting_corruption_is_contained_per_domain() {
+        let policy = explicit_realtime_workload(4, 1, 1, 4, 1);
         let registry = test_realtime_registry(policy);
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let reservation = flow.reserve_output(4).expect("output is admitted");
@@ -8764,44 +11009,71 @@ mod tests {
 
         let state = registry.state.lock();
         assert!(state.accounting_poisoned_by_domain[RealtimeFlowDomain::InboundQuarantine.index()]);
-        assert_eq!(
-            state.retained_bytes_by_domain[RealtimeFlowDomain::InboundQuarantine.index()],
-            8,
-            "a damaged domain is conservatively charged at its full ceiling"
-        );
         assert!(
             !state.accounting_poisoned_by_domain[RealtimeFlowDomain::OutboundCompatibility.index()]
         );
         drop(state);
-        assert!(registry.open_inbound_flow().is_none());
-        assert!(flow.reserve_output(1).is_none());
         assert!(
             registry.open_outbound_flow().is_some(),
             "inbound accounting corruption does not poison the independent outbound owner"
         );
     }
 
+    /// Sustained inbound RTP is bounded by the per-packet work claim rather
+    /// than by any cumulative counter: a packet is admitted only while the
+    /// provider still owns capacity for the classification and framing it is
+    /// about to cost, and that capacity returns when the packet's work does.
     #[test]
-    fn v4_arc03h_sustained_pre_auth_rtp_exhausts_a_finite_cumulative_envelope() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+    fn v4_arc03h_sustained_inbound_rtp_is_bounded_by_its_exact_packet_work() {
+        // The shared shaped envelope cannot state this. It funds one
+        // ordered-fragment claim per admissible fragment, and a fragment claim
+        // spends `ParsingOrCpuWork` — the only dimension the packet claim is
+        // scarce in — so under it the second packet below is afforded out of
+        // fragment capacity this control never retains a fragment against, and
+        // the refusal is unreachable. Scarcity has to be built for the claim
+        // under test or it is not scarcity at all.
+        //
+        // This used to build that grant inline on `explicit_test_grant(1, 1)`,
+        // and the comment above it claimed the enumeration was what kept the
+        // refusal honest. It was not: that base adds one spare
+        // `connector_operation_claim` per fixture candidate, carrying exactly
+        // one `ParsingOrCpuWork` that nothing here holds — so the second packet
+        // was afforded after all, and this control was passing on capacity it
+        // had never named. It shares `exact_realtime_work_scope` now, which
+        // funds only the records the scope genuinely reserves.
+        //
+        // The ready obligation is gone from the list for the same reason: a
+        // ready lease belongs to an enqueue, and this control never enqueues.
+        let packet_bytes = 8usize;
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::session_packet_work_claim(packet_bytes)
+                    .expect("the packet work claim is representable"),
+            ]),
+        );
+
         let _flow = registry
             .open_inbound_flow()
-            .expect("explicit provider owns one speculative inbound flow");
+            .expect("the exact grant owns one speculative inbound flow");
 
-        assert!(registry.admit_pre_auth_packet(8, false));
+        let packet = registry
+            .admit_session_packet_checked(packet_bytes)
+            .expect("and one inbound pump's packet work");
         assert!(
-            !registry.admit_pre_auth_packet(1, false),
-            "the packet ceiling stops sustained speculative work without a timer"
+            !registry.admit_session_packet(packet_bytes),
+            "a second concurrent packet has no unowned work capacity"
         );
-        let state = registry.state.lock();
-        assert_eq!(state.pre_auth_packets, 1);
-        assert_eq!(state.pre_auth_content_bytes, 8);
-        assert!(state.pre_auth_exhausted);
+
+        drop(packet);
+        assert!(
+            registry.admit_session_packet(packet_bytes),
+            "and completing the packet returns exactly that capacity"
+        );
     }
 
     #[tokio::test]
     async fn v4_arc03_cancelled_realtime_output_work_releases_its_claim() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_workload(8, 1, 1, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -8823,16 +11095,11 @@ mod tests {
 
     #[test]
     fn v4_arc03_realtime_flow_retirement_drains_its_owned_queue() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 2, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_workload(8, 1, 2, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
         assert!(flow.enqueue(
             QueuedTransportEvent {
-                event: TransportEvent::AudioSample(AudioSample {
-                    rtp_timestamp: 1,
-                    lane: 0,
-                    data: Bytes::from_static(b"owned"),
-                    _reservation: None,
-                }),
+                event: test_realtime_event(0, 1, b"owned"),
                 observation: None,
                 callback_work: None,
             },
@@ -8842,53 +11109,53 @@ mod tests {
         drop(flow);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
-        assert!(state.flows.is_empty());
+        // `len() == 0` rather than `is_empty()`: a `LeasedMap` deliberately has
+        // no `is_empty`, because emptiness there is a claim about released
+        // leases and not merely about entry count, and one method answering
+        // both would let a caller read the weaker fact as the stronger one.
+        assert_eq!(state.flows.len(), 0, "every flow record is gone");
         assert!(state.ready.is_empty());
         assert!(realtime_accounting_is_clean(&state));
     }
 
     #[tokio::test]
-    async fn v4_arc03_endpoint_and_realtime_units_have_independent_limits() {
+    /// Each payload is admitted at the size it actually is, in its own family.
+    ///
+    /// This used to also assert that the owner's real-time unit ceiling did not
+    /// reach the endpoint class — a real-time payload ceiling could be stated,
+    /// and the control's job was to show it stopped where it should. No ceiling
+    /// of either kind exists now, so what is left to hold is the part that was
+    /// always load-bearing: an endpoint frame and a real-time unit are admitted
+    /// separately, against their own families, at their own real sizes.
+    async fn v4_arc03_endpoint_and_realtime_payloads_are_admitted_at_their_actual_size() {
         let realtime_limit = 4;
-        let policy = explicit_realtime_callback_policy(realtime_limit, 1, 2, realtime_limit, 1, 16);
-        assert_eq!(
-            callback_payload_limit(policy, ConnectorCallbackClass::EndpointData),
-            Some(crate::engine::MAX_ENDPOINT_FRAME_BYTES)
-        );
-        assert_eq!(
-            callback_payload_limit(policy, ConnectorCallbackClass::Realtime),
-            Some(realtime_limit)
-        );
+        let policy = explicit_realtime_workload(realtime_limit, 1, 2, realtime_limit, 1);
 
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let (events, mut receiver) = test_event_mailboxes_with_workload(
+            NonZeroUsize::new(1).expect("one is nonzero"),
+            policy,
+        );
         let sink = test_event_sink_for_receiver(events, policy, Some(scope.clone()), &receiver);
 
         let flow = sink
             .open_inbound_realtime_flow()
             .expect("fixture admits one exact real-time flow");
-        assert!(flow.reserve_output(5).is_none());
         assert!(receiver.try_recv().is_err());
 
         assert!(
             sink.emit(TransportEvent::Message(Bytes::from_static(b"12345")))
                 .await
         );
-        let video = TransportEvent::VideoSample(VideoSample {
-            rtp_timestamp: 1,
-            key: true,
-            lane: 0,
-            data: Bytes::from_static(b"1234"),
-            _reservation: None,
-        });
+        let unit = test_realtime_event(0, 1, b"1234");
         let reservation = flow
             .reserve_output(4)
             .expect("fixture reserves the complete real-time unit");
-        assert!(sink.emit_realtime(&flow, video, reservation));
+        assert!(sink.emit_realtime(&flow, unit, reservation));
 
         let report = scope.report();
         let frame = report
@@ -8909,7 +11176,7 @@ mod tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::VideoSample(_))
+            Ok(TransportEvent::RealtimeUnit(_))
         ));
     }
 
@@ -9036,7 +11303,7 @@ mod tests {
         let owner = test_resource_owner(2, 1);
         let (close_owner, _lifetime) = close_owner_fixture(&owner);
         let calls = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate = TestNativeCloseGate::new();
         assert!(
             close_owner.attach_native_port(Arc::new(TestNativeClosePort {
                 result: TestNativeCloseResult::Gate(Arc::clone(&gate)),
@@ -9078,7 +11345,7 @@ mod tests {
         assert_eq!(owner.report().failed_cleanup_candidates, 0);
         assert!(!owner.report().accounting_poisoned);
 
-        gate.notify_one();
+        gate.open();
         tokio::time::timeout(Duration::from_secs(1), close_owner.wait())
             .await
             .expect("released native dependency completes")
@@ -9161,7 +11428,7 @@ mod tests {
         let owner = test_resource_owner(1, 1);
         let (close_owner, _lifetime) = close_owner_fixture(&owner);
         let calls = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate = TestNativeCloseGate::new();
         assert!(
             close_owner.attach_native_port(Arc::new(TestNativeClosePort {
                 result: TestNativeCloseResult::Gate(gate),
@@ -9313,7 +11580,7 @@ mod tests {
             DataChannelOpenTransition::Connected(capability) => capability,
             _ => panic!("fixture connector promotes"),
         };
-        let task = crate::endpoint_auth::EndpointAuthTask::begin(EndpointAuthHandoff::new(
+        let task = task_from_handoff(EndpointAuthHandoff::new(
             connected,
             Arc::clone(&close_owner.ownership.incarnation),
             Arc::clone(&close_owner),
@@ -9327,6 +11594,671 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    // ---- Arc 04 endpoint-authentication controls -------------------------
+    //
+    // These live here rather than in `endpoint_auth` because the ownership
+    // half of the property needs real connector incarnations and a real close
+    // owner, which is exactly what `close_owner_fixture` provides. The
+    // transcript half is covered by the controls in `endpoint_auth::tests`.
+
+    /// The fixture Device keys. Seed 1 is this endpoint, seed 2 the expected
+    /// remote; both match the identities the fixture task is constructed with,
+    /// so a proof signed by seed 2 is the one it will accept. Any other seed is
+    /// an impostor by construction.
+    fn auth_key(seed: u8) -> (ed25519_dalek::SigningKey, String) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let device_id = data_encoding::BASE32_NOPAD
+            .encode(signing_key.verifying_key().as_bytes())
+            .to_lowercase();
+        (signing_key, device_id)
+    }
+
+    type AuthTaskFixture = (
+        Arc<crate::endpoint_auth::EndpointAuthTask>,
+        Arc<ConnectorCloseOwner>,
+        AttemptLifetime,
+        Arc<AtomicUsize>,
+    );
+
+    /// One live endpoint-auth task over a fresh connector incarnation.
+    fn auth_task_fixture(owner: &MeshConnectorResourceScope) -> AuthTaskFixture {
+        auth_task_fixture_with(owner, None, TestNativeCloseResult::Success)
+    }
+
+    /// The same fixture with the native close held open by a caller's gate.
+    ///
+    /// Only the refused-proof control uses it, and only because the property it
+    /// asserts is a *during*: the connected claim stays owned while the one
+    /// native close is in flight. With the ungated port that window is not
+    /// observable — the dedicated cleanup thread may finish the close before
+    /// any assertion runs, so the same assertion would be a race rather than a
+    /// control. The gate makes the window exact instead of timed.
+    fn auth_task_fixture_gated(
+        owner: &MeshConnectorResourceScope,
+        gate: Arc<TestNativeCloseGate>,
+    ) -> AuthTaskFixture {
+        auth_task_fixture_with(owner, None, TestNativeCloseResult::Gate(gate))
+    }
+
+    /// The same fixture, forcing this endpoint's contribution to a prior value.
+    ///
+    /// Only the same-certificate control uses it, and only to build the case
+    /// production freshness makes unreachable.
+    fn auth_task_fixture_reusing(
+        owner: &MeshConnectorResourceScope,
+        local_contribution: &str,
+    ) -> AuthTaskFixture {
+        auth_task_fixture_with(
+            owner,
+            Some(local_contribution),
+            TestNativeCloseResult::Success,
+        )
+    }
+
+    fn auth_task_fixture_with(
+        owner: &MeshConnectorResourceScope,
+        reuse: Option<&str>,
+        native_close: TestNativeCloseResult,
+    ) -> AuthTaskFixture {
+        let (close_owner, lifetime) = close_owner_fixture(owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: native_close,
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let handoff = EndpointAuthHandoff::new(
+            connected,
+            Arc::clone(&close_owner.ownership.incarnation),
+            Arc::clone(&close_owner),
+        );
+        let task = Arc::new(match reuse {
+            Some(value) => task_from_handoff_reusing(handoff, value),
+            None => task_from_handoff(handoff),
+        });
+        (task, close_owner, lifetime, calls)
+    }
+
+    /// One fresh peer contribution, as the wire would carry it.
+    fn peer_draw() -> crate::endpoint_auth::PeerContribution {
+        crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("a generated draw is canonical")
+    }
+
+    /// What the exchange drivers return.
+    ///
+    /// Spelled through `std::result::Result` on purpose. This module has the
+    /// crate-wide `Result<T>` alias in scope, which fixes the error type to
+    /// `crate::Error`, so a bare `Result<Capability, EndpointAuthError>` here is
+    /// not a two-parameter `Result` at all — it silently resolves to the alias.
+    /// These drivers must surface the exact `EndpointAuthError` the typed
+    /// assertions below match on, so the error type is named explicitly rather
+    /// than left to whichever `Result` happens to be in scope.
+    ///
+    /// The success side is the task's own closed outcome, not a bare capability.
+    /// An attempt that has already promoted is not a failure of this exchange,
+    /// so it does not appear on the error side at all: `Err` here means the task
+    /// terminalized, which is exactly what the refusal controls below assert.
+    type ExchangeResult = std::result::Result<
+        crate::endpoint_auth::PeerProofAcceptance,
+        crate::endpoint_auth::EndpointAuthError,
+    >;
+
+    /// Drive one task through its exchange using typed inputs only.
+    ///
+    /// The mesh, the profile, the Device pair, the channel binding, this
+    /// endpoint's own contribution and its own local proof all belong to the
+    /// task and none of them is supplied here. A control chooses exactly two
+    /// things: the peer contribution that binds the attempt, and which key signs
+    /// the peer's half. The signature itself is built inside `endpoint_auth`
+    /// from the task's own context, so no control can make a proof verify by
+    /// describing an exchange the task does not hold — which is precisely what
+    /// the deleted all-facts entry point allowed.
+    fn drive_exchange(
+        task: &crate::endpoint_auth::EndpointAuthTask,
+        peer: &crate::endpoint_auth::PeerContribution,
+        peer_key: &ed25519_dalek::SigningKey,
+    ) -> ExchangeResult {
+        task.accept_peer_hello(peer.clone())?;
+        let proof = crate::endpoint_auth::peer_proof_for_test(task, peer, peer_key);
+        task.accept_peer_proof(&proof)
+    }
+
+    /// The same two typed steps, with the peer's half supplied verbatim.
+    ///
+    /// Only for the replay control, which must offer a signature captured from
+    /// a different channel rather than one built for this task.
+    fn drive_exchange_with_signature(
+        task: &crate::endpoint_auth::EndpointAuthTask,
+        peer: &crate::endpoint_auth::PeerContribution,
+        peer_signature: &str,
+    ) -> ExchangeResult {
+        task.accept_peer_hello(peer.clone())?;
+        task.accept_peer_proof(peer_signature)
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_complete_transcript_promotes_the_exact_channel() {
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let (remote_key, _remote_id) = auth_key(2);
+        let remote_c = peer_draw();
+
+        let authenticated = drive_exchange(&task, &remote_c, &remote_key)
+            .expect("a complete mutual proof over the exact channel promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
+        drop(authenticated);
+
+        // The handoff is consumed exactly once: replaying the whole exchange
+        // against this task finds no channel left to move. The Hello is an exact
+        // duplicate and is still answered from the cached proof, and promotion
+        // states that it already happened — so the replay yields no second
+        // capability, without the intact task being reported as terminal.
+        assert!(
+            matches!(
+                drive_exchange(&task, &remote_c, &remote_key)
+                    .expect("a replay against a promoted attempt is not a refusal"),
+                crate::endpoint_auth::PeerProofAcceptance::AlreadyPromoted
+            ),
+            "one channel yields at most one authenticated capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_refused_remote_half_is_terminal_and_drives_exactly_one_native_close() {
+        // The failure path that positive-only tests miss. A refusal is terminal
+        // and drops the handoff there and then — which is what runs connector
+        // retention — so the refused attempt neither strands the claim nor
+        // releases it behind the close it is supposed to drive. The native
+        // close is held on a gate so each of those is asserted at a point where
+        // it is actually decided, rather than wherever the dedicated cleanup
+        // thread happened to be.
+        let owner = test_resource_owner(1, 1);
+        let gate = TestNativeCloseGate::new();
+        let (task, close_owner, _lifetime, calls) =
+            auth_task_fixture_gated(&owner, Arc::clone(&gate));
+        // Signed by a key that is not the expected remote Device.
+        let (impostor_key, _) = auth_key(9);
+        let (remote_key, _remote_id) = auth_key(2);
+        let remote_c = peer_draw();
+
+        // Non-vacuity: the channel is claimed and nothing has closed yet, so
+        // every transition below is one this refusal caused.
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        assert_eq!(
+            drive_exchange(&task, &remote_c, &impostor_key).err(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "an impostor's half is refused with the exact typed cause"
+        );
+        assert_eq!(
+            task.terminal_error(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "and the refusal is terminal for this exact task"
+        );
+
+        // No retry, and no promotion by a later genuine half. The task keeps the
+        // cause that actually refused it rather than reporting whichever
+        // lifecycle event reached it next, so a refused channel cannot be
+        // reopened by supplying the key it was expecting all along.
+        assert_eq!(
+            drive_exchange(&task, &peer_draw(), &remote_key).err(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "the first cause stands and the genuine remote cannot promote it"
+        );
+
+        // Exactly one native close begins, driven by the terminal release
+        // itself: the task is still alive here, so nothing but the refusal put
+        // this connector into close.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal release drives the connector's native close");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // While that close is in flight the connected claim is still owned. An
+        // unheld close could complete before this line, which is why the gate
+        // exists: the claim releases on the confirmed close, never ahead of it.
+        assert_eq!(
+            owner.report().active_candidates,
+            1,
+            "the refusal must leave the channel claim owned while close is in flight"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), close_owner.wait())
+                .await
+                .is_err(),
+            "and the close cannot be terminal while the native dependency is held"
+        );
+
+        // Release the gate: the one native close succeeds and the claim goes
+        // back with it.
+        gate.open();
+        tokio::time::timeout(Duration::from_secs(1), close_owner.wait())
+            .await
+            .expect("released native dependency completes")
+            .expect("native close follows the terminal release");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+        drop(task);
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_production_retirement_invalidates_the_endpoint_auth_task() {
+        // Drives the *production* replacement path, `retire_connector`, rather
+        // than calling `task.retire()` directly. Before this was wired, the
+        // task survived replacement with `is_retired() == false` and its
+        // handoff intact, so a late proof could still mint a capability —
+        // install would reject it, but only after the fact. Retirement must
+        // fail closed at the source.
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let peer = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "retiring-peer".to_string(),
+            Arc::clone(&task),
+        );
+        *peer.state.write() = admitted_legacy_state();
+        peer.install_authenticated_channel_for_test();
+
+        // Non-vacuity: everything is live and admitted before replacement.
+        assert!(!task.is_retired());
+        assert!(task.belongs_to(task.incarnation()));
+        assert!(peer.has_authenticated_channel());
+
+        // The exact production replacement call.
+        peer.retire_connector();
+
+        assert!(
+            task.is_retired(),
+            "replacement must retire the task at the source"
+        );
+        assert!(
+            !task.belongs_to(task.incarnation()),
+            "a retired task belongs to no connector"
+        );
+        assert!(
+            !peer.has_authenticated_channel(),
+            "the channel authority must be gone immediately after replacement, which is what leaves nothing for the session gate to promote from"
+        );
+
+        // An exchange that would otherwise promote is now refused with the exact
+        // typed cause, before any capability can be minted.
+        let (remote_key, _remote_id) = auth_key(2);
+        assert_eq!(
+            drive_exchange(&task, &peer_draw(), &remote_key).err(),
+            Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent),
+            "a superseded connector must refuse promotion, not merely fail to install"
+        );
+        assert!(
+            !peer.has_authenticated_channel(),
+            "and no capability is installed by the attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_retired_task_cannot_authenticate() {
+        // Replacement invalidation is a security control here, not
+        // housekeeping: with a certificate-fingerprint binding that is not
+        // session-unique, exact incarnation ownership is what separates two
+        // channels between the same pair.
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let (remote_key, _remote_id) = auth_key(2);
+        let remote_c = peer_draw();
+
+        // The channel is replaced/retired before the proof arrives.
+        task.retire();
+
+        assert_eq!(
+            drive_exchange(&task, &remote_c, &remote_key).err(),
+            Some(crate::endpoint_auth::EndpointAuthError::ChannelNotCurrent),
+            "a proof that would otherwise verify must not promote a retired channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_same_certificate_two_channels_bind_capabilities_to_distinct_incarnations() {
+        // C5. Two channels between one device pair reusing the same
+        // certificates, so the channel binding is identical by construction.
+        let owner = test_resource_owner(3, 3);
+        let (channel_one, _co1, _l1, _c1) = auth_task_fixture(&owner);
+        let (channel_two, _co2, _l2, _c2) = auth_task_fixture(&owner);
+        let (remote_key, _remote_id) = auth_key(2);
+
+        // (a) NON-VACUITY. Both channels are built by the same fixture, so they
+        // share one Device pair and one channel binding by construction — the
+        // context is fixed inside `endpoint_auth`, identically for both. Nothing
+        // cryptographic separates these two channels; if the fixture ever varied
+        // the binding per channel this control would silently become a no-op
+        // that passes while proving nothing.
+        //
+        // Channel 1 authenticates normally.
+        let one_remote = peer_draw();
+        let promoted = drive_exchange(&channel_one, &one_remote, &remote_key)
+            .expect("channel 1 authenticates")
+            .into_promoted()
+            .expect("channel 1's promotion issues the capability");
+        // The exact proof channel 1 accepted, captured for replay below.
+        let one_remote_sig =
+            crate::endpoint_auth::peer_proof_for_test(&channel_one, &one_remote, &remote_key);
+
+        // (b) ORDINARY REPLAY. Channel 2 binds its own fresh peer contribution,
+        // and its task drew its own local one, so channel 1's captured
+        // signature does not cover channel 2's transcript. This is freshness
+        // doing the work, not the binding.
+        assert_eq!(
+            drive_exchange_with_signature(&channel_two, &peer_draw(), &one_remote_sig).err(),
+            Some(crate::endpoint_auth::EndpointAuthError::SignatureInvalid),
+            "a replayed proof must not authenticate a channel with fresh contributions"
+        );
+
+        // (c) THE DISCRIMINATING CASE, stated honestly. Force a third channel to
+        // reuse channel 1's exact contribution pair — its local draw as well as
+        // the peer value, because forcing only the peer half leaves the local
+        // halves different and this degenerates back into (b). With the binding
+        // already equal, the two transcripts are now byte-identical and channel
+        // 1's signature is cryptographically VALID over this one. Ownership
+        // cannot and does not change that; asserting otherwise would be an
+        // overclaim, so this asserts that it DOES promote.
+        let (forced, _co3, _l3, _c3) =
+            auth_task_fixture_reusing(&owner, &channel_one.local_contribution());
+        let forced_capability =
+            drive_exchange_with_signature(&forced, &one_remote, &one_remote_sig)
+                .expect(
+                    "with identical certificates and identical contributions the replayed proof \
+                     is genuinely valid, and the task cannot tell where it was signed",
+                )
+                .into_promoted()
+                .expect("the replayed proof genuinely promotes this third channel");
+
+        // Two distinct mechanisms carry this, and they must not be conflated:
+        //
+        //  * Cross-channel *proof* replay is prevented by per-attempt
+        //    contribution uniqueness, and by that alone — which is exactly what
+        //    (c) just demonstrated by removing it. In production that case does
+        //    not arise: the task draws its own contribution at `begin` and
+        //    `LocalContribution` has no constructor that rebuilds one from bytes
+        //    outside `cfg(test)`. Non-`Clone` prevents casual duplication; it is
+        //    not by itself the guarantee.
+        //
+        //  * Ownership prevents *already-issued authority* from transferring
+        //    across channels or surviving replacement. That is what the
+        //    assertions below cover, and what
+        //    `v4_arc04_install_refuses_a_capability_from_another_incarnation`
+        //    exercises through the real install path.
+        //
+        // So even where the proof replays, the authority does not: the
+        // capability minted from the replayed proof belongs to the channel that
+        // ran the exchange, never to channel 1.
+        assert!(
+            forced_capability.belongs_to(forced.incarnation()),
+            "a replayed-but-valid proof mints authority bound to the channel that ran it"
+        );
+        assert!(
+            !forced_capability.belongs_to(channel_one.incarnation()),
+            "and that authority is not channel 1's, valid proof or not"
+        );
+        assert!(
+            promoted.belongs_to(channel_one.incarnation()),
+            "non-vacuity: the predicate is not constantly false"
+        );
+        assert!(
+            !promoted.belongs_to(channel_two.incarnation()),
+            "a capability promoted on channel 1 must not be installable against \
+             channel 2, valid proof or not"
+        );
+        assert!(
+            !Arc::ptr_eq(channel_one.incarnation(), channel_two.incarnation()),
+            "the two fixtures really are distinct incarnations"
+        );
+        drop(forced_capability);
+        drop(promoted);
+    }
+
+    /// Promote one channel to an authenticated capability, for install tests.
+    fn promote_for_install(
+        task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> crate::endpoint_auth::AuthenticatedChannelCapability {
+        let (remote_key, _remote_id) = auth_key(2);
+        drive_exchange(task, &peer_draw(), &remote_key)
+            .expect("the fixture proof promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability")
+    }
+
+    /// Peer state that legacy policy would call admitted.
+    fn admitted_legacy_state() -> crate::engine::connection::PeerStateData {
+        crate::engine::connection::PeerStateData {
+            authenticated: true,
+            status: crate::engine::connection::PeerStatus::Active,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_application_admission_requires_a_live_capability_not_just_the_legacy_bool() {
+        // The enforcement half. Storing the capability is not the same as
+        // gating on it: `authenticated` records policy history and survives
+        // channel replacement, so a gate reading only the bool would keep
+        // admitting application traffic after the authority artifact is gone.
+        let owner = test_resource_owner(1, 1);
+        let (task, _close_owner, _lifetime, _calls) = auth_task_fixture(&owner);
+        let peer = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "gate-peer".to_string(),
+            Arc::clone(&task),
+        );
+
+        // This control owns the *channel-authority* half of admission. The
+        // policy half moved to the broker, where `CurrentPolicyAdmission` is a
+        // promotion conjunct with its own negative control — this fixture holds
+        // no registry and no broker, so it cannot promote and must not pretend
+        // to test policy.
+
+        // (1) Legacy bool set, no capability installed → no channel authority.
+        *peer.state.write() = admitted_legacy_state();
+        assert!(
+            peer.state.read().is_admitted(),
+            "non-vacuity: legacy policy really does consider this admitted"
+        );
+        assert!(
+            !peer.has_authenticated_channel(),
+            "the legacy bool alone establishes no channel authority, so there is \
+             nothing for the session gate to promote from"
+        );
+
+        // (2) Capability installed on the current connector → authority present.
+        let capability = promote_for_install(&task);
+        assert!(peer.install_authenticated_channel(&task, capability));
+        assert!(peer.has_authenticated_channel());
+
+        // (3) Replacement invalidates immediately, while the registry entry and
+        // the legacy bool are both untouched.
+        peer.retire_connector();
+        assert!(
+            peer.state.read().is_admitted(),
+            "the legacy bool is deliberately left set, which is why it could \
+             never have been the gate"
+        );
+        assert!(
+            !peer.has_authenticated_channel(),
+            "retiring the connector drops the channel authority at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_install_refuses_a_capability_from_another_incarnation() {
+        // The install-path half of C5, and the one that actually fails if the
+        // capability/incarnation binding is removed from
+        // `install_authenticated_channel`. Both channels share device
+        // identities and certificate fingerprints, so nothing cryptographic
+        // separates them — only provenance does.
+        let owner = test_resource_owner(3, 3);
+        let (task_one, _co1, _l1, _c1) = auth_task_fixture(&owner);
+        let (task_two, _co2, _l2, _c2) = auth_task_fixture(&owner);
+        // A third live channel, so the negative case uses a capability this
+        // test still owns rather than one already moved into `peer_one`.
+        let (task_three, _co3, _l3, _c3) = auth_task_fixture(&owner);
+        assert!(
+            !Arc::ptr_eq(task_one.incarnation(), task_two.incarnation()),
+            "non-vacuity: the fixtures are genuinely distinct incarnations"
+        );
+
+        // POSITIVE: a capability installs on the peer whose current task
+        // promoted it. Without this the negative case below could pass simply
+        // because install always refuses.
+        let cap_one = promote_for_install(&task_one);
+        let peer_one = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "peer-one".to_string(),
+            Arc::clone(&task_one),
+        );
+        assert!(
+            peer_one.install_authenticated_channel(&task_one, cap_one),
+            "a capability must install against the task that promoted it"
+        );
+        assert!(peer_one.has_authenticated_channel());
+
+        // NEGATIVE: channel 2's task is current on its own peer, but the
+        // capability came from channel 1. Checking only that the *task* is
+        // current would accept this, which is the cross-channel relay.
+        let relayed = promote_for_install(&task_three);
+        let peer_two = crate::engine::connection::PeerConnection::with_endpoint_auth_for_test(
+            "peer-two".to_string(),
+            Arc::clone(&task_two),
+        );
+        assert!(
+            !peer_two.install_authenticated_channel(&task_two, relayed),
+            "a capability promoted on another connector incarnation must not \
+             install, even with the current task supplied alongside it"
+        );
+        assert!(
+            !peer_two.has_authenticated_channel(),
+            "and nothing is left installed after the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc04_promoted_capability_retains_the_connected_claim_until_native_close() {
+        // Promotion must carry the *whole* handoff. If it moved only the
+        // connected capability, dropping the authenticated capability — on
+        // retirement, or on a refused install — would release the claim
+        // directly and defeat Arc 03's "retained until native close succeeds".
+        let owner = test_resource_owner(1, 1);
+        // A *gated* native close, so the interval between "close entered" and
+        // "close succeeded" is observable. With an immediate close, an early
+        // release would produce the same before/after readings and the control
+        // would not discriminate.
+        let gate = TestNativeCloseGate::new();
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Gate(Arc::clone(&gate)),
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = Arc::new(task_from_handoff(EndpointAuthHandoff::new(
+            connected,
+            Arc::clone(&close_owner.ownership.incarnation),
+            Arc::clone(&close_owner),
+        )));
+        let (remote_key, _remote_id) = auth_key(2);
+        let promoted = drive_exchange(&task, &peer_draw(), &remote_key)
+            .expect("promotes")
+            .into_promoted()
+            .expect("the promotion issues the capability");
+        assert_eq!(
+            owner.report().active_candidates,
+            1,
+            "promotion does not release the connected claim"
+        );
+
+        // Dropping the authenticated capability is what a retirement or a
+        // refused install does. The claim must survive into native close.
+        drop(promoted);
+        drop(task);
+
+        // Native close has now been entered but is blocked on the gate. This
+        // is the load-bearing interval: if promotion had stripped the handoff
+        // and the capability released the claim directly, the claim would
+        // already be gone here.
+        let closing = tokio::spawn({
+            let close_owner = Arc::clone(&close_owner);
+            async move { close_owner.wait().await }
+        });
+        // Wait on the gate's own entry rather than on the port's call counter.
+        // The counter is bumped before the returned future is polled, so it
+        // reports a close that has been *submitted*; the gate publishes from
+        // inside the held future, so it reports one that has genuinely reached
+        // the hold point. Every wait below is bounded, so a regression that
+        // reintroduces a lost wake fails this named control at its deadline
+        // instead of hanging the suite.
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_for_entry())
+            .await
+            .expect("the promoted claim's native close reaches the hold point");
+        assert_eq!(
+            gate.entries(),
+            1,
+            "native close is entered exactly once, and is still held here"
+        );
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "and that entry is the one submitted close, not a second port call"
+        );
+        assert_eq!(
+            owner.report().active_candidates,
+            1,
+            "the connected claim must still be retained while native close is in flight"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), close_owner.wait())
+                .await
+                .is_err(),
+            "and the close cannot be terminal while the gate still holds it"
+        );
+
+        // Release. The permit is stored, so it is observed even if it is
+        // published before the held close parks — the exact window in which a
+        // wake-only primitive would drop it and strand this control.
+        gate.open();
+        tokio::time::timeout(Duration::from_secs(1), closing)
+            .await
+            .expect("the released native close completes")
+            .expect("close task joins")
+            .expect("native close succeeds once released");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "exactly one native close: no double retention, no missed release"
+        );
+        assert_eq!(
+            gate.entries(),
+            1,
+            "and the release drove that one close through, not a repeat of it"
+        );
+        assert_eq!(
+            owner.report().active_candidates,
+            0,
+            "and the claim is released only after close succeeded"
+        );
     }
 
     #[tokio::test]
@@ -9344,7 +12276,7 @@ mod tests {
             DataChannelOpenTransition::Connected(capability) => capability,
             _ => panic!("fixture connector promotes"),
         };
-        let task = crate::endpoint_auth::EndpointAuthTask::begin(EndpointAuthHandoff::new(
+        let task = task_from_handoff(EndpointAuthHandoff::new(
             connected,
             Arc::clone(&close_owner.ownership.incarnation),
             Arc::clone(&close_owner),
@@ -9376,7 +12308,7 @@ mod tests {
             DataChannelOpenTransition::Connected(capability) => capability,
             _ => panic!("fixture connector promotes"),
         };
-        let task = crate::endpoint_auth::EndpointAuthTask::begin(EndpointAuthHandoff::new(
+        let task = task_from_handoff(EndpointAuthHandoff::new(
             connected,
             Arc::clone(&close_owner.ownership.incarnation),
             Arc::clone(&close_owner),
@@ -9410,7 +12342,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc03_cross_connector_endpoint_auth_and_realtime_capabilities_are_rejected() {
+    fn v4_arc03_cross_connector_endpoint_auth_capabilities_are_rejected() {
         let owner = test_resource_owner(2, 1);
         let (first_close_owner, _first_lifetime) = close_owner_fixture(&owner);
         let (second_close_owner, _second_lifetime) = close_owner_fixture(&owner);
@@ -9418,7 +12350,7 @@ mod tests {
             DataChannelOpenTransition::Connected(capability) => capability,
             _ => panic!("fixture connector promotes"),
         };
-        let first_task = crate::endpoint_auth::EndpointAuthTask::begin(EndpointAuthHandoff::new(
+        let first_task = task_from_handoff(EndpointAuthHandoff::new(
             connected,
             Arc::clone(&first_close_owner.ownership.incarnation),
             Arc::clone(&first_close_owner),
@@ -9427,14 +12359,9 @@ mod tests {
         assert!(first_close_owner.ownership.owns_endpoint_auth(&first_task));
         assert!(!second_close_owner.ownership.owns_endpoint_auth(&first_task));
 
-        let first_flow = test_realtime_capability(&first_close_owner.ownership);
-        assert!(first_close_owner.ownership.owns_realtime_flow(&first_flow));
-        assert!(!second_close_owner.ownership.owns_realtime_flow(&first_flow));
-
         first_close_owner.retire_local();
         assert!(!first_close_owner.ownership.owns_endpoint_auth(&first_task));
-        assert!(!first_close_owner.ownership.owns_realtime_flow(&first_flow));
-        drop((first_task, first_flow));
+        drop(first_task);
     }
 
     #[test]
@@ -9457,33 +12384,6 @@ mod tests {
             .ownership
             .enter_operation()
             .expect("dropping the exact operation restores its work capacity");
-        drop(replacement);
-    }
-
-    #[test]
-    fn v4_arc03_legacy_realtime_capability_holds_its_exact_resource_lease() {
-        let owner = test_resource_owner(1, 1);
-        let (close_owner, _lifetime) = close_owner_fixture(&owner);
-        let first = test_realtime_capability(&close_owner.ownership);
-        let claim = crate::connector::realtime_flow_capability_claim()
-            .expect("fixture capability claim is representable");
-
-        let pressure = close_owner
-            .ownership
-            .work_resource_scope
-            .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
-            .expect_err("a live compatibility capability retains its finite claim");
-        assert!(matches!(
-            pressure,
-            crate::resource::ResourceUnavailable::Pressure(_)
-        ));
-
-        drop(first);
-        let replacement = close_owner
-            .ownership
-            .work_resource_scope
-            .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
-            .expect("dropping the capability restores its exact capacity");
         drop(replacement);
     }
 
@@ -9521,7 +12421,7 @@ mod tests {
         let scope = context.peer_connection_scope();
         let candidate = observed_candidate();
         let candidate_use = candidate_resource_measurement(&candidate).observed();
-        let mut queue = PendingRemoteCandidateQueue::new(test_pending_candidate_policy());
+        let mut queue = PendingRemoteCandidateQueue::new();
         assert_eq!(
             queue.push_observed_for_test(
                 candidate,
@@ -9564,7 +12464,7 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let mut candidate = observed_candidate();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let pressure = state
             .current
             .work_resources
@@ -9599,7 +12499,14 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc03g_candidate_queue_deduplicates_before_retention_and_enforces_both_bounds() {
+    /// One digest, one retention: a repeat submission is refused before it can
+    /// take a second retention lease.
+    ///
+    /// The control used to also drive an item ceiling and a content-byte
+    /// ceiling to refusal. Neither exists, so what is left is the half that was
+    /// never a ceiling at all — the digest set — plus the fact that a candidate
+    /// the fixture's grant cannot fund is refused by the provider.
+    fn v4_arc03g_candidate_queue_deduplicates_before_retention() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -9608,19 +12515,12 @@ mod tests {
         let first = observed_candidate();
         let content_bytes =
             candidate_content_bytes(&first).expect("fixture content is representable");
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
         let two_candidates = content_bytes
             .checked_mul(2)
-            .and_then(NonZeroUsize::new)
-            .expect("two candidate contents are representable and nonzero");
+            .expect("two candidate contents are representable");
 
-        let mut item_bounded = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
-            one,
-            two_candidates,
-            one,
-            two,
-        ));
+        let mut item_bounded =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(2, two_candidates));
         assert_eq!(
             item_bounded.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Queued
@@ -9629,10 +12529,7 @@ mod tests {
             item_bounded.admit(first.clone(), &scope),
             PendingRemoteCandidateQueuePush::Duplicate
         );
-        assert_eq!(
-            item_bounded.current.pending.budget.report(),
-            (1, content_bytes, 1, 0, false)
-        );
+        assert_eq!(item_bounded.current.seen.len(), 1);
         let mut distinct = first.clone();
         distinct.candidate.replace_range(0..1, "C");
         assert_eq!(
@@ -9642,32 +12539,47 @@ mod tests {
         );
         assert_eq!(
             item_bounded.admit(distinct.clone(), &scope),
-            PendingRemoteCandidateQueuePush::Refused
+            PendingRemoteCandidateQueuePush::Queued,
+            "a distinct candidate the grant funds is retained, not refused by a count"
         );
-        assert_eq!(
-            item_bounded.current.pending.budget.report(),
-            (1, content_bytes, 1, 0, false)
-        );
+        assert_eq!(item_bounded.current.seen.len(), 2);
 
-        let exact_one_payload =
-            NonZeroUsize::new(content_bytes).expect("fixture candidate content is nonzero");
-        let mut byte_bounded = RemoteCandidateState::new(PendingRemoteCandidatePolicy::new(
-            two,
-            exact_one_payload,
-            one,
-            two,
-        ));
+        // A grant funded for exactly one candidate refuses the second, and the
+        // refusal comes from the provider rather than from a number beside it.
+        let mut exactly_one =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(1, content_bytes));
         assert_eq!(
-            byte_bounded.admit(first, &scope),
+            exactly_one.admit(first, &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(
-            byte_bounded.admit(distinct, &scope),
-            PendingRemoteCandidateQueuePush::Refused
+        // A provider refusal is terminal for the attempt, and the digest set goes
+        // with it. Every refusal path in `RemoteCandidateAttemptEnvelope::admit`
+        // calls `retire()` before returning, and `retire()` clears `seen` along
+        // with the queue and the retained reservations. So there is no outcome
+        // in which the second candidate is refused and the first candidate's
+        // digest survives — an earlier version of this control asserted exactly
+        // that, and it was asserting a state the type cannot reach.
+        //
+        // This is deliberate rather than a leak: a candidate the owner's grant
+        // cannot fund ends the ICE attempt, and the caller restarts. Retaining
+        // digests for an attempt that is already dead would be keeping dedup
+        // state for submissions that can only ever be answered `Retired`.
+        assert!(
+            matches!(
+                exactly_one.admit(distinct, &scope),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+                    | PendingRemoteCandidateQueuePush::Retired
+            ),
+            "the second candidate is refused by the provider"
         );
-        assert_eq!(
-            byte_bounded.current.pending.budget.report(),
-            (1, content_bytes, 0, 0, false)
+        assert!(
+            !exactly_one.current.attempt.is_active(),
+            "the refusal retired the attempt"
+        );
+        assert!(
+            exactly_one.current.seen.is_empty(),
+            "and released its digests with it, rather than retaining dedup state \
+             for an attempt that can only answer `Retired`"
         );
     }
 
@@ -9726,16 +12638,7 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let candidate = observed_candidate();
-        let content_bytes =
-            candidate_content_bytes(&candidate).expect("fixture content is representable");
-        let policy = PendingRemoteCandidatePolicy::new(
-            NonZeroUsize::new(1).expect("one is nonzero"),
-            NonZeroUsize::new(content_bytes).expect("fixture content is nonzero"),
-            NonZeroUsize::new(1).expect("one is nonzero"),
-            NonZeroUsize::new(1).expect("one is nonzero"),
-        );
-        let mut queue = PendingRemoteCandidateQueue::new(policy);
-        let budget = Arc::clone(&queue.budget);
+        let mut queue = PendingRemoteCandidateQueue::new();
         assert_eq!(
             queue.push_observed_for_test(
                 candidate,
@@ -9754,10 +12657,8 @@ mod tests {
         let waker = Waker::noop();
         let mut task_context = Context::from_waker(waker);
         assert_eq!(application.as_mut().poll(&mut task_context), Poll::Pending);
-        assert_eq!(budget.report(), (1, content_bytes, 0, 0, false));
 
         drop(application);
-        assert_eq!(budget.report(), (1, content_bytes, 0, 0, false));
         drop(drain);
     }
 
@@ -9768,9 +12669,8 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let policy = test_pending_candidate_policy();
-        let mut state = RemoteCandidateState::new(policy);
-        let displaced_budget = Arc::clone(&state.current.pending.budget);
+        let work = test_candidate_fixture_work();
+        let mut state = RemoteCandidateState::new(work);
         assert_eq!(
             state.current.pending.push_observed_for_test(
                 observed_candidate(),
@@ -9779,12 +12679,12 @@ mod tests {
             ),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(displaced_budget.report().0, 1);
+        assert_eq!(state.current.pending.entries.len(), 1);
 
-        let displaced = std::mem::replace(&mut state, RemoteCandidateState::new(policy));
+        let displaced = std::mem::replace(&mut state, RemoteCandidateState::new(work));
         drop(displaced);
-        assert_eq!(displaced_budget.report().0, 1);
-        assert_eq!(state.current.pending.budget.report(), (0, 0, 0, 0, false));
+        assert!(state.current.pending.entries.is_empty());
+        assert!(state.current.seen.is_empty());
     }
 
     #[tokio::test]
@@ -9794,7 +12694,7 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         assert_eq!(
             state.admit(observed_candidate(), &scope),
             PendingRemoteCandidateQueuePush::Queued
@@ -9870,14 +12770,14 @@ mod tests {
 
     #[test]
     fn v4_arc03_local_restart_overlap_charge_releases_on_commit_and_failure() {
-        let policy = test_pending_candidate_policy();
+        let policy = test_candidate_fixture_work();
         let root_claim = crate::runtime::attempt::remote_candidate_attempt_root_claim()
             .expect("fixture restart root claim is representable");
         let overlap_charge = FiniteResourceProvider::reservation_charge_for_test(root_claim)
             .expect("fixture restart reservation charge is representable");
         let (provider, _owner, _candidate, _lifetime, work_scope) =
             elastic_remote_candidate_test_resources_with_additional(policy, overlap_charge);
-        let mut state = RemoteCandidateState::with_resources(policy, work_scope);
+        let mut state = RemoteCandidateState::with_resources(work_scope);
         let baseline = provider.in_use();
 
         let (_, replacement) = state
@@ -9909,7 +12809,7 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03_dropped_ice_transaction_fences_attempt_and_starts_exact_close_owner() {
-        let policy = test_pending_candidate_policy();
+        let policy = test_candidate_fixture_work();
         let state = Arc::new(SyncMutex::new(
             RemoteCandidateState::new_with_restart_overlap(policy),
         ));
@@ -9947,7 +12847,7 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_dropped_remote_description_cannot_leave_reusable_inflight_state() {
         let state = Arc::new(SyncMutex::new(RemoteCandidateState::new(
-            test_pending_candidate_policy(),
+            test_candidate_fixture_work(),
         )));
         let resource_owner = test_resource_owner(1, 1);
         let (close_owner, _attempt_lifetime) = close_owner_fixture(&resource_owner);
@@ -9986,7 +12886,7 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let old_attempt = Arc::clone(&state.current.attempt);
         let (_retiring, replacement) = state
             .begin_local_ice_restart()
@@ -10020,15 +12920,8 @@ mod tests {
         replacement_candidate.username_fragment = Some("second-fragment".to_string());
         let candidate_bytes = candidate_content_bytes(&replacement_candidate)
             .expect("fixture candidate content is representable");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
-        let policy = PendingRemoteCandidatePolicy::new(
-            two,
-            NonZeroUsize::new(candidate_bytes * 2)
-                .expect("two fixture candidates have nonzero content"),
-            two,
-            two,
-        );
-        let mut state = RemoteCandidateState::new(policy);
+        let mut state =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(2, candidate_bytes * 2));
         let fingerprint = "AA:BB:CC:DD";
         let initial_sdp = exact_ice_sdp("remote-fragment", "old-password", fingerprint);
         let initial = state
@@ -10124,7 +13017,7 @@ mod tests {
     fn v4_arc03j_remote_restart_migrates_only_explicit_replacement_candidates() {
         fn initialized_state() -> RemoteCandidateState {
             let mut state =
-                RemoteCandidateState::new_with_restart_overlap(test_pending_candidate_policy());
+                RemoteCandidateState::new_with_restart_overlap(test_candidate_fixture_work());
             let initial = state
                 .prepare_remote_description(
                     sdp_ice_credentials(&exact_ice_sdp("old-u", "old-p", "AA:BB:CC:DD"))
@@ -10258,7 +13151,7 @@ mod tests {
 
     #[test]
     fn v4_arc03j_media_renegotiation_cannot_mint_a_candidate_attempt() {
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let initial_sdp = exact_ice_sdp("data-u", "data-p", "AA:BB:CC:DD");
         let initial = state
             .prepare_remote_description(
@@ -10307,16 +13200,26 @@ mod tests {
         let mut over_limit = observed_candidate();
         over_limit.candidate.push_str(" distinct");
         let mut state =
-            RemoteCandidateState::new(test_pending_candidate_policy_for(&[over_limit.clone()]));
+            RemoteCandidateState::new(test_candidate_fixture_work_for(&[over_limit.clone()]));
         assert_eq!(
             state.admit(observed_candidate(), &scope),
             PendingRemoteCandidateQueuePush::Queued
         );
-        assert_eq!(
-            state.admit(over_limit, &scope),
-            PendingRemoteCandidateQueuePush::Refused
+        // The provider refuses, and says so in its own vocabulary. This used to
+        // read `Refused`, which was the owner's answer under the deleted
+        // cumulative envelope — a candidate the grant could have funded, turned
+        // away by a number beside the grant. There is no such answer now: the
+        // only thing that declines a candidate is the provider running out, and
+        // it reports which dimension and by how much.
+        assert!(
+            matches!(
+                state.admit(over_limit, &scope),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+            ),
+            "the exhausting candidate is refused by the provider, not by a ceiling"
         );
-        let terminal_report = state.current.pending.budget.report();
+        let terminal_queue_len = state.current.pending.entries.len();
+        let terminal_digest_len = state.current.seen.len();
         for index in 0..1024 {
             let mut hostile = observed_candidate();
             hostile.candidate.push_str(&format!(" hostile-{index}"));
@@ -10326,14 +13229,33 @@ mod tests {
             );
         }
         assert_eq!(
-            state.current.pending.budget.report(),
-            terminal_report,
-            "terminal attempts perform no later digest, retention, duplicate, or work accounting"
+            (
+                state.current.pending.entries.len(),
+                state.current.seen.len()
+            ),
+            (terminal_queue_len, terminal_digest_len),
+            "terminal attempts perform no later digest work and take no later retention"
         );
     }
 
+    /// Post-SDP candidates draw on one envelope, and exhausting it retires the
+    /// attempt for everything that follows.
+    ///
+    /// The envelope used to be *cumulative*: it counted submissions, so
+    /// resubmitting one candidate three times consumed it and the third repeat
+    /// was refused. That tally is gone, and with it the only thing that made a
+    /// duplicate cost anything — a repeat is now recognised by the digest set
+    /// and turned away before it can take a lease, so it is free and can never
+    /// exhaust anything. Draining the envelope needs candidates that are
+    /// actually distinct, which is what this now does.
+    ///
+    /// The sharing claim itself is untouched and is the reason the control
+    /// survives: one funded envelope backs every post-SDP candidate on the
+    /// attempt, so the one that finds it empty retires the attempt and every
+    /// later submission — unique or not — is a constant-work refusal until an
+    /// explicit restart mints a fresh envelope.
     #[test]
-    fn v4_arc03h_post_sdp_candidates_share_one_cumulative_attempt_envelope() {
+    fn v4_arc03h_post_sdp_candidates_share_one_attempt_envelope() {
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -10341,14 +13263,8 @@ mod tests {
             .peer_connection_scope();
         let first = observed_candidate();
         let content_bytes = candidate_content_bytes(&first).expect("fixture content is finite");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
-        let policy = PendingRemoteCandidatePolicy::new(
-            two,
-            NonZeroUsize::new(content_bytes * 2).expect("fixture content bound is nonzero"),
-            two,
-            NonZeroUsize::new(1).expect("one application is permitted"),
-        );
-        let mut state = RemoteCandidateState::new(policy);
+        let mut state =
+            RemoteCandidateState::new(RemoteCandidateFixtureWork::new(2, content_bytes * 2));
         state.current.remote_description_set = true;
 
         assert_eq!(
@@ -10362,36 +13278,44 @@ mod tests {
             .expect("post-SDP candidate moves directly to application");
         let first_reservation = first_pending
             ._queue_reservation
-            .expect("unique candidate carries the attempt budget");
-        assert!(first_reservation.budget.reserve_application_work());
+            .expect("a queued candidate carries its post-application ownership slot");
         state
             .current
             .retained_reservations
             .push_back(first_reservation);
 
         assert_eq!(
-            state.admit(first.clone(), &scope),
-            PendingRemoteCandidateQueuePush::Duplicate
-        );
-        assert_eq!(
-            state.admit(first.clone(), &scope),
-            PendingRemoteCandidateQueuePush::Duplicate
-        );
-        assert_eq!(
             state.admit(first, &scope),
-            PendingRemoteCandidateQueuePush::Refused
+            PendingRemoteCandidateQueuePush::Duplicate,
+            "a repeat is recognised before it can take a lease, so it costs the \
+             shared envelope nothing"
         );
 
-        let old_budget = Arc::clone(&state.current.pending.budget);
-        assert_eq!(old_budget.report(), (1, content_bytes, 2, 1, false));
+        let distinct = |replacement: &str| {
+            let mut candidate = observed_candidate();
+            candidate.candidate.replace_range(0..1, replacement);
+            candidate
+        };
+        assert_eq!(
+            state.admit(distinct("C"), &scope),
+            PendingRemoteCandidateQueuePush::Queued,
+            "the second distinct candidate draws on the same envelope the first did"
+        );
+        assert!(
+            matches!(
+                state.admit(distinct("D"), &scope),
+                PendingRemoteCandidateQueuePush::ResourceUnavailable(_)
+                    | PendingRemoteCandidateQueuePush::Retired
+            ),
+            "and the one that finds the shared envelope empty is refused"
+        );
+
         assert!(!state.current.attempt.is_active());
 
-        let mut second = observed_candidate();
-        second.candidate.replace_range(0..1, "C");
         assert_eq!(
-            state.admit(second, &scope),
+            state.admit(distinct("E"), &scope),
             PendingRemoteCandidateQueuePush::Retired,
-            "the first envelope refusal makes later unique submissions constant-work refusals"
+            "the envelope refusal makes later unique submissions constant-work refusals"
         );
         let (retiring_attempt, replacement_attempt) = state
             .begin_local_ice_restart()
@@ -10405,11 +13329,8 @@ mod tests {
             &replacement.envelope.attempt,
             &replacement_attempt
         ));
-        assert_eq!(
-            replacement.envelope.pending.budget.report(),
-            (0, 0, 0, 0, false)
-        );
-        assert_eq!(old_budget.report(), (1, content_bytes, 2, 1, false));
+        assert!(replacement.envelope.pending.entries.is_empty());
+        assert!(replacement.envelope.seen.is_empty());
     }
 
     #[test]
@@ -10433,19 +13354,12 @@ mod tests {
                 .expect("finite observation burst content is representable");
             candidates.push(candidate);
         }
-        let policy = PendingRemoteCandidatePolicy::new(
-            candidate_count,
-            NonZeroUsize::new(total_content_bytes)
-                .expect("observation burst carries nonzero candidate content"),
-            candidate_count,
-            candidate_count,
-        );
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut queue = PendingRemoteCandidateQueue::new(policy);
+        let mut queue = PendingRemoteCandidateQueue::new();
         let started = Instant::now();
         for (index, candidate) in candidates.iter().cloned().enumerate() {
             let pushed_at = Instant::now();
@@ -10457,9 +13371,9 @@ mod tests {
                 ),
                 PendingRemoteCandidateQueuePush::Queued
             );
-            let (items, content_bytes, duplicates, work, poisoned) = queue.budget.report();
+            let items = queue.entries.len();
             println!(
-                "arc03_candidate_burst_raw index={index} push_ns={} items={items} content_bytes={content_bytes} duplicates={duplicates} application_work={work} poisoned={poisoned}",
+                "arc03_candidate_burst_raw index={index} push_ns={} items={items}",
                 pushed_at.elapsed().as_nanos()
             );
         }
@@ -10477,11 +13391,11 @@ mod tests {
             duplicate_at.elapsed().as_nanos(),
             started.elapsed().as_nanos()
         );
-        let budget = Arc::clone(&queue.budget);
+        assert_eq!(queue.entries.len(), candidate_count.get());
         drop(queue.take());
-        assert_eq!(
-            budget.report(),
-            (candidate_count.get(), total_content_bytes, 1, 0, false)
+        assert!(
+            total_content_bytes > 0,
+            "the observed burst carried real candidate content"
         );
     }
 
@@ -10600,7 +13514,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -10615,9 +13528,27 @@ mod tests {
     }
 
     fn assert_callback_class_backpressure(first: TransportEvent, second: TransportEvent) {
-        let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
-            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        let TransportEvent::Message(ref first_payload) = first else {
+            panic!("fixture class backpressure is arranged out of endpoint data");
+        };
+        let endpoint_bytes = first_payload.len();
+        let one = std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero");
+        let policy = test_realtime_workload(one);
+        // One endpoint payload of exactly the size the first event carries, the
+        // control class starved to a single byte so it cannot pay for endpoint
+        // work, and only the two lifecycle deliveries this fixture actually
+        // reserves. The second insert therefore meets an empty pool rather than
+        // the slack a general fixture grant would have left it.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                endpoint_bytes,
+                std::num::NonZeroUsize::new(2)
+                    .expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
         );
         let sink = test_event_sink(events, policy, None);
         let waker = Waker::noop();
@@ -10640,20 +13571,34 @@ mod tests {
     }
 
     fn assert_realtime_flow_backpressure(first: TransportEvent, second: TransportEvent) {
-        let policy = explicit_realtime_callback_policy(16, 1, 1, 16, 1, 32);
+        let payload_bytes = |event: &TransportEvent| match event {
+            TransportEvent::RealtimeUnit(delivery) => delivery.payload_bytes(),
+            _ => panic!("fixture event must be a real-time unit"),
+        };
+        // One flow and exactly one queued unit of the first event's size. The
+        // shaped envelope funds a queue slot per flow per domain and a native
+        // read per inbound flow, and those spend the same
+        // `CallbackOrScheduledWork` a second output reservation needs — so under
+        // it the competing unit is admitted out of capacity for work this
+        // control never does.
+        let first_bytes = payload_bytes(&first);
         let observer = Arc::new(TestRealtimeObserver::default());
-        let registry = test_realtime_registry_with_observer(
-            policy,
+        let (registry, _grant) = exact_realtime_registry_with_observer(
+            exact_realtime_open_claims().into_iter().chain([
+                RealtimeFlowRegistry::output_claim(first_bytes)
+                    .expect("the output claim is representable"),
+                RealtimeFlowRegistry::queue_claim(first_bytes)
+                    .expect("the queued-byte claim is representable"),
+                RealtimeFlowRegistry::queued_event_node_claim()
+                    .expect("the queue node claim is representable"),
+                // Taken by the enqueue below, not by the open above.
+                RealtimeFlowRegistry::ready_claim().expect("the ready claim is representable"),
+            ]),
             observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let flow = registry
             .open_inbound_flow()
             .expect("fixture admits one exact real-time flow");
-        let payload_bytes = |event: &TransportEvent| match event {
-            TransportEvent::AudioSample(sample) => sample.data.len(),
-            TransportEvent::VideoSample(sample) => sample.data.len(),
-            _ => panic!("fixture event must be a real-time compatibility unit"),
-        };
         let first_reservation = flow
             .reserve_output(payload_bytes(&first))
             .expect("fixture reserves the first complete unit");
@@ -10665,29 +13610,24 @@ mod tests {
             },
             first_reservation,
         ));
-        let second_reservation = flow
-            .reserve_output(payload_bytes(&second))
-            .expect("aggregate bytes admit the competing unit before queue pressure");
-        assert!(flow.enqueue(
-            QueuedTransportEvent {
-                event: second,
-                observation: None,
-                callback_work: None,
-            },
-            second_reservation,
-        ));
+        // The competing unit is refused where the refusal now lives: the
+        // fixture funds one queued unit, so the second reservation cannot be
+        // admitted at all. It used to be reserved and then dropped by a per-flow
+        // queue count, which is a bound that no longer exists.
+        assert!(flow.reserve_output(payload_bytes(&second)).is_none());
+        drop(second);
         assert!(observer.observations.lock().iter().any(|observation| {
             matches!(
                 observation,
                 RealtimeFlowObservation::Drop {
-                    reason: RealtimeFlowDropReason::FlowQueueFull,
+                    reason: RealtimeFlowDropReason::ResourceUnavailable(_),
                     ..
                 }
             )
         }));
         assert!(matches!(
             registry.try_recv().map(|queued| queued.event),
-            Some(TransportEvent::AudioSample(_) | TransportEvent::VideoSample(_))
+            Some(TransportEvent::RealtimeUnit(_))
         ));
         assert!(registry.try_recv().is_none());
     }
@@ -10696,7 +13636,7 @@ mod tests {
     fn v4_arc03i_lifecycle_control_does_not_compete_for_mailbox_capacity() {
         let (events, mut receiver) = test_event_mailboxes(1);
         let policy =
-            test_callback_policy(NonZeroUsize::new(1).expect("fixture capacity is nonzero"));
+            test_realtime_workload(NonZeroUsize::new(1).expect("fixture capacity is nonzero"));
         let sink = test_event_sink(events, policy, None);
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -10721,40 +13661,10 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc03_audio_callback_contention_honors_configured_bound() {
+    fn v4_arc03_realtime_callback_contention_honors_configured_bound() {
         assert_realtime_flow_backpressure(
-            TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 0,
-                lane: 0,
-                data: Bytes::from_static(b"first"),
-                _reservation: None,
-            }),
-            TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 1,
-                lane: 0,
-                data: Bytes::from_static(b"second"),
-                _reservation: None,
-            }),
-        );
-    }
-
-    #[test]
-    fn v4_arc03_video_callback_contention_honors_configured_bound() {
-        assert_realtime_flow_backpressure(
-            TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 0,
-                key: true,
-                lane: 0,
-                data: Bytes::from_static(b"first"),
-                _reservation: None,
-            }),
-            TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 1,
-                key: false,
-                lane: 0,
-                data: Bytes::from_static(b"second"),
-                _reservation: None,
-            }),
+            test_realtime_event(0, 0, b"first"),
+            test_realtime_event(0, 1, b"second"),
         );
     }
 
@@ -10782,13 +13692,14 @@ mod tests {
         // This raw laboratory envelope is derived only to hold the requested
         // finite observation workload. It is not a production policy or a
         // proposed default.
-        let policy = test_callback_policy(callback_capacity);
+        let policy = test_realtime_workload(callback_capacity);
 
         for class in [
             ConnectorCallbackClass::Control,
             ConnectorCallbackClass::EndpointData,
         ] {
-            let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+            let (events, mut receiver) =
+                test_event_mailboxes_with_workload(callback_capacity, policy);
             let sink = test_event_sink(events, policy, None);
             let mut queued_at = std::collections::VecDeque::new();
             for index in 0..samples.get() {
@@ -10837,13 +13748,14 @@ mod tests {
                     .expect("raw observation envelope retains the requested unit");
                 assert!(flow.enqueue(
                     QueuedTransportEvent {
-                        event: TransportEvent::VideoSample(VideoSample {
-                            rtp_timestamp: unit_index as u32,
-                            key: false,
-                            lane: u8::try_from(flow_index).unwrap_or(u8::MAX),
-                            data: payload,
-                            _reservation: None,
-                        }),
+                        event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
+                            test_label(u8::try_from(flow_index).unwrap_or(u8::MAX)),
+                            RealtimeRecvUnit {
+                                timestamp: unit_index as u32,
+                                marker: false,
+                                data: payload,
+                            },
+                        )),
                         observation: None,
                         callback_work: None,
                     },
@@ -10884,18 +13796,16 @@ mod tests {
             .get()
             .checked_add(latency_units.get())
             .expect("finite observation unit count is representable");
-        let retained_bytes = total_units
-            .checked_mul(payload_bytes.get())
-            .expect("finite observation bytes are representable");
-        let policy = explicit_realtime_callback_policy(
+        let policy = explicit_realtime_workload(
             payload_bytes.get(),
             2,
             saturated_units.get(),
             payload_bytes.get(),
             1,
-            retained_bytes,
         );
         let registry = test_realtime_registry(policy);
+        let saturated_label = test_label(0);
+        let latency_label = test_label(1);
         let saturated = registry
             .open_inbound_flow()
             .expect("observation admits the saturated flow");
@@ -10913,13 +13823,14 @@ mod tests {
             saturated_at.push_back(Instant::now());
             assert!(saturated.enqueue(
                 QueuedTransportEvent {
-                    event: TransportEvent::VideoSample(VideoSample {
-                        rtp_timestamp: u32::try_from(index).unwrap_or(u32::MAX),
-                        key: false,
-                        lane: 0,
-                        data: payload,
-                        _reservation: None,
-                    }),
+                    event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
+                        saturated_label.clone(),
+                        RealtimeRecvUnit {
+                            timestamp: u32::try_from(index).unwrap_or(u32::MAX),
+                            marker: false,
+                            data: payload,
+                        },
+                    )),
                     observation: None,
                     callback_work: None,
                 },
@@ -10934,12 +13845,14 @@ mod tests {
             latency_at.push_back(Instant::now());
             assert!(latency.enqueue(
                 QueuedTransportEvent {
-                    event: TransportEvent::AudioSample(AudioSample {
-                        rtp_timestamp: u32::try_from(index).unwrap_or(u32::MAX),
-                        lane: 1,
-                        data: payload,
-                        _reservation: None,
-                    }),
+                    event: TransportEvent::RealtimeUnit(RealtimeInboundDelivery::new(
+                        latency_label.clone(),
+                        RealtimeRecvUnit {
+                            timestamp: u32::try_from(index).unwrap_or(u32::MAX),
+                            marker: false,
+                            data: payload,
+                        },
+                    )),
                     observation: None,
                     callback_work: None,
                 },
@@ -10953,27 +13866,29 @@ mod tests {
                 .try_recv()
                 .expect("every admitted observation unit remains serviceable")
                 .event;
-            match event {
-                TransportEvent::VideoSample(_) => {
-                    let queued_at = saturated_at
-                        .pop_front()
-                        .expect("one timestamp exists per saturated unit");
-                    println!(
-                        "arc03_flow_fairness_raw class=saturated service_index={service_index} queue_age_ns={}",
-                        queued_at.elapsed().as_nanos()
-                    );
-                }
-                TransportEvent::AudioSample(_) => {
-                    first_latency_service_index.get_or_insert(service_index);
-                    let queued_at = latency_at
-                        .pop_front()
-                        .expect("one timestamp exists per latency-sensitive unit");
-                    println!(
-                        "arc03_flow_fairness_raw class=latency service_index={service_index} queue_age_ns={}",
-                        queued_at.elapsed().as_nanos()
-                    );
-                }
-                _ => panic!("observation registry returned a non-real-time event"),
+            let TransportEvent::RealtimeUnit(delivery) = event else {
+                panic!("observation registry returned a non-real-time event");
+            };
+            // The label is the only thing that says which flow served this
+            // turn, and it is a fact this observation minted rather than
+            // anything read back out of the unit.
+            if delivery.label == saturated_label {
+                let queued_at = saturated_at
+                    .pop_front()
+                    .expect("one timestamp exists per saturated unit");
+                println!(
+                    "arc03_flow_fairness_raw class=saturated service_index={service_index} queue_age_ns={}",
+                    queued_at.elapsed().as_nanos()
+                );
+            } else {
+                first_latency_service_index.get_or_insert(service_index);
+                let queued_at = latency_at
+                    .pop_front()
+                    .expect("one timestamp exists per latency-sensitive unit");
+                println!(
+                    "arc03_flow_fairness_raw class=latency service_index={service_index} queue_age_ns={}",
+                    queued_at.elapsed().as_nanos()
+                );
             }
         }
         assert!(
@@ -10984,14 +13899,27 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03h_callback_producer_flood_cannot_queue_behind_full_mailbox() {
-        let (events, mut receiver) = test_event_mailboxes(1);
-        let policy = test_callback_policy(
-            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        const RETAINED: &[u8] = b"retained";
+        let one = std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero");
+        let policy = test_realtime_workload(one);
+        // Exactly one endpoint payload, so the flood below meets an empty pool
+        // rather than the slack a general fixture grant leaves in the two
+        // dimensions an insert spends.
+        let (events, mut receiver) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                RETAINED.len(),
+                std::num::NonZeroUsize::new(2)
+                    .expect("the two reserved lifecycle deliveries are nonzero"),
+            ),
+            policy,
         );
         let sink = test_event_sink(events, policy, None);
 
         assert!(
-            sink.emit(TransportEvent::Message(Bytes::from_static(b"retained")))
+            sink.emit(TransportEvent::Message(Bytes::from_static(RETAINED)))
                 .await
         );
         let mut producers = tokio::task::JoinSet::new();
@@ -11012,7 +13940,7 @@ mod tests {
         .expect("all overloaded producers finish without a hidden queue");
         assert!(matches!(
             receiver.try_recv(),
-            Ok(TransportEvent::Message(bytes)) if bytes == Bytes::from_static(b"retained")
+            Ok(TransportEvent::Message(bytes)) if bytes == Bytes::from_static(RETAINED)
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -11033,7 +13961,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -11085,7 +14012,6 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
-            reclaim: None,
             data_channel_open_committed: false,
             data_channel_closed: false,
             operation_fence: Arc::clone(&ownership.operation_fence),
@@ -11629,18 +14555,35 @@ mod tests {
             _ => panic!("live exact candidate must produce one connected capability"),
         };
         assert!(ownership.accepts(&before_open));
-        let media = stamped_event(
-            &ownership,
-            TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 0,
-                lane: 0,
-                data: Bytes::new(),
-                _reservation: None,
-            }),
+    }
+
+    /// Connector authority refuses a real-time unit before the channel is
+    /// connected, and that refusal is the connector's own to make: nothing this
+    /// state holds could authorize one.
+    ///
+    /// What it deliberately does **not** claim is the converse. Once connected,
+    /// this type answers `true`, and it should — the session's binding table is
+    /// not the connector's to know about. Whether a unit belongs to a live
+    /// session is asked one layer up, by
+    /// `v4_arc03_realtime_unit_requires_a_live_session_binding_table`.
+    #[test]
+    fn v4_arc03_connector_authority_refuses_realtime_units_before_connection() {
+        let (candidate, _lifetime) = crate::runtime::attempt::connector_candidate_for_test(
+            crate::runtime::runtime_for_test(),
         );
+        let ownership = admitted_ownership(candidate);
+        let unit = stamped_event(&ownership, test_realtime_event(0, 0, b""));
+
         assert!(
-            !ownership.accepts(&media),
-            "connected-channel authority is not application-media authority"
+            !ownership.accepts(&unit),
+            "an unconnected connector authorizes no real-time unit"
+        );
+        // Non-vacuity: the refusal is about the state, not about this event
+        // being unacceptable to the type in general.
+        let lifecycle = stamped_event(&ownership, TransportEvent::DataChannelClosed);
+        assert!(
+            ownership.accepts(&lifecycle),
+            "the same awaiting connector still carries its own lifecycle events"
         );
     }
 
@@ -11999,7 +14942,7 @@ mod tests {
             .network_instance_scope()
             .peer_connection_scope();
         let mut state =
-            RemoteCandidateState::new(test_pending_candidate_policy_for(&[conflicting.clone()]));
+            RemoteCandidateState::new(test_candidate_fixture_work_for(&[conflicting.clone()]));
         assert_eq!(
             state.admit(conflicting, &scope),
             PendingRemoteCandidateQueuePush::InvalidBinding(
@@ -12069,7 +15012,7 @@ mod tests {
                 )
             })
             .expect("fixture description grant is representable");
-        let policy = test_pending_candidate_policy_for(&[observed_candidate()]);
+        let policy = test_candidate_fixture_work_for(&[observed_candidate()]);
         let (provider, _owner, _candidate, _lifetime, work_scope) =
             elastic_remote_candidate_test_resources_with_additional(policy, additional);
         let baseline = provider.in_use();
@@ -12233,7 +15176,7 @@ mod tests {
                 .network_instance_scope()
                 .peer_connection_scope();
             let mut state =
-                RemoteCandidateState::new(test_pending_candidate_policy_for(&[invalid.clone()]));
+                RemoteCandidateState::new(test_candidate_fixture_work_for(&[invalid.clone()]));
             assert_eq!(
                 state.admit(observed_candidate(), &scope),
                 PendingRemoteCandidateQueuePush::Queued,
@@ -12252,7 +15195,6 @@ mod tests {
 
             let terminal_queue_len = state.current.pending.entries.len();
             let terminal_digest_len = state.current.seen.len();
-            let terminal_budget = state.current.pending.budget.report();
             let terminal_resources = candidate_report(&process.report().pre_authentication);
             let terminal_resource_counters = (
                 terminal_resources.active,
@@ -12281,7 +15223,6 @@ mod tests {
             assert_eq!(classified_results, 1);
             assert_eq!(state.current.pending.entries.len(), terminal_queue_len);
             assert_eq!(state.current.seen.len(), terminal_digest_len);
-            assert_eq!(state.current.pending.budget.report(), terminal_budget);
             let later_resources = candidate_report(&process.report().pre_authentication);
             assert_eq!(
                 (
@@ -12301,7 +15242,7 @@ mod tests {
 
     #[test]
     fn v4_arc03j_restart_transactions_reject_ambiguous_interleavings() {
-        let mut state = RemoteCandidateState::new(test_pending_candidate_policy());
+        let mut state = RemoteCandidateState::new(test_candidate_fixture_work());
         let credentials = sdp_ice_credentials(&exact_ice_sdp(
             "remote-fragment",
             "remote-password",
@@ -12331,7 +15272,25 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let corrupt_candidates = ["one", "two"].map(|suffix| {
+        // Eight, and the count is deliberately a wide margin rather than the
+        // smallest number that fails.
+        //
+        // The submission ceiling that used to refuse this migration is gone, so
+        // the refusal has to come from the replacement attempt's grant running
+        // out. How many candidates that grant actually holds is not one number:
+        // the restart-overlap fixture funds a second attempt's worth of digest
+        // retention on purpose — that overlap is the whole point, it is what
+        // lets a legitimate migration carry its queue across — and on top of it
+        // the per-candidate queue claim and the fixture's `content` term each
+        // leave room for another candidate or two in a different dimension.
+        // Picking the exact first count that tips it would tie this control to
+        // three separate constants and quietly stop testing anything the day one
+        // of them moves. A queue several times larger than any of those terms is
+        // refused whichever dimension binds first.
+        let corrupt_candidates = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ]
+        .map(|suffix| {
             let mut candidate = observed_candidate();
             candidate.username_fragment = Some("replacement-fragment".to_string());
             candidate.candidate.push_str(suffix);
@@ -12343,9 +15302,8 @@ mod tests {
             .max()
             .and_then(NonZeroUsize::new)
             .expect("corrupt fixture candidates have finite nonzero content");
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
         let mut state = RemoteCandidateState::new_with_restart_overlap(
-            PendingRemoteCandidatePolicy::new(one, candidate_bytes, one, one),
+            RemoteCandidateFixtureWork::new(1, candidate_bytes.get()),
         );
         let initial_credentials = sdp_ice_credentials(&exact_ice_sdp(
             "initial-fragment",
@@ -12386,117 +15344,6 @@ mod tests {
             state.has_no_viable_attempt(),
             "a corrupt over-limit migration must fence both attempts so the caller retires the connector"
         );
-    }
-
-    #[test]
-    fn legacy_track_id_requires_exact_kind_and_in_range_lane() {
-        assert_eq!(lane_of_track_id("video-0", LaneKind::Video, 8), Some(0));
-        assert_eq!(lane_of_track_id("video-3", LaneKind::Video, 8), Some(3));
-        assert_eq!(lane_of_track_id("audio-7", LaneKind::Audio, 8), Some(7));
-        assert_eq!(lane_of_track_id("video", LaneKind::Video, 8), None);
-        assert_eq!(lane_of_track_id("audio", LaneKind::Audio, 8), None);
-        assert_eq!(lane_of_track_id("video-8", LaneKind::Video, 8), None);
-        assert_eq!(lane_of_track_id("video-x", LaneKind::Video, 8), None);
-        assert_eq!(lane_of_track_id("video-00", LaneKind::Video, 8), None);
-        assert_eq!(lane_of_track_id("video-+0", LaneKind::Video, 8), None);
-        assert_eq!(lane_of_track_id("video- 0", LaneKind::Video, 8), None);
-        assert_eq!(lane_of_track_id("video-0", LaneKind::Audio, 8), None);
-        assert_eq!(lane_of_track_id("weird", LaneKind::Video, 8), None);
-    }
-
-    #[test]
-    fn v4_arc03h_legacy_provider_rejects_wrong_codec_and_malformed_track() {
-        let profile = LegacyWebRtcMediaProfile::h264_opus(
-            NonZeroUsize::new(8).expect("fixture lane ceiling is nonzero"),
-            1,
-            1,
-        )
-        .expect("fixture profile is valid");
-        assert_eq!(
-            legacy_track_identity(RTPCodecType::Video, MIME_TYPE_H264, "video-3", profile),
-            Some((LaneKind::Video, true, 3))
-        );
-        assert_eq!(
-            legacy_track_identity(RTPCodecType::Video, "video/VP8", "video-3", profile),
-            None
-        );
-        assert_eq!(
-            legacy_track_identity(RTPCodecType::Audio, MIME_TYPE_H264, "audio-3", profile),
-            None
-        );
-        assert_eq!(
-            legacy_track_identity(RTPCodecType::Video, MIME_TYPE_H264, "video-x", profile),
-            None
-        );
-    }
-
-    #[test]
-    fn v4_arc03j_legacy_codec_registration_is_only_h264_and_opus() {
-        let codecs = legacy_media_codecs();
-        assert!(!codecs.is_empty());
-        assert!(codecs.iter().all(|(codec, kind)| {
-            match kind {
-                RTPCodecType::Audio => codec.capability.mime_type == MIME_TYPE_OPUS,
-                RTPCodecType::Video => codec.capability.mime_type == MIME_TYPE_H264,
-                RTPCodecType::Unspecified => false,
-            }
-        }));
-        assert_eq!(
-            codecs
-                .iter()
-                .filter(|(_, kind)| *kind == RTPCodecType::Audio)
-                .count(),
-            1
-        );
-        assert_eq!(
-            codecs
-                .iter()
-                .filter(|(_, kind)| *kind == RTPCodecType::Video)
-                .count(),
-            5
-        );
-    }
-
-    #[test]
-    fn v4_arc03i_legacy_track_shape_bounds_duplicates_codecs_and_track_count() {
-        let profile = LegacyWebRtcMediaProfile::h264_opus(
-            NonZeroUsize::new(2).expect("fixture lane ceiling is nonzero"),
-            0,
-            0,
-        )
-        .expect("fixture profile is valid");
-        let mut admitted = std::collections::HashSet::new();
-
-        for (kind, mime, id) in [
-            (RTPCodecType::Video, MIME_TYPE_H264, "video-0"),
-            (RTPCodecType::Video, MIME_TYPE_H264, "video-1"),
-            (RTPCodecType::Audio, MIME_TYPE_OPUS, "audio-0"),
-            (RTPCodecType::Audio, MIME_TYPE_OPUS, "audio-1"),
-        ] {
-            assert!(admit_legacy_track_shape(kind, mime, id, profile, &mut admitted).is_ok());
-        }
-        assert_eq!(admitted.len(), 4);
-        assert_eq!(
-            admit_legacy_track_shape(
-                RTPCodecType::Video,
-                MIME_TYPE_H264,
-                "video-0",
-                profile,
-                &mut admitted,
-            ),
-            Err("duplicate compatibility media track")
-        );
-        for (kind, mime, id) in [
-            (RTPCodecType::Video, "video/VP8", "video-0"),
-            (RTPCodecType::Audio, MIME_TYPE_OPUS, "audio-x"),
-            (RTPCodecType::Video, MIME_TYPE_H264, "video-2"),
-        ] {
-            assert_eq!(
-                admit_legacy_track_shape(kind, mime, id, profile, &mut admitted),
-                Err("media track is outside the compatibility provider")
-            );
-        }
-        assert_eq!(admitted.len(), 4);
     }
 
     // ---- ICE interface filter -----------------------------------------
@@ -12583,6 +15430,16 @@ mod tests {
         }
     }
 
+    /// The framing every assembler control below drives.
+    ///
+    /// The assembly machinery is codec-neutral and the fragmentation rules are
+    /// not, so a control that exercises reordering, loss or the fragment stop
+    /// has to name one framing. H.264 is the one with real fragment shapes to
+    /// build a chain out of.
+    fn h264_framing() -> Arc<dyn RealtimeUnitFraming> {
+        Arc::new(H264Framing)
+    }
+
     /// A single-NAL IDR payload (type 5) — emits as one whole unit.
     const IDR_NAL: &[u8] = &[0x65, 0xAA, 0xBB];
     /// The same IDR as three FU-A fragments (start / middle / end).
@@ -12590,15 +15447,44 @@ mod tests {
     const FU_M: &[u8] = &[0x7C, 0x05, 0x22];
     const FU_E: &[u8] = &[0x7C, 0x45, 0x33];
 
+    /// A guarded assembler whose fragment the provider will not fund rolls the
+    /// unit back rather than retaining half of it.
+    ///
+    /// The refusal used to be a fragment-byte ceiling: the payload was three
+    /// bytes, the owner's fragment maximum was two, and the assembler rejected
+    /// it on sight. There is no maximum to compare against now, so the refusal
+    /// has to come from the provider — and *which* acquisition it lands on
+    /// decides what the caller sees, which an earlier version of this control
+    /// got wrong by funding neither.
+    ///
+    /// `RealtimeUnitAssembler::push` has two refusal exits and they are not
+    /// interchangeable. A refused `begin_unit` leaves `self.assembly` at `None`,
+    /// clears the current parts and returns `Ok(None)` — the packet is dropped
+    /// quietly, because nothing was ever begun. Only a refused
+    /// `retain_ordered_fragment`, on an assembly that already exists, clears the
+    /// parts *and* `prev_end` and returns `Err`. This control is named for the
+    /// second one, so the grant funds the assembly and stops there: the unit
+    /// begins, the fragment is refused, and the error is the caller's signal
+    /// that the stream lost its anchor.
+    ///
+    /// Funding the assembly is also what keeps the ledger assertions from being
+    /// vacuous. `in_progress_units` really does reach one before the refusal, so
+    /// reading zero afterwards is a rollback rather than a state that was never
+    /// entered — and the refused fragment retaining no bytes is the ordering
+    /// property the name claims.
     #[test]
     fn v4_arc03_guarded_video_refuses_fragment_before_retention() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 2, 1, 16));
+        let (registry, _grant) = exact_realtime_registry(
+            exact_realtime_open_claims()
+                .into_iter()
+                .chain([RealtimeFlowRegistry::assembly_claim()
+                    .expect("the assembly claim is representable")]),
+        );
         let flow = registry.open_inbound_flow().expect("flow is admitted");
-        let mut assembler = H264AuAssembler::guarded(flow);
-        assert!(assembler
-            .push_guarded(&rtp_pkt(1, 100, true, IDR_NAL))
-            .is_err());
-        assert!(assembler.parts.is_empty());
+        let mut assembler =
+            RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&flow));
+        assert!(assembler.push(&rtp_pkt(1, 100, true, IDR_NAL)).is_err());
+        assert_eq!(assembler.fragments_held(), 0);
         let state = registry.state.lock();
         assert_eq!(retained_realtime_bytes(&state), 0);
         assert_eq!(RealtimeFlowRegistry::in_progress_units(&state), 0);
@@ -12607,11 +15493,12 @@ mod tests {
 
     #[test]
     fn v4_arc03f_silent_partial_unit_retains_only_its_finite_claim_until_owner_drop() {
-        let registry = test_realtime_registry(explicit_realtime_callback_policy(8, 1, 1, 8, 1, 16));
+        let registry = test_realtime_registry(explicit_realtime_workload(8, 1, 1, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
-        let mut assembler = H264AuAssembler::guarded(flow);
+        let mut assembler =
+            RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&flow));
         assert!(assembler
-            .push_guarded(&rtp_pkt(1, 100, false, FU_S))
+            .push(&rtp_pkt(1, 100, false, FU_S))
             .expect("the bounded fragment is valid")
             .is_none());
         {
@@ -12627,62 +15514,561 @@ mod tests {
         assert!(realtime_accounting_is_clean(&state));
     }
 
+    /// Replacing a session frees its labels and its resources, and the
+    /// replaced session's label stops working.
+    ///
+    /// The single control for the bundle-drop invariant. One name throughout on
+    /// purpose: it is the name an application is most likely to ask for again
+    /// the instant it reconnects, so a retired session's hold on it outliving
+    /// the session would show here first.
+    ///
+    /// The fixture admits exactly one active flow per domain and exactly one
+    /// queued unit. That is what makes the last assertion a proof rather than
+    /// a formality — the fresh session can only open at all if the replaced
+    /// session's flow was genuinely released, not merely forgotten.
+    #[test]
+    fn v4_macro1_a_replacing_a_session_frees_label_zero_and_its_resources() {
+        struct FixtureSession {
+            incarnation: Arc<crate::connector::ConnectorIncarnation>,
+        }
+
+        impl session_flow::RealtimeSessionBinding for FixtureSession {
+            fn is_current_on(
+                &self,
+                incarnation: &Arc<crate::connector::ConnectorIncarnation>,
+            ) -> bool {
+                Arc::ptr_eq(&self.incarnation, incarnation)
+            }
+        }
+
+        fn fixture_unit() -> RealtimeSendUnit {
+            RealtimeSendUnit {
+                pace: Duration::from_millis(20),
+                data: Bytes::from_static(b"unit"),
+            }
+        }
+
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
+        let name = fixture_flow_name();
+        let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
+            .expect("the fixture encoding names a shape a flow can carry");
+
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = FixtureSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(session_flow::leased_control_profile(&registry)),
+        );
+
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding: encoding.clone(),
+                    name: name.clone(),
+                },
+            ),
+            Ok(name.clone()),
+            "the application names its own flow and this side claims it exactly"
+        );
+        flows
+            .send(&session, Some(&incarnation), &name, fixture_unit())
+            .expect("a live flow of a current session takes a unit");
+
+        let queued = {
+            let state = registry.state.lock();
+            retained_realtime_bytes(&state)
+        };
+        assert!(
+            queued > 0,
+            "a queued unit holds its payload lease while it is queued — without \
+             this the release assertion below would pass vacuously"
+        );
+
+        // Retirement: the worker no longer has a live incarnation to offer.
+        assert_eq!(
+            flows.send(&session, None, &name, fixture_unit()),
+            Err(RealtimeFlowError::SessionNotCurrent),
+            "a retired connector cannot keep feeding a torn-down peer"
+        );
+
+        // Replacement: a different incarnation is a different connector, and
+        // the session's own belief that it is current is not enough.
+        let replacement = crate::connector::ConnectorIncarnation::new();
+        assert_eq!(
+            flows.send(&session, Some(&replacement), &name, fixture_unit()),
+            Err(RealtimeFlowError::SessionNotCurrent),
+            "the replaced session's label is unusable against the connector \
+             that replaced it"
+        );
+
+        // The drop of the bundle is the release. Nothing announces it.
+        drop(flows);
+        {
+            let state = registry.state.lock();
+            assert_eq!(
+                retained_realtime_bytes(&state),
+                0,
+                "the queued unit's bytes went with the session that owned it"
+            );
+            assert!(
+                realtime_accounting_is_clean(&state),
+                "and they were released rather than lost, which would poison \
+                 the domain instead"
+            );
+        }
+
+        // A freshly promoted session claims exactly the label the replaced one
+        // held. Under a one-flow-per-domain ceiling this is only possible if
+        // the flow itself was released, not just its name.
+        let next_session = FixtureSession {
+            incarnation: Arc::clone(&replacement),
+        };
+        let mut next = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(session_flow::leased_control_profile(&registry)),
+        );
+        assert_eq!(
+            next.open(
+                &next_session,
+                Some(&replacement),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding,
+                    name: name.clone(),
+                },
+            ),
+            Ok(name),
+            "the name an application is most likely to reuse is available again"
+        );
+    }
+
+    /// A fixture session bound to one connector incarnation.
+    ///
+    /// Hoisted out of the controls that declare their own copy, because three
+    /// of the flow-lifecycle controls below need one and a fourth definition
+    /// would be the point at which they start disagreeing.
+    struct FlowFixtureSession {
+        incarnation: Arc<crate::connector::ConnectorIncarnation>,
+    }
+
+    impl session_flow::RealtimeSessionBinding for FlowFixtureSession {
+        fn is_current_on(&self, incarnation: &Arc<crate::connector::ConnectorIncarnation>) -> bool {
+            Arc::ptr_eq(&self.incarnation, incarnation)
+        }
+    }
+
+    /// One inbound application flow consumes exactly one active-flow slot, and
+    /// the admitted track's handle on it is not a second owner.
+    ///
+    /// **The discriminating case is a one-flow ceiling.** Under it, the two
+    /// defects this control exists for are each a hard failure rather than a
+    /// degradation:
+    ///
+    /// - The connector used to open a *second* registry flow when the negotiated
+    ///   track arrived, for a flow the application had already opened. At
+    ///   capacity one that second acquisition refuses, so a flow whose open had
+    ///   succeeded would silently carry no media; at capacity *n* it would
+    ///   simply halve the configured capacity, which is the same defect wearing
+    ///   a number that looks deliberate.
+    /// - A strong port on the pump would keep the flow's lease alive past its
+    ///   close, so the replacement open below would refuse.
+    ///
+    /// The positive half is not decoration: an attachment that resolved to
+    /// nothing would satisfy the capacity assertion vacuously, so the control
+    /// proves the admitted handle really does reach *this* flow's accounting
+    /// while it is open, and really does stop after the close.
+    #[test]
+    fn v4_macro1_one_inbound_flow_holds_exactly_one_active_flow_slot() {
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
+        let name = fixture_flow_name();
+        let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
+            .expect("the fixture encoding names a shape a flow can carry");
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = FlowFixtureSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(session_flow::leased_control_profile(&registry)),
+        );
+
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding: encoding.clone(),
+                    name: name.clone(),
+                },
+            ),
+            Ok(name.clone()),
+            "the one inbound slot this fixture has is taken by the application's \
+             own open"
+        );
+
+        // Exactly what the fence does: mint, then bind, then negotiate. The
+        // retirement is minted against its own funded work scope because this
+        // control is about *flow-slot* accounting; what it needs from the
+        // retirement is only that the flow, rather than this caller, ends up
+        // holding it.
+        let (
+            _native_provider,
+            _native_owner,
+            _native_mesh,
+            _native_candidate,
+            _native_lifetime,
+            native_scope,
+        ) = realtime_native_test_scope(0, 1, 1);
+        let tracks = Arc::new(RealtimeSessionTracks::default());
+        let identity = RealtimeTrackIdentity::mint_for_test(&native_scope);
+        flows
+            .bind_inbound(
+                &session,
+                Some(&incarnation),
+                &name,
+                Arc::clone(&identity),
+                test_inbound_retirement(&tracks, &identity, &native_scope),
+            )
+            .expect("an open inbound flow of a current session takes a binding");
+
+        // Exactly what `on_track` does. No second open anywhere on this path.
+        let bindings = flows
+            .inbound_bindings()
+            .upgrade()
+            .expect("the set that just bound is still alive");
+        let attachment = bindings
+            .admit(&identity, WebRtcRtpKind::Video, "video/h264", 90_000, 0)
+            .expect("the track this side negotiated is admitted to its own flow");
+        assert_eq!(attachment.label.name(), &name);
+
+        // Positive: the handle reaches this flow's accounting while it is open.
+        // Without this the capacity assertion below could pass because the
+        // attachment pointed at nothing at all.
+        assert!(
+            attachment.port.port().is_some(),
+            "an admitted track's handle resolves to the flow it was admitted to"
+        );
+
+        // The attachment stays alive across the close, exactly as a running pump
+        // would be. If it owned a lease, this is where the leak would start.
+        let remains = flows
+            .close(&session, Some(&incarnation), &name)
+            .expect("the session that opened this flow may close it");
+        assert!(
+            matches!(
+                remains,
+                RealtimeFlowRemains::Inbound(ref retirement)
+                    if Arc::ptr_eq(retirement.identity(), &identity)
+            ),
+            "closing a bound inbound flow hands back the retirement for the exact \
+             token whose transceiver is still to be stopped"
+        );
+        assert!(
+            attachment.port.port().is_none(),
+            "and the pump's handle stops resolving, which is the whole of how it \
+             learns the flow is gone"
+        );
+
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding,
+                    name: name.clone(),
+                },
+            ),
+            Ok(name),
+            "the one slot is free again while the closed flow's attachment is \
+             still held — so the attachment never owned one"
+        );
+    }
+
+    /// An outbound open for a family the application never registered is
+    /// refused as such, and costs nothing.
+    ///
+    /// The defect this replaces was silent in the way that matters: the open
+    /// succeeded, took a label and a flow slot, and the refusal surfaced later
+    /// from native negotiation as `FlowRefused` — which tells a caller to back
+    /// off and retry something that can never succeed. Inbound already answered
+    /// at bind time; outbound had no such point.
+    ///
+    /// Proved by consequence rather than by the error alone: under a one-flow
+    /// ceiling and on the same label, a registered open immediately afterwards
+    /// can only succeed if the refusal consumed neither.
+    #[test]
+    fn v4_macro1_an_unregistered_outbound_open_costs_no_label_and_no_capacity() {
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
+        let name = fixture_flow_name();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = FlowFixtureSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(session_flow::leased_control_profile(&registry)),
+        );
+
+        let unregistered = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/VP8", 90_000, 0)
+            .expect("an encoding naming a family the control profile never registered");
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding: unregistered,
+                    name: name.clone(),
+                },
+            ),
+            Err(RealtimeFlowError::EncodingInvalid),
+            "an unregistered family has no codec to negotiate and no framer to \
+             install, which is a property of the request and not of what the \
+             transport later makes of it"
+        );
+
+        let registered = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
+            .expect("an encoding naming a family the control profile registers");
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Outbound,
+                    encoding: registered,
+                    name: name.clone(),
+                },
+            ),
+            Ok(name),
+            "the same name and the only outbound slot are both still free, so \
+             the refusal above acquired neither"
+        );
+    }
+
+    /// A second party to one retirement waits for the first to finish, and is
+    /// never told the work is done before it is.
+    ///
+    /// Three parties can reach the same native object — an explicit close, the
+    /// pump that was feeding the flow, and the install that supersedes the
+    /// session — and single ownership is only half the answer. The other half
+    /// is what the losers are told. A loser that returned immediately would let
+    /// the daemon acknowledge a close while the transceiver was still being
+    /// stopped, and a reopen on that label would then race a transceiver still
+    /// offering to receive.
+    ///
+    /// Exercised on [`RealtimeRetirement`] directly, which is why that state is
+    /// a type of its own and holds no transceiver: the race is in the claim and
+    /// the completion, and standing up a peer connection to reach it would test
+    /// `webrtc`'s `stop` rather than this decision. The assertion that matters
+    /// is the *negative* one — that the waiter is still waiting — because a
+    /// completion that fired early would satisfy every positive assertion here.
+    ///
+    /// The **late** subscriber is the second load-bearing case, and it is what
+    /// the completion cell is shaped for: a party that arrives after the stop has
+    /// already finished must be told so immediately rather than parking on a
+    /// notification that has been and gone. Completion is a state read before
+    /// registering, not an edge.
+    #[tokio::test]
+    async fn v4_macro1_a_losing_retirer_waits_for_the_winner_to_finish() {
+        // No identity and exactly one completion cell: this control never mints
+        // a track, and an identity it does not hold would be capacity standing
+        // behind the completion cell it does.
+        let (_candidate, _lifetime, scope) = identity_test_scope(0, 1);
+        let signal = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                RealtimeRetirementSignal::mint_claim()
+                    .expect("the completion claim is representable"),
+            )
+            .expect("the fixture grant funds one completion cell");
+        let mut retirement = RealtimeRetirement::new(signal);
+
+        // `let ... else` rather than `expect`/`expect_err`. Both arms of
+        // `claim` are `FundedArc<RealtimeRetirementSignal>`, and that type has no
+        // `Debug` — deliberately, because a completion cell's contents are not
+        // a thing to print — so the panicking helpers cannot name it. Giving it
+        // one to satisfy a test would put a formatting surface on a
+        // synchronisation primitive for the sake of a message these panics
+        // already carry.
+        let Ok(done) = retirement.claim() else {
+            panic!("the first caller takes responsibility")
+        };
+        let Err(waiting) = retirement.claim() else {
+            panic!("a second caller does not get a second claim on one object")
+        };
+        let Err(third) = retirement.claim() else {
+            panic!("nor does any later one")
+        };
+
+        let mut waiter = tokio::spawn(await_retirement(waiting));
+        // Not `is_finished`, which would be a race against the spawn itself.
+        // A timed poll that expires is the honest form of "still waiting".
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "the loser is still waiting while the winner's stop is outstanding — \
+             without this the assertion below would pass on a completion that \
+             had fired immediately"
+        );
+        assert!(
+            !third.is_done(),
+            "and nothing observing the state reports it as retired yet"
+        );
+
+        // What `stop_owned` does once `stop` has returned.
+        done.finish();
+
+        waiter
+            .await
+            .expect("the loser is released once the winner has finished");
+        assert!(third.is_done());
+        // The late arrival. It registers nothing that could have been missed,
+        // because it reads the state first — so this returns rather than parking
+        // forever on a wake that fired before it existed.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            await_retirement(third),
+        )
+        .await
+        .expect("a party that arrives after the stop is told immediately");
+    }
+
+    /// A unit that arrives for a label with no open inbound flow is dropped at
+    /// arrival, and its bytes go with it.
+    ///
+    /// The discriminating case for the early-arrival race: a peer's first
+    /// units can outrun the application-level announcement that would have
+    /// caused this side to open the flow. Nothing queues them against a
+    /// future open — there is no place to put them that is not an unbounded,
+    /// unaccounted buffer keyed on a label the session does not yet use, and
+    /// a label is not a reservation.
+    ///
+    /// So the answer is refuse-and-release, and the second half is the part
+    /// worth a control: the caller's lease is consumed by the drop, which
+    /// returns the bytes rather than stranding them. A drop that leaked its
+    /// lease would look identical from the caller's side and would exhaust
+    /// the envelope one unarrived flow at a time.
+    #[test]
+    fn v4_macro1_a_unit_for_an_unopened_flow_is_dropped_and_its_bytes_released() {
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
+        let flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(session_flow::leased_control_profile(&registry)),
+        );
+        let data = Bytes::from_static(b"unit");
+
+        // A lease taken exactly as the inbound pump would take it.
+        let port = registry
+            .open_inbound_flow()
+            .expect("the fixture admits one inbound flow");
+        let output = port
+            .reserve_output(data.len())
+            .expect("the fixture envelope admits one unit");
+        let payload = output.into_payload_lease();
+        {
+            let state = registry.state.lock();
+            assert!(
+                retained_realtime_bytes(&state) > 0,
+                "the lease is really holding bytes before the drop — without \
+                 this the release assertion below would pass vacuously"
+            );
+        }
+
+        // Assembled exactly as the inbound pump assembles one: a leaseless
+        // delivery, with the queue's lease attached afterwards. Passed intact,
+        // because that is the only shape the engine can hand over — it cannot
+        // name the lease inside, let alone separate it.
+        let mut delivery = RealtimeInboundDelivery::new(
+            test_label(7),
+            RealtimeRecvUnit {
+                timestamp: 90_000,
+                marker: true,
+                data,
+            },
+        );
+        delivery
+            .attach(payload)
+            .expect("a freshly built delivery has no lease to displace");
+
+        assert!(
+            !flows.deliver_inbound(delivery),
+            "a label this session holds no flow for takes nothing"
+        );
+
+        drop(port);
+        let state = registry.state.lock();
+        assert_eq!(
+            retained_realtime_bytes(&state),
+            0,
+            "the refused unit's lease was consumed by the drop, not stranded"
+        );
+        assert!(
+            realtime_accounting_is_clean(&state),
+            "and released rather than lost, which would poison the domain"
+        );
+    }
+
     #[test]
     fn v4_arc03_guarded_video_reordered_unit_transfers_exact_output_claim() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(32, 1, 1, 8, 1, 64));
+        let registry = test_realtime_registry(explicit_realtime_workload(32, 1, 1, 8, 1));
         let flow = registry.open_inbound_flow().expect("flow is admitted");
-        let mut assembler = H264AuAssembler::guarded(flow);
+        let mut assembler =
+            RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&flow));
         let anchor = assembler
-            .push_guarded(&rtp_pkt(9, 100, true, IDR_NAL))
+            .push(&rtp_pkt(9, 100, true, IDR_NAL))
             .expect("anchor is valid")
             .expect("anchor emits");
         drop(anchor);
         assert!(assembler
-            .push_guarded(&rtp_pkt(10, 200, false, FU_S))
+            .push(&rtp_pkt(10, 200, false, FU_S))
             .unwrap()
             .is_none());
         assert!(assembler
-            .push_guarded(&rtp_pkt(12, 200, true, FU_E))
+            .push(&rtp_pkt(12, 200, true, FU_E))
             .unwrap()
             .is_none());
-        let sample = assembler
-            .push_guarded(&rtp_pkt(11, 200, false, FU_M))
+        let unit = assembler
+            .push(&rtp_pkt(11, 200, false, FU_M))
             .expect("late middle is valid")
             .expect("whole reordered unit emits");
-        assert_eq!(
-            sample.sample.data.as_ref(),
-            &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]
-        );
+        assert_eq!(unit.data.as_ref(), &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]);
         assert_eq!(
             retained_realtime_bytes(&registry.state.lock()),
-            sample.sample.data.len()
+            unit.data.len()
         );
-        drop(sample);
+        drop(unit);
         assert_eq!(retained_realtime_bytes(&registry.state.lock()), 0);
     }
 
     #[test]
     fn v4_arc03f_guarded_video_in_progress_limit_is_independent_per_flow() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
+        let registry = test_realtime_registry(explicit_realtime_workload(32, 2, 1, 8, 1));
         let first_flow = registry
             .open_inbound_flow()
             .expect("first flow is admitted");
         let second_flow = registry
             .open_inbound_flow()
             .expect("second flow is admitted");
-        let mut first = H264AuAssembler::guarded(first_flow);
-        let mut second = H264AuAssembler::guarded(second_flow);
-        assert!(first
-            .push_guarded(&rtp_pkt(1, 100, false, FU_S))
-            .unwrap()
-            .is_none());
+        let mut first =
+            RealtimeUnitAssembler::guarded(h264_framing(), RealtimeFlowPortHandle::of(&first_flow));
+        let mut second = RealtimeUnitAssembler::guarded(
+            h264_framing(),
+            RealtimeFlowPortHandle::of(&second_flow),
+        );
+        assert!(first.push(&rtp_pkt(1, 100, false, FU_S)).unwrap().is_none());
         assert!(second
-            .push_guarded(&rtp_pkt(2, 200, false, FU_S))
+            .push(&rtp_pkt(2, 200, false, FU_S))
             .unwrap()
             .is_none());
-        assert_eq!(second.parts.len(), 1);
+        assert_eq!(second.fragments_held(), 1);
         assert_eq!(
             RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
             2
@@ -12699,40 +16085,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v4_arc03f_in_progress_unit_limit_is_enforced_per_flow() {
-        let registry =
-            test_realtime_registry(explicit_realtime_callback_policy(32, 2, 1, 8, 1, 64));
-        let first_flow = registry
-            .open_inbound_flow()
-            .expect("first flow is admitted");
-        let second_flow = registry
-            .open_inbound_flow()
-            .expect("second flow is admitted");
-
-        let first_unit = first_flow.begin_unit().expect("first unit is admitted");
-        assert!(
-            first_flow.begin_unit().is_none(),
-            "the same flow cannot exceed its unit ceiling"
-        );
-        let second_unit = second_flow
-            .begin_unit()
-            .expect("another flow retains its independent unit slot");
-        assert_eq!(
-            RealtimeFlowRegistry::in_progress_units(&registry.state.lock()),
-            2
-        );
-
-        drop(first_unit);
-        assert!(first_flow.begin_unit().is_some());
-        drop(second_unit);
-    }
+    // A control asserting that one flow could not exceed *its own* in-progress
+    // unit ceiling while a second flow kept an independent slot used to live
+    // here. Both halves were the owner-selected per-flow unit ceiling: there is
+    // no per-flow limit now, and the capacity that admits an assembly is one
+    // pooled provider grant with no flow in it, so a second unit on the first
+    // flow legitimately spends what a fixture intended for the second flow. No
+    // grant size expresses "per flow" out of a pool — funding one assembly
+    // refuses the second flow too, which is not the claim. What survives is that
+    // in-progress units are counted and released per flow, and
+    // `v4_arc03f_guarded_video_in_progress_limit_is_independent_per_flow` above
+    // already proves exactly that, on two flows, without a ceiling.
 
     #[test]
     fn single_packet_units_emit_in_order() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         let s1 = asm.push(&rtp_pkt(1, 100, true, IDR_NAL)).unwrap().unwrap();
-        assert!(s1.key, "type-5 NAL is a key unit");
+        assert!(s1.entry_point, "type-5 NAL is a decoder entry point");
         assert_eq!(&s1.data[..], &[0, 0, 0, 1, 0x65, 0xAA, 0xBB]);
         let s2 = asm.push(&rtp_pkt(2, 200, true, IDR_NAL)).unwrap();
         assert!(s2.is_some(), "the anchored next unit emits too");
@@ -12740,7 +16109,7 @@ mod tests {
 
     #[test]
     fn fragments_reassemble_even_when_reordered() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         // Anchor with a complete first unit.
         asm.push(&rtp_pkt(9, 100, true, IDR_NAL)).unwrap().unwrap();
         // Fragments arrive start, END (marker), middle — out of order.
@@ -12752,12 +16121,12 @@ mod tests {
             .expect("contiguous after the late middle arrives");
         // Reconstructed: start code + NAL header (idc|type) + fragments.
         assert_eq!(&s.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]);
-        assert!(s.key);
+        assert!(s.entry_point);
     }
 
     #[test]
     fn a_hole_mid_unit_drops_that_unit_never_a_torn_one() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         asm.push(&rtp_pkt(20, 100, true, IDR_NAL)).unwrap().unwrap();
         // Unit 2 loses its middle fragment for good.
         assert!(asm.push(&rtp_pkt(21, 200, false, FU_S)).unwrap().is_none());
@@ -12773,7 +16142,7 @@ mod tests {
 
     #[test]
     fn an_anchored_hole_waits_for_the_retransmit() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         asm.push(&rtp_pkt(29, 100, true, IDR_NAL)).unwrap().unwrap();
         // The unit's *first* packet is missing; the marker alone must not
         // emit a headless tail.
@@ -12789,7 +16158,7 @@ mod tests {
 
     #[test]
     fn late_retransmit_of_an_abandoned_unit_cannot_clobber_the_live_one() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         // Unit at ts 100 never completes (tail lost)…
         assert!(asm.push(&rtp_pkt(40, 100, false, FU_S)).unwrap().is_none());
         // …the next unit begins…
@@ -12807,7 +16176,7 @@ mod tests {
 
     #[test]
     fn a_headless_tail_never_emits_without_an_anchor() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         // Fresh stream joined mid-unit: middle + end fragments only.
         assert!(asm.push(&rtp_pkt(50, 100, false, FU_M)).unwrap().is_none());
         assert!(
@@ -12818,7 +16187,7 @@ mod tests {
 
     #[test]
     fn sequence_wraparound_is_transparent() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         asm.push(&rtp_pkt(65534, 100, true, IDR_NAL))
             .unwrap()
             .unwrap();
@@ -12844,6 +16213,987 @@ mod tests {
         assert!(payload_starts_au(&Bytes::from_static(&[0x78, 0x00, 0x01])));
     }
 
+    /// The connector's binding slot dies with the session that owns it, and a
+    /// replacement points only at the new one.
+    ///
+    /// This is the `Weak` doing the whole job. The slot exists so `on_track`
+    /// can find the table that says which flow a negotiated track may attach
+    /// to, and the one thing it must never do is keep answering after the
+    /// `PromotedSession` that owned those flows is gone — a table that outlived
+    /// its session would resolve tokens to labels in a flow set that no longer
+    /// exists.
+    ///
+    /// Three cases, and the middle one is the discriminating one: a strong
+    /// slot would pass "install works" and "replacement points at the new set"
+    /// identically, and would fail only here.
+    #[test]
+    fn v4_macro1_the_connector_binding_slot_cannot_outlive_its_session() {
+        // No resources and no ceiling, and **no profile either**. What this
+        // control exercises is the slot's `Weak`, which never consults codecs:
+        // nothing here opens a flow or admits a track. A registry with no
+        // resources could not pay for a profile record in any case — the
+        // acquisition answers `OwnerPolicyMissing` before capacity is even a
+        // question — so asking for one would make the fixture, rather than the
+        // slot, the thing under test.
+        let registry = RealtimeFlowRegistry::new(None);
+        // Shared, because the table owns the retirement of the transceivers it
+        // records and hands a clone of itself to whichever task performs one.
+        // This control negotiates none, so that sweep has nothing to do here.
+        let tracks = Arc::new(RealtimeSessionTracks::default());
+
+        // Nothing installed yet: an arriving track has nothing to consult.
+        assert!(
+            tracks.current().is_none(),
+            "a connector with no promoted session admits no inbound track"
+        );
+
+        let flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        tracks.install(flows.inbound_bindings());
+        let installed = tracks
+            .current()
+            .expect("the installed table upgrades while its flow set is alive");
+        assert!(
+            flows.owns_bindings(&installed),
+            "and it is *that* flow set's table, not merely some table"
+        );
+        // Released before the session ends, and that is load-bearing rather
+        // than tidy: `current()` hands back a *strong* reference, so a control
+        // still holding one is itself a second owner and the slot below would
+        // upgrade for that reason alone. The premise of the next assertion is
+        // that the flow set is the only strong holder.
+        drop(installed);
+
+        // The session ends. This is the case a strong slot would fail: the
+        // flow set is the only strong holder, so dropping it must make the
+        // connector's slot unupgradable.
+        drop(flows);
+        assert!(
+            tracks.current().is_none(),
+            "the table died with the session that owned the flows it names — a \
+             strong slot here would have kept it resolving into a flow set that \
+             no longer exists"
+        );
+
+        // A replacement session installs its own, and the slot points only at
+        // the new one.
+        let replacement = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        tracks.install(replacement.inbound_bindings());
+        let current = tracks
+            .current()
+            .expect("the replacement's table upgrades in its turn");
+        assert!(
+            replacement.owns_bindings(&current),
+            "the slot names the replacement's table and not a survivor of the \
+             session it replaced"
+        );
+        drop(current);
+
+        // And the replacement's own drop clears it again, so the slot is not
+        // merely correct once.
+        drop(replacement);
+        assert!(tracks.current().is_none());
+    }
+
+    /// A flow that ends with nobody calling anything still submits its inbound
+    /// transceiver's retirement, and a flow that is closed submits exactly one.
+    ///
+    /// **The gap.** The close path used to be the only submitter: it handed back
+    /// a bare `Arc<RealtimeTrackIdentity>` and the engine stopped the
+    /// transceiver against it. Every other way a flow ends — a revoked policy, a
+    /// replaced peer, a shutdown, the promoted session simply being dropped —
+    /// dropped that token and started nothing, leaving a `recvonly` transceiver
+    /// and its `m` line on a connector that may well go on hosting another
+    /// session. The superseding install does sweep those, but only when a *next*
+    /// session is promoted, so on a connector that hosts no further session the
+    /// leak has no end.
+    ///
+    /// **The observable is the track table's weak count**, which is exactly "how
+    /// many retirements are still owed on it". That is what makes both legs
+    /// discriminating rather than restatements of the code: a design that kept
+    /// handing back a bare token would leave the count at zero throughout and
+    /// satisfy nothing here, and a design that submitted on drop *and* on close
+    /// would leave the explicit leg still owing a second stop for one
+    /// transceiver, which the disarm assertion rejects.
+    ///
+    /// The implicit leg then separates *submitted* from *discarded*, which the
+    /// weak count alone cannot: it reads the **process cleanup executor's own
+    /// job count** across the drop. A retirement that reaches its submission
+    /// adds a job there and can add one no other way, and the reading is the sum
+    /// across every job state, so no single counter's transition can be mistaken
+    /// for one. The sum is exact on a *settled* executor rather than at an
+    /// arbitrary instant — see [`submitted_cleanup_jobs`] — so the leg waits for
+    /// the executor's own thread to finish moving its counters and then asserts
+    /// the total. That wait is about this fixture's reading, not about the
+    /// submission: the submission is synchronous and has already happened when
+    /// the destructor returns.
+    ///
+    /// **No runtime is required and that is the third property under test.** The
+    /// review requires a drop-safe submission owner; a design that submitted
+    /// through `tokio::runtime::Handle::try_current` would retire nothing when a
+    /// flow set is dropped during a shutdown, an unwind, or on a bare thread. So
+    /// the implicit leg runs on a plain `#[test]` with no runtime in scope at
+    /// all, and a `try_current`-based submitter fails it outright.
+    #[test]
+    fn v4_arc05_an_implicitly_ended_inbound_flow_submits_its_retirement() {
+        let registry = test_realtime_registry(explicit_realtime_workload(16, 1, 1, 16, 1));
+        let name = fixture_flow_name();
+        let encoding = RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
+            .expect("the fixture encoding names a shape a flow can carry");
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = FlowFixtureSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        // Two retirements' worth of native funding, one per leg. Exact, so a
+        // leg that leaked a queue slot would refuse the next mint rather than
+        // pass quietly.
+        let (
+            _native_provider,
+            native_owner,
+            _native_mesh,
+            _native_candidate,
+            _native_lifetime,
+            native_scope,
+        ) = realtime_native_test_scope(0, 2, 2);
+        // The cleanup owner both legs mint from. No transceiver is negotiated
+        // against either token: what is under test is who owes the stop and
+        // where the stop is submitted, not what performing one does.
+        let tracks = Arc::new(RealtimeSessionTracks::default());
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(session_flow::leased_control_profile(&registry)),
+        );
+        let submitted_before = submitted_cleanup_jobs(&native_owner);
+
+        // Leg one: an explicit close, which takes the submission and is then the
+        // only party that will make one.
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding: encoding.clone(),
+                    name: name.clone(),
+                },
+            ),
+            Ok(name.clone()),
+            "the fixture's one inbound slot opens"
+        );
+        let closed = RealtimeTrackIdentity::mint_for_test(&native_scope);
+        flows
+            .bind_inbound(
+                &session,
+                Some(&incarnation),
+                &name,
+                Arc::clone(&closed),
+                test_inbound_retirement(&tracks, &closed, &native_scope),
+            )
+            .expect("an open inbound flow of a current session takes a binding");
+        assert_eq!(
+            Arc::weak_count(&tracks),
+            1,
+            "the flow, not the caller that minted it, is what owes this \
+             transceiver its stop"
+        );
+        let remains = flows
+            .close(&session, Some(&incarnation), &name)
+            .expect("the session that opened this flow may close it");
+        let RealtimeFlowRemains::Inbound(mut retirement) = remains else {
+            panic!("closing a bound inbound flow hands back its retirement");
+        };
+        assert!(
+            retirement.submits_on_drop(),
+            "until the close takes it, this is still the thing that would submit"
+        );
+        assert!(
+            Arc::ptr_eq(&retirement.take_for_explicit_close(), &closed),
+            "and it names the exact token this flow was bound to"
+        );
+        assert!(
+            !retirement.submits_on_drop(),
+            "taking it disarms the drop, so the caller that will await the \
+             receipt stays the single submitter on its own path"
+        );
+        drop(retirement);
+        assert_eq!(
+            Arc::weak_count(&tracks),
+            0,
+            "and a taken retirement leaves nothing behind that would stop one \
+             transceiver a second time"
+        );
+        assert_eq!(
+            submitted_cleanup_jobs(&native_owner),
+            submitted_before,
+            "an explicit close queues nothing: it runs the retirement on its own \
+             task so it can await the receipt, and a job here would be a second \
+             stop for one transceiver"
+        );
+
+        // Leg two: nobody closes anything. This is the case a bare token lost
+        // outright.
+        assert_eq!(
+            flows.open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding,
+                    name: name.clone(),
+                },
+            ),
+            Ok(name.clone()),
+            "the slot the close released takes the second flow"
+        );
+        let ended = RealtimeTrackIdentity::mint_for_test(&native_scope);
+        flows
+            .bind_inbound(
+                &session,
+                Some(&incarnation),
+                &name,
+                Arc::clone(&ended),
+                test_inbound_retirement(&tracks, &ended, &native_scope),
+            )
+            .expect("the replacement flow takes its binding too");
+
+        drop(flows);
+        assert_eq!(
+            Arc::weak_count(&tracks),
+            0,
+            "the session's end consumed the retirement rather than leaving it \
+             owed by something that no longer exists"
+        );
+        // The submission itself is synchronous and is already done — what is
+        // not yet done is the executor's own bookkeeping, whose counters move
+        // one at a time on its thread. So this waits for that thread to settle
+        // rather than for the submission, and then reads the total where it is
+        // exact. Bounded rather than slept: the deadline exists to fail an
+        // executor that never took the work at all, and a correct one is past
+        // this in the first few yields.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let cleanup = native_owner.report().cleanup;
+            if cleanup.queued_jobs == 0
+                && cleanup.active_jobs == 0
+                && submitted_cleanup_jobs(&native_owner) == submitted_before + 1
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped flow set never reached the process cleanup executor \
+                 with its retirement, so nothing will ever stop that transceiver"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            submitted_cleanup_jobs(&native_owner),
+            submitted_before + 1,
+            "and consumed it by submitting exactly one retirement to the process \
+             cleanup executor — from a plain test with no runtime in scope, which \
+             is the case a `Handle::try_current` submitter loses outright. Exact \
+             on a settled executor: one more than before, and not two, which is \
+             what a design that submitted on drop *and* on close would leave"
+        );
+    }
+
+    /// A connector that cannot fund a retirement does not negotiate the
+    /// transceiver that would need one.
+    ///
+    /// **Reserve-before-need, and the "before" is the whole assertion.** The
+    /// submission a retirement makes happens in a destructor, where there is no
+    /// caller to refuse and nothing to report a refusal to. So the queue slot it
+    /// will use is acquired while the flow is still being bound, which is the
+    /// one moment a refusal is an ordinary refusal.
+    ///
+    /// The discriminating shape is a grant for exactly one. A design that
+    /// acquired the slot lazily at drop time passes every liveness assertion and
+    /// fails only here — and in production it would fail nowhere at all, it would
+    /// just stop retiring transceivers on exactly the connectors that are already
+    /// under pressure.
+    ///
+    /// The second queue-slot acquisition is the load-bearing half; the first is
+    /// what proves the grant was not simply too small for anything, which would
+    /// make the refusal true for the wrong reason.
+    #[test]
+    fn v4_arc05_a_connector_that_cannot_fund_a_retirement_refuses_it_at_bind() {
+        let (_provider, owner, _mesh, _candidate, _lifetime, scope) =
+            realtime_native_test_scope(0, 1, 1);
+        let tracks = Arc::new(RealtimeSessionTracks::default());
+        let slot_claim = crate::runtime::attempt::cleanup_job_claim()
+            .expect("the retirement slot claim is representable");
+
+        let funded = RealtimeTrackIdentity::mint_for_test(&scope);
+        let first = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                slot_claim,
+            )
+            .expect("the grant funds the one retirement it was derived for");
+        let retirement = tracks.retirement(
+            Arc::clone(&funded),
+            scope.cleanup_submission().clone(),
+            first,
+        );
+
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    slot_claim,
+                )
+                .is_err(),
+            "a second retirement has no queue slot to stand on, so the bind that \
+             would have needed it refuses instead of negotiating a transceiver \
+             nothing could later retire"
+        );
+
+        // And the refusal is capacity, not a permanently poisoned scope: the
+        // slot comes back, so the next flow on this connector can be bound.
+        // Without this the assertion above would also pass for a scope that had
+        // simply stopped working.
+        //
+        // **It comes back when the retirement's job finishes, not when the
+        // retirement drops.** The destructor does not release the slot; it hands
+        // it to `submit_subordinate`, where it becomes the accepted job's own
+        // funding and is released only when that job ends. That is the same
+        // reserve-before-need asymmetry this control exists to state, seen from
+        // the other end, and the earlier reading of it — "the slot comes back
+        // when its retirement does" — was the reason this control failed under
+        // load rather than a fact about the design.
+        //
+        // A *refused* submission is the other case and it is not this one: no
+        // job survives to fund, so the slot is released the ordinary way, and
+        // what moves to failed-cleanup retention there is the native charge —
+        // the transceiver nobody could prove stopped — never the queue slot.
+        // Stated in
+        // `v4_arc05_a_refused_cleanup_executor_retains_the_transceivers_exact_claim`;
+        // the executor here is live, so the accepted path is what runs.
+        //
+        // Deliberately still a plain `#[test]`. The cleanup executor owns the
+        // thread and the runtime that await the job, which is what lets a
+        // destructor submit from a bare thread at all, and it is observable from
+        // here without one.
+        let submitted_before = submitted_cleanup_jobs(&owner);
+        let completed_before = owner.report().cleanup.completed_jobs;
+        drop(retirement);
+
+        // The earliest reading first, because it is the only one that can catch
+        // a destructor releasing to the pool: an immediate re-acquisition may or
+        // may not have raced the executor, and asserting either outcome outright
+        // would be asserting a timing. What is invariant is the pairing —
+        // capacity may only reappear once the job it was funding has finished. A
+        // design that released at drop time shows up here as a grant with no
+        // completion behind it, and it has to be asked *now*, before anything
+        // below waits for that completion and makes the pairing trivially true.
+        let early = scope.acquire(
+            crate::resource::ResourceAuthorityClass::Admitted,
+            slot_claim,
+        );
+        assert!(
+            early.is_err() || owner.report().cleanup.completed_jobs > completed_before,
+            "the slot was grantable again before the job it funds had run, so the \
+             destructor released capacity it had already committed"
+        );
+        drop(early);
+
+        // Now to actual completion, and to a job total that can be read exactly.
+        // Both need the same thing — the executor's own thread to have finished
+        // moving its counters — so it is one wait rather than two. The submission
+        // is synchronous and already happened; what has not is the bookkeeping,
+        // which crosses two handoffs where the total is momentarily wrong in
+        // either direction (see [`submitted_cleanup_jobs`]). A timeout rather
+        // than an unbounded spin, so an executor that never runs the job fails as
+        // a failed control instead of a hung one.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let cleanup = owner.report().cleanup;
+            if cleanup.completed_jobs > completed_before
+                && cleanup.queued_jobs == 0
+                && cleanup.active_jobs == 0
+                && submitted_cleanup_jobs(&owner) == submitted_before + 1
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process cleanup executor never completed the submitted \
+                 retirement, so the slot it funds could never come back"
+            );
+            std::thread::yield_now();
+        }
+
+        // The drop handed the slot to a job rather than to the pool. Asserted on
+        // the settled executor, where the total is exact and nothing further can
+        // move it: a destructor that had released instead of submitting leaves
+        // the total where it was, and fails the wait above at its deadline.
+        assert_eq!(
+            submitted_cleanup_jobs(&owner),
+            submitted_before + 1,
+            "the dropped retirement submitted its slot as a cleanup job instead of \
+             releasing it, which is the reserve-before-need asymmetry the bind \
+             refusal above depends on"
+        );
+
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    slot_claim,
+                )
+                .is_ok(),
+            "the completed job released its slot, so the refusal above was this \
+             connector being full rather than this connector being broken"
+        );
+    }
+
+    /// A stop that refuses moves the transceiver's exact claim into failed-
+    /// cleanup retention; a stop that returns releases it.
+    ///
+    /// **The asymmetry is the whole property.** A completed `stop` is an
+    /// observation that the native object is gone, and only then may its charge
+    /// be handed back. A refused `stop` observes nothing, so releasing would
+    /// grant this connector's next admission capacity it never actually
+    /// recovered — the accounting equivalent of assuming a cleanup worked
+    /// because it was attempted. The old path did exactly that: it logged the
+    /// error, announced success, forgot the record and released everything.
+    ///
+    /// **Both readings come from the provider**, not from a tally this module
+    /// keeps, because a local counter could agree with itself while the provider
+    /// had already released the claim. And both are stated twice over — once as
+    /// the retention total, once as whether the capacity can be granted again —
+    /// so "retained" cannot be confused with "released and separately counted".
+    ///
+    /// The success leg is not decoration. Without it a design that retained
+    /// unconditionally, and therefore leaked capacity on every ordinary close,
+    /// would satisfy the failure leg perfectly.
+    ///
+    /// The grant is exactly two transceivers and no slots, so the acquisition
+    /// assertions are about this control's own two records and nothing else.
+    #[tokio::test]
+    async fn v4_arc05_a_refused_native_stop_retains_the_transceivers_exact_claim() {
+        let (provider, _owner, _mesh, _candidate, _lifetime, scope) =
+            realtime_native_test_scope(2, 0, 2);
+        let tracks = Arc::new(RealtimeSessionTracks::default());
+        let transceiver_claim =
+            negotiated_inbound_transceiver_claim().expect("the transceiver claim is representable");
+        let record_claim =
+            negotiated_inbound_record_claim().expect("the record claim is representable");
+        let signal_claim =
+            RealtimeRetirementSignal::mint_claim().expect("the completion claim is representable");
+
+        // Both recorded before either is retired, so the grant is exhausted and
+        // every acquisition below is a statement about what a retirement gave
+        // back rather than about spare headroom.
+        let (stopped, stopped_calls) = record_test_transceiver(&tracks, &scope, false);
+        let (refused, refused_calls) = record_test_transceiver(&tracks, &scope, true);
+        let retained_before = provider.retained_after_failed_cleanup();
+
+        // The success leg.
+        tracks.stop_claimed(&stopped).await;
+        assert_eq!(
+            stopped_calls.load(Ordering::Acquire),
+            1,
+            "the retirement reached the native stop exactly once"
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            retained_before,
+            "a stop that returned proves the object is gone, so nothing is \
+             retained for it"
+        );
+        // Held, not dropped: this is the capacity the successful retirement gave
+        // back, and holding it is what makes the refusal below mean "the failed
+        // one is still charged" rather than "something was free".
+        let recovered_record = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                record_claim,
+            )
+            .expect("forgetting the record freed its node, one allocation exactly");
+        let recovered_native = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                transceiver_claim,
+            )
+            .expect("and the stopped transceiver's own claim is grantable again");
+        let recovered_signal = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                signal_claim,
+            )
+            .expect("and so is the completion cell of the retirement that ended");
+
+        // The failure leg.
+        tracks.stop_claimed(&refused).await;
+        assert_eq!(
+            refused_calls.load(Ordering::Acquire),
+            1,
+            "the refused stop was genuinely attempted, once"
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            retained_before
+                .checked_add(transceiver_claim)
+                .expect("the retained total is representable"),
+            "and its exact NATIVE claim moved to failed-cleanup retention — this \
+             claim alone, not the record's node with it, not a rounded one, and \
+             not a different dimension"
+        );
+        // **Classification survives the refusal.** This is the assertion the
+        // whole success-only removal exists for: the transceiver is still on the
+        // peer connection, so a track arriving on it must still read as one this
+        // side solicited. A design that forgot the record on every path would
+        // pass every accounting assertion here and turn that track into one the
+        // peer appears to have named.
+        assert!(
+            tracks.classifies(&refused),
+            "a transceiver whose stop refused is still there, so its record is \
+             still here to classify what arrives on it"
+        );
+        assert!(
+            !tracks.classifies(&stopped),
+            "while the one that really stopped is gone from the table — without \
+             this the assertion above would pass on a table that never forgets \
+             anything"
+        );
+        // And the record it kept is still charged for, exactly. The node is not
+        // a bookkeeping entry that can be quietly released while the allocation
+        // it names is still live.
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    record_claim,
+                )
+                .is_err(),
+            "so its node is still held too: the record is retained, not swept"
+        );
+        // The completion cell is likewise still held, because the retained
+        // record still owns its retirement. Only the finished one came back.
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    signal_claim,
+                )
+                .is_err(),
+            "and so is its completion cell — one cell came back, from the record \
+             that was actually forgotten"
+        );
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    transceiver_claim,
+                )
+                .is_err(),
+            "and the retained native claim is still counted against this \
+             connector, so the capacity behind a transceiver nobody could stop is \
+             not handed out again"
+        );
+        // A later party reaching the retained record loses the claim and must
+        // still be released. The winning attempt announced its end even though
+        // the stop refused; without that this call would park forever on a
+        // completion nobody is left to make. Bounded rather than slept: the
+        // timeout is a deadline for a hang, not a wait for a scheduler.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tracks.stop_claimed(&refused),
+        )
+        .await
+        .expect("a loser on a refused retirement is released rather than wedged");
+        assert_eq!(
+            refused_calls.load(Ordering::Acquire),
+            1,
+            "and it started no second stop: the claim is still taken, so the \
+             refusal is not retried by whoever arrives next"
+        );
+        drop((recovered_record, recovered_native, recovered_signal));
+    }
+
+    /// A cleanup executor that refuses a retirement retains the transceiver's
+    /// exact claim rather than dropping it on the floor.
+    ///
+    /// The other end of the same obligation. Blocker one moved the submission
+    /// off `Handle::try_current` and onto the process cleanup executor, which
+    /// makes the submission itself the thing that can fail — the executor can be
+    /// unavailable, poisoned, or already torn down. A refused submission means
+    /// **nobody will ever stop this transceiver**, which is exactly the state
+    /// failed-cleanup retention exists to describe.
+    ///
+    /// Discriminating in two directions at once. A design that ignored the
+    /// submission result would leave the retention total unmoved while the
+    /// transceiver leaked; a design that treated refusal as completion would
+    /// release the claim and hand the capacity straight back out. The stop
+    /// counter rules out a third: nothing was stopped here, so the retention is
+    /// not a successful cleanup being miscounted.
+    ///
+    /// The last leg is the one this control was extended for. Abandoning a
+    /// retirement takes the claim, so **nobody else will ever announce** — and a
+    /// party arriving afterwards through the ordinary path must still be
+    /// released rather than parking on a completion that cannot come. That is a
+    /// hang, not a wrong answer, so it is asserted with a deadline rather than
+    /// with a sleep: the timeout exists to fail a wedge, and a correct
+    /// implementation returns without ever reaching it.
+    #[tokio::test]
+    async fn v4_arc05_a_refused_cleanup_executor_retains_the_transceivers_exact_claim() {
+        let (provider, owner, mesh, _candidate, _lifetime, scope) =
+            realtime_native_test_scope(1, 1, 1);
+        let tracks = Arc::new(RealtimeSessionTracks::default());
+        let transceiver_claim =
+            negotiated_inbound_transceiver_claim().expect("the transceiver claim is representable");
+        let (identity, stops) = record_test_transceiver(&tracks, &scope, false);
+        let retirement = test_inbound_retirement(&tracks, &identity, &scope);
+        let retained_before = provider.retained_after_failed_cleanup();
+
+        // The connector is fine; its process's cleanup executor is not.
+        mesh.fail_cleanup_executor_for_test();
+
+        // Settle before measuring anything. `fail_cleanup_executor_for_test`
+        // terminates the executor thread, and that thread is what owns the
+        // executor's infrastructure reservation: the lease is released as it
+        // unwinds, asynchronously with respect to this one. A baseline taken
+        // before that release counts a charge the final snapshot will not, and
+        // the exact vector relation at the end of this control would then fail
+        // on a dimension nothing here is about.
+        //
+        // `SocketOrHandle` is the exact predicate because that infrastructure
+        // claim is the only Socket holder in this scope. Its reaching zero is
+        // precisely "the executor's own lease is gone" and nothing else, so it
+        // puts the baseline and the final snapshot on the same side of the
+        // release rather than merely allowing time to pass.
+        //
+        // Bounded and yielded rather than slept: a correct teardown is past
+        // this within the first few yields, and the deadline is here to fail an
+        // executor that never releases at all, not to wait out a slow one.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if provider
+                .in_use()
+                .amount(crate::resource::ResourceClass::SocketOrHandle)
+                == 0
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed cleanup executor never released its infrastructure \
+                 reservation, so no baseline taken here could be compared with a \
+                 total taken after the drop"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Read before the drop, because a refusal does two different things to
+        // two different charges — one retained, one returned — and stating
+        // either against a total taken afterwards would let them stand in for
+        // each other.
+        let in_use_before = provider.in_use();
+        let failed_before = owner.report().cleanup.failed_jobs;
+
+        // The implicit end, into an executor that will not take the work.
+        drop(retirement);
+        assert_eq!(
+            stops.load(Ordering::Acquire),
+            0,
+            "a refused submission stops nothing, which is why the claim cannot \
+             be released"
+        );
+        // Provenance, so the retention below is the *executor* refusing rather
+        // than a retirement that was never submitted at all. A drop that
+        // returned early — no table, no slot — would retain nothing and count
+        // nothing, and without this the accounting assertions could not tell
+        // that apart from a refusal.
+        assert_eq!(
+            owner.report().cleanup.failed_jobs,
+            failed_before + 1,
+            "the retirement really reached the executor and the executor really \
+             refused it"
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            retained_before
+                .checked_add(transceiver_claim)
+                .expect("the retained total is representable"),
+            "so the transceiver's exact native claim moved to failed-cleanup \
+             retention at the moment the submission was refused"
+        );
+
+        // The queue slot is the one charge a refusal genuinely gives back, and
+        // it is not the native one: there is no job left to fund, so its lease
+        // is released the ordinary way while the native claim — the thing
+        // nobody could prove gone — stays held. Taken back here and **held to
+        // the end of this control**, because that returned capacity is exactly
+        // what the refusals below would otherwise be satisfied by: they are
+        // statements about an exhausted grant, and a spare slot would let them
+        // pass while measuring a dimension nobody asked about.
+        let returned_slot = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                crate::runtime::attempt::cleanup_job_claim()
+                    .expect("the retirement slot claim is representable"),
+            )
+            .expect(
+                "a refused submission has no job left to fund, so the queue slot it \
+                 was carrying came back",
+            );
+        // And with it back the provider holds what it held before the drop,
+        // less exactly one of its own reservation records. That subtraction is
+        // the whole precision of this assertion rather than a fudge factor:
+        // `retain_after_failed_cleanup` keeps the transceiver's raw claim in
+        // use — that is what retention *is* — while the reservation it was held
+        // under stops existing, and a reservation record is itself charged
+        // against the same envelope it records. So the exact expected shape
+        // after re-taking the slot is "one record lighter, native claim
+        // untouched", stated as one vector relation.
+        //
+        // Still stronger than either half alone: a design that released the
+        // native claim shows up here as a shortfall far larger than one record,
+        // one that also retained the queue slot shows up at the acquire above,
+        // and one that leaked the record shows up as no shortfall at all.
+        let expected_in_use = in_use_before
+            .checked_sub(FiniteResourceProvider::scope_record_charge_for_test())
+            .expect("the in-use total covers the record the retention removed");
+        assert_eq!(
+            provider.in_use(),
+            expected_in_use,
+            "the refusal returned this retirement's queue slot and dropped the \
+             refused reservation's own record, and did neither of those things \
+             to the transceiver's raw claim, which stayed exactly where it was"
+        );
+
+        // A second returned charge, sealed the same way the queue slot is.
+        //
+        // Terminating the executor releases the infrastructure lease its thread
+        // owned, and that capacity comes back to the one grant every
+        // acquisition here draws on. It covers a whole transceiver claim on
+        // every dimension a transceiver claim uses — CallbackOrScheduledWork
+        // 1 >= 1, OpaqueDependencyResidual 4 >= 4, and a tokio runtime plus
+        // three handles against one native port — so left standing it, and not
+        // the retention under test, is what the probes below would be
+        // measuring.
+        //
+        // This value is a control-owned pressure seal shaped like that
+        // infrastructure claim. It is not a live executor, and holding it
+        // asserts nothing about ownership: no thread, runtime or queue exists
+        // behind it. Its only job is to occupy the capacity a terminated
+        // executor handed back, so the refusals below are about the
+        // transceiver's retained claim and nothing else.
+        //
+        // Placed *after* the ledger assertion above, deliberately. Taken any
+        // earlier it would be inside the totals that assertion compares, and
+        // could then stand in for retention or for a returned record — the two
+        // things that assertion exists to tell apart. After it, the exact
+        // vector relation is already proved and this cannot participate in it.
+        //
+        // The `expect` is the discriminator rather than a formality: an
+        // executor that leaked its infrastructure on termination leaves this
+        // capacity unavailable and fails here by name, instead of quietly
+        // satisfying the probes below.
+        let infrastructure_seal = scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Admitted,
+                crate::runtime::attempt::cleanup_executor_infrastructure_claim()
+                    .expect("the executor infrastructure claim is representable"),
+            )
+            .expect(
+                "a terminated cleanup executor released the exact infrastructure \
+                 capacity its thread was holding",
+            );
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    transceiver_claim,
+                )
+                .is_err(),
+            "and it is still counted, so this connector cannot admit another \
+             transceiver on capacity a failed cleanup never returned"
+        );
+        // The record is deliberately still on the table, so its node is still
+        // charged. Classification has to survive an abandoned retirement for the
+        // same reason it survives a running one: a track arriving on that
+        // transceiver is still one this side negotiated, and a table that had
+        // dropped the record would call it a track the peer named.
+        assert!(
+            scope
+                .acquire(
+                    crate::resource::ResourceAuthorityClass::Admitted,
+                    negotiated_inbound_record_claim().expect("the record claim is representable"),
+                )
+                .is_err(),
+            "and the record's node is still held too, because the record itself \
+             was kept rather than swept along with the failed submission"
+        );
+
+        // The abandoned retirement took the claim, so this caller loses it and
+        // waits — on a completion the abandoning path is the only one left to
+        // make. Before that path announced, this hung forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tracks.stop_claimed(&identity),
+        )
+        .await
+        .expect("a party arriving after an abandoned retirement is released, not wedged");
+        assert_eq!(
+            stops.load(Ordering::Acquire),
+            0,
+            "and it started no stop of its own: the abandoned retirement is \
+             terminal, not a slot the next caller may retry into"
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            retained_before
+                .checked_add(transceiver_claim)
+                .expect("the retained total is representable"),
+            "and the accounting is unchanged by that visit — a loser retains \
+             nothing, because it was never holding the charge"
+        );
+        // Both held all the way to here on purpose: released any earlier and
+        // every refusal above would have had returned capacity standing behind
+        // it — the queue slot the refusal gave back, and the infrastructure the
+        // terminated executor gave back. The terminal visit above is inside
+        // that span for the same reason, so it observes the same exhausted
+        // grant the probes did rather than one that quietly refilled underneath
+        // it.
+        drop(returned_slot);
+        drop(infrastructure_seal);
+    }
+
+    /// An FU-B start fragment is not an anchor, because this side cannot frame
+    /// one.
+    ///
+    /// The two halves of the assembler have to agree about which payloads it
+    /// can act on. `annexb_output_len` handles single NAL, STAP-A and FU-A and
+    /// errors on everything else, so anchoring on an FU-B (type 29) commits to
+    /// a chain the framing then always rejects. `try_emit` treats a framing
+    /// error as a *consumed* unit — it advances `prev_end` and clears — so the
+    /// cost is the whole unit, repeated for as long as the peer sends FU-B,
+    /// rather than one refused packet.
+    ///
+    /// The discriminating comparison is against FU-A, which is byte-identical
+    /// apart from the NAL type and must still anchor: a fix that refused both
+    /// would stop the deployed H.264 path dead and would pass a test that only
+    /// asserted the FU-B negative.
+    #[test]
+    fn v4_macro1_an_fu_b_fragment_is_not_an_anchor_the_framing_would_reject() {
+        // 0x7D = FU-B (type 29) with the same start bit and NAL header the
+        // FU-A fixtures use, so the only difference from `FU_S` is the type.
+        const FU_B_S: &[u8] = &[0x7D, 0x85, 0x11];
+
+        assert!(
+            payload_starts_au(&Bytes::from_static(FU_S)),
+            "FU-A still anchors — this is the deployed shape and refusing it \
+             would be worse than the defect"
+        );
+        assert!(
+            !payload_starts_au(&Bytes::from_static(FU_B_S)),
+            "FU-B does not, because the framing has no case for type 29"
+        );
+
+        // The reason, stated against the framing itself rather than restated:
+        // an FU-B chain really is unframeable, so admitting it as an anchor
+        // could only ever produce the error path.
+        let mut parts = std::collections::BTreeMap::new();
+        parts.insert(0i64, Bytes::from_static(FU_B_S));
+        assert!(
+            H264Framing
+                .framed_len(UnitFragments::new(
+                    &parts,
+                    FragmentCursor::for_test(0),
+                    FragmentCursor::for_test(0)
+                ))
+                .is_err(),
+            "type 29 has no framing case, which is what makes anchoring on it \
+             a guaranteed lost unit"
+        );
+    }
+
+    /// A retransmit arriving after a successful emit does not rewind the
+    /// assembler or cost the next unit its anchor.
+    ///
+    /// The steady state between two units is `parts` empty and `prev_end`
+    /// holding the last marker. Testing emptiness to decide whether a
+    /// timestamp may be adopted therefore accepts an *older* timestamp in
+    /// exactly that state — the assembler rewinds, files the stale packet as
+    /// the start of a new unit, and the next genuine packet then sees a
+    /// non-empty `parts`, discards `prev_end` as an abandoned unit, and forces
+    /// the unit after it to re-anchor.
+    ///
+    /// So the visible damage is one unit *later* than the stale packet, which
+    /// is what makes it worth a control: the retransmit itself is correctly
+    /// swallowed either way, and only the third unit shows the difference.
+    #[test]
+    fn v4_macro1_a_retransmit_after_an_emit_does_not_rewind_the_assembler() {
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
+
+        // Unit one emits and anchors the stream at seq 10.
+        let first = asm
+            .push(&rtp_pkt(10, 100, true, IDR_NAL))
+            .unwrap()
+            .expect("a single-packet unit emits immediately");
+        assert_eq!(first.rtp_timestamp, 100);
+
+        // A duplicate of that same unit arrives late, in the window where
+        // `parts` is empty because the emit cleared it.
+        assert!(
+            asm.push(&rtp_pkt(10, 100, true, IDR_NAL))
+                .unwrap()
+                .is_none(),
+            "the stale copy emits nothing, which is true before and after the \
+             fix and is therefore not the discriminating assertion"
+        );
+
+        // The next unit is fragmented, so it can only emit if `prev_end`
+        // survived: its first fragment is an FU-A start, and re-anchoring
+        // would work here too — so make the unit after it the real test.
+        assert!(asm.push(&rtp_pkt(11, 200, false, FU_S)).unwrap().is_none());
+        let second = asm
+            .push(&rtp_pkt(12, 200, true, FU_E))
+            .unwrap()
+            .expect("the anchor survived the stale retransmit");
+        assert_eq!(second.rtp_timestamp, 200);
+        assert_eq!(&second.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x33]);
+
+        // And a headless unit — one with no start fragment — still emits,
+        // which it can do only from a live anchor. This is the assertion that
+        // separates the two implementations: with the rewind, `prev_end` is
+        // gone by now and this unit is dropped for want of something
+        // `payload_starts_au` accepts.
+        assert!(asm.push(&rtp_pkt(13, 300, false, FU_M)).unwrap().is_none());
+        let third = asm
+            .push(&rtp_pkt(14, 300, true, FU_E))
+            .unwrap()
+            .expect("a headless unit emits from the surviving anchor");
+        assert_eq!(third.rtp_timestamp, 300);
+    }
+
+    /// A stream whose first packet carries a high random RTP timestamp still
+    /// starts.
+    ///
+    /// The companion to the control above, and the reason the fix cannot
+    /// simply compare timestamps. `self.timestamp` initialises to 0 while a
+    /// real sender picks a random 32-bit start, so for roughly half of all
+    /// streams the first packet is "older than zero" under shortest-distance
+    /// comparison. Without an explicit uninitialised case those streams would
+    /// never produce a single unit.
+    #[test]
+    fn v4_macro1_a_stream_starting_past_the_wrap_point_still_emits() {
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
+        // Greater than 2^31, so `newer_rtp_ts(ts, 0)` is false.
+        let high = 0x9000_0000u32;
+        assert!(
+            !crate::transport::webrtc::unit_assembly::newer_rtp_ts(high, 0),
+            "the fixture really is on the far side of the wrap, or this test \
+             proves nothing"
+        );
+        let unit = asm
+            .push(&rtp_pkt(7, high, true, IDR_NAL))
+            .unwrap()
+            .expect("the first packet of a stream is adopted whatever its timestamp");
+        assert_eq!(unit.rtp_timestamp, high);
+    }
+
     #[test]
     fn private_lan_ips_recognised_public_ones_not() {
         // RFC1918 + link-local → LAN.
@@ -12860,23 +17210,223 @@ mod tests {
         assert!(!is_private_lan_ip("not-an-ip"));
     }
 
+    /// Build a lab producer from a policy stating exactly these per-class
+    /// ceilings, at an explicit slot count.
+    fn lab_producer(
+        slots: usize,
+        control_ceiling: usize,
+        endpoint_ceiling: usize,
+    ) -> CallbackProducerOwner {
+        let slots = NonZeroUsize::new(slots).expect("the control states a nonzero slot count");
+        CallbackProducerOwner::for_local_lab_grant(callback::TransportLabCallbackGrant {
+            control_slots: slots,
+            endpoint_slots: slots,
+            control_payload_bytes: NonZeroUsize::new(control_ceiling)
+                .expect("the control states a nonzero control ceiling"),
+            endpoint_payload_bytes: NonZeroUsize::new(endpoint_ceiling)
+                .expect("the control states a nonzero endpoint ceiling"),
+            observation_slots: lab_observation_slots(),
+        })
+        .expect("a grant that states both ceilings derives a lab provider")
+    }
+
+    // The size of a host candidate actually gathered on the native loopback
+    // path, not a round number. These controls exist because candidates of about
+    // this size were refused for want of `QueuedBytes`.
+    const GATHERED_CANDIDATE_BYTES: usize = 69;
+
+    /// The native peak, exactly: one executing control callback still retaining
+    /// its converted payload while the handoff behind it takes a queued lease at
+    /// the same size. That is the moment the native pump reaches, and the moment
+    /// that was refused.
+    ///
+    /// Built from the real transitions in the real order — structural admission,
+    /// `begin_execution`, `account_executing_payload` with the measured bytes,
+    /// then the queued admission — rather than from two independent admissions,
+    /// because two independent admissions never put both phases in flight at
+    /// once and so cannot tell a grant that funds both from one that funds
+    /// either.
+    ///
+    /// Non-vacuity is structural rather than hoped for. The policy states one
+    /// control slot, one endpoint slot, a control ceiling of exactly the
+    /// candidate size and an endpoint ceiling of one byte, so the pool holds
+    /// `QueuedBytes` for exactly one control handoff plus one byte. A build
+    /// whose formula funded only the executing phase would grant zero
+    /// `QueuedBytes` and fail at the handoff; one that funded only the queued
+    /// phase would fail at `account_executing_payload`; one still cross-funding
+    /// classes, or handing the five lifecycle reservations payload surplus,
+    /// would pass the third admission, which must be refused. Each of those is a
+    /// separate assertion below.
+    #[test]
+    fn v4_f8_one_executing_control_payload_and_its_queued_handoff_coexist_at_the_stated_ceiling() {
+        // Endpoint deliberately starved to one byte: if this control passes, it
+        // passed on control's own ceiling and not on endpoint's.
+        let producer = lab_producer(1, GATHERED_CANDIDATE_BYTES, 1);
+
+        // Admission is structural — the candidate has not been converted yet and
+        // its size is not known.
+        let mut executing = producer
+            .try_admit_with_accounted_slack(ConnectorCallbackClass::Control, 0, 0)
+            .expect("the structural control admission is funded");
+        executing
+            .begin_execution()
+            .expect("the executing phase of one control callback is funded");
+        producer
+            .account_executing_payload(&mut executing, GATHERED_CANDIDATE_BYTES, 0)
+            .expect("the executing lease retains the converted candidate's measured bytes");
+        assert!(
+            executing
+                .claim()
+                .amount(crate::resource::ResourceClass::AccountedMemoryBytes)
+                >= GATHERED_CANDIDATE_BYTES as u64,
+            "the executing lease must retain the measured payload, not the structural claim it was admitted with"
+        );
+
+        // The peak: the handoff is admitted while the lease above is still held
+        // and still retaining its payload.
+        let queued = producer
+            .try_admit_with_accounted_slack(
+                ConnectorCallbackClass::Control,
+                GATHERED_CANDIDATE_BYTES,
+                0,
+            )
+            .expect("the queued handoff is funded while the executing payload is still retained");
+        assert!(
+            queued
+                .claim()
+                .amount(crate::resource::ResourceClass::QueuedBytes)
+                >= GATHERED_CANDIDATE_BYTES as u64,
+            "the queued handoff must charge the candidate's bytes against QueuedBytes"
+        );
+
+        // One control slot was stated, so a second handoff must be refused while
+        // the first two leases are live. Without this the assertions above could
+        // be passing on surplus — cross-funded from the endpoint class, or from
+        // the lifecycle reservations.
+        let Err(CallbackProducerOverload::ResourceUnavailable { class, unavailable }) = producer
+            .try_admit_with_accounted_slack(
+                ConnectorCallbackClass::Control,
+                GATHERED_CANDIDATE_BYTES,
+                0,
+            )
+        else {
+            panic!(
+                "a one-slot control ceiling must not fund a second queued handoff beside the peak"
+            )
+        };
+        assert_eq!(class, ConnectorCallbackClass::Control);
+        // The dimension is the load-bearing half. A refusal on slots or on a
+        // bookkeeping dimension would satisfy the class check while saying
+        // nothing about the bytes the stated ceiling exists to fund, and this
+        // control would then pass for the wrong reason.
+        assert_eq!(
+            unavailable.dimension(),
+            Some(crate::resource::ResourceClass::QueuedBytes),
+            "the refusal must land on the byte dimension the control ceiling funds"
+        );
+
+        // Both held to the end: releasing either would let the refusal above
+        // pass against capacity the peak had already returned.
+        drop((executing, queued));
+    }
+
+    /// Each class is funded from its own stated ceiling, and neither pays for
+    /// the other.
+    ///
+    /// The two halves differ in nothing but which class was given the bytes, so
+    /// a build funding both from one shared number — `max(control, endpoint)`,
+    /// the softer form of the original defect — would admit both admissions in
+    /// both halves and fail this.
+    #[test]
+    fn v4_f8_a_generous_ceiling_on_one_callback_class_does_not_fund_the_other() {
+        let control_only = lab_producer(1, GATHERED_CANDIDATE_BYTES, 1);
+        let held = control_only
+            .try_admit_with_accounted_slack(
+                ConnectorCallbackClass::Control,
+                GATHERED_CANDIDATE_BYTES,
+                0,
+            )
+            .expect("control's own stated ceiling funds a control callback");
+        assert!(
+            matches!(
+                control_only.try_admit_with_accounted_slack(
+                    ConnectorCallbackClass::EndpointData,
+                    GATHERED_CANDIDATE_BYTES,
+                    0,
+                ),
+                Err(CallbackProducerOverload::ResourceUnavailable {
+                    class: ConnectorCallbackClass::EndpointData,
+                    ..
+                })
+            ),
+            "a one-byte endpoint ceiling must not be rescued by control's generous one"
+        );
+        drop(held);
+
+        let endpoint_only = lab_producer(1, 1, GATHERED_CANDIDATE_BYTES);
+        let held = endpoint_only
+            .try_admit_with_accounted_slack(
+                ConnectorCallbackClass::EndpointData,
+                GATHERED_CANDIDATE_BYTES,
+                0,
+            )
+            .expect("endpoint's own stated ceiling funds an endpoint callback");
+        assert!(
+            matches!(
+                endpoint_only.try_admit_with_accounted_slack(
+                    ConnectorCallbackClass::Control,
+                    GATHERED_CANDIDATE_BYTES,
+                    0,
+                ),
+                Err(CallbackProducerOverload::ResourceUnavailable {
+                    class: ConnectorCallbackClass::Control,
+                    ..
+                })
+            ),
+            "a one-byte control ceiling must not be rescued by endpoint's generous one"
+        );
+        drop(held);
+    }
+
+    // Two controls stood here proving that a self-funding fixture which stated
+    // no per-class payload ceiling was refused by name rather than having its
+    // payload priced at zero. Both are gone, and the property is stronger for
+    // it: the ceilings are now required fields on `TransportLabCallbackGrant`
+    // and `TransportLabCallbackWorkload`, so a fixture that omits one does not
+    // compile. There is no run-time state left for a control to observe.
+
     #[tokio::test]
     async fn loopback_handshake_opens_data_channel() {
         // Bring up two peer sessions on the same in-process
-        // Transport. No STUN / TURN — they exchange host
-        // candidates over the same loopback interface. Verifies
-        // the entire offer/answer/candidate cycle plus the
-        // data-channel handshake without external dependencies.
+        // Transport. No STUN / TURN, so the pairing is whatever
+        // host candidate gathering produces — and that is *not*
+        // loopback. Nothing in this crate calls
+        // `SettingEngine::set_include_loopback_candidate`, which
+        // is off by default, so `127.0.0.1` is never offered. The
+        // two sides pair over this machine's own routable
+        // interface addresses, whichever survive the virtual-
+        // interface and link-local filters installed in
+        // `Transport::new`. This host must therefore accept its
+        // own UDP on that address for the pairing to complete.
+        // Verifies the entire offer/answer/candidate cycle plus
+        // the data-channel handshake without external
+        // dependencies.
         let observed_at = Instant::now();
         let transport = Transport::new().expect("transport");
         let cfg = RTCConfiguration::default();
         let callback_policy = test_webrtc_profile(NATIVE_LOOPBACK_CALLBACK_CAPACITY).callbacks();
+        let callback_grant = lab_callback_grant(
+            NonZeroUsize::new(NATIVE_LOOPBACK_CALLBACK_CAPACITY)
+                .expect("the loopback fixture callback capacity is nonzero"),
+            NonZeroUsize::new(NATIVE_LOOPBACK_CALLBACK_CAPACITY)
+                .expect("the loopback fixture callback capacity is nonzero"),
+        );
         let (offerer, mut off_rx) = transport
-            .open_peer_with_config(Role::Offerer, cfg.clone(), callback_policy)
+            .open_peer_with_config(Role::Offerer, cfg.clone(), callback_policy, callback_grant)
             .await
             .expect("offerer");
         let (answerer, mut ans_rx) = transport
-            .open_peer_with_config(Role::Answerer, cfg, callback_policy)
+            .open_peer_with_config(Role::Answerer, cfg, callback_policy, callback_grant)
             .await
             .expect("answerer");
 
@@ -13005,7 +17555,7 @@ mod tests {
 
     #[test]
     fn au_assembler_groups_by_timestamp_and_drops_torn_units() {
-        let mut asm = H264AuAssembler::default();
+        let mut asm = RealtimeUnitAssembler::new(h264_framing());
         // Two single-NAL packets of one frame; marker closes it.
         assert!(asm
             .push(&rtp_pkt(1, 1000, false, &[0x41, 1, 1, 1]))
@@ -13015,7 +17565,10 @@ mod tests {
             .push(&rtp_pkt(2, 1000, true, &[0x65, 2, 2, 2]))
             .unwrap()
             .expect("marker completes the unit");
-        assert!(s.key, "an IDR NAL anywhere in the unit marks it key");
+        assert!(
+            s.entry_point,
+            "an IDR NAL anywhere in the unit marks it a decoder entry point"
+        );
         assert_eq!(s.rtp_timestamp, 1000);
         // Depacketized single NALs come back with start codes attached.
         assert_eq!(
@@ -13034,229 +17587,26 @@ mod tests {
             .unwrap()
             .expect("fresh unit completes");
         assert_eq!(s.rtp_timestamp, 3000);
-        assert!(!s.key);
+        assert!(!s.entry_point);
         assert_eq!(s.data.as_ref(), &[0, 0, 0, 1, 0x41, 9, 9, 9]);
     }
 
     #[tokio::test]
-    async fn loopback_video_lane_carries_h264_samples() {
-        let observed_at = Instant::now();
-        let planned_au: Vec<u8> = {
-            let mut value = vec![0u8, 0, 0, 1, 0x65];
-            value.extend((0..400u32).map(|i| (i % 251) as u8));
-            value
-        };
-        let fixture_unit_bytes = NonZeroUsize::new(planned_au.len())
-            .expect("the native video fixture access unit is nonempty");
-        // Same loopback bring-up as the data-channel test, but the
-        // assertion is on the provisioned video lane: an Annex-B access
-        // unit written on the offerer's track arrives at the answerer as
-        // one assembled VideoSample, byte-equal and key-flagged. This is
-        // the negotiation-without-renegotiation property end to end:
-        // m-line in the one offer/answer, RTP, depacketize, reassembly.
-        let transport = Transport::new().expect("transport");
-        let (offerer, mut off_rx, _offerer_owner) =
-            open_explicit_legacy_media_peer(&transport, Role::Offerer, fixture_unit_bytes)
-                .await
-                .expect("offerer");
-        let (answerer, mut ans_rx, _answerer_owner) =
-            open_explicit_legacy_media_peer(&transport, Role::Answerer, fixture_unit_bytes)
-                .await
-                .expect("answerer");
-
-        // Lifecycle era: lane 3 doesn't exist until someone asks for
-        // it. Prime it with one pre-negotiation write — the write
-        // no-ops, but the auto-open attaches the track so the initial
-        // offer negotiates it (the engine-driven path renegotiates
-        // in place instead; transport tests have no engine).
-        offerer
-            .send_video(
-                3,
-                Bytes::from_static(b"\x00"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect("prime video lane 3");
-
-        let offer = offerer.create_offer().await.expect("create_offer");
-        answerer
-            .set_remote_description(offer)
-            .await
-            .expect("answerer.set_remote");
-        let answer = answerer.create_answer().await.expect("create_answer");
-        offerer
-            .set_remote_description(answer)
-            .await
-            .expect("offerer.set_remote");
-
-        // One synthetic IDR access unit. The H264 payloader parses
-        // Annex-B, so the bytes must be a plausible NAL stream.
-        let au = planned_au;
-
-        // The track binds only once negotiation + ICE complete, and
-        // writes before that are silent no-ops — so keep (re)sending
-        // the unit at frame cadence until the far side reports it.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut received: Option<VideoSample> = None;
-        let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(50));
-        while received.is_none() && tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                _ = send_tick.tick() => {
-                    // A non-zero lane proves the whole pool negotiates and the
-                    // far side recovers the lane from the track id (not just
-                    // lane 0): write on lane 3, expect it back tagged lane 3.
-                    let _ = offerer
-                        .send_video(3, Bytes::from(au.clone()), std::time::Duration::from_millis(33))
-                        .await;
-                }
-                Some(ev) = off_rx.recv() => {
-                    if let TransportEvent::LocalIceCandidate(Some(c)) = &ev {
-                        answerer.add_ice_candidate(c.clone()).await.expect("ice → answerer");
-                    }
-                }
-                Some(ev) = ans_rx.recv() => {
-                    match ev {
-                        TransportEvent::LocalIceCandidate(Some(c)) => {
-                            offerer.add_ice_candidate(c.clone()).await.expect("ice → offerer");
-                        }
-                        TransportEvent::VideoSample(s) => received = Some(s),
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let sample = received.expect("answerer never received a video sample");
-        assert_eq!(sample.data.as_ref(), &au[..], "AU survives byte-exact");
-        assert!(sample.key, "IDR unit arrives key-flagged");
-        assert_eq!(sample.lane, 3, "the lane survives the round-trip");
-        if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
-            println!(
-                "arc03_legacy_media_raw profile=h264 first_unit_ns={} unit_bytes={}",
-                observed_at.elapsed().as_nanos(),
-                sample.data.len()
-            );
-        }
-
-        offerer.close().await.expect("close offerer");
-        answerer.close().await.expect("close answerer");
-    }
-
-    #[tokio::test]
-    async fn loopback_audio_lane_carries_opus_frames() {
-        let observed_at = Instant::now();
-        let planned_frame: Vec<u8> = {
-            let mut value = vec![0x78u8];
-            value.extend((0..160u32).map(|i| (i % 251) as u8));
-            value
-        };
-        let fixture_unit_bytes = NonZeroUsize::new(planned_frame.len())
-            .expect("the native audio fixture frame is nonempty");
-        // The audio twin of the video lane test: an Opus frame written
-        // on the offerer's audio track arrives at the answerer as one
-        // AudioSample, byte-equal — the same single offer/answer
-        // negotiates both lanes, and no reassembly exists to get wrong
-        // (one frame per RTP packet, RFC 7587).
-        let transport = Transport::new().expect("transport");
-        let (offerer, mut off_rx, _offerer_owner) =
-            open_explicit_legacy_media_peer(&transport, Role::Offerer, fixture_unit_bytes)
-                .await
-                .expect("offerer");
-        let (answerer, mut ans_rx, _answerer_owner) =
-            open_explicit_legacy_media_peer(&transport, Role::Answerer, fixture_unit_bytes)
-                .await
-                .expect("answerer");
-
-        // Lifecycle era: lane 5 doesn't exist until someone asks for
-        // it. Prime it with one pre-negotiation write — the write
-        // no-ops, but the auto-open attaches the track so the initial
-        // offer negotiates it (the engine-driven path renegotiates
-        // in place instead; transport tests have no engine).
-        offerer
-            .send_audio(
-                5,
-                Bytes::from_static(b"\x00"),
-                std::time::Duration::from_millis(20),
-            )
-            .await
-            .expect("prime audio lane 5");
-
-        let offer = offerer.create_offer().await.expect("create_offer");
-        answerer
-            .set_remote_description(offer)
-            .await
-            .expect("answerer.set_remote");
-        let answer = answerer.create_answer().await.expect("create_answer");
-        offerer
-            .set_remote_description(answer)
-            .await
-            .expect("offerer.set_remote");
-
-        // One synthetic Opus frame: a valid TOC byte then arbitrary
-        // payload — the lane ships bytes, it never parses them.
-        let frame = planned_frame;
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut received: Option<AudioSample> = None;
-        let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(20));
-        while received.is_none() && tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                _ = send_tick.tick() => {
-                    // A different non-zero lane (audio pool is independent):
-                    // write on lane 5, expect it back tagged lane 5.
-                    let _ = offerer
-                        .send_audio(5, Bytes::from(frame.clone()), std::time::Duration::from_millis(20))
-                        .await;
-                }
-                Some(ev) = off_rx.recv() => {
-                    if let TransportEvent::LocalIceCandidate(Some(c)) = &ev {
-                        answerer.add_ice_candidate(c.clone()).await.expect("ice → answerer");
-                    }
-                }
-                Some(ev) = ans_rx.recv() => {
-                    match ev {
-                        TransportEvent::LocalIceCandidate(Some(c)) => {
-                            offerer.add_ice_candidate(c.clone()).await.expect("ice → offerer");
-                        }
-                        TransportEvent::AudioSample(s) => received = Some(s),
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let sample = received.expect("answerer never received an audio sample");
-        assert_eq!(
-            sample.data.as_ref(),
-            &frame[..],
-            "frame survives byte-exact"
-        );
-        assert_eq!(sample.lane, 5, "the lane survives the round-trip");
-        if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
-            println!(
-                "arc03_legacy_media_raw profile=opus first_unit_ns={} unit_bytes={}",
-                observed_at.elapsed().as_nanos(),
-                sample.data.len()
-            );
-        }
-
-        offerer.close().await.expect("close offerer");
-        answerer.close().await.expect("close answerer");
-    }
-
-    #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
-    async fn v4_arc03h_data_only_and_generic_realtime_without_provider_allocate_no_codec_tracks() {
+    async fn v4_arc03h_data_only_and_generic_realtime_without_flows_allocate_no_media_lines() {
         for (profile_name, profile) in [
             ("disabled", test_webrtc_profile(4)),
             (
-                "generic-without-provider",
+                "generic-without-open-flow",
                 test_generic_realtime_webrtc_profile(4),
             ),
         ] {
             let observed_at = Instant::now();
-            let grant = one_mesh_connector_fixture_grant(&[profile])
-                .expect("the codec-neutral fixture claim is representable");
+            let grant = one_mesh_connector_fixture_grant(
+                &[profile.clone()],
+                lab_callback_workload(NonZeroUsize::new(4).expect("four is nonzero")),
+            )
+            .expect("the codec-neutral fixture claim is representable");
             let provider = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
                 .expect("the codec-neutral fixture accounts for its process scope");
             let owner = ConnectorResourceOwnerPort::new(provider)
@@ -13270,10 +17620,6 @@ mod tests {
             let transport = Transport::new()
                 .expect("test transport")
                 .with_connector_resource_scope(owner, profile);
-            assert!(
-                transport.legacy_media_api.lock().is_none(),
-                "{profile_name} construction does not register compatibility codecs"
-            );
             let (worker, _events) = transport
                 .open_connector_peer(Role::Offerer, &[], &[], scope)
                 .await
@@ -13289,22 +17635,9 @@ mod tests {
                 .any(|line| line.starts_with("m=application")));
             assert!(!offer.sdp.lines().any(|line| line.starts_with("m=audio")));
             assert!(!offer.sdp.lines().any(|line| line.starts_with("m=video")));
-            assert!(
-                transport.legacy_media_api.lock().is_none(),
-                "opening {profile_name} keeps codec registration absent"
-            );
-
-            assert_eq!(worker.session.open_lane_count(LaneKind::Video), 0);
-            assert_eq!(worker.session.open_lane_count(LaneKind::Audio), 0);
-            assert!(worker.session.legacy_media_profile.is_none());
-            let _media_error = worker
-                .session
-                .send_video(0, Bytes::from_static(b"unit"), Duration::ZERO)
-                .await
-                .expect_err("codec-neutral policy has no compatibility provider");
             if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
                 println!(
-                    "arc03_data_only_raw profile={} constructed_ns={} video_tracks=0 audio_tracks=0",
+                    "arc03_data_only_raw profile={} constructed_ns={} media_lines=0",
                     profile_name,
                     observed_at.elapsed().as_nanos()
                 );
@@ -13319,7 +17652,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
-    async fn v4_arc03g_close_fence_rejects_endpoint_send_realtime_write_and_lane_open() {
+    async fn v4_arc03g_close_fence_rejects_endpoint_send() {
         let owner = test_resource_owner(1, 4);
         let process = ProcessResourceRoot::isolated();
         let scope = process
@@ -13333,31 +17666,19 @@ mod tests {
             .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
             .expect("data-only connector is constructed");
-        let realtime = test_realtime_capability(&worker.ownership);
 
         worker.retire();
 
-        for error in [
-            worker
-                .send_owned(Bytes::from_static(b"endpoint"))
-                .await
-                .expect_err("endpoint send is fenced after close"),
-            worker
-                .send_video(&realtime, 0, Bytes::from_static(b"unit"), Duration::ZERO)
-                .await
-                .expect_err("real-time write is fenced after close"),
-            worker
-                .open_media_lane(&realtime, LaneKind::Video)
-                .await
-                .expect_err("track creation is fenced after close"),
-        ] {
-            assert!(
-                error
-                    .to_string()
-                    .contains("connector close fence has committed"),
-                "operation reached its native or compatibility owner after close: {error}"
-            );
-        }
+        let error = worker
+            .send_owned(Bytes::from_static(b"endpoint"))
+            .await
+            .expect_err("endpoint send is fenced after close");
+        assert!(
+            error
+                .to_string()
+                .contains("connector close fence has committed"),
+            "the operation reached its native owner after close: {error}"
+        );
 
         worker
             .retire_and_close()
@@ -13394,7 +17715,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
-    async fn v4_arc03h_close_wins_before_legacy_realtime_admission() {
+    /// A retired connector can no longer be named by a promotion, so nothing
+    /// downstream of promotion — including every real-time flow — can be opened
+    /// against it. Close wins the race by removing the only identity the
+    /// admission fence is allowed to bind.
+    async fn v4_arc03h_close_wins_before_connector_naming() {
         let owner = test_resource_owner(1, 4);
         let scope = ProcessResourceRoot::isolated()
             .mesh_runtime_scope()
@@ -13402,324 +17727,108 @@ mod tests {
             .peer_connection_scope();
         let transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(owner, test_legacy_realtime_webrtc_profile(4));
+            .with_connector_resource_scope(owner, test_generic_realtime_webrtc_profile(4));
         let (worker, _events) = transport
             .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
-            .expect("legacy-provider connector is constructed");
+            .expect("real-time connector is constructed");
         let handoff = match worker.confirm_data_channel_open() {
             DataChannelOpenOwnership::Connected(handoff) => handoff,
             _ => panic!("live connector produces one Endpoint Auth handoff"),
         };
-        let task = crate::endpoint_auth::EndpointAuthTask::begin(handoff);
+        let task = task_from_handoff(handoff);
+        assert!(
+            worker.live_connector_incarnation().is_some(),
+            "non-vacuity — a live connector really can be named"
+        );
+        assert!(worker.owns_endpoint_auth(&task));
 
         worker.retire();
-        assert!(worker.admit_legacy_realtime_flow(&task).is_none());
+        assert!(worker.live_connector_incarnation().is_none());
+        assert!(!worker.owns_endpoint_auth(&task));
         worker
             .retire_and_close()
             .await
             .expect("native peer closes through its exact owner");
     }
 
+    /// A real-time unit is admitted only while the session that could have
+    /// produced it still owns a live binding table.
+    ///
+    /// Driven through `accept_event`, which is the production entry point the
+    /// engine's connector pump calls — not through `ConnectorOwnership::accepts`
+    /// underneath it, which answers the connector question only and answers
+    /// `true` for a connected connector however long ago its session died.
+    ///
+    /// The connector is held at `Connected` and untouched for the whole body,
+    /// so every transition below is the session table's alone.
     #[tokio::test]
     #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
-    async fn v4_arc03f_track_attach_failure_rolls_back_outbound_flow_owner() {
-        let transport = Transport::new().expect("transport");
-        let (session, _events, _owner) = open_explicit_legacy_media_peer(
-            &transport,
-            Role::Offerer,
-            NonZeroUsize::new(b"unit".len()).expect("fixture unit is nonempty"),
-        )
-        .await
-        .expect("open");
-        let baseline = session.outbound_realtime_flows.lock().len();
-        session
-            .fail_next_track_attach
-            .store(true, Ordering::Release);
-
-        let error = session
-            .send_video(1, Bytes::from_static(b"unit"), Duration::ZERO)
+    async fn v4_arc03_realtime_unit_requires_a_live_session_binding_table() {
+        let owner = test_resource_owner(1, 4);
+        let scope = ProcessResourceRoot::isolated()
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner, test_generic_realtime_webrtc_profile(4));
+        let (worker, _events) = transport
+            .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
-            .expect_err("injected native track attachment fails");
-        assert!(error.to_string().contains("injected native track"));
-        assert_eq!(session.open_lane_count(LaneKind::Video), 1);
-        assert_eq!(session.outbound_realtime_flows.lock().len(), baseline);
-        assert!(!session
-            .outbound_realtime_flows
-            .lock()
-            .contains_key(&(true, 1)));
-
-        session.close().await.expect("close");
-    }
-
-    #[tokio::test]
-    async fn lanes_are_lifecycle_managed_not_pre_pooled() {
-        let transport = Transport::new().expect("transport");
-        let (session, mut events, _owner) = open_explicit_legacy_media_peer(
-            &transport,
-            Role::Offerer,
-            NonZeroUsize::new(b"x".len()).expect("fixture unit is nonempty"),
-        )
-        .await
-        .expect("open");
-
-        // Setup provisions lane 0 only — no 8-lane SDP tax.
-        assert_eq!(
-            session.open_lane_count(LaneKind::Video),
-            PRE_PROVISIONED_LANES
-        );
-        assert_eq!(
-            session.open_lane_count(LaneKind::Audio),
-            PRE_PROVISIONED_LANES
-        );
-
-        // First write to a closed lane opens it transparently and flags
-        // a renegotiation; the write itself is a pre-negotiation no-op.
-        session
-            .send_video(
-                3,
-                Bytes::from_static(b"x"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect("auto-open write");
-        assert_eq!(session.open_lane_count(LaneKind::Video), 2);
-        let mut saw_reneg = false;
-        while let Ok(ev) = events.try_recv() {
-            if matches!(ev, TransportEvent::RenegotiationNeeded) {
-                saw_reneg = true;
-            }
-        }
-        assert!(saw_reneg, "lane open must flag a renegotiation");
-
-        // A second write to the same lane is quiet — no new flag.
-        session
-            .send_video(
-                3,
-                Bytes::from_static(b"y"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect("write on open lane");
-        assert!(
-            events.try_recv().is_err(),
-            "an already-open lane never re-flags"
-        );
-
-        // Explicit open takes the lowest free slot (1: 0 is pre-opened,
-        // 3 is auto-opened) — a fresh slot, so it flags a renegotiation.
-        // Drain the flag so the close/revive checks below observe
-        // silence.
-        let lane = session
-            .open_media_lane(LaneKind::Video)
-            .await
-            .expect("explicit open");
-        assert_eq!(lane, 1);
-        let mut saw_reneg = false;
-        while let Ok(ev) = events.try_recv() {
-            if matches!(ev, TransportEvent::RenegotiationNeeded) {
-                saw_reneg = true;
-            }
-        }
-        assert!(saw_reneg, "a fresh explicit open flags a renegotiation");
-
-        // Suspend keeps the slot's m-line, emits nothing, and is idempotent.
-        // signaled, and it's idempotent.
-        session
-            .close_media_lane(LaneKind::Video, 3)
-            .await
-            .expect("close");
-        assert_eq!(
-            session.open_lane_count(LaneKind::Video),
-            3,
-            "a suspended lane still holds its m-line"
-        );
-        assert!(events.try_recv().is_err(), "suspension is silent");
-        session
-            .close_media_lane(LaneKind::Video, 3)
-            .await
-            .expect("double close is a no-op");
-
-        // Resume revives the exact suspended lane with no SDP work.
-        let lane = session
-            .open_media_lane(LaneKind::Video)
-            .await
-            .expect("reopen");
-        assert_eq!(lane, 3, "resume revives the suspended lane");
-        assert!(
-            events.try_recv().is_err(),
-            "a revival is free — no renegotiation"
-        );
-
-        // Finalization is explicit. No elapsed time changes ownership.
-        session
-            .close_media_lane(LaneKind::Video, 3)
-            .await
-            .expect("re-close");
-        assert_eq!(session.finalize_suspended_lanes().await, 1);
-        assert_eq!(session.open_lane_count(LaneKind::Video), 2);
-        assert!(!session
-            .outbound_realtime_flows
-            .lock()
-            .contains_key(&(true, 3)));
-
-        // With nothing suspended, an explicit open claims the lowest
-        // free slot again.
-        let lane = session
-            .open_media_lane(LaneKind::Video)
-            .await
-            .expect("fresh open after finalize");
-        assert_eq!(lane, 2, "explicit open takes the lowest free slot");
-
-        // The device ceiling still errors rather than mis-routing.
-        let err = session
-            .send_video(
-                MEDIA_LANES as u8,
-                Bytes::from_static(b"z"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect_err("past-ceiling lane must error");
-        assert!(err.to_string().contains("no video lane"));
-
-        session.close().await.expect("close");
-    }
-
-    #[tokio::test]
-    async fn pinned_lane_suspends_until_explicit_finalization() {
-        let transport = Transport::new().expect("transport");
-        let (session, mut events, _owner) = open_explicit_legacy_media_peer(
-            &transport,
-            Role::Offerer,
-            NonZeroUsize::new(b"x".len()).expect("fixture unit is nonempty"),
-        )
-        .await
-        .expect("open");
-
-        // Lane 0 is pre-provisioned. Suspending it keeps its track and explicit
-        // finalization leaves it pinned. A reopen therefore always revives
-        // the same negotiated track (zero SDP) instead of recycling an
-        // m-line, which is the reliable path. This is the CEC console
-        // stop→start fast path made durable rather than time-boxed.
-        session
-            .close_media_lane(LaneKind::Video, 0)
-            .await
-            .expect("close lane 0");
-        assert!(
-            events.try_recv().is_err(),
-            "suspension is silent: no renegotiation occurs until explicit finalization"
-        );
-
-        // Explicit finalization does not remove a pinned compatibility lane.
-        assert_eq!(
-            session.finalize_suspended_lanes().await,
-            0,
-            "the pinned lane is never finalized"
-        );
-        assert_eq!(
-            session.open_lane_count(LaneKind::Video),
-            PRE_PROVISIONED_LANES,
-            "the pinned lane keeps its m-line while suspended"
-        );
-
-        // Re-open revives the same lane in place, free.
-        let lane = session
-            .open_media_lane(LaneKind::Video)
-            .await
-            .expect("reopen pinned lane");
-        assert_eq!(lane, 0, "reopen revives the pinned lane in place");
-        assert!(
-            events.try_recv().is_err(),
-            "reviving the pinned lane is free — no renegotiation"
-        );
-
-        // A transient lane can be finalized by an explicit owner event.
-        session
-            .send_video(
-                1,
-                Bytes::from_static(b"x"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect("auto-open transient lane 1");
-        while events.try_recv().is_ok() {}
-        session
-            .close_media_lane(LaneKind::Video, 1)
-            .await
-            .expect("close lane 1");
-        assert_eq!(
-            session.finalize_suspended_lanes().await,
-            1,
-            "the transient lane is finalized"
-        );
-        assert!(!session
-            .outbound_realtime_flows
-            .lock()
-            .contains_key(&(true, 1)));
-
-        session.close().await.expect("close");
-    }
-
-    #[tokio::test]
-    async fn v4_arc03h_failed_remove_track_retains_exact_lane_owner_and_blocks_reuse() {
-        let transport = Transport::new().expect("transport");
-        let (session, mut events, _owner) = open_explicit_legacy_media_peer(
-            &transport,
-            Role::Offerer,
-            NonZeroUsize::new(b"x".len()).expect("fixture unit is nonempty"),
-        )
-        .await
-        .expect("open");
-        session
-            .send_video(
-                1,
-                Bytes::from_static(b"x"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect("open transient lane");
-        while events.try_recv().is_ok() {}
-        session
-            .close_media_lane(LaneKind::Video, 1)
-            .await
-            .expect("suspend transient lane");
-        let retained_flow = session
-            .outbound_realtime_flows
-            .lock()
-            .get(&(true, 1))
-            .cloned()
-            .expect("transient lane owns one exact flow before finalization");
-        session
-            .fail_next_track_remove
-            .store(true, Ordering::Release);
-
-        assert_eq!(session.finalize_suspended_lanes().await, 0);
-        let failed_flow = match &session.video_tracks.lock().expect("lane pool")[1] {
-            Some(LaneSlot::FailedRemove { flow, .. }) => flow.clone(),
-            _ => panic!("failed removal retains the exact lane owner"),
+            .expect("real-time connector is constructed");
+        let _task = match worker.confirm_data_channel_open() {
+            DataChannelOpenOwnership::Connected(handoff) => task_from_handoff(handoff),
+            _ => panic!("live connector produces one Endpoint Auth handoff"),
         };
-        assert!(Arc::ptr_eq(&retained_flow.lifetime, &failed_flow.lifetime));
-        assert!(!session
-            .outbound_realtime_flows
-            .lock()
-            .contains_key(&(true, 1)));
-        let error = session
-            .send_video(
-                1,
-                Bytes::from_static(b"y"),
-                std::time::Duration::from_millis(33),
-            )
-            .await
-            .expect_err("failed native removal makes the exact lane non-reusable");
-        assert!(error.to_string().contains("non-reusable"));
+
+        // BEFORE PROMOTION. Connector authority is fully satisfied — the
+        // connector is live, connected, and stamped these events itself — so a
+        // refusal here is attributable to the session gate and to nothing else.
         assert!(
-            !session
-                .outbound_realtime_flows
-                .lock()
-                .contains_key(&(true, 1)),
-            "failed-lane reuse must not allocate a second flow owner"
+            worker
+                .accept_event(worker.stamp_event_for_test(TransportEvent::DataChannelClosed))
+                .is_some(),
+            "non-vacuity: connector authority admits this worker's own events"
+        );
+        assert!(
+            worker
+                .accept_event(worker.stamp_event_for_test(test_realtime_event(0, 0, b"early")))
+                .is_none(),
+            "a unit with no live session table behind it is refused before delivery"
         );
 
-        session.close().await.expect("close");
+        // PROMOTED. The same event on the same connector is now admitted, which
+        // is what makes the refusals on either side of it discriminating rather
+        // than a path that never accepts a unit at all.
+        let flows = worker.new_session_flows();
+        assert!(
+            worker
+                .accept_event(worker.stamp_event_for_test(test_realtime_event(0, 1, b"live")))
+                .is_some(),
+            "a promoted session's table is what admits a unit"
+        );
+
+        // SESSION GONE, CONNECTOR UNCHANGED. The table is held weakly, so
+        // dropping the flow set is exactly what a `PromotedSession` dropping
+        // does — no retirement, no close, no connector state change.
+        drop(flows);
+        assert!(
+            worker
+                .accept_event(worker.stamp_event_for_test(test_realtime_event(0, 2, b"late")))
+                .is_none(),
+            "and a unit outliving its session's table is refused again"
+        );
+        assert!(
+            worker
+                .accept_event(worker.stamp_event_for_test(TransportEvent::DataChannelClosed))
+                .is_some(),
+            "while the connector itself is untouched — the gate is the session's, not a retirement"
+        );
+
+        worker
+            .retire_and_close()
+            .await
+            .expect("native peer closes through its exact owner");
     }
 }

@@ -188,7 +188,12 @@ mod tests {
             .expect("outbound signaling rx should be available");
         on_wake(&state).await;
         assert!(
-            matches!(rx.try_recv(), Ok(SignalingOutbound::Announce)),
+            matches!(
+                rx.try_recv()
+                    .as_ref()
+                    .map(crate::resource::ResourceMailboxDelivery::value),
+                Some(SignalingOutbound::Announce)
+            ),
             "on_wake must emit a fresh announce"
         );
     }

@@ -36,6 +36,7 @@ use myownmesh_core::engine::NetworkState;
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
+use myownmesh_core::Channel;
 use myownmesh_core::NetworkKind;
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -89,7 +90,62 @@ fn admitted(state: &Arc<NetworkState>, peer: &str) -> bool {
     })
 }
 
-async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node]) {
+/// One side's view of a peer, or the absence of a record for it.
+///
+/// Read from the existing `PeerInfo` snapshot; nothing new is exposed. Called
+/// only from the failure path, so an ordinary passing run never evaluates it.
+///
+/// **These describe whichever peer record exists under this device id at the
+/// instant of the read, and nothing else.** A record that was rebuilt has
+/// already replaced the one before it, so `hello_sent`, `local_approve_sent`,
+/// `remote_approve_seen` and `selected_pair` carry no evidence about an attempt
+/// that was abandoned first and must not be read as if they did.
+fn peer_state(state: &Arc<NetworkState>, peer: &str) -> String {
+    match state.peer_info(peer) {
+        Some(info) => format!(
+            "authenticated={} status={:?} local_shelved={} remote_shelved={} hello_sent={} local_approve_sent={} remote_approve_seen={} selected_pair={}",
+            info.authenticated,
+            info.status,
+            info.local_shelved,
+            info.remote_shelved,
+            info.verification_code_sent.is_some(),
+            info.local_approve_sent,
+            info.remote_approve_seen,
+            info.selected_pair.is_some(),
+        ),
+        None => "no peer record".to_string(),
+    }
+}
+
+/// Both sides' admission state for every member, plus the provider's own
+/// capacity, at the instant a wait gave up.
+///
+/// Built only on a failing path, so a passing run pays nothing for it. Both
+/// directions are reported because `admitted` is a conjunction over them: a
+/// member the operator still holds but which no longer holds the operator is a
+/// different fault from one that never came up. The two provider reports
+/// separate a refusal on capacity from a refusal with capacity to spare.
+fn admission_diagnostic(operator: &Node, spokes: &[Node], transport: &Transport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, spoke) in spokes.iter().enumerate() {
+        let _ = write!(
+            out,
+            "\n  member-{i}: operator sees [{}] · member sees [{}]",
+            peer_state(&operator.state, &spoke.id),
+            peer_state(&spoke.state, &operator.id),
+        );
+    }
+    let _ = write!(
+        out,
+        "\n  process resources: {:?}\n  mesh resources: {:?}",
+        transport.connector_resource_report(),
+        transport.mesh_connector_resource_report(),
+    );
+    out
+}
+
+async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node], transport: &Transport) {
     let deadline = Instant::now() + DIAL_TIMEOUT;
     let mut next_dial = Instant::now();
     loop {
@@ -112,8 +168,9 @@ async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node]) {
         }
         assert!(
             Instant::now() < deadline,
-            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline",
-            spokes.len()
+            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline{}",
+            spokes.len(),
+            admission_diagnostic(operator, spokes, transport)
         );
         tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
     }
@@ -214,8 +271,9 @@ async fn run_area(n_spokes: usize) {
             }
             assert!(
                 Instant::now() < deadline,
-                "operator dial to {} did not come up in 60s",
-                spoke.id
+                "operator dial to {} did not come up in 60s{}",
+                spoke.id,
+                admission_diagnostic(&operator, &spokes, &transport)
             );
             tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
         }
@@ -227,7 +285,7 @@ async fn run_area(n_spokes: usize) {
     // slow runner brings up later sessions. Re-drive only missing pairs and
     // require one simultaneous admitted snapshot before testing N-session
     // shape or application delivery.
-    converge_all_operator_sessions(&operator, &spokes).await;
+    converge_all_operator_sessions(&operator, &spokes, &transport).await;
 
     // ---- the area shape holds under N sessions --------------------------
     for (i, spoke) in spokes.iter().enumerate() {
@@ -251,18 +309,38 @@ async fn run_area(n_spokes: usize) {
     // trip. This is the Phase B acked path end to end: queue → wire →
     // deliver → echo → wire → deliver.
     for spoke in &spokes {
-        let mut rx = spoke.state.subscribe_channel(CHANNEL);
+        // One resource-backed mailbox per member, held by its echo task for the
+        // run. `recv` separates the two endings the old receiver merged: `None`
+        // is the channel going away with the network, `Err` is one frame that
+        // did not decode.
+        let mut rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), spoke.state.clone())
+            .subscribe()
+            .expect("member subscription admitted");
         let echo_state = spoke.state.clone();
         let operator_id = operator.id.clone();
+        let member = spoke.id.clone();
         tokio::spawn(async move {
-            while let Ok(frame) = rx.recv().await {
-                let _ = echo_state
-                    .send_channel_frame(&operator_id, CHANNEL, frame.payload)
-                    .await;
+            while let Some(next) = rx.recv().await {
+                match next {
+                    Ok(frame) => {
+                        let _ = echo_state
+                            .send_channel_frame(&operator_id, CHANNEL, frame.body().clone())
+                            .await;
+                    }
+                    // Reported and survivable, which is the truthful shape here.
+                    // A panic would be swallowed by a `JoinHandle` nobody awaits
+                    // and ending the loop would stop every later echo, so both
+                    // would reach the operator as nothing but a timeout. Saying
+                    // it keeps the real fault visible while the run still
+                    // measures the sessions that are working.
+                    Err(e) => eprintln!("member {member} dropped an undecodable probe frame: {e}"),
+                }
             }
         });
     }
-    let mut echo_rx = operator.state.subscribe_channel(CHANNEL);
+    let mut echo_rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), operator.state.clone())
+        .subscribe()
+        .expect("operator subscription admitted");
     let pings_per_spoke: usize = 10;
     let mut rtt_ms = Vec::with_capacity(n_spokes * pings_per_spoke);
     for (i, spoke) in spokes.iter().enumerate() {
@@ -282,9 +360,15 @@ async fn run_area(n_spokes: usize) {
                     "echo from member-{i} seq {seq} never arrived"
                 );
                 match tokio::time::timeout(remaining, echo_rx.recv()).await {
-                    Ok(Ok(frame)) if frame.payload == payload => break,
-                    Ok(Ok(_)) => {} // stale/other frame — keep draining
-                    Ok(Err(e)) => panic!("operator echo stream closed: {e}"),
+                    Ok(Some(Ok(frame))) if frame.body() == &payload => break,
+                    Ok(Some(Ok(_))) => {} // stale/other frame — keep draining
+                    // The old receiver reported both of these as "stream
+                    // closed". They are different faults and only one of them
+                    // has an error to name.
+                    Ok(Some(Err(e))) => panic!("operator echo frame did not decode: {e}"),
+                    Ok(None) => panic!(
+                        "operator echo channel closed while member-{i} seq {seq} was outstanding"
+                    ),
                     Err(_) => panic!("echo from member-{i} seq {seq} timed out"),
                 }
             }

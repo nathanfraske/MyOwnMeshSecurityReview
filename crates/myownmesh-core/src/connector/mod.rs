@@ -2,11 +2,29 @@
 //!
 //! This Arc 02 module adds the ownership transition only. Existing WebRTC,
 //! Arc 03 wraps the existing ICE, TURN, and connection behavior in this owner.
+//!
+//! Arc 04B-1 adds the transport-independent boundary that endpoint
+//! authentication consumes, split by owner rather than by size:
+//!
+//! - [`incarnation`] owns the opaque process-local connector identity;
+//! - [`handoff`] owns the move-only channel handoff and its retention contract;
+//! - [`binding`] owns the closed connector-supplied channel binding.
+//!
+//! A transport keeps its own incarnation type and owns a generic one. Endpoint
+//! authentication names only the generic types, so it imports no transport.
+
+mod binding;
+mod handoff;
+mod incarnation;
+
+pub(crate) use binding::EndpointAuthBinding;
+#[cfg(test)]
+pub(crate) use handoff::{counted_handoff_for_test, handoff_for_test};
+pub(crate) use handoff::{ConnectedChannelHandoff, ConnectedChannelRetention};
+pub(crate) use incarnation::ConnectorIncarnation;
 
 use crate::runtime::attempt::ConnectorCandidateCapability;
 use crate::runtime::RuntimeIncarnation;
-use crate::transport::WebRtcConnectorIncarnation;
-use std::sync::Arc;
 
 /// Local proof that a connector candidate produced a working channel.
 ///
@@ -79,85 +97,18 @@ impl ConnectedChannelCapability {
     }
 }
 
-/// Compatibility-only, process-local authority for connector-native
-/// real-time work.
-///
-/// This type deliberately says nothing about codecs, media kinds, lanes, or
-/// application semantics. It only proves that the legacy admission path
-/// authorized real-time work on one exact live connector incarnation. It is
-/// not the generalized flow contract. That later authority must be bound to
-/// an authenticated session and principal, guarded by application policy, and
-/// backed by its own resource reservation.
-///
-/// It has no public constructor and is neither cloneable by value nor
-/// serializable. Runtime owners may share the exact instance through `Arc`.
-pub(crate) struct ConnectorRealtimeFlowCapability {
-    incarnation: Arc<WebRtcConnectorIncarnation>,
-    _resources: crate::resource::ResourceLease,
-}
-
-impl ConnectorRealtimeFlowCapability {
-    pub(super) fn new(
-        incarnation: Arc<WebRtcConnectorIncarnation>,
-        resources: crate::resource::ResourceLease,
-    ) -> Self {
-        Self {
-            incarnation,
-            _resources: resources,
-        }
-    }
-
-    pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
-        Arc::ptr_eq(&self.incarnation, incarnation) && incarnation.is_active()
-    }
-}
-
-pub(super) fn realtime_flow_capability_claim(
-) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
-    let bytes =
-        u64::try_from(std::mem::size_of::<ConnectorRealtimeFlowCapability>()).map_err(|_| {
-            crate::resource::ResourceClaimArithmeticError::Overflow {
-                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
-            }
-        })?;
-    crate::resource::ResourceClaim::try_from_entries([
-        (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
-        (crate::resource::ResourceClass::StorageObject, 1),
-        (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
-    ])
-}
-
-/// Temporary adapter for the existing live channel object.
-///
-/// The adapter requires a capability that the connector already produced. A
-/// legacy object cannot mint the capability. Arc 04 deletes this wrapper when
-/// endpoint authentication consumes `ConnectedChannelCapability` directly.
-#[allow(
-    dead_code,
-    reason = "Arc 04 installs and deletes this migration adapter"
-)]
-pub(crate) struct LegacyConnectedChannel<T> {
-    capability: ConnectedChannelCapability,
-    legacy: T,
-}
-
-#[allow(
-    dead_code,
-    reason = "Arc 04 installs and deletes this migration adapter"
-)]
-impl<T> LegacyConnectedChannel<T> {
-    pub(crate) fn new(capability: ConnectedChannelCapability, legacy: T) -> Self {
-        Self { capability, legacy }
-    }
-
-    pub(crate) fn capability(&self) -> &ConnectedChannelCapability {
-        &self.capability
-    }
-
-    fn into_parts(self) -> (ConnectedChannelCapability, T) {
-        (self.capability, self.legacy)
-    }
-}
+// The connector issues no real-time authority.
+//
+// Real-time work is authorized by the promoted `SessionCapability` and the flow
+// set that session owns. That set is the only thing that mints a label, and an
+// inbound track may attach only to a binding the set established, so a
+// connector holding no promoted session has nothing a track can attach to.
+//
+// There is exactly one admission decision, and it is promotion — which proves
+// the exact current connector, current policy, the authenticated local
+// principal, and a held post-authentication reservation atomically under the
+// engine's registry fence. No second connector-side capability or delivery
+// boolean exists to be kept in step with it.
 
 #[cfg(test)]
 pub(crate) fn connected_for_test(runtime: RuntimeIncarnation) -> ConnectedChannelCapability {
@@ -188,15 +139,5 @@ mod tests {
             connector_candidate_for_test(crate::runtime::runtime_for_test());
         retired_lifetime.retire();
         assert!(mark_connected(retired_candidate).is_none());
-    }
-
-    #[test]
-    fn v4_arc02_legacy_adapter_requires_an_existing_capability() {
-        let connected = connected_for_test(crate::runtime::runtime_for_test());
-        let wrapper = LegacyConnectedChannel::new(connected, "legacy channel");
-        let _ = wrapper.capability();
-        let (_capability, legacy) = wrapper.into_parts();
-
-        assert_eq!(legacy, "legacy channel");
     }
 }

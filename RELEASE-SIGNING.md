@@ -45,12 +45,17 @@ signing isn't configured.
    `myownmesh-*.tar.gz` / `.zip`, and that `myownmesh update` on a build compiled
    with the pubkey accepts it.
 
-## Note on the bundled daemon
+## Scope of this key
 
-AllMyStuff ships this `myownmesh` daemon as a Tauri sidecar pinned via
-`.myownmesh-rev`. That sidecar is fetched/built at AllMyStuff build time and is
-covered by AllMyStuff's own release verification; this key signs the standalone
-MyOwnMesh release archives consumed by `myownmesh update`.
+This key signs the standalone MyOwnMesh release archives consumed by
+`myownmesh update`, and only those.
+
+An application that embeds or bundles this daemon — fetching or building it at
+its own build time and shipping it as a sidecar — is outside that scope. Such a
+copy never passes through `myownmesh update`, so nothing here verifies it, and
+the embedder is responsible for covering it under its own release verification.
+Stated explicitly because the gap is easy to assume closed: a signed project is
+not the same as a signed copy of it.
 
 ## Rotation
 

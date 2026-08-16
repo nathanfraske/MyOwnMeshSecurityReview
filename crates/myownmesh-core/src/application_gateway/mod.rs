@@ -1,109 +1,92 @@
 //! Local-principal and application-queue capability boundary for V4.
 //!
-//! Arc 02 installs memory-only authority types. It does not choose the
-//! operating-system principal binding or redirect an application operation.
+//! The principal binding selected here is the **local process itself**: the
+//! application operations this crate serves run in-process with the embedder, so
+//! the operating-system principal that authenticated is the one already running
+//! this code. That is a real binding, not a placeholder, and it is deliberately
+//! the narrowest one that is true — there is no per-request principal inference,
+//! no client label, and no identity or attestation framework.
+//!
+//! The owner itself is one type, `ApplicationGateway`, and its state is
+//! declared here so that each submodule can reach exactly the fields its own
+//! operations need. The submodules hold the operations, not a second owner:
+//! `capabilities` the retained local advertisement, `channels` the named
+//! subscriber queues, `frame` the encoded-frame admission and decode split,
+//! `mailbox` the accepted-entry representation those queues are built on,
+//! `principal` the local-process principal, and `rpc` the RPC seam.
 
-use crate::runtime::RuntimeIncarnation;
+mod capabilities;
+mod channels;
+mod frame;
+mod mailbox;
+mod principal;
+mod rpc;
 
-/// Local proof that an operating-system principal was authenticated and is
-/// eligible for a later Session Broker policy check.
-///
-/// A public user, client, request, or peer label cannot construct this type:
-///
-/// ```compile_fail,E0308
-/// use myownmesh_core::application_gateway::LocalPrincipalCapability;
-///
-/// let public_client_label = String::new();
-/// let _principal = LocalPrincipalCapability::from(public_client_label);
-/// ```
-#[allow(dead_code, reason = "Arc 06 moves the production gateway caller")]
-pub struct LocalPrincipalCapability {
-    runtime: RuntimeIncarnation,
+pub use frame::json_input_work_claim;
+pub use principal::LocalPrincipalCapability;
+
+pub(crate) use capabilities::{CapabilityReplaceRefusal, LocalCapabilityState};
+pub(crate) use channels::{ChannelSubscriber, GatewayChannelFrame};
+pub(crate) use frame::{structural_json_claim, AdmittedApplicationFrame, DecodedApplicationFrame};
+pub(crate) use mailbox::{GatewayAccepted, GatewayDelivery, GatewayMailbox};
+
+use crate::resource::{LeasedMap, LocalApplicationResourceScope, ResourceUnavailable};
+
+use channels::GatewayChannel;
+
+/// The one local application owner for a joined network.
+pub(crate) struct ApplicationGateway {
+    channels: parking_lot::Mutex<LeasedMap<String, GatewayChannel>>,
+    capabilities: LocalCapabilityState,
+    rpc: parking_lot::RwLock<Option<crate::resource::FundedArc<crate::rpc::RpcInner>>>,
+    closed: std::sync::atomic::AtomicBool,
+    resources: LocalApplicationResourceScope,
 }
 
-#[allow(dead_code, reason = "Arc 06 moves the production gateway caller")]
-impl LocalPrincipalCapability {
-    pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.runtime
+impl ApplicationGateway {
+    pub(crate) fn new(resources: LocalApplicationResourceScope) -> Self {
+        Self {
+            channels: parking_lot::Mutex::new(LeasedMap::new()),
+            capabilities: LocalCapabilityState::new(),
+            rpc: parking_lot::RwLock::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            resources,
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(runtime: RuntimeIncarnation) -> Self {
-        Self { runtime }
-    }
-}
-
-/// Proof that post-authentication application-queue capacity was admitted.
-///
-/// Arc 02 creates no production issuer and supplies no conversion from any
-/// pre-authentication permit.
-#[allow(dead_code, reason = "Arc 06 moves the production gateway caller")]
-pub struct ApplicationQueuePermit {
-    runtime: RuntimeIncarnation,
-}
-
-impl ApplicationQueuePermit {
-    #[cfg(test)]
-    pub(crate) fn for_test(runtime: RuntimeIncarnation) -> Self {
-        Self { runtime }
+    pub(crate) fn capability_state(&self) -> &LocalCapabilityState {
+        &self.capabilities
     }
 
-    #[cfg(test)]
-    pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.runtime
-    }
-}
-
-/// Arc 06 compatibility container for an already-authenticated local
-/// principal.
-#[allow(
-    dead_code,
-    reason = "Arc 06 installs and deletes this migration adapter"
-)]
-pub(crate) struct LegacyPrincipal<T> {
-    capability: LocalPrincipalCapability,
-    legacy: T,
-}
-
-#[allow(
-    dead_code,
-    reason = "Arc 06 installs and deletes this migration adapter"
-)]
-impl<T> LegacyPrincipal<T> {
-    pub(crate) fn new(capability: LocalPrincipalCapability, legacy: T) -> Self {
-        Self { capability, legacy }
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn capability(&self) -> &LocalPrincipalCapability {
-        &self.capability
-    }
-
-    fn into_parts(self) -> (LocalPrincipalCapability, T) {
-        (self.capability, self.legacy)
+    pub(crate) fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let subscribers = std::mem::take(&mut *self.channels.lock());
+        drop(subscribers);
+        self.capabilities.clear();
+        if let Some(rpc) = self.rpc.write().take() {
+            drop(std::mem::take(&mut *rpc.handlers.lock()));
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn v4_arc02_principal_and_queue_permit_are_runtime_bound() {
-        let runtime = crate::runtime::runtime_for_test();
-        let principal = LocalPrincipalCapability::for_test(runtime.clone());
-        let queue = ApplicationQueuePermit::for_test(runtime.clone());
-
-        assert!(principal.runtime().is_same(&runtime));
-        assert!(queue.runtime().is_same(&runtime));
-    }
-
-    #[test]
-    fn v4_arc02_legacy_principal_requires_existing_authority() {
-        let principal = LocalPrincipalCapability::for_test(crate::runtime::runtime_for_test());
-        let wrapper = LegacyPrincipal::new(principal, "legacy principal");
-        let _ = wrapper.capability();
-        let (_capability, legacy) = wrapper.into_parts();
-
-        assert_eq!(legacy, "legacy principal");
-    }
+/// Why the Application Gateway refused an encoded application frame or queued
+/// delivery. No receiver and provider pressure are different facts and remain
+/// distinguishable to reliable delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum GatewayRefusal {
+    #[error("no local receiver is installed")]
+    NoReceiver,
+    #[error("the application gateway is closed")]
+    Revoked,
+    #[error("the local receiver lagged by {0} entries")]
+    Lag(u64),
+    #[error("the resource provider refused application work: {0:?}")]
+    Pressure(ResourceUnavailable),
+    #[error("application work is not representable as a resource claim")]
+    Malformed,
 }

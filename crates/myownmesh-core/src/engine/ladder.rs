@@ -39,20 +39,6 @@ pub enum ConnectionTier {
         #[serde(skip, default = "now")]
         started: std::time::Instant,
     },
-    /// Retained for wire / GUI compatibility — the engine no longer
-    /// drives a re-handshake loop (silence rebuilds instead), so this is
-    /// never produced.
-    Rehandshake {
-        attempt: u32,
-        #[serde(skip, default = "now")]
-        next_at: std::time::Instant,
-    },
-    /// Retained for wire / GUI compatibility — see [`Self::Rehandshake`].
-    RoomRejoin {
-        attempt: u32,
-        #[serde(skip, default = "now")]
-        next_at: std::time::Instant,
-    },
     /// Tier 6 — signaling / STUN / TURN config edit forced
     /// stop+start.
     StopStart,
@@ -195,7 +181,7 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
             format!("dialing shape edge to {}", super::short_peer(&id)),
             serde_json::json!({ "peer": id }),
         );
-        super::ensure_peer_session(state, id, crate::transport::Role::Offerer).await;
+        super::ensure_peer_session(state, &id, crate::transport::Role::Offerer).await;
     }
 }
 
@@ -271,12 +257,8 @@ mod tests {
         *state.topology_impl.write() = from_mode(&mode);
         // A spoke↔spoke connection (no edge under Star): built as a real
         // session so the prune has something to close.
-        crate::engine::ensure_peer_session(
-            &state,
-            "spoke-b".into(),
-            crate::transport::Role::Offerer,
-        )
-        .await;
+        crate::engine::ensure_peer_session(&state, "spoke-b", crate::transport::Role::Offerer)
+            .await;
         {
             let peer = state.peers.get("spoke-b").unwrap();
             let mut data = peer.state.write();
@@ -309,12 +291,8 @@ mod tests {
         *state.topology_impl.write() = from_mode(&mode);
         // A live spoke↔spoke session (no edge under Star) held by a pin —
         // a technician's standing support dial.
-        crate::engine::ensure_peer_session(
-            &state,
-            "spoke-b".into(),
-            crate::transport::Role::Offerer,
-        )
-        .await;
+        crate::engine::ensure_peer_session(&state, "spoke-b", crate::transport::Role::Offerer)
+            .await;
         state.add_sticky("spoke-b");
         {
             let peer = state.peers.get("spoke-b").unwrap();
@@ -337,12 +315,8 @@ mod tests {
         let mode = TopologyMode::Star { hub: "~hub".into() };
         *state.topology.write() = mode.clone();
         *state.topology_impl.write() = from_mode(&mode);
-        crate::engine::ensure_peer_session(
-            &state,
-            "spoke-b".into(),
-            crate::transport::Role::Offerer,
-        )
-        .await;
+        crate::engine::ensure_peer_session(&state, "spoke-b", crate::transport::Role::Offerer)
+            .await;
         // Shelved before the pin existed (the dial raced the shelve pass) —
         // the next reevaluation must heal it back to Active.
         {
@@ -365,12 +339,8 @@ mod tests {
         let mode = TopologyMode::Star { hub: "~hub".into() };
         *state.topology.write() = mode.clone();
         *state.topology_impl.write() = from_mode(&mode);
-        crate::engine::ensure_peer_session(
-            &state,
-            "spoke-b".into(),
-            crate::transport::Role::Offerer,
-        )
-        .await;
+        crate::engine::ensure_peer_session(&state, "spoke-b", crate::transport::Role::Offerer)
+            .await;
         state.add_sticky("spoke-b");
         {
             let peer = state.peers.get("spoke-b").unwrap();

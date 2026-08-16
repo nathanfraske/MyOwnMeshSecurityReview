@@ -21,7 +21,6 @@ is a normal member).
 | Service | What it does | Default | Needs |
 |---|---|---|---|
 | **Node** | Participate as a regular mesh member (join configured networks). On by default; off = pure-infra box. | on | nothing |
-| **LegacyV1 member relay** | Frozen application-frame forwarding for pre-V4 deployments. This is not TURN or signaling. | unavailable in normal V4 builds | `legacy-v1`, explicit legacy daemon option, node on |
 | **Signaling** | An *intelligent* Nostr relay (NIP-01 / WebSocket) peers use in place of public Nostr, with live presence, instant departure, and flood limits. | off · :4848 | nothing |
 | **STUN** | Answers RFC 5389 binding requests so peers learn their reflexive address. | off · :3478 | nothing |
 | **TURN** | Relays media / data for peers behind symmetric NAT (RFC 5766), with an optional per-connection bandwidth cap. | off · :3478 | public IP + credentials |
@@ -32,33 +31,22 @@ Whether this device participates as a regular mesh member by joining its
 configured networks and acting as a peer. It's on by default. Turn it off
 to run a **pure-infrastructure box**: the daemon hosts signaling / STUN /
 TURN (advertising itself purely as an edge / ingress-egress point) and
-joins no networks itself. The frozen LegacyV1 member relay is different: it
-requires node participation because it forwards application frames between
-members.
+joins no networks itself.
 
 Toggling `node` live joins or leaves every configured network in place;
 no restart needed.
 
-### LegacyV1 member relay
+### There is no member payload relay
 
-This section describes frozen pre-V4 compatibility. Normal V4 startup rejects
-the old `services.relay` configuration. A retained compatibility build must
-enable the `legacy-v1` feature and start the daemon with `--legacy-v1`.
+A device never forwards another member's application payload. Application
+data goes endpoint to endpoint over that pair's own authenticated session,
+and a mesh member is not a hop on that path — TURN relays packets at the ICE
+layer without ever holding an application frame, which is a different thing
+entirely.
 
-When enabled, the device forwards typed-channel frames between roster
-members on a reserved channel. A spoke sends a `RelayEnvelope`
-(`{ dst, payload }`) to the relay; the relay rewrites the authenticated
-origin into `src` and forwards it to one destination (directed) or to
-every other reachable member (broadcast, `dst` empty).
-
-Forwarding is **roster-gated on both ends**: a frame is only relayed when
-its sender is an approved peer of the relay device, and a directed frame
-only reaches its destination when that destination is also approved. The
-relay never forwards for or to strangers.
-
-This is application-frame routing built on the old channel API. It is not a
-V4 connector feature, TURN, signaling, or a generic relay. New V4 code must
-not use it. It remains only while downstream applications migrate.
+There is no `services.relay` key to set, no `relay` name the CLI or GUI will
+toggle, no relay field in the status report, and no relay role in the
+capability advert. A peer has nothing to point at.
 
 ### Signaling
 
@@ -180,7 +168,6 @@ Services live under `services` in `~/.myownmesh/config.json`:
   "version": 1,
   "services": {
     "node":      { "enabled": true },
-    "relay":     { "enabled": false, "max_fanout": 0 },
     "signaling": {
       "enabled": true,
       "bind": "0.0.0.0",
@@ -270,15 +257,13 @@ endpoint URLs in a structured `services` blob inside its capability
 { "services": {
     "signaling_url": "ws://203.0.113.7:4848",
     "stun_url": "stun:203.0.113.7:3478",
-    "turn_url": "turn:203.0.113.7:3478",
-    "relay": false
+    "turn_url": "turn:203.0.113.7:3478"
 } }
 ```
 
-The wire field `relay` and tag `service:relay` are frozen LegacyV1 names for
-the ordinary-member application relay. Their source role is
-`LegacyV1MemberRelay`. They do not describe TURN, signaling, or a generic
-opaque relay.
+There is no relay field or `service:relay` tag. Those named the ordinary-member
+application relay, not TURN — a device that hosts TURN advertises `turn_url`
+and the `service:turn` tag, which is a separate thing.
 
 A peer reads this with `ServiceAdvert::from_extra(...)` and can drop the
 URLs straight into its own network config.
@@ -406,7 +391,7 @@ WebSockets?), then **firewall** (is the port open?).
 | Piece | Location |
 |---|---|
 | Service config schema | `crates/myownmesh-core/src/config.rs` (`ServicesConfig`, `NodeServiceConfig`) |
-| Service roles and advert, including the frozen LegacyV1 member relay | `crates/myownmesh-core/src/services/` |
+| Service roles and advert | `crates/myownmesh-core/src/services/` |
 | STUN / TURN servers (+ bandwidth throttle) | `crates/myownmesh-services/` |
 | Intelligent signaling relay (presence / leave / limits) | `crates/myownmesh-signaling/src/server.rs` |
 | `Leave` signal + driver `PeerLeft` | `crates/myownmesh-signaling/src/{lib.rs,nostr/driver.rs}` |

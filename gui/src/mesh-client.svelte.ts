@@ -53,8 +53,8 @@ function createMeshClient() {
    *  `types.ts` — the Governance tab reads what it needs by key. */
   let governanceByNetwork = $state<Record<string, unknown>>({});
   let diags = $state<DiagEntry[]>([]);
-  // Device-level infrastructure services this device hosts (relay /
-  // signaling / STUN / TURN): live status + the persisted config the
+  // Device-level infrastructure services this device hosts (signaling /
+  // STUN / TURN): live status + the persisted config the
   // Services settings section edits. `null` until first fetched.
   let services = $state<ServicesStatusResponse | null>(null);
   // Wall-clock ms of the most recent "network change" diag, per
@@ -180,9 +180,9 @@ function createMeshClient() {
     await Promise.all([refreshPeers(network), refreshRoster(network)]);
   }
 
-  async function rosterList(network: string) {
+  async function rosterList(network: string): Promise<AuthorizedPeer[]> {
     const resp = (await invoke("mesh_roster_list", { network })) as {
-      roster: Array<{ device_id: string; label: string; approved_at: number }>;
+      roster: AuthorizedPeer[];
     };
     return resp.roster ?? [];
   }
@@ -435,7 +435,7 @@ function createMeshClient() {
     return (await invoke("update_set_prefs", { prefs })) as UpdateStatus;
   }
 
-  // ---- infrastructure services (relay / signaling / STUN / TURN) -----
+  // ---- infrastructure services (signaling / STUN / TURN) -------------
 
   /** Fetch the device's service status + persisted config. Cheap; runs
    *  on every `refreshAll` so the Services section has current data. */

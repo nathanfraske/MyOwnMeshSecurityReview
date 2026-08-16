@@ -1361,10 +1361,11 @@ name = "myownmesh"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
- "dashmap",
  "data-encoding",
  "dirs",
+ "getrandom 0.2.17",
  "interprocess",
  "libc",
  "myownmesh-core",
@@ -1379,6 +1380,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "widestring",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

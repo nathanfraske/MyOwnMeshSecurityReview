@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Own the single atomic transition from authenticated channel plus current policy, authenticated local principal, and post-authentication capacity into `SessionCapability`. Arc 02 defines the types only. Arc 05 implements promotion.
+Own the single atomic transition from authenticated channel plus current policy, authenticated local principal, and post-authentication capacity into `SessionCapability`.
 
 ## Owned state
 
-The target owner holds current policy guards, principal bindings, post-authentication permits, and live promoted-session capabilities. No mutable production state moves here in Arc 02.
+The owner holds current policy guards, principal bindings, post-authentication permits, and live promoted-session capabilities.
 
 ## Inputs
 
@@ -27,7 +27,7 @@ Session Broker depends on Semantic Node policy output, Endpoint Auth Task output
 
 ## Resources
 
-Session capacity is a post-authentication class distinct from all attempt and endpoint-authentication work. Arc 02 defines `SessionPermit` but has no production issuer and chooses no bound.
+Session capacity is a post-authentication class distinct from all attempt and endpoint-authentication work. `SessionPermit` is reserved against the owner's resource scope inside `promote`, so a session that could not be paid for is not promoted; the bound is the provider's, not a constant chosen here.
 
 ## Restart behavior
 
@@ -37,10 +37,4 @@ Possession of a session capability or permit grants the authority represented by
 
 This node does not gather candidates, run packet loops, parse application meaning, infer a principal from a client label, accept a connected channel as authenticated, or promote without every `MayPromote` predicate.
 
-## Arc 02 construction status
-
-There is no production Session mint in Arc 02. The `cfg(test)` scaffold exists only to prove type composition and runtime binding. It is not a policy or authentication implementation.
-
-## Compatibility adapter
-
-`LegacySession<T>` can hold a legacy session only beside an already-issued capability and cannot expose its raw value outside this owner. Arc 06 deletes it when application entry points require `SessionCapability` directly.
+`SessionBroker::promote` is the sole mint. There is no adapter that pairs a session capability with an unpromoted value: application entry points require `SessionCapability` directly.

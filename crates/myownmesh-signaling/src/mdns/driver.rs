@@ -39,7 +39,7 @@ use tracing::{debug, info, trace, warn};
 use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
 use super::wire::{self, Frame};
 use crate::nostr::handle::derive_room_handle;
-use crate::{Error, SignalingMessage};
+use crate::{Error, OwnedQueue, SignalingMessage};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -117,6 +117,26 @@ pub fn start(
     outbound_rx: mpsc::UnboundedReceiver<MdnsOutbound>,
     inbound_tx: mpsc::UnboundedSender<MdnsInbound>,
 ) -> crate::Result<MdnsDriverHandle> {
+    start_with_queue_owner(config, outbound_rx, inbound_tx, ())
+}
+
+/// [`start`], with an opaque owner for the outbound queue.
+///
+/// The owner rides into the outbound pump inside an [`OwnedQueue`], so it is
+/// released only after the receiver and everything the caller left queued in
+/// it — including when the pump is cancelled mid-`recv` rather than exiting
+/// cleanly. See [`OwnedQueue`] for why the driver takes something it never
+/// reads, and why `O` is inline rather than boxed.
+///
+/// On a failed start the owner is dropped here with the receiver, before any
+/// pump exists: nothing was translated, so nothing is left unaccounted.
+pub fn start_with_queue_owner<O: Send + 'static>(
+    config: MdnsDriverConfig,
+    outbound_rx: mpsc::UnboundedReceiver<MdnsOutbound>,
+    inbound_tx: mpsc::UnboundedSender<MdnsInbound>,
+    queue_owner: O,
+) -> crate::Result<MdnsDriverHandle> {
+    let outbound_rx = OwnedQueue::new(outbound_rx, queue_owner);
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
 
     // TCP exchange listener first — its port goes into the SRV record.
@@ -319,7 +339,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
     }
 }
 
-async fn run_outbound(shared: Arc<Shared>, mut outbound_rx: mpsc::UnboundedReceiver<MdnsOutbound>) {
+async fn run_outbound<O: Send>(shared: Arc<Shared>, mut outbound_rx: OwnedQueue<MdnsOutbound, O>) {
     while let Some(outbound) = outbound_rx.recv().await {
         match outbound {
             MdnsOutbound::Announce => {

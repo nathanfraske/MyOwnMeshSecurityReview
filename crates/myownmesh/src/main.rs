@@ -28,18 +28,7 @@ enum Command {
     /// Run the mesh daemon in the foreground (headless). The desktop
     /// GUI auto-spawns this; run it yourself on servers and headless
     /// boxes. A bare `myownmesh` (no subcommand) opens the GUI instead.
-    Serve {
-        /// Enable the frozen pre-V4 application routing and relay profile.
-        /// This option is temporary and available only in legacy-v1 builds.
-        #[cfg(feature = "legacy-v1")]
-        #[arg(long)]
-        legacy_v1: bool,
-        /// Attach the reviewed H.264 and Opus compatibility provider.
-        /// This authority is independent from the LegacyV1 routing profile.
-        #[cfg(feature = "legacy-media")]
-        #[arg(long)]
-        legacy_media: bool,
-    },
+    Serve,
     /// Show this device's identity.
     Identity {
         #[command(subcommand)]
@@ -217,42 +206,7 @@ fn main() -> ExitCode {
 
     let result: Result<()> = runtime.block_on(async move {
         match cmd {
-            Command::Serve {
-                #[cfg(feature = "legacy-v1")]
-                legacy_v1,
-                #[cfg(feature = "legacy-media")]
-                legacy_media,
-            } => {
-                #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
-                {
-                    match (legacy_v1, legacy_media) {
-                        (false, false) => cli::serve::run().await,
-                        (true, false) => cli::serve::run_with_legacy_v1().await,
-                        (false, true) => cli::serve::run_with_legacy_media().await,
-                        (true, true) => cli::serve::run_with_legacy_v1_and_media().await,
-                    }
-                }
-                #[cfg(all(feature = "legacy-v1", not(feature = "legacy-media")))]
-                {
-                    if legacy_v1 {
-                        cli::serve::run_with_legacy_v1().await
-                    } else {
-                        cli::serve::run().await
-                    }
-                }
-                #[cfg(all(not(feature = "legacy-v1"), feature = "legacy-media"))]
-                {
-                    if legacy_media {
-                        cli::serve::run_with_legacy_media().await
-                    } else {
-                        cli::serve::run().await
-                    }
-                }
-                #[cfg(all(not(feature = "legacy-v1"), not(feature = "legacy-media")))]
-                {
-                    cli::serve::run().await
-                }
-            }
+            Command::Serve => cli::serve::run().await,
             Command::Identity { action } => cli::identity::run(action).await,
             Command::Ctl { action } => cli::ctl::run(action).await,
             Command::Update { action } => cli::update::run(action).await,
@@ -276,52 +230,26 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    /// `serve` takes no compatibility flags, and the absence is the assertion.
+    ///
+    /// There were three: `--legacy-v1`, `--legacy-media`, and both together.
+    /// Each admitted a retired authority — pre-V4 application routing, and a
+    /// fixed H.264/Opus lane provider — so a build that still parses one can
+    /// still be asked to install it. Rejecting them at the CLI is the cheapest
+    /// place to prove the authority is gone rather than merely unused.
     #[test]
-    fn v4_arc03j_v4_only_daemon_option_set_is_empty() {
-        let cli = Cli::try_parse_from(["myownmesh", "serve"])
-            .expect("ordinary V4 serve remains available without compatibility authority");
-        assert!(matches!(cli.command, Some(Command::Serve { .. })));
-    }
-
-    #[cfg(feature = "legacy-v1")]
-    #[test]
-    fn v4_arc03h_legacy_v1_daemon_option_is_explicit() {
-        let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-v1"])
-            .expect("legacy-v1 feature exposes the deprecated explicit daemon option");
+    fn serve_admits_no_compatibility_authority_flags() {
+        for flag in ["--legacy-v1", "--legacy-media"] {
+            assert!(
+                Cli::try_parse_from(["myownmesh", "serve", flag]).is_err(),
+                "`serve {flag}` must not parse: the authority it selected no longer exists"
+            );
+        }
         assert!(matches!(
-            cli.command,
-            Some(Command::Serve {
-                legacy_v1: true,
-                ..
-            })
-        ));
-    }
-
-    #[cfg(feature = "legacy-media")]
-    #[test]
-    fn v4_arc03j_legacy_media_daemon_option_is_independent() {
-        let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-media"])
-            .expect("legacy-media authority is independently explicit");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Serve {
-                legacy_media: true,
-                ..
-            })
-        ));
-    }
-
-    #[cfg(all(feature = "legacy-v1", feature = "legacy-media"))]
-    #[test]
-    fn v4_arc03j_combined_compatibility_authorities_require_both_flags() {
-        let cli = Cli::try_parse_from(["myownmesh", "serve", "--legacy-v1", "--legacy-media"])
-            .expect("the combined deprecated compatibility deployment is explicit");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Serve {
-                legacy_v1: true,
-                legacy_media: true,
-            })
+            Cli::try_parse_from(["myownmesh", "serve"])
+                .expect("plain serve still parses")
+                .command,
+            Some(Command::Serve)
         ));
     }
 }

@@ -59,6 +59,10 @@
   }
 
   $effect(() => {
+    // Ratified governance transitions update the daemon-owned role mirrored
+    // into each roster row. Track the snapshot before `refresh` awaits so a
+    // later ratification re-lists this component's local roster state.
+    void govView;
     void refresh();
   });
 
@@ -69,13 +73,6 @@
 
   function fmtDate(epoch: number): string {
     return new Date(epoch * 1000).toLocaleString();
-  }
-
-  function roleOf(deviceId: string): Role {
-    // Roster entries from the daemon don't (yet) carry the role
-    // field — the engine isn't aware of governance. Read from the
-    // GUI-local governance store; default to `member`.
-    return governance.roleOf(network.config_id, devicePubkey(deviceId));
   }
 
   /** Strip a roster entry's display-suffix to get the bare pubkey
@@ -305,7 +302,7 @@
       </thead>
       <tbody>
         {#each roster as r (r.device_id)}
-          {@const role = roleOf(r.device_id)}
+          {@const role = r.role}
           {@const isBusy = busy === r.device_id}
           <tr>
             <td>

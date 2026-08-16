@@ -2,8 +2,7 @@
 
 use super::*;
 use crate::resource::{
-    ReclaimResult, ResourceAdmission, ResourceAuthorityClass, ResourceClaim, ResourceClass,
-    ResourceLease, ResourceProviderPort, ResourceReclaimSubscription, ResourceReclaimTarget,
+    ResourceAuthorityClass, ResourceClaim, ResourceClass, ResourceLease, ResourceProviderPort,
     ResourceScope, ResourceUnavailable,
 };
 use futures_util::FutureExt;
@@ -194,12 +193,21 @@ pub(super) struct MeshConnectorResourceScopeToken {
 pub(crate) struct ConnectorWorkResourceScope {
     provider: ResourceProviderPort,
     scope: ResourceScope,
-    reclaim_target: Option<ResourceReclaimTarget>,
+    /// The process cleanup executor this connector's subordinate native objects
+    /// submit their retirements to.
+    ///
+    /// Carried here rather than looked up, because the owners that need it need
+    /// it from a destructor: by the time a native object's owner is dropping
+    /// there is nothing left to ask. A work scope is already the thing that
+    /// funds native work on this connector, so it is also the honest place to
+    /// find out where that work goes to be undone.
+    cleanup_submission: ConnectorCleanupSubmissionPort,
 }
 
 impl ConnectorWorkResourceScope {
-    pub(crate) fn scope_id(&self) -> crate::resource::ResourceScopeId {
-        self.scope.id()
+    /// Where this connector's subordinate native retirements are submitted.
+    pub(crate) fn cleanup_submission(&self) -> &ConnectorCleanupSubmissionPort {
+        &self.cleanup_submission
     }
 
     pub(crate) fn acquire(
@@ -207,12 +215,7 @@ impl ConnectorWorkResourceScope {
         authority: ResourceAuthorityClass,
         claim: ResourceClaim,
     ) -> Result<ResourceLease, ResourceUnavailable> {
-        match (authority, self.reclaim_target.as_ref()) {
-            (ResourceAuthorityClass::Speculative, Some(target)) => self
-                .provider
-                .acquire_reclaimable_now(&self.scope, claim, target.clone()),
-            _ => self.provider.acquire(&self.scope, authority, claim),
-        }
+        self.provider.acquire(&self.scope, authority, claim)
     }
 
     #[cfg(test)]
@@ -251,12 +254,12 @@ impl MeshConnectorResourceScope {
         cleanup: ConnectorCleanupFuture,
         on_complete: ConnectorCleanupCompletion,
         on_failure: ConnectorCleanupFailure,
-    ) -> std::result::Result<(), ConnectorCleanupJob> {
+    ) -> ConnectorCleanupSubmission {
         if !Arc::ptr_eq(
             &capability.reservation.process_diagnostics,
             &self.token.owner.diagnostics,
         ) {
-            return Err(ConnectorCleanupJob::new(
+            return ConnectorCleanupSubmission::refused(ConnectorCleanupJob::new(
                 capability,
                 cleanup,
                 on_complete,
@@ -274,6 +277,22 @@ impl MeshConnectorResourceScope {
             ))
     }
 
+    /// A durable, cloneable port for submitting subordinate native cleanup.
+    ///
+    /// Handed to owners that must be able to submit a retirement from `Drop`.
+    /// That is the whole reason it exists: `Drop` cannot await and cannot assume
+    /// a runtime, and the executor behind this port already owns its own thread
+    /// and its own runtime, so a submission through it is a synchronous send
+    /// onto an unbounded channel and nothing else.
+    ///
+    /// It grants no capacity. Every job it accepts still arrives with an exact
+    /// lease acquired beforehand.
+    pub(crate) fn cleanup_submission_port(&self) -> ConnectorCleanupSubmissionPort {
+        ConnectorCleanupSubmissionPort {
+            owner: Arc::clone(&self.token.owner),
+        }
+    }
+
     /// Mark the diagnostics inexact without replacing provider truth.
     pub(crate) fn poison_accounting(&self) {
         self.token.owner.diagnostics.poison();
@@ -283,6 +302,43 @@ impl MeshConnectorResourceScope {
     #[cfg(test)]
     pub(crate) fn fail_cleanup_executor_for_test(&self) {
         self.token.owner.cleanup_executor.fail_for_test();
+    }
+
+    /// Reserve post-authentication session capacity from this Mesh's grant.
+    ///
+    /// `Admitted` authority, not `Speculative`: a promoted session is not
+    /// candidate work and must not be reclaimed as though it were. This is the
+    /// explicit resource transition promotion performs — a successful
+    /// pre-authentication lease is not reusable as proof that this capacity
+    /// exists, so the claim is acquired fresh here or the promotion refuses.
+    ///
+    /// The lease is returned bare rather than wrapped in a candidate
+    /// reservation: a session has no candidate lifecycle, no cleanup job, and no
+    /// reclaim subscription. Dropping it releases exactly this reservation.
+    pub(crate) fn reserve_session(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.token.owner.provider.acquire(
+            &self.token.scope,
+            ResourceAuthorityClass::Admitted,
+            claim,
+        )
+    }
+
+    /// Reserve retention owned by the local Application Gateway from this
+    /// Mesh runtime's admitted resource scope. It is deliberately a sibling of
+    /// session reservation: local application truth is not attributed to any
+    /// remote session, while both draw on the process owner's finite grant.
+    pub(crate) fn reserve_application(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.token.owner.provider.acquire(
+            &self.token.scope,
+            ResourceAuthorityClass::Admitted,
+            claim,
+        )
     }
 
     pub(super) fn reserve(
@@ -297,7 +353,7 @@ impl MeshConnectorResourceScope {
         let work_scope = ConnectorWorkResourceScope {
             provider: self.token.owner.provider.clone(),
             scope: connector_scope,
-            reclaim_target: None,
+            cleanup_submission: self.cleanup_submission_port(),
         };
         self.token.owner.diagnostics.note_acquired();
         self.token.diagnostics.note_acquired();
@@ -313,58 +369,6 @@ impl MeshConnectorResourceScope {
         })
     }
 
-    /// Wait for one fair process turn, then atomically install the child scope
-    /// and its first reclaimable speculative lease.
-    ///
-    /// No time limit applies. The pending demand is move-only and cancellation
-    /// drops its fairness turn without installing an empty child scope.
-    pub(super) async fn reserve_cooperatively(
-        &self,
-        claim: ResourceClaim,
-    ) -> Result<(ConnectorCandidateReservation, ResourceReclaimSubscription), ResourceUnavailable>
-    {
-        let (reclaim_target, reclaim_subscription) = ResourceReclaimSubscription::channel();
-        let work_reclaim_target = reclaim_target.clone();
-        let mut admission = self
-            .token
-            .owner
-            .provider
-            .create_scope_with_reclaimable_lease_cooperatively(
-                &self.token.scope,
-                claim,
-                reclaim_target,
-            )?;
-        let lease = loop {
-            match admission {
-                ResourceAdmission::Acquired(lease) => break lease,
-                ResourceAdmission::Pending(demand) => {
-                    demand.ready().await?;
-                    admission = demand.retry()?;
-                }
-            }
-        };
-        let work_scope = ConnectorWorkResourceScope {
-            provider: self.token.owner.provider.clone(),
-            scope: lease.scope(),
-            reclaim_target: Some(work_reclaim_target),
-        };
-        self.token.owner.diagnostics.note_acquired();
-        self.token.diagnostics.note_acquired();
-        Ok((
-            ConnectorCandidateReservation {
-                state: Arc::new(ConnectorCandidateReservationState {
-                    lease: Mutex::new(Some(lease)),
-                    work_scope,
-                    process_diagnostics: Arc::clone(&self.token.owner.diagnostics),
-                    mesh_diagnostics: Arc::clone(&self.token.diagnostics),
-                    cleanup_capability_issued: AtomicBool::new(false),
-                    cleanup_lifecycle: Mutex::new(Default::default()),
-                }),
-            },
-            reclaim_subscription,
-        ))
-    }
-
     #[cfg(test)]
     pub(super) fn same_provider(&self, other: &Self) -> bool {
         self.token
@@ -374,9 +378,84 @@ impl MeshConnectorResourceScope {
     }
 }
 
+/// A durable handle on the process cleanup executor, for owners that must submit
+/// from a destructor.
+///
+/// **Synchronous and runtime-independent by construction.** Submission is a send
+/// on the executor's unbounded channel; the executor's own thread and runtime do
+/// the awaiting. A holder can therefore submit from `Drop`, during an unwind, or
+/// from a thread that has never seen a Tokio runtime, and the answer is the same
+/// in all three.
+///
+/// Cloning it keeps the same executor and grants nothing. It is a *port*, not a
+/// capability: a job still has to bring its own exact lease.
+#[derive(Clone)]
+pub(crate) struct ConnectorCleanupSubmissionPort {
+    owner: Arc<ConnectorResourceOwnerInner>,
+}
+
+impl ConnectorCleanupSubmissionPort {
+    /// Queue one subordinate native retirement.
+    ///
+    /// `funding` is the queue slot's own exact lease, acquired by the caller
+    /// before the object it retires could need retiring — so the submission
+    /// itself can never be refused for want of capacity at the one moment the
+    /// caller has no way to react.
+    ///
+    /// A refused submission retains the job in its returned answer. Dropping
+    /// that answer drops the job and runs `on_failure`, so a caller cannot
+    /// discard a refusal without taking its failure path. That is the same shape
+    /// the connector's own close uses and it is deliberate: there is no way to
+    /// submit and hear nothing back.
+    pub(crate) fn submit_subordinate(
+        &self,
+        funding: ResourceLease,
+        cleanup: ConnectorCleanupFuture,
+        on_complete: ConnectorCleanupCompletion,
+        on_failure: ConnectorCleanupFailure,
+    ) -> ConnectorCleanupSubmission {
+        self.owner
+            .cleanup_executor
+            .submit(ConnectorCleanupJob::subordinate(
+                funding,
+                cleanup,
+                on_complete,
+                on_failure,
+            ))
+    }
+}
+
 pub(crate) type ConnectorCleanupFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type ConnectorCleanupCompletion = Box<dyn FnOnce() + Send + 'static>;
 pub(crate) type ConnectorCleanupFailure = Box<dyn FnOnce(String) + Send + 'static>;
+
+/// The synchronous answer to one cleanup submission.
+///
+/// A refusal retains the complete job by value so dropping the answer still
+/// runs the job's failure callback and releases its exact funding. This is a
+/// dedicated wrapper rather than `Result<(), ConnectorCleanupJob>` because the
+/// job is large enough to trip `clippy::result_large_err`, whose suggested
+/// remedy is to box the error. That box would be an allocation nothing has
+/// reserved; this wrapper keeps the job inline and preserves its existing
+/// allocation-free ownership and drop semantics.
+#[must_use]
+pub(crate) struct ConnectorCleanupSubmission {
+    refused: Option<ConnectorCleanupJob>,
+}
+
+impl ConnectorCleanupSubmission {
+    fn accepted() -> Self {
+        Self { refused: None }
+    }
+
+    fn refused(job: ConnectorCleanupJob) -> Self {
+        Self { refused: Some(job) }
+    }
+
+    pub(crate) fn was_refused(&self) -> bool {
+        self.refused.is_some()
+    }
+}
 
 /// Exact connector-owned claim reserved before one cleanup job can exist.
 /// Inline bytes cover the queued record and its two linked queue pointers.
@@ -408,11 +487,56 @@ pub(crate) fn cleanup_job_claim(
     ])
 }
 
+/// What funds one queued cleanup job for as long as it is queued or running.
+///
+/// Two shapes, because there are two kinds of cleanup and collapsing them would
+/// break one of them. A **connector** close consumes its reservation's one-shot
+/// proof, which is what makes "this connector has entered cleanup" a fact the
+/// provider knows rather than a claim the connector makes. A **subordinate**
+/// job — one native object belonging to a connector that is otherwise perfectly
+/// alive — has no such reservation and must not consume the connector's, so it
+/// brings an ordinary exact lease acquired before the job could be needed.
+///
+/// Held and never read. Its whole purpose is to be dropped exactly when the job
+/// leaves the queue, which is what makes the queue slot funded rather than free.
+///
+/// The payloads are named and underscore-prefixed for that reason, rather than
+/// carried positionally: a held-not-read value is exactly what the leading
+/// underscore states, and it is the same convention [`ConnectorCleanupJob`]'s
+/// own `_funding` field uses one declaration below. Naming them also stops a
+/// later reader from mistaking an unread payload for an unused one and
+/// discarding it — dropping either of these early would release the funding
+/// while the job it pays for is still queued.
+enum ConnectorCleanupFunding {
+    Connector {
+        _capability: ConnectorCleanupCapability,
+    },
+    Subordinate {
+        _lease: ResourceLease,
+    },
+}
+
+/// One queued cleanup job: the work, its two callbacks, and the funding that
+/// pays for all of it.
+///
+/// **`_funding` is declared last, and that is the whole of the ordering.**
+/// [`cleanup_job_claim`] prices this job's inline bytes *and* four residuals
+/// standing for the boxed close future, the boxed completion callback, the
+/// boxed failure callback and the channel node — so the funding covers three
+/// heap allocations that live in the three `Option` fields above it. Fields are
+/// destroyed in declaration order, so funding declared first would be handed
+/// back while all three of those allocations were still there. Declared last,
+/// it is released only once every allocation it names is gone.
+///
+/// This type has its own [`Drop`], and that does not change the rule: an
+/// explicit `drop` body runs *before* any field is destroyed, so the failure
+/// callback below still fires with the funding fully intact, and the three
+/// boxes are freed after it and before the funding goes back.
 pub(crate) struct ConnectorCleanupJob {
-    _capability: ConnectorCleanupCapability,
     future: Option<ConnectorCleanupFuture>,
     on_complete: Option<ConnectorCleanupCompletion>,
     on_failure: Option<ConnectorCleanupFailure>,
+    _funding: ConnectorCleanupFunding,
 }
 
 impl ConnectorCleanupJob {
@@ -423,10 +547,27 @@ impl ConnectorCleanupJob {
         on_failure: ConnectorCleanupFailure,
     ) -> Self {
         Self {
-            _capability: capability,
             future: Some(future),
             on_complete: Some(on_complete),
             on_failure: Some(on_failure),
+            _funding: ConnectorCleanupFunding::Connector {
+                _capability: capability,
+            },
+        }
+    }
+
+    /// One subordinate native object's retirement, funded by its own lease.
+    fn subordinate(
+        funding: ResourceLease,
+        future: ConnectorCleanupFuture,
+        on_complete: ConnectorCleanupCompletion,
+        on_failure: ConnectorCleanupFailure,
+    ) -> Self {
+        Self {
+            future: Some(future),
+            on_complete: Some(on_complete),
+            on_failure: Some(on_failure),
+            _funding: ConnectorCleanupFunding::Subordinate { _lease: funding },
         }
     }
 
@@ -623,27 +764,24 @@ impl ConnectorCleanupExecutor {
         Ok(())
     }
 
-    fn submit(
-        &self,
-        mut cleanup: ConnectorCleanupJob,
-    ) -> std::result::Result<(), ConnectorCleanupJob> {
+    fn submit(&self, mut cleanup: ConnectorCleanupJob) -> ConnectorCleanupSubmission {
         if self.health.executor_failed.load(Ordering::Acquire) {
             self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
             cleanup.fail("cleanup executor is unavailable".to_string());
-            return Err(cleanup);
+            return ConnectorCleanupSubmission::refused(cleanup);
         }
         let state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
                 self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
                 cleanup.fail("cleanup executor state is poisoned".to_string());
-                return Err(cleanup);
+                return ConnectorCleanupSubmission::refused(cleanup);
             }
         };
         let Some(sender) = state.sender.as_ref() else {
             self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
             cleanup.fail("cleanup executor has no submission port".to_string());
-            return Err(cleanup);
+            return ConnectorCleanupSubmission::refused(cleanup);
         };
         self.health.queued_jobs.fetch_add(1, Ordering::AcqRel);
         if let Err(error) = sender.send(cleanup) {
@@ -651,9 +789,9 @@ impl ConnectorCleanupExecutor {
             self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
             let mut cleanup = error.0;
             cleanup.fail("cleanup executor queue is closed".to_string());
-            return Err(cleanup);
+            return ConnectorCleanupSubmission::refused(cleanup);
         }
-        Ok(())
+        ConnectorCleanupSubmission::accepted()
     }
 
     fn report(&self) -> ConnectorCleanupHealth {
@@ -724,15 +862,11 @@ pub(super) fn retain_failed_reservation(
 ) {
     let expected = lease.claim();
     match lease.retain_after_failed_cleanup() {
-        ReclaimResult::Retained(retained) if retained == expected => {
+        Ok(retained) if retained == expected => {
             process_diagnostics.note_failed_cleanup();
             mesh_diagnostics.note_failed_cleanup();
         }
-        ReclaimResult::NotNeeded
-        | ReclaimResult::Reclaimed(_)
-        | ReclaimResult::Retained(_)
-        | ReclaimResult::Deferred(_)
-        | ReclaimResult::ProviderInvariant { .. } => {
+        Ok(_) | Err(_) => {
             process_diagnostics.poison();
             mesh_diagnostics.poison();
         }

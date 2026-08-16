@@ -183,8 +183,12 @@ async fn two_peers_handshake_over_mdns_only() {
     let mut alice_traces = alice_state.subscribe_conn_trace();
     let mut bob_traces = bob_state.subscribe_conn_trace();
 
-    let alice_drivers = attach_signaling(&alice_state).expect("alice signaling");
-    let bob_drivers = attach_signaling(&bob_state).expect("bob signaling");
+    let alice_drivers = attach_signaling(&alice_state)
+        .expect("alice signaling resources")
+        .expect("alice signaling");
+    let bob_drivers = attach_signaling(&bob_state)
+        .expect("bob signaling resources")
+        .expect("bob signaling");
     assert_eq!(alice_drivers.describe(), "mdns");
     assert_eq!(bob_drivers.describe(), "mdns");
 
@@ -260,8 +264,12 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     let mut alice_traces = alice_state.subscribe_conn_trace();
     let mut bob_traces = bob_state.subscribe_conn_trace();
 
-    let alice_drivers = attach_signaling(&alice_state).expect("alice signaling");
-    let bob_drivers = attach_signaling(&bob_state).expect("bob signaling");
+    let alice_drivers = attach_signaling(&alice_state)
+        .expect("alice signaling resources")
+        .expect("alice signaling");
+    let bob_drivers = attach_signaling(&bob_state)
+        .expect("bob signaling resources")
+        .expect("bob signaling");
     // mDNS may or may not come up depending on the environment; the
     // Nostr side must. Either way the handshake has to complete —
     // and when both are up, completing proves the cross-driver dedup

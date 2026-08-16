@@ -4,7 +4,6 @@
 //! losing work, and transfers an exact child claim when a candidate connects.
 
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -156,11 +155,6 @@ pub(crate) fn explicit_test_grant(candidate_count: u64, mesh_scope_count: u64) -
     // connector operation per fixture candidate. Tests that need a different
     // concurrency shape construct their own finite provider grant.
     let operation = scale_test_claim(connector_operation_claim(), candidate_count);
-    let compatibility_realtime = scale_test_claim(
-        crate::connector::realtime_flow_capability_claim()
-            .expect("the compatibility real-time capability claim is representable"),
-        candidate_count,
-    );
     let infrastructure = resource_owner::cleanup_executor_infrastructure_claim()
         .expect("the cleanup infrastructure claim is representable");
     let bookkeeping = 1_u64
@@ -173,7 +167,6 @@ pub(crate) fn explicit_test_grant(candidate_count: u64, mesh_scope_count: u64) -
         .expect("the bounded fixture bookkeeping is representable");
     candidate
         .checked_add(operation)
-        .and_then(|claim| claim.checked_add(compatibility_realtime))
         .and_then(|claim| claim.checked_add(infrastructure))
         .and_then(|claim| {
             claim.checked_add(ResourceClaim::single(
@@ -257,10 +250,7 @@ mod tests {
     use crate::resource::{
         FiniteResourceProvider, ResourceAuthorityClass, ResourceProviderPort, ResourceUnavailable,
     };
-    use crate::transport::webrtc::{
-        LegacyWebRtcMediaProfile, PendingRemoteCandidatePolicy, WebRtcConnectorProfile,
-        WebRtcConnectorProfileError,
-    };
+    use crate::transport::webrtc::WebRtcConnectorProfile;
 
     fn owner_and_scopes(
         provider: &FiniteResourceProvider,
@@ -280,72 +270,7 @@ mod tests {
     }
 
     fn data_only_webrtc_profile() -> WebRtcConnectorProfile {
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::data_only(one, one),
-            RealtimeConnectorPolicy::Disabled,
-        )
-        .expect("the test callback policy is structurally valid");
-        WebRtcConnectorProfile::new(
-            callbacks,
-            PendingRemoteCandidatePolicy::new(one, one, one, one),
-        )
-    }
-
-    fn explicit_realtime_test_policy(max_outbound_flows: usize) -> WebRtcConnectorProfile {
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let two = NonZeroUsize::new(2).expect("two is nonzero");
-        let flows = ConnectorRealtimeFlowPolicy::new(
-            ConnectorRealtimeFlowCapacities::new(
-                one,
-                NonZeroUsize::new(max_outbound_flows)
-                    .expect("the fixture outbound flow count is nonzero"),
-                one,
-            ),
-            ConnectorRealtimeInboundLimits::new(one, one, one, one, one),
-            ConnectorRealtimeByteBudgets::new(two, one),
-            RealtimeQueueOverflowRule::DropNewest,
-        );
-        let realtime = RealtimeConnectorPolicy::enabled_with_local_ceiling(one, flows)
-            .expect("the fixture real-time policy is structurally valid");
-        let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::new(one, one, one),
-            realtime,
-        )
-        .expect("the fixture callback policy is valid");
-        WebRtcConnectorProfile::new(
-            callbacks,
-            PendingRemoteCandidatePolicy::new(one, one, one, one),
-        )
-    }
-
-    #[test]
-    fn v4_arc03_generic_realtime_policy_does_not_request_media_tracks() {
-        assert_eq!(
-            explicit_realtime_test_policy(1).legacy_media_internal(),
-            None
-        );
-    }
-
-    #[test]
-    fn v4_arc03_legacy_video_and_audio_require_two_preprovisioned_flows() {
-        let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let profile = LegacyWebRtcMediaProfile::h264_opus(one, 1, 1)
-            .expect("one lane per compatibility kind is representable");
-        assert_eq!(
-            explicit_realtime_test_policy(1).with_legacy_webrtc_media(profile),
-            Err(
-                WebRtcConnectorProfileError::LegacyMediaExceedsOutboundFlowCeiling {
-                    required_flows: 2,
-                    available_flows: 1,
-                }
-            )
-        );
-        assert!(explicit_realtime_test_policy(2)
-            .with_legacy_webrtc_media(profile)
-            .is_ok());
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only())
     }
 
     #[test]
@@ -403,37 +328,6 @@ mod tests {
         assert!(second_attempt
             .reserve_connector_candidate(candidate_claim())
             .is_some());
-    }
-
-    #[tokio::test]
-    async fn v4_arc03_elastic_connector_root_yields_to_another_mesh_fairness_turn() {
-        let provider = FiniteResourceProvider::new(explicit_test_grant(1, 2));
-        let (_owner, scopes) = owner_and_scopes(&provider, 2);
-        let (first_attempt, _first_lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
-        let (second_attempt, _second_lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[1].clone());
-        let (first, reclaim) = first_attempt
-            .reserve_connector_candidate_cooperatively(candidate_claim())
-            .await
-            .expect("the provider remains internally exact")
-            .expect("the first attempt remains live");
-
-        let second = tokio::spawn(async move {
-            second_attempt
-                .reserve_connector_candidate_cooperatively(candidate_claim())
-                .await
-        });
-        reclaim.requested().await;
-        assert!(reclaim.is_requested());
-        drop(first);
-
-        let (second, _reclaim) = second
-            .await
-            .expect("the second admission task joins")
-            .expect("the provider remains internally exact")
-            .expect("the second attempt remains live after its fairness turn");
-        drop(second);
     }
 
     #[test]
@@ -652,14 +546,17 @@ mod tests {
         drop(candidate);
         assert_eq!(owner.report().active_candidates, 1);
 
-        scopes[0]
-            .submit_cleanup(
-                cleanup,
-                Box::pin(async {}),
-                Box::new(|| {}),
-                Box::new(|_| {}),
-            )
-            .unwrap_or_else(|_| panic!("the exact Mesh owner accepts its cleanup capability"));
+        assert!(
+            !scopes[0]
+                .submit_cleanup(
+                    cleanup,
+                    Box::pin(async {}),
+                    Box::new(|| {}),
+                    Box::new(|_| {}),
+                )
+                .was_refused(),
+            "the exact Mesh owner accepts its cleanup capability"
+        );
         for _ in 0..10_000 {
             if owner.report().cleanup.completed_jobs == 1 {
                 break;
@@ -691,14 +588,17 @@ mod tests {
                 .expect("cleanup begins under the pre-reserved claim");
             drop(candidate);
             let job_gate = Arc::clone(&gate);
-            scopes[0]
-                .submit_cleanup(
-                    cleanup,
-                    Box::pin(async move { job_gate.notified().await }),
-                    Box::new(|| {}),
-                    Box::new(|_| {}),
-                )
-                .unwrap_or_else(|_| panic!("the exact Mesh owner accepts its cleanup claim"));
+            assert!(
+                !scopes[0]
+                    .submit_cleanup(
+                        cleanup,
+                        Box::pin(async move { job_gate.notified().await }),
+                        Box::new(|| {}),
+                        Box::new(|_| {}),
+                    )
+                    .was_refused(),
+                "the exact Mesh owner accepts its cleanup claim"
+            );
         }
 
         for _ in 0..10_000 {

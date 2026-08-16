@@ -51,73 +51,43 @@ when node participation is disabled. A participating node requires every
 provider resource dimension below before startup:
 
 ```text
-MYOWNMESH_RESOURCE_ACCOUNTED_MEMORY_BYTES
-MYOWNMESH_RESOURCE_QUEUED_BYTES
-MYOWNMESH_RESOURCE_SOCKET_OR_HANDLE
-MYOWNMESH_RESOURCE_NATIVE_TRANSPORT_OBJECT
-MYOWNMESH_RESOURCE_WORKER_OR_TASK
-MYOWNMESH_RESOURCE_CALLBACK_OR_SCHEDULED_WORK
-MYOWNMESH_RESOURCE_STORAGE_BYTES
-MYOWNMESH_RESOURCE_STORAGE_OBJECT
-MYOWNMESH_RESOURCE_RELAY_OR_PROVIDER_ALLOCATION
-MYOWNMESH_RESOURCE_PARSING_OR_CPU_WORK
-MYOWNMESH_RESOURCE_OPAQUE_DEPENDENCY_RESIDUAL
-MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY
+MYOWNMESH_RESOURCE_GRANT
 MYOWNMESH_CONNECTOR_REALTIME_POLICY
 ```
 
-Every dimension is required so the process grant is explicit, including a
-deliberate zero. The current WebRTC connector does not yet charge
-`SocketOrHandle` when native ICE sockets or handles are created, and it does
-not charge `RelayOrProviderAllocation` for a native TURN allocation. Supplying
-either value does not enforce that native resource today. Those allocations
-remain dependency or provider residuals until the adapter exposes an exact
-claim. See the
-[Arc 03 resource ownership report](v4-transition/ARC-03-RESOURCE-OWNERSHIP-REPORT.md#4-current-resource-ownership-and-residual-matrix).
-
-Set `MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=none` for ordinary elastic
-construction. In that mode no Mesh, peer, connector, flow, or queue-item count
-is required. Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only
-connector, or `enabled` for codec-neutral real-time resource ownership.
-
-An administrator may select
-`MYOWNMESH_CONNECTOR_LOCAL_CEILING_POLICY=enabled` for an appliance, carrier,
-test fixture, or other deliberately restricted deployment. That optional
-wrapper requires:
+`MYOWNMESH_RESOURCE_GRANT` is the whole process grant, written as a
+comma-separated list of `dimension=value`:
 
 ```text
-MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS
-MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_CONTENT_BYTES
-MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_DUPLICATES
-MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_APPLICATION_WORK
-MYOWNMESH_CONNECTOR_CONTROL_CAPACITY
-MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY
-MYOWNMESH_CONNECTOR_CONTROL_WEIGHT
-MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT
+MYOWNMESH_RESOURCE_GRANT="accounted_memory_bytes=0,queued_bytes=0,\
+socket_or_handle=0,native_transport_object=0,worker_or_task=0,\
+callback_or_scheduled_work=0,storage_bytes=0,storage_object=0,\
+relay_or_provider_allocation=0,parsing_or_cpu_work=0,\
+opaque_dependency_residual=0"
 ```
 
-Within that optional wrapper, the `enabled` real-time form additionally
-requires:
+All eleven dimensions are required so the process grant is explicit, including
+a deliberate zero. A grant that omits one, names one twice, names one that does
+not exist, or carries a value this daemon cannot represent is refused at
+startup with a message naming the dimension at fault.
 
-```text
-MYOWNMESH_CONNECTOR_REALTIME_WEIGHT
-MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES
-MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS
-MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS
-MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW
-MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES
-MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT
-MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW
-MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_PACKETS
-MYOWNMESH_CONNECTOR_REALTIME_MAX_PRE_AUTH_CONTENT_BYTES
-MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES
-MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES
-```
+The current WebRTC connector does not yet charge `socket_or_handle` when native
+ICE sockets or handles are created, and it does not charge
+`relay_or_provider_allocation` for a native TURN allocation. Supplying either
+value does not enforce that native resource today. Those allocations remain
+dependency or provider residuals until the adapter exposes an exact claim.
 
-Candidate content bytes in the optional wrapper cover the candidate fields
-submitted during one ICE attempt. They are not an exact retained-memory limit.
-The duplicate and application-work ceilings are cumulative for that attempt
-and renew only on a new attempt or an explicit ICE restart.
+Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only connector, or
+`enabled` for codec-neutral real-time resource ownership. There is no second
+connector shape and no local ceiling: what bounds the daemon is the process
+grant above, so no Mesh, peer, connector, flow, or queue-item count is
+configured beside it.
+
+`enabled` additionally requires `MYOWNMESH_REALTIME_PROFILE`, the
+application-supplied codec profile. It is governed separately from the process
+grant — see the realtime section below — and supplying it to a data-only daemon
+is a startup error rather than a harmless extra, because nothing would register
+it.
 
 MyOwnMesh supplies no numeric fallback. Missing or invalid provider values stop
 the connector-capable daemon before it joins a mesh. A provider dimension may

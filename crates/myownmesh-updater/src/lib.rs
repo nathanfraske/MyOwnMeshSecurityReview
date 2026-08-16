@@ -102,6 +102,80 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+const UPDATER_OPERATION_CLAIM: myownmesh_core::ResourceClaim =
+    myownmesh_core::ResourceClaim::single(
+        myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        1,
+    );
+
+/// Admission plan for one updater operation.
+///
+/// The updater has no pre-existing coherent lock or funded source root: status
+/// is assembled from config and filesystem probes, while checks cross a remote
+/// await and may stage files. This deliberately broader residual is therefore
+/// acquired before entering the operation and structurally retained with its
+/// owned success or error. It makes no exact claim about the dependency graph.
+#[must_use = "an updater operation plan must be funded and run or dropped"]
+pub struct PreparedUpdaterOperation;
+
+pub fn prepare_operation() -> PreparedUpdaterOperation {
+    PreparedUpdaterOperation
+}
+
+impl PreparedUpdaterOperation {
+    pub const fn claim(&self) -> myownmesh_core::ResourceClaim {
+        UPDATER_OPERATION_CLAIM
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "returning the exact lease on mismatch is allocation-free; boxing allocates on refusal"
+    )]
+    pub fn run<T>(
+        self,
+        lease: myownmesh_core::ResourceLease,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> std::result::Result<FundedUpdaterResult<T>, myownmesh_core::ResourceLease> {
+        if lease.claim() != UPDATER_OPERATION_CLAIM {
+            return Err(lease);
+        }
+        Ok(FundedUpdaterResult {
+            result: operation(),
+            _operation: lease,
+        })
+    }
+
+    pub async fn run_async<T, F>(
+        self,
+        lease: myownmesh_core::ResourceLease,
+        operation: F,
+    ) -> std::result::Result<FundedUpdaterResult<T>, myownmesh_core::ResourceLease>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        if lease.claim() != UPDATER_OPERATION_CLAIM {
+            return Err(lease);
+        }
+        Ok(FundedUpdaterResult {
+            result: operation.await,
+            _operation: lease,
+        })
+    }
+}
+
+/// One updater success or error coupled to the broader operation residual.
+/// Borrowed inspection only; neither branch can escape its owner unfunded.
+pub struct FundedUpdaterResult<T> {
+    result: Result<T>,
+    _operation: myownmesh_core::ResourceLease,
+}
+
+impl<T> FundedUpdaterResult<T> {
+    pub fn get(&self) -> std::result::Result<&T, &Error> {
+        self.result.as_ref()
+    }
+}
+
 impl Error {
     fn msg(s: impl Into<String>) -> Self {
         Error::Other(s.into())

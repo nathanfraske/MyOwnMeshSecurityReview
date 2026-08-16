@@ -3,16 +3,43 @@
 //! The provider submodule grants finite resource leases. The existing
 //! accountant below remains observation-only and cannot authorize work.
 //! Keeping those roles distinct prevents measurements from becoming permits.
+//!
+//! The queue and map submodules are containers built on those leases rather
+//! than a second kind of permit: they store what an owner already paid for, one
+//! funded allocation per entry, and they grant nothing of their own. Both exist
+//! because the standard collections cannot state an entry's cost — a ring's
+//! spare capacity belongs to no entry, and a B-tree's node belongs to several —
+//! so an owner using one can charge per entry or release per entry, but not
+//! both truthfully.
 
+mod mailbox;
+mod map;
 pub mod provider;
+pub(crate) mod queue;
+
+pub(crate) use mailbox::strings_measure;
+/// The borrowed-measurement kit: measure a source, combine the parts, claim,
+/// acquire, and only then build the owned value. Public because an owner
+/// outside this crate has the same obligation to fund a snapshot before it
+/// allocates one, and reimplementing these would be a second source of truth
+/// for the same arithmetic.
+pub use mailbox::{checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim};
+pub use mailbox::{
+    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
+    serialized_mailbox_item_claim_as, PreparedResourceMailbox, ResourceMailboxAdmissionError,
+    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
+    ResourceMailboxItemBuilder, ResourceMailboxItemError, ResourceMailboxPlanningError,
+    ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender,
+};
+pub use map::{LeasedMap, LeasedMapInsertRefusal};
+pub(crate) use queue::LeasedQueue;
 
 pub use provider::{
-    FiniteResourceProvider, ReclaimResult, ResourceAcquireDemand, ResourceAdmission,
-    ResourceAuthorityClass, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
-    ResourceLease, ResourcePressure, ResourceProvider, ResourceProviderAuthority,
-    ResourceProviderConflict, ResourceProviderPort, ResourceReclaimSubscription,
-    ResourceReclaimTarget, ResourceReservationState, ResourceScope, ResourceScopeId,
-    ResourceUnavailable, RESOURCE_CLASS_COUNT,
+    FiniteResourceProvider, FundedArc, FundedWeak, ResourceAuthorityClass, ResourceClaim,
+    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourcePressure, ResourceProvider,
+    ResourceProviderAuthority, ResourceProviderConflict, ResourceProviderPort,
+    ResourceReservationState, ResourceScope, ResourceScopeId, ResourceUnavailable,
+    RESOURCE_CLASS_COUNT,
 };
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -301,6 +328,7 @@ pub fn process_resource_report() -> ResourceReport {
 #[derive(Clone)]
 pub struct ProcessResourceRoot {
     accountant: ResourceAccountant,
+    provider: Arc<OnceLock<ResourceProviderPort>>,
     connector_owner: Arc<OnceLock<crate::runtime::attempt::ConnectorResourceOwnerPort>>,
 }
 
@@ -311,7 +339,7 @@ impl std::fmt::Debug for ProcessResourceRoot {
             .field("accountant", &self.accountant)
             .field(
                 "resource_provider_installed",
-                &self.connector_owner.get().is_some(),
+                &self.provider.get().is_some(),
             )
             .finish()
     }
@@ -323,6 +351,7 @@ impl ProcessResourceRoot {
         PROCESS_RESOURCE_ROOT
             .get_or_init(|| Self {
                 accountant: ResourceAccountant::observation_only(),
+                provider: Arc::new(OnceLock::new()),
                 connector_owner: Arc::new(OnceLock::new()),
             })
             .clone()
@@ -340,14 +369,46 @@ impl ProcessResourceRoot {
         crate::runtime::attempt::ConnectorResourceOwnerPort,
         ResourceProviderConflict,
     > {
+        let installed_provider = self.install_local_application_provider(provider)?;
         let installed = self.connector_owner.get_or_init(|| {
-            crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider.clone())
+            crate::runtime::attempt::ConnectorResourceOwnerPort::new(installed_provider.clone())
         });
+        if installed.same_provider(&installed_provider) {
+            Ok(installed.clone())
+        } else {
+            Err(ResourceProviderConflict)
+        }
+    }
+
+    /// Install or reuse the one owner-selected provider without installing
+    /// connector authority. Infrastructure-only runtimes use this boundary.
+    pub fn install_local_application_provider(
+        &self,
+        provider: ResourceProviderPort,
+    ) -> Result<ResourceProviderPort, ResourceProviderConflict> {
+        let installed = self.provider.get_or_init(|| provider.clone());
         if installed.same_provider(&provider) {
             Ok(installed.clone())
         } else {
             Err(ResourceProviderConflict)
         }
+    }
+
+    /// Issue one local-application scope from the exact process provider.
+    /// This does not install connector authority and is available to an
+    /// infrastructure-only runtime whose owner supplied the provider directly.
+    pub fn issue_local_application_scope(
+        &self,
+    ) -> Result<LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError> {
+        let provider = self
+            .provider
+            .get()
+            .ok_or(LocalApplicationResourceScopeIssueError::ResourceProviderMissing)?
+            .clone();
+        let scope = provider
+            .create_scope(&provider.process_scope())
+            .map_err(LocalApplicationResourceScopeIssueError::ResourcesUnavailable)?;
+        Ok(LocalApplicationResourceScope { provider, scope })
     }
 
     /// Return the installed process connector owner, if the process owner has
@@ -390,8 +451,73 @@ impl ProcessResourceRoot {
     pub(crate) fn isolated() -> Self {
         Self {
             accountant: ResourceAccountant::observation_only(),
+            provider: Arc::new(OnceLock::new()),
             connector_owner: Arc::new(OnceLock::new()),
         }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LocalApplicationResourceScopeIssueError {
+    #[error("the process resource provider is not installed")]
+    ResourceProviderMissing,
+    #[error("the process resource provider refused the local application scope: {0:?}")]
+    ResourcesUnavailable(ResourceUnavailable),
+}
+
+/// Acquisition port for daemon and local-application state that is not owned
+/// by any connector or remote session.
+#[derive(Clone)]
+pub struct LocalApplicationResourceScope {
+    provider: ResourceProviderPort,
+    scope: ResourceScope,
+}
+
+impl LocalApplicationResourceScope {
+    pub fn child(&self) -> Result<Self, ResourceUnavailable> {
+        let scope = self.provider.create_scope(&self.scope)?;
+        Ok(Self {
+            provider: self.provider.clone(),
+            scope,
+        })
+    }
+
+    /// One application scope under an explicitly supplied port, for another
+    /// crate's controls.
+    ///
+    /// **A private owner, not a wider door.** A daemon control that wants to
+    /// watch a charge appear and go away needs a provider whose whole grant it
+    /// chose, and it cannot get one through the ordinary issuer: that reads the
+    /// installed process provider, so a control sized against it would either be
+    /// measuring a pool other tests share or be quietly starving
+    /// `ProcessResourceRoot`. Handing the port in makes the owner exactly as
+    /// private as the control's own `FiniteResourceProvider`.
+    ///
+    /// This is deliberately a *factory over the same two calls the production
+    /// issuer makes* — `create_scope` under the port's process scope — and not
+    /// raw construction from a port and a scope. Raw construction would let a
+    /// caller pair a port with a scope it does not own, which is a shape no
+    /// production path can produce, and controls built on it would be proving
+    /// something about an arrangement that cannot occur.
+    ///
+    /// Feature-gated and hidden because it exists for cross-crate controls. It
+    /// widens no authority: everything reachable through the returned scope is
+    /// bounded by the grant the caller already had.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn transport_lab_child_of(
+        provider: &ResourceProviderPort,
+    ) -> Result<Self, ResourceUnavailable> {
+        let scope = provider.create_scope(&provider.process_scope())?;
+        Ok(Self {
+            provider: provider.clone(),
+            scope,
+        })
+    }
+
+    pub fn acquire(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
+        self.provider
+            .acquire(&self.scope, ResourceAuthorityClass::Admitted, claim)
     }
 }
 
