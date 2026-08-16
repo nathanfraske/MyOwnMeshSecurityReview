@@ -69,9 +69,21 @@ pub enum NostrInbound {
         device_id: String,
         attribution: CarrierAttribution,
     },
-    /// A peer's signaling connection dropped — an intelligent relay told
-    /// us the instant the peer's socket closed, so the engine can tear
-    /// the peer down promptly instead of waiting for a heartbeat timeout.
+    /// A peer's signaling connection dropped, as far as the room can tell.
+    ///
+    /// **`SenderClaimed`, and that is the whole of what it is worth.** Whether
+    /// the report came from an intelligent relay noticing a socket close or from
+    /// a peer publishing its own `leave`, the device id reaching the engine is
+    /// the one in the payload, and neither the relay nor the event author is
+    /// authenticated to that device. So this is reachability evidence: it may
+    /// update availability, cancel speculative work, and prompt a look at the
+    /// connector, and it retires no session in any state.
+    ///
+    /// **Teardown is the connector's and the heartbeat's.** An earlier version
+    /// of this doc said the engine could tear the peer down promptly on it,
+    /// which was true and is no longer: exact connector closure, the
+    /// authenticated `SessionControl::Depart` over the session itself, or the
+    /// heartbeat timeout retire a session, and nothing on this path does.
     PeerLeft {
         device_id: String,
         attribution: CarrierAttribution,

@@ -692,9 +692,18 @@ impl JoinedNetwork {
     /// receiver may use as reachability evidence — to update availability, to
     /// stop speculative work that never became a session, or to go look at a
     /// connector — and may not use to retire a healthy authenticated session.
-    /// [`Self::announce_leave`] is the deliberate exit, and it departs the
-    /// sessions over themselves before calling this.
-    pub fn request_departure(&self) {
+    /// On a network carrier the receiver reads it as sender-claimed, which
+    /// retires nothing in any session state.
+    ///
+    /// **Private, because there is nothing here for a caller to want.** It was
+    /// `pub` while the hint *was* the departure; now that
+    /// [`Self::announce_leave`] departs each session over itself first, a caller
+    /// reaching for this alone would be asking to publish an announcement with
+    /// no authority behind it and no session left in a different state for it to
+    /// describe. `announce_leave` is the deliberate exit and its only caller.
+    /// `TRANSITION-PLAYBOOK.md` §7.3 admits no dead public surface, and a repo
+    /// scan finds no other caller in or outside this crate.
+    fn request_departure(&self) {
         self.state.announce_departure();
     }
 

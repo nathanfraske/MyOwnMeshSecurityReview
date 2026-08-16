@@ -312,11 +312,10 @@ impl EphemeralIngress {
 
     /// Which attach of that carrier observed it.
     ///
-    /// `cfg(test)`, with [`Self::attribution`] below. Production reads both off
-    /// the field inside this module - the runtime is the only thing that acts on
-    /// either, and it owns the value. The controls read them through here to
-    /// assert what the engine would see if it ever asked, which is the one
-    /// question the field access cannot answer.
+    /// `cfg(test)`: production acts on the instance only inside this module,
+    /// where the runtime owns the value and reads it off the field. The controls
+    /// read it through here to assert what the engine would see if it ever
+    /// asked, which is the one question the field access cannot answer.
     #[cfg(test)]
     pub(crate) fn instance(&self) -> CarrierInstance {
         self.instance
@@ -327,9 +326,15 @@ impl EphemeralIngress {
         self.signal
     }
 
-    /// How the carrier came by the device id. `cfg(test)`; see
-    /// [`Self::instance`].
-    #[cfg(test)]
+    /// How the carrier came by the device id.
+    ///
+    /// **Production, and narrowly so.** One consumer outside this module: the
+    /// carrier-withdrawal arm in `engine/mod.rs`, where a `SenderClaimed`
+    /// withdrawal is teardown-inert in every session state and only a
+    /// `CarrierObserved` one may retire a session that is not live. That
+    /// decision cannot be made here — the runtime owns reachability, not the
+    /// Peer Session lifecycle — so the value has to survive the boundary rather
+    /// than being consumed at it. Nothing else reads it.
     pub(crate) fn attribution(&self) -> CarrierAttribution {
         self.attribution
     }
@@ -387,14 +392,23 @@ impl EphemeralIngress {
         )
     }
 
-    /// A carrier stopped seeing a device. See [`Self::for_control`].
-    pub(crate) fn withdrawal_for_control(carrier: SignalingCarrier, device_id: &str) -> Self {
+    /// A carrier stopped seeing a device, or a payload said it had.
+    ///
+    /// The attribution is a parameter and not a default, because it is the one
+    /// thing the engine's withdrawal arm reads: a control that could only build
+    /// the carrier-observed shape could not tell the two rules apart. See
+    /// [`Self::for_control`].
+    pub(crate) fn withdrawal_for_control(
+        carrier: SignalingCarrier,
+        device_id: &str,
+        attribution: CarrierAttribution,
+    ) -> Self {
         Self::for_control(
             carrier,
             EphemeralSignal::Withdrawal,
             ObservationBody::Withdrawal {
                 device_id: device_id.to_string(),
-                attribution: CarrierAttribution::CarrierObserved,
+                attribution,
             },
         )
     }

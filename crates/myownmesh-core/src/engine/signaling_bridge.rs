@@ -281,10 +281,19 @@ impl From<NostrInbound> for CarrierReport {
                 device_id,
                 attribution,
             },
-            // An intelligent relay told us the peer's signaling socket dropped —
-            // tear the peer down now rather than waiting for the heartbeat
-            // timeout. Still only a carrier observation: it ends a session, not
-            // a membership.
+            // A relay reported that the peer's signaling socket dropped, or the
+            // peer published its own `leave`. Both arrive here as
+            // `SenderClaimed`, because either way the device id is one a payload
+            // carried and neither the relay nor the event author is
+            // authenticated to that device.
+            //
+            // So this is reachability evidence and nothing more: it may update
+            // availability, cancel speculative work, and prompt a look at the
+            // connector, and it retires no session in any state. Teardown is
+            // exact connector closure, the authenticated
+            // `SessionControl::Depart` over the session itself, or the heartbeat.
+            // This comment used to say the engine tore the peer down promptly on
+            // it, which was true and is not — see `NostrInbound::PeerLeft`.
             NostrInbound::PeerLeft {
                 device_id,
                 attribution,

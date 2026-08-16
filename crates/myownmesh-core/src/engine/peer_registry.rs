@@ -80,6 +80,19 @@ impl PeerOwnerToken {
         &self.peer.device_id
     }
 
+    /// The exact installed connection this token names.
+    ///
+    /// For deciding *about* an installation and then acting on that same one.
+    /// Looking the device id up twice — once to read a predicate, once to take a
+    /// token — can straddle a replacement and act on B's behalf using A's state;
+    /// reading through the token cannot, because the token is what the action
+    /// resolves against. The carrier-withdrawal arm in `engine/mod.rs` is the
+    /// caller: it reads session liveness here and hands this same token to
+    /// [`super::drop_peer_if_current`].
+    pub(crate) fn connection(&self) -> &Arc<PeerConnection> {
+        &self.peer
+    }
+
     /// A token naming a peer that is installed nowhere.
     ///
     /// For the one control seam that needs a [`RealtimeFlowHandle`] outside this

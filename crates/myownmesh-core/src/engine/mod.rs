@@ -50,9 +50,9 @@ pub use signaling_bridge::{
 // `CarrierObservation`, a `pub` attach, or a `pub` admitted value would each
 // have handed it one. See the block on the `state` re-export below for the rest
 // of the narrowed surface.
-use signaling_ingress::EphemeralIngress;
 #[cfg(test)]
 use signaling_ingress::SignalingCarrier;
+use signaling_ingress::{CarrierAttribution, EphemeralIngress};
 
 /// Minimum gap between announces we publish in response to a peer's
 /// announce. The engine fires one reflected announce per inbound
@@ -563,6 +563,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
         delivered.inbound(),
         SignalingInbound::PeerAnnounced { .. }
     ));
+    // Read before the value is consumed: the withdrawal arm below is the one
+    // place in the engine where how the carrier came by the device id changes
+    // what happens, and `into_inbound` drops the provenance by design.
+    let attribution = delivered.attribution();
     match delivered.into_inbound() {
         SignalingInbound::PeerAnnounced { device_id } => {
             // A stood-down engine (this device is signed-evicted from the
@@ -1022,63 +1026,102 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
         // disconnect, and `ARCHITECTURE.md` §4 ranks a signaling observation
         // below fresh traffic on a live authenticated session.
         //
-        // So the hint keeps exactly the power that matches its trust: it can
-        // end speculative work that has not yet become a session, and it can
-        // say "look now" to the machinery that *is* allowed to decide. A peer
-        // holding an open, authenticated data channel is left alone — the
-        // authenticated `SessionControl::Depart` on that very session, or
-        // ordinary connector closure, or the heartbeat, retires it.
+        // So the hint keeps exactly the power that matches its trust, and that
+        // trust is not one thing — it is two, and the arm below reads both.
         //
-        // This is also what makes the body-claimed target harmless: naming a
-        // third Device in a `leave` now reaches a peer this side will not
-        // retire on that evidence.
+        // **A `SenderClaimed` withdrawal is teardown-inert in every session
+        // state.** It selects nothing. The device id came out of a payload the
+        // sender wrote and was never checked against any wire identity, so the
+        // sender chose the target; letting a chosen target retire *anything*
+        // makes the choice worth something. It remains availability and
+        // recovery evidence — the ingress runtime still folds it into what it
+        // knows about reachability — and that is the whole of its effect.
+        //
+        // **A `CarrierObserved` withdrawal may retire a session that is not
+        // live, and may not touch one that is.** Here the carrier established
+        // the id itself, so the sender did not pick the victim; the evidence is
+        // worth ending speculative work that has not yet become a session. It
+        // is still not worth a live one: a peer holding an open, authenticated
+        // data channel is left alone, and the authenticated
+        // `SessionControl::Depart` on that very session, ordinary connector
+        // closure, or the heartbeat retires it.
+        //
+        // **This is what makes a body-claimed target inert rather than merely
+        // narrowed.** The earlier shape guarded on liveness alone, so a
+        // sender-claimed `leave` naming a third Device still retired that
+        // Device's authenticated-but-channel-closed session — a session in
+        // recovery, which is exactly when it is least able to defend itself.
+        // Attribution, not liveness, is what closes that: the sender-claimed
+        // hint now selects no session in any state.
         SignalingInbound::PeerLeft { device_id } => {
-            let healthy_authenticated_session = state
-                .peers
-                .get(&device_id)
-                .map(|peer| {
-                    let data = peer.state.read();
+            // The owner token, not just the predicate: it names the exact
+            // installation the health check was made against, so a replacement
+            // installed between this read and the retirement below is not
+            // retired by a hint that was about the one it replaced.
+            let current = state.peers.owner(&device_id);
+            let healthy_authenticated_session = current
+                .as_ref()
+                .map(|owner| {
+                    let data = owner.connection().state.read();
                     data.authenticated && data.data_channel_open
                 })
                 .unwrap_or(false);
+            let retire = match attribution {
+                // Teardown-inert in every state, including the one above.
+                CarrierAttribution::SenderClaimed => false,
+                CarrierAttribution::CarrierObserved => !healthy_authenticated_session,
+            };
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
                 "signaling",
                 format!(
                     "peer left signaling: {} ({})",
                     short_peer(&device_id),
-                    if healthy_authenticated_session {
-                        "reachability hint only — its authenticated session is live"
-                    } else {
-                        "no live authenticated session to keep"
+                    match (attribution, healthy_authenticated_session) {
+                        (CarrierAttribution::SenderClaimed, _) =>
+                            "reachability hint only — the sender chose this target",
+                        (CarrierAttribution::CarrierObserved, true) =>
+                            "reachability hint only — its authenticated session is live",
+                        (CarrierAttribution::CarrierObserved, false) =>
+                            "no live authenticated session to keep",
                     }
                 ),
                 serde_json::json!({
                     "peer": device_id,
-                    "retired_session": !healthy_authenticated_session,
+                    "attribution": match attribution {
+                        CarrierAttribution::SenderClaimed => "sender_claimed",
+                        CarrierAttribution::CarrierObserved => "carrier_observed",
+                    },
+                    "retired_session": retire,
                 }),
             );
-            if healthy_authenticated_session {
+            let Some(owner) = current.filter(|_| retire) else {
                 return;
-            }
-            // Nothing live is holding this peer open, so the hint is ending
+            };
+            // Reaching here means the carrier established the id itself and
+            // nothing live is holding this peer open, so the hint is ending
             // speculative work rather than a session: exactly the "cancel
             // carrier-specific speculative work" a withdrawal may do.
             //
-            // **The guard window, stated exactly, because "healthy" is a
-            // conjunction and the second half is the narrow one.** The predicate
-            // above is `authenticated && data_channel_open`. A session that is
+            // **The guard window, stated exactly, and it now applies only to
+            // `CarrierObserved`.** The liveness predicate is a conjunction,
+            // `authenticated && data_channel_open`, so a session that is
             // authenticated but whose data channel is closed — mid-recovery, or
-            // mid-replacement of the transport underneath it — fails it, and
-            // reaches this line: a carrier hint can retire it. That is
-            // deliberate rather than an oversight. It is the same predicate
+            // mid-replacement of the transport underneath it — fails it and can
+            // be retired here. That is deliberate for a carrier's own
+            // observation: it is the same predicate
             // `depart_authenticated_sessions` uses to choose which sessions get
             // an authenticated goodbye, so both halves of the lifecycle agree on
             // what a live session is, and a session with no channel has no
-            // channel for a `SessionControl::Depart` to arrive on either. It is
-            // still a real window, and a session inside it is retired on
-            // evidence weaker than the session itself.
-            drop_peer(state, &device_id, DropReason::UserLeft).await;
+            // channel for a `SessionControl::Depart` to arrive on either. A
+            // sender-claimed hint never reaches this line at all, so nothing a
+            // sender writes can aim at that window.
+            //
+            // `drop_peer_if_current` rather than `drop_peer`: the token names
+            // the installation the predicate was read from, so a session that
+            // replaced it in the meantime — the reconnect this hint may well
+            // have raced — is not retired by evidence about its predecessor.
+            drop_peer_if_current(state, &owner, DropReason::UserLeft).await;
         }
     }
 }
@@ -6240,9 +6283,23 @@ mod tests {
         EphemeralIngress::presence_for_control(SignalingCarrier::Local, device_id)
     }
 
-    /// The same, for a carrier that stopped seeing the peer.
+    /// The same, for a carrier that stopped seeing the peer itself.
     fn withdrawn_by_local_carrier(device_id: &str) -> EphemeralIngress {
-        EphemeralIngress::withdrawal_for_control(SignalingCarrier::Local, device_id)
+        EphemeralIngress::withdrawal_for_control(
+            SignalingCarrier::Local,
+            device_id,
+            CarrierAttribution::CarrierObserved,
+        )
+    }
+
+    /// A departure a payload asserted rather than a carrier observed - the
+    /// shape a hostile sender can aim at any device id it likes.
+    fn departure_claimed_over_local_carrier(device_id: &str) -> EphemeralIngress {
+        EphemeralIngress::withdrawal_for_control(
+            SignalingCarrier::Local,
+            device_id,
+            CarrierAttribution::SenderClaimed,
+        )
     }
 
     /// The borrowed stream frame exists so the sender never owns what it sends.
@@ -15017,8 +15074,21 @@ mod tests {
     /// subsumes the other, and only this one speaks to a Nostr-only network,
     /// where presence and departure are both sender-claimed.
     ///
-    /// The guard is `authenticated && data_channel_open`; the window that
-    /// conjunction leaves open is documented at the `PeerLeft` arm itself.
+    /// **The third property is the one a reviewer found the first two did not
+    /// give.** The guard on liveness is a conjunction,
+    /// `authenticated && data_channel_open`, so a session that is authenticated
+    /// with its channel closed - in recovery - fails it. Guarding on liveness
+    /// alone therefore still let a *sender-claimed* departure naming a third
+    /// device retire that device's session, at the moment it was least able to
+    /// defend itself. So the arm reads attribution too, and the last part of
+    /// this control pins both halves of that rule:
+    ///
+    /// - a sender-claimed withdrawal retires nothing in *any* state, and
+    /// - a carrier-observed one still retires that same not-live shape.
+    ///
+    /// The second bullet is why this is a rule rather than a blanket refusal to
+    /// drop: with only the first, an arm that had simply stopped retiring
+    /// anything would pass.
     #[tokio::test]
     async fn v4_m2_a_carrier_withdrawal_leaves_a_healthy_authenticated_session_intact() {
         use crate::network_state::{transition_payload, Transition, TransitionVariant};
@@ -15125,6 +15195,34 @@ mod tests {
             governance::current_policy_admits(&state.governance_state.read(), &me, &target),
             "and the device is still admissible, so its next reappearance is an \
              ordinary reconnect rather than a re-admission it has to be granted"
+        );
+
+        // The recovery shape: still authenticated, but the channel underneath
+        // it has gone. This is the state the liveness-only guard let a
+        // sender-claimed departure reach.
+        session.state.write().data_channel_open = false;
+
+        handle_signaling_inbound(&state, departure_claimed_over_local_carrier(&target)).await;
+        assert!(
+            state.peers.get(&target).is_some(),
+            "a sender-claimed departure selects no session in any state - the \
+             sender picked this target, so it may not pick a victim"
+        );
+
+        handle_signaling_inbound(&state, withdrawn_by_local_carrier(&target)).await;
+        assert!(
+            state.peers.get(&target).is_none(),
+            "but the carrier's own observation still retires a session that is \
+             not live - so the rule above is a rule about attribution, not an \
+             arm that has stopped dropping anything"
+        );
+
+        // And the retirement is still only a session: the durable half is
+        // untouched by the drop that did happen.
+        assert!(!governance::log_evicted(&state, &target));
+        assert!(
+            state.is_rostered(&target),
+            "retiring a session is not deleting a roster row"
         );
 
         state.shutdown().await;
