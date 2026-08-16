@@ -32,6 +32,7 @@ pub mod reconcile;
 pub mod reliable;
 pub mod scheduler;
 pub mod signaling_bridge;
+pub(crate) mod signaling_lane;
 pub(crate) mod state;
 pub mod tick;
 pub mod traffic;
@@ -40,6 +41,16 @@ pub mod wake;
 pub use signaling_bridge::{
     attach_local, attach_mdns, attach_nostr, attach_signaling, SignalingDrivers,
 };
+// The lane boundary is the Signaling Node's, and only the classified value it
+// produces is public — it appears in `NetworkState`'s inbound sender and in
+// `run_driver`'s receiver, so an embedder has to be able to name it. Everything
+// that *makes* one stays crate-private: `ARCHITECTURE.md` §10 and
+// `FORMAL-PROOFS.md` Theorem 11.2 both turn on application code having no
+// constructor for a signaling record, and a `pub CarrierObservation` would have
+// handed it one.
+pub use signaling_lane::LaneDelivery;
+#[cfg(test)]
+use signaling_lane::{CarrierObservation, SignalingCarrier};
 
 /// Minimum gap between announces we publish in response to a peer's
 /// announce. The engine fires one reflected announce per inbound
@@ -88,7 +99,14 @@ use crate::transport::{
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
-pub use state::{NetworkCmd, NetworkState, SignalingInbound, SignalingOutbound};
+pub use state::{NetworkCmd, NetworkState, SignalingOutbound};
+// `SignalingInbound` is no longer public. It was re-exported when it was the
+// engine's inbound mailbox item and appeared in `NetworkState`'s sender and in
+// `run_driver`'s receiver; `LaneDelivery` holds both of those positions now, and
+// no other public signature names it. Keeping the re-export would leave a public
+// type nothing public mentions, which is what §7.3's "no dead public re-export"
+// rules out. The type itself stays exactly where it was.
+use state::SignalingInbound;
 
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
@@ -124,7 +142,7 @@ pub(crate) async fn spawn_network_in_mesh_scope(
 /// command events.
 pub async fn run_driver(
     state: Arc<NetworkState>,
-    mut signaling_inbound: crate::resource::ResourceMailboxReceiver<SignalingInbound>,
+    mut signaling_inbound: crate::resource::ResourceMailboxReceiver<LaneDelivery>,
     mut cmd_rx: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
 ) {
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
@@ -229,7 +247,7 @@ pub async fn run_driver(
                     break "signaling channel closed";
                 };
                 // Same shape as the command arm above, for the same reason:
-                // `SignalingInbound` is public and its payloads are consumed by
+                // the delivery's payloads are consumed by
                 // value downstream — `apply_remote_sdp` takes an owned `String`
                 // and `add_remote_candidate_observed` takes an owned
                 // `LocalIceCandidate`. Handling from a borrow would mean
@@ -516,15 +534,23 @@ fn connecting_stuck_past_grace(data: &connection::PeerStateData, grace_ms: u64) 
             .unwrap_or(false)
 }
 
-async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbound) {
+async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: LaneDelivery) {
     // Entry trace: signaling handlers run inline on the driver, so in a
     // debug capture the last of these lines names the message being handled
-    // when the driver stopped.
-    trace!(network = %state.network_id, kind = sig.kind_name(), "driver: signaling inbound");
-    state
-        .traffic
-        .record_signaling_rx(matches!(sig, SignalingInbound::PeerAnnounced { .. }));
-    match sig {
+    // when the driver stopped — and now also which lane it came in on and
+    // which carrier saw it, which is what the retained provenance is for.
+    trace!(
+        network = %state.network_id,
+        kind = delivered.kind_name(),
+        lane = delivered.lane().name(),
+        carrier = delivered.carrier().name(),
+        "driver: signaling inbound"
+    );
+    state.traffic.record_signaling_rx(matches!(
+        delivered.inbound(),
+        SignalingInbound::PeerAnnounced { .. }
+    ));
+    match delivered.into_inbound() {
         SignalingInbound::PeerAnnounced { device_id } => {
             // A stood-down engine (this device is signed-evicted from the
             // network) ignores the mesh entirely: no reflect, no dial —
@@ -5206,7 +5232,7 @@ fn build_test_state_parts_metered(
             .expect("outbound signaling mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<NetworkCmd>::root_claim()
             .expect("engine command mailbox root is representable"),
-        crate::resource::ResourceMailboxSender::<SignalingInbound>::root_claim()
+        crate::resource::ResourceMailboxSender::<LaneDelivery>::root_claim()
             .expect("inbound signaling mailbox root is representable"),
     ]
     .into_iter()
@@ -5230,12 +5256,18 @@ fn build_test_state_parts_metered(
     const ENGINE_FIXTURE_PROMOTION_COMMANDS_PER_CONNECTOR: u64 = 1;
     const ENGINE_FIXTURE_QUEUED_CALLER_COMMANDS: u64 = 1;
 
-    let inbound_signaling = SignalingInbound::Offer {
-        device_id: "fixture-signaling-peer".into(),
-        sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
-    };
+    let inbound_signaling = CarrierObservation::directed(
+        SignalingCarrier::Local,
+        "fixture-signaling-peer".into(),
+        myownmesh_signaling::SignalingMessage::Offer {
+            peer_id: "fixture-signaling-peer".into(),
+            offer_id: "fixture-offer".into(),
+            sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
+        },
+    )
+    .into_delivery();
     let inbound_signaling =
-        crate::resource::ResourceMailboxSender::<SignalingInbound>::accepted_item_charge_for_test(
+        crate::resource::ResourceMailboxSender::<LaneDelivery>::accepted_item_charge_for_test(
             &inbound_signaling,
         )
         .checked_scale(
@@ -6016,6 +6048,21 @@ mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
     use std::time::{Duration, Instant};
+
+    /// One presence observation, as the in-process carrier would report it.
+    ///
+    /// Every carrier now reaches the driver through the lane boundary, so a
+    /// control that handed `handle_signaling_inbound` a bare `SignalingInbound`
+    /// would be exercising a path production no longer has.
+    fn announced_by_local_carrier(device_id: &str) -> LaneDelivery {
+        CarrierObservation::presence(SignalingCarrier::Local, device_id.to_string()).into_delivery()
+    }
+
+    /// The same, for a carrier that stopped seeing the peer.
+    fn withdrawn_by_local_carrier(device_id: &str) -> LaneDelivery {
+        CarrierObservation::withdrawal(SignalingCarrier::Local, device_id.to_string())
+            .into_delivery()
+    }
 
     /// The borrowed stream frame exists so the sender never owns what it sends.
     /// The cost is a second spelling of a wire shape, and the risk is that the
@@ -6944,13 +6991,7 @@ mod tests {
         assert!(state.is_silent());
 
         let peer = "peerpubkeyzzz-customer";
-        handle_signaling_inbound(
-            &state,
-            SignalingInbound::PeerAnnounced {
-                device_id: peer.to_string(),
-            },
-        )
-        .await;
+        handle_signaling_inbound(&state, announced_by_local_carrier(peer)).await;
 
         let entry = state
             .peers
@@ -6968,13 +7009,7 @@ mod tests {
 
         // A re-announce is idempotent — still no session, still Sighted.
         drop(entry);
-        handle_signaling_inbound(
-            &state,
-            SignalingInbound::PeerAnnounced {
-                device_id: peer.to_string(),
-            },
-        )
-        .await;
+        handle_signaling_inbound(&state, announced_by_local_carrier(peer)).await;
         assert!(state.peers.get(peer).unwrap().session.lock().is_none());
     }
 
@@ -14760,6 +14795,125 @@ mod tests {
             governance::current_policy_admits(&state.governance_state.read(), &me, &me),
             "and this device is still a member of its own network — the removal \
              is exactly one device wide"
+        );
+
+        state.shutdown().await;
+    }
+
+    /// **A carrier withdrawal is not a durable leave, and mints no authority.**
+    ///
+    /// The engine-side half of the lane boundary's negative controls. The
+    /// module-side half proves that a withdrawal's only available effect is
+    /// `SignalingEffect::CarrierWithdrawal` — that the effect union contains
+    /// no durable-leave or roster-mutation variant for it to be instead. This
+    /// one proves the consequence where it would actually be visible: after the
+    /// driver has handled the withdrawal, the device is still a signed member,
+    /// still rostered, and still admissible.
+    ///
+    /// **Its non-vacuity is the neighbouring control, not another assertion
+    /// here.** `v4_r7_core_an_evicted_device_is_not_admitted_by_the_current_policy`
+    /// takes the same fixture and shows all three of these flipping — the member
+    /// log evicts, the roster row is deleted, and the policy refuses — under a
+    /// signed removal. So "nothing moved" here is meaningful precisely because
+    /// something does move when the authority that owns the roster says so, and
+    /// a carrier is not that authority.
+    ///
+    /// No session exists for the withdrawal to tear down, which is deliberate:
+    /// tearing down a live session is what a withdrawal is *for*, is covered by
+    /// the peer-leave suite, and would need a WebRTC object here. What this
+    /// control isolates is the property a session teardown must not carry with
+    /// it.
+    #[tokio::test]
+    async fn v4_m2_u1_a_carrier_withdrawal_leaves_the_signed_membership_intact() {
+        use crate::network_state::{transition_payload, Transition, TransitionVariant};
+
+        let state = build_test_state("carrier-withdrawal-no-durable-leave");
+        let me = state.identity.public_id().to_string();
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        let authority = crate::identity::Identity::ephemeral();
+        let authority_id = authority.public_id().to_string();
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(&state.network_id, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(authority.signing_key(), &payload)],
+                signers: vec![authority_id.clone()],
+                variant,
+            }
+        };
+        let member = |who: &str, at: u64| {
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: who.to_string(),
+                    role: crate::network_state::Role::Member,
+                },
+                at,
+            )
+        };
+        let elected = signed(
+            TransitionVariant::KindChange {
+                to: crate::network_state::NetworkKind::Closed,
+            },
+            1,
+        );
+        let admits = vec![member(&me, 2), member(&target, 3)];
+        governance::adopt_transition_log(
+            &state,
+            &authority_id,
+            std::slice::from_ref(&elected),
+            &admits,
+        )
+        .await;
+
+        // Non-vacuity: a closed network with a real signed member, so the
+        // assertions after the withdrawal are about something that could have
+        // been taken away.
+        assert!(
+            !state.governance_state.read().kind.is_open_governance(),
+            "the adopted log really closed the network"
+        );
+        assert!(state.is_rostered(&target), "and really seated the member");
+
+        // Both shapes a departure can take at this boundary. The out-of-band
+        // withdrawal is what every driver reports when an advertisement expires
+        // or a relay sees a socket close, and it is the live path on all three
+        // carriers. The directed departure reaches the lane parse from
+        // `LocalBroker` alone — the Nostr and mDNS drivers normalize a
+        // `SignalingMessage::Leave` into their own `PeerLeft` before the bridge
+        // sees it — so it is built here with the carrier that actually delivers
+        // it, rather than with a carrier that would make the control read wider
+        // than it is.
+        handle_signaling_inbound(&state, withdrawn_by_local_carrier(&target)).await;
+        handle_signaling_inbound(
+            &state,
+            CarrierObservation::directed(
+                SignalingCarrier::Local,
+                target.clone(),
+                myownmesh_signaling::SignalingMessage::Leave {
+                    peer_id: target.clone(),
+                },
+            )
+            .into_delivery(),
+        )
+        .await;
+
+        assert!(
+            !governance::log_evicted(&state, &target),
+            "a carrier saying a device is gone is not the network saying it is \
+             out — only a signed removal is that, and none was adopted"
+        );
+        assert!(
+            state.is_rostered(&target),
+            "so the roster row survives the withdrawal: the roster is the \
+             Semantic Node's, and no signaling effect can delete a row in it"
+        );
+        assert!(
+            governance::current_policy_admits(&state.governance_state.read(), &me, &target),
+            "and the device is still admissible, so its next reappearance is an \
+             ordinary reconnect rather than a re-admission it has to be granted"
         );
 
         state.shutdown().await;

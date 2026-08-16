@@ -30,6 +30,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{broadcast, oneshot, watch};
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
+use super::signaling_lane::LaneDelivery;
 
 /// See a closed flow's native half retired, whichever half it had.
 ///
@@ -451,14 +452,25 @@ impl SignalingInbound {
     }
 }
 
-impl ResourceMailboxItem for SignalingInbound {
-    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
-        let measure = match self {
+impl SignalingInbound {
+    /// Everything this value reaches, measured for the owner that will hold it.
+    ///
+    /// Deliberately not a [`ResourceMailboxItem`] impl. What the engine's
+    /// inbound mailbox carries is a
+    /// [`super::signaling_lane::LaneDelivery`] — a classified input with its
+    /// lane and carrier provenance — and that is the type whose footprint the
+    /// claim has to be priced against. Splitting the measurement out means the
+    /// owner supplies `size_of::<Self>()` while this stays the one description
+    /// of what a `SignalingInbound` reaches, rather than the two drifting.
+    pub(super) fn string_measure(
+        &self,
+    ) -> std::result::Result<(usize, usize, usize), ResourceMailboxItemError> {
+        match self {
             Self::PeerAnnounced { device_id } | Self::PeerLeft { device_id } => {
-                strings_measure([device_id.as_str()])?
+                strings_measure([device_id.as_str()])
             }
             Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
-                strings_measure([device_id.as_str(), sdp.as_str()])?
+                strings_measure([device_id.as_str(), sdp.as_str()])
             }
             Self::Candidate {
                 device_id,
@@ -472,9 +484,8 @@ impl ResourceMailboxItem for SignalingInbound {
                 ]
                 .into_iter()
                 .flatten(),
-            )?,
-        };
-        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+            ),
+        }
     }
 }
 
@@ -579,7 +590,11 @@ pub struct NetworkState {
     pub(crate) application_gateway: crate::application_gateway::ApplicationGateway,
 
     pub signaling_tx: ResourceMailboxSender<SignalingOutbound>,
-    pub signaling_inbound_tx: ResourceMailboxSender<SignalingInbound>,
+    /// Where every attached carrier delivers, and it takes a classified value
+    /// rather than a bare [`SignalingInbound`]: the lane and the carrier
+    /// provenance ride with the message to the engine instead of being computed
+    /// and dropped at the bridge.
+    pub signaling_inbound_tx: ResourceMailboxSender<LaneDelivery>,
     pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
 
     /// Receiving end of `signaling_tx` — held here so callers can
@@ -802,7 +817,7 @@ impl NetworkState {
         transport: Transport,
     ) -> Result<(
         Arc<Self>,
-        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<LaneDelivery>,
         ResourceMailboxReceiver<NetworkCmd>,
     )> {
         let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
@@ -820,7 +835,7 @@ impl NetworkState {
         local_resources: &LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<LaneDelivery>,
         ResourceMailboxReceiver<NetworkCmd>,
     )> {
         Self::new_in_resource_scope(
@@ -841,7 +856,7 @@ impl NetworkState {
         local_resources: LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        ResourceMailboxReceiver<SignalingInbound>,
+        ResourceMailboxReceiver<LaneDelivery>,
         ResourceMailboxReceiver<NetworkCmd>,
     )> {
         // Standing dials survive restarts by riding the network config —
