@@ -250,6 +250,17 @@ new-mode MyOwnMesh release. Downstream consumer migration begins only when the
 owner separately authorizes that program. Its last phase is the closure gate in
 7.3, which is what makes the deletions above verifiable rather than asserted.
 
+#### 7.2.1. Entry ledger
+
+Macro-slice 2 begins on `macro/02-authority-durability-relay`, created from the
+fork `main` merge commit `c79ea09cc577bfb3953cf532b2dd555229f7e12c`. This
+entry is the review boundary for the first unit. The transitional
+[`MACRO-SLICE-2-ENTRY-LEDGER.md`](MACRO-SLICE-2-ENTRY-LEDGER.md) carries the
+three accepted residuals and the first bounded unit. It must be deleted at the
+7.3 closure gate rather than survive as a second architecture dossier, but only
+after every residual is discharged. An open residual at that gate is a stop
+condition, not permission to delete the record.
+
 ### 7.3. Repository Closure and Nodularity Gate
 
 The final phase of Macro-slice 2, and the last thing that happens before the
