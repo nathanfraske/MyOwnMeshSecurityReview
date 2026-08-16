@@ -320,6 +320,57 @@ fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
     Ok(enrolled)
 }
 
+/// What a supplied code earns against one exact enrollment record.
+enum CodeVerdict {
+    /// A TOTP for the current window. Nothing about the record changes, and
+    /// nothing is owed to disk.
+    Totp,
+    /// A one-time recovery code, at this position in `recovery_hashes`.
+    ///
+    /// Consuming it is the *caller's* write, not this check's, because whether
+    /// a write is owed depends on what the caller does with the record next: a
+    /// gate that keeps the enrollment has to burn the code, and a disable that
+    /// removes the whole record has nothing left to burn it out of.
+    Recovery(usize),
+}
+
+/// Check `code` against one already-loaded enrollment.
+///
+/// Factored out so both callers authorize identically **and neither has to
+/// reach for the store lock to do it**. That second half is the load-bearing
+/// one: `disable_at` used to authorize by calling the lock-taking gate, which
+/// released [`STORE_LOCK`] before the removal ran, and the removal then deleted
+/// whichever record existed by the time it reacquired. Two local control
+/// requests were enough — a disable against a network with no enrollment
+/// returned `Ok` without validating anything, and then removed a *successor*
+/// that a concurrent enroll had installed and already answered for. Verification
+/// is a pure function of one record, so it belongs where the record is, under
+/// the caller's own guard.
+fn verify_code(enrollment: &Enrollment, code: Option<&str>) -> Result<CodeVerdict> {
+    let Some(code) = code.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Err(Error::Custody(
+            "this change requires your authenticator code".into(),
+        ));
+    };
+    // TOTP for the current window (±1 step) first.
+    let secret = BASE32_NOPAD
+        .decode(enrollment.secret_b32.as_bytes())
+        .map_err(|e| Error::Custody(format!("stored secret is not valid base32: {e}")))?;
+    if verify_totp_at(&secret, code, now_unix()) {
+        return Ok(CodeVerdict::Totp);
+    }
+    // Otherwise a one-time recovery code.
+    let h = hash_code(code);
+    if let Some(pos) = enrollment
+        .recovery_hashes
+        .iter()
+        .position(|x| constant_eq(x.as_bytes(), h.as_bytes()))
+    {
+        return Ok(CodeVerdict::Recovery(pos));
+    }
+    Err(Error::Custody("invalid authenticator code".into()))
+}
+
 fn require_at(path: &Path, network_id: &str, code: Option<&str>) -> Result<()> {
     // A recovery code is *consumed* on match, which makes this a store mutation
     // like any other: two gates racing on the same code could otherwise both
@@ -329,45 +380,40 @@ fn require_at(path: &Path, network_id: &str, code: Option<&str>) -> Result<()> {
     let Some(enr) = store.networks.get_mut(network_id) else {
         return Ok(()); // not enrolled on this device → the gate is a no-op
     };
-    let Some(code) = code.map(str::trim).filter(|c| !c.is_empty()) else {
-        return Err(Error::Custody(
-            "this change requires your authenticator code".into(),
-        ));
-    };
-    // TOTP for the current window (±1 step) first.
-    let secret = BASE32_NOPAD
-        .decode(enr.secret_b32.as_bytes())
-        .map_err(|e| Error::Custody(format!("stored secret is not valid base32: {e}")))?;
-    if verify_totp_at(&secret, code, now_unix()) {
-        return Ok(());
+    match verify_code(enr, code)? {
+        CodeVerdict::Totp => Ok(()),
+        CodeVerdict::Recovery(pos) => {
+            enr.recovery_hashes.remove(pos);
+            save_at(path, &store)
+        }
     }
-    // Otherwise a one-time recovery code — consumed on match.
-    let h = hash_code(code);
-    if let Some(pos) = enr
-        .recovery_hashes
-        .iter()
-        .position(|x| constant_eq(x.as_bytes(), h.as_bytes()))
-    {
-        enr.recovery_hashes.remove(pos);
-        save_at(path, &store)?;
-        return Ok(());
-    }
-    Err(Error::Custody("invalid authenticator code".into()))
 }
 
 fn disable_at(path: &Path, network_id: &str, code: &str) -> Result<()> {
-    // The gate takes and releases [`STORE_LOCK`] itself, so the removal below
-    // takes a *fresh* one rather than wrapping both: the guard is a plain
-    // non-reentrant mutex, and holding it across the gate would deadlock on the
-    // first call. Nothing is lost by the gap — an install refuses while a lock
-    // is present, a second disable is idempotent, and a provisional rollback
-    // removes only its own exact record.
-    require_at(path, network_id, Some(code))?;
+    // One guard, one load, one verify, one removal, one save. The record the
+    // code is checked against and the record that is removed are the same
+    // borrow of the same loaded store, so nothing can be installed, rolled back
+    // or replaced between the two — which is the whole correction here. The
+    // previous shape authorized through the lock-taking gate and reacquired for
+    // the removal, and that gap was enough for a disable to delete an
+    // enrollment nobody had authorized it against.
     let _serialized = store_guard();
     let mut store = load_at(path)?;
+    let Some(enrollment) = store.networks.get(network_id) else {
+        // Nothing is installed, so there is nothing to remove and nothing to
+        // write. Answering `Ok` keeps disable idempotent — the end state it
+        // promises is "this network has no lock", which already holds — and
+        // writing nothing is what makes that answer safe: the old shape's
+        // unconditional removal-and-save is exactly what could take a
+        // successor away.
+        return Ok(());
+    };
+    // The verdict itself is spent here. A recovery code needs no consumption
+    // write on this path: the same locked mutation removes the record the code
+    // would have been burned out of, and saves once.
+    verify_code(enrollment, Some(code))?;
     store.networks.remove(network_id);
-    save_at(path, &store)?;
-    Ok(())
+    save_at(path, &store)
 }
 
 // ---------------------------------------------------------------------------

@@ -2120,9 +2120,16 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             Request::GovernanceMfaEnroll { network } => {
                 let ((reply, output), provisional) =
                     dispatch::governance::mfa_enroll(&json_lines, network)?;
-                // The secret and the recovery codes are shown exactly once and
-                // are not recoverable from disk, so nothing is written until
-                // this line is.
+                // The lock is already installed. It has to be: a success
+                // response has to name an enrollment that exists, and deferring
+                // the write until this line would let two clients both be told
+                // they enrolled, because neither installed lock would exist to
+                // refuse the other. What is provisional is ownership, not the
+                // write — the enrollment is rollback-owned until this line
+                // reaches `Wrote::Sent`, and settled either way below. The
+                // secret and the recovery codes are still shown exactly once
+                // and are not recoverable from disk, which is why an unhanded
+                // enrollment has to be removed rather than left installed.
                 let line =
                     match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
                         Ok(line) => line,

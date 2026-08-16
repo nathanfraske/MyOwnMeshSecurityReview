@@ -14625,6 +14625,146 @@ mod tests {
         });
     }
 
+    /// An evicted device is refused by the current policy itself, so it cannot
+    /// re-enter an authorizing roster even if no denial frame ever reached it.
+    ///
+    /// The retained, non-ignored statement of no-readmission. The end-to-end
+    /// version of this — an offline device redialing and standing down — is
+    /// deferred to Macro-slice 2 because the device's *own* stand-down rides
+    /// B3's single best-effort denial frame. The member-side half does not: it
+    /// is decided entirely by the signed state each member already holds, so it
+    /// is deterministic and belongs in the default run.
+    ///
+    /// Two independent barriers are asserted, because the resurrection loop this
+    /// closes needed only one of them to be missing. `log_evicted` is what makes
+    /// the handshake gate deny with proof; `current_policy_admits` is what the
+    /// admission flow computes *after* that gate, and it is what decides
+    /// auto-approve — the step that used to put the device straight back into
+    /// the roster and gossip it fleet-wide. A build whose denial frame is lost
+    /// still cannot re-admit, which is precisely the property the deferred
+    /// control cannot be relied on to show.
+    ///
+    /// Driven through the real [`governance::adopt_transition_log`], the same
+    /// path a member takes when it learns of an eviction by gossip, so the roles
+    /// and the roster are production's own projection rather than a fixture's.
+    /// The first adoption is the non-vacuity twin: before the tombstone the
+    /// device really is admitted, really is rostered, and really is not evicted,
+    /// so each assertion after it names a change rather than a constant.
+    #[tokio::test]
+    async fn v4_r7_core_an_evicted_device_is_not_admitted_by_the_current_policy() {
+        use crate::network_state::{transition_payload, Transition, TransitionVariant};
+
+        let state = build_test_state("evicted-not-admitted");
+        let me = state.identity.public_id().to_string();
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        // The network's owner, whose signature is the authority every entry
+        // below is verified against. Held by this control rather than by the
+        // device under test: the point is a member applying somebody else's
+        // signed removal.
+        let authority = crate::identity::Identity::ephemeral();
+        let authority_id = authority.public_id().to_string();
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(&state.network_id, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(authority.signing_key(), &payload)],
+                signers: vec![authority_id.clone()],
+                variant,
+            }
+        };
+        let member = |who: &str, at: u64| {
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: who.to_string(),
+                    role: crate::network_state::Role::Member,
+                },
+                at,
+            )
+        };
+        // The founder self-election that seats the authority as Owner. Without
+        // it nothing below verifies, and every assertion would pass for the
+        // wrong reason.
+        let elected = signed(
+            TransitionVariant::KindChange {
+                to: crate::network_state::NetworkKind::Closed,
+            },
+            1,
+        );
+        let admits = vec![member(&me, 2), member(&target, 3)];
+
+        governance::adopt_transition_log(
+            &state,
+            &authority_id,
+            std::slice::from_ref(&elected),
+            &admits,
+        )
+        .await;
+
+        // Non-vacuity: before the tombstone this really is an admitted,
+        // rostered member of a closed network.
+        assert!(
+            !state.governance_state.read().kind.is_open_governance(),
+            "the adopted log really closed the network — an open one admits \
+             everyone and would make every assertion below vacuous"
+        );
+        assert!(
+            !governance::log_evicted(&state, &target),
+            "non-vacuity: nothing has evicted it yet"
+        );
+        assert!(
+            governance::current_policy_admits(&state.governance_state.read(), &me, &target),
+            "non-vacuity: the current policy really does admit it while it is a \
+             signed member"
+        );
+        assert!(
+            state.is_rostered(&target),
+            "non-vacuity: and the roster mirror really did seat it"
+        );
+
+        // The owner's signed removal, learned the way a member learns it.
+        let mut evicted = admits.clone();
+        evicted.push(signed(
+            TransitionVariant::Evict {
+                target: target.clone(),
+            },
+            4,
+        ));
+        governance::adopt_transition_log(
+            &state,
+            &authority_id,
+            std::slice::from_ref(&elected),
+            &evicted,
+        )
+        .await;
+
+        assert!(
+            governance::log_evicted(&state, &target),
+            "the verified member tier says the device is out, which is what \
+             makes the handshake gate deny it with proof"
+        );
+        assert!(
+            !governance::current_policy_admits(&state.governance_state.read(), &me, &target),
+            "and the admission flow's own policy refuses it independently — so \
+             auto-approve cannot fire and cannot put it back in the roster, \
+             whether or not the denial frame was ever delivered"
+        );
+        assert!(
+            !state.is_rostered(&target),
+            "the roster mirror deleted it, so there is no rostered row for a \
+             later auto-approve to treat as a re-admission"
+        );
+        assert!(
+            governance::current_policy_admits(&state.governance_state.read(), &me, &me),
+            "and this device is still a member of its own network — the removal \
+             is exactly one device wide"
+        );
+
+        state.shutdown().await;
+    }
+
     /// An evicted peer is dropped when the denial's send attempt returns, and a
     /// send that failed does not postpone it.
     ///
