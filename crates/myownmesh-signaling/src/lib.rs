@@ -36,6 +36,32 @@ use serde::{Deserialize, Serialize};
 /// subscription that drops the legacy catch-all filter once it does.
 pub const SIG_CAP_PTAG: &str = "ptag";
 
+/// How a driver came by the device id in a presence or withdrawal report.
+///
+/// Every driver reports presence and withdrawal, and the two ways it can know
+/// who the report is about are worth very different things:
+///
+/// - [`Self::CarrierObserved`] - the carrier itself knows. The in-process
+///   broker stamps the registered id of the handle that sent; mDNS resolved or
+///   expired its own browse record. The sender did not choose it.
+/// - [`Self::SenderClaimed`] - the id was decoded out of a signaling payload.
+///   It is never checked against the relay event's pubkey or the wire source,
+///   so it is not an authenticated identity; it is a string the sender picked,
+///   and it may name somebody else.
+///
+/// Neither is an authority: a device is admitted by endpoint authentication and
+/// policy, never by being named in a signaling report. The distinction exists so
+/// the consumer can refuse to let the second cancel the first - which is the
+/// difference between "the LAN stopped seeing this device" and "somebody sent a
+/// payload saying so".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierAttribution {
+    /// The carrier established the id itself.
+    CarrierObserved,
+    /// The id was decoded from a payload the sender wrote.
+    SenderClaimed,
+}
+
 /// A driver queue's receiver and whatever the caller says funds it, in that
 /// order.
 ///

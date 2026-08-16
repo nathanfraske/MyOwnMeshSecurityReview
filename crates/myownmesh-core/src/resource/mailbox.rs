@@ -456,7 +456,7 @@ impl<T> ResourceMailboxDelivery<T> {
     /// downstream.** A command handler is not a reader — `NetworkCmd` carries
     /// `oneshot::Sender`s in fifteen of its variants, and `Sender::send`
     /// consumes, so the command genuinely cannot be handled from a borrow.
-    /// The signaling `LaneDelivery` is the same shape for a different reason:
+    /// The signaling `EphemeralIngress` is the same shape for a different reason:
     /// the classified input it carries lands in `apply_remote_sdp`, which takes
     /// an owned `String`, and
     /// `add_remote_candidate_observed`, which takes an owned
@@ -490,7 +490,7 @@ impl<T> ResourceMailboxDelivery<T> {
     /// whole and read through [`Self::value`]; a writer has somewhere for the
     /// bytes to go and so does not need this. The callers are exactly the two
     /// `NetworkCmd` dispatch sites in `engine/mod.rs` — the driver loop and the
-    /// test command driver — plus the driver loop's `LaneDelivery` arm, and
+    /// test command driver — plus the driver loop's `EphemeralIngress` arm, and
     /// that census is the point of the seam being `pub(crate)` and named for
     /// what it is. `the_terminal_effect_seam_has_exactly_its_documented_callers`
     /// fails if the number moves.
@@ -1167,7 +1167,7 @@ mod tests {
     /// not be able to raise the number this census exists to hold down, so the
     /// file is cut at its test module and three are counted before it — the
     /// driver loop's `NetworkCmd` arm, the `#[cfg(test)]` command driver that
-    /// mirrors it, and the driver loop's `LaneDelivery` arm. Test coverage
+    /// mirrors it, and the driver loop's `EphemeralIngress` arm. Test coverage
     /// of the seam is then asserted separately, as coverage rather than as
     /// census.
     ///
@@ -1214,7 +1214,7 @@ mod tests {
             production, 3,
             "the seam's contract names three call sites ahead of the engine's \
              test module: the driver loop's `NetworkCmd` arm, the `#[cfg(test)]` \
-             command driver, and the driver loop's `LaneDelivery` arm. A \
+             command driver, and the driver loop's `EphemeralIngress` arm. A \
              fourth is not automatically wrong, but it is a new place a \
              delivered message can be consumed, and `Output = ()` does not stop \
              it being spawned or stored, so it needs the same read the first \

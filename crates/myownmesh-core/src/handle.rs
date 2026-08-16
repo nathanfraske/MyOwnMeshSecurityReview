@@ -34,13 +34,6 @@ use crate::runtime::attempt::{
 };
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
-/// How long [`JoinedNetwork::announce_leave`] waits after queuing the
-/// departure broadcast before returning, so the publish reaches the
-/// already-connected relay sockets before the caller drops the signaling
-/// driver. Long enough for one WebSocket frame on a live socket, short
-/// enough to be imperceptible on a user-initiated reconnect.
-const LEAVE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
 /// across all joined networks.
@@ -669,27 +662,38 @@ impl JoinedNetwork {
             .map_err(|_| Error::Network("engine dropped split reply".into()))?
     }
 
-    /// Announce a graceful departure to the room, then briefly wait for it
-    /// to reach the relays. Peers tear our session down immediately on the
-    /// `leave` (instead of waiting out the ~90 s heartbeat timeout), so a
-    /// deliberate reconnect — leave-then-rejoin — doesn't strand them on a
-    /// dead session whose ICE still falsely reports `Connected`.
+    /// Leave deliberately: depart every authenticated session, then drop the
+    /// carrier hint on the way out.
+    ///
+    /// **The departure travels on the authenticated sessions, and only the
+    /// carrier hint rides signaling.** Each live session is told over itself,
+    /// awaited, and then retired locally; the room-wide `leave` that follows is
+    /// reachability evidence with no teardown authority, because no carrier
+    /// supplies a Device-authenticated goodbye and a receiver will not retire a
+    /// healthy session on one.
     ///
     /// Call this on the *live* handle **before** the signaling driver is
-    /// dropped (the registry drops it inside `remove`): once the driver is
-    /// gone there's no socket left to publish on. Best-effort — the short
-    /// flush window lets the publish hit the already-connected relay sockets
-    /// without blocking teardown on a delivery confirmation the signaling
-    /// layer never provides anyway.
+    /// dropped (the registry drops it inside `remove`): once the driver is gone
+    /// there is no socket left to publish the hint on, and no data channel left
+    /// to depart over.
+    ///
+    /// Nothing is acknowledged, retried, or timed. What replaced the old fixed
+    /// flush window is not a shorter wait but a real one: this returns when the
+    /// sessions have actually been told, rather than after a duration chosen to
+    /// be probably-long-enough for a publish it never watched.
     pub async fn announce_leave(&self) {
+        crate::engine::depart_authenticated_sessions(&self.state).await;
         self.request_departure();
-        tokio::time::sleep(LEAVE_FLUSH).await;
     }
 
-    /// Queue the departure broadcast without waiting for it to flush. Bulk
-    /// teardown (daemon shutdown) emits one per network and then does a
-    /// single combined flush before draining, rather than paying the
-    /// per-network wait [`Self::announce_leave`] does.
+    /// Emit the carrier departure hint alone, without departing any session.
+    ///
+    /// **Hint only.** This publishes a room-wide `leave` on signaling, which a
+    /// receiver may use as reachability evidence — to update availability, to
+    /// stop speculative work that never became a session, or to go look at a
+    /// connector — and may not use to retire a healthy authenticated session.
+    /// [`Self::announce_leave`] is the deliberate exit, and it departs the
+    /// sessions over themselves before calling this.
     pub fn request_departure(&self) {
         self.state.announce_departure();
     }

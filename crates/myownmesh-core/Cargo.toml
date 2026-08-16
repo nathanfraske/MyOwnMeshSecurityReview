@@ -27,6 +27,14 @@ required-features = ["transport-lab"]
 name = "spin_probe"
 required-features = ["transport-lab"]
 
+# Drives the authenticated-departure path through `depart_for_lab`, which only
+# exists behind `transport-lab`. Gated here rather than with an inner `cfg` so
+# an ordinary build does not build the target at all.
+[[test]]
+name = "peer_leave"
+path = "tests/peer_leave.rs"
+required-features = ["transport-lab"]
+
 [dependencies]
 myownmesh-signaling = { workspace = true }
 

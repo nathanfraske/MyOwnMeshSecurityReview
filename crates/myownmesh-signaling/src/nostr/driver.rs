@@ -35,7 +35,7 @@ use super::event::{
 use super::handle::derive_room_handle;
 use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
-use crate::{SignalingMessage, SIG_CAP_PTAG};
+use crate::{CarrierAttribution, SignalingMessage, SIG_CAP_PTAG};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -65,11 +65,17 @@ pub struct NostrDriverConfig {
 #[derive(Debug, Clone)]
 pub enum NostrInbound {
     /// A peer announced their presence in the room.
-    PeerAnnounced { device_id: String },
+    PeerAnnounced {
+        device_id: String,
+        attribution: CarrierAttribution,
+    },
     /// A peer's signaling connection dropped — an intelligent relay told
     /// us the instant the peer's socket closed, so the engine can tear
     /// the peer down promptly instead of waiting for a heartbeat timeout.
-    PeerLeft { device_id: String },
+    PeerLeft {
+        device_id: String,
+        attribution: CarrierAttribution,
+    },
     /// A peer addressed us directly with a signaling message.
     Message { from: String, msg: SignalingMessage },
 }
@@ -1026,7 +1032,15 @@ fn handle_inbound_frame<O>(
                         shared.room_caps.lock().insert(peer_id.clone(), ptag);
                     }
                     recompute_compat(shared);
-                    let _ = inbound_tx.send(NostrInbound::PeerAnnounced { device_id: peer_id });
+                    // Sender-claimed, and deliberately still the body id: on
+                    // a relay the envelope's own `from` is a second field the
+                    // same sender wrote, so preferring it would buy nothing.
+                    // What the tag buys is that this can never cancel an
+                    // observation a carrier made itself.
+                    let _ = inbound_tx.send(NostrInbound::PeerAnnounced {
+                        device_id: peer_id,
+                        attribution: CarrierAttribution::SenderClaimed,
+                    });
                 }
                 SignalingMessage::Leave { peer_id } => {
                     // Departure rides the ephemeral kind like the rest of
@@ -1048,7 +1062,10 @@ fn handle_inbound_frame<O>(
                     // exactly when the catch-all filter can narrow away.
                     shared.room_caps.lock().remove(&peer_id);
                     recompute_compat(shared);
-                    let _ = inbound_tx.send(NostrInbound::PeerLeft { device_id: peer_id });
+                    let _ = inbound_tx.send(NostrInbound::PeerLeft {
+                        device_id: peer_id,
+                        attribution: CarrierAttribution::SenderClaimed,
+                    });
                 }
                 other => {
                     if event.kind != SIGNALING_EPHEMERAL_KIND {
@@ -1432,7 +1449,7 @@ mod tests {
 
         let first = rx.try_recv().expect("first delivery lands");
         match first {
-            NostrInbound::PeerAnnounced { device_id } => assert_eq!(device_id, peer_pub),
+            NostrInbound::PeerAnnounced { device_id, .. } => assert_eq!(device_id, peer_pub),
             other => panic!("expected PeerAnnounced, got {other:?}"),
         }
         assert!(

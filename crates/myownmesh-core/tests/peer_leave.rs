@@ -1,21 +1,27 @@
 //! Regression test for the "reconnect strands peers" bug: a graceful
-//! departure (`NetworkState::announce_departure`) must make the *other*
-//! peer drop our session immediately, instead of waiting out the ~90 s
-//! heartbeat timeout.
+//! departure must make the *other* peer drop our session immediately,
+//! instead of waiting out the ~90 s heartbeat timeout.
 //!
-//! Two peers handshake through an in-process `LocalBroker`; one announces a
-//! departure; the other must emit `PeerEvent::Dropped { UserLeft }` within a
-//! couple of seconds. Before the fix the engine had no way to *send* a
-//! `leave` (only an intelligent relay synthesised one), so on the default
-//! public relays a leave-then-rejoin — which is exactly what the app's
-//! "reconnect" button does — left peers showing online-but-unconnectable
-//! until the heartbeat backstop fired.
+//! Two peers handshake through an in-process `LocalBroker`; one departs; the
+//! other must emit `PeerEvent::Dropped { UserLeft }` within a couple of
+//! seconds. Before the fix the engine had no way to *say* it was leaving (only
+//! an intelligent relay synthesised one), so on the default public relays a
+//! leave-then-rejoin — which is exactly what the app's "reconnect" button does
+//! — left peers showing online-but-unconnectable until the heartbeat backstop
+//! fired.
+//!
+//! The departure it drives is the authenticated one: a `SessionControl::Depart`
+//! over the live session, which is the only thing that may retire a healthy
+//! authenticated session. The carrier-side hint this test used to send is now
+//! reachability evidence with no teardown authority, so sending it here would
+//! assert the opposite of the boundary. The bound and the reason are unchanged;
+//! only the path is.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, depart_for_lab, spawn_network};
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -70,9 +76,10 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
     wait_for_approval(&mut alice_events, bob_id.public_id()).await;
     wait_for_approval(&mut bob_events, alice_id.public_id()).await;
 
-    // Alice makes a deliberate exit. This is what the daemon now emits
-    // before tearing a network down on remove / restart / shutdown.
-    alice_state.announce_departure();
+    // Alice makes a deliberate exit. This is what the daemon runs before
+    // tearing a network down on remove / restart / shutdown, reached in
+    // production through `MeshHandle::announce_leave`.
+    depart_for_lab(&alice_state).await;
 
     // Bob must drop Alice promptly with `UserLeft`, not sit on a dead
     // session until the heartbeat timeout. A generous-but-far-below-90 s

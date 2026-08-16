@@ -72,7 +72,7 @@ async fn multicast_available() -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), a_in_rx.recv()).await {
-            Ok(Some(MdnsInbound::PeerAnnounced { device_id })) if device_id == "probe-b" => {
+            Ok(Some(MdnsInbound::PeerAnnounced { device_id, .. })) if device_id == "probe-b" => {
                 return true;
             }
             Ok(Some(_)) => continue,

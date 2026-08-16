@@ -60,19 +60,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use myownmesh_core::engine::SignalingDrivers;
 use myownmesh_core::JoinedNetwork;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
-
-/// How long [`NetworkRegistry::announce_all_departures`] waits after queuing
-/// the per-network `leave` broadcasts before returning, so they reach the
-/// already-connected relay sockets before the registry is drained on
-/// shutdown. Mirrors core's per-network `JoinedNetwork::announce_leave`
-/// flush window.
-const DEPARTURE_FLUSH: Duration = Duration::from_millis(250);
 
 /// Where one joined runtime is in its life. The single owner of that answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1399,33 +1391,39 @@ impl NetworkRegistry {
         outcome
     }
 
-    /// Broadcast a graceful `leave` on every joined network, then wait
-    /// briefly for the publishes to reach the relays, before the caller
-    /// drains the registry on daemon shutdown. Peers drop our sessions
-    /// immediately on the `leave` instead of waiting out their ~90 s
-    /// heartbeat timeout — the same courtesy `network_remove` extends for a
-    /// single network. The read lock is held only for the synchronous emit
-    /// (dropped before the flush wait), so this never holds a `parking_lot`
-    /// guard across `.await`.
+    /// Depart every joined network before the caller drains the registry on
+    /// daemon shutdown — the same courtesy `network_remove` extends to a single
+    /// network, extended to all of them.
+    ///
+    /// **Each network's departure now travels on its authenticated sessions**
+    /// rather than on a room-wide signaling `leave` this side hoped would land.
+    /// A peer retires our session because the session itself said so, not
+    /// because an unauthenticated carrier claimed it. The carrier `leave` still
+    /// goes out behind it as reachability evidence with no teardown authority.
+    ///
+    /// The lock is taken only to snapshot the distinct entries and is dropped
+    /// before the first `.await`, so this never holds a `parking_lot` guard
+    /// across one. Networks are departed in sequence rather than raced: each is
+    /// a bounded number of sends over channels that are already open, and a
+    /// concurrent fan-out would buy nothing but interleaving on the way out.
     pub async fn announce_all_departures(&self) {
-        let mut emitted = false;
-        {
+        let departing: Vec<Arc<Entry>> = {
             let state = self.state.lock();
-            let map = &state.aliases;
             // Dedup by entry pointer — both id aliases point at the same Arc.
             let mut seen: Vec<*const Entry> = Vec::new();
-            for entry in map.values() {
+            let mut distinct = Vec::new();
+            for entry in state.aliases.values() {
                 let ptr = Arc::as_ptr(entry);
                 if seen.contains(&ptr) {
                     continue;
                 }
                 seen.push(ptr);
-                entry.joined.request_departure();
-                emitted = true;
+                distinct.push(Arc::clone(entry));
             }
-        }
-        if emitted {
-            tokio::time::sleep(DEPARTURE_FLUSH).await;
+            distinct
+        };
+        for entry in departing {
+            entry.joined.announce_leave().await;
         }
     }
 

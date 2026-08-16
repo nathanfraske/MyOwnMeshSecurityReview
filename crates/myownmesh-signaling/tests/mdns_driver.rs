@@ -36,7 +36,7 @@ async fn wait_for_announce(
 ) -> Option<()> {
     loop {
         match timeout(DISCOVERY_GRACE, rx.recv()).await {
-            Ok(Some(MdnsInbound::PeerAnnounced { device_id })) if device_id == expect_peer => {
+            Ok(Some(MdnsInbound::PeerAnnounced { device_id, .. })) if device_id == expect_peer => {
                 return Some(());
             }
             Ok(Some(_)) => continue,
@@ -109,7 +109,7 @@ async fn two_drivers_discover_and_exchange() {
     b_out_tx.send(MdnsOutbound::Leave).expect("channel open");
     let left = loop {
         match timeout(DISCOVERY_GRACE, a_in_rx.recv()).await {
-            Ok(Some(MdnsInbound::PeerLeft { device_id })) => break device_id,
+            Ok(Some(MdnsInbound::PeerLeft { device_id, .. })) => break device_id,
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => panic!("goodbye never surfaced as PeerLeft"),
         }

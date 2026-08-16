@@ -41,6 +41,7 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::Deny(_)
         | MeshMessage::Shelve(_)
         | MeshMessage::Unshelve(_)
+        | MeshMessage::SessionControl(_)
         | MeshMessage::CapabilitiesUpdate(_) => FrameClass::Control,
         MeshMessage::NetworkState(_)
         | MeshMessage::NetworkStatePropose(_)

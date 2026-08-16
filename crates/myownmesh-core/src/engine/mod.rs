@@ -32,7 +32,7 @@ pub mod reconcile;
 pub mod reliable;
 pub mod scheduler;
 pub mod signaling_bridge;
-pub(crate) mod signaling_lane;
+pub(crate) mod signaling_ingress;
 pub(crate) mod state;
 pub mod tick;
 pub mod traffic;
@@ -41,16 +41,18 @@ pub mod wake;
 pub use signaling_bridge::{
     attach_local, attach_mdns, attach_nostr, attach_signaling, SignalingDrivers,
 };
-// The lane boundary is the Signaling Node's, and only the classified value it
-// produces is public — it appears in `NetworkState`'s inbound sender and in
-// `run_driver`'s receiver, so an embedder has to be able to name it. Everything
-// that *makes* one stays crate-private: `ARCHITECTURE.md` §10 and
-// `FORMAL-PROOFS.md` Theorem 11.2 both turn on application code having no
-// constructor for a signaling record, and a `pub CarrierObservation` would have
-// handed it one.
-pub use signaling_lane::LaneDelivery;
+// The ingress boundary is the Signaling Node's, and none of it is public — not
+// the admitted value, not the thing that makes one. `EphemeralIngress` appears
+// in `NetworkState`'s inbound sender and in `run_driver`'s receiver, and both of
+// those are crate-private too, so no embedder has to name it and none can.
+// `ARCHITECTURE.md` §10 and `FORMAL-PROOFS.md` Theorem 11.2 both turn on
+// application code having no constructor for a signaling record; a `pub`
+// `CarrierObservation`, a `pub` attach, or a `pub` admitted value would each
+// have handed it one. See the block on the `state` re-export below for the rest
+// of the narrowed surface.
+use signaling_ingress::EphemeralIngress;
 #[cfg(test)]
-use signaling_lane::{CarrierObservation, SignalingCarrier};
+use signaling_ingress::SignalingCarrier;
 
 /// Minimum gap between announces we publish in response to a peer's
 /// announce. The engine fires one reflected announce per inbound
@@ -99,13 +101,22 @@ use crate::transport::{
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
-pub use state::{NetworkCmd, NetworkState, SignalingOutbound};
+pub use state::{NetworkCmd, NetworkState};
+// The raw signaling surface is crate-private: `SignalingOutbound`, the two
+// mailbox endpoints on `NetworkState`, its constructors, `run_driver` and
+// `EphemeralIngress` are all reachable only from inside this crate. A repo-wide
+// scan found no caller of any of them outside `engine/`, so nothing was taken
+// away from anybody; what it removes is the public position that would let
+// application code emit or receive signaling directly, which is the surface
+// `FORMAL-PROOFS.md` Theorem 11.2 says must not exist. `spawn_network` and the
+// `attach_*` functions are the way in.
+use state::SignalingOutbound;
 // `SignalingInbound` is no longer public. It was re-exported when it was the
 // engine's inbound mailbox item and appeared in `NetworkState`'s sender and in
-// `run_driver`'s receiver; `LaneDelivery` holds both of those positions now, and
-// no other public signature names it. Keeping the re-export would leave a public
-// type nothing public mentions, which is what §7.3's "no dead public re-export"
-// rules out. The type itself stays exactly where it was.
+// `run_driver`'s receiver; `EphemeralIngress` holds both of those positions
+// now, and no other public signature names it. Keeping the re-export would
+// leave a public type nothing public mentions, which is what §7.3's "no dead
+// public re-export" rules out. The type itself stays exactly where it was.
 use state::SignalingInbound;
 
 /// Spawn the engine for a single joined network. Returns the
@@ -140,9 +151,9 @@ pub(crate) async fn spawn_network_in_mesh_scope(
 /// The engine's main loop. Owns the per-network state and the
 /// fan-in mpsc that consolidates signaling, transport, and
 /// command events.
-pub async fn run_driver(
+pub(crate) async fn run_driver(
     state: Arc<NetworkState>,
-    mut signaling_inbound: crate::resource::ResourceMailboxReceiver<LaneDelivery>,
+    mut signaling_inbound: crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
     mut cmd_rx: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
 ) {
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
@@ -534,16 +545,18 @@ fn connecting_stuck_past_grace(data: &connection::PeerStateData, grace_ms: u64) 
             .unwrap_or(false)
 }
 
-async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: LaneDelivery) {
+async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: EphemeralIngress) {
     // Entry trace: signaling handlers run inline on the driver, so in a
     // debug capture the last of these lines names the message being handled
-    // when the driver stopped — and now also which lane it came in on and
-    // which carrier saw it, which is what the retained provenance is for.
+    // when the driver stopped — and also which carrier saw it, on which attach,
+    // and whether the device id was the carrier's or the sender's, which is what
+    // the retained provenance is for.
     trace!(
         network = %state.network_id,
         kind = delivered.kind_name(),
-        lane = delivered.lane().name(),
+        signal = delivered.signal().name(),
         carrier = delivered.carrier().name(),
+        ?delivered,
         "driver: signaling inbound"
     );
     state.traffic.record_signaling_rx(matches!(
@@ -997,13 +1010,74 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: LaneDeli
                 }
             }
         }
+        // **A carrier withdrawal is reachability evidence, not authority.**
+        //
+        // This used to call `drop_peer` unconditionally, which handed an
+        // unauthenticated medium the power to retire a live authenticated
+        // session. No carrier supplies a Device-authenticated departure: a
+        // Nostr or mDNS `leave` is a body a sender wrote, its envelope `from`
+        // is sender-supplied too, and neither is checked against any wire
+        // identity. `IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md` §5.4 says
+        // the signaling runtime must not synthesize withdrawal from
+        // disconnect, and `ARCHITECTURE.md` §4 ranks a signaling observation
+        // below fresh traffic on a live authenticated session.
+        //
+        // So the hint keeps exactly the power that matches its trust: it can
+        // end speculative work that has not yet become a session, and it can
+        // say "look now" to the machinery that *is* allowed to decide. A peer
+        // holding an open, authenticated data channel is left alone — the
+        // authenticated `SessionControl::Depart` on that very session, or
+        // ordinary connector closure, or the heartbeat, retires it.
+        //
+        // This is also what makes the body-claimed target harmless: naming a
+        // third Device in a `leave` now reaches a peer this side will not
+        // retire on that evidence.
         SignalingInbound::PeerLeft { device_id } => {
+            let healthy_authenticated_session = state
+                .peers
+                .get(&device_id)
+                .map(|peer| {
+                    let data = peer.state.read();
+                    data.authenticated && data.data_channel_open
+                })
+                .unwrap_or(false);
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
                 "signaling",
-                format!("peer left signaling: {}", short_peer(&device_id)),
-                serde_json::json!({ "peer": device_id }),
+                format!(
+                    "peer left signaling: {} ({})",
+                    short_peer(&device_id),
+                    if healthy_authenticated_session {
+                        "reachability hint only — its authenticated session is live"
+                    } else {
+                        "no live authenticated session to keep"
+                    }
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "retired_session": !healthy_authenticated_session,
+                }),
             );
+            if healthy_authenticated_session {
+                return;
+            }
+            // Nothing live is holding this peer open, so the hint is ending
+            // speculative work rather than a session: exactly the "cancel
+            // carrier-specific speculative work" a withdrawal may do.
+            //
+            // **The guard window, stated exactly, because "healthy" is a
+            // conjunction and the second half is the narrow one.** The predicate
+            // above is `authenticated && data_channel_open`. A session that is
+            // authenticated but whose data channel is closed — mid-recovery, or
+            // mid-replacement of the transport underneath it — fails it, and
+            // reaches this line: a carrier hint can retire it. That is
+            // deliberate rather than an oversight. It is the same predicate
+            // `depart_authenticated_sessions` uses to choose which sessions get
+            // an authenticated goodbye, so both halves of the lifecycle agree on
+            // what a live session is, and a session with no channel has no
+            // channel for a `SessionControl::Depart` to arrive on either. It is
+            // still a real window, and a session inside it is retired on
+            // evidence weaker than the session itself.
             drop_peer(state, &device_id, DropReason::UserLeft).await;
         }
     }
@@ -2926,6 +3000,7 @@ async fn handle_inbound_frame_from(
         MeshMessage::Pong(p) => heartbeat::on_pong(state, &dispatch, p).await,
         MeshMessage::Shelve(s) => on_shelve(state, &dispatch, s).await,
         MeshMessage::Unshelve(_) => on_unshelve(state, &dispatch).await,
+        MeshMessage::SessionControl(control) => on_session_control(state, &dispatch, control).await,
         MeshMessage::CapabilitiesUpdate(u) => on_capabilities_update(state, &dispatch, u).await,
         MeshMessage::RpcRequest(req) => on_rpc_request(state, &dispatch, req).await,
         // The three response arms settle *our own* pending outbound calls,
@@ -3037,6 +3112,47 @@ async fn on_shelve(
             by_us: false,
         }));
     });
+}
+
+/// The authenticated departure: retire the exact session that carried it.
+///
+/// **This is the only thing in the engine that may retire a healthy
+/// authenticated session on a peer's say-so, and the reason it may is that the
+/// session itself is the authority.** The frame arrived on a promoted session,
+/// under that session's own owner token, so "this session is ending" is a
+/// statement the sender is entitled to make about the one thing it can end.
+/// Contrast the carrier withdrawal in `handle_ephemeral_transport`, which is an
+/// unauthenticated hint from a medium and may not do this.
+///
+/// `drop_peer_if_current` rather than `drop_peer` is the whole safety property.
+/// It retires the installation named by *this* owner token and returns without
+/// doing anything if the current installation is a different one — so a
+/// departure that was in flight while the transport was replaced retires the
+/// session it was sent on, never its successor. A repeat is idempotent for the
+/// same reason: the second one finds nothing current to retire.
+///
+/// Nothing is acknowledged, retried, or timed. A departure that never arrives
+/// leaves the session to end the way every other unannounced loss ends it,
+/// through connector closure and failure detection.
+async fn on_session_control(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
+    control: crate::protocol::SessionControl,
+) {
+    match control {
+        crate::protocol::SessionControl::Depart => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "peer",
+                format!(
+                    "{} departed over its authenticated session",
+                    short_peer(dispatch.owner().device_id())
+                ),
+                serde_json::json!({ "peer": dispatch.owner().device_id() }),
+            );
+            drop_peer_if_current(state, dispatch.owner(), DropReason::UserLeft).await;
+        }
+    }
 }
 
 async fn on_unshelve(state: &Arc<NetworkState>, dispatch: &peer_registry::AdmittedInboundDispatch) {
@@ -4295,6 +4411,73 @@ enum ChannelDisposition {
 /// shape looked the peer up a second time *after* the await to record the
 /// send, which attributed those bytes to whatever entry was current by then —
 /// a replacement included.
+/// Depart every authenticated session this network holds, one at a time.
+///
+/// The deliberate-exit path: a graceful network leave, a network removal, or a
+/// daemon shutdown. **A reconnect must not call this** — a reconnect keeps its
+/// session and its application state while the transport underneath it recovers
+/// or is replaced, and announcing a departure would tell the far side to throw
+/// exactly that away.
+///
+/// # The order is the contract
+///
+/// Per session: attempt the send once, await that attempt settling, then retire
+/// the exact local session. Awaiting first is what makes the announcement worth
+/// making — the frame is handed to a live data channel before this side tears
+/// the channel down, which is the job the old fixed 250 ms sleep was doing
+/// blindly for every network whether or not it had anything to say.
+///
+/// **Settling is not delivery, and nothing here pretends otherwise.** There is
+/// no acknowledgement, no retry, no timer and no grace period. A send that
+/// fails, or that succeeds into a channel that dies before the bytes land,
+/// leaves the far side to notice the ordinary way: connector closure, or the
+/// heartbeat. The local retirement happens either way, because this side has
+/// decided to leave.
+pub(crate) async fn depart_authenticated_sessions(state: &Arc<NetworkState>) {
+    let departing = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        // The same predicate the withdrawal hint refuses to act on: a session
+        // that is authenticated and carrying. Those are exactly the sessions
+        // that now need an authenticated goodbye, because nothing weaker may
+        // retire them.
+        if data.authenticated && data.data_channel_open {
+            Some(peer.device_id.clone())
+        } else {
+            None
+        }
+    });
+    for device_id in departing {
+        let sent = send_to_peer(
+            state,
+            &device_id,
+            &MeshMessage::SessionControl(crate::protocol::SessionControl::Depart),
+        )
+        .await;
+        if let Err(error) = sent {
+            debug!(peer = %device_id, %error, "departure send did not settle; leaving anyway");
+        }
+        drop_peer(state, &device_id, DropReason::UserLeft).await;
+    }
+}
+
+/// `transport-lab` seam: drive [`depart_authenticated_sessions`] from an
+/// integration control.
+///
+/// The departure path is owned by the Peer Session lifecycle and reached in
+/// production through [`crate::MeshHandle::announce_leave`], which needs a
+/// registry entry. A two-engine control that builds its peers directly from
+/// [`spawn_network`] has no handle to call, and the alternative — pointing the
+/// control at the carrier hint instead — would assert the opposite of the
+/// boundary: that a withdrawal retires a healthy authenticated session.
+///
+/// This adds no capability. It is the same crate-internal function, exported
+/// only where `transport-lab` is on, so an ordinary build has no such public
+/// item.
+#[cfg(feature = "transport-lab")]
+pub async fn depart_for_lab(state: &Arc<NetworkState>) {
+    depart_authenticated_sessions(state).await;
+}
+
 pub(crate) async fn send_to_peer(
     state: &Arc<NetworkState>,
     device_id: &str,
@@ -5232,7 +5415,7 @@ fn build_test_state_parts_metered(
             .expect("outbound signaling mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<NetworkCmd>::root_claim()
             .expect("engine command mailbox root is representable"),
-        crate::resource::ResourceMailboxSender::<LaneDelivery>::root_claim()
+        crate::resource::ResourceMailboxSender::<EphemeralIngress>::root_claim()
             .expect("inbound signaling mailbox root is representable"),
     ]
     .into_iter()
@@ -5256,18 +5439,17 @@ fn build_test_state_parts_metered(
     const ENGINE_FIXTURE_PROMOTION_COMMANDS_PER_CONNECTOR: u64 = 1;
     const ENGINE_FIXTURE_QUEUED_CALLER_COMMANDS: u64 = 1;
 
-    let inbound_signaling = CarrierObservation::directed(
+    let inbound_signaling = EphemeralIngress::directed_for_control(
         SignalingCarrier::Local,
-        "fixture-signaling-peer".into(),
+        "fixture-signaling-peer",
         myownmesh_signaling::SignalingMessage::Offer {
             peer_id: "fixture-signaling-peer".into(),
             offer_id: "fixture-offer".into(),
             sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
         },
-    )
-    .into_delivery();
+    );
     let inbound_signaling =
-        crate::resource::ResourceMailboxSender::<LaneDelivery>::accepted_item_charge_for_test(
+        crate::resource::ResourceMailboxSender::<EphemeralIngress>::accepted_item_charge_for_test(
             &inbound_signaling,
         )
         .checked_scale(
@@ -6051,17 +6233,16 @@ mod tests {
 
     /// One presence observation, as the in-process carrier would report it.
     ///
-    /// Every carrier now reaches the driver through the lane boundary, so a
+    /// Every carrier now reaches the driver through the ingress boundary, so a
     /// control that handed `handle_signaling_inbound` a bare `SignalingInbound`
     /// would be exercising a path production no longer has.
-    fn announced_by_local_carrier(device_id: &str) -> LaneDelivery {
-        CarrierObservation::presence(SignalingCarrier::Local, device_id.to_string()).into_delivery()
+    fn announced_by_local_carrier(device_id: &str) -> EphemeralIngress {
+        EphemeralIngress::presence_for_control(SignalingCarrier::Local, device_id)
     }
 
     /// The same, for a carrier that stopped seeing the peer.
-    fn withdrawn_by_local_carrier(device_id: &str) -> LaneDelivery {
-        CarrierObservation::withdrawal(SignalingCarrier::Local, device_id.to_string())
-            .into_delivery()
+    fn withdrawn_by_local_carrier(device_id: &str) -> EphemeralIngress {
+        EphemeralIngress::withdrawal_for_control(SignalingCarrier::Local, device_id)
     }
 
     /// The borrowed stream frame exists so the sender never owns what it sends.
@@ -14802,13 +14983,13 @@ mod tests {
 
     /// **A carrier withdrawal is not a durable leave, and mints no authority.**
     ///
-    /// The engine-side half of the lane boundary's negative controls. The
-    /// module-side half proves that a withdrawal's only available effect is
-    /// `SignalingEffect::CarrierWithdrawal` — that the effect union contains
-    /// no durable-leave or roster-mutation variant for it to be instead. This
-    /// one proves the consequence where it would actually be visible: after the
-    /// driver has handled the withdrawal, the device is still a signed member,
-    /// still rostered, and still admissible.
+    /// The engine-side half of the ingress boundary's negative controls. The
+    /// module-side half proves that a withdrawal's only available kind is
+    /// `EphemeralSignal::Withdrawal` — that the union contains no durable-leave
+    /// or roster-mutation kind for it to be instead. This one proves the
+    /// consequence where it would actually be visible: after the driver has
+    /// handled the withdrawal, the device is still a signed member, still
+    /// rostered, and still admissible.
     ///
     /// **Its non-vacuity is the neighbouring control, not another assertion
     /// here.** `v4_r7_core_an_evicted_device_is_not_admitted_by_the_current_policy`
@@ -14818,13 +14999,28 @@ mod tests {
     /// something does move when the authority that owns the roster says so, and
     /// a carrier is not that authority.
     ///
-    /// No session exists for the withdrawal to tear down, which is deliberate:
-    /// tearing down a live session is what a withdrawal is *for*, is covered by
-    /// the peer-leave suite, and would need a WebRTC object here. What this
-    /// control isolates is the property a session teardown must not carry with
-    /// it.
+    /// **Two properties, and the first is the one the review turned on.** A
+    /// healthy authenticated session - authenticated, on an open data channel -
+    /// is installed before the withdrawals arrive, and it is still installed
+    /// afterwards: a carrier withdrawal is reachability evidence and has no
+    /// authority to retire it. Only the authenticated `SessionControl::Depart`
+    /// over that exact session can. The second is that nothing durable moved
+    /// either: the device is still a signed member, still rostered, and still
+    /// admissible.
+    ///
+    /// **This is the delivered-withdrawal half, and it is the half that covers
+    /// the single-carrier case.** The withdrawals here reach the handler, which
+    /// is what a lone attach produces: the ingress runtime holds a withdrawal
+    /// back only while some *other* attach still observes the device, which
+    /// `a_withdrawal_is_delivered_only_when_nothing_still_observes_the_device`
+    /// in `engine/signaling_ingress.rs` asserts separately. Neither control
+    /// subsumes the other, and only this one speaks to a Nostr-only network,
+    /// where presence and departure are both sender-claimed.
+    ///
+    /// The guard is `authenticated && data_channel_open`; the window that
+    /// conjunction leaves open is documented at the `PeerLeft` arm itself.
     #[tokio::test]
-    async fn v4_m2_u1_a_carrier_withdrawal_leaves_the_signed_membership_intact() {
+    async fn v4_m2_a_carrier_withdrawal_leaves_a_healthy_authenticated_session_intact() {
         use crate::network_state::{transition_payload, Transition, TransitionVariant};
 
         let state = build_test_state("carrier-withdrawal-no-durable-leave");
@@ -14886,20 +15082,35 @@ mod tests {
         // sees it — so it is built here with the carrier that actually delivers
         // it, rather than with a carrier that would make the control read wider
         // than it is.
+        // A healthy authenticated session for the withdrawals to fail to retire.
+        // Built directly rather than through a handshake: what is under test is
+        // the predicate the withdrawal reads, not how the session got there.
+        let session = Arc::new(PeerConnection::new(target.clone(), None));
+        {
+            let mut data = session.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        install_peer(&state.peers, Arc::clone(&session));
+
         handle_signaling_inbound(&state, withdrawn_by_local_carrier(&target)).await;
         handle_signaling_inbound(
             &state,
-            CarrierObservation::directed(
+            EphemeralIngress::directed_for_control(
                 SignalingCarrier::Local,
-                target.clone(),
+                &target,
                 myownmesh_signaling::SignalingMessage::Leave {
                     peer_id: target.clone(),
                 },
-            )
-            .into_delivery(),
+            ),
         )
         .await;
 
+        assert!(
+            state.peers.get(&target).is_some(),
+            "neither shape of carrier withdrawal may retire a healthy              authenticated session"
+        );
         assert!(
             !governance::log_evicted(&state, &target),
             "a carrier saying a device is gone is not the network saying it is \

@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::{OwnedQueue, SignalingMessage};
+use crate::{CarrierAttribution, OwnedQueue, SignalingMessage};
 
 /// Engine-side outbound message — the engine emits these for the
 /// signaling driver to deliver.
@@ -32,9 +32,18 @@ pub enum LocalOutbound {
 /// engine's command queue.
 #[derive(Debug, Clone)]
 pub enum LocalInbound {
-    PeerAnnounced { device_id: String },
-    Message { from: String, msg: SignalingMessage },
-    PeerLeft { device_id: String },
+    PeerAnnounced {
+        device_id: String,
+        attribution: CarrierAttribution,
+    },
+    Message {
+        from: String,
+        msg: SignalingMessage,
+    },
+    PeerLeft {
+        device_id: String,
+        attribution: CarrierAttribution,
+    },
 }
 
 /// One peer's hook into the broker. Stored in the broker's
@@ -107,9 +116,11 @@ impl LocalBroker {
             for p in peers.iter() {
                 let _ = p.inbound_tx.send(LocalInbound::PeerAnnounced {
                     device_id: device_id.to_string(),
+                    attribution: CarrierAttribution::CarrierObserved,
                 });
                 let _ = in_tx.send(LocalInbound::PeerAnnounced {
                     device_id: p.device_id.clone(),
+                    attribution: CarrierAttribution::CarrierObserved,
                 });
             }
             peers.push(PeerHandle {
@@ -132,7 +143,10 @@ impl LocalBroker {
             if let Some(peers) = guard.rooms.get_mut(&room) {
                 let left = device_id_for_task.clone();
                 peers.retain(|p| p.device_id != left);
-                let leave = LocalInbound::PeerLeft { device_id: left };
+                let leave = LocalInbound::PeerLeft {
+                    device_id: left,
+                    attribution: CarrierAttribution::CarrierObserved,
+                };
                 for p in peers.iter() {
                     let _ = p.inbound_tx.send(leave.clone());
                 }
@@ -162,8 +176,12 @@ fn route_outbound(
             continue;
         }
         let msg = match out {
-            LocalOutbound::Announce { device_id } => LocalInbound::PeerAnnounced {
-                device_id: device_id.clone(),
+            // Attributed to the registered handle that sent, not to the id
+            // in the payload. The two are the same for an honest peer, and when
+            // they differ the sender was naming somebody else.
+            LocalOutbound::Announce { device_id: _ } => LocalInbound::PeerAnnounced {
+                device_id: from.to_string(),
+                attribution: CarrierAttribution::CarrierObserved,
             },
             LocalOutbound::DirectedToPeer { to, msg } => {
                 if &p.device_id != to {
@@ -174,8 +192,9 @@ fn route_outbound(
                     msg: msg.clone(),
                 }
             }
-            LocalOutbound::Leave { device_id } => LocalInbound::PeerLeft {
-                device_id: device_id.clone(),
+            LocalOutbound::Leave { device_id: _ } => LocalInbound::PeerLeft {
+                device_id: from.to_string(),
+                attribution: CarrierAttribution::CarrierObserved,
             },
         };
         if p.inbound_tx.send(msg).is_ok() {
@@ -204,7 +223,7 @@ mod tests {
             .unwrap()
             .unwrap()
         {
-            LocalInbound::PeerAnnounced { device_id } => assert_eq!(device_id, "bob"),
+            LocalInbound::PeerAnnounced { device_id, .. } => assert_eq!(device_id, "bob"),
             other => panic!("alice expected PeerAnnounced(bob), got {other:?}"),
         }
         match tokio::time::timeout(std::time::Duration::from_millis(100), rx_b.recv())
@@ -212,7 +231,7 @@ mod tests {
             .unwrap()
             .unwrap()
         {
-            LocalInbound::PeerAnnounced { device_id } => assert_eq!(device_id, "alice"),
+            LocalInbound::PeerAnnounced { device_id, .. } => assert_eq!(device_id, "alice"),
             other => panic!("bob expected PeerAnnounced(alice), got {other:?}"),
         }
     }

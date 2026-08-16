@@ -39,7 +39,7 @@ use tracing::{debug, info, trace, warn};
 use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
 use super::wire::{self, Frame};
 use crate::nostr::handle::derive_room_handle;
-use crate::{Error, OwnedQueue, SignalingMessage};
+use crate::{CarrierAttribution, Error, OwnedQueue, SignalingMessage};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -64,10 +64,16 @@ pub struct MdnsDriverConfig {
 #[derive(Debug, Clone)]
 pub enum MdnsInbound {
     /// A peer's advertisement resolved (or refreshed) in our room.
-    PeerAnnounced { device_id: String },
+    PeerAnnounced {
+        device_id: String,
+        attribution: CarrierAttribution,
+    },
     /// A peer's advertisement was withdrawn (mDNS goodbye) or its
     /// record expired from the cache.
-    PeerLeft { device_id: String },
+    PeerLeft {
+        device_id: String,
+        attribution: CarrierAttribution,
+    },
     /// A peer addressed us directly over the TCP exchange.
     Message { from: String, msg: SignalingMessage },
 }
@@ -321,6 +327,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 // an announce; the engine is idempotent on repeats, same
                 // as with periodic Nostr announces.
                 let _ = shared.inbound_tx.send(MdnsInbound::PeerAnnounced {
+                    attribution: CarrierAttribution::CarrierObserved,
                     device_id: advert.peer,
                 });
             }
@@ -330,9 +337,10 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                     shared.peers.lock().remove(&peer);
                     shared.conns.lock().remove(&peer);
                     debug!(peer = %&peer[..peer.len().min(16)], "mdns peer withdrew");
-                    let _ = shared
-                        .inbound_tx
-                        .send(MdnsInbound::PeerLeft { device_id: peer });
+                    let _ = shared.inbound_tx.send(MdnsInbound::PeerLeft {
+                        device_id: peer,
+                        attribution: CarrierAttribution::CarrierObserved,
+                    });
                 }
             }
         }
@@ -589,10 +597,19 @@ async fn run_reader(
         }
         on_peer_frame(&frame.from);
         let inbound = match frame.msg {
+            // Both are attributed to the frame's own sender field, which is
+            // also what the peer table above is keyed on - a leave naming a
+            // third party used to reach the engine as that third party's.
+            // Sender-claimed either way: `frame.from` is decoded payload too,
+            // never checked against the wire source.
             SignalingMessage::Announce { .. } => MdnsInbound::PeerAnnounced {
                 device_id: frame.from,
+                attribution: CarrierAttribution::SenderClaimed,
             },
-            SignalingMessage::Leave { peer_id } => MdnsInbound::PeerLeft { device_id: peer_id },
+            SignalingMessage::Leave { peer_id: _ } => MdnsInbound::PeerLeft {
+                device_id: frame.from,
+                attribution: CarrierAttribution::SenderClaimed,
+            },
             other => MdnsInbound::Message {
                 from: frame.from,
                 msg: other,
@@ -650,9 +667,10 @@ async fn run_reannounce(shared: Arc<Shared>) {
         // peers, so this is noise, not harm.
         let peers: Vec<String> = shared.peers.lock().keys().cloned().collect();
         for device_id in peers {
-            let _ = shared
-                .inbound_tx
-                .send(MdnsInbound::PeerAnnounced { device_id });
+            let _ = shared.inbound_tx.send(MdnsInbound::PeerAnnounced {
+                device_id,
+                attribution: CarrierAttribution::CarrierObserved,
+            });
         }
     }
 }

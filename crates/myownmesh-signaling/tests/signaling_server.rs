@@ -200,7 +200,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // self-hosted relay (live forward or stored replay).
     let found = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(ev) = in_rx_b.recv().await {
-            if let NostrInbound::PeerAnnounced { device_id } = ev {
+            if let NostrInbound::PeerAnnounced { device_id, .. } = ev {
                 if device_id == "device-aaa" {
                     return true;
                 }
@@ -256,7 +256,7 @@ async fn driver_self_announced_leave_reaches_peer() {
     // B discovers A first.
     tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(ev) = in_rx_b.recv().await {
-            if matches!(ev, NostrInbound::PeerAnnounced { device_id } if device_id == "device-aaa")
+            if matches!(ev, NostrInbound::PeerAnnounced { device_id, .. } if device_id == "device-aaa")
             {
                 return;
             }
@@ -275,7 +275,7 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     let saw_leave = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(ev) = in_rx_b.recv().await {
-            if matches!(ev, NostrInbound::PeerLeft { device_id } if device_id == "device-aaa") {
+            if matches!(ev, NostrInbound::PeerLeft { device_id, .. } if device_id == "device-aaa") {
                 return true;
             }
         }
@@ -379,7 +379,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
     // First B discovers A.
     tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(ev) = in_rx_b.recv().await {
-            if matches!(ev, NostrInbound::PeerAnnounced { device_id } if device_id == "device-aaa")
+            if matches!(ev, NostrInbound::PeerAnnounced { device_id, .. } if device_id == "device-aaa")
             {
                 return;
             }
@@ -396,7 +396,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
 
     let saw_leave = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(ev) = in_rx_b.recv().await {
-            if matches!(ev, NostrInbound::PeerLeft { device_id } if device_id == "device-aaa") {
+            if matches!(ev, NostrInbound::PeerLeft { device_id, .. } if device_id == "device-aaa") {
                 return true;
             }
         }

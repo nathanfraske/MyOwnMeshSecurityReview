@@ -13,9 +13,8 @@ use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::resource::{
     checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
     LocalApplicationResourceScope, MeshRuntimeResourceScope, NetworkInstanceResourceScope,
-    ProcessResourceRoot, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
-    ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxReceiver, ResourceMailboxSender,
-    ResourceReport,
+    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceMailboxItem,
+    ResourceMailboxItemError, ResourceMailboxReceiver, ResourceMailboxSender, ResourceReport,
 };
 use crate::roster::Roster;
 use crate::runtime::session_broker::SessionBroker;
@@ -30,7 +29,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{broadcast, oneshot, watch};
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
-use super::signaling_lane::LaneDelivery;
+use super::signaling_ingress::EphemeralIngress;
 
 /// See a closed flow's native half retired, whichever half it had.
 ///
@@ -457,7 +456,7 @@ impl SignalingInbound {
     ///
     /// Deliberately not a [`ResourceMailboxItem`] impl. What the engine's
     /// inbound mailbox carries is a
-    /// [`super::signaling_lane::LaneDelivery`] — a classified input with its
+    /// [`super::signaling_ingress::EphemeralIngress`] — an admitted input with its
     /// lane and carrier provenance — and that is the type whose footprint the
     /// claim has to be priced against. Splitting the measurement out means the
     /// owner supplies `size_of::<Self>()` while this stays the one description
@@ -492,8 +491,13 @@ impl SignalingInbound {
 /// Outbound signaling messages from the engine to the signaling task.
 /// `Clone` so the bridge's fan-out can hand one engine emission to
 /// several concurrently-attached drivers (Nostr + mDNS).
+///
+/// Crate-private, with the rest of the raw signaling surface. Nothing outside
+/// `engine` constructs one, and a `pub` emission type is exactly the generic
+/// message bus `FORMAL-PROOFS.md` Theorem 11.2 turns on application code not
+/// having.
 #[derive(Debug, Clone)]
-pub enum SignalingOutbound {
+pub(crate) enum SignalingOutbound {
     Announce,
     /// Graceful departure broadcast — the dual of [`Announce`]. Tells every
     /// peer in the room to tear our session down *now* instead of waiting
@@ -589,12 +593,12 @@ pub struct NetworkState {
     pub events_tx: broadcast::Sender<MeshEvent>,
     pub(crate) application_gateway: crate::application_gateway::ApplicationGateway,
 
-    pub signaling_tx: ResourceMailboxSender<SignalingOutbound>,
+    pub(crate) signaling_tx: ResourceMailboxSender<SignalingOutbound>,
     /// Where every attached carrier delivers, and it takes a classified value
     /// rather than a bare [`SignalingInbound`]: the lane and the carrier
     /// provenance ride with the message to the engine instead of being computed
     /// and dropped at the bridge.
-    pub signaling_inbound_tx: ResourceMailboxSender<LaneDelivery>,
+    pub(crate) signaling_inbound_tx: ResourceMailboxSender<EphemeralIngress>,
     pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
 
     /// Receiving end of `signaling_tx` — held here so callers can
@@ -807,25 +811,15 @@ pub struct NetworkState {
 }
 
 impl NetworkState {
-    /// Construct a new network state. Returns the state plus the
-    /// inbound signaling receiver and the command-queue receiver
-    /// the driver consumes.
-    #[allow(clippy::type_complexity)]
-    pub fn new(
-        config: NetworkConfig,
-        identity: Arc<Identity>,
-        transport: Transport,
-    ) -> Result<(
-        Arc<Self>,
-        ResourceMailboxReceiver<LaneDelivery>,
-        ResourceMailboxReceiver<NetworkCmd>,
-    )> {
-        let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-        let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
-        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources)
-    }
-
     /// Construct state below an existing Mesh runtime observation scope.
+    ///
+    /// The entry point for every construction. There used to be a `new` above
+    /// this that acquired the global scopes itself and delegated here; nothing
+    /// called it once the raw signaling surface stopped being public, because
+    /// both real paths ([`super::spawn_network`] and its in-scope sibling)
+    /// already hold the scopes they want this state to live under. Reaching for
+    /// the global root inside a constructor was the thing that made it a
+    /// convenience rather than a seam.
     #[allow(clippy::type_complexity)]
     pub(crate) fn new_in_mesh_scope(
         config: NetworkConfig,
@@ -835,7 +829,7 @@ impl NetworkState {
         local_resources: &LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        ResourceMailboxReceiver<LaneDelivery>,
+        ResourceMailboxReceiver<EphemeralIngress>,
         ResourceMailboxReceiver<NetworkCmd>,
     )> {
         Self::new_in_resource_scope(
@@ -856,7 +850,7 @@ impl NetworkState {
         local_resources: LocalApplicationResourceScope,
     ) -> Result<(
         Arc<Self>,
-        ResourceMailboxReceiver<LaneDelivery>,
+        ResourceMailboxReceiver<EphemeralIngress>,
         ResourceMailboxReceiver<NetworkCmd>,
     )> {
         // Standing dials survive restarts by riding the network config —
@@ -1300,7 +1294,7 @@ impl NetworkState {
     /// Take the outbound signaling receiver so the signaling task
     /// can drain it. Only one consumer is supported; subsequent
     /// calls return `None`.
-    pub fn take_signaling_outbound_rx(
+    pub(crate) fn take_signaling_outbound_rx(
         self: &Arc<Self>,
     ) -> Option<ResourceMailboxReceiver<SignalingOutbound>> {
         self.signaling_outbound_rx.lock().take()

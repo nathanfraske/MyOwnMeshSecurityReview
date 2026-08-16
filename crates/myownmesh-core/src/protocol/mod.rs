@@ -234,6 +234,43 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
     })
 }
 
+/// The closed lifecycle control of one authenticated Peer Session.
+///
+/// **Not application payload, not a durable fact, and not signaling.** It is the
+/// one thing an endpoint may say about the session it is already speaking on,
+/// and it is deliberately the narrowest union that can say it.
+///
+/// # Why it carries no target
+///
+/// There is no Device ID field, and its absence is the security property rather
+/// than an economy. The session defines its own two endpoints, so a `Depart`
+/// means "this session is ending" and can mean nothing else. A target field
+/// would immediately be a way for one authenticated peer to ask a receiver to
+/// retire a *third* device's session — the same third-party naming that makes
+/// an unauthenticated carrier leave untrustworthy, reintroduced on the one path
+/// that is trusted.
+///
+/// # What a receiver may do with it
+///
+/// Retire the exact session that carried it, and nothing else. It is consumed
+/// under the current session owner, so a frame that arrives on a session which
+/// has since been replaced retires nothing — a stale departure cannot reach
+/// through to its own replacement. Repeats are idempotent: the second one finds
+/// the session already gone.
+///
+/// No acknowledgement, retry, timer, or grace period participates. A departure
+/// that is lost resolves the way every other lost frame does, through ordinary
+/// connector closure and failure detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SessionControl {
+    /// This endpoint is leaving deliberately: a graceful network leave, a
+    /// network removal, or a daemon shutdown. **Not** sent by a reconnect,
+    /// which keeps its session and application state while the transport
+    /// underneath it recovers or is replaced.
+    Depart,
+}
+
 /// Tagged union of every wire frame the mesh transport carries.
 ///
 /// The set is closed. There is no catch-all variant and no
@@ -255,6 +292,9 @@ pub enum MeshMessage {
     CapabilitiesUpdate(CapabilitiesUpdateMessage),
     Shelve(ShelveMessage),
     Unshelve(UnshelveMessage),
+    /// The authenticated session-lifecycle control. See [`SessionControl`] for
+    /// why it has no target field and what a receiver may do with it.
+    SessionControl(SessionControl),
     RpcRequest(RpcRequestMessage),
     RpcResponse(RpcResponseMessage),
     RpcStreamChunk(RpcStreamChunkMessage),
