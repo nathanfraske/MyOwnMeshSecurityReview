@@ -92,49 +92,91 @@ pub fn is_enrolled(network_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// One enrollment that exists but is not yet this device's lock.
+/// One enrollment that is **installed** but is not yet its caller's.
 ///
 /// Custody material is the one thing a caller cannot ask for twice: the secret
 /// and the recovery codes are shown exactly once and are never recoverable from
-/// disk. So the two halves are separable. Everything is generated here and
-/// nothing is written, which means a caller that could not hand the material to
-/// whoever asked for it leaves this device with **no** enrollment at all —
-/// rather than one whose secret nobody holds and which can only be removed by
-/// presenting a code nobody has.
+/// disk. That makes both orderings wrong on their own. Writing after the
+/// response is sent lets a device be told it is locked when the write then
+/// failed and it is not; never writing until then lets two callers both be told
+/// they are locked, because neither one exists to refuse the other.
 ///
-/// Dropping this value is therefore a complete rollback: it never touched disk.
-#[must_use = "an enrollment that is neither committed nor deliberately dropped installs no lock"]
-pub struct PreparedEnrollment {
+/// So the lock is installed *first*, under the store's serializing lock, and
+/// this value is the
+/// rollback that owns it until the material has been handed over. A successful
+/// response therefore names a lock that already exists, and an install that
+/// failed is an error response rather than a promise.
+///
+/// **Armed while it lives.** The undo runs on drop, so an unwind between the
+/// install and the handoff cannot strand a lock whose secret went nowhere —
+/// which, since `disable` requires a valid code, is a lock nobody could satisfy
+/// and nobody could remove. [`Self::keep`] disarms it; [`Self::roll_back`]
+/// performs it now and reports what happened.
+///
+/// **Exactly this record.** The undo compares the currently-installed secret
+/// against the one it installed and removes only on equality, so a rollback that
+/// runs late cannot take a successor's lock away: a second enrollment carries 20
+/// fresh random bytes, and the comparison fails.
+#[must_use = "an enrollment that is neither kept nor rolled back is undone on drop"]
+pub struct ProvisionalEnrollment {
+    /// The store this was installed in — held so the undo cannot be pointed at
+    /// a different one, and so the controls never touch the real one.
+    path: PathBuf,
     network_id: String,
     enrolled: Enrolled,
-    record: Enrollment,
+    /// False once [`Self::keep`] or [`Self::roll_back`] has settled this.
+    armed: bool,
 }
 
-impl PreparedEnrollment {
+impl ProvisionalEnrollment {
     /// The material the caller must show exactly once.
     pub fn enrolled(&self) -> &Enrolled {
         &self.enrolled
     }
 
-    /// The network this would lock.
+    /// The network this locks.
     pub fn network_id(&self) -> &str {
         &self.network_id
     }
 
-    /// Make it this device's lock.
+    /// The caller has the material, so the installed lock is this device's.
     ///
-    /// The duplicate check runs again here, against the store as it is now: a
-    /// second enrollment that landed while this one was being handed off keeps
-    /// its own lock rather than being overwritten by an older preparation.
-    pub fn commit(self) -> Result<()> {
-        commit_enrollment_at(&store_path()?, self)
+    /// Nothing is written: the lock is already on disk, which is the whole point
+    /// of installing before answering. This only disarms the undo.
+    pub fn keep(mut self) {
+        self.armed = false;
     }
 
-    /// [`Self::commit`] against an explicit store, as every other operation
-    /// here has: the controls must not write to the real one.
-    #[cfg(test)]
-    fn commit_at(self, path: &Path) -> Result<()> {
-        commit_enrollment_at(path, self)
+    /// The caller does not have the material, so remove exactly this lock.
+    ///
+    /// Reported rather than swallowed, so a daemon whose store it could not
+    /// reach says so. The drop below runs the same removal for the paths that
+    /// cannot report — an unwind, or a caller that dropped the value.
+    ///
+    /// Disarmed only once the removal has actually happened. A failed explicit
+    /// rollback that gave up ownership would leave the very lock this exists to
+    /// remove installed and unowned; instead the value stays armed, so the drop
+    /// that immediately follows tries once more. The retry is safe because the
+    /// removal is exact and idempotent: it removes this record or nothing.
+    pub fn roll_back(mut self) -> Result<()> {
+        remove_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ProvisionalEnrollment {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = remove_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)
+        {
+            tracing::warn!(
+                network = %self.network_id,
+                "a provisional MFA enrollment could not be rolled back: {error}"
+            );
+        }
     }
 }
 
@@ -144,18 +186,24 @@ impl PreparedEnrollment {
 /// first (which itself requires a valid code), so the lock can't be
 /// silently rotated away.
 ///
-/// Prepares and commits in one step. A caller that must hand the material over
-/// before the lock exists uses [`prepare_enroll`] and commits once it has.
+/// Installs and keeps in one step. A caller that has to hand the material to
+/// somebody else before it can say the enrollment succeeded uses
+/// [`install_provisional_enroll`] and settles it against whether the handoff
+/// actually happened.
 pub fn enroll(network_id: &str, account: &str) -> Result<Enrolled> {
-    let prepared = prepare_enroll(network_id, account)?;
-    let enrolled = prepared.enrolled.clone();
-    prepared.commit()?;
+    let provisional = install_provisional_enroll(network_id, account)?;
+    let enrolled = provisional.enrolled.clone();
+    provisional.keep();
     Ok(enrolled)
 }
 
-/// Generate an enrollment without installing it. See [`PreparedEnrollment`].
-pub fn prepare_enroll(network_id: &str, account: &str) -> Result<PreparedEnrollment> {
-    prepare_enroll_at(&store_path()?, network_id, account)
+/// Install an enrollment whose rollback the caller owns. See
+/// [`ProvisionalEnrollment`].
+pub fn install_provisional_enroll(
+    network_id: &str,
+    account: &str,
+) -> Result<ProvisionalEnrollment> {
+    install_provisional_enroll_at(&store_path()?, network_id, account)
 }
 
 /// The gate. `Ok(())` when the network has no enrollment on this device (the
@@ -178,8 +226,35 @@ pub fn disable(network_id: &str, code: &str) -> Result<()> {
 // Path-injectable core (so unit tests never touch the real secrets dir)
 // ---------------------------------------------------------------------------
 
-fn prepare_enroll_at(path: &Path, network_id: &str, account: &str) -> Result<PreparedEnrollment> {
-    let store = load_at(path)?;
+/// Serializes every read-modify-write of the custody store.
+///
+/// The store is one file read, checked, edited and written back, and the check
+/// is what makes "this device has one lock" true. Two of those sequences
+/// interleaving is the whole failure: both read a store with no entry for the
+/// network, both pass the duplicate check, both write, and the last write wins —
+/// so two callers are told they are enrolled and only one of the two secrets
+/// opens the lock that survives. `write_atomic` prevents a torn file; it cannot
+/// prevent a lost update, because the loser's read happened before the winner's
+/// write existed to be read.
+///
+/// Held across load → check → save and never across an `await`, since nothing
+/// under it is async. Poison-tolerant: a caller that panicked mid-sequence left
+/// the *file* consistent — `save_at` is atomic — so refusing every later
+/// enrollment because of it would turn one panic into a permanently unusable
+/// custody store.
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn install_provisional_enroll_at(
+    path: &Path,
+    network_id: &str,
+    account: &str,
+) -> Result<ProvisionalEnrollment> {
+    let _serialized = store_guard();
+    let mut store = load_at(path)?;
     if store.networks.contains_key(network_id) {
         return Err(Error::Custody(format!(
             "network {network_id} already has MFA enrolled on this device; disable it first"
@@ -190,42 +265,66 @@ fn prepare_enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Pre
     let recovery_codes = gen_recovery_codes();
     let recovery_hashes = recovery_codes.iter().map(|c| hash_code(c)).collect();
     let otpauth_uri = provisioning_uri(&secret_b32, account);
-    Ok(PreparedEnrollment {
-        network_id: network_id.to_string(),
-        enrolled: Enrolled {
+    store.networks.insert(
+        network_id.to_string(),
+        Enrollment {
             secret_b32: secret_b32.clone(),
-            otpauth_uri,
-            recovery_codes,
-        },
-        record: Enrollment {
-            secret_b32,
             recovery_hashes,
             created_at: now_unix(),
         },
+    );
+    // Written before anything is answered, so what comes back names a lock that
+    // exists. A failure here is the caller's failure: no material has been
+    // shown, and nothing is installed.
+    save_at(path, &store)?;
+    Ok(ProvisionalEnrollment {
+        path: path.to_path_buf(),
+        network_id: network_id.to_string(),
+        enrolled: Enrolled {
+            secret_b32,
+            otpauth_uri,
+            recovery_codes,
+        },
+        armed: true,
     })
 }
 
-fn commit_enrollment_at(path: &Path, prepared: PreparedEnrollment) -> Result<()> {
+/// Remove `network_id`'s lock, but only while it is still the exact one
+/// `secret_b32` names.
+///
+/// The comparison is the difference between an undo and a denial of service. A
+/// rollback that keys on the network alone removes whatever lock is installed by
+/// the time it runs — including a successor the operator enrolled after the
+/// first attempt failed, whose material *was* delivered. Constant-time, for the
+/// same reason every other comparison against stored custody material here is.
+fn remove_exact_at(path: &Path, network_id: &str, secret_b32: &str) -> Result<()> {
+    let _serialized = store_guard();
     let mut store = load_at(path)?;
-    if store.networks.contains_key(&prepared.network_id) {
-        return Err(Error::Custody(format!(
-            "network {} already has MFA enrolled on this device; disable it first",
-            prepared.network_id
-        )));
+    let Some(installed) = store.networks.get(network_id) else {
+        // Already gone — disabled, or rolled back once already. Same end state.
+        return Ok(());
+    };
+    if !constant_eq(installed.secret_b32.as_bytes(), secret_b32.as_bytes()) {
+        // A successor holds this network. It is not this rollback's to remove.
+        return Ok(());
     }
-    store.networks.insert(prepared.network_id, prepared.record);
+    store.networks.remove(network_id);
     save_at(path, &store)
 }
 
 #[cfg(test)]
 fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
-    let prepared = prepare_enroll_at(path, network_id, account)?;
-    let enrolled = prepared.enrolled.clone();
-    commit_enrollment_at(path, prepared)?;
+    let provisional = install_provisional_enroll_at(path, network_id, account)?;
+    let enrolled = provisional.enrolled.clone();
+    provisional.keep();
     Ok(enrolled)
 }
 
 fn require_at(path: &Path, network_id: &str, code: Option<&str>) -> Result<()> {
+    // A recovery code is *consumed* on match, which makes this a store mutation
+    // like any other: two gates racing on the same code could otherwise both
+    // read it unused and both be admitted by it.
+    let _serialized = store_guard();
     let mut store = load_at(path)?;
     let Some(enr) = store.networks.get_mut(network_id) else {
         return Ok(()); // not enrolled on this device → the gate is a no-op
@@ -257,7 +356,14 @@ fn require_at(path: &Path, network_id: &str, code: Option<&str>) -> Result<()> {
 }
 
 fn disable_at(path: &Path, network_id: &str, code: &str) -> Result<()> {
+    // The gate takes and releases [`STORE_LOCK`] itself, so the removal below
+    // takes a *fresh* one rather than wrapping both: the guard is a plain
+    // non-reentrant mutex, and holding it across the gate would deadlock on the
+    // first call. Nothing is lost by the gap — an install refuses while a lock
+    // is present, a second disable is idempotent, and a provisional rollback
+    // removes only its own exact record.
     require_at(path, network_id, Some(code))?;
+    let _serialized = store_guard();
     let mut store = load_at(path)?;
     store.networks.remove(network_id);
     save_at(path, &store)?;
@@ -540,102 +646,149 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// An enrollment whose material was never handed over installs no lock.
+    /// Two callers enrolling one network at once leave one lock, and the one
+    /// success is the secret that opens it.
     ///
-    /// The discriminating case for the daemon's MFA response: the secret and
-    /// the recovery codes are shown exactly once, so a lock written before the
-    /// caller has them is a lock nobody can satisfy and nobody can remove —
-    /// `disable` requires a valid code, which is precisely what would have been
-    /// lost. Dropping a prepared enrollment must therefore leave the store
-    /// exactly as it was.
+    /// The discriminating case for install-before-answer. Two clients used to be
+    /// able to run load → duplicate check → insert → save concurrently: both
+    /// read a store with no entry, both passed the check, and the last write
+    /// won. Both callers were told they were enrolled, and only one of the two
+    /// secrets opened the lock that survived — the other held material for a
+    /// lock that does not exist, on a device that now refuses to author
+    /// governance without a code it cannot produce.
     ///
-    /// The store is read after the drop rather than merely re-asked through
-    /// `is_enrolled_at`: what is being proved is that nothing was written, so
-    /// the file that would carry it is the thing to look at. A store that never
-    /// existed and a store that exists with no entry are both "no lock", and
-    /// both are checked.
+    /// Real threads and a barrier, so the two sequences genuinely overlap rather
+    /// than being asserted to. The *outcome* is deterministic under every
+    /// interleaving, which is the property: whichever thread takes
+    /// [`STORE_LOCK`] first installs, and the other one's duplicate check now
+    /// sees the entry the first wrote, because it is behind that same lock.
     #[test]
-    fn a_prepared_enrollment_that_is_dropped_installs_no_lock() {
+    fn v4_r7_core_b1_two_concurrent_enrollments_leave_one_lock_and_one_success() {
         let path = tmp();
-        let net = "fleet-prepared";
+        let net = "fleet-concurrent";
 
-        let prepared = prepare_enroll_at(&path, net, "laptop").expect("prepare");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let racing: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    install_provisional_enroll_at(&path, net, "phone").map(|installed| {
+                        let material = installed.enrolled().clone();
+                        // The response reached its caller, so the lock stands.
+                        installed.keep();
+                        material
+                    })
+                })
+            })
+            .collect();
+        let answered: Vec<Enrolled> = racing
+            .into_iter()
+            .filter_map(|thread| thread.join().expect("neither enrollment panics").ok())
+            .collect();
+
         assert_eq!(
-            prepared.enrolled().recovery_codes.len(),
-            RECOVERY_CODES,
-            "the caller is given the whole of what it must show exactly once"
+            answered.len(),
+            1,
+            "exactly one caller is told it enrolled; the other is refused, \
+             rather than both being told yes and one of them being wrong"
         );
-        assert_eq!(prepared.network_id(), net);
-        assert!(
-            !path.exists(),
-            "preparing writes nothing at all — not an empty store, not a store \
-             with the entry pending"
-        );
-
-        // The rollback: the material never reached its caller, so the lock it
-        // would have installed is abandoned with it.
-        drop(prepared);
-        assert!(!is_enrolled_at(&path, net), "and no lock survives the drop");
-        assert!(
-            require_at(&path, net, None).is_ok(),
-            "so the gate is still a no-op and this device is not locked out"
-        );
-
-        // The recoverable direction, stated as an outcome: enrolling again
-        // works, because nothing is there to refuse it.
-        let second = prepare_enroll_at(&path, net, "laptop").expect("prepare again");
-        second.commit_at(&path).expect("commit");
-        assert!(is_enrolled_at(&path, net));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The positive twin: a committed preparation is the lock, and it is the
-    /// one whose material the caller was given.
-    ///
-    /// Without this the control above would be satisfied by a `prepare` that
-    /// generated nothing usable. The secret that came back is used the way an
-    /// authenticator app uses it, against the store the commit wrote.
-    #[test]
-    fn a_committed_preparation_is_the_lock_its_caller_holds() {
-        let path = tmp();
-        let net = "fleet-committed";
-
-        // **Both prepared before either commits**, which is the only ordering
-        // that reaches the window `commit`'s second duplicate check exists for.
-        // Preparing the loser afterwards would be refused by `prepare` itself —
-        // correctly, since the store already holds a lock by then — and would
-        // leave the commit-time check untested, which is precisely the check
-        // that separates "this device has one lock" from "whichever handoff
-        // finished last wins".
-        let prepared = prepare_enroll_at(&path, net, "phone").expect("prepare");
-        let concurrent = prepare_enroll_at(&path, net, "phone")
-            .expect("a second preparation, taken while no lock exists yet");
-        let enrolled = prepared.enrolled().clone();
-        prepared.commit_at(&path).expect("commit");
-
-        assert!(is_enrolled_at(&path, net));
-        let secret = BASE32_NOPAD.decode(enrolled.secret_b32.as_bytes()).unwrap();
+        let secret = BASE32_NOPAD
+            .decode(answered[0].secret_b32.as_bytes())
+            .expect("the answered secret is base32");
         let code = totp_at(&secret, now_unix());
         assert!(
             require_at(&path, net, Some(&code)).is_ok(),
-            "the committed lock is satisfied by the secret its caller was shown"
+            "and the secret that came back is the installed lock — not the \
+             loser's, and not one that was overwritten"
         );
         assert!(
             require_at(&path, net, Some("000000")).is_err(),
             "non-vacuity: the gate is really locked, not accepting everything"
         );
 
-        // The loser of that race lands second and is refused, rather than
-        // overwriting a lock whose secret its own caller does not hold.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An enrollment whose material never reached its caller is removed — and a
+    /// successor is not removed by that undo arriving late.
+    ///
+    /// Both halves of the rollback's contract, in the order production reaches
+    /// them. The lock is installed *before* the response, so a response that is
+    /// refused or whose socket ended leaves a lock nobody holds: `disable`
+    /// requires a valid code, which is exactly what was lost, so nothing could
+    /// ever remove it. The armed drop is what removes it, and the drop rather
+    /// than an explicit call is deliberate — an unwind between the install and
+    /// the handoff must not strand one either.
+    ///
+    /// The stale-undo half is driven end to end rather than asserted about: the
+    /// first attempt's lock is cleared by the operator's own `disable`, a second
+    /// enrollment is installed and *delivered*, and only then does the first
+    /// attempt's rollback finally run. Keyed on the network alone it would take
+    /// the successor's lock away; keyed on the exact installed secret it finds
+    /// somebody else's 20 random bytes and leaves them alone.
+    #[test]
+    fn v4_r7_core_b1_an_unhanded_enrollment_is_removed_and_a_successor_survives_its_late_undo() {
+        let path = tmp();
+        let net = "fleet-unhanded";
+
+        let unhanded = install_provisional_enroll_at(&path, net, "laptop").expect("install");
+        assert_eq!(
+            unhanded.enrolled().recovery_codes.len(),
+            RECOVERY_CODES,
+            "the caller is given the whole of what it must show exactly once"
+        );
+        assert_eq!(unhanded.network_id(), net);
         assert!(
-            concurrent.commit_at(&path).is_err(),
-            "a preparation committed after another already holds the network is \
-             refused rather than silently rotating the lock away"
+            is_enrolled_at(&path, net),
+            "non-vacuity: the lock is on disk before anything is answered, which \
+             is the ordering the whole repair rests on"
+        );
+
+        // The response never reached `Sent`, so the armed rollback runs.
+        drop(unhanded);
+        assert!(
+            !is_enrolled_at(&path, net),
+            "an unhanded enrollment leaves no lock behind"
         );
         assert!(
-            require_at(&path, net, Some(&code)).is_ok(),
-            "and the original secret still satisfies it"
+            require_at(&path, net, None).is_ok(),
+            "so the gate is a no-op again and this device is not locked out of \
+             its own governance"
+        );
+
+        // A first attempt that *did* answer, and is then surrendered the
+        // ordinary way — which is what lets a successor exist while the first
+        // attempt's rollback is still owed.
+        let first = install_provisional_enroll_at(&path, net, "laptop").expect("install again");
+        let first_material = first.enrolled().clone();
+        let first_secret = BASE32_NOPAD
+            .decode(first_material.secret_b32.as_bytes())
+            .expect("the first secret is base32");
+        disable_at(&path, net, &totp_at(&first_secret, now_unix()))
+            .expect("the operator surrenders the first lock with its own code");
+
+        let successor = install_provisional_enroll_at(&path, net, "laptop").expect("the successor");
+        let successor_material = successor.enrolled().clone();
+        successor.keep();
+        assert!(
+            is_enrolled_at(&path, net),
+            "non-vacuity: there is a successor lock for a stale undo to threaten"
+        );
+
+        // The late rollback of the first attempt, arriving now.
+        drop(first);
+        assert!(
+            is_enrolled_at(&path, net),
+            "the successor's lock is not the first attempt's to remove"
+        );
+        let successor_secret = BASE32_NOPAD
+            .decode(successor_material.secret_b32.as_bytes())
+            .expect("the successor secret is base32");
+        assert!(
+            require_at(&path, net, Some(&totp_at(&successor_secret, now_unix()))).is_ok(),
+            "and it is still satisfied by the secret its own caller was shown"
         );
 
         let _ = std::fs::remove_file(&path);

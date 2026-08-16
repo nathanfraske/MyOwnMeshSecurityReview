@@ -29,17 +29,20 @@ pub async fn run() -> Result<()> {
         myownmesh::embedded::start_infrastructure_only(cfg, resources).await?
     };
 
-    // Subscribed before the wait, not inside it: a broadcast receiver sees only
-    // what is sent after it subscribes, and the daemon can ask for its own
-    // shutdown the moment a reset request lands.
-    let mut runtime_shutdown = daemon.supervisor().subscribe();
     // Two ways this process stops serving, and neither is a duration. The host
     // signal is the operator's; the runtime request is the daemon's own, raised
     // by a reset that has already removed the state it was running on. Either
-    // way the drain below is the same one.
+    // way the drain below is the same one — the same `shutdown` an embedder
+    // calls, reached here through a select because this deployment also has a
+    // signal to answer, and through `run_until_shutdown` where it does not.
+    //
+    // No subscription is taken first. The request is a latched state, so one
+    // submitted while this process was still starting — the control socket is
+    // accepting before `start_*` returns — resolves here rather than being a
+    // wake nobody was listening for.
     tokio::select! {
         () = wait_for_shutdown_signal() => tracing::info!("shutdown requested"),
-        _ = runtime_shutdown.recv() => {
+        () = daemon.supervisor().wait_requested() => {
             tracing::info!("daemon runtime requested shutdown — returning so the service supervisor can start a fresh instance");
         }
     }

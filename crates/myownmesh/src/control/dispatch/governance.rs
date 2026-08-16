@@ -378,26 +378,33 @@ pub(in crate::control) async fn spawn_split(
 }
 
 /// Enrol this device in local MFA custody for one network.
-/// The enrollment is generated but not installed.
 ///
-/// Its secret and recovery codes are shown exactly once and cannot be recovered
-/// from disk, so the lock is only written once the connection loop reports the
-/// line carrying them was sent. Until then this device holds no enrollment at
-/// all, which is the recoverable direction: a caller can enroll again. See
-/// [`ProvisionalHandoff`].
+/// The lock is installed before this answers, so a success response names an
+/// enrollment that already exists: an install this device could not perform is
+/// an error response rather than a promise, and a second client enrolling the
+/// same network at the same moment is refused by the lock the first one
+/// installed rather than by a check neither of them can see.
+///
+/// The secret and recovery codes are shown exactly once and cannot be recovered
+/// from disk, so a response that is refused or whose socket ended would leave a
+/// lock nobody can satisfy and nobody can remove — `disable` requires a valid
+/// code. The connection loop settles that: the enrollment is kept once the line
+/// carrying its material was sent, and removed by its exact installed identity
+/// otherwise. See [`ProvisionalHandoff`].
 pub(in crate::control) fn mfa_enroll(
     admission: &FrameAdmission,
     network: String,
 ) -> Result<(Answer, ProvisionalHandoff)> {
     let owner =
         ResponseOwner::acquire(admission).context("MFA enrollment operation was not admitted")?;
-    let (result, provisional) = match myownmesh_core::custody::prepare_enroll(&network, &network) {
-        Ok(prepared) => (
-            Ok(prepared.enrolled().clone()),
-            ProvisionalHandoff::MfaEnrollment(prepared),
-        ),
-        Err(error) => (Err(error), ProvisionalHandoff::None),
-    };
+    let (result, provisional) =
+        match myownmesh_core::custody::install_provisional_enroll(&network, &network) {
+            Ok(installed) => (
+                Ok(installed.enrolled().clone()),
+                ProvisionalHandoff::MfaEnrollment(installed),
+            ),
+            Err(error) => (Err(error), ProvisionalHandoff::None),
+        };
     let answer = funded(
         PreparedReply::Variable(FundedVariableReply::mfa_enrollment(result, owner)),
         admission,

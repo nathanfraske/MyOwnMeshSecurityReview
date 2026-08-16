@@ -9,7 +9,6 @@
 //! daemon as a child process), but nothing here is mobile-specific — any
 //! embedder that wants the daemon in-process can use it.
 
-use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::control;
@@ -63,10 +62,31 @@ impl EmbeddedDaemon {
     ///
     /// A reset submits through this object, so a host that only ever waits on
     /// its own signal would keep running against state the daemon has deleted.
-    /// Subscribe while starting up: a broadcast receiver sees only what is sent
-    /// after it subscribes.
+    /// There is no subscribe-in-time rule: the request is a latched state, and
+    /// `wait_requested` resolves on one submitted before this handle even
+    /// existed — which it can be, since the control socket is accepting before
+    /// startup returns.
     pub fn supervisor(&self) -> &crate::supervisor::RuntimeSupervisor {
         &self.supervisor
+    }
+
+    /// Hold this daemon until its runtime is asked to stop, then drain it.
+    ///
+    /// The whole of what a host with no signal source of its own has to do, and
+    /// the reason it exists is that the two halves were previously the host's to
+    /// join: a reset submitted through the supervisor stopped the *control
+    /// surface*, while hosted services, departure announcements and every joined
+    /// network were only torn down by [`Self::shutdown`]. A host that did not
+    /// write that glue kept a half-dead daemon.
+    ///
+    /// One drain, shared with an embedder's explicit `shutdown` — this is that
+    /// call, after the wait. Idempotent because it consumes the daemon: there is
+    /// no second drain to run, rather than a flag saying there is not. Nothing
+    /// here is timed and nothing ends the host process; this returns and the
+    /// application carries on.
+    pub async fn run_until_shutdown(self) {
+        self.supervisor.wait_requested().await;
+        self.shutdown().await;
     }
 
     /// Graceful teardown, exactly like the serve binary's signal path.
@@ -204,13 +224,11 @@ async fn start_with_mesh(
 
     // Control socket: the same listener + wire protocol every client talks
     // to, whether the daemon is a process or embedded.
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let supervisor = crate::supervisor::RuntimeSupervisor::new(shutdown_tx);
+    let supervisor = crate::supervisor::RuntimeSupervisor::new();
     let ctl_supervisor = supervisor.clone();
     let ctl_mesh = mesh.clone();
     let ctl_registry = registry.clone();
     let ctl_services = service_manager.clone();
-    let ctl_shutdown = supervisor.subscribe();
     let ctl_socket = cfg.daemon.control_socket.clone();
     // Kept, not discarded. See [`EmbeddedDaemon::control`].
     let control = tokio::spawn(async move {
@@ -221,7 +239,6 @@ async fn start_with_mesh(
             ctl_socket,
             realtime,
             ctl_supervisor,
-            ctl_shutdown,
         )
         .await
         {
@@ -395,20 +412,28 @@ mod tests {
         );
     }
 
-    /// The reset path's own action: one runtime shutdown request drains this
-    /// daemon and leaves the process hosting it running.
+    /// A reset submitted **before** the host has a waiter still drains the whole
+    /// daemon, and leaves the process hosting it running.
     ///
-    /// This is what the deleted shape could not pass. A reset used to spawn a
-    /// detached task, sleep for a fixed interval it hoped was longer than the
-    /// write, and call `std::process::exit(0)` — which ends the *host*, not the
-    /// daemon, and takes every embedder's own state with it. Here the request is
-    /// submitted the way the reset arm submits it, after the response reached a
-    /// write disposition, and what follows is the ordinary drain.
+    /// The discriminating control for B2, and the ordering is the whole of it.
+    /// The request used to be a broadcast send: `start_with_mesh` spawns the
+    /// control socket and only *then* returns the handle a host could subscribe
+    /// through, so a reset arriving in that window signalled nobody, latched the
+    /// submitted flag so no later request could signal either, and left the host
+    /// waiting forever on a daemon whose state had already been deleted. Here
+    /// the request is submitted first — the way the reset arm submits it, once
+    /// its response has reached a write disposition — and the waiter is
+    /// constructed afterwards, by `run_until_shutdown`.
     ///
-    /// The request and the embedder's later `shutdown` are the same idempotent
-    /// path, so the second one submits nothing second — asserted here rather
-    /// than inferred, because a second send on a capacity-one broadcast would
-    /// overwrite an unread first.
+    /// `run_until_shutdown` rather than a direct `shutdown`, because a direct
+    /// call drains whether or not anything ever observed the request, which is
+    /// exactly the claim under test. What it reaches is the same single drain:
+    /// the control surface awaited, then hosted services, then departures, then
+    /// every joined network.
+    ///
+    /// The request and an embedder's own `shutdown` are one idempotent path, so
+    /// a second submission submits nothing second — asserted rather than
+    /// inferred.
     ///
     /// The host being alive is not asserted with a duration or a probe: this
     /// control body simply continues, and a process that had exited could not
@@ -418,7 +443,7 @@ mod tests {
     /// this control chooses.
     #[cfg(unix)]
     #[tokio::test]
-    async fn v4_r6_daemon_b2_a_runtime_shutdown_request_drains_and_leaves_the_host_alive() {
+    async fn v4_r7_daemon_b2_a_reset_submitted_before_any_waiter_drains_the_whole_daemon() {
         use interprocess::local_socket::{tokio::prelude::*, GenericFilePath, ToFsName};
 
         const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
@@ -454,7 +479,7 @@ mod tests {
             "non-vacuity: nothing has asked this runtime to stop yet"
         );
         // The reset arm's action, submitted once the response has reached its
-        // write disposition.
+        // write disposition — and before anything below waits on it.
         assert!(
             daemon.supervisor().request_shutdown(),
             "the reset submits the one request"
@@ -465,9 +490,12 @@ mod tests {
             "which a later caller does not submit a second time"
         );
 
-        match tokio::time::timeout(HANG_GUARD, daemon.shutdown()).await {
+        // The waiter is constructed here, strictly after both submissions. A
+        // request that had been a notification would have nothing left to
+        // deliver, and this would never return.
+        match tokio::time::timeout(HANG_GUARD, daemon.run_until_shutdown()).await {
             Ok(()) => {}
-            Err(_) => panic!("hang guard: the requested drain returns"),
+            Err(_) => panic!("hang guard: a waiter built after the request resolves and drains"),
         }
 
         let name = socket

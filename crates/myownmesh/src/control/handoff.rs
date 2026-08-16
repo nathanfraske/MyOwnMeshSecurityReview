@@ -12,6 +12,13 @@
 //! rather than keeping it, and the loop settles it against the one fact only
 //! the loop has: whether the answer was actually written.
 //!
+//! Two of the three are not the daemon's until the loop commits them. The MFA
+//! enrollment is the exception and is deliberately the other way round: the lock
+//! is installed *before* the response, so a success response names a lock that
+//! already exists, and what the loop settles is whether to keep or remove it.
+//! Deferring the write instead would let two clients both be told they enrolled,
+//! because neither installed lock would exist to refuse the other.
+//!
 //! This is deliberately not a transaction framework. There is one value, it
 //! moves, and it has exactly two outcomes. Operations with queryable or
 //! idempotent results — labels, ordinary governance mutations, dials, joins —
@@ -54,8 +61,9 @@ pub(in crate::control) enum ProvisionalHandoff {
     /// survives an unhanded setup response" true by construction rather than by
     /// cancellation.
     RpcStream(super::dispatch::rpc::PendingStreamForward),
-    /// Custody material that has been generated but not written.
-    MfaEnrollment(myownmesh_core::custody::PreparedEnrollment),
+    /// A custody lock that is installed but whose material has not been
+    /// delivered.
+    MfaEnrollment(myownmesh_core::custody::ProvisionalEnrollment),
 }
 
 impl ProvisionalHandoff {
@@ -80,20 +88,11 @@ impl ProvisionalHandoff {
             // is reading, and only now does the client hold the coordinate that
             // names what it will carry.
             Self::RpcStream(pending) => pending.spawn(),
-            // A commit that fails leaves this device unlocked, which is the
-            // recoverable direction: the caller holds material for an
-            // enrollment that does not exist and can enroll again. The opposite
-            // — a lock installed whose secret was never delivered — is what
-            // this ordering exists to prevent.
-            Self::MfaEnrollment(prepared) => {
-                let network = prepared.network_id().to_owned();
-                if let Err(error) = prepared.commit() {
-                    warn!(
-                        %network,
-                        "MFA enrollment was handed to its caller but could not be persisted: {error}"
-                    );
-                }
-            }
+            // Nothing is written and nothing can fail: the lock was installed
+            // before the response named it, so a caller told it enrolled is
+            // holding the secret to a lock that already exists. This only
+            // disarms the undo that owned it until now.
+            Self::MfaEnrollment(provisional) => provisional.keep(),
         }
     }
 
@@ -119,8 +118,20 @@ impl ProvisionalHandoff {
             // Dropping the pending forward drops the filed stream's receiver,
             // which withdraws it, and no task was ever spawned to outlive it.
             Self::RpcStream(pending) => drop(pending),
-            // Nothing was written, so there is nothing to remove.
-            Self::MfaEnrollment(prepared) => drop(prepared),
+            // The lock exists and its secret went nowhere, so remove exactly
+            // that lock — by its installed identity, so a rollback that runs
+            // after the operator enrolled again leaves the successor alone. A
+            // store this cannot reach is reported here rather than only inside
+            // the drop, which has nowhere to say it.
+            Self::MfaEnrollment(provisional) => {
+                let network = provisional.network_id().to_owned();
+                if let Err(error) = provisional.roll_back() {
+                    warn!(
+                        %network,
+                        "an unhanded MFA enrollment could not be removed: {error}"
+                    );
+                }
+            }
         }
     }
 }

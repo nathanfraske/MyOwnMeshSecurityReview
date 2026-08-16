@@ -193,12 +193,16 @@ pub async fn propose(
         id: id.clone(),
         created_at: member_tier_timestamp(state, &variant),
         proposer: self_pubkey.clone(),
-        variant: variant.clone(),
-        signers: vec![self_pubkey.clone()],
-        signatures: vec![signature.clone()],
+        variant,
+        signers: vec![self_pubkey],
+        signatures: vec![signature],
         deniers: Vec::new(),
         split_spawned: false,
     };
+    // The announcement is derived from the record, before the record is filed
+    // away — see [`announcement`] for why it is not built from the same values a
+    // second time.
+    let msg = MeshMessage::NetworkStatePropose(announcement(&proposal));
 
     {
         let mut gov = state.governance_state.write();
@@ -206,13 +210,6 @@ pub async fn propose(
         network_state::save(&gov)?;
     }
 
-    let msg = MeshMessage::NetworkStatePropose(NetworkStateProposeMessage {
-        proposal_id: id.clone(),
-        variant,
-        proposer: self_pubkey,
-        created_at: now_unix(),
-        signature,
-    });
     broadcast(state, msg).await;
 
     // After every governance-mutating step that wrote to pending or
@@ -227,6 +224,38 @@ pub async fn propose(
     let _ = try_ratify(state, &id).await;
 
     Ok(id)
+}
+
+/// The wire announcement for a proposal this device just filed.
+///
+/// Built from the **record**, not a second time from the values the record was
+/// built from, and that distinction is the whole of this function. One signed
+/// proposal has one `created_at`: the local pending entry and the frame that
+/// announces it used to sample the clock independently, so the proposer filed
+/// `member_tier_timestamp` — deliberately strictly past the target's newest
+/// member-log entry — while every receiver filed a bare wall clock. `try_ratify`
+/// builds `Transition { at: p.created_at, .. }` from whichever record it holds,
+/// so one proposal ratified into two different member-log entries.
+///
+/// That is not cosmetic drift. The member tier orders by `at`, and its total
+/// order lets an equal-stamp grant beat a tombstone, so an eviction authored in
+/// the same wall-clock second as its target's admit removed the member on the
+/// proposer and left it granted on every peer — one node refusing a device
+/// another still positively authorises. The two `at` values also gave the two
+/// entries different `member_entry_key`s, so the union merge kept both copies of
+/// what was logically one transition.
+///
+/// The signature is the proposer's own, which is the only one a freshly filed
+/// proposal carries. A record without it announces an empty signature, which no
+/// receiver can verify — a malformed proposal is refused rather than trusted.
+fn announcement(proposal: &Proposal) -> NetworkStateProposeMessage {
+    NetworkStateProposeMessage {
+        proposal_id: proposal.id.clone(),
+        variant: proposal.variant.clone(),
+        proposer: proposal.proposer.clone(),
+        created_at: proposal.created_at,
+        signature: proposal.signatures.first().cloned().unwrap_or_default(),
+    }
 }
 
 /// Sign an existing pending proposal authored elsewhere (or
@@ -2107,5 +2136,246 @@ mod state_broadcast_reply_controls {
                 }
             }
         }
+    }
+}
+
+/// Controls for the one timestamp a member proposal carries.
+#[cfg(test)]
+mod member_proposal_timestamp_controls {
+    use super::*;
+
+    /// The transition [`try_ratify`] would build from a filed proposal.
+    ///
+    /// Spelled here rather than reached through `try_ratify` because the two
+    /// sides under test are deliberately *unable* to ratify — the point is that
+    /// the record each one holds already determines the entry, so the entries
+    /// can be compared without a quorum either side has. It is the same three
+    /// lines `try_ratify` runs, and if it ever stops being, the byte-identity
+    /// claim below is the thing that stops meaning anything.
+    fn would_ratify(proposal: &Proposal) -> Transition {
+        let (signers, signatures) =
+            canonicalize_signers(&proposal.proposer, &proposal.signers, &proposal.signatures);
+        Transition {
+            at: proposal.created_at,
+            variant: proposal.variant.clone(),
+            signers,
+            signatures,
+        }
+    }
+
+    /// A closed network this device holds no authority on.
+    ///
+    /// The proposal below is filed and announced but cannot ratify, and that is
+    /// the whole reason for the stranger-owner: a ratified proposal is removed
+    /// from `pending`, and the pending record is what this control has to read.
+    /// Nothing else about the network is unusual.
+    fn ungoverned_closed_network(state: &Arc<EngineState>, stranger: &str) {
+        let mut gov = state.governance_state.write();
+        gov.kind = NetworkKind::Closed;
+        gov.roles.insert(pk(stranger), Role::Owner);
+    }
+
+    /// One signed proposal carries one `created_at`, locally and on the wire.
+    ///
+    /// The discriminating control for the divergence. `member_tier_timestamp`
+    /// stamps an eviction strictly past its target's newest member-log entry, so
+    /// that a same-second admit cannot win the member tier's last-writer-wins
+    /// tie. The announcement used to sample the wall clock a second time, which
+    /// threw that stamp away for every receiver: the proposer removed the member
+    /// and each peer kept it granted, from one signed proposal.
+    ///
+    /// The seeded admit is stamped *now*, which is what makes this exact rather
+    /// than approximate — the two numbers under test are only distinguishable
+    /// within one wall-clock second, and `admitted_at` puts the control there by
+    /// construction rather than by being fast. Its signature is not a trust
+    /// input here: `member_tier_timestamp` reads a member-log entry's target and
+    /// `at`, and nothing else.
+    ///
+    /// The receiving side is the real [`on_propose`], so the wire value is
+    /// verified, filed and read back the way a peer files it rather than
+    /// asserted about in the abstract.
+    #[tokio::test]
+    async fn v4_r7_core_b3_one_member_proposal_carries_one_timestamp_to_every_peer() {
+        let author = crate::engine::build_test_state("one-proposal-one-stamp");
+        let receiver = crate::engine::build_test_state("one-proposal-one-stamp");
+        let stranger = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        ungoverned_closed_network(&author, &stranger);
+        ungoverned_closed_network(&receiver, &stranger);
+
+        let admitted_at = now_unix();
+        {
+            let mut gov = author.governance_state.write();
+            gov.member_log.push(Transition {
+                at: admitted_at,
+                variant: TransitionVariant::RoleGrant {
+                    target: target.clone(),
+                    role: Role::Member,
+                },
+                signers: vec![pk(&stranger)],
+                signatures: vec![String::new()],
+            });
+        }
+
+        let id = propose(
+            &author,
+            TransitionVariant::Evict {
+                target: target.clone(),
+            },
+            None,
+        )
+        .await
+        .expect("the eviction is filed even where this device cannot ratify it");
+
+        let (filed_at, announced, local_entry) = {
+            let gov = author.governance_state.read();
+            let filed =
+                gov.pending.iter().find(|p| p.id == id).expect(
+                    "an unratifiable proposal stays pending, which is what makes it readable",
+                );
+            (filed.created_at, announcement(filed), would_ratify(filed))
+        };
+
+        assert!(
+            filed_at > admitted_at,
+            "non-vacuity: the author's stamp really is strictly past the target's \
+             admit, so a second clock sample in the same second is a different \
+             number and this control can tell the two apart"
+        );
+        assert_eq!(
+            announced.created_at, filed_at,
+            "the announcement carries the stamp that was filed, not a second \
+             sample of the clock"
+        );
+
+        on_propose(&receiver, author.identity.public_id(), announced).await;
+        let remote_entry = {
+            let gov = receiver.governance_state.read();
+            let received = gov
+                .pending
+                .iter()
+                .find(|p| p.id == id)
+                .expect("the receiver verifies and files the announced proposal");
+            would_ratify(received)
+        };
+
+        assert_eq!(
+            local_entry, remote_entry,
+            "one proposal ratifies to one transition on both sides, `at` included"
+        );
+        assert_eq!(
+            serde_json::to_string(&local_entry).expect("a transition serializes"),
+            serde_json::to_string(&remote_entry).expect("a transition serializes"),
+            "and to one union-merge key: the member log dedupes on the whole \
+             serialized entry, so two `at` values would keep two copies of what \
+             was logically one transition"
+        );
+    }
+
+    /// An admit and an eviction in the same wall-clock second still remove the
+    /// member, on the author and on every peer.
+    ///
+    /// The consequence half, taken at the tier that decides it. The member log's
+    /// total order puts a tombstone *before* a grant of the same `at` and folds
+    /// last-writer-wins, so an equal-stamp grant survives — which is why
+    /// `member_tier_timestamp` exists and why announcing a bare clock instead
+    /// mattered. Both shapes are asserted: the tie is the counterexample the
+    /// divergence produced, and without it the positive claim would hold for a
+    /// log that never had a tie in it.
+    #[test]
+    fn v4_r7_core_b3_an_equal_second_admit_and_eviction_removes_the_member() {
+        let owner = crate::identity::Identity::ephemeral();
+        let owner_pk = owner.public_id().to_string();
+        let network_id = "equal-second-eviction-control";
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let target_pk = crate::signing::pubkey_part(&target).to_string();
+
+        // The founder self-election, which is what seats the author as Owner in
+        // the verified state the member tier evaluates authority against.
+        let close = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let elected = Transition {
+            at: 1,
+            variant: close.clone(),
+            signers: vec![owner_pk.clone()],
+            signatures: vec![network_state::sign_transition(
+                network_id,
+                &close,
+                owner.signing_key(),
+            )],
+        };
+        let verified = network_state::verify_log(network_id, std::slice::from_ref(&elected))
+            .expect("the founder election verifies");
+
+        let signed = |variant: &TransitionVariant, at: u64| Transition {
+            at,
+            variant: variant.clone(),
+            signers: vec![owner_pk.clone()],
+            signatures: vec![network_state::sign_transition(
+                network_id,
+                variant,
+                owner.signing_key(),
+            )],
+        };
+        // One second, shared: the admit and the eviction the owner authors
+        // inside it.
+        let second = 1_700_000_000u64;
+        let admit = TransitionVariant::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        };
+        let evict = TransitionVariant::Evict {
+            target: target.clone(),
+        };
+        let granted = signed(&admit, second);
+        // What a receiver used to file: the bare wall clock, tied with the admit.
+        let tied = signed(&evict, second);
+        // What the author files, and now what it announces: strictly past.
+        let monotonic = signed(&evict, second + 1);
+
+        assert!(
+            !network_state::member_log_removed(
+                &verified,
+                &[granted.clone(), tied.clone()],
+                network_id
+            )
+            .contains(&target_pk),
+            "non-vacuity: an eviction tied with the admit really does lose the \
+             member tier's order — that is the divergence, not a rounding detail"
+        );
+        assert!(
+            network_state::member_log_removed(
+                &verified,
+                &[granted.clone(), monotonic.clone()],
+                network_id
+            )
+            .contains(&target_pk),
+            "and the stamp both sides now carry removes the member"
+        );
+
+        assert_eq!(
+            network_state::merge_member_logs(
+                &[granted.clone(), monotonic.clone()],
+                &[granted.clone(), monotonic.clone()]
+            )
+            .len(),
+            2,
+            "two peers holding the same two proposals merge to two entries — one \
+             per proposal"
+        );
+        assert_eq!(
+            network_state::merge_member_logs(&[granted.clone(), monotonic], &[granted, tied]).len(),
+            3,
+            "non-vacuity: the divergence this replaces merged one logical \
+             eviction into two, and grew the member log by one entry per peer \
+             that ratified it"
+        );
     }
 }

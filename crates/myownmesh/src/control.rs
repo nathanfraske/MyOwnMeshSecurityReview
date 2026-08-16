@@ -493,8 +493,13 @@ impl<T> std::ops::Deref for Retained<T> {
     }
 }
 
-/// Start the control socket listener. Returns when the shutdown
-/// broadcast fires.
+/// Start the control socket listener. Returns once the runtime's shutdown has
+/// been requested.
+///
+/// The supervisor is the only thing this takes for that: it carries both the
+/// submission a reset makes and the state every waiter reads, so there is no
+/// second channel that could be handed out at a different moment than the
+/// handle which submits through it.
 pub async fn serve(
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
@@ -502,7 +507,6 @@ pub async fn serve(
     custom: Option<PathBuf>,
     realtime: RealtimeAdvert,
     supervisor: RuntimeSupervisor,
-    shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     serve_with_hooks(
         ControlSurface {
@@ -513,7 +517,6 @@ pub async fn serve(
             supervisor,
         },
         custom,
-        shutdown,
         ControlHooks::default(),
     )
     .await
@@ -539,7 +542,6 @@ struct ControlSurface {
 async fn serve_with_hooks(
     surface: ControlSurface,
     custom: Option<PathBuf>,
-    mut shutdown: broadcast::Receiver<()>,
     hooks: ControlHooks,
 ) -> Result<()> {
     let ControlSurface {
@@ -549,6 +551,10 @@ async fn serve_with_hooks(
         realtime,
         supervisor,
     } = surface;
+    // Read before the listener binds and kept for the whole accept loop. The
+    // request it resolves on is a latched state, so a reset that lands between
+    // this line and the first poll below is not a lost wake.
+    let shutdown = supervisor.clone();
     // Both are optional, and absence is not absence of a bound. Nothing a
     // connection retains is held without a lease -- a frame's growth funded per
     // step at the capacity that step requests, the fixed read window funded in
@@ -621,7 +627,7 @@ async fn serve_with_hooks(
 
     loop {
         tokio::select! {
-            _ = shutdown.recv() => {
+            () = shutdown.wait_requested() => {
                 info!("control socket shutting down");
                 break;
             }
@@ -963,7 +969,7 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
             supported: false,
             encodings: Vec::new(),
         },
-        supervisor: RuntimeSupervisor::new(broadcast::channel(1).0),
+        supervisor: RuntimeSupervisor::new(),
         json_line_bytes: None,
         realtime_frame_bytes: None,
         before_events_subscribe_commit: None,
@@ -3554,7 +3560,7 @@ mod terminal_shutdown_tests {
         let directory = tempfile::tempdir().expect("temporary control root");
         let socket = directory.path().join("private").join("control.sock");
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let supervisor = crate::supervisor::RuntimeSupervisor::new();
         let networks = NetworkRegistry::new();
         assert!(
             networks.insert(near, None).into_refusal().is_none(),
@@ -3573,10 +3579,9 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
-                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
+                supervisor: supervisor.clone(),
             },
             Some(socket.clone()),
-            shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
@@ -3625,9 +3630,10 @@ mod terminal_shutdown_tests {
         guarded("the remote parked handler is entered", handler_entered_rx)
             .await
             .expect("the far handler reports its first entry");
-        shutdown_tx
-            .send(())
-            .expect("the shutdown broadcast is live");
+        assert!(
+            supervisor.request_shutdown(),
+            "the runtime shutdown is requested exactly once here"
+        );
         guarded("serve begins closing", clients.closing()).await;
         guarded("the parked RPC is withdrawn", async {
             loop {
@@ -3696,7 +3702,7 @@ mod terminal_shutdown_tests {
         let directory = tempfile::tempdir().expect("temporary control root");
         let socket = directory.path().join("private").join("control.sock");
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
         let mesh = test_mesh().await;
         let networks = NetworkRegistry::new();
@@ -3710,10 +3716,9 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
-                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
+                supervisor: supervisor.clone(),
             },
             Some(socket.clone()),
-            shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
@@ -3762,9 +3767,10 @@ mod terminal_shutdown_tests {
         assert_eq!(residue.lifecycle, crate::ipc::Lifecycle::Running);
 
         // (2) The drain begins.
-        shutdown_tx
-            .send(())
-            .expect("the shutdown broadcast is live");
+        assert!(
+            supervisor.request_shutdown(),
+            "the runtime shutdown is requested exactly once here"
+        );
         guarded("serve begins closing", clients.closing()).await;
 
         // (3) And `serve` returns, which it cannot do with an accepted task
@@ -3847,7 +3853,7 @@ mod terminal_shutdown_tests {
         let socket = directory.path().join("private").join("control.sock");
         let (barrier, live, resume) = DispatchBarrier::paired();
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
         let mesh = test_mesh().await;
         let networks = NetworkRegistry::new();
@@ -3861,10 +3867,9 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
-                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
+                supervisor: supervisor.clone(),
             },
             Some(socket.clone()),
-            shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
@@ -3939,9 +3944,10 @@ mod terminal_shutdown_tests {
         // in for the cancellation this asserts, and would pass against a `serve`
         // that never cancelled anything.
         resume.send(()).expect("the paused task is still waiting");
-        shutdown_tx
-            .send(())
-            .expect("the shutdown broadcast is live");
+        assert!(
+            supervisor.request_shutdown(),
+            "the runtime shutdown is requested exactly once here"
+        );
         guarded("serve begins closing", clients.closing()).await;
         guarded("serve returns", serving)
             .await
@@ -4006,7 +4012,7 @@ mod terminal_shutdown_tests {
         );
         let (barrier, arrived, release) = DispatchBarrier::paired();
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
         let mesh = test_mesh().await;
         let networks = NetworkRegistry::new();
@@ -4020,10 +4026,9 @@ mod terminal_shutdown_tests {
                     supported: false,
                     encodings: Vec::new(),
                 },
-                supervisor: crate::supervisor::RuntimeSupervisor::new(shutdown_tx.clone()),
+                supervisor: supervisor.clone(),
             },
             Some(socket.clone()),
-            shutdown_rx,
             ControlHooks {
                 before_events_subscribe_commit: Some(barrier),
                 registry: Some(registry_tx),
@@ -4070,9 +4075,10 @@ mod terminal_shutdown_tests {
             "nothing is filed yet, but the connection carrying the paused              subscribe is itself an accepted task and is counted as one"
         );
 
-        shutdown_tx
-            .send(())
-            .expect("the shutdown broadcast is live");
+        assert!(
+            supervisor.request_shutdown(),
+            "the runtime shutdown is requested exactly once here"
+        );
         // Observed, not waited out: this resolves on the registry's own signal,
         // which `begin_closing` publishes from inside `serve`'s terminal path.
         // Past this line the drain has provably started.
