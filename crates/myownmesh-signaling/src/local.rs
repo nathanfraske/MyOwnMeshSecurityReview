@@ -2,10 +2,10 @@
 //! apps that want to wire two `Mesh` instances together in the
 //! same process without taking a dependency on a Nostr relay.
 //!
-//! A single [`LocalBroker`] owns the routing table. Each peer
-//! calls [`LocalBroker::join`] with the channels the engine
-//! gave it; the broker fans the engine's outbound messages to
-//! the matching destination's inbound queue.
+//! A single [`LocalBroker`] owns the routing table. Each peer joins with the
+//! outbound queue the engine fills and somewhere to put what arrives; the
+//! broker fans the engine's outbound messages to the matching destination.
+//! There is no inbound queue in between — see [`crate::InboundSink`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::{CarrierAttribution, OwnedQueue, SignalingMessage};
+use crate::{CarrierAttribution, InboundSink, OutboundSource, SignalingMessage};
 
 /// Engine-side outbound message — the engine emits these for the
 /// signaling driver to deliver.
@@ -50,7 +50,7 @@ pub enum LocalInbound {
 /// routing table.
 struct PeerHandle {
     device_id: String,
-    inbound_tx: mpsc::UnboundedSender<LocalInbound>,
+    inbound: InboundSink<LocalInbound>,
 }
 
 #[derive(Default)]
@@ -72,10 +72,12 @@ impl LocalBroker {
         Self::default()
     }
 
-    /// Join a peer to the named room. Returns the inbound queue
-    /// the engine drains and an outbound sender it writes to.
-    /// The broker drives a small loop that forwards outbound
-    /// messages to all matching peers and announces the join.
+    /// Join a peer to the named room, holding the inbound queue here.
+    ///
+    /// The standalone convenience: the broker builds an unbounded queue and
+    /// hands back its receiver, which is what an embedder with no accountant
+    /// wants. A consumer that *has* one calls [`Self::join_with_sink`] and keeps
+    /// no queue at all.
     pub fn join(
         &self,
         room: &str,
@@ -84,28 +86,41 @@ impl LocalBroker {
         mpsc::UnboundedSender<LocalOutbound>,
         mpsc::UnboundedReceiver<LocalInbound>,
     ) {
-        self.join_with_queue_owner(room, device_id, ())
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<LocalInbound>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        self.join_with_sink(
+            room,
+            device_id,
+            Box::new(crate::UnboundedSource::new(out_rx)),
+            InboundSink::from_unbounded(in_tx),
+        );
+        (out_tx, in_rx)
     }
 
-    /// [`Self::join`], with an opaque owner for the outbound queue.
+    /// Join a peer to the named room, delivering into the caller's sink.
     ///
-    /// The broker's forwarding task holds `queue_owner` inside an
-    /// [`OwnedQueue`] alongside the receiver, so it is released only after the
-    /// receiver and everything the caller left queued in it. See [`OwnedQueue`]
-    /// for why the broker takes something it never reads.
-    pub fn join_with_queue_owner<O: Send + 'static>(
+    /// The broker keeps no inbound queue: every report is offered to `inbound`
+    /// on the task that produced it, so a consumer that will not admit a value
+    /// is not turned into a place the broker stores it.
+    ///
+    /// The broker keeps no outbound queue either: it pulls `outbound`, so a
+    /// translated value exists only when the broker is ready to route it. See
+    /// [`OutboundSource`].
+    ///
+    /// # The sink is called under the routing lock
+    ///
+    /// Registration and fan-out both offer while the routing table is held, so
+    /// a sink that tried to call back into this broker would deadlock. Admitting
+    /// a value is all a sink is for, and the consumers here do exactly that; the
+    /// alternative — copying the peer list out and offering afterwards — would
+    /// let a peer that left in between be delivered to.
+    pub fn join_with_sink(
         &self,
         room: &str,
         device_id: &str,
-        queue_owner: O,
-    ) -> (
-        mpsc::UnboundedSender<LocalOutbound>,
-        mpsc::UnboundedReceiver<LocalInbound>,
+        mut outbound: Box<dyn OutboundSource<LocalOutbound>>,
+        inbound: InboundSink<LocalInbound>,
     ) {
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
-        let mut out_rx = OwnedQueue::new(out_rx, queue_owner);
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<LocalInbound>();
-
         // Register and announce to existing peers.
         {
             let mut inner = self.inner.lock();
@@ -114,18 +129,18 @@ impl LocalBroker {
             // them. Both directions fire so each side initiates
             // its handshake from the same announce signal.
             for p in peers.iter() {
-                let _ = p.inbound_tx.send(LocalInbound::PeerAnnounced {
+                let _ = p.inbound.send(LocalInbound::PeerAnnounced {
                     device_id: device_id.to_string(),
                     attribution: CarrierAttribution::CarrierObserved,
                 });
-                let _ = in_tx.send(LocalInbound::PeerAnnounced {
+                let _ = inbound.send(LocalInbound::PeerAnnounced {
                     device_id: p.device_id.clone(),
                     attribution: CarrierAttribution::CarrierObserved,
                 });
             }
             peers.push(PeerHandle {
                 device_id: device_id.to_string(),
-                inbound_tx: in_tx.clone(),
+                inbound,
             });
         }
 
@@ -134,7 +149,7 @@ impl LocalBroker {
         let room = room.to_string();
         let device_id_for_task = device_id.to_string();
         tokio::spawn(async move {
-            while let Some(out) = out_rx.recv().await {
+            while let Some(out) = outbound.recv().await {
                 let routed = route_outbound(&inner, &room, &device_id_for_task, &out);
                 trace!(routed, "broker fanout");
             }
@@ -148,15 +163,13 @@ impl LocalBroker {
                     attribution: CarrierAttribution::CarrierObserved,
                 };
                 for p in peers.iter() {
-                    let _ = p.inbound_tx.send(leave.clone());
+                    let _ = p.inbound.send(leave.clone());
                 }
                 if peers.is_empty() {
                     guard.rooms.remove(&room);
                 }
             }
         });
-
-        (out_tx, in_rx)
     }
 }
 
@@ -197,7 +210,7 @@ fn route_outbound(
                 attribution: CarrierAttribution::CarrierObserved,
             },
         };
-        if p.inbound_tx.send(msg).is_ok() {
+        if p.inbound.send(msg).is_ok() {
             delivered += 1;
         }
     }

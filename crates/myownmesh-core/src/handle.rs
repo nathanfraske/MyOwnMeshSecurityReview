@@ -691,7 +691,8 @@ impl JoinedNetwork {
     /// **Hint only.** This publishes a room-wide `leave` on signaling, which a
     /// receiver may use as reachability evidence — to update availability, to
     /// stop speculative work that never became a session, or to go look at a
-    /// connector — and may not use to retire a healthy authenticated session.
+    /// connector — and may not use to retire a session holding a promoted
+    /// `SessionCapability`.
     /// On a network carrier the receiver reads it as sender-claimed, which
     /// retires nothing in any session state.
     ///

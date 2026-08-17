@@ -31,6 +31,7 @@ pub mod phase;
 pub mod reconcile;
 pub mod reliable;
 pub mod scheduler;
+pub(crate) mod semantic_ingress;
 pub mod signaling_bridge;
 pub(crate) mod signaling_ingress;
 pub(crate) mod state;
@@ -1033,43 +1034,47 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
         // state.** It selects nothing. The device id came out of a payload the
         // sender wrote and was never checked against any wire identity, so the
         // sender chose the target; letting a chosen target retire *anything*
-        // makes the choice worth something. It remains availability and
-        // recovery evidence — the ingress runtime still folds it into what it
-        // knows about reachability — and that is the whole of its effect.
+        // makes the choice worth something. It stays reachability evidence and
+        // nothing else, in every state the named peer could be in.
         //
-        // **A `CarrierObserved` withdrawal may retire a session that is not
-        // live, and may not touch one that is.** Here the carrier established
-        // the id itself, so the sender did not pick the victim; the evidence is
-        // worth ending speculative work that has not yet become a session. It
-        // is still not worth a live one: a peer holding an open, authenticated
-        // data channel is left alone, and the authenticated
-        // `SessionControl::Depart` on that very session, ordinary connector
-        // closure, or the heartbeat retires it.
+        // **A `CarrierObserved` withdrawal may cancel an exact unpromoted
+        // attempt, and may not touch a promoted one.** Here the carrier
+        // established the id itself, so the sender did not pick the victim, and
+        // the evidence is worth ending speculative work that never became a
+        // session. It is not worth a session: an entry holding a promoted
+        // `SessionCapability` is left alone whatever its transport is doing, and
+        // the authenticated `SessionControl::Depart` over that very session,
+        // ordinary connector closure, or the heartbeat retires it.
+        //
+        // **The predicate is promotion, and the transport booleans are not it.**
+        // `authenticated && data_channel_open` describes the transport
+        // underneath a session; a Peer Session is the promoted capability. An
+        // earlier shape read those booleans, so a channel that had closed
+        // mid-recovery looked retirable — which is exactly when a session is
+        // least able to defend itself. Nothing here reads them now.
         //
         // **This is what makes a body-claimed target inert rather than merely
-        // narrowed.** The earlier shape guarded on liveness alone, so a
-        // sender-claimed `leave` naming a third Device still retired that
-        // Device's authenticated-but-channel-closed session — a session in
-        // recovery, which is exactly when it is least able to defend itself.
-        // Attribution, not liveness, is what closes that: the sender-claimed
-        // hint now selects no session in any state.
+        // narrowed.** That earlier shape also guarded on liveness alone, so a
+        // sender-claimed `leave` naming a third Device could reach that window.
+        // Attribution, not liveness, is what closes it: the sender-claimed hint
+        // selects nothing in any state, promoted or not.
         SignalingInbound::PeerLeft { device_id } => {
             // The owner token, not just the predicate: it names the exact
             // installation the health check was made against, so a replacement
             // installed between this read and the retirement below is not
             // retired by a hint that was about the one it replaced.
             let current = state.peers.owner(&device_id);
-            let healthy_authenticated_session = current
+            let promoted_session = current
                 .as_ref()
-                .map(|owner| {
-                    let data = owner.connection().state.read();
-                    data.authenticated && data.data_channel_open
-                })
+                .map(|owner| owner.connection().holds_promoted_session())
                 .unwrap_or(false);
             let retire = match attribution {
                 // Teardown-inert in every state, including the one above.
                 CarrierAttribution::SenderClaimed => false,
-                CarrierAttribution::CarrierObserved => !healthy_authenticated_session,
+                // A promoted session is the Peer Session owner's and the
+                // connector's. What is left for a carrier observation to cancel
+                // is an attempt that never became one.
+                CarrierAttribution::CarrierObserved => !promoted_session,
             };
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
@@ -1077,13 +1082,13 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 format!(
                     "peer left signaling: {} ({})",
                     short_peer(&device_id),
-                    match (attribution, healthy_authenticated_session) {
+                    match (attribution, promoted_session) {
                         (CarrierAttribution::SenderClaimed, _) =>
                             "reachability hint only — the sender chose this target",
                         (CarrierAttribution::CarrierObserved, true) =>
-                            "reachability hint only — its authenticated session is live",
+                            "reachability hint only — a promoted session exists",
                         (CarrierAttribution::CarrierObserved, false) =>
-                            "no live authenticated session to keep",
+                            "cancelling an attempt that never became a session",
                     }
                 ),
                 serde_json::json!({
@@ -1099,23 +1104,21 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 return;
             };
             // Reaching here means the carrier established the id itself and
-            // nothing live is holding this peer open, so the hint is ending
-            // speculative work rather than a session: exactly the "cancel
-            // carrier-specific speculative work" a withdrawal may do.
+            // this installation holds no promoted session, so the hint is
+            // ending speculative work rather than a session: exactly the
+            // "cancel carrier-specific speculative work" a withdrawal may do.
             //
-            // **The guard window, stated exactly, and it now applies only to
-            // `CarrierObserved`.** The liveness predicate is a conjunction,
-            // `authenticated && data_channel_open`, so a session that is
-            // authenticated but whose data channel is closed — mid-recovery, or
-            // mid-replacement of the transport underneath it — fails it and can
-            // be retired here. That is deliberate for a carrier's own
-            // observation: it is the same predicate
-            // `depart_authenticated_sessions` uses to choose which sessions get
-            // an authenticated goodbye, so both halves of the lifecycle agree on
-            // what a live session is, and a session with no channel has no
-            // channel for a `SessionControl::Depart` to arrive on either. A
-            // sender-claimed hint never reaches this line at all, so nothing a
-            // sender writes can aim at that window.
+            // **What this line can reach, stated exactly, and only for
+            // `CarrierObserved`.** It reaches an attempt that never became a
+            // Peer Session — no promoted `SessionCapability` — and nothing
+            // else. A promoted session is immune here whatever its transport is
+            // doing: a channel closed mid-recovery or mid-replacement leaves
+            // the capability installed, and the connector and the Peer Session
+            // own that state rather than signaling. Both halves of the
+            // lifecycle read the same thing, so
+            // `depart_authenticated_sessions` departs exactly the sessions this
+            // may not retire. A sender-claimed hint never reaches this line at
+            // all.
             //
             // `drop_peer_if_current` rather than `drop_peer`: the token names
             // the installation the predicate was read from, so a session that
@@ -3038,6 +3041,23 @@ async fn handle_inbound_frame_from(
     // From here on `device_id` is never a dispatch key: every arm names the
     // captured installation, through the witness or through its owner token.
     let owner = dispatch.owner();
+    // The Semantic Node takes its own first, whole.
+    //
+    // Durable facts — the transition log, the roster — are a different ownership
+    // from everything below, and the difference is not the message shape but
+    // where it may come from. These arrive only here, on a promoted session,
+    // under the exact owner token that session belongs to; the carrier ingress
+    // in `signaling_ingress` has no kind that can produce one, however it is
+    // fed. Routing them through one closed typed admission keeps that
+    // separation structural rather than a property of this match staying
+    // correct. See `semantic_ingress` for why the two are disjoint by
+    // construction.
+    let msg = match semantic_ingress::admit(msg) {
+        semantic_ingress::SemanticAdmission::Durable(durable) => {
+            return semantic_ingress::reduce(state, owner, durable).await
+        }
+        semantic_ingress::SemanticAdmission::NotDurable(other) => other,
+    };
     match msg {
         MeshMessage::Ping(p) => heartbeat::on_ping(state, &dispatch, p).await,
         MeshMessage::Pong(p) => heartbeat::on_pong(state, &dispatch, p).await,
@@ -3094,36 +3114,30 @@ async fn handle_inbound_frame_from(
         // resolved there, while each frame and its lease were still together.
         // Nothing is owed out here, which is why this arm does nothing.
         MeshMessage::ChannelAck { .. } => {}
-        MeshMessage::NetworkState(b) => governance::on_state_broadcast(state, owner, b).await,
-        // The four arms below mutate durable, pubkey-keyed governance and
-        // roster facts. They resolve no peer entry, send nothing to the sender,
-        // and so have no installation-scoped effect a replacement could
-        // receive; their sender-directed follow-ups (the roster pull and reply)
-        // are the owner-bound arms above and below. They take the attributed
-        // device id, which is mesh identity here, not a registry key.
-        MeshMessage::NetworkStatePropose(m) => {
-            governance::on_propose(state, owner.device_id(), m).await
-        }
-        MeshMessage::NetworkStateAck(m) => governance::on_ack(state, owner.device_id(), m).await,
-        MeshMessage::NetworkStateSplit(m) => {
-            governance::on_split(state, owner.device_id(), m).await
-        }
-        MeshMessage::RosterSummary(m) => governance::on_roster_summary(state, owner, m).await,
-        MeshMessage::RosterRequest(m) => governance::on_roster_request(state, owner, m).await,
-        MeshMessage::RosterEntries(m) => {
-            governance::on_roster_entries(state, owner.device_id(), m).await
-        }
-        // Unreachable at runtime: `message_admission` classifies exactly these
-        // four as `Protocol`, and the protocol branch above returns before this
-        // match. They are listed explicitly rather than swept up by a `_` arm
-        // so that a *new* `MeshMessage` variant — which `message_admission`
-        // classifies as `Application` by its fail-closed default — still breaks
-        // this match at compile time and has to be handled deliberately.
-        // Discarded rather than panicked on: this is peer-supplied input.
+        // Unreachable at runtime, in two different ways, and both are listed
+        // explicitly rather than swept up by a `_` arm — so that a *new*
+        // `MeshMessage` variant still breaks this match at compile time and has
+        // to be handled deliberately. Discarded rather than panicked on: this is
+        // peer-supplied input.
+        //
+        // The four protocol frames: `message_admission` classifies exactly these
+        // as `Protocol`, and the protocol branch above returns before this match.
+        //
+        // The seven durable frames: `semantic_ingress::admit` took them
+        // above and this function already returned. They cannot be handled here
+        // *and* there without two owners for one fact, which is the arrangement
+        // the semantic ingress exists to end.
         MeshMessage::Hello(_)
         | MeshMessage::AuthResponse(_)
         | MeshMessage::Approve(_)
-        | MeshMessage::Deny(_) => {
+        | MeshMessage::Deny(_)
+        | MeshMessage::NetworkState(_)
+        | MeshMessage::NetworkStatePropose(_)
+        | MeshMessage::NetworkStateAck(_)
+        | MeshMessage::NetworkStateSplit(_)
+        | MeshMessage::RosterSummary(_)
+        | MeshMessage::RosterRequest(_)
+        | MeshMessage::RosterEntries(_) => {
             trace!(peer = %device_id, "discarding misclassified protocol frame");
         }
     }
@@ -4477,29 +4491,36 @@ enum ChannelDisposition {
 /// heartbeat. The local retirement happens either way, because this side has
 /// decided to leave.
 pub(crate) async fn depart_authenticated_sessions(state: &Arc<NetworkState>) {
-    let departing = state.peers.collect_map(|peer| {
-        let data = peer.state.read();
-        // The same predicate the withdrawal hint refuses to act on: a session
-        // that is authenticated and carrying. Those are exactly the sessions
-        // that now need an authenticated goodbye, because nothing weaker may
-        // retire them.
-        if data.authenticated && data.data_channel_open {
-            Some(peer.device_id.clone())
-        } else {
-            None
-        }
-    });
-    for device_id in departing {
-        let sent = send_to_peer(
+    // Selection yields owner tokens, and nothing after this line looks a device
+    // id up again. Selecting by id and re-resolving it at the send, or at the
+    // retirement, is what let a replacement receive its predecessor's goodbye
+    // and then its predecessor's teardown: both races are closed by carrying the
+    // exact installation through the whole operation rather than its name.
+    //
+    // The predicate is the promoted session itself, not the transport booleans
+    // underneath one. A session that exists is what can be departed; a channel
+    // that happens to be open is not the same claim.
+    let departing = state
+        .peers
+        .owners_snapshot(|peer| peer.holds_promoted_session());
+    for owner in departing {
+        let sent = send_to_peer_owner(
             state,
-            &device_id,
+            &owner,
             &MeshMessage::SessionControl(crate::protocol::SessionControl::Depart),
         )
         .await;
         if let Err(error) = sent {
-            debug!(peer = %device_id, %error, "departure send did not settle; leaving anyway");
+            debug!(
+                peer = %owner.device_id(),
+                %error,
+                "departure send did not settle; leaving anyway"
+            );
         }
-        drop_peer(state, &device_id, DropReason::UserLeft).await;
+        // The same token that was selected and sent over. A successor installed
+        // before the send, during the awaited send, or after it, is not this
+        // token's installation, so `drop_peer_if_current` leaves it alone.
+        drop_peer_if_current(state, &owner, DropReason::UserLeft).await;
     }
 }
 
@@ -4511,7 +4532,7 @@ pub(crate) async fn depart_authenticated_sessions(state: &Arc<NetworkState>) {
 /// registry entry. A two-engine control that builds its peers directly from
 /// [`spawn_network`] has no handle to call, and the alternative — pointing the
 /// control at the carrier hint instead — would assert the opposite of the
-/// boundary: that a withdrawal retires a healthy authenticated session.
+/// boundary: that a withdrawal retires a promoted session.
 ///
 /// This adds no capability. It is the same crate-internal function, exported
 /// only where `transport-lab` is on, so an ordinary build has no such public
@@ -6280,7 +6301,31 @@ mod tests {
     /// control that handed `handle_signaling_inbound` a bare `SignalingInbound`
     /// would be exercising a path production no longer has.
     fn announced_by_local_carrier(device_id: &str) -> EphemeralIngress {
-        EphemeralIngress::presence_for_control(SignalingCarrier::Local, device_id)
+        EphemeralIngress::presence_for_control(
+            SignalingCarrier::Local,
+            device_id,
+            CarrierAttribution::CarrierObserved,
+        )
+    }
+
+    /// A LAN advertisement naming a device id. Sender-claimed on every count:
+    /// the TXT record is written by whoever is advertising, so this is the shape
+    /// a third party on the same LAN produces when it names somebody else.
+    fn announced_over_mdns(device_id: &str) -> EphemeralIngress {
+        EphemeralIngress::presence_for_control(
+            SignalingCarrier::Mdns,
+            device_id,
+            CarrierAttribution::SenderClaimed,
+        )
+    }
+
+    /// The matching withdrawal: the record went away, or said it had.
+    fn withdrawn_over_mdns(device_id: &str) -> EphemeralIngress {
+        EphemeralIngress::withdrawal_for_control(
+            SignalingCarrier::Mdns,
+            device_id,
+            CarrierAttribution::SenderClaimed,
+        )
     }
 
     /// The same, for a carrier that stopped seeing the peer itself.
@@ -7552,7 +7597,7 @@ mod tests {
             .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
             .is_none());
         assert!(
-            !fixture.peer.holds_promoted_session_for_test(),
+            !fixture.peer.holds_promoted_session(),
             "adoption returns only after revoking the promoted session"
         );
     }
@@ -7655,7 +7700,7 @@ mod tests {
             // Named individually, because an answer of "revoked" would be a
             // claim about a state that none of the three agree with.
             assert!(
-                closed_fixture.peer.holds_promoted_session_for_test(),
+                closed_fixture.peer.holds_promoted_session(),
                 "the promoted session outlives its connector's close fence"
             );
             assert!(
@@ -7726,7 +7771,7 @@ mod tests {
             "non-vacuity: every conjunct holds, so the fence admits and promotes"
         );
         assert!(
-            fixture.peer.holds_promoted_session_for_test(),
+            fixture.peer.holds_promoted_session(),
             "and that admission really did install a session to revoke"
         );
         state
@@ -8025,7 +8070,7 @@ mod tests {
             "the refused send moved no traffic counter in any lane"
         );
         assert!(
-            !fixture.peer.holds_promoted_session_for_test(),
+            !fixture.peer.holds_promoted_session(),
             "the refusal dropped the session, so the queues that unit would have \
              been enqueued on no longer exist — the operation had no effect at \
              all, not a partial one"
@@ -8087,7 +8132,7 @@ mod tests {
             gov.roles.remove(self_state.identity.public_id());
         });
         assert!(
-            !self_fixture.peer.holds_promoted_session_for_test(),
+            !self_fixture.peer.holds_promoted_session(),
             "self-eviction synchronously clears every promoted session"
         );
         assert!(!fence_admits(&self_state, "self-revoked-peer"));
@@ -9814,7 +9859,7 @@ mod tests {
             "non-vacuity: with the pool sealed, B's promotion is refused"
         );
         assert!(
-            !peer_b.peer.holds_promoted_session_for_test(),
+            !peer_b.peer.holds_promoted_session(),
             "non-vacuity: the refusal mints nothing, so there is no debt to consume"
         );
         assert!(
@@ -11420,7 +11465,7 @@ mod tests {
         let (reply, mut receiver) = tokio::sync::oneshot::channel();
         reliable::submit(&state, "peer", "c", serde_json::json!(1), reply).await;
         assert!(
-            fixture.peer.holds_promoted_session_for_test(),
+            fixture.peer.holds_promoted_session(),
             "non-vacuity: the submission promoted a session to retain the frame under"
         );
         assert_eq!(
@@ -11451,7 +11496,7 @@ mod tests {
             "the frame and its lease are released with the session that held them"
         );
         assert!(
-            !fixture.peer.holds_promoted_session_for_test(),
+            !fixture.peer.holds_promoted_session(),
             "and the session itself is gone, not merely refusing"
         );
     }
@@ -12195,7 +12240,7 @@ mod tests {
             "non-vacuity: this peer genuinely cannot be promoted"
         );
         assert!(
-            !fixture.peer.holds_promoted_session_for_test(),
+            !fixture.peer.holds_promoted_session(),
             "non-vacuity: this arm is about a peer that genuinely has no session, \
              not one that quietly acquired one during setup"
         );
@@ -12206,7 +12251,7 @@ mod tests {
         )
         .await;
         assert!(
-            !fixture.peer.holds_promoted_session_for_test(),
+            !fixture.peer.holds_promoted_session(),
             "and the frame promoted none, which is exactly what would otherwise make \
              the two assertions below pass for the wrong reason"
         );
@@ -15056,30 +15101,36 @@ mod tests {
     /// something does move when the authority that owns the roster says so, and
     /// a carrier is not that authority.
     ///
-    /// **Two properties, and the first is the one the review turned on.** A
-    /// healthy authenticated session - authenticated, on an open data channel -
-    /// is installed before the withdrawals arrive, and it is still installed
-    /// afterwards: a carrier withdrawal is reachability evidence and has no
-    /// authority to retire it. Only the authenticated `SessionControl::Depart`
-    /// over that exact session can. The second is that nothing durable moved
-    /// either: the device is still a signed member, still rostered, and still
-    /// admissible.
+    /// **What this control can prove without a connector, and what it hands
+    /// off.** The peer it installs is authenticated with an open data channel
+    /// and *no promoted `SessionCapability`*, because only a real connector
+    /// promotes one. That is not a defect of the fixture: it is precisely the
+    /// unpromoted attempt, and it is the only side of the rule a
+    /// default-feature control can reach honestly.
     ///
-    /// **This is the delivered-withdrawal half, and it is the half that covers
-    /// the single-carrier case.** The withdrawals here reach the handler, which
-    /// is what a lone attach produces: the ingress runtime holds a withdrawal
-    /// back only while some *other* attach still observes the device, which
-    /// `a_withdrawal_is_delivered_only_when_nothing_still_observes_the_device`
-    /// in `engine/signaling_ingress.rs` asserts separately. Neither control
-    /// subsumes the other, and only this one speaks to a Nostr-only network,
-    /// where presence and departure are both sender-claimed.
+    /// So this proves two things about that state — a sender-claimed departure
+    /// selects it no matter how healthy its transport looks, and a
+    /// carrier-observed withdrawal does cancel it — plus that neither moves
+    /// anything durable. The other side, that a *promoted* session survives
+    /// both, needs a live connector and lives in
+    /// `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` behind
+    /// `transport-lab`. Neither half is worth much alone: without the first,
+    /// an arm that had simply stopped dropping anything would pass; without the
+    /// second, nothing checks that a real session is safe.
+    ///
+    /// **Every withdrawal here reaches the handler.** The ingress runtime holds
+    /// nothing back any more — it once kept a per-device map of which attaches
+    /// still observed a peer, and that map was removed rather than repaired
+    /// (see [`signaling_ingress::SignalingRuntime`]) — so what the engine's arm
+    /// does with a delivered withdrawal is the whole rule, and this is where it
+    /// is asserted.
     ///
     /// **The third property is the one a reviewer found the first two did not
-    /// give.** The guard on liveness is a conjunction,
-    /// `authenticated && data_channel_open`, so a session that is authenticated
-    /// with its channel closed - in recovery - fails it. Guarding on liveness
-    /// alone therefore still let a *sender-claimed* departure naming a third
-    /// device retire that device's session, at the moment it was least able to
+    /// give.** The predicate the arm reads is `holds_promoted_session`, so an
+    /// authenticated attempt whose channel is merely open has not become a
+    /// session and does not survive on transport health alone. Reading liveness
+    /// alone would also have let a *sender-claimed* departure naming a third
+    /// device retire that device's session at the moment it was least able to
     /// defend itself. So the arm reads attribution too, and the last part of
     /// this control pins both halves of that rule:
     ///
@@ -15090,7 +15141,7 @@ mod tests {
     /// drop: with only the first, an arm that had simply stopped retiring
     /// anything would pass.
     #[tokio::test]
-    async fn v4_m2_a_carrier_withdrawal_leaves_a_healthy_authenticated_session_intact() {
+    async fn v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt() {
         use crate::network_state::{transition_payload, Transition, TransitionVariant};
 
         let state = build_test_state("carrier-withdrawal-no-durable-leave");
@@ -15143,28 +15194,25 @@ mod tests {
         );
         assert!(state.is_rostered(&target), "and really seated the member");
 
-        // Both shapes a departure can take at this boundary. The out-of-band
-        // withdrawal is what every driver reports when an advertisement expires
-        // or a relay sees a socket close, and it is the live path on all three
-        // carriers. The directed departure reaches the lane parse from
-        // `LocalBroker` alone — the Nostr and mDNS drivers normalize a
-        // `SignalingMessage::Leave` into their own `PeerLeft` before the bridge
-        // sees it — so it is built here with the carrier that actually delivers
-        // it, rather than with a carrier that would make the control read wider
-        // than it is.
-        // A healthy authenticated session for the withdrawals to fail to retire.
-        // Built directly rather than through a handshake: what is under test is
-        // the predicate the withdrawal reads, not how the session got there.
-        let session = Arc::new(PeerConnection::new(target.clone(), None));
+        // An attempt that never became a session: authenticated, transport
+        // apparently healthy, and unpromoted. Built directly rather than through
+        // a handshake because what is under test is the predicate the withdrawal
+        // reads, and this fixture cannot counterfeit the other value of it.
+        let attempt = Arc::new(PeerConnection::new(target.clone(), None));
         {
-            let mut data = session.state.write();
+            let mut data = attempt.state.write();
             data.authenticated = true;
             data.status = PeerStatus::Active;
             data.data_channel_open = true;
         }
-        install_peer(&state.peers, Arc::clone(&session));
+        install_peer(&state.peers, Arc::clone(&attempt));
 
-        handle_signaling_inbound(&state, withdrawn_by_local_carrier(&target)).await;
+        // Both shapes a sender-claimed departure can take. The directed leave
+        // reaches the parse from `LocalBroker` alone — the two network drivers
+        // normalize a `SignalingMessage::Leave` into their own `PeerLeft` before
+        // the bridge sees it — so it is built with the carrier that actually
+        // delivers it rather than one that would make this read wider than it is.
+        handle_signaling_inbound(&state, departure_claimed_over_local_carrier(&target)).await;
         handle_signaling_inbound(
             &state,
             EphemeralIngress::directed_for_control(
@@ -15176,10 +15224,11 @@ mod tests {
             ),
         )
         .await;
-
         assert!(
             state.peers.get(&target).is_some(),
-            "neither shape of carrier withdrawal may retire a healthy              authenticated session"
+            "a sender-claimed departure selects nothing, in any state and \
+             however healthy the transport under it looks - the sender picked \
+             this target, so it may not pick a victim"
         );
         assert!(
             !governance::log_evicted(&state, &target),
@@ -15197,32 +15246,347 @@ mod tests {
              ordinary reconnect rather than a re-admission it has to be granted"
         );
 
-        // The recovery shape: still authenticated, but the channel underneath
-        // it has gone. This is the state the liveness-only guard let a
-        // sender-claimed departure reach.
-        session.state.write().data_channel_open = false;
-
-        handle_signaling_inbound(&state, departure_claimed_over_local_carrier(&target)).await;
-        assert!(
-            state.peers.get(&target).is_some(),
-            "a sender-claimed departure selects no session in any state - the \
-             sender picked this target, so it may not pick a victim"
-        );
-
+        // The carrier's own observation is the one thing that may cancel an
+        // attempt this side never promoted. Without this half, an arm that had
+        // simply stopped dropping anything would pass everything above.
         handle_signaling_inbound(&state, withdrawn_by_local_carrier(&target)).await;
         assert!(
             state.peers.get(&target).is_none(),
-            "but the carrier's own observation still retires a session that is \
-             not live - so the rule above is a rule about attribution, not an \
-             arm that has stopped dropping anything"
+            "a carrier-observed withdrawal cancels an unpromoted attempt, so the \
+             rule above is about attribution rather than an arm that no longer \
+             drops anything"
         );
 
-        // And the retirement is still only a session: the durable half is
+        // And cancelling an attempt is still only that: the durable half is
         // untouched by the drop that did happen.
         assert!(!governance::log_evicted(&state, &target));
         assert!(
             state.is_rostered(&target),
-            "retiring a session is not deleting a roster row"
+            "cancelling an attempt is not deleting a roster row"
+        );
+
+        state.shutdown().await;
+    }
+
+    /// **A third party on the LAN can claim a device id and then withdraw it,
+    /// and neither yields a session or moves anything durable.**
+    ///
+    /// mDNS is the carrier where this is cheapest to try: a device id reaches
+    /// the driver from a TXT record, and any participant on the segment may
+    /// write any value into one. So the announce below names a device this node
+    /// has never met, and the withdrawal below names a device this node holds a
+    /// live attempt for — the two halves of "somebody else said so".
+    ///
+    /// **Why it is a separate control from its sender-claimed sibling.** That
+    /// one drives the shape `LocalBroker` delivers, which is the only carrier
+    /// that can produce a *carrier-observed* report at all; this one drives the
+    /// shape a network carrier produces, where both directions are claimed and
+    /// the claim is the whole input. Without it, an arm that happened to be
+    /// correct only for the in-process carrier would pass.
+    ///
+    /// # What a claimed announce is allowed to do, and what it is not
+    ///
+    /// It is allowed to make this node *try*. An announce paces a dial — the
+    /// arm calls `ensure_peer_session` on a shaped-edge network — so a claimed
+    /// id can leave an unpromoted attempt behind it. That is deliberate and it
+    /// is not an admission: the attempt holds no `SessionCapability`, and the
+    /// endpoint-authentication and policy path still stands between it and
+    /// anything. The cost of a stranger's lie is a connection that will not
+    /// authenticate, which is the same cost as a peer that went away.
+    ///
+    /// What it may not do is *become* something. So the assertions are the two
+    /// that matter: whatever the announce left behind holds no promoted session,
+    /// and the durable state — roster version, roster size, transition log,
+    /// member log — is byte-identical before and after both reports. A
+    /// before/after comparison rather than a list of things that did not happen,
+    /// because a list can only name the movements somebody thought of.
+    ///
+    /// The peer-entry assertion is written to hold whether or not the dial
+    /// materialises, since whether a `PeerConnection` object comes up is the
+    /// transport's business and not this rule's.
+    #[tokio::test]
+    async fn v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable() {
+        /// Everything a signaling report is forbidden to touch, in one value.
+        fn durable(state: &Arc<NetworkState>) -> (u32, usize, usize, usize) {
+            let roster = state.roster.read();
+            let governance = state.governance_state.read();
+            (
+                roster.version,
+                roster.authorized_devices.len(),
+                governance.transitions.len(),
+                governance.member_log.len(),
+            )
+        }
+
+        let state = build_test_state("third-party-lan-claim");
+        let victim = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let stranger = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        // A live attempt for the victim, exactly as its sender-claimed sibling
+        // builds one: authenticated, channel open, never promoted.
+        let attempt = Arc::new(PeerConnection::new(victim.clone(), None));
+        {
+            let mut data = attempt.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        install_peer(&state.peers, Arc::clone(&attempt));
+
+        let before = durable(&state);
+
+        // A record appears on the LAN naming a device nobody here has met.
+        handle_signaling_inbound(&state, announced_over_mdns(&stranger)).await;
+        let promoted = state
+            .peers
+            .owner(&stranger)
+            .is_some_and(|owner| owner.connection().holds_promoted_session());
+        assert!(
+            !promoted,
+            "a claimed id may pace a dial and may not become a session: whatever \
+             the announce left behind must hold no promoted capability"
+        );
+        assert!(
+            !state.is_rostered(&stranger),
+            "and it certainly does not seat one"
+        );
+
+        // …and the same LAN participant then says the victim is gone.
+        handle_signaling_inbound(&state, withdrawn_over_mdns(&victim)).await;
+        assert!(
+            state.peers.get(&victim).is_some(),
+            "a claimed withdrawal retires nothing: the sender chose this target, \
+             so it may not choose a victim"
+        );
+        assert_eq!(
+            durable(&state),
+            before,
+            "neither report moved the roster or either log — a LAN participant \
+             is not an authority, and this compares the whole durable state \
+             rather than the movements somebody thought to rule out"
+        );
+
+        // Non-vacuity: the same device id, withdrawn by a carrier that observed
+        // the loss itself, does cancel the same unpromoted attempt. Without
+        // this, an arm that had stopped retiring anything would pass.
+        handle_signaling_inbound(&state, withdrawn_by_local_carrier(&victim)).await;
+        assert!(
+            state.peers.get(&victim).is_none(),
+            "so the rule above is about who established the id, not about \
+             refusing to act on withdrawals"
+        );
+        assert_eq!(
+            durable(&state),
+            before,
+            "and cancelling an attempt is still only that: the withdrawal that \
+             *was* allowed to act moved nothing durable either"
+        );
+
+        state.shutdown().await;
+    }
+
+    /// **A replacement installed before the departure sweep reaches a peer is
+    /// not retired by it.**
+    ///
+    /// `depart_authenticated_sessions` snapshots the owners it is going to
+    /// depart, then sends and retires one at a time. Every one of those steps
+    /// yields, so the peer named by a snapshot entry may be replaced — a
+    /// reconnect, a fresh handshake — while the sweep is still walking. Retiring
+    /// by device id would then tear down the *new* installation on the strength
+    /// of a decision made about the old one, and the visible symptom is a
+    /// reconnect that immediately drops itself.
+    ///
+    /// The sweep therefore carries `PeerOwnerToken`s and retires through
+    /// `drop_peer_if_current`, which is what this control drives directly: the
+    /// token is the exact installation, and a token whose installation has been
+    /// replaced retires nothing.
+    ///
+    /// **Both orderings are the same mechanism.** "Replaced before the sweep
+    /// looked" and "replaced while the sweep was mid-send" differ only in when
+    /// the replacement lands relative to an await, and both arrive at this call
+    /// with a stale token — which is the state under test. What this control
+    /// does *not* drive is the full sweep, because selection there requires a
+    /// promoted session and no default-feature fixture can mint one honestly.
+    /// The end-to-end sweep runs in the `transport-lab` `peer_leave` integration
+    /// test, over a real connector.
+    #[tokio::test]
+    async fn v4_m2_a_replacement_survives_a_stale_departure_token() {
+        let state = build_test_state("departure-vs-replacement");
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        let first = Arc::new(PeerConnection::new(target.clone(), None));
+        install_peer(&state.peers, Arc::clone(&first));
+        let stale = state
+            .peers
+            .owner(&target)
+            .expect("the sweep snapshotted the first installation");
+
+        // The reconnect lands. Same device id, different installation.
+        let second = Arc::new(PeerConnection::new(target.clone(), None));
+        install_peer(&state.peers, Arc::clone(&second));
+        let current = state
+            .peers
+            .owner(&target)
+            .expect("the replacement is installed");
+        assert!(
+            !Arc::ptr_eq(current.connection(), &first),
+            "non-vacuity: the replacement really displaced the first installation"
+        );
+
+        drop_peer_if_current(&state, &stale, DropReason::UserLeft).await;
+        let survivor = state
+            .peers
+            .owner(&target)
+            .expect("a stale token retires nothing, so the replacement is still here");
+        assert!(
+            Arc::ptr_eq(survivor.connection(), &second),
+            "and it is the replacement that survived, not a resurrected first \
+             installation"
+        );
+
+        // Non-vacuity for the mechanism itself: the *current* token does retire
+        // its own installation, so the rule is about identity rather than a
+        // call that stopped removing anything.
+        drop_peer_if_current(&state, &survivor, DropReason::UserLeft).await;
+        assert!(
+            state.peers.owner(&target).is_none(),
+            "the exact installation named by a live token is retired"
+        );
+
+        state.shutdown().await;
+    }
+
+    /// **A stale token cannot send a predecessor's goodbye over its
+    /// replacement.**
+    ///
+    /// The other half of the sweep, and the half that runs first. Retirement is
+    /// covered by `v4_m2_a_replacement_survives_a_stale_departure_token`; this
+    /// is the *send*. `depart_authenticated_sessions` awaits
+    /// `send_to_peer_owner` before it retires, so the widest window in the whole
+    /// operation is the one where a token has already been selected and the
+    /// frame has not gone out yet. If a send resolved the peer by Device ID, a
+    /// reconnect that landed inside that window would be handed a
+    /// `SessionControl::Depart` chosen for the installation it replaced — and
+    /// `Depart` is the one control a peer is entitled to act on immediately, so
+    /// the fresh session would tear itself down on arrival.
+    ///
+    /// It does not, because the send resolves through `get_if_current`, which
+    /// answers only for the exact installation the token names. The assertions
+    /// are that resolution and its consequence, in that order: a stale token
+    /// resolves to nothing, a live one resolves, and the send under the stale
+    /// token is refused rather than redirected.
+    ///
+    /// **Why the refusal is the assertion and not "the replacement received
+    /// nothing".** Observing a non-delivery needs a live connector, which this
+    /// suite does not have. The refusal is stronger anyway: it is taken before
+    /// any session is reached, so there is no path from a stale token to *any*
+    /// peer's transport — not merely to a delivery that would have been
+    /// unobservable here.
+    #[tokio::test]
+    async fn v4_m2_a_stale_token_cannot_send_a_departure_over_a_replacement() {
+        let state = build_test_state("departure-send-vs-replacement");
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        let first = Arc::new(PeerConnection::new(target.clone(), None));
+        install_peer(&state.peers, Arc::clone(&first));
+        let stale = state
+            .peers
+            .owner(&target)
+            .expect("the sweep snapshotted the first installation");
+
+        // The reconnect lands while the sweep is between selection and send.
+        let second = Arc::new(PeerConnection::new(target.clone(), None));
+        install_peer(&state.peers, Arc::clone(&second));
+        let current = state
+            .peers
+            .owner(&target)
+            .expect("the replacement is installed");
+
+        assert!(
+            state.peers.get_if_current(&stale).is_none(),
+            "the stale token resolves to nothing: there is no route from it to \
+             the replacement's transport"
+        );
+        assert!(
+            state.peers.get_if_current(&current).is_some(),
+            "non-vacuity: the live token still resolves, so the rule is about \
+             identity rather than a resolution that stopped answering"
+        );
+
+        let sent = send_to_peer_owner(
+            &state,
+            &stale,
+            &MeshMessage::SessionControl(crate::protocol::SessionControl::Depart),
+        )
+        .await;
+        assert!(
+            sent.is_err(),
+            "and the send itself is refused, so a predecessor's Depart cannot \
+             reach the session that replaced it"
+        );
+        assert!(
+            state.peers.owner(&target).is_some(),
+            "the refusal costs the replacement nothing"
+        );
+
+        state.shutdown().await;
+    }
+
+    /// **A promoted session survives every shape of carrier withdrawal.**
+    ///
+    /// The half its default-feature sibling cannot reach. `insert_promoted_peer`
+    /// opens a real connector and the first admission mints the session through
+    /// the fence, exactly as production does, so `holds_promoted_session` is
+    /// true for a reason rather than because a field was written.
+    ///
+    /// Both shapes arrive and neither selects it. A promoted session is the Peer
+    /// Session owner's and the connector's: an exact channel failure or the
+    /// authenticated `SessionControl::Depart` over that very session retires it,
+    /// and a signaling observation — however the carrier came by the device id —
+    /// does not.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session() {
+        let state = build_test_state("carrier-withdrawal-vs-promoted-session");
+        let target = "promoted-withdrawal-target";
+
+        let fixture = insert_promoted_peer(&state, target).await;
+        let owner = state.peers.owner(target).expect("promoted peer owner");
+        assert!(
+            state
+                .peers
+                .admit_application_operation(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id
+                )
+                .is_some(),
+            "the fence mints the session on first admission"
+        );
+        assert!(
+            fixture.peer.holds_promoted_session(),
+            "non-vacuity: this control is about a session that really exists"
+        );
+
+        handle_signaling_inbound(&state, departure_claimed_over_local_carrier(target)).await;
+        handle_signaling_inbound(&state, withdrawn_by_local_carrier(target)).await;
+
+        assert!(
+            state.peers.get(target).is_some(),
+            "no carrier withdrawal retires a promoted session"
+        );
+        assert!(
+            fixture.peer.holds_promoted_session(),
+            "and the session itself is untouched, not merely the registry row"
         );
 
         state.shutdown().await;

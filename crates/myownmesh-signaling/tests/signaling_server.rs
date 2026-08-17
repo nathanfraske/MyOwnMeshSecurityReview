@@ -16,6 +16,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use myownmesh_signaling::server::{Limits, SignalingServer};
+use myownmesh_signaling::{InboundSink, UnboundedSource};
 
 /// Read frames until a text frame arrives (skipping pings/pongs),
 /// failing the test on timeout or close.
@@ -190,11 +191,19 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // test — dropping either tears the driver down.
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_a = start(mk("device-aaa"), out_rx_a, in_tx_a);
+    let _driver_a = start(
+        mk("device-aaa"),
+        Box::new(UnboundedSource::new(out_rx_a)),
+        InboundSink::from_unbounded(in_tx_a),
+    );
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start(mk("device-bbb"), out_rx_b, in_tx_b);
+    let _driver_b = start(
+        mk("device-bbb"),
+        Box::new(UnboundedSource::new(out_rx_b)),
+        InboundSink::from_unbounded(in_tx_b),
+    );
 
     // Drivers auto-announce on start; B should learn about A through the
     // self-hosted relay (live forward or stored replay).
@@ -247,11 +256,19 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_a = start(mk("device-aaa"), out_rx_a, in_tx_a);
+    let _driver_a = start(
+        mk("device-aaa"),
+        Box::new(UnboundedSource::new(out_rx_a)),
+        InboundSink::from_unbounded(in_tx_a),
+    );
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start(mk("device-bbb"), out_rx_b, in_tx_b);
+    let _driver_b = start(
+        mk("device-bbb"),
+        Box::new(UnboundedSource::new(out_rx_b)),
+        InboundSink::from_unbounded(in_tx_b),
+    );
 
     // B discovers A first.
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -370,11 +387,19 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let driver_a = start(mk("device-aaa"), out_rx_a, in_tx_a);
+    let driver_a = start(
+        mk("device-aaa"),
+        Box::new(UnboundedSource::new(out_rx_a)),
+        InboundSink::from_unbounded(in_tx_a),
+    );
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start(mk("device-bbb"), out_rx_b, in_tx_b);
+    let _driver_b = start(
+        mk("device-bbb"),
+        Box::new(UnboundedSource::new(out_rx_b)),
+        InboundSink::from_unbounded(in_tx_b),
+    );
 
     // First B discovers A.
     tokio::time::timeout(Duration::from_secs(20), async {

@@ -24,10 +24,11 @@
 //!   to force.
 //!
 //! [`SignalingRuntime`] is the owner on this side of the boundary: it mints one
-//! opaque [`CarrierInstance`] per attach, owns cross-carrier de-duplication, and
-//! owns availability — which carrier instances currently observe a device — so
-//! that a withdrawal reaches the engine as evidence of unreachability rather
-//! than as one carrier's opinion.
+//! opaque [`CarrierInstance`] per attach and owns cross-carrier de-duplication,
+//! whose every retained key is funded by the finite provider rather than capped
+//! by a constant. It retains no untrusted record — see its own documentation for
+//! the availability map that used to live there and why it was removed rather
+//! than repaired.
 //!
 //! # What this boundary is not
 //!
@@ -36,7 +37,7 @@
 //! behaviour. Nothing here can grant, revoke, or record membership.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,8 +48,8 @@ use tracing::{trace, warn};
 use myownmesh_signaling::SignalingMessage;
 
 use crate::resource::{
-    mailbox_retained_claim, ResourceClaim, ResourceMailboxItem, ResourceMailboxItemError,
-    ResourceMailboxSendError, ResourceMailboxSender,
+    mailbox_retained_claim, LocalApplicationResourceScope, ResourceClaim, ResourceLease,
+    ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxSendError, ResourceMailboxSender,
 };
 use crate::transport::LocalIceCandidate;
 
@@ -108,13 +109,18 @@ impl SignalingCarrier {
 /// minted by [`SignalingRuntime::attach`] and never leaves the process: it is
 /// not on any wire, not derived from anything a peer sends, and carries no
 /// address, relay or key. It is a receipt for "this attach of this carrier", so
-/// that when the same driver is detached and reattached the availability the old
-/// attach claimed does not survive as the new one's.
+/// a consumer can tell one attach of a driver from the next without either of
+/// them naming anything.
+///
+/// It is **provenance handed outward with the value, not state retained here**.
+/// Nothing on this side keeps a record keyed by an instance, which is why a
+/// carrier that detaches has nothing to clean up and a receipt cannot go stale:
+/// the earlier design that did keep such records is described on
+/// [`SignalingRuntime`], along with why it was removed rather than repaired.
 ///
 /// It is deliberately **not** a route identity and not a path generation: it
 /// names no path, orders nothing, and no decision anywhere reads it as a
-/// preference. The only questions it answers are "same attach?" and "how many
-/// distinct attaches still see this device?".
+/// preference. The only question it answers is "same attach?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CarrierInstance(u64);
 
@@ -145,9 +151,9 @@ pub(crate) use myownmesh_signaling::CarrierAttribution;
 /// revoke or record membership however the carrier is fed.
 ///
 /// It is decided from the carrier value **before** the domain parse, and it is
-/// read in production — [`SignalingRuntime`] keys de-duplication and
-/// availability off it — so it is a working part rather than a tag kept alive to
-/// look complete.
+/// read in production — the engine's inbound handler dispatches on it and it is
+/// the kind carried on every diagnostic — so it is a working part rather than a
+/// tag kept alive to look complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EphemeralSignal {
     /// A carrier saw a device advertise itself. Discovery evidence only: it
@@ -175,12 +181,6 @@ impl EphemeralSignal {
             Self::ConnectAnswer => "connect_answer",
             Self::CandidateHint => "candidate_hint",
         }
-    }
-
-    /// Whether this kind reports on a device's availability rather than on one
-    /// transport attempt.
-    fn is_availability(self) -> bool {
-        matches!(self, Self::Presence | Self::Withdrawal)
     }
 }
 
@@ -331,10 +331,12 @@ impl EphemeralIngress {
     /// **Production, and narrowly so.** One consumer outside this module: the
     /// carrier-withdrawal arm in `engine/mod.rs`, where a `SenderClaimed`
     /// withdrawal is teardown-inert in every session state and only a
-    /// `CarrierObserved` one may retire a session that is not live. That
-    /// decision cannot be made here — the runtime owns reachability, not the
-    /// Peer Session lifecycle — so the value has to survive the boundary rather
-    /// than being consumed at it. Nothing else reads it.
+    /// `CarrierObserved` one may cancel an exact unpromoted attempt — never an
+    /// entry holding a promoted `SessionCapability`. **That decision is not
+    /// made here.** This module admits and delivers; it owns no view of the
+    /// Peer Session lifecycle and could not decide a teardown if it wanted to,
+    /// which is why the value has to survive the boundary rather than being
+    /// consumed at it. Nothing else reads it.
     pub(crate) fn attribution(&self) -> CarrierAttribution {
         self.attribution
     }
@@ -363,9 +365,9 @@ impl EphemeralIngress {
     /// **This bypasses the runtime, not the admission.** The kind still comes
     /// from the same constructors production uses, and the parse is still
     /// [`CarrierObservation::into_ingress`], so a control cannot manufacture a
-    /// shape production could not produce — it only skips the de-duplication and
-    /// availability the runtime would have applied on the way past, which is
-    /// exactly what a handler-level control is not testing.
+    /// shape production could not produce — it only skips the de-duplication the
+    /// runtime would have applied on the way past, which is exactly what a
+    /// handler-level control is not testing.
     fn for_control(
         carrier: SignalingCarrier,
         signal: EphemeralSignal,
@@ -381,13 +383,22 @@ impl EphemeralIngress {
     }
 
     /// A carrier saw a device advertise itself. See [`Self::for_control`].
-    pub(crate) fn presence_for_control(carrier: SignalingCarrier, device_id: &str) -> Self {
+    ///
+    /// The attribution is a parameter for the same reason it is on
+    /// [`Self::withdrawal_for_control`], and for one more: only `LocalBroker`
+    /// produces a carrier-observed presence, so a control that could build only
+    /// that shape could not describe an mDNS or Nostr announce at all.
+    pub(crate) fn presence_for_control(
+        carrier: SignalingCarrier,
+        device_id: &str,
+        attribution: CarrierAttribution,
+    ) -> Self {
         Self::for_control(
             carrier,
             EphemeralSignal::Presence,
             ObservationBody::Presence {
                 device_id: device_id.to_string(),
-                attribution: CarrierAttribution::CarrierObserved,
+                attribution,
             },
         )
     }
@@ -532,50 +543,91 @@ fn parse_directed(from: String, message: SignalingMessage) -> SignalingInbound {
     }
 }
 
-/// Window of the cross-carrier de-duplication ring. Same order of magnitude as
-/// the Nostr driver's per-event ring — comfortably covers the busiest realistic
-/// mesh without unbounded growth.
-const SEEN_CAPACITY: usize = 2048;
-
-/// How many devices the availability owner will track at once.
+/// What became of one value offered to the engine.
 ///
-/// A bound, not a budget: it is not a peer limit and nothing reads it as one.
-/// Past it, a device the runtime is not tracking has its withdrawals delivered
-/// unconditionally — the behaviour this owner refines, so overflow degrades to
-/// the plain hint rather than to silence.
-const AVAILABILITY_CAPACITY: usize = 2048;
+/// Three outcomes and not a bool, because two of them mean "keep the driver
+/// running" and only one of them means the engine *has* the value — and
+/// conflating those is exactly how a de-duplication key gets committed for a
+/// message nobody received.
+enum Delivered {
+    /// The engine's mailbox took it and will hand it to the handler.
+    Accepted,
+    /// Refused under local pressure, or unrepresentable. Nothing downstream
+    /// happened; a later copy is the recovery, so it must find no history.
+    Dropped,
+    /// The engine is gone. The driver's pump exits.
+    Closed,
+}
+
+/// One retained de-duplication key and the lease that funds it.
+///
+/// The lease is held for exactly as long as the key is remembered and released
+/// by the same `Drop` that forgets it, so the ring cannot outlive what pays for
+/// it. `_lease` is never read: holding it *is* the effect.
+struct SeenKey {
+    key: u64,
+    _lease: ResourceLease,
+}
 
 /// The Signaling Node's runtime owner for one network.
 ///
-/// Owns exactly three things, and each is one this side of the boundary is
-/// entitled to: the [`CarrierInstance`] receipts it mints at attach,
-/// cross-carrier de-duplication, and availability. It owns no roster decision,
-/// no endpoint identity and no application delivery, and it has no way to
-/// acquire one — everything it can emit is a [`SignalingInbound`], which is the
-/// [`EphemeralSignal`] union and nothing else.
+/// Owns two things, and each is one this side of the boundary is entitled to:
+/// the [`CarrierInstance`] receipts it mints at attach, and cross-carrier
+/// de-duplication. It owns no roster decision, no endpoint identity and no
+/// application delivery, and it has no way to acquire one — everything it can
+/// emit is a [`SignalingInbound`], which is the [`EphemeralSignal`] union and
+/// nothing else.
+///
+/// # It used to own availability, and removing that was the correction
+///
+/// An earlier revision kept a per-device map of which attaches currently
+/// observed each device, so a withdrawal could be held back while another
+/// carrier still saw the peer. Three things were wrong with it and they
+/// compounded:
+///
+/// - the map was keyed by **attacker-chosen device ids** and capped by an
+///   invented constant, so filling it with 2,048 fabricated ids evicted real
+///   peers and turned the next withdrawal into "the last observation";
+/// - none of that retained state was funded, so the cap was the only bound and
+///   the cap was a guess;
+/// - an attach that stopped never removed its receipts, so a dead carrier's
+///   observation suppressed a live carrier's withdrawal forever.
+///
+/// The map is gone rather than repaired. What it was protecting no longer needs
+/// protecting: a delivered withdrawal can now cancel only an attempt that never
+/// became a session, which is exactly what a withdrawal is allowed to do, so
+/// suppressing one on the strength of another carrier's *claim* bought a
+/// refinement at the price of an unbounded untrusted keyspace. **No untrusted
+/// record is retained here at all now**, which is also why a carrier detach has
+/// nothing to clean up: there is no per-attach state to go stale.
 pub(crate) struct SignalingRuntime {
     tx: ResourceMailboxSender<EphemeralIngress>,
+    /// Funds every retained de-duplication key. The provider is the bound; this
+    /// module names no count.
+    scope: LocalApplicationResourceScope,
     instances: AtomicU64,
-    seen: Mutex<VecDeque<u64>>,
-    /// Which attaches currently observe each device, and whether any of those
-    /// observations was the carrier's own rather than a sender's claim.
-    availability: Mutex<HashMap<String, Availability>>,
+    seen: Mutex<VecDeque<SeenKey>>,
 }
 
-/// Per-device availability: who still sees it, and on what evidence.
-#[derive(Default)]
-struct Availability {
-    observed: HashSet<CarrierInstance>,
-    claimed: HashSet<CarrierInstance>,
-}
+/// What one remembered de-duplication key costs.
+///
+/// A structural charge for one retained record, not a magnitude: it says that
+/// remembering a key is a thing the accountant knows about, and the finite
+/// provider decides how many of them exist. Nothing here reads it as a peer
+/// limit, a mesh size, or a capacity.
+const SEEN_KEY_CLAIM: ResourceClaim =
+    ResourceClaim::single(crate::resource::ResourceClass::OpaqueDependencyResidual, 1);
 
 impl SignalingRuntime {
-    pub(crate) fn new(tx: ResourceMailboxSender<EphemeralIngress>) -> Arc<Self> {
+    pub(crate) fn new(
+        tx: ResourceMailboxSender<EphemeralIngress>,
+        scope: LocalApplicationResourceScope,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tx,
+            scope,
             instances: AtomicU64::new(0),
-            seen: Mutex::new(VecDeque::with_capacity(SEEN_CAPACITY)),
-            availability: Mutex::new(HashMap::new()),
+            seen: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -592,121 +644,123 @@ impl SignalingRuntime {
         }
     }
 
-    /// Deliver an admitted observation, unless the runtime owns a reason not to.
+    /// Deliver an admitted observation, unless it is a duplicate the engine has
+    /// already been handed.
     ///
     /// Returns `false` once the engine side is gone, which is the pump's signal
     /// to exit. Every other outcome is `true`: signaling ingress is explicitly
     /// lossy under local resource pressure, and a dropped observation leaves a
     /// later bounded one to recover the connection.
+    ///
+    /// # A key is remembered only after the engine has actually accepted it
+    ///
+    /// The obvious order — remember, then send — poisons the boundary under
+    /// pressure: a first offer refused by the engine's mailbox would leave its
+    /// key behind, and the retransmission that was supposed to rescue the
+    /// attempt would be discarded as a duplicate of something the engine never
+    /// received. So the send happens first and the key is committed only on
+    /// `Ok`. A refused or unrepresentable value leaves no de-duplication
+    /// history at all.
+    ///
+    /// "Accepted" is the mailbox taking it and nothing weaker. A send refused
+    /// under pressure, or as unrepresentable, still returns the driver to its
+    /// loop — signaling ingress is lossy on purpose — but it leaves no key,
+    /// because nothing downstream happened for a later copy to be a duplicate
+    /// of. That distinction is why [`Delivered`] has three variants and `send`
+    /// does not return a bool: the bool read "keep pumping" as "the engine has
+    /// it", and committed a key for a message that was dropped.
+    ///
+    /// The whole check-send-commit runs under the `seen` lock. `send` is
+    /// synchronous and nothing is awaited, so holding it is cheap and it makes
+    /// the sequence atomic: two identical copies arriving on two carriers at
+    /// once cannot both pass the check, which is the exact case a reservation
+    /// would otherwise be needed for.
     fn deliver(&self, observation: CarrierObservation) -> bool {
         let ingress = observation.into_ingress();
-
-        if ingress.signal.is_availability() {
-            if !self.record_availability(&ingress) {
-                return true;
-            }
-        } else if let Some(key) = ingress
+        let key = ingress
             .carrier
             .restamps_duplicates()
             .then(|| dedup_key(&ingress))
-            .flatten()
-        {
-            let mut seen = self.seen.lock();
-            if seen.contains(&key) {
-                trace!(
-                    kind = ingress.kind_name(),
-                    "cross-carrier duplicate dropped"
-                );
+            .flatten();
+        let Some(key) = key else {
+            // Nothing to remember, so only the engine being gone matters.
+            return !matches!(self.send(ingress), Delivered::Closed);
+        };
+
+        let mut seen = self.seen.lock();
+        if seen.iter().any(|entry| entry.key == key) {
+            trace!(
+                kind = ingress.kind_name(),
+                "cross-carrier duplicate dropped"
+            );
+            return true;
+        }
+        let kind = ingress.kind_name();
+        match self.send(ingress) {
+            Delivered::Closed => return false,
+            // Refused, so there is nothing for a later copy to be a duplicate
+            // *of*. No key is committed, and the retransmission that rescues
+            // this attempt finds a clean slate — which is the whole reason the
+            // send happens before the commit.
+            Delivered::Dropped => {
+                trace!(kind, "refused before commit; no de-duplication history");
                 return true;
             }
-            if seen.len() >= SEEN_CAPACITY {
-                seen.pop_front();
-            }
-            seen.push_back(key);
+            Delivered::Accepted => {}
         }
+        // Accepted, and only now. Remembering it is an optimization, and an
+        // optimization the provider may decline to fund: if it does, the key is
+        // simply not remembered and a later duplicate reaches the engine twice.
+        // That is a worse outcome than de-duplication and a much better one than
+        // refusing traffic, and it is the only thing pressure is allowed to
+        // change here — it never strengthens a withdrawal and never alters
+        // authority.
+        let funded = self.retain_key(&mut seen);
+        match funded {
+            Some(lease) => seen.push_back(SeenKey { key, _lease: lease }),
+            None => trace!(kind, "de-duplication key unfunded; duplicates will pass"),
+        }
+        true
+    }
 
+    /// Fund one more remembered key, evicting the oldest once if that is what it
+    /// takes.
+    ///
+    /// No capacity constant: the ring is exactly as long as the provider will
+    /// pay for, which is the bound `TRANSITION-PLAYBOOK.md` asks for and an
+    /// invented count is not. One eviction and one retry, because the eviction
+    /// releases exactly one lease and a second refusal means the shortage is not
+    /// this ring's to solve.
+    fn retain_key(&self, seen: &mut VecDeque<SeenKey>) -> Option<ResourceLease> {
+        if let Ok(lease) = self.scope.acquire(SEEN_KEY_CLAIM) {
+            return Some(lease);
+        }
+        seen.pop_front()?;
+        self.scope.acquire(SEEN_KEY_CLAIM).ok()
+    }
+
+    /// Hand one admitted value to the engine.
+    ///
+    /// The caller needs two different things from this and a bool can only carry
+    /// one: whether to keep pumping, and whether the engine actually has the
+    /// value. Only [`Delivered::Accepted`] answers yes to the second.
+    fn send(&self, ingress: EphemeralIngress) -> Delivered {
         let kind = ingress.kind_name();
         match self.tx.send(ingress) {
-            Ok(()) => true,
-            Err(ResourceMailboxSendError::Closed(_)) => false,
+            Ok(()) => Delivered::Accepted,
+            Err(ResourceMailboxSendError::Closed(_)) => Delivered::Closed,
             Err(ResourceMailboxSendError::Pressure { error, .. }) => {
                 warn!(
                     kind,
                     ?error,
                     "inbound signaling dropped under declared resource pressure"
                 );
-                true
+                Delivered::Dropped
             }
             Err(ResourceMailboxSendError::Claim { error, .. }) => {
                 warn!(kind, %error, "unrepresentable inbound signaling dropped");
-                true
+                Delivered::Dropped
             }
-        }
-    }
-
-    /// Fold one presence or withdrawal into the availability the runtime owns.
-    /// Returns whether the observation is still worth delivering.
-    ///
-    /// A presence is always worth delivering: the engine paces dialling on it and
-    /// a repeat is that pacing, not noise.
-    ///
-    /// A withdrawal is worth delivering only when nothing still sees the device.
-    /// That is what makes it evidence of unreachability rather than one carrier's
-    /// opinion, and it is the whole reason this owner exists: with Nostr and mDNS
-    /// both attached, losing the LAN is not losing the device.
-    ///
-    /// **A sender-claimed withdrawal cannot cancel a carrier-observed presence.**
-    /// Naming a third party in a payload therefore cannot make the runtime forget
-    /// that the third party is reachable — the strongest thing it can do is
-    /// withdraw a claim the same kind of payload made.
-    fn record_availability(&self, ingress: &EphemeralIngress) -> bool {
-        let device_id = match ingress.inbound() {
-            SignalingInbound::PeerAnnounced { device_id }
-            | SignalingInbound::PeerLeft { device_id } => device_id,
-            // Unreachable by construction: `is_availability` is true for exactly
-            // the two kinds these two variants parse from. Delivering is the safe
-            // reading if that ever stops being true.
-            _ => return true,
-        };
-        let mut availability = self.availability.lock();
-        match ingress.signal {
-            EphemeralSignal::Presence => {
-                if !availability.contains_key(device_id)
-                    && availability.len() >= AVAILABILITY_CAPACITY
-                {
-                    return true;
-                }
-                let entry = availability.entry(device_id.clone()).or_default();
-                match ingress.attribution {
-                    CarrierAttribution::CarrierObserved => entry.observed.insert(ingress.instance),
-                    CarrierAttribution::SenderClaimed => entry.claimed.insert(ingress.instance),
-                };
-                true
-            }
-            EphemeralSignal::Withdrawal => {
-                let Some(entry) = availability.get_mut(device_id) else {
-                    return true;
-                };
-                match ingress.attribution {
-                    CarrierAttribution::CarrierObserved => {
-                        entry.observed.remove(&ingress.instance);
-                        entry.claimed.remove(&ingress.instance);
-                    }
-                    CarrierAttribution::SenderClaimed => {
-                        entry.claimed.remove(&ingress.instance);
-                    }
-                }
-                if entry.observed.is_empty() && entry.claimed.is_empty() {
-                    availability.remove(device_id);
-                    return true;
-                }
-                trace!(
-                    carrier = ingress.carrier.name(),
-                    "withdrawal held: another attach still observes this device"
-                );
-                false
-            }
-            _ => true,
         }
     }
 }
@@ -746,7 +800,7 @@ impl CarrierAttach {
     ///
     /// Reachability evidence. It cannot be a durable leave: this boundary has no
     /// kind that records one, the roster is the Semantic Node's to change, and
-    /// the engine will not let it retire a healthy authenticated session.
+    /// the engine will not let it retire a promoted session.
     pub(crate) fn withdrawal(
         &self,
         device_id: String,
@@ -822,7 +876,7 @@ fn dedup_key(ingress: &EphemeralIngress) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const EVERY_CARRIER: [SignalingCarrier; 3] = [
@@ -839,13 +893,20 @@ mod tests {
         }
     }
 
-    /// A runtime with a funded mailbox behind it, and the receiver to drain.
-    pub(super) fn runtime_with_rx() -> (
-        Arc<SignalingRuntime>,
-        crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
-    ) {
+    /// A runtime, the receiver to drain, and the scope that funds both.
+    struct Funded {
+        runtime: Arc<SignalingRuntime>,
+        rx: crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
+        /// The same finite provider the runtime and its mailbox draw on, so a
+        /// control can take funding away in the open rather than by guessing how
+        /// many bytes a message happens to weigh.
+        scope: crate::resource::LocalApplicationResourceScope,
+    }
+
+    /// A runtime on an isolated provider whose per-dimension grant is `budget`.
+    fn funded(budget: impl Fn(crate::resource::ResourceClass) -> u64) -> Funded {
         let grant = crate::resource::ResourceClaim::try_from_entries(
-            crate::resource::ResourceClass::ALL.map(|dimension| (dimension, 1_000_000)),
+            crate::resource::ResourceClass::ALL.map(|dimension| (dimension, budget(dimension))),
         )
         .expect("test grant is representable");
         let provider = crate::resource::ResourceProviderPort::new(
@@ -855,12 +916,28 @@ mod tests {
         let root = crate::resource::ProcessResourceRoot::isolated();
         root.install_local_application_provider(provider)
             .expect("isolated root accepts its provider");
-        let (tx, rx) = crate::resource::resource_mailbox(
-            root.issue_local_application_scope()
-                .expect("test local-application scope"),
-        )
-        .expect("test mailbox");
-        (SignalingRuntime::new(tx), rx)
+        let scope = root
+            .issue_local_application_scope()
+            .expect("test local-application scope");
+        let (tx, rx) = crate::resource::resource_mailbox(scope.clone()).expect("test mailbox");
+        Funded {
+            runtime: SignalingRuntime::new(tx, scope.clone()),
+            rx,
+            scope,
+        }
+    }
+
+    /// A generously funded runtime and the receiver to drain.
+    ///
+    /// Shared with `signaling_bridge`'s controls rather than copied into them:
+    /// two harnesses that build the same isolated provider are two places for
+    /// the funding a control depends on to drift.
+    pub(crate) fn runtime_with_rx() -> (
+        Arc<SignalingRuntime>,
+        crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
+    ) {
+        let funded = funded(|_| 1_000_000);
+        (funded.runtime, funded.rx)
     }
 
     /// One attach, for the admission-only controls that never deliver.
@@ -878,7 +955,8 @@ mod tests {
     /// behaviour everywhere. A directed announce or leave reaches it from
     /// `LocalBroker` alone — the two network drivers normalize those into their
     /// own presence and withdrawal reports first, and what *they* attribute is
-    /// covered by [`CarrierAttribution`] and by the availability control below.
+    /// covered by [`CarrierAttribution`] and, for what a delivered withdrawal is
+    /// then allowed to do, by the engine's withdrawal controls.
     ///
     /// The stronger property holds on every carrier and is structural rather
     /// than asserted: neither field mints authority, because no kind could.
@@ -1011,9 +1089,9 @@ mod tests {
 
     /// **The instance receipt is per-attach, opaque, and not peer-choosable.**
     ///
-    /// Two attaches of the *same* carrier are distinguishable, which is what
-    /// makes availability survive a driver restart honestly; and nothing a peer
-    /// sends changes the receipt, which is what keeps it from becoming a route
+    /// Two attaches of the *same* carrier are distinguishable, so a restarted
+    /// driver's reports are not the old attach's; and nothing a peer sends
+    /// changes the receipt, which is what keeps it from becoming a route
     /// identity.
     #[test]
     fn each_attach_receives_its_own_opaque_instance() {
@@ -1037,60 +1115,6 @@ mod tests {
             "the receipt is the attach's, not the message's"
         );
         assert_ne!(a.instance(), second.instance);
-    }
-
-    /// **A sender-claimed withdrawal cannot cancel a carrier-observed presence.**
-    ///
-    /// The discriminating control for the availability owner: while any attach
-    /// still observes a device, a withdrawal is held as one carrier's opinion
-    /// rather than delivered as evidence that the device is gone.
-    ///
-    /// **What it does not prove, and must not be read as proving.** This is the
-    /// *multi-carrier* hold. On a single attach - a Nostr-only network, say -
-    /// there is nothing left observing the device once that attach withdraws,
-    /// so the withdrawal is delivered, and on Nostr both the presence and the
-    /// departure are `SenderClaimed`. The property that a *delivered*
-    /// withdrawal still cannot retire a healthy authenticated session is the
-    /// engine's, and is asserted by
-    /// `v4_m2_a_carrier_withdrawal_leaves_a_healthy_authenticated_session_intact`
-    /// in `engine/mod.rs`. Neither control subsumes the other.
-    #[test]
-    fn a_withdrawal_is_delivered_only_when_nothing_still_observes_the_device() {
-        let (runtime, mut rx) = runtime_with_rx();
-        let lan = SignalingRuntime::attach(&runtime, SignalingCarrier::Mdns);
-        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
-
-        let seen = lan.presence("peer-a".into(), CarrierAttribution::CarrierObserved);
-        assert!(lan.deliver(seen));
-        let claimed = relay.presence("peer-a".into(), CarrierAttribution::SenderClaimed);
-        assert!(relay.deliver(claimed));
-
-        // A payload naming the device cannot undo what mDNS resolved itself.
-        let hostile = relay.withdrawal("peer-a".into(), CarrierAttribution::SenderClaimed);
-        assert!(relay.deliver(hostile));
-
-        // Nor can the relay attach's own carrier-observed loss, while the LAN
-        // still sees it.
-        let relay_gone = relay.withdrawal("peer-a".into(), CarrierAttribution::CarrierObserved);
-        assert!(relay.deliver(relay_gone));
-
-        // Only the last observer leaving is evidence of unreachability.
-        let lan_gone = lan.withdrawal("peer-a".into(), CarrierAttribution::CarrierObserved);
-        assert!(lan.deliver(lan_gone));
-
-        let mut delivered = Vec::new();
-        while let Some(item) = rx.try_recv() {
-            delivered.push(item.value().signal());
-        }
-        assert_eq!(
-            delivered,
-            [
-                EphemeralSignal::Presence,
-                EphemeralSignal::Presence,
-                EphemeralSignal::Withdrawal,
-            ],
-            "two presences reached the engine and exactly one withdrawal did"
-        );
     }
 
     /// **One emission that fanned out to two carriers reaches the engine once;
@@ -1144,16 +1168,125 @@ mod tests {
         );
     }
 
-    /// The de-duplication ring is bounded, and the bound is not a peer limit.
+    /// **The de-duplication ring is bounded by the provider, and running out of
+    /// funding costs nothing but de-duplication.**
+    ///
+    /// The bound is not a constant in this module, so the control cannot assert
+    /// one: what it asserts is the two properties a constant was standing in for.
+    /// The ring stops well short of the number of distinct values pushed through
+    /// it, and every one of those values still reaches the engine — an unfunded
+    /// key means a later duplicate is delivered twice, never that traffic is
+    /// refused and never that a withdrawal counts for more.
     #[test]
-    fn the_dedup_ring_is_bounded() {
-        let (runtime, mut rx) = runtime_with_rx();
+    fn the_dedup_ring_is_bounded_by_its_funding_and_never_by_refusing_traffic() {
+        const PUSHED: usize = 512;
+        const RESIDUALS: u64 = 32;
+
+        let Funded {
+            runtime, mut rx, ..
+        } = funded(|dimension| match dimension {
+            crate::resource::ResourceClass::OpaqueDependencyResidual => RESIDUALS,
+            _ => 1_000_000,
+        });
         let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
-        for i in 0..(SEEN_CAPACITY + 10) {
-            assert!(relay.deliver(relay.directed("peer-a".into(), offer(&format!("sdp-{i}")))));
+
+        let mut delivered = 0usize;
+        for i in 0..PUSHED {
+            assert!(
+                relay.deliver(relay.directed("peer-a".into(), offer(&format!("sdp-{i}")))),
+                "pressure on an optional record must never look like a closed engine"
+            );
+            // Drained each time so the mailbox's own residual is released and the
+            // only lasting competition for it is the ring itself.
+            while rx.try_recv().is_some() {
+                delivered += 1;
+            }
         }
-        assert_eq!(runtime.seen.lock().len(), SEEN_CAPACITY);
-        while rx.try_recv().is_some() {}
+
+        assert_eq!(
+            delivered, PUSHED,
+            "every distinct value reached the engine, funded ring or not"
+        );
+        let retained = runtime.seen.lock().len();
+        assert!(
+            retained <= usize::try_from(RESIDUALS).expect("small"),
+            "the ring outgrew what funds it: {retained}"
+        );
+        assert!(
+            retained < PUSHED,
+            "the ring grew with the traffic instead of with its funding: {retained}"
+        );
+    }
+
+    /// **An offer the engine refused leaves no de-duplication history, and the
+    /// identical retransmission lands.**
+    ///
+    /// The exact failure the commit-after-accept ordering exists for. Remembering
+    /// a key before the send would make this the worst possible outcome: the
+    /// engine never receives the offer, and the retransmission that was supposed
+    /// to rescue the connection is discarded as a duplicate of something that was
+    /// never delivered — a permanently wedged attempt from one moment of local
+    /// pressure.
+    ///
+    /// The refusal is produced by taking the funding away rather than by sizing a
+    /// message against a budget, so the control asserts the ordering and not an
+    /// arithmetic coincidence.
+    ///
+    /// It has already earned its place: the first implementation committed on
+    /// the boolean `send` returned — which is `true` for "refused under
+    /// pressure" as well as for "accepted", because both mean the driver keeps
+    /// pumping — and this control failed on exactly the swallowed
+    /// retransmission. [`Delivered`] exists because of it.
+    #[test]
+    fn a_refused_offer_leaves_no_dedup_history_and_its_retransmission_lands() {
+        const QUEUE_BYTES: u64 = 4096;
+
+        let Funded {
+            runtime,
+            mut rx,
+            scope,
+        } = funded(|dimension| match dimension {
+            crate::resource::ResourceClass::QueuedBytes => QUEUE_BYTES,
+            _ => 1_000_000,
+        });
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+
+        // Take the queue funding away a byte at a time until the provider says
+        // no. Whatever the mailbox already holds, what is left afterwards is
+        // nothing, so the refusal below is certain without this control knowing
+        // what an offer weighs.
+        let mut squeeze = Vec::new();
+        while let Ok(lease) = scope.acquire(ResourceClaim::single(
+            crate::resource::ResourceClass::QueuedBytes,
+            1,
+        )) {
+            squeeze.push(lease);
+        }
+        assert!(
+            !squeeze.is_empty(),
+            "the control never took any funding away"
+        );
+
+        assert!(
+            relay.deliver(relay.directed("peer-a".into(), offer("sdp-1"))),
+            "a refused offer is not a closed engine"
+        );
+        assert!(
+            rx.try_recv().is_none(),
+            "the offer was refused, so nothing should have arrived"
+        );
+
+        drop(squeeze);
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("sdp-1"))));
+
+        let arrived: Vec<_> = std::iter::from_fn(|| rx.try_recv())
+            .map(|item| item.value().signal())
+            .collect();
+        assert_eq!(
+            arrived,
+            [EphemeralSignal::ConnectIntent],
+            "the retransmission of a refused offer must reach the engine exactly once"
+        );
     }
 
     /// **The `Debug` output carries the diagnostic fields and none of the

@@ -63,10 +63,20 @@ async fn multicast_available() -> bool {
     let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
     let (_b_out_tx, b_out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (b_in_tx, _b_in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
-    let Ok(_a) = mdns::start(cfg("probe-a"), a_out_rx, a_in_tx) else {
+    let a_in = myownmesh_signaling::InboundSink::from_unbounded(a_in_tx);
+    let b_in = myownmesh_signaling::InboundSink::from_unbounded(b_in_tx);
+    let Ok(_a) = mdns::start(
+        cfg("probe-a"),
+        Box::new(myownmesh_signaling::UnboundedSource::new(a_out_rx)),
+        a_in,
+    ) else {
         return false;
     };
-    let Ok(_b) = mdns::start(cfg("probe-b"), b_out_rx, b_in_tx) else {
+    let Ok(_b) = mdns::start(
+        cfg("probe-b"),
+        Box::new(myownmesh_signaling::UnboundedSource::new(b_out_rx)),
+        b_in,
+    ) else {
         return false;
     };
     let deadline = Instant::now() + Duration::from_secs(10);

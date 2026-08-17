@@ -39,7 +39,7 @@ use tracing::{debug, info, trace, warn};
 use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
 use super::wire::{self, Frame};
 use crate::nostr::handle::derive_room_handle;
-use crate::{CarrierAttribution, Error, OwnedQueue, SignalingMessage};
+use crate::{CarrierAttribution, Error, InboundSink, OutboundSource, SignalingMessage};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -120,29 +120,9 @@ const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 /// fall back to other transports.
 pub fn start(
     config: MdnsDriverConfig,
-    outbound_rx: mpsc::UnboundedReceiver<MdnsOutbound>,
-    inbound_tx: mpsc::UnboundedSender<MdnsInbound>,
+    outbound: Box<dyn OutboundSource<MdnsOutbound>>,
+    inbound_tx: InboundSink<MdnsInbound>,
 ) -> crate::Result<MdnsDriverHandle> {
-    start_with_queue_owner(config, outbound_rx, inbound_tx, ())
-}
-
-/// [`start`], with an opaque owner for the outbound queue.
-///
-/// The owner rides into the outbound pump inside an [`OwnedQueue`], so it is
-/// released only after the receiver and everything the caller left queued in
-/// it — including when the pump is cancelled mid-`recv` rather than exiting
-/// cleanly. See [`OwnedQueue`] for why the driver takes something it never
-/// reads, and why `O` is inline rather than boxed.
-///
-/// On a failed start the owner is dropped here with the receiver, before any
-/// pump exists: nothing was translated, so nothing is left unaccounted.
-pub fn start_with_queue_owner<O: Send + 'static>(
-    config: MdnsDriverConfig,
-    outbound_rx: mpsc::UnboundedReceiver<MdnsOutbound>,
-    inbound_tx: mpsc::UnboundedSender<MdnsInbound>,
-    queue_owner: O,
-) -> crate::Result<MdnsDriverHandle> {
-    let outbound_rx = OwnedQueue::new(outbound_rx, queue_owner);
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
 
     // TCP exchange listener first — its port goes into the SRV record.
@@ -208,7 +188,7 @@ pub fn start_with_queue_owner<O: Send + 'static>(
     {
         let shared = shared.clone();
         tasks.push(tokio::spawn(async move {
-            run_outbound(shared, outbound_rx).await;
+            run_outbound(shared, outbound).await;
             trace!("mdns outbound pump exiting");
         }));
     }
@@ -283,7 +263,7 @@ struct Shared {
     /// can ride the same socket the request arrived on.
     conns: Mutex<HashMap<String, ConnHandle>>,
     conn_gen: AtomicU64,
-    inbound_tx: mpsc::UnboundedSender<MdnsInbound>,
+    inbound_tx: InboundSink<MdnsInbound>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,8 +306,20 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 // Every resolve (first sight or cache refresh) surfaces as
                 // an announce; the engine is idempotent on repeats, same
                 // as with periodic Nostr announces.
+                //
+                // **`SenderClaimed`, and the mDNS daemon seeing the record is
+                // not what makes it otherwise.** The device id here was parsed
+                // out of the advertisement's TXT record, which any LAN
+                // participant may write with any value: what the daemon
+                // established is that *a record* appeared, not whose device it
+                // names. The same holds for the expiry and re-surface sites
+                // below - withdrawing a record you advertised proves nothing
+                // about the device id inside it. Until an mDNS service record
+                // carries an independently authenticated binding to the device
+                // key, none of this carrier's presence or withdrawal is a
+                // carrier-established identity.
                 let _ = shared.inbound_tx.send(MdnsInbound::PeerAnnounced {
-                    attribution: CarrierAttribution::CarrierObserved,
+                    attribution: CarrierAttribution::SenderClaimed,
                     device_id: advert.peer,
                 });
             }
@@ -339,7 +331,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                     debug!(peer = %&peer[..peer.len().min(16)], "mdns peer withdrew");
                     let _ = shared.inbound_tx.send(MdnsInbound::PeerLeft {
                         device_id: peer,
-                        attribution: CarrierAttribution::CarrierObserved,
+                        attribution: CarrierAttribution::SenderClaimed,
                     });
                 }
             }
@@ -347,8 +339,8 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
     }
 }
 
-async fn run_outbound<O: Send>(shared: Arc<Shared>, mut outbound_rx: OwnedQueue<MdnsOutbound, O>) {
-    while let Some(outbound) = outbound_rx.recv().await {
+async fn run_outbound(shared: Arc<Shared>, mut source: Box<dyn OutboundSource<MdnsOutbound>>) {
+    while let Some(outbound) = source.recv().await {
         match outbound {
             MdnsOutbound::Announce => {
                 if !shared.registered.load(Ordering::SeqCst) {
@@ -669,7 +661,7 @@ async fn run_reannounce(shared: Arc<Shared>) {
         for device_id in peers {
             let _ = shared.inbound_tx.send(MdnsInbound::PeerAnnounced {
                 device_id,
-                attribution: CarrierAttribution::CarrierObserved,
+                attribution: CarrierAttribution::SenderClaimed,
             });
         }
     }

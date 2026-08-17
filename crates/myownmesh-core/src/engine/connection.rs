@@ -672,7 +672,7 @@ impl PeerConnection {
         *self.authenticated_channel.lock() = Some(capability);
     }
 
-    /// Whether this entry currently holds a promoted session.
+    /// Whether a promoted `SessionCapability` is installed on this entry.
     ///
     /// Observation only: it cannot lend one, clone one, or revive one, and it
     /// answers nothing about whether that session would still be admitted.
@@ -680,12 +680,21 @@ impl PeerConnection {
     /// from "the fence refused and left it installed" — which is the whole
     /// difference between a revocation that takes effect and one that merely
     /// declines the next call while the authority stays alive behind it.
-    /// Gated to exactly its callers. Every control that asks this stands on a
-    /// live connector with a real promoted session, which only the
-    /// `transport-lab` harness builds, so a plain `cargo test` compiles the
-    /// tests module without it.
-    #[cfg(all(test, feature = "transport-lab"))]
-    pub(crate) fn holds_promoted_session_for_test(&self) -> bool {
+    ///
+    /// **This is also what "a live session" means, and the booleans it replaces
+    /// were not it.** `authenticated && data_channel_open` describes the transport
+    /// underneath a session; promotion is the session. Two owners now read this
+    /// rather than those booleans: graceful departure, which may only depart a
+    /// session that exists, and the carrier-withdrawal arm, which may not retire
+    /// one. A channel that has closed while recovery or replacement is in
+    /// progress leaves the promoted session installed, and that is the whole
+    /// point - the connector and the Peer Session own that state, not signaling.
+    ///
+    /// Production, and there is no counterfeit. Only a real connector promotes,
+    /// which is why every control that needs the true case lives behind
+    /// `transport-lab`; a control that wanted to fake one would be asserting
+    /// against a session the product cannot produce.
+    pub(crate) fn holds_promoted_session(&self) -> bool {
         self.promoted_session.is_installed()
     }
 

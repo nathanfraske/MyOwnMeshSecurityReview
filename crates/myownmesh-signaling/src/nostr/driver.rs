@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, watch};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
@@ -35,7 +35,7 @@ use super::event::{
 use super::handle::derive_room_handle;
 use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
-use crate::{CarrierAttribution, SignalingMessage, SIG_CAP_PTAG};
+use crate::{CarrierAttribution, InboundSink, OutboundSource, SignalingMessage, SIG_CAP_PTAG};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -112,27 +112,8 @@ pub enum NostrOutbound {
 /// the handle (drop to stop).
 pub fn start(
     config: NostrDriverConfig,
-    outbound_rx: mpsc::UnboundedReceiver<NostrOutbound>,
-    inbound_tx: mpsc::UnboundedSender<NostrInbound>,
-) -> NostrDriverHandle {
-    start_with_queue_owner(config, outbound_rx, inbound_tx, ())
-}
-
-/// [`start`], with an opaque owner for this driver's queues.
-///
-/// The owner is stored as the last field of `DriverShared`, so everything the
-/// driver holds that came from the caller — the `outbound` receiver with
-/// whatever was left queued in it, and the `outbound_replay` buffer of events
-/// built from those messages — is dropped before the owner is released. See
-/// [`OwnedQueue`](crate::OwnedQueue) for why a driver takes something it never
-/// reads, and why `O` is inline rather than boxed.
-///
-/// `O` is unconstrained beyond thread-safety: the driver never reads it.
-pub fn start_with_queue_owner<O: Send + Sync + 'static>(
-    config: NostrDriverConfig,
-    outbound_rx: mpsc::UnboundedReceiver<NostrOutbound>,
-    inbound_tx: mpsc::UnboundedSender<NostrInbound>,
-    queue_owner: O,
+    outbound: Box<dyn OutboundSource<NostrOutbound>>,
+    inbound_tx: InboundSink<NostrInbound>,
 ) -> NostrDriverHandle {
     let identity = NostrIdentity::generate();
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
@@ -202,7 +183,7 @@ pub fn start_with_queue_owner<O: Send + Sync + 'static>(
         room_handle,
         device_id: config.device_id.clone(),
         relays: Mutex::new(Vec::new()),
-        outbound: tokio::sync::Mutex::new(Some(outbound_rx)),
+        outbound: tokio::sync::Mutex::new(Some(outbound)),
         publish_tx,
         force_reconnect: force_reconnect.clone(),
         relay_connected: relay_connected.clone(),
@@ -212,7 +193,6 @@ pub fn start_with_queue_owner<O: Send + Sync + 'static>(
         outbound_replay: Mutex::new(std::collections::VecDeque::new()),
         room_caps: Mutex::new(std::collections::HashMap::new()),
         compat_directed,
-        _queue_owner: queue_owner,
     });
     {
         let mut relays = shared.relays.lock();
@@ -333,12 +313,12 @@ impl Drop for NostrDriverHandle {
     }
 }
 
-struct DriverShared<O> {
+struct DriverShared {
     identity: NostrIdentity,
     room_handle: String,
     device_id: String,
     relays: Mutex<Vec<RelayHandle>>,
-    outbound: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<NostrOutbound>>>,
+    outbound: tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound>>>>,
     publish_tx: broadcast::Sender<Arc<NostrEvent>>,
     /// Generation counter for forced reconnects. Bumping it wakes
     /// every relay task's `watch::Receiver` so it drops its socket
@@ -389,29 +369,13 @@ struct DriverShared<O> {
     /// what stops every pairwise offer/answer/candidate in the room from
     /// being delivered to every member.
     compat_directed: Arc<watch::Sender<bool>>,
-    /// Whatever the caller says funds this driver's queues, held inline and
-    /// never read. See [`OwnedQueue`](crate::OwnedQueue).
-    ///
-    /// **Declared last on purpose, and it must stay last.** Fields drop in
-    /// declaration order, so everything above — the `outbound` receiver with
-    /// whatever the engine left queued in it, and `outbound_replay`, which
-    /// holds events built from those messages after they have been sent — is
-    /// released before this is. Moving it up would let the owner go while
-    /// values it accounts for are still alive, which is the whole thing it is
-    /// here to prevent.
-    ///
-    /// Inline, not boxed: a `Box` is an allocation the caller would then have
-    /// to account for, and `Box` drops its payload before it frees itself, so
-    /// a boxed owner would release its claim and only then deallocate the
-    /// thing that claim covered.
-    _queue_owner: O,
 }
 
 /// Re-evaluate [`DriverShared::compat_directed`] from the current
 /// `room_caps` map and signal sessions if it changed. Conservative: an
 /// empty room keeps compat on (no evidence everyone tags), and any
 /// announced peer without the cap keeps it on.
-fn recompute_compat<O>(shared: &DriverShared<O>) {
+fn recompute_compat(shared: &DriverShared) {
     let caps = shared.room_caps.lock();
     let need_compat = caps.is_empty() || caps.values().any(|ptag| !*ptag);
     drop(caps);
@@ -440,7 +404,7 @@ fn recompute_compat<O>(shared: &DriverShared<O>) {
 ///
 /// One REQ, multiple filters (OR semantics), so narrowing is a
 /// same-sub-id REQ replacement rather than sub churn.
-fn desired_filters<O>(shared: &DriverShared<O>, compat: bool) -> Vec<Value> {
+fn desired_filters(shared: &DriverShared, compat: bool) -> Vec<Value> {
     let since = now_secs().saturating_sub(PRESENCE_REPLAY_WINDOW_SECS);
     let mut filters = vec![
         serde_json::json!({
@@ -468,7 +432,7 @@ fn desired_filters<O>(shared: &DriverShared<O>, compat: bool) -> Vec<Value> {
 }
 
 /// Serialize the room REQ for `desired_filters`.
-fn build_req<O>(shared: &DriverShared<O>, sub_id: &str, compat: bool) -> String {
+fn build_req(shared: &DriverShared, sub_id: &str, compat: bool) -> String {
     let mut arr = vec![
         Value::String("REQ".to_string()),
         Value::String(sub_id.to_string()),
@@ -513,10 +477,10 @@ struct RelayHandle {
     connected: bool,
 }
 
-async fn run_relay<O: Send + Sync + 'static>(
+async fn run_relay(
     url: String,
-    shared: Arc<DriverShared<O>>,
-    inbound_tx: mpsc::UnboundedSender<NostrInbound>,
+    shared: Arc<DriverShared>,
+    inbound_tx: InboundSink<NostrInbound>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     live: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) {
@@ -661,10 +625,10 @@ fn fallback_action(primary_live: usize, fallback_active: bool, down_for_ms: u64)
 /// fallback URL; when a primary returns it cancels them. So the public
 /// relays only ever carry traffic when the configured/primary set can't —
 /// presence stays off public infrastructure in normal operation.
-async fn run_fallback_supervisor<O: Send + Sync + 'static>(
+async fn run_fallback_supervisor(
     urls: Vec<String>,
-    shared: Arc<DriverShared<O>>,
-    inbound_tx: mpsc::UnboundedSender<NostrInbound>,
+    shared: Arc<DriverShared>,
+    inbound_tx: InboundSink<NostrInbound>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     primary_live: Arc<std::sync::atomic::AtomicUsize>,
 ) {
@@ -744,13 +708,13 @@ enum RelaySessionOutcome {
 /// promptly rather than waiting on its own connection timeout.
 const RELAY_CANCEL_POLL_MS: u64 = 250;
 
-async fn run_relay_session<O: Send + Sync + 'static>(
+async fn run_relay_session(
     url: &str,
     stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
-    shared: &Arc<DriverShared<O>>,
-    inbound_tx: &mpsc::UnboundedSender<NostrInbound>,
+    shared: &Arc<DriverShared>,
+    inbound_tx: &InboundSink<NostrInbound>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     force_rx: &mut watch::Receiver<u64>,
 ) -> RelaySessionOutcome {
@@ -910,10 +874,7 @@ async fn run_relay_session<O: Send + Sync + 'static>(
 /// joiner wants to be visible to existing peers without delay).
 /// Subsequent waits follow the curve in `upstream.rs` item 7:
 /// dense at startup, settling to a 60s steady-state heartbeat.
-async fn run_announcer<O: Send + Sync + 'static>(
-    shared: Arc<DriverShared<O>>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-) {
+async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
     let mut count: usize = 0;
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -960,11 +921,11 @@ async fn run_announcer<O: Send + Sync + 'static>(
     }
 }
 
-fn handle_inbound_frame<O>(
+fn handle_inbound_frame(
     url: &str,
     frame: &str,
-    shared: &Arc<DriverShared<O>>,
-    inbound_tx: &mpsc::UnboundedSender<NostrInbound>,
+    shared: &Arc<DriverShared>,
+    inbound_tx: &InboundSink<NostrInbound>,
 ) -> Result<(), String> {
     let value: Value = serde_json::from_str(frame).map_err(|e| e.to_string())?;
     let arr = value.as_array().ok_or_else(|| "not an array".to_string())?;
@@ -1123,7 +1084,7 @@ struct SignalingEnvelope {
 /// open-announce, and the engine-driven reactive announce all publish
 /// exactly this event, so there is a single place the announce's shape
 /// (and its advertised signaling caps) can ever change.
-fn build_announce_event<O>(shared: &DriverShared<O>) -> NostrEvent {
+fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     let envelope = SignalingEnvelope {
         from: shared.device_id.clone(),
         to: None,
@@ -1182,10 +1143,7 @@ fn drain_fresh_outbound(
         .collect()
 }
 
-async fn run_outbound_pump<O: Send + Sync + 'static>(
-    shared: Arc<DriverShared<O>>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-) {
+async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
     let mut rx_guard = shared.outbound.lock().await;
     let Some(mut rx) = rx_guard.take() else {
         return;
@@ -1300,6 +1258,10 @@ fn short(url: &str) -> &str {
 mod tests {
     use super::*;
     use crate::nostr::event::NostrIdentity;
+    // Only the controls build channels now: the driver itself takes an
+    // `OutboundSource` and an `InboundSink`, and owns no queue in either
+    // direction.
+    use tokio::sync::mpsc;
 
     #[test]
     fn fallback_holds_while_a_primary_is_up() {
@@ -1393,10 +1355,12 @@ mod tests {
         );
     }
 
-    fn fixture_shared() -> Arc<DriverShared<()>> {
+    fn fixture_shared() -> Arc<DriverShared> {
         let identity = NostrIdentity::generate();
         let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(16);
         let (_out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
+        let out_rx: Box<dyn OutboundSource<NostrOutbound>> =
+            Box::new(crate::UnboundedSource::new(out_rx));
         Arc::new(DriverShared {
             identity,
             room_handle: "test-room".into(),
@@ -1412,7 +1376,6 @@ mod tests {
             outbound_replay: Mutex::new(std::collections::VecDeque::new()),
             room_caps: Mutex::new(std::collections::HashMap::new()),
             compat_directed: Arc::new(watch::channel(true).0),
-            _queue_owner: (),
         })
     }
 
@@ -1454,6 +1417,7 @@ mod tests {
         let peer_pub = peer_signer.pubkey_hex().to_string();
         let (frame, event_id) = announce_frame_for(&peer_pub, &peer_signer);
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
 
         handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
         handle_inbound_frame("wss://relay-b", &frame, &shared, &tx).expect("dup parses");
@@ -1508,6 +1472,7 @@ mod tests {
         assert_ne!(id1, ev2.id, "test fixture: events must have distinct ids");
 
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
         handle_inbound_frame("wss://relay-a", &frame1, &shared, &tx).expect("frame 1 parses");
         handle_inbound_frame("wss://relay-a", &frame2, &shared, &tx).expect("frame 2 parses");
 
@@ -1578,6 +1543,7 @@ mod tests {
             SIGNALING_EPHEMERAL_KIND,
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
 
         handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
 
@@ -1601,6 +1567,7 @@ mod tests {
         let peer_pub = peer_signer.pubkey_hex().to_string();
         let frame = offer_frame_for(&peer_pub, "self-device", &peer_signer, SIGNALING_EVENT_KIND);
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
 
         handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
 
@@ -1635,6 +1602,7 @@ mod tests {
         let frame =
             serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&ev).unwrap()]).to_string();
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
 
         handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
 
@@ -1697,6 +1665,7 @@ mod tests {
         let a = NostrIdentity::generate();
         let b = NostrIdentity::generate();
         let (tx, _rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
 
         // One tagging peer: narrows (they're the whole room).
         let frame = announce_frame_with_caps(a.pubkey_hex(), &a, &[SIG_CAP_PTAG]);

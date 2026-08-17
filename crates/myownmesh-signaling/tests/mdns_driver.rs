@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use myownmesh_signaling::mdns::{self, MdnsDriverConfig, MdnsInbound, MdnsOutbound};
-use myownmesh_signaling::SignalingMessage;
+use myownmesh_signaling::{InboundSink, SignalingMessage, UnboundedSource};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -54,14 +54,25 @@ async fn two_drivers_discover_and_exchange() {
     let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
 
-    let a = match mdns::start(driver_config(&network, "device-a"), a_out_rx, a_in_tx) {
+    let a_in = InboundSink::from_unbounded(a_in_tx);
+    let b_in = InboundSink::from_unbounded(b_in_tx);
+
+    let a = match mdns::start(
+        driver_config(&network, "device-a"),
+        Box::new(UnboundedSource::new(a_out_rx)),
+        a_in,
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("SKIP mdns_driver test: driver A failed to start ({e}) — no mDNS here");
             return;
         }
     };
-    let b = match mdns::start(driver_config(&network, "device-b"), b_out_rx, b_in_tx) {
+    let b = match mdns::start(
+        driver_config(&network, "device-b"),
+        Box::new(UnboundedSource::new(b_out_rx)),
+        b_in,
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("SKIP mdns_driver test: driver B failed to start ({e}) — no mDNS here");

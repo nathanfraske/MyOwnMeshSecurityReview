@@ -735,16 +735,24 @@ impl PeerRegistry {
         .flatten()
     }
 
-    /// Snapshot owner tokens for the entries a fanout selects.
+    /// Snapshot owner tokens for the entries `select` accepts.
+    ///
+    /// The token-shaped counterpart to [`Self::values_snapshot`], for any work
+    /// that picks peers now and acts on them later — a fanout, and the departure
+    /// sweep in `depart_authenticated_sessions`, which passes
+    /// `PeerConnection::holds_promoted_session` as its selector.
     ///
     /// Owner tokens rather than device id **strings**, because a string has to
-    /// be re-resolved at send time: between the collection and the send a peer
-    /// can be replaced, and the replacement answers the lookup and receives the
-    /// payload. An owner token names one *installation*, so after replacement it
-    /// names nothing and that element of the fanout simply drops.
+    /// be re-resolved at the moment of action: between the collection and the
+    /// send a peer can be replaced, and the replacement answers the lookup and
+    /// receives the effect chosen for its predecessor. An owner token names one
+    /// *installation*, so after replacement it names nothing and that element
+    /// simply drops.
     ///
     /// Selection stays a policy read — it is not authority. Each element is
-    /// still individually authorized by the session gate when it is sent.
+    /// still individually authorized by the session gate when it is sent, and a
+    /// selector that accepts everything (`|_| true`) is a legitimate whole-map
+    /// snapshot rather than a second helper.
     pub(super) fn owners_snapshot(
         &self,
         mut select: impl FnMut(&PeerConnection) -> bool,
