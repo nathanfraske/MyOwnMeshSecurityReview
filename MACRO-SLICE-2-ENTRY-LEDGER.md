@@ -26,11 +26,20 @@ discharge record at the end of this file names the exact closing commit and
 control, and an open residual at the 7.3 gate remains a stop condition rather
 than permission to delete the record.
 
-**R4 was not part of that acceptance and is not claimed to be.** It is a
-pre-existing defect the first bounded unit found while proving its own
-boundary, recorded here on the same terms so it cannot be lost, and awaiting the
-owner's decision on whether it carries the same exit-condition commitment as the
-first three.
+**R4 was not part of that acceptance and is not claimed to be.** The operator
+accepted R1, R2 and R3 on 2026-08-16, and that acceptance was never extended
+backwards to cover R4. R4 is a pre-existing defect the first bounded unit found
+while proving its own boundary; it was recorded here under the same non-deletion
+mechanic so it could not be lost, but on this record's authority rather than the
+operator's. **That distinction is preserved for provenance and nothing below
+softens it.**
+
+What has changed is the implementation, not the acceptance. R4 was discharged at
+`0237f9e02df3ab21131c5612c1b231050c860cc4`, so the open question — whether it
+carried the same exit-condition commitment as the first three — no longer has to
+be answered by anyone: there is no unresolved R4 choice left at the 7.3 gate. A
+discharge is evidence that the defect is closed, and it is not a ratification of
+R4 by the operator.
 
 ### R1 — `STORE_LOCK` is process-local
 
@@ -91,31 +100,43 @@ device's live local session with them.
 **Addressed by the signaling + semantic-ingress boundary. The three counts are
 not equals, and saying so is the point:**
 
-1. **The report no longer names a third party on mDNS.** `mdns/driver.rs`
-   attributes a normalized leave to `frame.from` — the same field its announce
-   already used, and the same one its own peer table is keyed on. **Narrows the
-   surface; mDNS only.** It does not help on Nostr, where the departure still
-   carries the body `peer_id`.
-2. **A sender's claim cannot cancel a carrier's observation.**
-   `SignalingRuntime` refuses to let a `SenderClaimed` withdrawal clear a
-   `CarrierObserved` presence, and delivers no withdrawal at all while another
-   attach still observes the device. **Narrows the surface; it does not close
-   the effect on a single carrier.** Nostr presence *and* departure are both
-   `SenderClaimed`, so on a Nostr-only attach — no mDNS, nothing else observing
-   the device — a hostile relay payload naming a third party still withdraws
-   what a relay payload claimed, and that withdrawal **is delivered to the
-   engine** as a `PeerLeft` for the named third party. This is stated plainly
-   because counts 1 and 2 together do not stop it.
+1. **The report no longer names a third party on mDNS, and mDNS is no longer
+   trusted to name one at all.** `mdns/driver.rs` attributes a normalized leave
+   to `frame.from` — the same field its announce already used, and the same one
+   its own peer table is keyed on. **Narrows the surface; mDNS only.** It does
+   not help on Nostr, where the departure still carries the body `peer_id`.
+
+   The exact-head review found the deeper error: browse resolve, expiry and
+   goodbye were labelled `CarrierObserved`, but the device id in every one of
+   them is parsed from the advertisement TXT record, which any LAN participant
+   may write with any value. An attacker could advertise a victim's Device ID
+   and then withdraw it. **All mDNS presence and withdrawal is now
+   `SenderClaimed`**, which leaves the in-process `LocalBroker` as the only
+   producer of `CarrierObserved` anywhere in the system. A driver leaves that
+   state by gaining an authenticated binding between what it observed and the
+   device key, not by observing more carefully.
+2. **Attribution travels with the report, unchanged, to the one place that
+   reads it.** `SignalingRuntime` retains nothing and decides nothing about a
+   withdrawal: an earlier revision held one back while some other attach still
+   observed the device, and that availability map was deleted rather than
+   repaired (see the boundary section). **Narrows nothing on its own; it
+   preserves the evidence.** A hostile Nostr payload naming a third party is
+   delivered to the engine as a `PeerLeft` for that third party, on every
+   network shape, single-carrier or not. Nothing before the engine stops it, and
+   nothing before the engine is asked to — which is why count 3 is the one that
+   closes the effect.
 3. **The engine barrier: a sender-claimed withdrawal selects no session in any
    state. This is the count that holds on every carrier and closes the
    body-target effect outright.** `PeerLeft` is reachability evidence, and
    `engine/mod.rs` reads *attribution* before liveness. A `SenderClaimed`
    withdrawal is teardown-inert — it retires nothing, whatever state the named
    session is in — so the delivered Nostr withdrawal of count 2 reaches the
-   engine and selects nothing. Only a `CarrierObserved` withdrawal may retire a
-   session, and only one that is not live; a live session is retired by the
-   authenticated `SessionControl::Depart` over that exact session, ordinary
-   connector closure, or the heartbeat, and by nothing else.
+   engine and selects nothing. Only a `CarrierObserved` withdrawal may retire
+   anything, and only an attempt that never became a session: **the predicate is
+   the promoted `SessionCapability` itself**, not the transport booleans
+   underneath one. A promoted session is retired by an exact channel failure or
+   the authenticated `SessionControl::Depart` over that very session, and by
+   nothing else.
 
    **This count was liveness-only when it was first written, and that was
    wrong.** Guarding on `authenticated && data_channel_open` alone left a
@@ -124,36 +145,54 @@ not equals, and saying so is the point:**
    when it is least able to defend itself. Attribution, not liveness, is what
    makes the body-claimed target inert rather than merely narrowed.
 
-**The guard window, exactly, and it now applies only to `CarrierObserved`.**
-"Live" is the conjunction the engine tests: `authenticated && data_channel_open`.
-A session that is authenticated but whose data channel is closed — mid-recovery,
-or mid-replacement of the transport underneath it — does **not** satisfy it, and
-a carrier's *own* observation naming that device can retire it. That is
-deliberate and consistent: it is the same predicate
-`depart_authenticated_sessions` uses to choose which sessions get an
-authenticated goodbye, so the two halves of the lifecycle agree on what a live
-session is, and a session with no channel has no channel for a
-`SessionControl::Depart` to arrive on either. Nothing a sender writes can aim at
-that window, because a sender-claimed hint never reaches the retirement at all.
+**The guard window is closed, not narrowed.** An earlier revision defined "live"
+as `authenticated && data_channel_open`, which left a real window: a session
+whose channel had closed while recovery or replacement was in progress failed the
+conjunction and could be retired by a carrier's own observation. That state
+belongs to the Peer Session and connector-recovery owners, so the predicate on
+both sides of the lifecycle is now `PeerConnection::holds_promoted_session` —
+graceful departure may only depart a session that exists, and a carrier
+withdrawal may not retire one. A closed channel no longer changes either answer.
 
-**Stale-replacement safety.** The retirement takes the peer owner token, reads
-liveness through that same token, and retires with `drop_peer_if_current`. A
-session installed between the read and the retirement — the reconnect this hint
-may well have raced — is not retired by evidence about the one it replaced.
-Nothing on this path touches the roster or the member log.
+**Stale-replacement safety, on both sides.** The withdrawal arm takes the peer
+owner token, reads promotion through that same token, and retires with
+`drop_peer_if_current`. Graceful departure now does the same: it selects
+`PeerRegistry::owners_snapshot()` and never re-resolves a Device ID again, so a
+replacement installed before the send, during the awaited send, or after it is
+neither sent a goodbye meant for its predecessor nor torn down in its place.
+Nothing on either path touches the roster or the member log.
 
-**Control coverage, and the two controls prove different things.**
-`a_withdrawal_is_delivered_only_when_nothing_still_observes_the_device` in
-`engine/signaling_ingress.rs` proves the **multi-carrier hold**: while any attach
-still observes the device, the withdrawal is not delivered at all. It says
-nothing about a single-carrier attach, where the withdrawal *is* delivered.
-`v4_m2_a_carrier_withdrawal_leaves_a_healthy_authenticated_session_intact` in
-`engine/mod.rs` proves what happens to one that **is** delivered, in three
-parts: it cannot retire a healthy authenticated session; a sender-claimed one
-cannot retire an authenticated session whose channel has closed either; and a
-carrier-observed one still can retire that same not-live shape — which is what
-makes the control a rule about attribution rather than an arm that has stopped
-dropping anything. It keeps its durable assertions throughout: the device stays
+**Control coverage, and the two controls prove different things.** Every
+withdrawal now reaches the engine — the runtime's availability map, which used to
+hold one back while another attach still observed the device, was removed rather
+than repaired — so what the engine's arm does with a delivered withdrawal is the
+whole rule. `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` in
+`engine/mod.rs` proves it over the in-process carrier, the only one that can
+produce a carrier-observed report at all: a sender-claimed departure selects
+nothing however healthy the transport looks, and a carrier-observed withdrawal
+does cancel an unpromoted attempt — which makes it a rule about attribution
+rather than an arm that has stopped dropping anything.
+`v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable`
+proves the network carrier's shape, where both directions are claimed: a LAN
+participant may write any device id into a TXT record, and neither the announce
+naming a stranger nor the withdrawal naming a victim yields a promoted session or
+changes the roster version, roster size, transition log or member log — compared
+before and after, not enumerated. A claimed announce *may* leave an unpromoted
+attempt behind it, because an announce paces a dial; that is the cost of a
+connection that will not authenticate, and it is not an admission.
+
+**The promoted half cannot be proven without a connector, and is not
+counterfeited.** Only a real connector mints a `SessionCapability`, so
+`v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` lives behind
+`transport-lab` with the rest of the promotion controls. It is `#[ignore]`d,
+because it opens a native WebRTC object, so **the ordinary `transport-lab` CI job
+compiles it and does not run it**; no scheduled job executes it. Its only
+execution to date is the explicit manager run `ef44f52a`. **Neither the
+default-feature job nor the ordinary `transport-lab` job covers the
+promoted-session side of this boundary**, which is disclosed here rather than
+left to be discovered, and "CI runs it" is not claimed. The alternative — a fixture writing a promotion field the
+product cannot produce — would assert against a session that does not exist. The
+default-feature control keeps its durable assertions throughout: the device stays
 a signed member, stays rostered, and stays admissible. Neither control subsumes
 the other, and only the second speaks to the Nostr-only case above.
 
@@ -177,19 +216,39 @@ unavailable on a relay-only network**, and exact connector closure, the
 authenticated `SessionControl::Depart`, or the heartbeat timeout is the backstop.
 That is slower than the relay hint used to be, and it is the price of the hint
 not being aimable: a relay report was exactly as forgeable as any other payload.
-The other two carriers keep a genuine observed path — mDNS browse expiry and
-goodbye, and every `LocalBroker` join and drop, are `CarrierObserved` — so a LAN
-peer disappearing is still noticed promptly by the carrier that was watching it.
+**mDNS has no `CarrierObserved` path either, and this correction removed the
+last one it had.** Browse resolve, expiry and goodbye all take the device id from
+an advertisement's TXT record, so the daemon observing a record appear or vanish
+establishes that *a record* moved, not whose device it names. The in-process
+`LocalBroker` is the only producer of `CarrierObserved` anywhere in the system,
+because it is the only one that stamps the registered id of the handle that sent
+rather than reading an id out of something a sender wrote. On every network
+carrier, prompt carrier-driven retirement is therefore unavailable by design, and
+exact connector closure, the authenticated `SessionControl::Depart`, or the
+heartbeat timeout is the backstop.
 
-Status: **discharged at correction commit
-`7fb4708d01895269b4aff809857b9d6ffe88d6ad`.** The earlier implementation commit
-`0b9b5b2c5be60f8204aa2fef4e14259e5d385611` guarded on liveness alone and was
-insufficient: it left a sender-claimed departure able to retire a third party's
-authenticated-but-channel-closed session. The correction commit moves
-attribution ahead of liveness, makes every sender-claimed withdrawal
-teardown-inert, and binds the carrier-observed liveness decision and retirement
-to one exact `PeerOwnerToken`. The controls named in the table below are committed
-at that exact correction head.
+Status: **discharged at
+`0237f9e02df3ab21131c5612c1b231050c860cc4`** — "Complete signaling and semantic
+ingress ownership", parent `ee8f5b98622ddbfe2c4307294113f9ddd2c73d8e`, 15 source
+and test files at +1713/-870, adding `engine/semantic_ingress.rs`. This ledger is
+deliberately not in that commit, so the evidence does not contain its own claim.
+
+**Two prior discharges are superseded, and both are kept here rather than
+overwritten**, because a residual that was closed twice on insufficient evidence
+is worth being able to read back.
+`0b9b5b2c5be60f8204aa2fef4e14259e5d385611` guarded on liveness alone, so a
+sender-claimed departure could retire a third party's
+authenticated-but-channel-closed session — a session in recovery, which is
+exactly when it is least able to defend itself.
+`7fb4708d01895269b4aff809857b9d6ffe88d6ad` moved attribution ahead of liveness
+and bound the decision to one exact `PeerOwnerToken`, which closed the aimable
+half but left two holes the exact-head review of `ee8f5b9` found: the mDNS driver
+still labelled a sender-chosen TXT Device ID `CarrierObserved`, so an attacker
+could advertise a victim's id and then withdraw it; and the retirement predicate
+was still the transport booleans rather than the promoted session. Neither
+survives in `0237f9e0…` — every mDNS report is `SenderClaimed` there, and the
+predicate is a promoted `SessionCapability` — and the three controls named in the
+discharge record below are present in that commit and are what close it.
 
 ## The Macro-slice 2 signaling and semantic-ingress boundary
 
@@ -204,28 +263,114 @@ carrier provenance is retained, and the admission is an exhaustive match with no
 wildcard arm, so a new carrier variant cannot compile until someone states what
 it is — and a variant carrying a durable signed fact has no kind to choose.
 
-**There is no durable-semantic ingress, and none is pretended.** No carrier
-variant carries a durable signed fact, so an uninhabited durable arm would have
-been a tag whose other value nothing can hold. The distinction `ARCHITECTURE.md`
-§4 draws is carried by the type this module produces.
+**There is no durable-semantic *signaling* variant, and none is pretended.** No
+carrier variant carries a durable signed fact, so an uninhabited durable arm on
+the signaling union would have been a tag whose other value nothing can hold.
 
-`SignalingRuntime` is the owner on the signaling side. It owns exactly three
-things: an opaque process-local `CarrierInstance` minted per attach,
-cross-carrier de-duplication, and availability — which attaches currently
-observe a device, and on what attribution. It owns no roster decision, no
-endpoint identity, and no application delivery.
+The durable half lives where the sender is known. `engine/semantic_ingress.rs`
+is the Semantic Node's ingress: the seven existing authenticated-session durable
+messages (`NetworkState`, `NetworkStatePropose`, `NetworkStateAck`,
+`NetworkStateSplit`, `RosterSummary`, `RosterRequest`, `RosterEntries`) enter one
+closed typed `DurableSemanticIngress`, and a separate reducer applies them under
+the exact `PeerOwnerToken` the session belongs to. The type wraps a private enum,
+so the only way to obtain one is the module's `admit`, and `admit` is total over
+`MeshMessage` with no wildcard — a new durable message is a compile error until
+it is classified. Its outcome is a two-variant `SemanticAdmission`, not a
+`Result`: "not a durable fact" is the ordinary case rather than an error, and a
+`Result` would have put a whole `MeshMessage` in an `Err` on the way past every
+non-durable live frame. Boxing that would have bought an allocation per frame in
+front of the entire inbound path; the enum moves the frame and allocates nothing. The two ownerships are therefore disjoint by construction:
+unauthenticated carrier ingress carries no durable fact and has no kind that
+could, and durable ingress is reachable only from a promoted session.
 
-The semantic-ingress half is the Peer Session lifecycle owner: an authenticated
+`SignalingRuntime` is the owner on the signaling side. It owns exactly two
+things: an opaque process-local `CarrierInstance` minted per attach, and
+cross-carrier de-duplication whose every retained key is funded by the finite
+provider rather than capped by a constant. **It retains no untrusted record.** An
+earlier revision kept a per-device availability map keyed by attacker-chosen
+device ids and bounded by an invented constant; it was removed rather than
+repaired, which closes the flood that evicted real peers and the stale-attach
+suppression together, and leaves a detaching carrier with nothing to clean up.
+
+A key is committed only where the engine's mailbox actually **accepted** the
+value. The send reports three outcomes — accepted, dropped, engine gone — rather
+than a keep-pumping boolean, because a boolean conflates "the driver carries on"
+with "the engine has it": under that reading a first offer refused by local
+pressure still left its key behind, and the retransmission meant to rescue the
+attempt was swallowed as a duplicate of something nobody received. That is the
+defect `a_refused_offer_leaves_no_dedup_history_and_its_retransmission_lands`
+exists to catch, and it caught it.
+
+The Peer Session lifecycle owner is unchanged: an authenticated
 `SessionControl::Depart` sent over the exact live session, consumed only under
 that session's owner, with no target Device ID because the session defines its
 endpoints. A carrier withdrawal is reachability evidence and cannot retire a
-healthy authenticated session; `announce_leave` may still emit the carrier hint,
-but it carries no teardown authority and the fixed departure wait is gone.
+promoted session; `announce_leave` may still emit the carrier hint, but it
+carries no teardown authority and the fixed departure wait is gone.
+
+**Both driver queues are gone rather than sized, in both directions.**
+
+*Inbound.* A driver used to push decoded reports into an unbounded channel that a
+bridge pump drained, and that stretch was unaccounted memory an unauthenticated
+carrier filled at its own rate. Drivers now take a
+`myownmesh_signaling::InboundSink` — an opaque closure — and carry each report
+through the engine's funded admission on their own task. Local pressure is lossy
+and never a teardown signal; only a gone consumer stops a driver.
+
+*Outbound.* The mirror defect, and the one a single whole-queue lease did not
+close. The bridge used to translate each engine event into the driver's type and
+push that translation into a second unbounded channel, with one standing
+`SIGNALING_DRIVER_QUEUE_CLAIM` acquired for "the queue". That named the subsystem
+without bounding it: the translations are the allocations, the depth is how many
+exist at once, and one claim says nothing about that number however long it is
+held. Drivers now take a `myownmesh_signaling::OutboundSource` and **pull**; the
+translation is built at the moment the driver asks for one, from the engine's
+own per-driver funded mailbox, which already admitted the pre-translation value.
+Nothing is ever queued in a translated form, so there is no queue lease —
+`SIGNALING_DRIVER_QUEUE_CLAIM`, `acquire_driver_queue_owner`, `OwnedQueue`,
+`start_with_queue_owner` and `join_with_queue_owner` are all deleted rather than
+kept as vestigial accounting for a queue that no longer exists.
+
+Both seams are opaque callbacks or traits over plain values, so the signaling
+crate still learns no resource vocabulary and still works standalone.
 
 Excluded, and still excluded: anti-entropy, proof delivery, B3 changes, timers,
 polls, retries, terminal acknowledgements, relay and durable-store work, route
 identities, route ledgers, path generations, persistence, application payload in
 signaling, downstream migration, and any generic framework.
+
+### Named residuals inside this boundary
+
+Both the engine→driver and driver→engine seams are queueless now: a driver pulls
+its outbound values through an `OutboundSource` and offers its inbound reports to
+an `InboundSink`, so nothing is retained in a translated form on either side.
+
+Three unbounded queues remain **on the production bridge path or upstream of
+it**, and they are named rather than quietly sized:
+
+- **mDNS discovery events** (`mdns/discovery/embedded.rs`,
+  `mdns/discovery/system.rs`). These are **upstream of admission and on the
+  carrier→engine path**: a LAN participant's multicast lands here before the
+  driver has decided anything, so this is a real bound the driver still lacks.
+  It is left open because bounding it belongs to the driver's own work model —
+  the system backend's queue is the `mdns-sd` dependency's, which the review
+  allows to remain a named residual, and the embedded backend's is the same
+  buffer under our own control. Naming it as internal would have been the
+  comfortable answer and the wrong one.
+- **The mDNS resolve queue** (`mdns/driver.rs`), fed from the discovery events
+  above and drained by the exchange dialler. Same position, same reason.
+- **`server.rs`'s per-connection outbound queue.** The self-hosted relay is a
+  separate deployment with no `NetworkState` and no provider to answer to; it is
+  not on this node's carrier→engine path at all.
+
+The count is those three and no more. It deliberately excludes the adapters a
+caller may opt into — `LocalBroker::join`, `InboundSink::from_unbounded`,
+`UnboundedSource` — which do build unbounded channels, but only for a standalone
+embedder or a control that asked for one, and never on the production bridge
+path: `attach_local`, `attach_nostr` and `attach_mdns` construct none of them.
+That is the point of naming them in the signaling crate's public surface rather
+than hiding a buffer inside a driver — the choice appears in the source of
+whoever made it.
 
 ## Scope ceiling
 
@@ -247,4 +392,4 @@ evidence, not its sole copy.
 | R1 | — | — |
 | R2 | — | — |
 | R3 | — | — |
-| R4 | `7fb4708d01895269b4aff809857b9d6ffe88d6ad` (supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `a_withdrawal_is_delivered_only_when_nothing_still_observes_the_device` (multi-carrier hold), `v4_m2_a_carrier_withdrawal_leaves_a_healthy_authenticated_session_intact` (delivered sender-claimed withdrawal retires nothing in any state; carrier-observed still retires a not-live session) |
+| R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |
