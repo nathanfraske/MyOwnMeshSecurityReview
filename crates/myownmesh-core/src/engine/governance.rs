@@ -474,26 +474,28 @@ pub async fn spawn_split(state: &Arc<EngineState>, proposal_id: &str) -> Result<
 
 // ---- inbound dispatch -----------------------------------------------
 
-/// A peer asks us to consider their proposal. Verify the proposer's
-/// signature; if valid + not already known, add to pending so the
-/// local user can sign or deny.
-pub async fn on_propose(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateProposeMessage) {
-    // Reject if the claimed proposer's pubkey isn't the one that
-    // actually owns the data channel. A peer can't author a
-    // proposal "as" someone else.
-    let peer_pubkey = pk(peer_id);
-    if msg.proposer != peer_pubkey {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!(
-                "rejecting proposal claiming proposer={} from peer={}",
-                &msg.proposer[..msg.proposer.len().min(12)],
-                &peer_pubkey[..peer_pubkey.len().min(12)]
-            ),
-        );
-        return;
-    }
+/// A peer asks us to consider a proposal. Verify the proposer's signature; if
+/// valid + not already known, add to pending so the local user can sign or deny.
+///
+/// # Who delivered it is not part of what makes it true
+///
+/// There is no parameter for the sending session, because the answer to "may
+/// this proposal be acted on" is entirely inside the message: an embedded
+/// proposer, a signature over the canonical payload, and — inside that payload
+/// via [`network_state::transition_payload`] — this network's id and the state
+/// signing-domain tag. A forgery fails the verification below whoever hands it
+/// over, and a genuine proposal stays genuine whoever hands it over.
+///
+/// An earlier revision also required `msg.proposer` to equal the delivering
+/// session's own pubkey. That check authenticated nothing the signature had not
+/// already settled; what it did was ban relaying, so a peer could not carry a
+/// valid signed proposal on behalf of an author this node cannot currently
+/// reach, and no cache, file or future durable carrier could feed this reducer
+/// without first becoming an authenticated session. Fact authority is canonical
+/// content plus embedded author and signature plus domain context — never the
+/// carrier and never the current sender — so the check is gone rather than
+/// narrowed.
+pub async fn on_propose(state: &Arc<EngineState>, msg: NetworkStateProposeMessage) {
     // Verify the proposer actually signed the canonical payload.
     let payload = network_state::transition_payload(&state.network_id, &msg.variant);
     let ok = crate::signing::verify(&msg.proposer, &payload, &msg.signature).unwrap_or(false);
@@ -545,24 +547,16 @@ pub async fn on_propose(state: &Arc<EngineState>, peer_id: &str, msg: NetworkSta
     let _ = try_ratify(state, &msg.proposal_id).await;
 }
 
-/// A peer's sign or deny response to a proposal we already have.
-/// Verify the ack-signature, fold the decision into the pending
-/// record, ratify if the new signer set satisfies the quorum.
-pub async fn on_ack(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateAckMessage) {
-    let peer_pubkey = pk(peer_id);
-    if msg.signer != peer_pubkey {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!(
-                "rejecting ack claiming signer={} from peer={}",
-                &msg.signer[..msg.signer.len().min(12)],
-                &peer_pubkey[..peer_pubkey.len().min(12)]
-            ),
-        );
-        return;
-    }
-
+/// A sign or deny response to a proposal we already have. Verify the
+/// ack-signature, fold the decision into the pending record, ratify if the new
+/// signer set satisfies the quorum.
+///
+/// Self-authenticating on the same terms as [`on_propose`]: the signer is
+/// embedded, the signature covers a payload carrying this network's id and the
+/// state domain tag, and the delivering session is not consulted. An ack that
+/// travelled through a third peer counts exactly once, the same as one that
+/// arrived directly — quorum is over signers, not over couriers.
+pub async fn on_ack(state: &Arc<EngineState>, msg: NetworkStateAckMessage) {
     let variant = {
         let gov = state.governance_state.read();
         match gov.pending.iter().find(|p| p.id == msg.proposal_id) {
@@ -629,19 +623,12 @@ pub async fn on_ack(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateAc
     let _ = try_ratify(state, &msg.proposal_id).await;
 }
 
-/// A peer spawned a split from a proposal we were tracking. Verify
-/// the proposer's signature over the new network's `Split`
-/// payload, then record the split in our parent network's state.
-pub async fn on_split(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateSplitMessage) {
-    let peer_pubkey = pk(peer_id);
-    if msg.proposer != peer_pubkey {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            "rejecting split with mismatched proposer",
-        );
-        return;
-    }
+/// A split was spawned from a proposal we were tracking. Verify the proposer's
+/// signature over the new network's `Split` payload, then record the split in
+/// our parent network's state.
+///
+/// Self-authenticating on the same terms as [`on_propose`].
+pub async fn on_split(state: &Arc<EngineState>, msg: NetworkStateSplitMessage) {
     let split_variant = TransitionVariant::Split {
         new_network_id: msg.new_network_id.clone(),
         members: msg.members.clone(),
@@ -967,7 +954,13 @@ pub(super) async fn on_roster_request(
 /// Inbound roster entries. Additively merge any members we were missing,
 /// persist if the roster changed, and — if it did — re-summarise to our
 /// peers so the new member propagates onward (gossip convergence).
-pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: RosterEntriesMessage) {
+pub async fn on_roster_entries(state: &Arc<EngineState>, source: &str, msg: RosterEntriesMessage) {
+    // `source` names where this arrived from, for the diagnostics below and for
+    // the ones `adopt_transition_log` emits. It is not consulted by any decision
+    // in either place: the governance and member logs authenticate themselves
+    // through `verify_log` / `verify_member_log`, and the unsigned `entries` are
+    // trusted or ignored by network kind rather than by who delivered them.
+    let peer_id = source;
     // Membership trust is split by network kind:
     //
     //   * `open` network — permissionless gossip: "a member is anyone any
@@ -2252,7 +2245,7 @@ mod member_proposal_timestamp_controls {
              sample of the clock"
         );
 
-        on_propose(&receiver, author.identity.public_id(), announced).await;
+        on_propose(&receiver, announced).await;
         let remote_entry = {
             let gov = receiver.governance_state.read();
             let received = gov
@@ -2273,6 +2266,108 @@ mod member_proposal_timestamp_controls {
             "and to one union-merge key: the member log dedupes on the whole \
              serialized entry, so two `at` values would keep two copies of what \
              was logically one transition"
+        );
+    }
+
+    /// **A signed proposal is worth the same whoever hands it over, and a
+    /// forged one is worth nothing however direct the route.**
+    ///
+    /// The two halves are one control because each is the other's non-vacuity.
+    /// A reducer that accepted everything would pass the first alone; one that
+    /// accepted nothing would pass the second.
+    ///
+    /// The first half is the correction. The proposal is authored and signed by
+    /// one Device and then handed over by a *different* one — a relay, a peer
+    /// forwarding what it heard, and equally the shape a cache or a file replay
+    /// would present. An earlier revision rejected exactly this, because it
+    /// required the embedded proposer to equal the delivering session's own
+    /// pubkey; that check authenticated nothing the signature had not settled,
+    /// and what it actually did was make fact authority depend on the carrier.
+    ///
+    /// The second half is what makes the first safe: the signature still
+    /// decides. The forgery here is a proposal whose signature was made over a
+    /// *different* transition, so the bytes are well-formed and the author is a
+    /// real Device — it fails on verification rather than on shape.
+    #[tokio::test]
+    async fn v4_m2_a_a_signed_fact_is_verified_by_its_own_signature_not_its_courier() {
+        // One network, two Devices. The suffix is deliberately the *same* for
+        // both: `build_test_state` derives the network id from it and mints a
+        // fresh ephemeral identity each call, and the canonical payload a
+        // proposal is signed over binds the network id (`transition_payload`).
+        // Two suffixes would therefore make the receiver refuse a perfectly
+        // valid signature for the right reason — wrong network — and this
+        // control would pass its second half while proving nothing with its
+        // first. The non-vacuity assertion below is what keeps the shared
+        // suffix from quietly becoming one Device talking to itself.
+        let author = crate::engine::build_test_state("relayed-proposal");
+        let receiver = crate::engine::build_test_state("relayed-proposal");
+        let stranger = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        ungoverned_closed_network(&author, &stranger);
+        ungoverned_closed_network(&receiver, &stranger);
+
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let id = propose(
+            &author,
+            TransitionVariant::Evict {
+                target: target.clone(),
+            },
+            None,
+        )
+        .await
+        .expect("the author files its own proposal");
+        let announced = {
+            let gov = author.governance_state.read();
+            announcement(
+                gov.pending
+                    .iter()
+                    .find(|p| p.id == id)
+                    .expect("the proposal is pending on the author"),
+            )
+        };
+        assert_ne!(
+            announced.proposer,
+            crate::signing::pubkey_part(receiver.identity.public_id()),
+            "non-vacuity: the author and the receiver really are different \
+             Devices, so nothing here is a proposal a peer made about itself"
+        );
+
+        // Delivered by somebody who did not write it, and never named to the
+        // reducer at all — which is the point: there is no parameter for it.
+        on_propose(&receiver, announced.clone()).await;
+        assert!(
+            receiver
+                .governance_state
+                .read()
+                .pending
+                .iter()
+                .any(|p| p.id == id),
+            "a valid signed proposal is filed on the strength of its own \
+             signature, whoever carried it"
+        );
+
+        // Same author, same signature, different claim: the signature was made
+        // over an eviction and this says something else.
+        let forged = NetworkStateProposeMessage {
+            variant: TransitionVariant::KindChange {
+                to: NetworkKind::Closed,
+            },
+            proposal_id: format!("{id}-forged"),
+            ..announced
+        };
+        on_propose(&receiver, forged.clone()).await;
+        assert!(
+            !receiver
+                .governance_state
+                .read()
+                .pending
+                .iter()
+                .any(|p| p.id == forged.proposal_id),
+            "and a signature that does not cover the claim is refused, so \
+             dropping the courier check did not drop the verification"
         );
     }
 

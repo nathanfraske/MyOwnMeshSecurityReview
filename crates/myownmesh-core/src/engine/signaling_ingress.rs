@@ -131,10 +131,19 @@ pub(crate) struct CarrierInstance(u64);
 /// so the type belongs where the decision is made and a second copy on this side
 /// would be a place for the two to disagree.
 ///
-/// What this side does with it: a [`CarrierAttribution::SenderClaimed`]
-/// withdrawal cannot cancel a [`CarrierAttribution::CarrierObserved`] presence,
-/// so naming a third party in a payload cannot make the runtime forget that the
-/// third party is reachable. Neither value mints authority — a device is
+/// What this side does with it: **nothing, and that is the current design.** An
+/// earlier revision held a withdrawal back while some other attach still
+/// observed the device, and the map that decided it was deleted rather than
+/// repaired — see [`SignalingRuntime`]. The value now travels with the report,
+/// unread, to the engine's withdrawal arm, which is the one place entitled to
+/// act on it: a [`CarrierAttribution::SenderClaimed`] withdrawal is
+/// teardown-inert in every state, and a [`CarrierAttribution::CarrierObserved`]
+/// one may cancel an exact unpromoted attempt and never a promoted session.
+///
+/// So a hostile payload naming a third party *is* delivered here as a
+/// withdrawal for that third party, on every network carrier. It is inert when
+/// it lands, which is a stronger place to stop it than a suppression rule
+/// keyed on ids an attacker chooses. Neither value mints authority — a device is
 /// admitted by endpoint authentication and policy, never by being named here.
 pub(crate) use myownmesh_signaling::CarrierAttribution;
 
@@ -509,30 +518,39 @@ pub(crate) fn outbound_signal(outbound: &SignalingOutbound) -> EphemeralSignal {
 /// than on a device that sent nothing.
 fn parse_directed(from: String, message: SignalingMessage) -> SignalingInbound {
     match message {
-        SignalingMessage::Announce { peer_id, caps } => {
-            let _ = (peer_id, caps);
+        SignalingMessage::Announce { peer_id } => {
+            let _ = peer_id;
             SignalingInbound::PeerAnnounced { device_id: from }
         }
         SignalingMessage::Leave { peer_id } => {
             let _ = peer_id;
             SignalingInbound::PeerLeft { device_id: from }
         }
-        SignalingMessage::Offer { sdp, .. } => SignalingInbound::Offer {
+        // `offer_id` is the sender's attempt correlation and it is kept, not
+        // dropped. Discarding it here is what left de-duplication with nothing
+        // but content to key on, so a candidate that recurs verbatim on a
+        // replacement attempt was indistinguishable from the second relay's
+        // copy of the retired one — and the live copy lost.
+        SignalingMessage::Offer { sdp, offer_id, .. } => SignalingInbound::Offer {
             device_id: from,
+            attempt: offer_id,
             sdp,
         },
-        SignalingMessage::Answer { sdp, .. } => SignalingInbound::Answer {
+        SignalingMessage::Answer { sdp, offer_id, .. } => SignalingInbound::Answer {
             device_id: from,
+            attempt: offer_id,
             sdp,
         },
         SignalingMessage::Candidate {
             candidate,
+            offer_id,
             sdp_mid,
             sdp_mline_index,
             username_fragment,
             ..
         } => SignalingInbound::Candidate {
             device_id: from,
+            attempt: offer_id,
             candidate: LocalIceCandidate {
                 candidate,
                 sdp_mid,
@@ -559,12 +577,21 @@ enum Delivered {
     Closed,
 }
 
-/// One retained de-duplication key and the lease that funds it.
+/// One retained de-duplication key, the attempt it belongs to, and the lease
+/// that funds it.
 ///
 /// The lease is held for exactly as long as the key is remembered and released
 /// by the same `Drop` that forgets it, so the ring cannot outlive what pays for
 /// it. `_lease` is never read: holding it *is* the effect.
+///
+/// `attempt` is what makes the key mean something. Without it the key was pure
+/// content, and two different questions hashed the same: "is this the second
+/// relay's copy of the offer I already took?" and "is this the same host
+/// candidate again, on the attempt that replaced the one I retired?". The first
+/// must be dropped and the second must be delivered, and a content-only key
+/// answered both with "drop it".
 struct SeenKey {
+    attempt: u64,
     key: u64,
     _lease: ResourceLease,
 }
@@ -682,13 +709,16 @@ impl SignalingRuntime {
             .restamps_duplicates()
             .then(|| dedup_key(&ingress))
             .flatten();
-        let Some(key) = key else {
+        let Some((attempt, key)) = key else {
             // Nothing to remember, so only the engine being gone matters.
             return !matches!(self.send(ingress), Delivered::Closed);
         };
 
         let mut seen = self.seen.lock();
-        if seen.iter().any(|entry| entry.key == key) {
+        if seen
+            .iter()
+            .any(|entry| entry.attempt == attempt && entry.key == key)
+        {
             trace!(
                 kind = ingress.kind_name(),
                 "cross-carrier duplicate dropped"
@@ -717,10 +747,34 @@ impl SignalingRuntime {
         // authority.
         let funded = self.retain_key(&mut seen);
         match funded {
-            Some(lease) => seen.push_back(SeenKey { key, _lease: lease }),
+            Some(lease) => seen.push_back(SeenKey {
+                attempt,
+                key,
+                _lease: lease,
+            }),
             None => trace!(kind, "de-duplication key unfunded; duplicates will pass"),
         }
         true
+    }
+
+    /// Forget everything remembered for one attempt.
+    ///
+    /// Called by the engine when an attempt ends or is replaced — the two
+    /// moments after which nothing belonging to it can legitimately arrive
+    /// again. Each forgotten key releases its own lease, so the funding goes
+    /// back at exactly the same time the record does.
+    ///
+    /// This is the other half of scoping the key. Scoping alone stops a retired
+    /// attempt from suppressing a live one; releasing on the exact end is what
+    /// stops the ring from being a slowly filling record of every attempt the
+    /// process ever made, emptied only by provider pressure.
+    pub(crate) fn forget_attempt(&self, attempt: &str) {
+        if attempt.is_empty() {
+            return;
+        }
+        let attempt = hash_attempt(attempt);
+        let mut seen = self.seen.lock();
+        seen.retain(|entry| entry.attempt != attempt);
     }
 
     /// Fund one more remembered key, evicting the oldest once if that is what it
@@ -838,26 +892,61 @@ impl CarrierAttach {
     }
 }
 
-/// Content key for de-duplication. `None` = never deduped.
+/// Hash one attempt correlation into the opaque value the ring compares.
 ///
-/// **Keyed on the message content and deliberately not on the carrier.** The
-/// duplicate this exists to catch is one engine emission that fanned out to
-/// Nostr and mDNS and came back over both, so the two copies differ in exactly
-/// the field a carrier-aware key would separate them by. Applying an offer twice
-/// via `set_remote_description` wedges WebRTC permanently. Retained provenance is
-/// for the engine to read, not for the key; the first carrier to arrive is the
-/// one whose provenance is delivered.
-fn dedup_key(ingress: &EphemeralIngress) -> Option<u64> {
+/// The correlation itself is a peer-supplied string and is deliberately not
+/// retained: a hash is all the ring needs to group and forget by, and it keeps
+/// the retained record free of anything a sender chose the length of.
+fn hash_attempt(attempt: &str) -> u64 {
     let mut h = DefaultHasher::new();
-    match ingress.inbound() {
-        SignalingInbound::Offer { device_id, sdp } => {
+    attempt.hash(&mut h);
+    h.finish()
+}
+
+/// De-duplication key: which attempt, and which message within it. `None` =
+/// never deduped.
+///
+/// **Content, and deliberately not the carrier.** The duplicate this exists to
+/// catch is one engine emission that fanned out to Nostr and mDNS and came back
+/// over both, so the two copies differ in exactly the field a carrier-aware key
+/// would separate them by. Applying an offer twice via `set_remote_description`
+/// wedges WebRTC permanently.
+///
+/// **Scoped to the attempt, and that is the correction.** Content alone was not
+/// enough in the other direction: a host candidate carries no `username_fragment`
+/// on many stacks, so the same candidate recurs byte-identically on the attempt
+/// that replaces a retired one and hashed to the retired one's key. The live
+/// copy was dropped as a duplicate of something that no longer existed. The
+/// attempt correlation is what tells those two apart, and it is why the engine
+/// mints one per attempt instead of each carrier inventing its own.
+///
+/// **An unstamped signal is not de-duplicated at all.** That is the honest
+/// outcome rather than a fallback to the old content-only key: without a
+/// correlation there is nothing that distinguishes a relay copy from a fresh
+/// attempt, and delivering twice is recoverable where suppressing a live attempt
+/// is not.
+fn dedup_key(ingress: &EphemeralIngress) -> Option<(u64, u64)> {
+    let mut h = DefaultHasher::new();
+    let attempt = match ingress.inbound() {
+        SignalingInbound::Offer {
+            device_id,
+            attempt,
+            sdp,
+        } => {
             (1u8, device_id, sdp).hash(&mut h);
+            attempt
         }
-        SignalingInbound::Answer { device_id, sdp } => {
+        SignalingInbound::Answer {
+            device_id,
+            attempt,
+            sdp,
+        } => {
             (2u8, device_id, sdp).hash(&mut h);
+            attempt
         }
         SignalingInbound::Candidate {
             device_id,
+            attempt,
             candidate,
         } => {
             (
@@ -869,10 +958,14 @@ fn dedup_key(ingress: &EphemeralIngress) -> Option<u64> {
                 &candidate.username_fragment,
             )
                 .hash(&mut h);
+            attempt
         }
         SignalingInbound::PeerAnnounced { .. } | SignalingInbound::PeerLeft { .. } => return None,
+    };
+    if attempt.is_empty() {
+        return None;
     }
-    Some(h.finish())
+    Some((hash_attempt(attempt), h.finish()))
 }
 
 #[cfg(test)]
@@ -1018,7 +1111,6 @@ pub(super) mod tests {
         let inbound = [
             SignalingMessage::Announce {
                 peer_id: "peer-a".into(),
-                caps: Vec::new(),
             },
             SignalingMessage::Leave {
                 peer_id: "peer-a".into(),
@@ -1031,6 +1123,7 @@ pub(super) mod tests {
             },
             SignalingMessage::Candidate {
                 peer_id: "peer-a".into(),
+                offer_id: "attempt-1".into(),
                 candidate: "candidate:1 1 UDP 1 10.0.0.1 5000 typ host".into(),
                 sdp_mid: Some("0".into()),
                 sdp_mline_index: Some(0),
@@ -1050,19 +1143,29 @@ pub(super) mod tests {
             "no current carrier variant carries a durable signed fact"
         );
 
+        // One attempt to one peer, so the three directed emissions carry the
+        // same correlation — that is what a real offer/answer/candidate run
+        // looks like, and the fixture should not describe a shape the engine
+        // never produces. It is a concrete value rather than an empty one on
+        // purpose: an empty correlation is precisely what `attempt_is_current`
+        // refuses, so writing one here would leave a bypass-shaped constant
+        // sitting in a fixture for the next reader to copy.
         let outbound = [
             SignalingOutbound::Announce,
             SignalingOutbound::Leave,
             SignalingOutbound::Offer {
                 device_id: "peer-a".into(),
+                attempt: "attempt-1".into(),
                 sdp: "sdp-1".into(),
             },
             SignalingOutbound::Answer {
                 device_id: "peer-a".into(),
+                attempt: "attempt-1".into(),
                 sdp: "sdp-1".into(),
             },
             SignalingOutbound::Candidate {
                 device_id: "peer-a".into(),
+                attempt: "attempt-1".into(),
                 candidate: LocalIceCandidate {
                     candidate: "candidate:1 1 UDP 1 10.0.0.1 5000 typ host".into(),
                     sdp_mid: Some("0".into()),
@@ -1134,6 +1237,7 @@ pub(super) mod tests {
 
         let candidate = |mid: &str| SignalingMessage::Candidate {
             peer_id: "body-claimed-id".into(),
+            offer_id: "attempt-1".into(),
             candidate: "candidate:1 1 UDP 1 10.0.0.1 5000 typ host".into(),
             sdp_mid: Some(mid.to_string()),
             sdp_mline_index: Some(0),
@@ -1165,6 +1269,84 @@ pub(super) mod tests {
                 (EphemeralSignal::ConnectIntent, SignalingCarrier::Nostr),
             ],
             "one duplicate swallowed, five distinct inputs through"
+        );
+    }
+
+    /// **The same candidate on a different attempt is not a duplicate, and the
+    /// keys of an attempt go back when the attempt ends.**
+    ///
+    /// This is the defect the correlation exists for, driven directly. A host
+    /// candidate carries no `username_fragment`, so the *identical* line recurs
+    /// on the attempt that replaces a retired one — same content, same peer,
+    /// same everything a content-only key could see. That key answered "already
+    /// had it" and the live attempt lost the candidate it needed.
+    ///
+    /// Three discriminations, and each is another's non-vacuity:
+    ///
+    /// - within one attempt the duplicate is still caught, so scoping did not
+    ///   simply disable de-duplication;
+    /// - across two attempts the identical candidate is delivered, which is the
+    ///   correction;
+    /// - after `forget_attempt` the first attempt's own candidate is delivered
+    ///   again, which proves the keys were released rather than merely
+    ///   out-competed — a ring that had kept them would still swallow it.
+    #[test]
+    fn a_key_is_scoped_to_its_attempt_and_released_when_the_attempt_ends() {
+        let (runtime, mut rx) = runtime_with_rx();
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+
+        // Byte-identical but for the attempt it names — the case a content-only
+        // key cannot tell apart.
+        let candidate = |attempt: &str| SignalingMessage::Candidate {
+            peer_id: "body-claimed-id".into(),
+            offer_id: attempt.to_string(),
+            candidate: "candidate:1 1 UDP 1 10.0.0.1 5000 typ host".into(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        };
+        let deliver =
+            |attempt: &str| relay.deliver(relay.directed("peer-a".into(), candidate(attempt)));
+        let drain = |rx: &mut crate::resource::ResourceMailboxReceiver<EphemeralIngress>| {
+            let mut n = 0;
+            while rx.try_recv().is_some() {
+                n += 1;
+            }
+            n
+        };
+
+        assert!(deliver("attempt-1"));
+        assert!(deliver("attempt-1"));
+        assert_eq!(
+            drain(&mut rx),
+            1,
+            "within one attempt the second copy is still a duplicate"
+        );
+
+        assert!(deliver("attempt-2"));
+        assert_eq!(
+            drain(&mut rx),
+            1,
+            "the identical candidate on the replacement attempt is delivered: \
+             this is what a content-only key swallowed"
+        );
+
+        runtime.forget_attempt("attempt-1");
+        assert!(deliver("attempt-1"));
+        assert_eq!(
+            drain(&mut rx),
+            1,
+            "and the ended attempt's key really went back — a ring that still \
+             held it would swallow this"
+        );
+
+        // Non-vacuity for the release itself: forgetting one attempt leaves the
+        // other's keys alone.
+        assert!(deliver("attempt-2"));
+        assert_eq!(
+            drain(&mut rx),
+            0,
+            "forgetting one attempt does not empty the ring"
         );
     }
 
@@ -1333,6 +1515,7 @@ pub(super) mod tests {
                 SECRET_DEVICE.into(),
                 SignalingMessage::Candidate {
                     peer_id: SECRET_DEVICE.into(),
+                    offer_id: "attempt-1".into(),
                     candidate: format!("candidate:1 1 UDP 1 {SECRET_ADDRESS} 5000 typ host"),
                     sdp_mid: Some("0".into()),
                     sdp_mline_index: Some(0),

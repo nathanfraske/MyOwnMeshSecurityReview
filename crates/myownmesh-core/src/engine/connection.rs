@@ -327,6 +327,23 @@ pub struct PeerConnection {
     /// endpoint-auth task that owns the current connector, and it is dropped
     /// whenever that connector is retired or replaced.
     authenticated_channel: Mutex<Option<crate::endpoint_auth::AuthenticatedChannelCapability>>,
+    /// The correlation naming this connection attempt, for de-duplication.
+    ///
+    /// One installation of a peer is one attempt, so this is minted here, once,
+    /// and a replacement installation gets a different one. It rides every
+    /// offer, answer and candidate this side emits for the attempt, and the
+    /// answering side adopts the offerer's value through [`Self::adopt_attempt`]
+    /// so both ends name the attempt the same thing.
+    ///
+    /// **What it is for, and the one thing it is not.** The signaling ingress
+    /// keys de-duplication under it, which is the only way to tell "the second
+    /// relay's copy of this offer" from "the same host candidate again on a
+    /// fresh attempt" — the two are byte-identical otherwise, which is how a
+    /// retired attempt's key used to swallow a live one. It is sender-chosen and
+    /// unauthenticated on arrival, so it may scope that and nothing else: it is
+    /// not a route identity, not a path generation, not a session generation,
+    /// and no decision anywhere reads it as authority or preference.
+    attempt: RwLock<String>,
     /// The promoted session for the exact current channel.
     ///
     /// Promotion **moves** the authenticated capability out of the slot above
@@ -382,6 +399,40 @@ impl PeerConnection {
         drop(replaced);
     }
 
+    /// This attempt's correlation, for stamping an outbound signal.
+    pub(super) fn attempt(&self) -> String {
+        self.attempt.read().clone()
+    }
+
+    /// Adopt the offerer's correlation for this attempt.
+    ///
+    /// The offering side mints; the answering side adopts, so one attempt has
+    /// one name on both ends rather than two names that agree about nothing.
+    /// Called when an offer is applied, before any answer or candidate for that
+    /// attempt is emitted.
+    ///
+    /// Returns the correlation this displaced, when it displaced a different
+    /// one. That return value is not a courtesy: a rebuild offer — the peer tore
+    /// its connection down and built a fresh one on the same installation —
+    /// establishes a second attempt here, and the keys the ingress remembered
+    /// under the first can never legitimately match again. The caller releases
+    /// them. Without the hand-back there is no other way to learn the old value,
+    /// and it would sit in the ring until provider pressure evicted it.
+    ///
+    /// Ignores an empty value, which is what an unstamped frame decodes to:
+    /// blanking the field would leave this side emitting uncorrelated signals
+    /// for an attempt that has a perfectly good name.
+    pub(super) fn adopt_attempt(&self, attempt: &str) -> Option<String> {
+        if attempt.is_empty() {
+            return None;
+        }
+        let mut current = self.attempt.write();
+        if *current == attempt {
+            return None;
+        }
+        Some(std::mem::replace(&mut *current, attempt.to_string()))
+    }
+
     pub(super) fn new(device_id: String, session: Option<Arc<WebRtcConnectorWorker>>) -> Self {
         Self {
             device_id,
@@ -389,6 +440,7 @@ impl PeerConnection {
             session: Mutex::new(session),
             endpoint_auth: Mutex::new(None),
             authenticated_channel: Mutex::new(None),
+            attempt: RwLock::new(mint_attempt()),
             promoted_session: crate::runtime::peer_session::PromotedSessionSlot::new(),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1000,4 +1052,16 @@ impl PeerConnection {
         }
         self.promoted_session.is_installed()
     }
+}
+
+/// Mint one attempt correlation.
+///
+/// Random rather than a counter: a counter would be a process-visible ordering,
+/// and this must not order anything. Base32 of eight random bytes, which is the
+/// same shape the carrier translations used to mint individually and short
+/// enough to ride every candidate without being a payload.
+fn mint_attempt() -> String {
+    use rand::Rng;
+    let bytes: [u8; 8] = rand::thread_rng().gen();
+    data_encoding::BASE32_NOPAD.encode(&bytes).to_lowercase()
 }

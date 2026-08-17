@@ -98,19 +98,19 @@
 //! `Sighted` and never advance — the exact "they just sit there"
 //! symptom users hit in the field.
 //!
-//! **Our fix:** Track inbound event IDs (sha256, already present on
-//! every NIP-01 event) in a bounded ring per driver instance. The
-//! first relay to deliver an event wins; subsequent copies via
-//! other relays drop at the driver boundary, so the engine sees
-//! each signaling event exactly once.
+//! **Where it is fixed now:** not here. The driver used to keep a bounded
+//! ring of inbound event ids and drop the second relay's copy at the driver
+//! boundary, which was the wrong layer twice over: the id was recorded before
+//! the value was parsed and before it was offered onward, and the offer's
+//! result was thrown away — so a copy the consumer refused under pressure left
+//! its id behind and the retransmission that would have rescued the attempt was
+//! dropped as already seen. Neither copy reached the engine.
 //!
-//! Implementation: `seen_event_ids` field on the Nostr driver's
-//! `DriverShared`, capacity [`SEEN_EVENT_CAPACITY`].
-//!
-//! Sized at 2048 entries × ~64 bytes = ~128 KB max — trivial, and
-//! large enough that two peers slowly trickling candidates over a
-//! long handshake never wrap (a typical handshake produces
-//! 5-20 events per side).
+//! De-duplication has one owner now, downstream in `engine::signaling_ingress`,
+//! which commits a key only after the value has been accepted and scopes that
+//! key to the exact connection attempt it describes. The ring here, and the
+//! capacity constant that sized it, are deleted rather than moved: two layers
+//! holding the same policy is how the refusal-poisoning survived the first fix.
 //!
 //! # 7. Adaptive announce cadence
 //!
@@ -185,17 +185,21 @@
 //! bigger the network, the worse it runs" cost lived here.
 //!
 //! **Our fix:** Directed ephemeral events carry a `["p", device_id]`
-//! tag naming their recipient, and each peer's REQ carries three
-//! filters: presence, `#p`-is-me negotiation, and — only while some
-//! announced peer predates the tag — a legacy catch-all. Announces
-//! advertise [`crate::SIG_CAP_PTAG`]; once every peer in the room does,
-//! the catch-all filter is dropped (same-sub-id REQ replacement) and
-//! the relay stops fanning pairwise negotiation to bystanders. Mixed
-//! rooms behave exactly as before; the envelope's `to` check remains
-//! as the receive-side backstop either way.
+//! tag naming their recipient, and each peer's REQ carries two
+//! filters: presence, and `#p`-is-me negotiation. The relay never
+//! fans a pairwise negotiation to a bystander. The envelope's `to`
+//! check remains as the receive-side backstop.
 //!
-//! Implementation: `desired_filters` / `recompute_compat` in
-//! [`super::nostr::driver`].
+//! **What was removed with it.** An earlier revision advertised the
+//! capability in the announce and kept a third, room-wide catch-all
+//! filter until every announced peer had claimed it. The bookkeeping
+//! was an unbounded map keyed on unauthenticated announce ids, so one
+//! sender could hold the catch-all on for the whole room — an
+//! amplification lever and an unbounded allocation on the same map.
+//! The hard-alpha cutover has no pre-tag peer to interoperate with, so
+//! the negotiation is deleted rather than capped.
+//!
+//! Implementation: `desired_filters` in [`super::nostr::driver`].
 
 /// Inbound-message staleness threshold for zombie clearing — see
 /// item 3. Picked at ~5× the legacy 5.333s announce cadence, well
@@ -206,11 +210,6 @@ pub const STALE_INBOUND_MS: u64 = 25_000;
 /// Minimum time between offer-pool flushes — see item 4. A wave
 /// of peer drops within this window collapses to one flush.
 pub const OFFER_POOL_FLUSH_THROTTLE_MS: u64 = 10_000;
-
-/// Inbound event-ID dedup ring size — see item 6. Bounded so the
-/// driver never grows unbounded on a long-lived mesh; sized to
-/// comfortably cover the busiest realistic handshake.
-pub const SEEN_EVENT_CAPACITY: usize = 2048;
 
 /// Disconnected-peer grace window before the engine tears down the
 /// connection. Matches Trystero's `disconnectedPeerGraceMs`.

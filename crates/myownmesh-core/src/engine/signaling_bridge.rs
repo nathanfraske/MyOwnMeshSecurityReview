@@ -42,10 +42,13 @@ use myownmesh_signaling::mdns::{
 use myownmesh_signaling::nostr::driver::{
     self as nostr_driver, NostrDriverConfig, NostrDriverHandle, NostrInbound, NostrOutbound,
 };
-use myownmesh_signaling::{InboundSink, OutboundSource, SignalingMessage};
+use myownmesh_signaling::{InboundSink, OutboundSource, OwnedSignal, SignalingMessage};
 use tracing::{trace, warn};
 
-use crate::resource::{ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender};
+use crate::resource::{
+    LocalApplicationResourceScope, ResourceClaim, ResourceLease, ResourceMailboxDelivery,
+    ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender,
+};
 
 use super::signaling_ingress::{
     outbound_signal, CarrierAttach, CarrierAttribution, CarrierObservation, SignalingCarrier,
@@ -80,24 +83,153 @@ use super::state::{NetworkState, SignalingOutbound};
 struct TranslatedOutbound<T> {
     /// Something the caller wants published before it drains anything — the
     /// broker join announce. Yielded once and then forgotten.
-    first: Option<T>,
+    ///
+    /// It has no delivery behind it because the engine never sent it, so its
+    /// owner is the derived-allocation lease alone. Acquired when the source is
+    /// built, which is what makes a zero grant refuse before the announce is
+    /// constructed rather than after.
+    first: Option<(LocalOutboundFirst<T>, ResourceLease)>,
     rx: ResourceMailboxReceiver<SignalingOutbound>,
+    scope: LocalApplicationResourceScope,
     translate: Box<dyn Fn(&SignalingOutbound) -> T + Send>,
 }
 
+/// The pre-drain value, built only once its lease exists.
+type LocalOutboundFirst<T> = T;
+
+/// What funds one translated outbound value and everything derived from it.
+///
+/// # Two leases, because there are two allocations and one of them is new
+///
+/// The delivery is the engine's own admission of the `SignalingOutbound`: it
+/// funds *that* value, the one the mailbox accepted. Carrying it is necessary —
+/// it is the provenance, and it must not be released while anything built from
+/// the value it holds is still alive — but it is **not permission for a second
+/// graph**. The translation allocates a driver-shaped message with copies of the
+/// device id, the SDP or the candidate; the driver then serializes that, clones
+/// it into an `Arc`, fans it to every relay task and may keep it in a replay
+/// buffer. None of that was priced when the engine admitted the original.
+///
+/// So the owner is both: the whole delivery, and a separately acquired lease for
+/// the derived allocations. The derived lease is taken **before** the translation
+/// builder runs, so a provider with nothing left refuses instead of paying for a
+/// copy after the fact.
+///
+/// Field order is the release order. `_source` is declared first so it drops
+/// first; the derived lease outlives it and goes last, after everything it paid
+/// for is gone.
+///
+/// # Why the names carry a leading underscore
+///
+/// Nothing ever reads either field, and nothing should: an owner is held, not
+/// consulted. Its whole job is to exist until the value it funded is gone and
+/// then run its own `Drop`. The underscore says that in the name rather than in
+/// a suppression — a reader who goes looking for the accessor learns there is
+/// none, and a future `let CoreOutboundOwner::Delivery { _source, .. }` that
+/// tried to inspect the admitted value would be visibly against the grain.
+///
+/// # Why the delivery is boxed, and why the owner is still whole
+///
+/// A `ResourceMailboxDelivery<SignalingOutbound>` is far larger than a lease, so
+/// an unboxed `Delivery` would set the size of the whole enum and every `First`
+/// — the join announce, which has no delivery at all — would carry that
+/// footprint for nothing. One indirection on the single large field levels the
+/// two variants.
+///
+/// The box changes where the delivery lives, not what it is. The same value
+/// moves in intact, is never taken apart, is never observed, has no second
+/// handle, and is dropped as one thing at exactly the moment it was dropped
+/// before. Provenance is a lifetime claim, and an indirection does not shorten
+/// or fork a lifetime — so "the exact owner travels whole with what it funded"
+/// is as true through a `Box` as it was without one.
+///
+/// The allocation the box performs is itself part of the derived graph, which is
+/// why it happens in `recv` only after [`DERIVED_OUTBOUND_CLAIM`] is already in
+/// hand. Boxing before that would be the same mistake as translating before it:
+/// an allocation made first and funded afterwards.
+enum CoreOutboundOwner {
+    /// A value the engine admitted, plus the funding for what was built from it.
+    Delivery {
+        _source: Box<ResourceMailboxDelivery<SignalingOutbound>>,
+        _derived: ResourceLease,
+    },
+    /// The broker join announce: no delivery, because the engine never sent it.
+    First { _derived: ResourceLease },
+}
+
+/// What one translated outbound value and its downstream copies cost.
+///
+/// A structural charge for one derived graph, not a magnitude: it says the
+/// translation, the encoded form and the shared clones are things the accountant
+/// knows about, and the finite provider decides how many exist at once. Nothing
+/// here reads it as a peer limit or a queue depth — there is no queue.
+const DERIVED_OUTBOUND_CLAIM: ResourceClaim =
+    ResourceClaim::single(crate::resource::ResourceClass::OpaqueDependencyResidual, 1);
+
 #[async_trait::async_trait]
 impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
-    async fn recv(&mut self) -> Option<T> {
-        if let Some(first) = self.first.take() {
-            return Some(first);
+    type Owner = CoreOutboundOwner;
+
+    async fn recv(&mut self) -> Option<OwnedSignal<T, CoreOutboundOwner>> {
+        if let Some((first, derived)) = self.first.take() {
+            return Some(OwnedSignal::new(
+                first,
+                CoreOutboundOwner::First { _derived: derived },
+            ));
         }
-        let delivery = self.rx.recv().await?;
-        // Read, not taken apart. The translation is a different type carrying
-        // fields the engine never sent, so this was never a forward of the
-        // delivered value: the delivery stays whole and is released at the end
-        // of this call, still holding its own funding, while what it produced
-        // goes to the driver that asked for it.
-        Some((self.translate)(delivery.value()))
+        // One iteration per admitted emission. The loop exists so that a
+        // refusal is scoped to the emission it refused: `None` leaves this
+        // function only where the mailbox itself is closed, because that is the
+        // only thing a driver's `while let Some(..)` pump can correctly read as
+        // "finished". See [`OutboundSource::recv`].
+        loop {
+            let delivery = self.rx.recv().await?;
+            // Acquire before translating. A refusal here means nothing is built:
+            // the delivery is dropped whole, its own funding goes back, and the
+            // driver simply does not see this emission. That ordering is the fix
+            // — the alternative is to build the copy and then discover nobody is
+            // paying for it, which is exactly what "admitted before it is queued"
+            // was asking to prevent.
+            let derived = match self.scope.acquire(DERIVED_OUTBOUND_CLAIM) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    // This emission is dropped, and only this emission. The
+                    // delivery falls out of scope at the end of the iteration,
+                    // which releases the funding the engine put behind it, and
+                    // the next admitted value gets its own fresh attempt at the
+                    // derived claim.
+                    //
+                    // It is not re-tried, re-queued or deferred: there is no
+                    // timer here and no second buffer, and inventing one would
+                    // rebuild the queue this type exists to have removed. A
+                    // signaling emission that cannot be funded *now* is stale
+                    // shortly after anyway — the engine re-announces, and a lost
+                    // offer is re-sent by the negotiation that wanted it.
+                    warn!(
+                        ?error,
+                        "outbound emission dropped: no derived funding for this one"
+                    );
+                    continue;
+                }
+            };
+            // Read, not taken apart. The translation is a different type
+            // carrying fields the engine never sent, so this was never a forward
+            // of the delivered value: the delivery stays whole and travels with
+            // the result as its owner, alongside the lease that pays for the
+            // result itself.
+            let value = (self.translate)(delivery.value());
+            // The box is allocated here, after the derived lease exists and
+            // after the translation it pays for — never before the funding. The
+            // delivery moves into it whole; nothing is read out of it, then or
+            // ever.
+            return Some(OwnedSignal::new(
+                value,
+                CoreOutboundOwner::Delivery {
+                    _source: Box::new(delivery),
+                    _derived: derived,
+                },
+            ));
+        }
     }
 }
 
@@ -126,10 +258,15 @@ fn local_scope(
 /// cannot get one is not built at all rather than built with an invented
 /// capacity: there is no unfunded mode to fall back to.
 fn signaling_runtime(state: &Arc<NetworkState>, driver: &str) -> Option<Arc<SignalingRuntime>> {
-    Some(SignalingRuntime::new(
+    let runtime = SignalingRuntime::new(
         state.signaling_inbound_tx.clone(),
         local_scope(state, driver)?,
-    ))
+    );
+    // Published so the peer lifecycle can tell it when an attempt ends. It is
+    // the only consumer, and it only ever releases: nothing outside this module
+    // can deliver through the runtime or read what it remembers.
+    state.publish_signaling_runtime(&runtime);
+    Some(runtime)
 }
 
 /// Attach an existing [`NetworkState`] to a [`LocalBroker`] room.
@@ -166,15 +303,33 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
     // Announce ourselves on join so peers learn we're here even if the engine
     // doesn't emit anything immediately — the source yields it before it drains
     // anything, which is where the pump used to push it.
+    let Some(scope) = local_scope(state, "local") else {
+        return;
+    };
+    // **Zero grant builds nothing.** The join announce is an allocation like any
+    // other, so its lease is acquired here, before the value exists. A provider
+    // with nothing left means the announce is never constructed — not
+    // constructed and then found to be unfunded — and the attach returns.
+    let Some(first) = scope.acquire(DERIVED_OUTBOUND_CLAIM).ok().map(|derived| {
+        (
+            LocalOutbound::Announce {
+                device_id: device_id.clone(),
+            },
+            derived,
+        )
+    }) else {
+        warn!(
+            network = %state.network_id,
+            "local signaling not attached: no funding for the join announce"
+        );
+        return;
+    };
     let device_id_for_out = device_id.clone();
-    broker.join_with_sink(
-        &room,
-        &device_id,
+    let outbound: Box<dyn OutboundSource<LocalOutbound, Owner = CoreOutboundOwner>> =
         Box::new(TranslatedOutbound {
-            first: Some(LocalOutbound::Announce {
-                device_id: device_id_for_out.clone(),
-            }),
+            first: Some(first),
             rx: outbound_rx,
+            scope,
             translate: Box::new(move |outbound| match outbound {
                 SignalingOutbound::Announce => LocalOutbound::Announce {
                     device_id: device_id_for_out.clone(),
@@ -182,28 +337,38 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                 SignalingOutbound::Leave => LocalOutbound::Leave {
                     device_id: device_id_for_out.clone(),
                 },
-                SignalingOutbound::Offer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
+                SignalingOutbound::Offer {
+                    device_id: to,
+                    attempt,
+                    sdp,
+                } => LocalOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Offer {
                         peer_id: device_id_for_out.clone(),
-                        offer_id: new_short_id(),
+                        offer_id: attempt.clone(),
                         sdp: sdp.clone(),
                     },
                 },
-                SignalingOutbound::Answer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
+                SignalingOutbound::Answer {
+                    device_id: to,
+                    attempt,
+                    sdp,
+                } => LocalOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Answer {
                         peer_id: device_id_for_out.clone(),
-                        offer_id: String::new(),
+                        offer_id: attempt.clone(),
                         sdp: sdp.clone(),
                     },
                 },
                 SignalingOutbound::Candidate {
                     device_id: to,
+                    attempt,
                     candidate,
                 } => LocalOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Candidate {
+                        offer_id: attempt.clone(),
                         peer_id: device_id_for_out.clone(),
                         candidate: candidate.candidate.clone(),
                         sdp_mid: candidate.sdp_mid.clone(),
@@ -212,7 +377,11 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     },
                 },
             }),
-        }),
+        });
+    broker.join_with_sink(
+        &room,
+        &device_id,
+        outbound,
         carrier_sink(SignalingRuntime::attach(&runtime, SignalingCarrier::Local)),
     );
 }
@@ -363,13 +532,6 @@ fn resolve_app_id() -> String {
         .unwrap_or_else(|_| crate::TRYSTERO_APP_ID.to_string())
 }
 
-fn new_short_id() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 8] = rng.gen();
-    data_encoding::BASE32_NOPAD.encode(&bytes).to_lowercase()
-}
-
 /// Attach the engine to the production Nostr signaling driver.
 /// Returns the driver handle — drop or call `.stop()` to detach.
 /// Prefer [`attach_signaling`] unless you specifically want Nostr
@@ -429,43 +591,56 @@ fn attach_nostr_with(
     // receiver-side dedup wouldn't collapse it) — wasted relay bandwidth for no
     // benefit.
     let device_id_for_out = device_id.clone();
-    let outbound: Box<dyn OutboundSource<NostrOutbound>> = Box::new(TranslatedOutbound {
-        first: None,
-        rx: outbound_rx,
-        translate: Box::new(move |outbound| match outbound {
-            SignalingOutbound::Announce => NostrOutbound::Announce,
-            SignalingOutbound::Leave => NostrOutbound::Leave,
-            SignalingOutbound::Offer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
-                to: to.clone(),
-                msg: SignalingMessage::Offer {
-                    peer_id: device_id_for_out.clone(),
-                    offer_id: new_short_id(),
-                    sdp: sdp.clone(),
+    let scope = local_scope(state, "nostr")?;
+    let outbound: Box<dyn OutboundSource<NostrOutbound, Owner = CoreOutboundOwner>> =
+        Box::new(TranslatedOutbound {
+            first: None,
+            rx: outbound_rx,
+            scope,
+            translate: Box::new(move |outbound| match outbound {
+                SignalingOutbound::Announce => NostrOutbound::Announce,
+                SignalingOutbound::Leave => NostrOutbound::Leave,
+                SignalingOutbound::Offer {
+                    device_id: to,
+                    attempt,
+                    sdp,
+                } => NostrOutbound::DirectedToPeer {
+                    to: to.clone(),
+                    msg: SignalingMessage::Offer {
+                        peer_id: device_id_for_out.clone(),
+                        offer_id: attempt.clone(),
+                        sdp: sdp.clone(),
+                    },
                 },
-            },
-            SignalingOutbound::Answer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
-                to: to.clone(),
-                msg: SignalingMessage::Answer {
-                    peer_id: device_id_for_out.clone(),
-                    offer_id: String::new(),
-                    sdp: sdp.clone(),
+                SignalingOutbound::Answer {
+                    device_id: to,
+                    attempt,
+                    sdp,
+                } => NostrOutbound::DirectedToPeer {
+                    to: to.clone(),
+                    msg: SignalingMessage::Answer {
+                        peer_id: device_id_for_out.clone(),
+                        offer_id: attempt.clone(),
+                        sdp: sdp.clone(),
+                    },
                 },
-            },
-            SignalingOutbound::Candidate {
-                device_id: to,
-                candidate,
-            } => NostrOutbound::DirectedToPeer {
-                to: to.clone(),
-                msg: SignalingMessage::Candidate {
-                    peer_id: device_id_for_out.clone(),
-                    candidate: candidate.candidate.clone(),
-                    sdp_mid: candidate.sdp_mid.clone(),
-                    sdp_mline_index: candidate.sdp_mline_index,
-                    username_fragment: candidate.username_fragment.clone(),
+                SignalingOutbound::Candidate {
+                    device_id: to,
+                    attempt,
+                    candidate,
+                } => NostrOutbound::DirectedToPeer {
+                    to: to.clone(),
+                    msg: SignalingMessage::Candidate {
+                        offer_id: attempt.clone(),
+                        peer_id: device_id_for_out.clone(),
+                        candidate: candidate.candidate.clone(),
+                        sdp_mid: candidate.sdp_mid.clone(),
+                        sdp_mline_index: candidate.sdp_mline_index,
+                        username_fragment: candidate.username_fragment.clone(),
+                    },
                 },
-            },
-        }),
-    });
+            }),
+        });
 
     // Inbound: NostrInbound → engine SignalingInbound on the driver's own task,
     // through this carrier's attach on the shared runtime.
@@ -520,43 +695,56 @@ fn attach_mdns_with(
     // Outbound: engine SignalingOutbound → MdnsOutbound, built when the driver
     // pulls. The driver's registration doubles as the announce, so Announce is
     // a cheap idempotent nudge.
-    let outbound: Box<dyn OutboundSource<MdnsOutbound>> = Box::new(TranslatedOutbound {
-        first: None,
-        rx: outbound_rx,
-        translate: Box::new(move |outbound| match outbound {
-            SignalingOutbound::Announce => MdnsOutbound::Announce,
-            SignalingOutbound::Leave => MdnsOutbound::Leave,
-            SignalingOutbound::Offer { device_id: to, sdp } => MdnsOutbound::DirectedToPeer {
-                to: to.clone(),
-                msg: SignalingMessage::Offer {
-                    peer_id: device_id.clone(),
-                    offer_id: new_short_id(),
-                    sdp: sdp.clone(),
+    let scope = local_scope(state, "mdns")?;
+    let outbound: Box<dyn OutboundSource<MdnsOutbound, Owner = CoreOutboundOwner>> =
+        Box::new(TranslatedOutbound {
+            first: None,
+            rx: outbound_rx,
+            scope,
+            translate: Box::new(move |outbound| match outbound {
+                SignalingOutbound::Announce => MdnsOutbound::Announce,
+                SignalingOutbound::Leave => MdnsOutbound::Leave,
+                SignalingOutbound::Offer {
+                    device_id: to,
+                    attempt,
+                    sdp,
+                } => MdnsOutbound::DirectedToPeer {
+                    to: to.clone(),
+                    msg: SignalingMessage::Offer {
+                        peer_id: device_id.clone(),
+                        offer_id: attempt.clone(),
+                        sdp: sdp.clone(),
+                    },
                 },
-            },
-            SignalingOutbound::Answer { device_id: to, sdp } => MdnsOutbound::DirectedToPeer {
-                to: to.clone(),
-                msg: SignalingMessage::Answer {
-                    peer_id: device_id.clone(),
-                    offer_id: String::new(),
-                    sdp: sdp.clone(),
+                SignalingOutbound::Answer {
+                    device_id: to,
+                    attempt,
+                    sdp,
+                } => MdnsOutbound::DirectedToPeer {
+                    to: to.clone(),
+                    msg: SignalingMessage::Answer {
+                        peer_id: device_id.clone(),
+                        offer_id: attempt.clone(),
+                        sdp: sdp.clone(),
+                    },
                 },
-            },
-            SignalingOutbound::Candidate {
-                device_id: to,
-                candidate,
-            } => MdnsOutbound::DirectedToPeer {
-                to: to.clone(),
-                msg: SignalingMessage::Candidate {
-                    peer_id: device_id.clone(),
-                    candidate: candidate.candidate.clone(),
-                    sdp_mid: candidate.sdp_mid.clone(),
-                    sdp_mline_index: candidate.sdp_mline_index,
-                    username_fragment: candidate.username_fragment.clone(),
+                SignalingOutbound::Candidate {
+                    device_id: to,
+                    attempt,
+                    candidate,
+                } => MdnsOutbound::DirectedToPeer {
+                    to: to.clone(),
+                    msg: SignalingMessage::Candidate {
+                        offer_id: attempt.clone(),
+                        peer_id: device_id.clone(),
+                        candidate: candidate.candidate.clone(),
+                        sdp_mid: candidate.sdp_mid.clone(),
+                        sdp_mline_index: candidate.sdp_mline_index,
+                        username_fragment: candidate.username_fragment.clone(),
+                    },
                 },
-            },
-        }),
-    });
+            }),
+        });
 
     // The driver's setup is synchronously fallible (mDNS daemon, TCP listener),
     // unlike Nostr's lazy socket dials, so it starts here and a failure returns
@@ -659,6 +847,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
         state.signaling_inbound_tx.clone(),
         state.local_application_resource_scope()?,
     );
+    state.publish_signaling_runtime(&runtime);
 
     let drivers = match (want_nostr, mdns_on) {
         (true, true) => {
@@ -812,6 +1001,187 @@ fn spawn_fanout(
 mod tests {
     use super::*;
     use crate::engine::signaling_ingress::{self, EphemeralSignal};
+
+    /// A scope on an isolated provider whose per-dimension grant is `budget`,
+    /// plus a handle on the provider itself.
+    ///
+    /// The provider handle is returned because a control that wants to observe a
+    /// refusal needs to *cause* one, and squeezing the grant is not a reliable
+    /// way to do that: leases come and go inside the code under test, so a
+    /// refusal timed by exhaustion is a refusal timed by whatever released last.
+    /// `FiniteResourceProvider` is `Clone` over shared state, so this handle and
+    /// the one inside the port are the same accountant.
+    fn scoped(
+        budget: impl Fn(crate::resource::ResourceClass) -> u64,
+    ) -> (
+        crate::resource::ProcessResourceRoot,
+        LocalApplicationResourceScope,
+        crate::resource::FiniteResourceProvider,
+    ) {
+        let grant = ResourceClaim::try_from_entries(
+            crate::resource::ResourceClass::ALL.map(|dimension| (dimension, budget(dimension))),
+        )
+        .expect("test grant is representable");
+        let accountant = crate::resource::FiniteResourceProvider::new(grant);
+        let provider = crate::resource::ResourceProviderPort::new(accountant.clone())
+            .expect("test grant funds process bookkeeping");
+        let root = crate::resource::ProcessResourceRoot::isolated();
+        root.install_local_application_provider(provider)
+            .expect("isolated root accepts its provider");
+        let scope = root
+            .issue_local_application_scope()
+            .expect("test local-application scope");
+        (root, scope, accountant)
+    }
+
+    /// One emission, labelled so a control can tell which one arrived.
+    fn labelled(device_id: &str) -> SignalingOutbound {
+        SignalingOutbound::Offer {
+            device_id: device_id.to_string(),
+            attempt: "attempt-1".to_string(),
+            sdp: "sdp".to_string(),
+        }
+    }
+
+    /// A source whose translation reports the label and counts its own runs.
+    fn labelling_source(
+        rx: crate::resource::ResourceMailboxReceiver<SignalingOutbound>,
+        scope: LocalApplicationResourceScope,
+        built: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> TranslatedOutbound<String> {
+        let counter = Arc::clone(built);
+        TranslatedOutbound {
+            first: None,
+            rx,
+            scope,
+            translate: Box::new(move |outbound: &SignalingOutbound| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match outbound {
+                    SignalingOutbound::Offer { device_id, .. } => device_id.clone(),
+                    other => unreachable!("this control only emits offers, not {other:?}"),
+                }
+            }),
+        }
+    }
+
+    /// **A derived allocation that cannot be funded is never built.**
+    ///
+    /// The ordering claim in [`CoreOutboundOwner`], stated as the failure it
+    /// exists to prevent: the version that translates first and discovers
+    /// afterwards that nobody is paying is the bug, because by then the copy
+    /// exists.
+    ///
+    /// The discrimination is in the labels rather than in a bare count. Two
+    /// emissions are admitted and the first is refused, so a correct
+    /// implementation yields `"b"` having run the builder exactly once. An
+    /// implementation that translated before acquiring would have run it twice,
+    /// and one that translated the refused value would yield `"a"`.
+    ///
+    /// # Why the refusal is scripted rather than squeezed
+    ///
+    /// The obvious harness — hold leases until the provider is empty, then pull —
+    /// does not work here, and the way it fails is instructive. `recv` pops the
+    /// mailbox entry *before* it acquires the derived claim, and the pop releases
+    /// that entry's queue-node lease. A grant squeezed to zero is therefore back
+    /// above zero by exactly the moment the derived acquire runs, so the acquire
+    /// succeeds and the control reads as a production ordering failure when the
+    /// ordering is correct.
+    ///
+    /// Scripting one pressure on the residual dimension removes the timing from
+    /// the question entirely: the next reservation that charges that dimension is
+    /// refused, whatever the balance happens to be. What is under test is the
+    /// order of two steps, not the arithmetic of a grant, so the harness should
+    /// not depend on the arithmetic either.
+    #[tokio::test]
+    async fn a_derived_outbound_allocation_that_cannot_be_funded_is_never_built() {
+        let (_root, scope, accountant) = scoped(|_| 1_000_000);
+        let (tx, rx) = crate::resource::resource_mailbox::<SignalingOutbound>(scope.clone())
+            .expect("test mailbox");
+
+        // Admit first, then script. Every mailbox admission charges the residual
+        // dimension too, so scripting before the sends would spend the one
+        // refusal on an admission instead of on the derived claim under test.
+        assert!(tx.send(labelled("a")).is_ok(), "the mailbox admits `a`");
+        assert!(tx.send(labelled("b")).is_ok(), "the mailbox admits `b`");
+        accountant.script_pressure(crate::resource::ResourceClass::OpaqueDependencyResidual);
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut source = labelling_source(rx, scope.clone(), &built);
+
+        let owned = source
+            .recv()
+            .await
+            .expect("a fundable translation is produced");
+        assert_eq!(
+            owned.value(),
+            "b",
+            "the refused emission was translated and handed on anyway"
+        );
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the builder ran for the emission whose funding was refused"
+        );
+    }
+
+    /// **A refusal costs one emission; only a closed source ends the pump.**
+    ///
+    /// The failure this exists for is not subtle once seen. Both drivers drain
+    /// with `while let Some(outbound) = source.recv().await`, and the Nostr
+    /// driver `take`s the source to do it — so a `None` returned for a transient
+    /// local refusal would retire that carrier for the rest of the process and
+    /// leave everything still in its mailbox undrained. One momentary pressure
+    /// on a shared residual dimension would silently cost a node its relay
+    /// transport until restart.
+    ///
+    /// So this control runs the driver's loop verbatim rather than calling `recv`
+    /// once. Three emissions are admitted, the sender is dropped so the loop can
+    /// legitimately end, and one refusal is scripted before the pump starts.
+    ///
+    /// Every clause is load-bearing:
+    /// * `["b", "c"]` — the refusal cost exactly the emission it refused, and
+    ///   the two behind it were still drained. The old shape yields `[]`.
+    /// * the builder ran twice — `"a"` was refused *before* translation, so this
+    ///   also re-states the acquire-before-translate ordering under a pump.
+    /// * the loop terminated at all — genuine closure still returns `None`, so
+    ///   the repair did not turn a finished source into a hang.
+    #[tokio::test]
+    async fn a_refused_emission_costs_one_value_and_only_closure_ends_the_pump() {
+        let (_root, scope, accountant) = scoped(|_| 1_000_000);
+        let (tx, rx) = crate::resource::resource_mailbox::<SignalingOutbound>(scope.clone())
+            .expect("test mailbox");
+
+        for label in ["a", "b", "c"] {
+            assert!(
+                tx.send(labelled(label)).is_ok(),
+                "the mailbox admits every emission this control sends"
+            );
+        }
+        // Closed, but not drained: `close` sets the flag and leaves the queue
+        // alone, so the pump sees all three and *then* sees the end.
+        drop(tx);
+        accountant.script_pressure(crate::resource::ResourceClass::OpaqueDependencyResidual);
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut source = labelling_source(rx, scope.clone(), &built);
+
+        // The driver's own loop, character for character.
+        let mut published = Vec::new();
+        while let Some(outbound) = source.recv().await {
+            published.push(outbound.value().clone());
+        }
+
+        assert_eq!(
+            published,
+            vec!["b".to_string(), "c".to_string()],
+            "a refusal must cost its own emission and nothing behind it"
+        );
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the refused emission reached the builder"
+        );
+    }
 
     /// **Every carrier reaches the engine through the ingress boundary, and the
     /// engine can still tell which one it was and what the report was worth.**

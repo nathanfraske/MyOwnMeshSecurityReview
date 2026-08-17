@@ -592,11 +592,13 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             } else {
                 Role::Answerer
             };
-            // Cross-relay dedup happens at the Nostr driver layer
-            // (see `upstream.rs` item 6 + the driver's
-            // `seen_event_ids`), so this fires once per actual
-            // periodic re-announce — not once per relay-delivery
-            // copy of the same announce. Every announce lands in
+            // A presence report is not de-duplicated anywhere: the
+            // ingress keys only the negotiation kinds, because two
+            // announces are two pieces of liveness evidence rather
+            // than one message arriving twice. So this can fire once
+            // per relay copy as well as once per re-announce, and it
+            // is written to be idempotent for exactly that reason —
+            // `ensure_peer_session` short-circuits. Every announce lands in
             // the log so the user can see signaling is alive even
             // for peers already in steady state; redundant work
             // (re-opening the peer slot) is short-circuited inside
@@ -671,6 +673,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                         );
                         let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                             device_id: device_id.clone(),
+                            attempt: attempt_of(state, &device_id),
                             sdp: desc.sdp,
                         });
                     }
@@ -801,7 +804,11 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 }
             }
         }
-        SignalingInbound::Offer { device_id, sdp } => {
+        SignalingInbound::Offer {
+            device_id,
+            attempt,
+            sdp,
+        } => {
             // If we didn't already start an answerer, do so now.
             let role = Role::Answerer;
             state.log_diag_with(
@@ -879,12 +886,32 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             ensure_peer_session(state, &device_id, role).await;
             apply_remote_sdp(state, &device_id, RTCSdpType::Offer, sdp).await;
             // Build the answer. Extract the session under the lock,
-            // drop everything, then await — guards across awaits
-            // would make the future non-Send.
-            let session = {
+            // Establish the offerer's correlation on the installation that is
+            // actually going to answer, and not before it exists: everything
+            // above may install or replace the peer, and a fresh installation
+            // mints its own, so adopting earlier would be overwritten by the
+            // very session this is for.
+            //
+            // **An offer is the only thing that may establish an attempt.** It
+            // is what opens one. An answer or a candidate arriving with a
+            // different correlation is evidence about some *other* attempt, and
+            // letting either write this field would hand an unauthenticated
+            // frame the ability to retag what this side emits next and to point
+            // the end-of-attempt release at the wrong keys.
+            let (session, displaced) = {
                 let peer = state.peers.get(&device_id);
-                peer.and_then(|p| p.session.lock().clone())
+                let displaced = peer
+                    .as_deref()
+                    .and_then(|peer| peer.adopt_attempt(&attempt));
+                (peer.and_then(|p| p.session.lock().clone()), displaced)
             };
+            // A rebuild offer establishes a second attempt on the installation
+            // that was already running one. Nothing belonging to the first can
+            // legitimately arrive again, so its keys go back now rather than
+            // waiting for pressure to evict them.
+            if let Some(displaced) = displaced {
+                forget_attempt(state, &displaced);
+            }
             if let Some(session) = session {
                 match session.create_answer().await {
                     Ok(desc) => {
@@ -896,6 +923,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                         );
                         let _ = state.signaling_tx.send(SignalingOutbound::Answer {
                             device_id: device_id.clone(),
+                            attempt: attempt_of(state, &device_id),
                             sdp: desc.sdp,
                         });
                     }
@@ -911,7 +939,22 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 }
             }
         }
-        SignalingInbound::Answer { device_id, sdp } => {
+        SignalingInbound::Answer {
+            device_id,
+            attempt,
+            sdp,
+        } => {
+            // Compared, never adopted. An answer names the attempt it answers;
+            // if that is not the attempt this installation is running, it
+            // answers something already retired and applying it would drive the
+            // live worker from a dead negotiation.
+            if !attempt_is_current(state, &device_id, &attempt) {
+                trace!(
+                    peer = %device_id,
+                    "answer for another attempt ignored"
+                );
+                return;
+            }
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "signaling",
@@ -922,8 +965,23 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
         }
         SignalingInbound::Candidate {
             device_id,
+            attempt,
             candidate,
         } => {
+            // Compared, never adopted — same rule as the answer above. This is
+            // the case that motivated the whole correlation: a host candidate
+            // carries no `username_fragment` on many stacks, so one that was in
+            // flight when the attempt was replaced is byte-identical to a
+            // candidate of the new attempt. Without this line the live worker
+            // would be fed a retired attempt's candidate; with it, the frame is
+            // ignored and the attempt that owns the connection is untouched.
+            if !attempt_is_current(state, &device_id, &attempt) {
+                trace!(
+                    peer = %device_id,
+                    "candidate for another attempt ignored"
+                );
+                return;
+            }
             // The worker decides whether the remote description is ready and
             // owns either the retained queue value or the live application.
             let owner = state.peers.owner(&device_id);
@@ -1284,6 +1342,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                             );
                             let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                                 device_id: device_id.to_string(),
+                                attempt: attempt_of(&state, device_id),
                                 sdp: desc.sdp,
                             });
                         });
@@ -1535,9 +1594,10 @@ pub(crate) async fn renegotiate_ice_for_owner(
                         "sdp_bytes": desc.sdp.len(),
                     }),
                 );
-                state.peers.with_current(owner, |_| {
+                state.peers.with_current(owner, |peer| {
                     let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                         device_id: device_id.to_string(),
+                        attempt: peer.attempt(),
                         sdp: desc.sdp,
                     });
                 });
@@ -1585,6 +1645,8 @@ fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str, why:
     if state.peers.contains_key(device_id) {
         return;
     }
+    // No release pass: the guard above means this never replaces an
+    // installation, so there is no displaced attempt to forget.
     install_peer(
         &state.peers,
         Arc::new(PeerConnection::new(device_id.to_string(), None)),
@@ -1713,7 +1775,13 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // now, the attempt is reclaimed and rebuilt (see
     // `ice_watchdog::poll_all`).
     peer.state.write().session_started_at = Some(Instant::now());
-    install_peer(&state.peers, peer.clone());
+    // A replacement here is a new attempt for the same device, so the one it
+    // displaced can never legitimately be heard from again: release its keys.
+    // Doing this is what keeps the ring from accumulating a record of every
+    // attempt a long-lived reconnecting peer ever made.
+    if let Some(replaced) = install_peer(&state.peers, peer.clone()) {
+        forget_attempt(state, &replaced);
+    }
 
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
         network_id: state.network_id.clone(),
@@ -1750,6 +1818,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
                 );
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                     device_id: device_id.to_string(),
+                    attempt: attempt_of(state, device_id),
                     sdp: desc.sdp,
                 });
                 if let Some(p) = state.peers.get(device_id) {
@@ -1994,6 +2063,7 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
                 );
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                     device_id: device_id.to_string(),
+                    attempt: attempt_of(state, device_id),
                     sdp: desc.sdp,
                 });
             }
@@ -2048,6 +2118,7 @@ async fn handle_transport_event(
                     peer.state.write().diag.local_candidates.record(kind);
                     state.signaling_tx.send(SignalingOutbound::Candidate {
                         device_id: device_id.clone(),
+                        attempt: peer.attempt(),
                         candidate: cand.clone(),
                     })
                 })
@@ -3043,18 +3114,22 @@ async fn handle_inbound_frame_from(
     let owner = dispatch.owner();
     // The Semantic Node takes its own first, whole.
     //
-    // Durable facts — the transition log, the roster — are a different ownership
-    // from everything below, and the difference is not the message shape but
-    // where it may come from. These arrive only here, on a promoted session,
-    // under the exact owner token that session belongs to; the carrier ingress
-    // in `signaling_ingress` has no kind that can produce one, however it is
-    // fed. Routing them through one closed typed admission keeps that
-    // separation structural rather than a property of this match staying
-    // correct. See `semantic_ingress` for why the two are disjoint by
-    // construction.
+    // Durable semantic exchange — the transition log, the roster, and the
+    // comparisons and requests that converge them — is a different ownership
+    // from everything below. Routing it through one closed typed admission
+    // keeps that separation structural rather than a property of this match
+    // staying correct.
+    //
+    // **This session is the reply route, and it is not why any of it is
+    // believed.** A promoted session is one producer of that port, not the
+    // source of authorship: a fact carries its own author, signature and domain
+    // context, so an equivalent fact projects identically whether it arrived
+    // here, from a cache, from a file or over a future durable carrier. The
+    // token goes in as `Some` because there *is* somewhere to answer, and the
+    // reducer's fact arms cannot read it. See `semantic_ingress`.
     let msg = match semantic_ingress::admit(msg) {
         semantic_ingress::SemanticAdmission::Durable(durable) => {
-            return semantic_ingress::reduce(state, owner, durable).await
+            return semantic_ingress::reduce(state, durable, Some(owner)).await
         }
         semantic_ingress::SemanticAdmission::NotDurable(other) => other,
     };
@@ -5112,6 +5187,9 @@ async fn finish_drop_peer(
     removed: Option<Arc<PeerConnection>>,
 ) {
     if let Some(peer) = removed {
+        // The attempt is over, so its de-duplication keys are released now
+        // rather than left for provider pressure to evict eventually.
+        forget_attempt(state, &peer.attempt());
         let cleanup_peer = Arc::clone(&peer);
         tokio::spawn(async move {
             if let Err(error) = cleanup_peer.retire_and_close().await {
@@ -5187,6 +5265,55 @@ async fn finish_drop_peer(
     ladder::reevaluate_topology(state).await;
 }
 
+/// Tell the signaling runtime that an attempt is over, if there is one to tell.
+///
+/// Called at exactly the two moments after which nothing belonging to that
+/// attempt can legitimately arrive again: the installation was retired, or it
+/// was replaced. Both release the keys the ingress remembered under it.
+fn forget_attempt(state: &Arc<NetworkState>, attempt: &str) {
+    if let Some(runtime) = state.signaling_runtime() {
+        runtime.forget_attempt(attempt);
+    }
+}
+
+/// This peer's current attempt correlation, for stamping an outbound signal.
+///
+/// Empty when there is no installation to ask — a signal emitted for a peer
+/// that has already gone correlates with nothing, which is the honest answer
+/// and de-duplicates against nothing rather than against some other attempt.
+fn attempt_of(state: &Arc<NetworkState>, device_id: impl AsRef<str>) -> String {
+    state
+        .peers
+        .get(device_id.as_ref())
+        .map(|peer| peer.attempt())
+        .unwrap_or_default()
+}
+
+/// Whether an inbound signal belongs to the attempt this peer is running.
+///
+/// The correlation is peer-supplied and unauthenticated, so it is read as a
+/// filter and never as authority: a mismatch means "this is about some other
+/// attempt", which is a reason to ignore a frame and never a reason to grant,
+/// retire or reconfigure anything.
+///
+/// **An unstamped answer or candidate is not current.** Every build that can
+/// reach this one stamps a correlation on all three negotiation kinds, so a
+/// frame without one is not an older peer to accommodate — the cutover is hard
+/// and there is no older peer. Treating it as current would have been a
+/// compatibility bypass that reopened the exact case this exists to close: an
+/// uncorrelated candidate is precisely the byte-identical stale candidate that
+/// used to be applied to whatever attempt was running when it landed.
+///
+/// **No installation is not current either.** There is nothing for the frame to
+/// belong to. The handlers resolve the peer themselves and no-op on its absence,
+/// so this only makes them stop earlier and say why.
+fn attempt_is_current(state: &Arc<NetworkState>, device_id: &str, attempt: &str) -> bool {
+    match state.peers.get(device_id) {
+        Some(peer) => !attempt.is_empty() && peer.attempt() == attempt,
+        None => false,
+    }
+}
+
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
     let removed = remove_peer(&state.peers, device_id);
     finish_drop_peer(state, device_id, reason, removed).await;
@@ -5207,15 +5334,21 @@ pub(crate) async fn drop_peer_if_current(
 /// Install the current peer owner and retire any replaced compatibility queue.
 /// Explicit retirement is required because other tasks may still hold an
 /// `Arc` to the replaced peer object.
-fn install_peer(peers: &peer_registry::PeerRegistry, peer: Arc<PeerConnection>) {
-    let Some(replaced) = peers.install(peer) else {
-        return;
-    };
+/// Install the current peer owner, returning the replaced installation's attempt
+/// correlation when there was one.
+///
+/// The return value is what lets the production call sites release the replaced
+/// attempt's de-duplication keys. Fixtures that only need a peer in the registry
+/// ignore it: a control that never signals has no keys to release.
+fn install_peer(peers: &peer_registry::PeerRegistry, peer: Arc<PeerConnection>) -> Option<String> {
+    let replaced = peers.install(peer)?;
+    let attempt = replaced.attempt();
     tokio::spawn(async move {
         if let Err(error) = replaced.retire_and_close().await {
             warn!(%error, "replaced peer cleanup did not complete successfully");
         }
     });
+    Some(attempt)
 }
 
 /// Remove the current peer owner and retire its compatibility queue before the
@@ -5525,6 +5658,7 @@ fn build_test_state_parts_metered(
         .expect("engine fixture inbound signaling capacity is representable");
     let outbound_signaling = SignalingOutbound::Offer {
         device_id: "fixture-signaling-peer".into(),
+        attempt: "fixture-attempt".into(),
         sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
     };
     let outbound_signaling =
@@ -15457,6 +15591,81 @@ mod tests {
         assert!(
             state.peers.owner(&target).is_none(),
             "the exact installation named by a live token is retired"
+        );
+
+        state.shutdown().await;
+    }
+
+    /// **An answer or candidate for a retired attempt is not current, and
+    /// cannot retag the attempt that replaced it.**
+    ///
+    /// The correlation is peer-supplied and unauthenticated, which is exactly
+    /// why only an *offer* may establish one. If an answer or a candidate could
+    /// write the field, any sender able to reach this node could rename the
+    /// attempt underneath a live connection: everything emitted afterwards would
+    /// carry the attacker's value, and the release at the end of the attempt
+    /// would hand back the keys of a bucket nobody was using while the real
+    /// ones stayed.
+    ///
+    /// So the rule is compare, never adopt, and this drives all three answers
+    /// `attempt_is_current` can give — each the others' non-vacuity:
+    ///
+    /// - the live attempt's own correlation is current, so the filter is not
+    ///   simply refusing everything;
+    /// - a retired attempt's correlation is not, which is the stale-frame case;
+    /// - an *absent* correlation is not either. That last one is deliberate and
+    ///   is not a compatibility allowance: every build that can reach this one
+    ///   stamps all three negotiation kinds, so an unstamped frame is not an
+    ///   older peer, and treating it as current would readmit precisely the
+    ///   uncorrelated stale candidate this exists to stop.
+    #[tokio::test]
+    async fn v4_m2_a_a_signal_for_a_retired_attempt_is_not_current() {
+        let state = build_test_state("attempt-correlation-filter");
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        let first = Arc::new(PeerConnection::new(target.clone(), None));
+        install_peer(&state.peers, Arc::clone(&first));
+        let retired = first.attempt();
+
+        // The replacement is a new attempt, so it mints its own name.
+        let second = Arc::new(PeerConnection::new(target.clone(), None));
+        install_peer(&state.peers, Arc::clone(&second));
+        let live = second.attempt();
+        assert_ne!(
+            retired, live,
+            "non-vacuity: one installation is one attempt, so a replacement \
+             really does get a different correlation"
+        );
+
+        assert!(
+            attempt_is_current(&state, &target, &live),
+            "the running attempt's own correlation is current"
+        );
+        assert!(
+            !attempt_is_current(&state, &target, &retired),
+            "a frame naming the attempt that was replaced is not"
+        );
+        assert!(
+            !attempt_is_current(&state, &target, ""),
+            "and neither is an unstamped one, which is the uncorrelated stale \
+             candidate this boundary exists to refuse"
+        );
+
+        // Adoption is the offer's alone, and it hands back what it displaced so
+        // the caller can release that attempt's keys.
+        let displaced = second.adopt_attempt("rebuilt-attempt");
+        assert_eq!(
+            displaced.as_deref(),
+            Some(live.as_str()),
+            "a rebuild offer hands back the attempt it displaced, which is the \
+             only way its keys can be released"
+        );
+        assert!(
+            second.adopt_attempt("rebuilt-attempt").is_none(),
+            "and re-establishing the same attempt displaces nothing, so a \
+             repeated offer does not release the keys still in use"
         );
 
         state.shutdown().await;

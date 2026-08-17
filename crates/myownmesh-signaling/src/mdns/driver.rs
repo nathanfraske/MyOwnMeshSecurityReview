@@ -39,7 +39,10 @@ use tracing::{debug, info, trace, warn};
 use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
 use super::wire::{self, Frame};
 use crate::nostr::handle::derive_room_handle;
-use crate::{CarrierAttribution, Error, InboundSink, OutboundSource, SignalingMessage};
+use crate::{
+    CarrierAttribution, ErasedOwner, ErasedSource, Error, InboundSink, OutboundSource, OwnedSignal,
+    SignalingMessage,
+};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -118,11 +121,15 @@ const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 /// listener can't come up (unlike Nostr, the fallible setup here is
 /// synchronous) — callers keep their engine-side receiver and can
 /// fall back to other transports.
-pub fn start(
+pub fn start<S>(
     config: MdnsDriverConfig,
-    outbound: Box<dyn OutboundSource<MdnsOutbound>>,
+    outbound: S,
     inbound_tx: InboundSink<MdnsInbound>,
-) -> crate::Result<MdnsDriverHandle> {
+) -> crate::Result<MdnsDriverHandle>
+where
+    S: OutboundSource<MdnsOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
 
     // TCP exchange listener first — its port goes into the SRV record.
@@ -188,7 +195,7 @@ pub fn start(
     {
         let shared = shared.clone();
         tasks.push(tokio::spawn(async move {
-            run_outbound(shared, outbound).await;
+            run_outbound(shared, Box::new(ErasedSource::new(outbound))).await;
             trace!("mdns outbound pump exiting");
         }));
     }
@@ -275,7 +282,7 @@ struct PeerEntry {
 #[derive(Clone)]
 struct ConnHandle {
     generation: u64,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>>,
 }
 
 async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<DiscoveryEvent>) {
@@ -339,9 +346,17 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
     }
 }
 
-async fn run_outbound(shared: Arc<Shared>, mut source: Box<dyn OutboundSource<MdnsOutbound>>) {
+async fn run_outbound(
+    shared: Arc<Shared>,
+    mut source: Box<dyn OutboundSource<MdnsOutbound, Owner = ErasedOwner>>,
+) {
     while let Some(outbound) = source.recv().await {
-        match outbound {
+        // Dispatched on a borrow. Only the directed arm builds anything, and it
+        // is handed the whole owned signal so the encoded line inherits the
+        // funding instead of becoming an unowned allocation beside it. The two
+        // registration arms build nothing and drop the signal — and its owner —
+        // at the end of the iteration.
+        match outbound.value() {
             MdnsOutbound::Announce => {
                 if !shared.registered.load(Ordering::SeqCst) {
                     register(&shared);
@@ -354,8 +369,8 @@ async fn run_outbound(shared: Arc<Shared>, mut source: Box<dyn OutboundSource<Md
                     shared.discovery.unregister();
                 }
             }
-            MdnsOutbound::DirectedToPeer { to, msg } => {
-                send_directed(&shared, to, msg).await;
+            MdnsOutbound::DirectedToPeer { .. } => {
+                send_directed(&shared, outbound).await;
             }
         }
     }
@@ -369,25 +384,56 @@ fn register(shared: &Shared) {
     }
 }
 
-async fn send_directed(shared: &Arc<Shared>, to: String, msg: SignalingMessage) {
-    let line = wire::encode_frame(&Frame {
-        v: wire::PROTOCOL_VERSION,
-        room: shared.room_handle.clone(),
-        from: shared.device_id.clone(),
-        to: to.clone(),
-        msg,
+/// Encode one directed message and get it onto a connection.
+///
+/// # The encoded line carries the owner, and the writer holds both
+///
+/// Serializing produces a second allocation the size of the frame. It used to
+/// be a bare `String` handed to a writer queue that can park on a slow or dead
+/// socket for as long as the connection lasts, with nothing tying that buffer
+/// back to whatever admitted the message it came from.
+///
+/// The encode is a [`OwnedSignal::map`] over the whole signal now, so the line
+/// *is* the value and the owner comes with it. The writer queue carries
+/// `OwnedSignal<String, ErasedOwner>` and drops an entry only once the write has
+/// completed or the connection is gone, so a parked writer keeps its funding
+/// live for exactly as long as it keeps the bytes.
+async fn send_directed(shared: &Arc<Shared>, outbound: OwnedSignal<MdnsOutbound, ErasedOwner>) {
+    let MdnsOutbound::DirectedToPeer { to, .. } = outbound.value() else {
+        return;
+    };
+    let to = to.clone();
+    let room_handle = shared.room_handle.clone();
+    let from = shared.device_id.clone();
+    let line = outbound.map(move |outbound| match outbound {
+        MdnsOutbound::DirectedToPeer { to, msg } => wire::encode_frame(&Frame {
+            v: wire::PROTOCOL_VERSION,
+            room: room_handle,
+            from,
+            to,
+            msg,
+        }),
+        // Unreachable: the borrow above already matched the directed arm, and
+        // the value is private, so nothing could have changed it in between.
+        // Encoding nothing is the inert answer if that ever stops being true.
+        _ => String::new(),
     });
-
     // Fast path: an existing connection for this peer — in either
     // direction. An inbound connection the peer dialed serves our
     // replies too (see `adopt_stream`), which is what lets a device
     // answer an offer even when its own mDNS view of the offerer is
     // missing or stale (asymmetric visibility).
-    if let Some(handle) = shared.conns.lock().get(&to).cloned() {
-        if handle.tx.send(line.clone()).is_ok() {
-            return;
-        }
-    }
+    // `send` gives the value back when the writer is gone, so a dead connection
+    // returns the line *and its owner* here rather than dropping either: the
+    // dial below reuses the same allocation and the same funding.
+    let existing = shared.conns.lock().get(&to).cloned();
+    let line = match existing {
+        Some(handle) => match handle.tx.send(line) {
+            Ok(()) => return,
+            Err(returned) => returned.0,
+        },
+        None => line,
+    };
 
     // Dial. Snapshot the endpoint before awaiting anything.
     let Some(entry) = shared.peers.lock().get(&to).cloned() else {
@@ -437,9 +483,9 @@ fn adopt_stream(
     shared: &Arc<Shared>,
     stream: TcpStream,
     known_peer: Option<String>,
-) -> mpsc::UnboundedSender<String> {
+) -> mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>> {
     let (read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let (tx, rx) = mpsc::unbounded_channel::<OwnedSignal<String, ErasedOwner>>();
     let generation = shared.conn_gen.fetch_add(1, Ordering::SeqCst);
     // The peer this connection is registered under — set at adopt
     // time for outbound dials, on first frame for inbound accepts.
@@ -509,19 +555,28 @@ fn adopt_stream(
     tx
 }
 
+/// Drain the queue onto the socket.
+///
+/// Each entry is an [`OwnedSignal`], held for the whole of its own write and
+/// dropped at the end of the iteration — after the bytes and the newline are on
+/// the wire, or immediately on a write error. So while a line is queued behind a
+/// slow peer, or parked half-written, the owner that admitted the message it was
+/// encoded from is still alive. On exit the receiver is dropped with everything
+/// still queued, releasing those owners together.
 async fn run_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<String>,
+    mut rx: mpsc::UnboundedReceiver<OwnedSignal<String, ErasedOwner>>,
 ) {
     loop {
         match timeout(CONN_IDLE_TIMEOUT, rx.recv()).await {
             Ok(Some(line)) => {
-                if write_half.write_all(line.as_bytes()).await.is_err() {
+                if write_half.write_all(line.value().as_bytes()).await.is_err() {
                     return;
                 }
                 if write_half.write_all(b"\n").await.is_err() {
                     return;
                 }
+                drop(line);
             }
             // Sender dropped (driver stopping / conn replaced) or idle.
             Ok(None) | Err(_) => return,
@@ -664,5 +719,63 @@ async fn run_reannounce(shared: Arc<Shared>) {
                 attribution: CarrierAttribution::SenderClaimed,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An owner that records its own release.
+    ///
+    /// What the owner type is for is *when* the funding goes back, and no
+    /// assertion about a type can observe that. This can: it fires once, in
+    /// `Drop`.
+    struct ReleaseFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ReleaseFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// **An encoded frame waiting behind a slow peer still has its funding, and
+    /// a connection that goes away releases everything it was still holding.**
+    ///
+    /// The writer queue is where an outbound line parks: a peer that has stopped
+    /// reading, or a socket the OS has not yet failed, can hold a frame there for
+    /// as long as the connection lasts. This is the retention that the old
+    /// `String` queue had no way to express — the bytes existed with nothing
+    /// tying them back to whatever admitted the message they came from.
+    ///
+    /// Asserted at the queue rather than through [`run_writer`], because the
+    /// property is about a line that has *not* been written and a writer that is
+    /// draining a real socket is exactly the thing that would make that
+    /// non-deterministic. The two halves discriminate in opposite directions: a
+    /// queue that dropped the owner on enqueue fails the first assertion, and a
+    /// teardown that leaked the queued entries fails the second.
+    #[test]
+    fn a_queued_line_holds_its_owner_until_the_connection_lets_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let released = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::unbounded_channel::<OwnedSignal<String, ErasedOwner>>();
+        tx.send(OwnedSignal::new(
+            "frame".to_string(),
+            Box::new(ReleaseFlag(Arc::clone(&released))) as ErasedOwner,
+        ))
+        .expect("the writer queue accepts a line");
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the encoded bytes are queued and could still be written, so their \
+             funding must not be back"
+        );
+        // The writer exiting drops the receiver with everything still queued —
+        // idle timeout, write error, or driver shutdown all end here.
+        drop(rx);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "a torn-down connection releases the owners of the lines it never \
+             managed to write"
+        );
     }
 }

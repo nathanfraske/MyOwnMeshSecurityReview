@@ -423,14 +423,28 @@ pub enum SignalingInbound {
     },
     Offer {
         device_id: String,
+        /// The sender's attempt correlation, preserved from the carrier frame.
+        ///
+        /// Kept because discarding it here is what left de-duplication unable
+        /// to tell one attempt from the next: a host candidate with no
+        /// `username_fragment` recurs verbatim on a replacement attempt, and a
+        /// key built from content alone suppressed the live copy on the
+        /// strength of a retired one. Unauthenticated and used for correlation
+        /// only.
+        attempt: String,
         sdp: String,
     },
     Answer {
         device_id: String,
+        /// The attempt correlation this answer echoes — see [`Self::Offer`].
+        attempt: String,
         sdp: String,
     },
     Candidate {
         device_id: String,
+        /// The attempt correlation this candidate belongs to — see
+        /// [`Self::Offer`]. Empty when the sender did not stamp one.
+        attempt: String,
         candidate: LocalIceCandidate,
     },
     PeerLeft {
@@ -468,15 +482,24 @@ impl SignalingInbound {
             Self::PeerAnnounced { device_id } | Self::PeerLeft { device_id } => {
                 strings_measure([device_id.as_str()])
             }
-            Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
-                strings_measure([device_id.as_str(), sdp.as_str()])
+            Self::Offer {
+                device_id,
+                attempt,
+                sdp,
             }
+            | Self::Answer {
+                device_id,
+                attempt,
+                sdp,
+            } => strings_measure([device_id.as_str(), attempt.as_str(), sdp.as_str()]),
             Self::Candidate {
                 device_id,
+                attempt,
                 candidate,
             } => strings_measure(
                 [
                     Some(device_id.as_str()),
+                    Some(attempt.as_str()),
                     Some(candidate.candidate.as_str()),
                     candidate.sdp_mid.as_deref(),
                     candidate.username_fragment.as_deref(),
@@ -510,14 +533,25 @@ pub(crate) enum SignalingOutbound {
     Leave,
     Offer {
         device_id: String,
+        /// The attempt this offer opens, minted once by the attempt's owner.
+        ///
+        /// Carried here rather than invented per carrier, which is what the
+        /// three translations used to do: each stamped its own id, so the two
+        /// copies of one fanned-out offer disagreed about which attempt they
+        /// belonged to and the value was useless for correlating anything.
+        attempt: String,
         sdp: String,
     },
     Answer {
         device_id: String,
+        /// The offerer's correlation, echoed verbatim — see [`Self::Offer`].
+        attempt: String,
         sdp: String,
     },
     Candidate {
         device_id: String,
+        /// The attempt this candidate belongs to — see [`Self::Offer`].
+        attempt: String,
         candidate: LocalIceCandidate,
     },
 }
@@ -526,15 +560,24 @@ impl ResourceMailboxItem for SignalingOutbound {
     fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
         let measure = match self {
             Self::Announce | Self::Leave => (0, 0, 0),
-            Self::Offer { device_id, sdp } | Self::Answer { device_id, sdp } => {
-                strings_measure([device_id.as_str(), sdp.as_str()])?
+            Self::Offer {
+                device_id,
+                attempt,
+                sdp,
             }
+            | Self::Answer {
+                device_id,
+                attempt,
+                sdp,
+            } => strings_measure([device_id.as_str(), attempt.as_str(), sdp.as_str()])?,
             Self::Candidate {
                 device_id,
+                attempt,
                 candidate,
             } => strings_measure(
                 [
                     Some(device_id.as_str()),
+                    Some(attempt.as_str()),
                     Some(candidate.candidate.as_str()),
                     candidate.sdp_mid.as_deref(),
                     candidate.username_fragment.as_deref(),
@@ -599,6 +642,18 @@ pub struct NetworkState {
     /// provenance ride with the message to the engine instead of being computed
     /// and dropped at the bridge.
     pub(crate) signaling_inbound_tx: ResourceMailboxSender<EphemeralIngress>,
+    /// The network's signaling runtime, once a carrier has attached one.
+    ///
+    /// Published here so the peer lifecycle can reach the single owner of
+    /// de-duplication. The runtime is built by the bridge — it is the bridge
+    /// that knows how many carriers share one — but "this attempt is over"
+    /// is known here, and a key scoped to an attempt has to be released when
+    /// that attempt ends or the scoping only defers the problem.
+    ///
+    /// `None` before any attach and after the last one is replaced. Nothing
+    /// fails without it: releasing early is an optimization over waiting for
+    /// provider pressure, so an unattached network simply has nothing to tell.
+    signaling_runtime: parking_lot::RwLock<Option<Arc<super::signaling_ingress::SignalingRuntime>>>,
     pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
 
     /// Receiving end of `signaling_tx` — held here so callers can
@@ -946,6 +1001,7 @@ impl NetworkState {
             local_resources,
             signaling_tx,
             signaling_inbound_tx,
+            signaling_runtime: parking_lot::RwLock::new(None),
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             #[cfg(test)]
@@ -1294,6 +1350,26 @@ impl NetworkState {
     /// Take the outbound signaling receiver so the signaling task
     /// can drain it. Only one consumer is supported; subsequent
     /// calls return `None`.
+    /// Publish the signaling runtime this network's carriers share.
+    ///
+    /// Called by the bridge at every attach. A later attach replaces the
+    /// earlier value, which is correct: the replaced runtime is dropped with
+    /// every key it held, and the keys of a runtime nothing is delivering
+    /// through describe attempts nothing can arrive for.
+    pub(crate) fn publish_signaling_runtime(
+        &self,
+        runtime: &Arc<super::signaling_ingress::SignalingRuntime>,
+    ) {
+        *self.signaling_runtime.write() = Some(Arc::clone(runtime));
+    }
+
+    /// The signaling runtime, if a carrier has attached one.
+    pub(crate) fn signaling_runtime(
+        &self,
+    ) -> Option<Arc<super::signaling_ingress::SignalingRuntime>> {
+        self.signaling_runtime.read().clone()
+    }
+
     pub(crate) fn take_signaling_outbound_rx(
         self: &Arc<Self>,
     ) -> Option<ResourceMailboxReceiver<SignalingOutbound>> {

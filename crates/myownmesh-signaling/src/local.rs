@@ -88,10 +88,16 @@ impl LocalBroker {
     ) {
         let (in_tx, in_rx) = mpsc::unbounded_channel::<LocalInbound>();
         let (out_tx, out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        // `Owner = ()`, written out: this is the standalone path, where the
+        // embedder chose a buffer and there is no accountant to name. The other
+        // callers of `join_with_sink` name a real owner, and the difference
+        // being visible at the call site is the point.
+        let outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
+            Box::new(crate::UnboundedSource::new(out_rx));
         self.join_with_sink(
             room,
             device_id,
-            Box::new(crate::UnboundedSource::new(out_rx)),
+            outbound,
             InboundSink::from_unbounded(in_tx),
         );
         (out_tx, in_rx)
@@ -114,11 +120,11 @@ impl LocalBroker {
     /// a value is all a sink is for, and the consumers here do exactly that; the
     /// alternative — copying the peer list out and offering afterwards — would
     /// let a peer that left in between be delivered to.
-    pub fn join_with_sink(
+    pub fn join_with_sink<O: Send + 'static>(
         &self,
         room: &str,
         device_id: &str,
-        mut outbound: Box<dyn OutboundSource<LocalOutbound>>,
+        mut outbound: Box<dyn OutboundSource<LocalOutbound, Owner = O>>,
         inbound: InboundSink<LocalInbound>,
     ) {
         // Register and announce to existing peers.
@@ -150,8 +156,14 @@ impl LocalBroker {
         let device_id_for_task = device_id.to_string();
         tokio::spawn(async move {
             while let Some(out) = outbound.recv().await {
-                let routed = route_outbound(&inner, &room, &device_id_for_task, &out);
+                // Routed by *borrowing* the owned signal, and dropped only after
+                // every inbound offer this fan-out makes has completed. The
+                // owner therefore outlives every copy `route_outbound` hands to
+                // a peer, which is the whole invariant: nothing derived from
+                // this value exists after what funded it is gone.
+                let routed = route_outbound(&inner, &room, &device_id_for_task, out.value());
                 trace!(routed, "broker fanout");
+                drop(out);
             }
             // Sender dropped → leave the room.
             let mut guard = inner.lock();
@@ -220,6 +232,102 @@ fn route_outbound(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OwnedSignal;
+
+    /// An owner that records its own release — see the mDNS control of the same
+    /// shape.
+    struct ReleaseFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ReleaseFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A source that yields a fixed script of owned values and then ends.
+    struct ScriptedSource(std::collections::VecDeque<OwnedSignal<LocalOutbound, ReleaseFlag>>);
+
+    #[async_trait::async_trait]
+    impl OutboundSource<LocalOutbound> for ScriptedSource {
+        type Owner = ReleaseFlag;
+
+        async fn recv(&mut self) -> Option<OwnedSignal<LocalOutbound, ReleaseFlag>> {
+            self.0.pop_front()
+        }
+    }
+
+    /// **A value's owner outlives the fan-out of that value, and is gone before
+    /// the next one is pulled.**
+    ///
+    /// Both halves are observed from inside the sink, which the broker calls
+    /// while the routing lock is held and — for the first message — while the
+    /// signal that produced it is still alive. So the same flag reads `false` at
+    /// the delivery of the first message and `true` at the delivery of the
+    /// second, and neither reading is a race: the broker's loop drops a signal
+    /// before it calls `recv` again, so by the time the second message exists the
+    /// first owner has certainly been released.
+    ///
+    /// The two readings discriminate in opposite directions. A broker that
+    /// released the owner before offering its value would read `true` first; a
+    /// broker that parked signals in a queue instead of dropping them would read
+    /// `false` second.
+    #[tokio::test]
+    async fn an_outbound_owner_spans_its_own_fanout_and_no_longer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broker = LocalBroker::new();
+
+        let first_released = Arc::new(AtomicBool::new(false));
+        let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<bool>();
+        let flag_for_sink = Arc::clone(&first_released);
+        // Bob is a peer with no outbound of its own; the sender is held so the
+        // broker does not treat him as having left.
+        let (_bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        let bob_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
+            Box::new(crate::UnboundedSource::new(bob_rx));
+        broker.join_with_sink(
+            "room1",
+            "bob",
+            bob_outbound,
+            InboundSink::new(move |value: LocalInbound| {
+                if matches!(value, LocalInbound::Message { .. }) {
+                    let _ = probe_tx.send(flag_for_sink.load(Ordering::SeqCst));
+                }
+                true
+            }),
+        );
+
+        let directed = |peer_id: &str| LocalOutbound::DirectedToPeer {
+            to: "bob".to_string(),
+            msg: SignalingMessage::Announce {
+                peer_id: peer_id.to_string(),
+            },
+        };
+        let mut script = std::collections::VecDeque::new();
+        script.push_back(OwnedSignal::new(
+            directed("one"),
+            ReleaseFlag(Arc::clone(&first_released)),
+        ));
+        script.push_back(OwnedSignal::new(
+            directed("two"),
+            ReleaseFlag(Arc::new(AtomicBool::new(false))),
+        ));
+        let alice_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ReleaseFlag>> =
+            Box::new(ScriptedSource(script));
+        broker.join_with_sink("room1", "alice", alice_outbound, InboundSink::new(|_| true));
+
+        assert_eq!(
+            probe_rx.recv().await,
+            Some(false),
+            "the first message was offered to a peer after its owner had already \
+             been released"
+        );
+        assert_eq!(
+            probe_rx.recv().await,
+            Some(true),
+            "the broker pulled a second value while still holding the first — \
+             that is a queue, and the broker is not supposed to be one"
+        );
+    }
 
     #[tokio::test]
     async fn join_announces_existing_peers() {

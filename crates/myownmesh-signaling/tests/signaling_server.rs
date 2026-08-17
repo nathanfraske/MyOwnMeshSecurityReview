@@ -307,8 +307,12 @@ async fn driver_self_announced_leave_reaches_peer() {
     server.stop();
 }
 
-// Intelligent-relay behaviour: when a member's socket drops, the relay
-// emits a `leave` to the room so others tear down promptly.
+// Intelligent-relay behaviour: when a member's socket drops, the relay emits a
+// `leave` to the room as a *reachability hint*. A receiver may stop pacing a
+// dial or cancel speculative work on it; it may not tear a promoted session
+// down on it, because the socket that dropped is the relay's, not the peer's,
+// and a peer reachable by another carrier is still there. Prompt teardown is
+// the authenticated `SessionControl::Depart` over the session itself.
 #[tokio::test]
 async fn relay_emits_leave_when_member_disconnects() {
     let server = SignalingServer::start("127.0.0.1", 0, Limits::default())

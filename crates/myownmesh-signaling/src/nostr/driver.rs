@@ -10,10 +10,9 @@
 //!   anti-flood pace for a flapping relay.
 //! - Transition-only logging — no per-event spam.
 //! - Directed negotiation (offer / answer / candidate) is tagged with
-//!   its recipient (`["p", device_id]`); once every announced peer in
-//!   the room advertises [`crate::SIG_CAP_PTAG`], the subscription
-//!   narrows to "presence + directed-to-me" and pairwise negotiation
-//!   stops being delivered to the whole room (see `desired_filters`).
+//!   its recipient (`["p", device_id]`) and the subscription asks for
+//!   "presence + directed-to-me", so the relay never fans a pairwise
+//!   negotiation to the whole room (see `desired_filters`).
 //!
 //! The driver is independent of the engine; the
 //! [`crate::SignalingChannel`] trait is the seam.
@@ -35,7 +34,46 @@ use super::event::{
 use super::handle::derive_room_handle;
 use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
-use crate::{CarrierAttribution, InboundSink, OutboundSource, SignalingMessage, SIG_CAP_PTAG};
+use crate::{
+    CarrierAttribution, ErasedOwner, ErasedSource, InboundSink, OutboundSource, OwnedSignal,
+    SignalingMessage,
+};
+
+/// One event on the publish bus, and what pays for it.
+///
+/// # Why this is two cases and not one
+///
+/// Nearly everything published here was derived from a value the engine
+/// admitted: the driver serialized it, wrapped it in an `Arc`, fanned that to
+/// every relay task and possibly kept it in the replay buffer. Each of those is
+/// an allocation the producer paid for, and the [`OwnedSignal`] is what keeps
+/// the payer alive for as long as any of them exist. The `Arc` is the mechanism:
+/// every clone shares one owner, dropping clones one at a time releases nothing,
+/// and the last one out — the final relay subscriber, a replay eviction, a stale
+/// drain — is what returns the funding.
+///
+/// The periodic presence beacon is genuinely different. The driver mints it on
+/// its own timer; nothing external asked for it and nothing external is paying
+/// for it, so there is no owner to carry and pretending otherwise would be a
+/// fiction in the type. Saying so in a second variant is the honest option, and
+/// it keeps the announce off the replay path by construction.
+enum Published {
+    /// Derived from an engine value; carries the owner that admitted it.
+    FromEngine(OwnedSignal<NostrEvent, ErasedOwner>),
+    /// The driver's own presence beacon. No external owner exists.
+    Announce(NostrEvent),
+}
+
+impl Published {
+    /// The event to serialize onto a socket. Borrow only — a relay task never
+    /// takes the event out from under its owner.
+    fn event(&self) -> &NostrEvent {
+        match self {
+            Self::FromEngine(owned) => owned.value(),
+            Self::Announce(event) => event,
+        }
+    }
+}
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -97,10 +135,13 @@ pub enum NostrInbound {
 pub enum NostrOutbound {
     Announce,
     /// Graceful departure broadcast — the dual of [`Announce`]. Publishes a
-    /// `leave` envelope so peers tear our session down promptly instead of
-    /// waiting out their heartbeat timeout. Rides the ephemeral kind (like
-    /// the rest of the live negotiation traffic) so a relay never replays it
-    /// onto a future session.
+    /// `leave` envelope as a reachability hint: a receiver may stop pacing a
+    /// dial or cancel speculative work on it, and may not tear a promoted
+    /// session down on it, because the device id it carries is one this sender
+    /// wrote. Prompt teardown is the authenticated `SessionControl::Depart`
+    /// over the session itself; this only ever arrives ahead of it. Rides the
+    /// ephemeral kind (like the rest of the live negotiation traffic) so a
+    /// relay never replays it onto a future session.
     Leave,
     DirectedToPeer {
         to: String,
@@ -110,11 +151,15 @@ pub enum NostrOutbound {
 
 /// Start the driver. Spawns a coordinator task per relay; returns
 /// the handle (drop to stop).
-pub fn start(
+pub fn start<S>(
     config: NostrDriverConfig,
-    outbound: Box<dyn OutboundSource<NostrOutbound>>,
+    outbound: S,
     inbound_tx: InboundSink<NostrInbound>,
-) -> NostrDriverHandle {
+) -> NostrDriverHandle
+where
+    S: OutboundSource<NostrOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
     let identity = NostrIdentity::generate();
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
     info!(
@@ -158,7 +203,7 @@ pub fn start(
 
     // Fan-out channel for outbound events. Capacity is generous
     // so a slow relay can't backpressure the publish side.
-    let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(64);
+    let (publish_tx, _) = broadcast::channel::<Arc<Published>>(64);
     // Force-reconnect signal. A bumped generation tells every relay
     // task to drop its current socket and redial *now*, skipping the
     // backoff wait — see `run_relay` / `run_relay_session`. The engine
@@ -173,26 +218,22 @@ pub fn start(
     // signaling to actually come back after a network change before it
     // renegotiates (see `relay_connected` on `DriverShared`).
     let relay_connected = Arc::new(watch::channel(0u64).0);
-    // Subscription-shape signal. `true` = keep the legacy catch-all
-    // directed filter (some peer in the room predates recipient tags);
-    // `false` = presence + directed-to-me only. Starts conservative
-    // (true) and narrows once every announced peer advertises the cap.
-    let compat_directed = Arc::new(watch::channel(true).0);
     let shared = Arc::new(DriverShared {
         identity,
         room_handle,
         device_id: config.device_id.clone(),
         relays: Mutex::new(Vec::new()),
-        outbound: tokio::sync::Mutex::new(Some(outbound)),
+        // Erased once, here, at the only place that knows the producer's owner
+        // type. Everything downstream — the shared state, the publish bus, the
+        // replay buffer — stays concrete, and the owner still travels with the
+        // value it funded because erasure consumes the pair rather than
+        // splitting it.
+        outbound: tokio::sync::Mutex::new(Some(Box::new(ErasedSource::new(outbound))
+            as Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>)),
         publish_tx,
         force_reconnect: force_reconnect.clone(),
         relay_connected: relay_connected.clone(),
-        seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
-            SEEN_EVENT_CAPACITY,
-        )),
         outbound_replay: Mutex::new(std::collections::VecDeque::new()),
-        room_caps: Mutex::new(std::collections::HashMap::new()),
-        compat_directed,
     });
     {
         let mut relays = shared.relays.lock();
@@ -318,8 +359,9 @@ struct DriverShared {
     room_handle: String,
     device_id: String,
     relays: Mutex<Vec<RelayHandle>>,
-    outbound: tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound>>>>,
-    publish_tx: broadcast::Sender<Arc<NostrEvent>>,
+    outbound:
+        tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>>>,
+    publish_tx: broadcast::Sender<Arc<Published>>,
     /// Generation counter for forced reconnects. Bumping it wakes
     /// every relay task's `watch::Receiver` so it drops its socket
     /// and redials without waiting out the backoff. See the comment
@@ -332,18 +374,6 @@ struct DriverShared {
     /// offers/candidates would reach nobody (the "0 remote candidates
     /// arrived" stall). See `engine::network_watch::on_network_change`.
     relay_connected: Arc<watch::Sender<u64>>,
-    /// Cross-relay event-ID dedupe ring. Each Nostr event has a
-    /// sha256 `id`; the same event published once to N relays
-    /// arrives N times if we don't dedupe. Without this, the engine
-    /// receives every announce N× (cosmetic log spam) AND every
-    /// Offer / Answer N× (functional: calling
-    /// `set_remote_description` twice on the same peer connection
-    /// puts WebRTC into an unrecoverable state and stalls the
-    /// handshake at Sighted — exactly the "they just sit there"
-    /// symptom users hit in the field). 2048 entries covers the
-    /// busiest realistic mesh comfortably without growing
-    /// unboundedly.
-    seen_event_ids: Mutex<std::collections::VecDeque<String>>,
     /// Outbound *directed* events (offers / answers / candidates) buffered
     /// while every relay socket was mid-reconnect, when `publish_tx` has no
     /// subscribers and a plain send would be dropped. This is the
@@ -356,57 +386,42 @@ struct DriverShared {
     /// the relay session's subscribe path. Bounded ([`OUTBOUND_REPLAY_CAP`])
     /// and TTL'd ([`OUTBOUND_REPLAY_TTL_MS`]) so a long outage can't grow it
     /// unboundedly or replay an offer the negotiation has moved past.
-    outbound_replay: Mutex<std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>>,
-    /// Signaling capabilities of every peer that has announced in this
-    /// room, keyed by device id: `true` = the peer tags its directed
-    /// events with the recipient (`SIG_CAP_PTAG`). Entries leave on
-    /// `Leave`. Drives [`DriverShared::compat_directed`].
-    room_caps: Mutex<std::collections::HashMap<String, bool>>,
-    /// `true` while at least one announced peer predates recipient tags,
-    /// so the subscription must keep the legacy catch-all directed
-    /// filter. Relay sessions watch this and re-issue their REQ (same
-    /// sub id — NIP-01 replaces the filters) when it flips. Narrowing is
-    /// what stops every pairwise offer/answer/candidate in the room from
-    /// being delivered to every member.
-    compat_directed: Arc<watch::Sender<bool>>,
+    /// Every entry holds its [`Published`], so a buffered directed event keeps
+    /// its owner alive for exactly as long as it is replayable. Eviction at the
+    /// cap and the stale drain are both release points.
+    outbound_replay: Mutex<std::collections::VecDeque<(std::time::Instant, Arc<Published>)>>,
 }
 
-/// Re-evaluate [`DriverShared::compat_directed`] from the current
-/// `room_caps` map and signal sessions if it changed. Conservative: an
-/// empty room keeps compat on (no evidence everyone tags), and any
-/// announced peer without the cap keeps it on.
-fn recompute_compat(shared: &DriverShared) {
-    let caps = shared.room_caps.lock();
-    let need_compat = caps.is_empty() || caps.values().any(|ptag| !*ptag);
-    drop(caps);
-    shared.compat_directed.send_if_modified(|current| {
-        if *current != need_compat {
-            debug!(
-                room = %&shared.room_handle[..16.min(shared.room_handle.len())],
-                need_compat,
-                "directed-subscription shape changed"
-            );
-            *current = need_compat;
-            true
-        } else {
-            false
-        }
-    });
-}
-
-/// The NIP-01 filter set for our room subscription, as the current
-/// room composition wants it:
+/// The NIP-01 filter set for our room subscription:
 ///
 ///   1. presence (stored kind, replayed over the `since` window),
-///   2. directed-to-me negotiation (ephemeral kind, `#p` = us),
-///   3. legacy catch-all negotiation — only while `compat` (some peer
-///      in the room doesn't tag its directed events yet).
+///   2. directed-to-me negotiation (ephemeral kind, `#p` = us).
 ///
-/// One REQ, multiple filters (OR semantics), so narrowing is a
-/// same-sub-id REQ replacement rather than sub churn.
-fn desired_filters(shared: &DriverShared, compat: bool) -> Vec<Value> {
+/// One REQ, both filters (OR semantics).
+///
+/// # There is no third, room-wide filter, and there is no longer a state
+/// machine that adds one
+///
+/// An earlier revision kept a per-room capability map: every announced peer
+/// recorded whether it stamped recipient tags, and while any of them did not,
+/// the subscription added a catch-all that asked the relay for *every* pairwise
+/// offer, answer and candidate in the room. Two things were wrong with it.
+///
+/// It was an unbounded unauthenticated keyspace. The map was keyed by the
+/// `peer_id` out of an announce nobody authenticated, so one sender could
+/// publish arbitrarily many claimed device ids, grow the map without bound, and
+/// — because a claimed id that does not advertise the tag holds the catch-all
+/// on — keep every peer's pairwise negotiation flowing past every subscriber.
+/// The memory and the metadata amplification were the same lever.
+///
+/// It was also a mixed-version compatibility path, and the adopted hard-alpha
+/// cutover has none: peers are same-build, there is no downgrade, and nothing
+/// on the wire needs to ask what shape the other end speaks. The map is deleted
+/// rather than capped, because a capacity would have kept the amplification and
+/// only bounded the memory.
+fn desired_filters(shared: &DriverShared) -> Vec<Value> {
     let since = now_secs().saturating_sub(PRESENCE_REPLAY_WINDOW_SECS);
-    let mut filters = vec![
+    vec![
         serde_json::json!({
             "kinds": [SIGNALING_EVENT_KIND],
             "#r": [shared.room_handle.clone()],
@@ -421,23 +436,16 @@ fn desired_filters(shared: &DriverShared, compat: bool) -> Vec<Value> {
             "#r": [shared.room_handle.clone()],
             "#p": [shared.device_id.clone(), shared.room_handle.clone()],
         }),
-    ];
-    if compat {
-        filters.push(serde_json::json!({
-            "kinds": [SIGNALING_EPHEMERAL_KIND],
-            "#r": [shared.room_handle.clone()],
-        }));
-    }
-    filters
+    ]
 }
 
 /// Serialize the room REQ for `desired_filters`.
-fn build_req(shared: &DriverShared, sub_id: &str, compat: bool) -> String {
+fn build_req(shared: &DriverShared, sub_id: &str) -> String {
     let mut arr = vec![
         Value::String("REQ".to_string()),
         Value::String(sub_id.to_string()),
     ];
-    arr.extend(desired_filters(shared, compat));
+    arr.extend(desired_filters(shared));
     Value::Array(arr).to_string()
 }
 
@@ -463,13 +471,6 @@ fn jittered_ms(base_ms: u64, seed: &str, salt: u64) -> u64 {
     let offset = raw % (span + 1);
     base_ms - (base_ms * 15 / 100) + offset
 }
-
-/// Window size of `seen_event_ids` — re-exported from
-/// [`crate::upstream`] which catalogues the rationale alongside the
-/// other upstream-Trystero fixes. The dedup itself lives here in
-/// the driver where the relay-fanout happens; the constant lives
-/// there with the rest of the tuning surface.
-use crate::upstream::SEEN_EVENT_CAPACITY;
 
 #[allow(dead_code)]
 struct RelayHandle {
@@ -725,19 +726,13 @@ async fn run_relay_session(
     //   - presence on the stored kind, with a `since` window that
     //     replays the last few minutes so a late joiner discovers
     //     everyone already here;
-    //   - directed-to-me negotiation on the ephemeral kind (`#p` us);
-    //   - while any peer in the room predates recipient tags, a
-    //     legacy catch-all for untagged negotiation.
+    //   - directed-to-me negotiation on the ephemeral kind (`#p` us).
     // Ephemeral events are never stored, so `since` governs presence
     // replay only — negotiation always arrives live (see
-    // `event::SIGNALING_EPHEMERAL_KIND`).
+    // `event::SIGNALING_EPHEMERAL_KIND`). The shape is fixed for the life
+    // of the session: nothing a peer publishes can widen it.
     let sub_id = "mom-sig-1";
-    // Watch the subscription-shape signal; `borrow_and_update` seeds the
-    // shape this session subscribes with and marks it seen, so only a
-    // *later* flip re-issues the REQ.
-    let mut compat_rx = shared.compat_directed.subscribe();
-    let mut compat = *compat_rx.borrow_and_update();
-    let req_text = build_req(shared, sub_id, compat);
+    let req_text = build_req(shared, sub_id);
 
     if let Err(e) = write.send(WsMessage::Text(req_text)).await {
         return RelaySessionOutcome::Error(format!("send REQ: {e}"));
@@ -815,7 +810,7 @@ async fn run_relay_session(
             publish = publish_rx.recv() => {
                 match publish {
                     Ok(event) => {
-                        let frame = serde_json::json!(["EVENT", &*event]).to_string();
+                        let frame = serde_json::json!(["EVENT", event.event()]).to_string();
                         if let Err(e) = write.send(WsMessage::Text(frame)).await {
                             return RelaySessionOutcome::Error(format!("send publish: {e}"));
                         }
@@ -837,23 +832,6 @@ async fn run_relay_session(
             // "reconnect now" intent.
             _ = force_rx.changed() => {
                 return RelaySessionOutcome::ForcedReconnect;
-            }
-            // The room's directed-subscription shape changed (a legacy
-            // peer appeared, or the last one left). Re-issue the REQ
-            // under the same sub id — NIP-01 replaces the filters in
-            // place, no unsubscribe round-trip needed.
-            changed = compat_rx.changed() => {
-                if changed.is_ok() {
-                    let now_compat = *compat_rx.borrow_and_update();
-                    if now_compat != compat {
-                        compat = now_compat;
-                        let req_text = build_req(shared, sub_id, compat);
-                        debug!(relay = %short(url), compat, "re-issuing room REQ (subscription shape changed)");
-                        if let Err(e) = write.send(WsMessage::Text(req_text)).await {
-                            return RelaySessionOutcome::Error(format!("send REQ: {e}"));
-                        }
-                    }
-                }
             }
             // Idle-wake so a stopped/dropped handle is noticed within one
             // poll interval even on a quiet socket. Without this, a
@@ -886,7 +864,7 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
         // writes it to its own socket. One tick → one publish →
         // N writes (one per relay), independent of how many
         // relays are currently connected.
-        let _ = shared.publish_tx.send(Arc::new(event));
+        let _ = shared.publish_tx.send(Arc::new(Published::Announce(event)));
 
         let base_ms = ANNOUNCE_BACKOFF_MS
             .get(count)
@@ -939,31 +917,26 @@ fn handle_inbound_frame(
             if event.pubkey == shared.identity.pubkey_hex() {
                 return Ok(());
             }
-            // Cross-relay dedup. The same Nostr event (same sha256
-            // `id`) gets delivered by every relay that has it — with
-            // `signaling.redundancy` typically 4-5, that's a 4-5×
-            // amplification on every announce, offer, answer, and
-            // candidate. The engine layer above us is mostly
-            // idempotent on announces (`ensure_peer_session`
-            // short-circuits) but NOT on Offer/Answer:
-            // `set_remote_description` on an already-stable
-            // RTCPeerConnection puts WebRTC into a permanently
-            // wedged state — exactly the "they just sit there"
-            // symptom users see when peers reach Sighted and
-            // nothing advances. Filtering by event ID here is the
-            // canonical fix per `upstream.rs` item 5: signaling-layer
-            // concerns belong in signaling-layer code, not bolted
-            // into every engine handler.
-            {
-                let mut seen = shared.seen_event_ids.lock();
-                if seen.iter().any(|id| id == &event.id) {
-                    return Ok(()); // already delivered via another relay
-                }
-                if seen.len() >= SEEN_EVENT_CAPACITY {
-                    seen.pop_front();
-                }
-                seen.push_back(event.id.clone());
-            }
+            // No de-duplication here, deliberately. The relay fan-out
+            // duplicate is real — one event published once arrives from
+            // every relay that has it, and applying an offer twice via
+            // `set_remote_description` wedges WebRTC permanently — but this
+            // is the wrong layer to remember it at, and remembering it here
+            // was a second bug on top of the first.
+            //
+            // The ring that used to sit on this line recorded the event id
+            // *before* the envelope was parsed and *before* the value was
+            // offered onward, and it discarded the offer's result. So a copy
+            // the consumer refused under pressure still left its id behind,
+            // and the identical copy arriving from the next relay — the one
+            // that would have rescued the attempt — was dropped here as
+            // already seen. Neither copy ever reached the engine.
+            //
+            // De-duplication now has one owner, downstream, which commits a
+            // key only after the value has actually been accepted and scopes
+            // it to the exact attempt it describes. A refused value leaves no
+            // history anywhere. See `engine::signaling_ingress`.
+            //
             // Pull our envelope out of the content.
             let envelope: SignalingEnvelope =
                 serde_json::from_str(&event.content).map_err(|e| e.to_string())?;
@@ -985,7 +958,7 @@ fn handle_inbound_frame(
             // an ephemeral event) and is dropped rather than applied
             // as a remote description against dead ICE credentials.
             match envelope.msg {
-                SignalingMessage::Announce { peer_id, caps } => {
+                SignalingMessage::Announce { peer_id } => {
                     if event.kind != SIGNALING_EVENT_KIND {
                         trace!(
                             relay = %short(url),
@@ -997,14 +970,6 @@ fn handle_inbound_frame(
                     if peer_id == shared.device_id {
                         return Ok(());
                     }
-                    // Track whether this peer tags its directed events; the
-                    // room-wide verdict decides whether our subscription
-                    // still needs the legacy catch-all filter.
-                    {
-                        let ptag = caps.iter().any(|c| c == SIG_CAP_PTAG);
-                        shared.room_caps.lock().insert(peer_id.clone(), ptag);
-                    }
-                    recompute_compat(shared);
                     // Sender-claimed, and deliberately still the body id: on
                     // a relay the envelope's own `from` is a second field the
                     // same sender wrote, so preferring it would buy nothing.
@@ -1030,11 +995,6 @@ fn handle_inbound_frame(
                     if peer_id == shared.device_id {
                         return Ok(());
                     }
-                    // The departed peer no longer votes on the room's
-                    // subscription shape — the last legacy peer leaving is
-                    // exactly when the catch-all filter can narrow away.
-                    shared.room_caps.lock().remove(&peer_id);
-                    recompute_compat(shared);
                     let _ = inbound_tx.send(NostrInbound::PeerLeft {
                         device_id: peer_id,
                         attribution: CarrierAttribution::SenderClaimed,
@@ -1083,14 +1043,13 @@ struct SignalingEnvelope {
 /// The one announce builder — the periodic ticker, the per-session
 /// open-announce, and the engine-driven reactive announce all publish
 /// exactly this event, so there is a single place the announce's shape
-/// (and its advertised signaling caps) can ever change.
+/// can ever change.
 fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     let envelope = SignalingEnvelope {
         from: shared.device_id.clone(),
         to: None,
         msg: SignalingMessage::Announce {
             peer_id: shared.device_id.clone(),
-            caps: vec![SIG_CAP_PTAG.to_string()],
         },
     };
     make_event(
@@ -1118,9 +1077,9 @@ const OUTBOUND_REPLAY_TTL_MS: u64 = 10_000;
 /// Push an outbound event onto the replay buffer, evicting the oldest if
 /// it would exceed [`OUTBOUND_REPLAY_CAP`].
 fn push_outbound_replay(
-    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>,
+    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<Published>)>,
     now: std::time::Instant,
-    event: Arc<NostrEvent>,
+    event: Arc<Published>,
 ) {
     buf.push_back((now, event));
     while buf.len() > OUTBOUND_REPLAY_CAP {
@@ -1133,9 +1092,9 @@ fn push_outbound_replay(
 /// buffer is emptied either way, so the first relay back replays and the
 /// rest see nothing.
 fn drain_fresh_outbound(
-    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>,
+    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<Published>)>,
     now: std::time::Instant,
-) -> Vec<Arc<NostrEvent>> {
+) -> Vec<Arc<Published>> {
     let ttl = Duration::from_millis(OUTBOUND_REPLAY_TTL_MS);
     buf.drain(..)
         .filter(|(t, _)| now.duration_since(*t) <= ttl)
@@ -1155,66 +1114,76 @@ async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::ato
         }
         // Presence rides the stored kind; directed negotiation rides
         // the ephemeral kind so it's never replayed onto a future
-        // session. The kind is chosen by message class, not content.
-        let (event, kind) = match outbound {
-            // Same builder as the ticker and the open-announce — one
-            // announce shape, one place to change it.
-            NostrOutbound::Announce => (
-                Arc::new(build_announce_event(&shared)),
-                SIGNALING_EVENT_KIND,
-            ),
-            // A departure is a broadcast (no `to`) on the ephemeral kind —
-            // same envelope shape an intelligent signaling server synthesises
-            // on a socket close (see `server::build_leave_event`), so
-            // receivers handle a self-announced leave identically.
-            NostrOutbound::Leave => {
-                let envelope = SignalingEnvelope {
-                    from: shared.device_id.clone(),
-                    to: None,
-                    msg: SignalingMessage::Leave {
-                        peer_id: shared.device_id.clone(),
-                    },
-                };
-                // Broadcast ephemerals are "addressed to the room": the
-                // `["p", room_handle]` tag is what keeps a departure
-                // visible to peers whose subscription has narrowed to
-                // recipient-tagged events only (see `desired_filters`).
-                let event = make_event(
-                    &shared.identity,
-                    SIGNALING_EPHEMERAL_KIND,
-                    vec![
-                        vec!["r".into(), shared.room_handle.clone()],
-                        vec!["p".into(), shared.room_handle.clone()],
-                    ],
-                    serde_json::to_string(&envelope).expect("serialize ok"),
-                    now_secs(),
-                );
-                (Arc::new(event), SIGNALING_EPHEMERAL_KIND)
-            }
-            // Directed negotiation carries its recipient both in the
-            // envelope (`to`, the receive-side check) and as a `["p", …]`
-            // tag — the tag is what lets subscribers narrow their REQ to
-            // "directed to me" so the relay stops fanning every pairwise
-            // negotiation to the whole room. See `SIG_CAP_PTAG`.
-            NostrOutbound::DirectedToPeer { to, msg } => {
-                let envelope = SignalingEnvelope {
-                    from: shared.device_id.clone(),
-                    to: Some(to.clone()),
-                    msg,
-                };
-                let event = make_event(
-                    &shared.identity,
-                    SIGNALING_EPHEMERAL_KIND,
-                    vec![
-                        vec!["r".into(), shared.room_handle.clone()],
-                        vec!["p".into(), to],
-                    ],
-                    serde_json::to_string(&envelope).expect("serialize ok"),
-                    now_secs(),
-                );
-                (Arc::new(event), SIGNALING_EPHEMERAL_KIND)
-            }
+        // session. The kind is chosen by message class, not content —
+        // and it is chosen on a *borrow*, before anything is built.
+        let kind = match outbound.value() {
+            NostrOutbound::Announce => SIGNALING_EVENT_KIND,
+            NostrOutbound::Leave | NostrOutbound::DirectedToPeer { .. } => SIGNALING_EPHEMERAL_KIND,
         };
+        // The event is created *inside* `map`, so the serialized
+        // `NostrEvent` — and every `Arc` clone of it that the broadcast
+        // bus, the relay subscribers and the replay buffer go on to hold —
+        // is born already carrying the owner that admitted the value it
+        // came from. There is no window in which the encoded form exists
+        // beside its funding rather than inside it.
+        let shared_for_event = Arc::clone(&shared);
+        let event = Arc::new(Published::FromEngine(outbound.map(move |outbound| {
+            let shared = shared_for_event;
+            match outbound {
+                // Same builder as the ticker and the open-announce — one
+                // announce shape, one place to change it.
+                NostrOutbound::Announce => build_announce_event(&shared),
+                // A departure is a broadcast (no `to`) on the ephemeral kind —
+                // same envelope shape an intelligent signaling server synthesises
+                // on a socket close (see `server::build_leave_event`), so
+                // receivers handle a self-announced leave identically.
+                NostrOutbound::Leave => {
+                    let envelope = SignalingEnvelope {
+                        from: shared.device_id.clone(),
+                        to: None,
+                        msg: SignalingMessage::Leave {
+                            peer_id: shared.device_id.clone(),
+                        },
+                    };
+                    // Broadcast ephemerals are "addressed to the room": the
+                    // `["p", room_handle]` tag is what keeps a departure
+                    // visible to peers whose subscription has narrowed to
+                    // recipient-tagged events only (see `desired_filters`).
+                    make_event(
+                        &shared.identity,
+                        SIGNALING_EPHEMERAL_KIND,
+                        vec![
+                            vec!["r".into(), shared.room_handle.clone()],
+                            vec!["p".into(), shared.room_handle.clone()],
+                        ],
+                        serde_json::to_string(&envelope).expect("serialize ok"),
+                        now_secs(),
+                    )
+                }
+                // Directed negotiation carries its recipient both in the
+                // envelope (`to`, the receive-side check) and as a `["p", …]`
+                // tag — the tag is what lets subscribers ask the relay only for
+                // "directed to me", so pairwise negotiation is never fanned to
+                // the whole room.
+                NostrOutbound::DirectedToPeer { to, msg } => {
+                    let envelope = SignalingEnvelope {
+                        from: shared.device_id.clone(),
+                        to: Some(to.clone()),
+                        msg,
+                    };
+                    make_event(
+                        &shared.identity,
+                        SIGNALING_EPHEMERAL_KIND,
+                        vec![
+                            vec!["r".into(), shared.room_handle.clone()],
+                            vec!["p".into(), to],
+                        ],
+                        serde_json::to_string(&envelope).expect("serialize ok"),
+                        now_secs(),
+                    )
+                }
+            }
+        })));
         // Fan out to every connected relay session via the
         // broadcast bus. Sessions that aren't subscribed yet
         // (still connecting / reconnecting) will pick up the
@@ -1300,22 +1269,76 @@ mod tests {
         assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
     }
 
-    fn test_event(signer: &NostrIdentity, n: u8) -> Arc<NostrEvent> {
+    fn test_nostr_event(signer: &NostrIdentity, n: u8) -> NostrEvent {
         let envelope = SignalingEnvelope {
             from: "peer".into(),
             to: Some("self-device".into()),
             msg: SignalingMessage::Announce {
                 peer_id: format!("p{n}"),
-                caps: Vec::new(),
             },
         };
-        Arc::new(crate::nostr::event::make_event(
+        crate::nostr::event::make_event(
             signer,
             SIGNALING_EPHEMERAL_KIND,
             vec![vec!["r".into(), "test-room".into()]],
             serde_json::to_string(&envelope).unwrap(),
             1_700_000_000,
-        ))
+        )
+    }
+
+    /// A published value with a unit owner — enough for the buffer mechanics,
+    /// which never look inside one.
+    fn test_event(signer: &NostrIdentity, n: u8) -> Arc<Published> {
+        Arc::new(Published::FromEngine(OwnedSignal::new(
+            test_nostr_event(signer, n),
+            Box::new(()) as ErasedOwner,
+        )))
+    }
+
+    /// An owner that records its own release.
+    ///
+    /// The point of the owner type is *when* the funding goes back, and no
+    /// assertion about a type can observe that. This can: it fires exactly once,
+    /// in `Drop`, so a control can distinguish "the buffer let go" from "the last
+    /// copy that could still be written to a socket let go".
+    struct ReleaseFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ReleaseFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_owner_outlives_every_shared_copy_of_what_it_funded() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let id = NostrIdentity::generate();
+        let released = Arc::new(AtomicBool::new(false));
+        let event = Arc::new(Published::FromEngine(OwnedSignal::new(
+            test_nostr_event(&id, 9),
+            Box::new(ReleaseFlag(Arc::clone(&released))) as ErasedOwner,
+        )));
+        // One relay subscriber holds its own clone — what `publish_tx` hands
+        // every live session — while the replay buffer holds another.
+        let subscriber = Arc::clone(&event);
+        let base = std::time::Instant::now();
+        let mut buf: VecDeque<(std::time::Instant, Arc<Published>)> = VecDeque::new();
+        push_outbound_replay(&mut buf, base, event);
+        // Stale, so the drain discards the buffer's copy.
+        let now = base + Duration::from_secs(60);
+        assert!(drain_fresh_outbound(&mut buf, now).is_empty());
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the buffer let go, but a subscriber can still write this event to a \
+             socket — the funding must not be back yet"
+        );
+        drop(subscriber);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the last copy is gone, so nothing derived from the admitted value \
+             remains and the owner is released"
+        );
     }
 
     #[test]
@@ -1323,7 +1346,7 @@ mod tests {
         use std::collections::VecDeque;
         let id = NostrIdentity::generate();
         let now = std::time::Instant::now();
-        let mut buf: VecDeque<(std::time::Instant, Arc<NostrEvent>)> = VecDeque::new();
+        let mut buf: VecDeque<(std::time::Instant, Arc<Published>)> = VecDeque::new();
         for n in 0..(OUTBOUND_REPLAY_CAP as u32 + 50) {
             push_outbound_replay(&mut buf, now, test_event(&id, n as u8));
         }
@@ -1343,7 +1366,7 @@ mod tests {
         // booted host while still putting the first event well past the TTL.
         let base = std::time::Instant::now();
         let now = base + Duration::from_secs(60);
-        let mut buf: VecDeque<(std::time::Instant, Arc<NostrEvent>)> = VecDeque::new();
+        let mut buf: VecDeque<(std::time::Instant, Arc<Published>)> = VecDeque::new();
         push_outbound_replay(&mut buf, base, test_event(&id, 1)); // 60 s old → stale
         push_outbound_replay(&mut buf, now, test_event(&id, 2)); // fresh
         push_outbound_replay(&mut buf, now, test_event(&id, 3)); // fresh
@@ -1357,10 +1380,14 @@ mod tests {
 
     fn fixture_shared() -> Arc<DriverShared> {
         let identity = NostrIdentity::generate();
-        let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(16);
+        let (publish_tx, _) = broadcast::channel::<Arc<Published>>(16);
         let (_out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
-        let out_rx: Box<dyn OutboundSource<NostrOutbound>> =
-            Box::new(crate::UnboundedSource::new(out_rx));
+        // The standalone shape: an unbounded source has no accountant, so its
+        // owner is `()`, and erasing that is what lets the fixture hand the
+        // driver the same concrete `ErasedOwner` the bridge does.
+        let out_rx: Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>> = Box::new(
+            crate::ErasedSource::new(crate::UnboundedSource::new(out_rx)),
+        );
         Arc::new(DriverShared {
             identity,
             room_handle: "test-room".into(),
@@ -1370,12 +1397,7 @@ mod tests {
             publish_tx,
             force_reconnect: Arc::new(watch::channel(0u64).0),
             relay_connected: Arc::new(watch::channel(0u64).0),
-            seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
-                SEEN_EVENT_CAPACITY,
-            )),
             outbound_replay: Mutex::new(std::collections::VecDeque::new()),
-            room_caps: Mutex::new(std::collections::HashMap::new()),
-            compat_directed: Arc::new(watch::channel(true).0),
         })
     }
 
@@ -1389,7 +1411,6 @@ mod tests {
             to: None,
             msg: SignalingMessage::Announce {
                 peer_id: peer.into(),
-                caps: Vec::new(),
             },
         };
         let content = serde_json::to_string(&envelope).unwrap();
@@ -1405,17 +1426,41 @@ mod tests {
         (frame, event.id)
     }
 
-    /// Same event delivered twice (simulating two relays carrying
-    /// the same Nostr event) should produce exactly one inbound
-    /// announce on the engine-facing channel. This is the canonical
-    /// "Offer-applied-twice wedges WebRTC" regression — see
-    /// `upstream.rs` item 6.
+    /// **The same event from two relays is offered onward twice, because this
+    /// layer no longer decides what a duplicate is.**
+    ///
+    /// It used to. A ring of event ids sat in front of the envelope parse, and
+    /// the second relay's copy was dropped here. That was one layer too early in
+    /// two separate ways: the id was recorded before the value was offered, and
+    /// the offer's result was discarded — so a copy the consumer refused under
+    /// pressure still poisoned the id, and the copy that would have rescued the
+    /// attempt was swallowed on its way past.
+    ///
+    /// What happens to the second copy downstream depends on what it is, and the
+    /// two answers are different on purpose.
+    ///
+    /// *Stamped negotiation* — an offer, answer or candidate — carries the
+    /// engine-minted attempt correlation, so the duplicate is collapsed once,
+    /// downstream, after acceptance and against that exact attempt (see
+    /// `engine::signaling_ingress`).
+    ///
+    /// *Presence* — an announce or a leave — carries no such stamp, and is not
+    /// de-duplicated at all: one copy per relay reaches the engine, **by
+    /// design**. `ensure_peer_session` is idempotent, so the second copy is a
+    /// no-op rather than a second session, and the alternative — a driver-side
+    /// ring keyed on event id — is exactly what was deleted here and for good
+    /// reason. Saying "it is deduped downstream" of presence would be false.
+    ///
+    /// What this control fixes in place is that the driver does not *also* have
+    /// an opinion about either class: two relay copies produce two offers, and a
+    /// policy that quietly reappeared here would fail this line rather than
+    /// silently double-guard the boundary.
     #[test]
-    fn duplicate_event_id_only_fires_inbound_once() {
+    fn every_relay_copy_is_offered_onward_from_this_layer() {
         let shared = fixture_shared();
         let peer_signer = NostrIdentity::generate();
         let peer_pub = peer_signer.pubkey_hex().to_string();
-        let (frame, event_id) = announce_frame_for(&peer_pub, &peer_signer);
+        let (frame, _event_id) = announce_frame_for(&peer_pub, &peer_signer);
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
         let tx = InboundSink::from_unbounded(tx);
 
@@ -1423,26 +1468,32 @@ mod tests {
         handle_inbound_frame("wss://relay-b", &frame, &shared, &tx).expect("dup parses");
         handle_inbound_frame("wss://relay-c", &frame, &shared, &tx).expect("dup parses");
 
-        let first = rx.try_recv().expect("first delivery lands");
-        match first {
-            NostrInbound::PeerAnnounced { device_id, .. } => assert_eq!(device_id, peer_pub),
-            other => panic!("expected PeerAnnounced, got {other:?}"),
+        for relay in ["a", "b", "c"] {
+            match rx.try_recv() {
+                Ok(NostrInbound::PeerAnnounced { device_id, .. }) => {
+                    assert_eq!(device_id, peer_pub, "relay {relay}'s copy names the peer")
+                }
+                other => panic!("relay {relay}'s copy must be offered onward, got {other:?}"),
+            }
         }
         assert!(
             rx.try_recv().is_err(),
-            "no second delivery for same event id"
-        );
-
-        let seen = shared.seen_event_ids.lock();
-        assert!(
-            seen.iter().any(|id| id == &event_id),
-            "event id recorded in dedupe ring"
+            "non-vacuity: three copies in, exactly three out — the layer is not \
+             inventing deliveries either"
         );
     }
 
     /// Different events from the same peer (e.g. periodic re-announces)
     /// must NOT be deduped — each one is a fresh signal that signaling
-    /// is alive. Only relay-replays of the SAME event id should drop.
+    /// is alive.
+    ///
+    /// Nothing is dropped here on an event id, either. The relay-replay case —
+    /// several copies of one event id arriving from several relays — is offered
+    /// onward from this layer too, which is what the control above this one
+    /// pins. What becomes of a duplicate is decided downstream and differs by
+    /// class: stamped negotiation is collapsed against its exact attempt, while
+    /// unstamped presence is intentionally not de-duplicated at all and reaches
+    /// the engine once per relay copy.
     #[test]
     fn distinct_events_each_fire_inbound() {
         let shared = fixture_shared();
@@ -1457,7 +1508,6 @@ mod tests {
             to: None,
             msg: SignalingMessage::Announce {
                 peer_id: peer_pub.clone(),
-                caps: Vec::new(),
             },
         };
         let ev2 = crate::nostr::event::make_event(
@@ -1484,26 +1534,6 @@ mod tests {
             rx.try_recv().expect("second announce"),
             NostrInbound::PeerAnnounced { .. }
         ));
-    }
-
-    /// The dedup ring is bounded so a long-lived mesh doesn't grow
-    /// without bound. Past `SEEN_EVENT_CAPACITY` the oldest entries
-    /// roll off — a very old event could legitimately re-deliver,
-    /// which is fine: at that age it's effectively a fresh event.
-    #[test]
-    fn seen_ring_bounded_at_capacity() {
-        let shared = fixture_shared();
-        {
-            let mut seen = shared.seen_event_ids.lock();
-            for i in 0..SEEN_EVENT_CAPACITY + 50 {
-                if seen.len() >= SEEN_EVENT_CAPACITY {
-                    seen.pop_front();
-                }
-                seen.push_back(format!("id-{i}"));
-            }
-        }
-        let seen = shared.seen_event_ids.lock();
-        assert_eq!(seen.len(), SEEN_EVENT_CAPACITY);
     }
 
     /// Build a directed Offer frame from `peer` to `to`, signed by
@@ -1589,7 +1619,6 @@ mod tests {
             to: None,
             msg: SignalingMessage::Announce {
                 peer_id: peer_pub.clone(),
-                caps: Vec::new(),
             },
         };
         let ev = crate::nostr::event::make_event(
@@ -1612,97 +1641,58 @@ mod tests {
         );
     }
 
-    /// An announce frame from `peer` advertising the given signaling caps.
-    fn announce_frame_with_caps(peer: &str, signer: &NostrIdentity, caps: &[&str]) -> String {
-        let envelope = SignalingEnvelope {
-            from: peer.into(),
-            to: None,
-            msg: SignalingMessage::Announce {
-                peer_id: peer.into(),
-                caps: caps.iter().map(|s| s.to_string()).collect(),
-            },
-        };
-        let event = crate::nostr::event::make_event(
-            signer,
-            SIGNALING_EVENT_KIND,
-            vec![vec!["r".into(), "test-room".into()]],
-            serde_json::to_string(&envelope).unwrap(),
-            1_700_000_000,
-        );
-        serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string()
-    }
-
+    /// **One subscription shape, and nothing a peer publishes can widen it.**
+    ///
+    /// The filter set used to be three: presence, directed-to-me, and — while
+    /// any announced peer had not advertised the recipient-tag capability — a
+    /// room-wide catch-all that asked the relay for every pairwise negotiation
+    /// in the room. Whether the third one was attached was decided by an
+    /// unbounded map keyed on unauthenticated announce ids, so one sender could
+    /// hold it on for everybody and read the room's whole negotiation traffic.
+    ///
+    /// Both assertions are the fix, and each is the other's non-vacuity: there
+    /// are exactly two filters, and every filter that asks for the negotiation
+    /// kind names us as its recipient. A re-introduced catch-all fails the
+    /// second even if it kept the count at two.
     #[test]
-    fn desired_filters_narrow_when_compat_off() {
+    fn the_subscription_asks_only_for_presence_and_directed_to_me() {
         let shared = fixture_shared();
-        let wide = desired_filters(&shared, true);
-        assert_eq!(wide.len(), 3, "compat keeps the legacy catch-all filter");
-        assert!(
-            wide[2].get("#p").is_none(),
-            "the catch-all filter has no recipient constraint"
-        );
-        let narrow = desired_filters(&shared, false);
-        assert_eq!(narrow.len(), 2, "narrowed shape: presence + directed-to-me");
+        let filters = desired_filters(&shared);
         assert_eq!(
-            narrow[1]["#p"][0], "self-device",
-            "the directed filter names us as the recipient"
+            filters.len(),
+            2,
+            "presence + directed-to-me, with no room-wide third"
         );
         assert_eq!(
-            narrow[0]["kinds"][0],
+            filters[0]["kinds"][0],
             serde_json::json!(SIGNALING_EVENT_KIND),
             "presence filter carries the stored kind"
         );
-    }
-
-    #[test]
-    fn compat_narrows_only_when_every_announced_peer_tags() {
-        let shared = fixture_shared();
-        assert!(
-            *shared.compat_directed.borrow(),
-            "empty room keeps compat on (no evidence)"
-        );
-
-        let a = NostrIdentity::generate();
-        let b = NostrIdentity::generate();
-        let (tx, _rx) = mpsc::unbounded_channel::<NostrInbound>();
-        let tx = InboundSink::from_unbounded(tx);
-
-        // One tagging peer: narrows (they're the whole room).
-        let frame = announce_frame_with_caps(a.pubkey_hex(), &a, &[SIG_CAP_PTAG]);
-        handle_inbound_frame("wss://r", &frame, &shared, &tx).unwrap();
-        assert!(
-            !*shared.compat_directed.borrow(),
-            "all-tagging room narrows"
-        );
-
-        // A legacy peer announces: widen again.
-        let frame = announce_frame_with_caps(b.pubkey_hex(), &b, &[]);
-        handle_inbound_frame("wss://r", &frame, &shared, &tx).unwrap();
-        assert!(
-            *shared.compat_directed.borrow(),
-            "legacy peer forces the catch-all back on"
-        );
-
-        // The legacy peer leaves: narrow once more.
-        shared.room_caps.lock().remove(b.pubkey_hex());
-        recompute_compat(&shared);
-        assert!(
-            !*shared.compat_directed.borrow(),
-            "compat drops when the last legacy peer departs"
-        );
+        for filter in &filters {
+            if filter["kinds"][0] == serde_json::json!(SIGNALING_EPHEMERAL_KIND) {
+                assert!(
+                    filter
+                        .get("#p")
+                        .and_then(|p| p.as_array())
+                        .is_some_and(|p| p.iter().any(|v| v == "self-device")),
+                    "a negotiation filter must name us as the recipient; an \
+                     unconstrained one is the amplification this deleted"
+                );
+            }
+        }
     }
 
     #[test]
     fn build_req_replaces_same_sub_id() {
         let shared = fixture_shared();
-        let req = build_req(&shared, "mom-sig-1", false);
+        let req = build_req(&shared, "mom-sig-1");
         let v: Value = serde_json::from_str(&req).unwrap();
         assert_eq!(v[0], "REQ");
         assert_eq!(v[1], "mom-sig-1");
         assert_eq!(
             v.as_array().unwrap().len(),
             2 + 2,
-            "REQ + sub id + two filters when narrowed"
+            "REQ + sub id + the two filters"
         );
     }
 

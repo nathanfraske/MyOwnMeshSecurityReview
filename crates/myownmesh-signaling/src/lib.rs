@@ -26,16 +26,6 @@ pub mod upstream;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// Signaling-layer capability id: the sender stamps a recipient tag on
-/// every ephemeral event it publishes — `["p", <device id>]` on directed
-/// offer / answer / candidate, `["p", <room handle>]` on room-addressed
-/// broadcasts (`leave`) — so subscribers can ask the relay for "directed
-/// to me (or the room)" instead of receiving every pairwise negotiation
-/// in the room. Advertised in the announce's `caps` so receivers know
-/// when the whole room tags — see `nostr::driver` for the adaptive
-/// subscription that drops the legacy catch-all filter once it does.
-pub const SIG_CAP_PTAG: &str = "ptag";
-
 /// How a driver came by the device id in a presence or withdrawal report.
 ///
 /// Every driver reports presence and withdrawal, and the two ways it can know
@@ -103,8 +93,178 @@ pub enum CarrierAttribution {
 /// yields one value at a time and the caller has already decided.
 #[async_trait]
 pub trait OutboundSource<T>: Send {
-    /// The next value for this driver to publish, or `None` when finished.
-    async fn recv(&mut self) -> Option<T>;
+    /// What travels with each value and outlives every allocation derived from
+    /// it. Opaque here: this crate has no resource vocabulary and does not want
+    /// one, so the owner is whatever the producer says it is.
+    type Owner: Send;
+
+    /// The next value for this driver to publish, or `None` when the source is
+    /// **closed**.
+    ///
+    /// `None` is terminal and means exactly one thing: nothing will ever arrive
+    /// again. Every driver pump here is a `while let Some(..)` loop, and two of
+    /// them consume the source to run it, so a `None` returned for any lesser
+    /// reason — a transient refusal, a value the producer chose not to build —
+    /// would silently retire that carrier for the life of the process and leave
+    /// whatever is behind it undrained. A producer that cannot supply *this*
+    /// value must skip it and keep going, not report the end of the world.
+    async fn recv(&mut self) -> Option<OwnedSignal<T, Self::Owner>>;
+}
+
+/// One outbound value and the owner that funds everything reachable from it.
+///
+/// # The invariant, and why it needs a type rather than a convention
+///
+/// ```text
+/// translated allocation, encoded event, broadcast clone, or replay entry exists
+///     -> the exact finite owner that admitted it also exists
+/// ```
+///
+/// Removing the second queue between the engine and a driver was correct, and it
+/// did not make a multi-kilobyte translated value free. A driver receives a
+/// value the engine paid for, then serializes it, clones it into an `Arc`, fans
+/// that to every relay task and keeps it in a replay buffer — and until now none
+/// of those allocations carried anything back to what admitted them. The owner
+/// travelled as far as the pump's stack frame and was dropped there.
+///
+/// This binds the two together in the type system. The value and the owner are
+/// **private**, there is no accessor that yields the value alone, and there is
+/// no `into_value`, `split` or `take` — so there is no expression anywhere that
+/// separates one from the other. A consumer either borrows through
+/// [`Self::value`], or transforms with [`Self::map`], which consumes the whole
+/// thing and rebuilds it around the same owner. Both keep the pair intact.
+///
+/// Field order is load-bearing: Rust drops fields in declaration order, so the
+/// value and everything derived from it are destroyed *before* the owner that
+/// paid for them is released.
+pub struct OwnedSignal<T, O> {
+    value: T,
+    owner: O,
+}
+
+impl<T, O> OwnedSignal<T, O> {
+    /// Pair a value with the owner that funds it.
+    ///
+    /// The owner has to be acquired **before** the value is built — the whole
+    /// point is that a refusal happens instead of an allocation, not after one.
+    /// This constructor cannot enforce that ordering; the producer's own
+    /// acquire-then-translate sequence does, and every producer in this
+    /// workspace does it that way.
+    pub fn new(value: T, owner: O) -> Self {
+        Self { value, owner }
+    }
+
+    /// Borrow the value. The only way to read it.
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Transform the value, carrying the same owner onto the result.
+    ///
+    /// Consuming rather than borrowing, so a caller cannot end up holding the
+    /// old value and the new one with one owner between them. This is how an
+    /// encoded form — a serialized frame, a wire line — inherits the funding of
+    /// the value it was encoded from instead of becoming an unowned allocation
+    /// beside it.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> OwnedSignal<U, O> {
+        OwnedSignal {
+            value: f(self.value),
+            owner: self.owner,
+        }
+    }
+}
+
+/// An owner whose type a driver does not need to know.
+///
+/// A driver holds the owner and never inspects it — that is the entire contract
+/// — so the type it is holding buys nothing and costs a generic parameter on
+/// every piece of shared state the value can reach: a connection table, a
+/// broadcast bus, a replay buffer. Erasing it at the boundary keeps that state
+/// concrete.
+///
+/// # Why `Sync` is in the bound and is not a convenience
+///
+/// The Nostr driver shares one published event across relay tasks as an `Arc`,
+/// and `Arc<T>` is only `Send` when `T` is `Send + Sync`. A `Box<dyn Send>`
+/// owner would therefore have made the broadcast bus un-sendable, and the
+/// tempting repair — an `unsafe impl`, or a mutex around something that is never
+/// mutated — would have been papering over a genuine constraint.
+///
+/// It is not one. The only owner this workspace erases is core's, and every part
+/// of it is `Sync` already: a resource lease is an `Arc<dyn ResourceProvider>`
+/// (that trait requires `Send + Sync`), an `Arc`-backed scope, a plain claim and
+/// an authority tag; a mailbox delivery is that lease plus a value that is
+/// itself plain data. So the bound is satisfied by what actually flows through
+/// here, and requiring it is the smallest sound shape rather than the widest
+/// convenient one. A future owner that genuinely is not `Sync` will fail to
+/// erase — which is the correct outcome, because it also could not be shared
+/// across the relay tasks that make this driver work.
+pub type ErasedOwner = Box<dyn Send + Sync>;
+
+impl<T, O: Send + Sync + 'static> OwnedSignal<T, O> {
+    /// Forget the owner's *type*, not the owner.
+    ///
+    /// This is not a split: the pair survives, the value is still unreachable
+    /// except by borrow, and the owner is still dropped after everything derived
+    /// from the value. Only the static type of the thing being held changes, and
+    /// a driver that cannot name it also cannot release it early.
+    pub fn erase_owner(self) -> OwnedSignal<T, ErasedOwner> {
+        OwnedSignal {
+            value: self.value,
+            owner: Box::new(self.owner),
+        }
+    }
+}
+
+/// A boxed source is a source.
+///
+/// Needed because the drivers take `S: OutboundSource<..>` by value now, and the
+/// bridge hands them a trait object: without this, every call site would have to
+/// choose between a box and a generic. Pure forwarding — it adds no behaviour and
+/// cannot observe the owner.
+#[async_trait]
+impl<T, S> OutboundSource<T> for Box<S>
+where
+    T: Send,
+    S: OutboundSource<T> + ?Sized + Send,
+{
+    type Owner = S::Owner;
+
+    async fn recv(&mut self) -> Option<OwnedSignal<T, Self::Owner>> {
+        (**self).recv().await
+    }
+}
+
+/// A source whose owner type has been erased, so a driver's shared state can
+/// stay concrete while the producer keeps whatever owner it needs.
+pub struct ErasedSource<S>(S);
+
+impl<S> ErasedSource<S> {
+    pub fn new(source: S) -> Self {
+        Self(source)
+    }
+}
+
+#[async_trait]
+impl<T, S> OutboundSource<T> for ErasedSource<S>
+where
+    T: Send,
+    S: OutboundSource<T> + Send,
+    S::Owner: Sync + 'static,
+{
+    type Owner = ErasedOwner;
+
+    async fn recv(&mut self) -> Option<OwnedSignal<T, ErasedOwner>> {
+        Some(self.0.recv().await?.erase_owner())
+    }
+}
+
+impl<T: std::fmt::Debug, O> std::fmt::Debug for OwnedSignal<T, O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedSignal")
+            .field("value", &self.value)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An unbounded channel as a source.
@@ -125,8 +285,15 @@ impl<T> UnboundedSource<T> {
 
 #[async_trait]
 impl<T: Send> OutboundSource<T> for UnboundedSource<T> {
-    async fn recv(&mut self) -> Option<T> {
-        self.rx.recv().await
+    /// **Explicitly nothing.** A standalone embedder has no accountant to name,
+    /// so saying so in the type is more honest than inventing a placeholder
+    /// owner that funds nothing. The unit owner also makes the two cases easy to
+    /// tell apart when reading a driver: `O = ()` is the no-accountant path, and
+    /// anything else came from a producer that had one.
+    type Owner = ();
+
+    async fn recv(&mut self) -> Option<OwnedSignal<T, ()>> {
+        Some(OwnedSignal::new(self.rx.recv().await?, ()))
     }
 }
 
@@ -227,27 +394,55 @@ impl<T> std::fmt::Debug for InboundSink<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalingMessage {
-    Announce {
-        peer_id: String,
-        /// Signaling-layer capabilities of the announcing build (e.g.
-        /// [`SIG_CAP_PTAG`]). `default` so pre-caps announces decode as
-        /// an empty list — receivers treat empty as "legacy build".
-        #[serde(default)]
-        caps: Vec<String>,
-    },
+    /// Presence. Carries the announcing device and nothing else.
+    ///
+    /// It used to carry a capability list too, so a receiver could discover
+    /// whether the whole room spoke the recipient-tagged shape and widen its
+    /// subscription if not. That negotiation is gone: the cutover is hard, peers
+    /// are same-build, and there is no downgrade for a capability list to
+    /// select. Announces from a build that still sends one decode fine — serde
+    /// ignores the field — and nothing reads it.
+    Announce { peer_id: String },
+    /// The offer that opens one connection attempt.
+    ///
+    /// `offer_id` is the **attempt correlation**: one opaque value minted once
+    /// by the offering side, carried identically by every carrier this offer
+    /// fans out to, echoed back on the [`Self::Answer`], and stamped on every
+    /// [`Self::Candidate`] belonging to the same attempt.
+    ///
+    /// It used to be none of that. Each carrier's translation minted its own
+    /// value, and the answer sent an empty string, so the field named nothing
+    /// two parties could agree on and the two copies of one fanned-out offer
+    /// disagreed about it. It is now the only thing that says which attempt a
+    /// signal belongs to.
+    ///
+    /// **Correlation only, never authority.** It is sender-chosen and
+    /// unauthenticated, so it may scope de-duplication and nothing else: it
+    /// admits nobody, names no route, orders nothing, and no decision reads it
+    /// as a preference.
     Offer {
         peer_id: String,
         offer_id: String,
         sdp: String,
     },
+    /// The answer to one attempt. `offer_id` echoes the offer's correlation
+    /// verbatim — see [`Self::Offer`].
     Answer {
         peer_id: String,
         offer_id: String,
         sdp: String,
     },
+    /// One ICE candidate for an attempt in progress. `offer_id` carries the
+    /// same attempt correlation — see [`Self::Offer`].
+    ///
+    /// `default` because a candidate's correlation is newer than the field's
+    /// two siblings; an old frame without one decodes to the empty string,
+    /// which correlates with nothing and is simply not de-duplicated.
     Candidate {
         peer_id: String,
         candidate: String,
+        #[serde(default)]
+        offer_id: String,
         #[serde(default)]
         sdp_mid: Option<String>,
         #[serde(default)]
@@ -259,17 +454,25 @@ pub enum SignalingMessage {
     /// the heartbeat-timeout fallback:
     ///
     /// - **Self-announced** by a peer making a deliberate exit (network
-    ///   remove, transport restart, daemon shutdown) so the others drop its
-    ///   session immediately rather than stranding on a dead connection
-    ///   whose ICE still reports `Connected` for ~90 s. This is what makes a
-    ///   "reconnect" (leave-then-rejoin) come back promptly.
+    ///   remove, transport restart, daemon shutdown).
     /// - **Synthesised** by an intelligent [`server`] relay the instant a
     ///   member's WebSocket closes, covering crashes / yanked cables where
     ///   the peer never got to announce.
     ///
-    /// Public relays never synthesise it; on those, a deliberate exit still
-    /// self-announces, and an ungraceful one falls back to timeout-based
-    /// detection.
+    /// # What a receiver may do with it, which is less than this used to claim
+    ///
+    /// It is **reachability evidence, not a teardown**. This frame carries a
+    /// device id out of a body the sender wrote, and nothing on a network
+    /// carrier authenticated that the sender is the device it names. A receiver
+    /// may use it to stop pacing a dial or to cancel speculative work that never
+    /// became a session; it may not use it to retire a session holding a
+    /// promoted capability, and on a network carrier it retires nothing in any
+    /// state.
+    ///
+    /// Prompt teardown belongs to the authenticated `SessionControl::Depart`
+    /// sent over the session itself, where the sender is known. This frame is a
+    /// hint that may arrive first, and the backstops behind it are exact
+    /// connector closure and the heartbeat timeout.
     Leave { peer_id: String },
 }
 
