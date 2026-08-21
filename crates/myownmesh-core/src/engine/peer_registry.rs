@@ -73,6 +73,7 @@ struct PeerRegistryEntry {
 pub struct PeerOwnerToken {
     peer: Arc<PeerConnection>,
     installation: Arc<()>,
+    worker: Option<Arc<crate::transport::WebRtcConnectorWorker>>,
 }
 
 impl PeerOwnerToken {
@@ -91,6 +92,26 @@ impl PeerOwnerToken {
     /// [`super::drop_peer_if_current`].
     pub(crate) fn connection(&self) -> &Arc<PeerConnection> {
         &self.peer
+    }
+
+    /// Stamp this installation token with the exact worker that accepted one
+    /// transport callback. The stamp is process-local custody: every registry
+    /// fence using it also proves that worker is still the current session.
+    pub(super) fn for_worker(&self, worker: Arc<crate::transport::WebRtcConnectorWorker>) -> Self {
+        Self {
+            peer: Arc::clone(&self.peer),
+            installation: Arc::clone(&self.installation),
+            worker: Some(worker),
+        }
+    }
+
+    fn worker_matches(&self, peer: &PeerConnection) -> bool {
+        self.worker.as_ref().is_none_or(|worker| {
+            peer.session
+                .lock()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, worker))
+        })
     }
 
     /// A token naming a peer that is installed nowhere.
@@ -112,8 +133,20 @@ impl PeerOwnerToken {
                 None,
             )),
             installation: Arc::new(()),
+            worker: None,
         }
     }
+}
+
+pub(super) enum SpeculativeWorkerRoute {
+    Speculative,
+    Promoted,
+    Stale,
+}
+
+pub(super) enum SpeculativeTerminalCleanup {
+    Candidate(Arc<crate::transport::WebRtcConnectorWorker>),
+    Promoted(Arc<PeerConnection>),
 }
 
 impl Default for PeerRegistry {
@@ -249,6 +282,170 @@ impl PeerRegistry {
         promotion.is_usable()
     }
 
+    /// Promote the exact authenticated speculative candidate while holding
+    /// the registry fence.  Replacement is one linearized map operation: the
+    /// predecessor is returned to the caller for retirement only after the
+    /// candidate owns the promoted session.
+    pub(super) fn queue_speculative_promotion(
+        &self,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+    ) -> bool {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return false;
+        }
+        let peer = &current.value().peer;
+        if !peer.speculative_is_exact(correlation, candidate) {
+            return false;
+        }
+        let Some(tx) = self.promotion_tx.get() else {
+            if let Some(candidate) = peer.take_speculative_exact(correlation, candidate) {
+                candidate.retire();
+            }
+            return false;
+        };
+        if tx
+            .send(super::state::NetworkCmd::PromoteSpeculative {
+                owner: owner.clone(),
+                candidate: super::state::SpeculativeCandidate::from_worker(Arc::clone(candidate)),
+                correlation: correlation.to_string(),
+            })
+            .is_err()
+        {
+            if let Some(candidate) = peer.take_speculative_exact(correlation, candidate) {
+                candidate.retire();
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Retire only the exact speculative worker owned by `owner`.
+    ///
+    /// Terminal transport cleanup and promotion take this same mutation fence:
+    /// whichever reaches it first consumes the candidate, while the other sees
+    /// an exact-slot mismatch and leaves the predecessor or successor alone.
+    pub(super) fn take_speculative_exact(
+        &self,
+        owner: &PeerOwnerToken,
+        correlation: &str,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+    ) -> Option<Arc<crate::transport::WebRtcConnectorWorker>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        current
+            .value()
+            .peer
+            .take_speculative_exact(correlation, candidate)
+    }
+
+    /// Classify a pump's exact worker under the registry mutation fence. The
+    /// result is only a routing snapshot; terminal cleanup below re-enters the
+    /// same fence for its linearized take/removal.
+    pub(super) fn speculative_worker_route(
+        &self,
+        owner: &PeerOwnerToken,
+        correlation: &str,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+    ) -> SpeculativeWorkerRoute {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return SpeculativeWorkerRoute::Stale;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return SpeculativeWorkerRoute::Stale;
+        }
+        let peer = &current.value().peer;
+        if peer.speculative_is_exact(correlation, candidate) {
+            return SpeculativeWorkerRoute::Speculative;
+        }
+        if peer
+            .session
+            .lock()
+            .as_ref()
+            .is_some_and(|session| Arc::ptr_eq(session, candidate))
+            && peer.holds_promoted_session()
+        {
+            SpeculativeWorkerRoute::Promoted
+        } else {
+            SpeculativeWorkerRoute::Stale
+        }
+    }
+
+    /// Linearize terminal candidate cleanup against speculative promotion.
+    /// Terminal-first consumes only the speculative slot. Promotion-first
+    /// removes and retires the exact current installation. A stale pump or a
+    /// later successor returns `None` and is never redirected by device id.
+    pub(super) fn terminal_speculative_cleanup(
+        &self,
+        owner: &PeerOwnerToken,
+        correlation: &str,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+    ) -> Option<SpeculativeTerminalCleanup> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if let Some(candidate) = peer.take_speculative_exact(correlation, candidate) {
+            return Some(SpeculativeTerminalCleanup::Candidate(candidate));
+        }
+        let promoted = peer
+            .session
+            .lock()
+            .as_ref()
+            .is_some_and(|session| Arc::ptr_eq(session, candidate))
+            && peer.holds_promoted_session();
+        if !promoted {
+            return None;
+        }
+        drop(current);
+        let (_, entry) = self.peers.remove(owner.device_id())?;
+        let peer = entry.peer;
+        peer.retire_connector();
+        Some(SpeculativeTerminalCleanup::Promoted(peer))
+    }
+
+    pub(super) fn promote_speculative_command(
+        &self,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        broker: &SessionBroker,
+        mesh_context: &str,
+    ) -> Option<Arc<crate::transport::WebRtcConnectorWorker>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if peer.unpromoted_offer_in_flight() {
+            return None;
+        }
+        if !peer.speculative_is_exact(correlation, candidate) {
+            return None;
+        }
+        let policy_admits =
+            peer.state.read().is_admitted() && self.policy_admits(owner.device_id());
+        peer.promote_speculative_if_needed(
+            correlation,
+            candidate,
+            broker,
+            mesh_context,
+            policy_admits,
+        )
+    }
+
     pub(super) fn get(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
         self.peers
             .get(device_id)
@@ -259,14 +456,37 @@ impl PeerRegistry {
         self.peers.get(device_id).map(|entry| PeerOwnerToken {
             peer: Arc::clone(&entry.value().peer),
             installation: Arc::clone(&entry.value().installation),
+            worker: None,
         })
     }
 
     pub(super) fn get_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
         self.peers.get(owner.device_id()).and_then(|entry| {
-            Arc::ptr_eq(&entry.value().installation, &owner.installation)
-                .then(|| Arc::clone(&entry.value().peer))
+            (Arc::ptr_eq(&entry.value().installation, &owner.installation)
+                && owner.worker_matches(&entry.value().peer))
+            .then(|| Arc::clone(&entry.value().peer))
         })
+    }
+
+    /// Begin one exact-owner legacy untrusted-signaling mutation while the
+    /// installation is still unpromoted. Both normal and speculative
+    /// promotion refuse while the returned witness is alive, so the
+    /// classification cannot be separated from the later awaited effect by a
+    /// candidate handoff.
+    pub(super) fn begin_unpromoted_negotiation(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Option<super::connection::UnpromotedNegotiation> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = Arc::clone(&current.value().peer);
+        if !peer.begin_unpromoted_negotiation() {
+            return None;
+        }
+        Some(super::connection::UnpromotedNegotiation::new(peer))
     }
 
     /// Run one synchronous effect only while `owner` is still the installed
@@ -280,7 +500,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         Some(effect(&current.value().peer))
@@ -316,7 +538,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -355,7 +579,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -407,7 +633,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -465,7 +693,9 @@ impl PeerRegistry {
         let Some(current) = self.peers.get(owner.device_id()) else {
             return false;
         };
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return false;
         }
         let peer = &current.value().peer;
@@ -500,7 +730,9 @@ impl PeerRegistry {
     ) -> Option<AdmittedApplicationOperation> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -549,7 +781,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -578,7 +812,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -639,7 +875,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -669,7 +907,9 @@ impl PeerRegistry {
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         let peer = &current.value().peer;
@@ -763,6 +1003,7 @@ impl PeerRegistry {
             .map(|entry| PeerOwnerToken {
                 peer: Arc::clone(&entry.value().peer),
                 installation: Arc::clone(&entry.value().installation),
+                worker: None,
             })
             .collect()
     }
@@ -861,7 +1102,28 @@ impl PeerRegistry {
     pub(super) fn remove_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
+            return None;
+        }
+        drop(current);
+        let (_, entry) = self.peers.remove(owner.device_id())?;
+        let peer = entry.peer;
+        peer.retire_connector();
+        Some(peer)
+    }
+
+    pub(super) fn remove_if_current_unpromoted(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Option<Arc<PeerConnection>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || current.value().peer.holds_promoted_session()
+            || current.value().peer.unpromoted_offer_in_flight()
+        {
             return None;
         }
         drop(current);
@@ -1264,10 +1526,10 @@ impl AdmittedApplicationOperation {
             }
         };
         let _mutation = peers.mutation.lock();
-        let current = peers
-            .peers
-            .get(self.owner.device_id())
-            .filter(|current| Arc::ptr_eq(&current.value().installation, &self.owner.installation));
+        let current = peers.peers.get(self.owner.device_id()).filter(|current| {
+            Arc::ptr_eq(&current.value().installation, &self.owner.installation)
+                && self.owner.worker_matches(&current.value().peer)
+        });
         if current.is_none() || !self.validity.is_live() {
             return Err(Self::revoked());
         }
@@ -1425,10 +1687,10 @@ impl AdmittedHandlerRun {
         }
         at_precommit();
         let _mutation = peers.mutation.lock();
-        let current = peers
-            .peers
-            .get(self.owner.device_id())
-            .filter(|current| Arc::ptr_eq(&current.value().installation, &self.owner.installation));
+        let current = peers.peers.get(self.owner.device_id()).filter(|current| {
+            Arc::ptr_eq(&current.value().installation, &self.owner.installation)
+                && self.owner.worker_matches(&current.value().peer)
+        });
         if current.is_none() || !self.validity.is_live() {
             return Err(Self::revoked());
         }

@@ -31,6 +31,26 @@ use tokio::sync::{broadcast, oneshot, watch};
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
 
+/// Opaque process-local identity for a speculative connector promotion.
+///
+/// The command enum is public for the engine command surface, but its exact
+/// worker must remain private: callers can carry this token only after the
+/// engine minted it and no public constructor can fabricate one.
+#[derive(Clone)]
+pub struct SpeculativeCandidate {
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+}
+
+impl SpeculativeCandidate {
+    pub(super) fn from_worker(worker: Arc<crate::transport::WebRtcConnectorWorker>) -> Self {
+        Self { worker }
+    }
+
+    pub(super) fn worker(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
+        &self.worker
+    }
+}
+
 /// See a closed flow's native half retired, whichever half it had.
 ///
 /// A free function rather than a method, and the only place the engine waits on
@@ -139,6 +159,14 @@ pub enum NetworkCmd {
     /// that announces.
     ReplayCapabilities {
         owner: super::peer_registry::PeerOwnerToken,
+    },
+    /// Mailbox-admitted candidate promotion. The worker identity is the
+    /// process-local authority; correlation is retained only for diagnostics
+    /// and an initial exact-slot filter.
+    PromoteSpeculative {
+        owner: super::peer_registry::PeerOwnerToken,
+        candidate: SpeculativeCandidate,
+        correlation: String,
     },
     /// Switch the topology selector at runtime.
     SetTopology(TopologyMode),
@@ -296,6 +324,9 @@ impl ResourceMailboxItem for NetworkCmd {
     fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
         let measure = match self {
             Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
+            Self::PromoteSpeculative { correlation, .. } => {
+                strings_measure([correlation.as_str()])?
+            }
             Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
             Self::ApproveRoster {
                 device_id, label, ..
@@ -366,7 +397,9 @@ impl ResourceMailboxItem for NetworkCmd {
         let effect_allocations = match self {
             // No reply, no cancellation, no channel: nothing to fund past the
             // payload the walk above already measured.
-            Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
+            Self::ReplayCapabilities { .. }
+            | Self::PromoteSpeculative { .. }
+            | Self::FanoutCapabilities { .. } => 0,
             Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
             Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
             Self::ApproveRoster { .. }
