@@ -128,16 +128,20 @@ pub(super) async fn on_ping(
         let now = monotonic_ms();
         // A superseded installation simply contributes no sample; the estimate
         // is a median over whoever is live, so there is nothing to handle.
-        let _ = dispatch.with_captured_peer(&state.peers, |peer| {
-            let mut data = peer.state.write();
-            let half_rtt = i64::from(data.rtt_ms.unwrap_or(0)) / 2;
-            let sample = ping.t + half_rtt - now;
-            data.clock_skew_samples.push(sample);
-            if data.clock_skew_samples.len() > SKEW_WINDOW {
-                data.clock_skew_samples.remove(0);
-            }
-            data.clock_skew_ms = median(&data.clock_skew_samples);
-        });
+        let _ = state
+            .peers
+            .with_same_session(dispatch.logical_operation(), |operation| {
+                operation.record_inbound(|peer| {
+                    let mut data = peer.state.write();
+                    let half_rtt = i64::from(data.rtt_ms.unwrap_or(0)) / 2;
+                    let sample = ping.t + half_rtt - now;
+                    data.clock_skew_samples.push(sample);
+                    if data.clock_skew_samples.len() > SKEW_WINDOW {
+                        data.clock_skew_samples.remove(0);
+                    }
+                    data.clock_skew_ms = median(&data.clock_skew_samples);
+                });
+            });
     }
     // Echo back unchanged so the sender can compute RTT against its own clock —
     // through the captured owner, so the echo cannot be delivered to (or
@@ -156,13 +160,17 @@ pub(super) async fn on_pong(
     pong: PongMessage,
 ) {
     let now = monotonic_ms();
-    let _ = dispatch.with_captured_peer(&state.peers, |peer| {
-        let mut data = peer.state.write();
-        if data.last_ping_t == Some(pong.t) {
-            let rtt = (now - pong.t).max(0) as u32;
-            data.rtt_ms = Some(rtt);
-        }
-    });
+    let _ = state
+        .peers
+        .with_same_session(dispatch.logical_operation(), |operation| {
+            operation.record_inbound(|peer| {
+                let mut data = peer.state.write();
+                if data.last_ping_t == Some(pong.t) {
+                    let rtt = (now - pong.t).max(0) as u32;
+                    data.rtt_ms = Some(rtt);
+                }
+            });
+        });
 }
 
 fn monotonic_ms() -> i64 {

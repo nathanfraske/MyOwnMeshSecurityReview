@@ -51,7 +51,7 @@ use tokio::sync::oneshot;
 use crate::error::{Error, Result};
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease};
-use crate::runtime::session_broker::SessionCapability;
+use crate::runtime::session_broker::{SessionCapability, SessionValidityWitness};
 
 /// Opaque process-local custody for one retained signaling key. This type lives
 /// below the engine so the session bundle can retain it without an
@@ -108,6 +108,74 @@ pub(crate) struct PeerSessionState {
     peer_advert: capabilities::RetainedAdvert,
     /// Whether this session still owes the peer the local advertisement.
     local_advert: capabilities::LocalAdvertDebt,
+}
+
+/// The logical-session witness is the broker's existing validity lineage.
+///
+/// Keeping this alias local lets slot and registry code speak in logical
+/// session terms without minting a second live flag, channel-owner count,
+/// wakeup, or provider lease.
+pub(crate) type LogicalSessionValidityWitness = SessionValidityWitness;
+
+/// One logical session's single application state, validity lineage, and
+/// provider retention for that state.
+///
+/// Channels may come and go around this value, but they never create a second
+/// [`PeerSessionState`].  The retained lease belongs to this record rather
+/// than to a carrying channel, so a delayed logical commit cannot outlive its
+/// funding when the selected channel is replaced.  There is deliberately no
+/// worker, selection, correlation, or route identity here.
+pub(crate) struct LogicalSessionRecord {
+    state: PeerSessionState,
+    validity: SessionValidityWitness,
+    _logical_lease: ResourceLease,
+}
+
+impl LogicalSessionRecord {
+    pub(crate) fn new(validity: SessionValidityWitness, logical_lease: ResourceLease) -> Self {
+        Self {
+            state: PeerSessionState::new(),
+            validity,
+            _logical_lease: logical_lease,
+        }
+    }
+
+    pub(crate) fn validity(&self) -> LogicalSessionValidityWitness {
+        self.validity.clone()
+    }
+
+    pub(crate) fn operation(&mut self) -> Option<LogicalSessionOperation<'_>> {
+        if !self.validity.is_live() {
+            return None;
+        }
+        Some(LogicalSessionOperation {
+            state: &mut self.state,
+            validity: self.validity.clone(),
+        })
+    }
+}
+
+/// Move-only access to one logical session's state.
+///
+/// The mutable borrow makes duplicate operations and state copies impossible;
+/// the witness gives delayed callers a way to distinguish this lineage from a
+/// replacement.  Operation lifetime is bounded by the fenced borrow, while
+/// retained payloads take their own exact claims through the logical witness,
+/// so they remain fundable after the carrying channel is removed.
+#[must_use = "a logical-session operation must be consumed"]
+pub(crate) struct LogicalSessionOperation<'a> {
+    state: &'a mut PeerSessionState,
+    validity: LogicalSessionValidityWitness,
+}
+
+impl LogicalSessionOperation<'_> {
+    pub(crate) fn state(&mut self) -> &mut PeerSessionState {
+        self.state
+    }
+
+    pub(crate) fn validity(&self) -> &LogicalSessionValidityWitness {
+        &self.validity
+    }
 }
 
 impl PeerSessionState {

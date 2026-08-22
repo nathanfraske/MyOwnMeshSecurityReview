@@ -370,12 +370,19 @@ impl PeerConnection {
 pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
+    /// Compatibility mirror for the unpromoted connector and legacy
+    /// diagnostics. Once a channel is promoted, `promoted_session` owns
+    /// worker membership and selection; all authority helpers consult it
+    /// first and never trust this mirror to select a channel.
     pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
     speculative: Mutex<Vec<SpeculativeAttempt>>,
     closing_workers: Mutex<Vec<Arc<WebRtcConnectorWorker>>>,
     retired_dedup: Mutex<Vec<DedupToken>>,
     signaling_runtime: RwLock<Option<Weak<crate::engine::signaling_ingress::SignalingRuntime>>>,
     media_renegotiation_workers: Mutex<Vec<Arc<WebRtcConnectorWorker>>>,
+    /// Unpromoted Endpoint Auth task mirror. Promoted channel auth is owned
+    /// by the slot's exact channel record; this field is retained only for the
+    /// pre-promotion handshake and compatibility accessors.
     endpoint_auth: Mutex<Option<Arc<crate::endpoint_auth::EndpointAuthTask>>>,
     /// The Arc 04 authority artifact for the exact current channel.
     ///
@@ -385,7 +392,10 @@ pub struct PeerConnection {
     /// endpoint-auth task that owns the current connector, and it is dropped
     /// whenever that connector is retired or replaced.
     authenticated_channel: Mutex<Option<crate::endpoint_auth::AuthenticatedChannelCapability>>,
-    /// The correlation naming this connection attempt, for de-duplication.
+    /// The correlation naming this unpromoted connection attempt, for
+    /// de-duplication. A promoted channel's exact correlation is owned by its
+    /// slot record; `attempt()` is slot-first and this value is only the
+    /// unpromoted/compatibility mirror.
     ///
     /// One installation of a peer is one attempt, so this is minted here, once,
     /// and a replacement installation gets a different one. It rides every
@@ -404,22 +414,10 @@ pub struct PeerConnection {
     attempt: RwLock<String>,
     attempt_dedup: Mutex<Option<DedupToken>>,
     additional_attempt_dedup: Mutex<Vec<DedupToken>>,
-    /// The promoted session for the exact current channel.
-    ///
-    /// Promotion **moves** the authenticated capability out of the slot above
-    /// and into the session, so the two are never both occupied for one channel:
-    /// once promoted, the session is the sole owner of that channel's authority,
-    /// and its drop is what returns the connected claim to connector retention.
-    ///
-    /// Dropped by `retire_connector` for the same reason the capability is —
-    /// a session promoted under the retired connector must not survive into its
-    /// replacement.
-    ///
-    /// The slot, the bundle it holds and the use and revocation rules that
-    /// govern it all belong to
-    /// [`peer_session`](crate::runtime::peer_session): this entry owns the
-    /// connector and refers to its session owner rather than implementing that
-    /// owner's state machine.
+    /// The promoted session bundle. This slot is the sole post-promotion
+    /// authority: it owns channel membership/selection, Endpoint Auth,
+    /// correlation, capability, realtime flows, and logical application state.
+    /// The legacy mirrors above remain only for unpromoted/compatibility paths.
     promoted_session: crate::runtime::peer_session::PromotedSessionSlot,
     registry_retired: AtomicBool,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
@@ -542,7 +540,23 @@ impl PeerConnection {
 
     /// This attempt's correlation, for stamping an outbound signal.
     pub(super) fn attempt(&self) -> String {
+        if let Some(worker) = self.promoted_session.selected_worker() {
+            if let Some(correlation) = self.promoted_session.correlation_for(&worker) {
+                return correlation;
+            }
+        }
         self.attempt.read().clone()
+    }
+
+    /// The selected slot channel is the post-promotion authority. The legacy
+    /// worker mirror remains only for an unpromoted installation and for
+    /// compatibility callers; it is never allowed to choose over the slot.
+    pub(super) fn current_worker(&self) -> Option<Arc<WebRtcConnectorWorker>> {
+        if self.promoted_session.is_installed() {
+            self.promoted_session.selected_worker()
+        } else {
+            self.session.lock().clone()
+        }
     }
 
     /// Adopt the offerer's correlation for this attempt.
@@ -618,7 +632,7 @@ impl PeerConnection {
         attempt_lease: ResourceLease,
         dedup: &mut Option<DedupToken>,
     ) -> bool {
-        if self.registry_retired() || self.session.lock().is_none() {
+        if self.registry_retired() || self.current_worker().is_none() {
             return false;
         }
         self.install_speculative_after_precheck(correlation, session, attempt_lease, dedup)
@@ -667,7 +681,7 @@ impl PeerConnection {
         session: Arc<WebRtcConnectorWorker>,
         attempt_lease: ResourceLease,
     ) -> bool {
-        if self.registry_retired() || self.session.lock().is_none() {
+        if self.registry_retired() || self.current_worker().is_none() {
             return false;
         }
         self.retire_connector();
@@ -839,7 +853,6 @@ impl PeerConnection {
         broker: &crate::runtime::session_broker::SessionBroker,
         mesh_context: &str,
         policy_admits: bool,
-        select: bool,
     ) -> Option<SpeculativePromotion> {
         if self.registry_retired() || !policy_admits || self.unpromoted_offer_in_flight() {
             return None;
@@ -883,15 +896,22 @@ impl PeerConnection {
             true,
         );
         let mut channel = Some(capability);
-        let promoted = match broker.promote(&mut channel, &connector, policy) {
-            Ok(promoted) => promoted,
-            Err(_) => {
+        let promoted = match self
+            .promoted_session
+            .with_established_session(|established| {
+                broker.promote_additional(&mut channel, &connector, policy, established)
+            }) {
+            Some(Ok(promoted)) => promoted,
+            Some(Err(_)) | None => {
                 if let Some(capability) = channel {
                     let mut candidates = self.speculative.lock();
                     if let Some(attempt) = candidates
                         .iter_mut()
                         .find(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
                     {
+                        // Capacity refusal leaves the exact authenticated
+                        // channel in `channel`; restore it together with the
+                        // Endpoint Auth and all candidate-owned dedup custody.
                         attempt.authenticated_channel = Some(capability);
                         attempt.endpoint_auth = Some(endpoint_auth);
                         attempt.dedup = dedup;
@@ -900,6 +920,9 @@ impl PeerConnection {
                         endpoint_auth.retire();
                     }
                 } else {
+                    // The broker consumed the channel on a terminal refusal.
+                    // Keep the candidate's remaining custody attached to this
+                    // exact attempt until its normal terminal edge.
                     let mut candidates = self.speculative.lock();
                     if let Some(attempt) = candidates
                         .iter_mut()
@@ -922,54 +945,41 @@ impl PeerConnection {
             dedup: dedup.take(),
             additional_dedup: std::mem::take(&mut additional_dedup),
         };
-        if let Err((returned_dedup, returned_additional_dedup)) = self.promoted_session.add_channel(
-            promoted,
-            candidate.new_session_flows(),
-            binding,
-            select,
-        ) {
-            endpoint_auth.retire();
-            candidate.retire();
-            // Leave the exact attempt in the speculative slot. The command
-            // consumer will run the normal exact terminal cleanup, which
-            // retains the token long enough for the caller to release only
-            // this candidate's dedup record.
-            dedup = returned_dedup;
-            additional_dedup = returned_additional_dedup;
+        if let Err(refusal) =
+            self.promoted_session
+                .add_channel(promoted, candidate.new_session_flows(), binding)
+        {
+            let (_reason, session, flows, binding) = refusal.into_parts();
+            let crate::runtime::peer_session::PromotedChannelBinding {
+                worker: binding_worker,
+                endpoint_auth: returned_endpoint_auth,
+                correlation: returned_correlation,
+                dedup: returned_dedup,
+                additional_dedup: returned_additional_dedup,
+            } = *binding;
+            let authenticated = (*session)
+                .demote()
+                .expect("a refused additional session retains its authenticated channel");
+            debug_assert!(Arc::ptr_eq(&binding_worker, &candidate));
+            debug_assert_eq!(returned_correlation, correlation);
+            drop(flows);
+            // Slot allocation refusal is retryable. Restore the exact
+            // speculative owner rather than retiring a candidate whose
+            // Endpoint Auth and authenticated capability remain valid.
             if let Some(attempt) = self
                 .speculative
                 .lock()
                 .iter_mut()
                 .find(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
             {
-                attempt.dedup = dedup;
-                attempt.additional_dedup = additional_dedup;
+                attempt.authenticated_channel = Some(authenticated);
+                attempt.endpoint_auth = returned_endpoint_auth;
+                attempt.dedup = returned_dedup;
+                attempt.additional_dedup = returned_additional_dedup;
+            } else if let Some(endpoint_auth) = returned_endpoint_auth {
+                endpoint_auth.retire();
             }
             return None;
-        }
-        if select {
-            self.session.lock().replace(Arc::clone(&candidate));
-            self.endpoint_auth.lock().replace(endpoint_auth);
-        }
-        let displaced_attempt = if select {
-            let mut attempt = self.attempt.write();
-            if *attempt == correlation {
-                None
-            } else {
-                *attempt = correlation.clone();
-                let dedup = self.attempt_dedup.lock().take();
-                let additional_dedup = std::mem::take(&mut *self.additional_attempt_dedup.lock());
-                Some(AttemptDisplacement {
-                    dedup,
-                    additional_dedup,
-                })
-            }
-        } else {
-            None
-        };
-        if select && displaced_attempt.is_some() {
-            self.attempt_dedup.lock().take();
-            self.additional_attempt_dedup.lock().clear();
         }
         let mut candidates = self.speculative.lock();
         if let Some(index) = candidates.iter().position(|attempt| {
@@ -978,8 +988,10 @@ impl PeerConnection {
             drop(candidates.swap_remove(index));
         }
         Some(SpeculativePromotion {
-            displaced_attempt,
-            selected: select,
+            displaced_attempt: None,
+            // Selection is now an explicit policy seam; authenticated
+            // promotion must not implicitly select the newly added channel.
+            selected: false,
         })
     }
 
@@ -1016,7 +1028,7 @@ impl PeerConnection {
         {
             return false;
         }
-        if self.session.lock().is_none() {
+        if self.current_worker().is_none() {
             self.unpromoted_offer_in_flight
                 .store(false, Ordering::Release);
             return false;
@@ -1055,8 +1067,7 @@ impl PeerConnection {
     /// Here the state guard is taken **inside** the session lender, so both are
     /// held together for the closure's whole life. That is the documented order
     /// and not a new one: the lender's own liveness predicate already takes
-    /// `state.read()` while holding `promoted_session` (see
-    /// [`Self::session_is_current`]), and no writer in this crate takes
+    /// `state.read()` while holding `promoted_session`, and no writer in this crate takes
     /// `state.write()` while holding the slot. Reversing it — state first, then
     /// the session — is the direction that closes a cycle, and it is what
     /// [`Self::with_live_session`]'s warning forbids.
@@ -1247,6 +1258,9 @@ impl PeerConnection {
         &self,
         task: Arc<crate::endpoint_auth::EndpointAuthTask>,
     ) -> bool {
+        if self.promoted_session.is_installed() {
+            return false;
+        }
         let exact_connector = self
             .session
             .lock()
@@ -1267,15 +1281,23 @@ impl PeerConnection {
         &self,
         task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
     ) -> bool {
-        self.endpoint_auth
-            .lock()
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, task))
+        self.endpoint_auth_task()
+            .is_some_and(|current| Arc::ptr_eq(&current, task))
     }
 
     /// The current endpoint-auth task, if this entry still owns one.
     pub(super) fn endpoint_auth_task(&self) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
-        (!self.registry_retired()).then(|| self.endpoint_auth.lock().clone())?
+        if self.registry_retired() {
+            return None;
+        }
+        if self.promoted_session.is_installed() {
+            return self
+                .promoted_session
+                .selected_worker()
+                .as_ref()
+                .and_then(|worker| self.promoted_session.endpoint_auth_for(worker));
+        }
+        self.endpoint_auth.lock().clone()
     }
 
     pub(super) fn endpoint_auth_task_for(
@@ -1288,6 +1310,9 @@ impl PeerConnection {
         let Some(worker) = worker else {
             return self.endpoint_auth_task();
         };
+        if self.promoted_session.is_installed() {
+            return self.promoted_session.endpoint_auth_for(worker);
+        }
         self.promoted_session.endpoint_auth_for(worker).or_else(|| {
             self.session
                 .lock()
@@ -1299,8 +1324,7 @@ impl PeerConnection {
 
     pub(super) fn attempt_for_worker(&self, worker: &Arc<WebRtcConnectorWorker>) -> Option<String> {
         self.promoted_session.correlation_for(worker).or_else(|| {
-            self.session
-                .lock()
+            self.current_worker()
                 .as_ref()
                 .filter(|current| Arc::ptr_eq(current, worker))
                 .map(|_| self.attempt())
@@ -1311,10 +1335,8 @@ impl PeerConnection {
         !self.registry_retired()
             && (self.promoted_session.contains_worker(worker)
                 || self
-                    .session
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, worker)))
+                    .current_worker()
+                    .is_some_and(|current| Arc::ptr_eq(&current, worker)))
     }
 
     pub(super) fn mark_media_renegotiation(&self, worker: &Arc<WebRtcConnectorWorker>) -> bool {
@@ -1352,23 +1374,12 @@ impl PeerConnection {
     ) -> Option<crate::runtime::peer_session::RemovedPromotedChannel> {
         let removed = self.promoted_session.remove_channel(worker)?;
         self.clear_media_renegotiation_worker(worker);
-        self.retain_closing_worker(Arc::clone(&removed.worker));
-        if let Some(selected) = removed.selected_worker.as_ref() {
-            self.session.lock().replace(Arc::clone(selected));
-            if let Some(task) = self.promoted_session.endpoint_auth_for(selected) {
-                self.endpoint_auth.lock().replace(task);
-            }
-            if let Some(correlation) = removed.selected_correlation.as_ref() {
-                *self.attempt.write() = correlation.clone();
-            }
-            self.attempt_dedup.lock().take();
-            self.additional_attempt_dedup.lock().clear();
-        } else {
-            drop(self.session.lock().take());
-            drop(self.endpoint_auth.lock().take());
-            self.attempt_dedup.lock().take();
-            self.additional_attempt_dedup.lock().clear();
+        if removed.selection_needed {
+            // Selection is explicit: only the slot may certify that exactly
+            // one surviving channel is still live and capability-bound.
+            let _ = self.select_unique_usable_channel();
         }
+        self.retain_closing_worker(Arc::clone(&removed.worker));
         Some(removed)
     }
 
@@ -1537,8 +1548,16 @@ impl PeerConnection {
         self.promoted_session.is_installed()
     }
 
+    #[cfg(test)]
     pub(super) fn promoted_channel_count(&self) -> usize {
         self.promoted_session.channel_count()
+    }
+
+    /// Select the sole exact channel that still proves live connector and
+    /// capability membership. Zero or multiple usable channels leave the
+    /// logical session unselected; admission never calls this implicitly.
+    pub(super) fn select_unique_usable_channel(&self) -> Option<Arc<WebRtcConnectorWorker>> {
+        self.promoted_session.select_unique_usable()
     }
 
     /// Promote this entry's authenticated channel into a live session, once.
@@ -1562,22 +1581,15 @@ impl PeerConnection {
     /// broker, because a capability whose own record does not match this entry's
     /// context is one this entry must not keep.
     ///
-    /// **Lock order: `session`, then `promoted_session`, then
-    /// `authenticated_channel`.** This is the only method that nests any of
-    /// them, and it is the reason the order exists at all: it holds
-    /// `promoted_session` across the capability take, because installing a
-    /// session and consuming the channel it was promoted from must be one step.
-    /// The worker is therefore cloned out of `session` and that guard released
-    /// *before* `promoted_session` is taken. Acquiring them the other way round
-    /// here — with `promoted_session` held while `session` is locked — is what
-    /// would close a cycle against [`Self::with_live_session_flow_and_worker`],
-    /// which reads `session` first on its way to the same pair.
-    ///
-    /// Reading the worker a moment early costs nothing: a connector that
-    /// retires in the gap fails the `is_current_for` recheck below, or the
-    /// `is_active` proof before promotion, or — for a session installed against
-    /// a connector that retired immediately after — the `belongs_to` check at
-    /// the next use. Every one of those refuses rather than admits.
+    /// The selected slot is consulted before the compatibility `session`
+    /// mirror, and each guard is released before the next slot/fence is taken.
+    /// This keeps membership and selection in one authority while avoiding a
+    /// nested slot/mirror lock cycle. Reading the worker a moment early costs
+    /// nothing: a connector that retires in the gap fails the `is_current_for`
+    /// recheck below, or the `is_active` proof before promotion, or — for a
+    /// session installed against a connector that retired immediately after —
+    /// the `belongs_to` check at the next use. Every one of those refuses
+    /// rather than admits.
     pub(super) fn promote_session_if_needed(
         &self,
         broker: &crate::runtime::session_broker::SessionBroker,
@@ -1592,10 +1604,19 @@ impl PeerConnection {
         if self.unpromoted_offer_in_flight() {
             return Promotion::Refused;
         }
-        let worker = self.session.lock().clone();
+        let worker = self.current_worker();
         let live_connector = worker
             .as_ref()
             .and_then(|worker| worker.live_connector_incarnation().cloned());
+        // A promoted bundle may intentionally have no selected transport
+        // while its other authenticated channels and logical application
+        // state remain live. Selection is explicit; do not let the reuse
+        // probe below treat that unselected bundle as revoked and discard the
+        // logical session.
+        if self.promoted_session.is_installed() && self.promoted_session.selected_worker().is_none()
+        {
+            return Promotion::Refused;
+        }
         // The use-time recheck, not merely a currentness test: current policy,
         // connector, mesh context, remote Device, principal and reservation
         // runtime are all re-proved against the session's own record before it
@@ -1607,17 +1628,7 @@ impl PeerConnection {
         // promoted while it held would otherwise never be asked again — every
         // operation this fence admits would keep running for a peer the mesh has
         // since refused.
-        match self.promoted_session.reuse_or_revoke(|session| {
-            policy_admits
-                && live_connector.as_ref().is_some_and(|connector| {
-                    session.is_current_for(
-                        connector,
-                        mesh_context,
-                        &self.device_id,
-                        broker.runtime(),
-                    )
-                })
-        }) {
+        match self.promoted_session.reuse_or_revoke() {
             crate::runtime::peer_session::Reuse::Current => return Promotion::Current,
             // Refused outright rather than re-promoted. Promoting again here
             // would take a fresh post-authentication reservation for authority
@@ -1669,19 +1680,56 @@ impl PeerConnection {
                 // installs a real capability directly and therefore has no
                 // task to counterfeit merely to exercise this admission seam.
                 let endpoint_auth = self.endpoint_auth.lock().clone();
-                self.promoted_session.install(
+                let correlation = self.attempt();
+                let install = self.promoted_session.install(
                     session,
                     worker.new_session_flows(),
                     PromotedChannelBinding {
                         worker: Arc::clone(&worker),
                         endpoint_auth,
-                        correlation: self.attempt(),
+                        correlation,
                         dedup: self.attempt_dedup.lock().take(),
                         additional_dedup: std::mem::take(
                             &mut *self.additional_attempt_dedup.lock(),
                         ),
                     },
                 );
+                if let Err(refusal) = install {
+                    // Slot allocation is a capacity refusal, not a channel
+                    // revocation.  Move the exact authenticated capability
+                    // back out of the broker session and restore every
+                    // unpromoted owner before returning; dropping the session
+                    // here would make a transient slot shortage destroy the
+                    // only retryable authenticated channel.
+                    let (_reason, session, flows, binding) = refusal.into_parts();
+                    let crate::runtime::peer_session::PromotedChannelBinding {
+                        worker: binding_worker,
+                        endpoint_auth,
+                        correlation: binding_correlation,
+                        dedup,
+                        additional_dedup,
+                    } = *binding;
+                    let authenticated = (*session)
+                        .demote()
+                        .expect("a refused promoted session retains its authenticated channel");
+                    debug_assert!(Arc::ptr_eq(&binding_worker, &worker));
+                    debug_assert_eq!(binding_correlation, self.attempt());
+                    drop(flows);
+                    *self.authenticated_channel.lock() = Some(authenticated);
+                    if let Some(endpoint_auth) = endpoint_auth {
+                        let mut current = self.endpoint_auth.lock();
+                        if current.is_none() {
+                            *current = Some(endpoint_auth);
+                        }
+                    }
+                    *self.attempt_dedup.lock() = dedup;
+                    *self.additional_attempt_dedup.lock() = additional_dedup;
+                    return Promotion::Refused;
+                }
+                // Initial promotion establishes membership; selection is a
+                // separate explicit seam even when this first channel is the
+                // only one currently present.
+                let _ = self.promoted_session.select_channel(&worker);
                 Promotion::NewlyPromoted
             }
             // Includes the capacity refusal, which is not terminal: the exact
@@ -1755,15 +1803,23 @@ impl PeerConnection {
             &mut crate::runtime::peer_session::PeerSessionState,
         ) -> R,
     ) -> Option<R> {
-        let worker = self.session.lock().clone()?;
-        let live = worker.live_connector_incarnation()?.clone();
-        self.promoted_session.with_live(
-            |session| self.session_is_current(session, &live),
-            |bundle| {
-                let (session, app) = bundle.app_mut();
-                effect(session, app)
-            },
-        )
+        self.promoted_session.with_live(|bundle| {
+            let (session, app) = bundle.app_mut()?;
+            Some(effect(session, app))
+        })?
+    }
+
+    /// Lend only the logical application state named by the promoted-session
+    /// witness.  This is deliberately independent of channel selection: an
+    /// admitted frame may finish its funded logical commit after its carrying
+    /// channel has been removed.  The slot's logical lender re-proves the
+    /// session witness and returns `None` for a replacement or retired slot;
+    /// no compatibility mirror participates in that decision.
+    pub(super) fn with_logical_session_state<R>(
+        &self,
+        effect: impl FnOnce(&mut crate::runtime::peer_session::LogicalSessionOperation<'_>) -> R,
+    ) -> Option<R> {
+        self.promoted_session.with_logical_operation(effect)
     }
 
     pub(super) fn with_live_session_flow<R>(
@@ -1800,18 +1856,15 @@ impl PeerConnection {
             &Arc<WebRtcConnectorWorker>,
         ) -> R,
     ) -> Option<R> {
-        let worker = self.session.lock().clone()?;
+        let worker = self.current_worker()?;
         let live = worker.live_connector_incarnation()?.clone();
-        self.promoted_session.with_live(
-            |session| self.session_is_current(session, &live),
-            |bundle| {
-                let (session, flows, channel_worker) = bundle.flows_mut();
-                if !Arc::ptr_eq(channel_worker, &worker) {
-                    return None;
-                }
-                Some(effect(session, flows, &live, &worker))
-            },
-        )?
+        self.promoted_session.with_live(|bundle| {
+            let (session, flows, channel_worker) = bundle.flows_mut()?;
+            if !Arc::ptr_eq(channel_worker, &worker) {
+                return None;
+            }
+            Some(effect(session, flows, &live, &worker))
+        })?
     }
 
     pub(super) fn with_live_session_flow_and_exact_worker<R>(
@@ -1851,26 +1904,6 @@ impl PeerConnection {
                 effect(session, flows, &live, channel_worker, correlation)
             },
         )
-    }
-
-    /// Both use-time conjuncts, evaluated under the session slot's own guard.
-    ///
-    /// The connector half is identity — a session promoted from a superseded
-    /// connector is not this connector's. `is_admitted` is retained
-    /// handshake/topology state, not a live governance read. Governance changes
-    /// become authoritative at the registry's synchronous commit seam, which
-    /// clears the promoted slot and invalidates effect-begin witnesses before
-    /// later effects can start.
-    ///
-    /// Lock order is preserved: the slot evaluates this with its own guard held
-    /// and `state` is taken inside a single statement, which is the order
-    /// [`Self::promote_session_if_needed`] already establishes.
-    fn session_is_current(
-        &self,
-        session: &crate::runtime::session_broker::SessionCapability,
-        live: &Arc<crate::connector::ConnectorIncarnation>,
-    ) -> bool {
-        session.belongs_to(live)
     }
 
     /// Whether this entry holds a live authenticated channel for its exact

@@ -4006,7 +4006,7 @@ async fn handle_inbound_frame_from(
                 // and — on the refusal arm — how the retirement below names the
                 // session that refused rather than whichever one holds the
                 // device id by the time it runs.
-                let witness = admitted.session_witness()?;
+                let witness = admitted.session_witness();
                 match admitted.with_session_state(|session, _record| {
                     crate::application_gateway::AdmittedApplicationFrame::admit(
                         session,
@@ -4088,7 +4088,10 @@ async fn handle_inbound_frame_from(
             match class.on_failure {
                 crate::protocol::FailurePolicy::EndSession => {
                     state.reach_exact_retirement_barrier();
-                    if state.peers.retire_exact_session(owner, &witness) {
+                    if let Some(dispatch) =
+                        admit_logical_terminal_dispatch_for_witness(state, owner, &witness)
+                    {
+                        retire_admitted_logical_session(state, &dispatch).await;
                         trace!(
                             peer = %device_id,
                             "retiring a session whose owner would not fund its inbound frame"
@@ -4131,7 +4134,9 @@ async fn handle_inbound_frame_from(
         // about one delivery — and it is not a state a peer can be pushed into
         // by anything this side does.
         state.reach_exact_retirement_barrier();
-        if state.peers.retire_exact_session(owner, &witness) {
+        if let Some(dispatch) = admit_logical_terminal_dispatch_for_witness(state, owner, &witness)
+        {
+            retire_admitted_logical_session(state, &dispatch).await;
             trace!(
                 peer = %device_id,
                 "retiring a session that delivered an undecodable admitted frame"
@@ -4151,10 +4156,19 @@ async fn handle_inbound_frame_from(
     // installation owns. The receive-side high-water mark is still not settled
     // here — it moves with the delivery, under the dispatch's own fence, in
     // `on_channel_seq_admitted`.
-    let admitted = state.peers.with_same_session(owner, &witness, |admitted| {
-        reliable::admit_inbound_reliable(admitted, decoded.message());
-        admitted.inbound_application_operation(decoded)
-    });
+    let admitted = state
+        .peers
+        .with_admitted_current_or_refused(
+            owner,
+            state.session_broker.as_ref(),
+            &state.network_id,
+            |admitted| {
+                reliable::admit_inbound_reliable(admitted, decoded.message());
+                Some(admitted.inbound_application_operation(decoded))
+            },
+            |_| None,
+        )
+        .flatten();
     let Some(operation) = admitted else {
         trace!(
             peer = %device_id,
@@ -4303,6 +4317,33 @@ async fn on_shelve(
     });
 }
 
+/// Remove the logical peer that authenticated one inbound control.
+///
+/// This is separate from `drop_peer_if_current`: a connector terminal event
+/// owns one channel and may select a fallback, while authenticated `Depart`
+/// owns the logical session that admitted the frame. The dispatch carries the
+/// exact owner and session witness, and the registry terminal seam verifies
+/// both again before removing the peer, so a replacement cannot inherit the
+/// old control's authority.
+async fn retire_admitted_logical_session(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
+) {
+    let operation = dispatch.logical_operation();
+    if let peer_registry::LogicalSessionTerminal::Removed(peer) = state
+        .peers
+        .remove_current_logical_session_for_terminal(operation)
+    {
+        finish_drop_peer(
+            state,
+            dispatch.owner().device_id(),
+            DropReason::UserLeft,
+            Some(peer),
+        )
+        .await;
+    }
+}
+
 /// The authenticated departure: retire the exact session that carried it.
 ///
 /// **This is the only thing in the engine that may retire a healthy
@@ -4313,12 +4354,14 @@ async fn on_shelve(
 /// Contrast the carrier withdrawal in `handle_ephemeral_transport`, which is an
 /// unauthenticated hint from a medium and may not do this.
 ///
-/// `drop_peer_if_current` rather than `drop_peer` is the whole safety property.
-/// It retires the installation named by *this* owner token and returns without
-/// doing anything if the current installation is a different one — so a
-/// departure that was in flight while the transport was replaced retires the
-/// session it was sent on, never its successor. A repeat is idempotent for the
-/// same reason: the second one finds nothing current to retire.
+/// The dispatch's exact owner-plus-witness fence is the whole safety property;
+/// it is the logical-session counterpart to `drop_peer_if_current` for
+/// connector loss. It removes the installation named by *this* admitted
+/// operation and returns without doing anything if the current installation
+/// is a different one; a departure in flight while the transport was replaced
+/// retires the session it was sent on, never its successor. A repeat is
+/// idempotent for the same reason: the second one finds nothing current to
+/// retire.
 ///
 /// Nothing is acknowledged, retried, or timed. A departure that never arrives
 /// leaves the session to end the way every other unannounced loss ends it,
@@ -4339,7 +4382,7 @@ async fn on_session_control(
                 ),
                 serde_json::json!({ "peer": dispatch.owner().device_id() }),
             );
-            drop_peer_if_current(state, dispatch.owner(), DropReason::UserLeft).await;
+            retire_admitted_logical_session(state, dispatch).await;
         }
         crate::protocol::SessionControl::RenegotiateRequest => {
             let Some(worker) = dispatch.owner().worker().cloned() else {
@@ -4502,22 +4545,17 @@ async fn on_capabilities_update(
     // the advertisement is a funded acquisition and can be refused; announcing a
     // change the session did not retain would tell subscribers a peer advertised
     // something this node is not holding and cannot answer a snapshot with.
-    let applied = state.peers.with_live_session_state(
-        dispatch.owner(),
-        state.session_broker.as_ref(),
-        &state.network_id,
-        |session, session_state| {
-            let stored = session_state.set_capabilities(session, &msg.capabilities);
-            if stored.is_ok() {
-                state.emit(MeshEvent::Peer(PeerEvent::CapabilitiesChanged {
-                    network_id: state.network_id.clone(),
-                    device_id: dispatch.owner().device_id().to_string(),
-                    capabilities: msg.capabilities.clone(),
-                }));
-            }
-            stored
-        },
-    );
+    let applied = dispatch.with_captured_session_state(&state.peers, |session, session_state| {
+        let stored = session_state.set_capabilities(session, &msg.capabilities);
+        if stored.is_ok() {
+            state.emit(MeshEvent::Peer(PeerEvent::CapabilitiesChanged {
+                network_id: state.network_id.clone(),
+                device_id: dispatch.owner().device_id().to_string(),
+                capabilities: msg.capabilities.clone(),
+            }));
+        }
+        stored
+    });
     if let Some(Err(error)) = applied {
         debug!(
             peer = %short_peer(dispatch.owner().device_id()),
@@ -4604,13 +4642,13 @@ fn rpc_refusal_frame(request_id: String, streaming: bool, error: String) -> Mesh
 /// settled is settled by the session ending.
 fn retire_after_failed_rpc_send(
     state: &Arc<NetworkState>,
-    owner: &peer_registry::PeerOwnerToken,
-    witness: &crate::runtime::session_broker::SessionValidityWitness,
+    operation: peer_registry::LogicalSessionOperation,
     what: &'static str,
     error: &Error,
 ) {
+    let owner = operation.owner().clone();
     state.reach_exact_retirement_barrier();
-    if state.peers.retire_exact_session(owner, witness) {
+    if state.peers.retire_exact_session(operation) {
         trace!(
             peer = %owner.device_id(),
             %what,
@@ -4627,15 +4665,20 @@ fn retire_after_failed_rpc_send(
 /// the caller must not send another frame for it.
 async fn send_rpc_frame_or_retire(
     state: &Arc<NetworkState>,
-    owner: &peer_registry::PeerOwnerToken,
-    witness: &crate::runtime::session_broker::SessionValidityWitness,
+    operation: &mut Option<peer_registry::LogicalSessionOperation>,
     msg: &MeshMessage,
     what: &'static str,
 ) -> bool {
-    match send_to_peer_owner(state, owner, msg).await {
+    let Some(current) = operation.as_ref() else {
+        return false;
+    };
+    let owner = current.owner().clone();
+    match send_to_peer_owner(state, &owner, msg).await {
         Ok(()) => true,
         Err(error) => {
-            retire_after_failed_rpc_send(state, owner, witness, what, &error);
+            if let Some(operation) = operation.take() {
+                retire_after_failed_rpc_send(state, operation, what, &error);
+            }
             false
         }
     }
@@ -4645,15 +4688,20 @@ async fn send_rpc_frame_or_retire(
 /// same answer and the same failure policy.
 async fn send_rpc_stream_frame_or_retire(
     state: &Arc<NetworkState>,
-    owner: &peer_registry::PeerOwnerToken,
-    witness: &crate::runtime::session_broker::SessionValidityWitness,
+    operation: &mut Option<peer_registry::LogicalSessionOperation>,
     frame: &OutboundStreamFrame<'_>,
     what: &'static str,
 ) -> bool {
-    match send_stream_frame_to_peer_owner(state, owner, frame).await {
+    let Some(current) = operation.as_ref() else {
+        return false;
+    };
+    let owner = current.owner().clone();
+    match send_stream_frame_to_peer_owner(state, &owner, frame).await {
         Ok(()) => true,
         Err(error) => {
-            retire_after_failed_rpc_send(state, owner, witness, what, &error);
+            if let Some(operation) = operation.take() {
+                retire_after_failed_rpc_send(state, operation, what, &error);
+            }
             false
         }
     }
@@ -4675,13 +4723,9 @@ async fn refuse_rpc_request(
     streaming: bool,
     error: String,
 ) {
-    let Some(witness) = dispatch
-        .with_captured_session_state(&state.peers, |session, _app| session.validity_witness())
-    else {
-        return;
-    };
     let frame = rpc_refusal_frame(request_id, streaming, error);
-    send_rpc_frame_or_retire(state, dispatch.owner(), &witness, &frame, "RPC refusal").await;
+    let mut operation = Some(dispatch.logical_operation());
+    send_rpc_frame_or_retire(state, &mut operation, &frame, "RPC refusal").await;
 }
 
 #[cfg(test)]
@@ -4907,6 +4951,10 @@ struct AdmittedRpcCall {
     /// after the reservation that funds both — never before it.
     reply_id: String,
     owner: peer_registry::PeerOwnerToken,
+    /// Move-only logical authority retained for a failed peer-facing send.
+    /// Successful sends leave it available for the next stream item; the
+    /// first failed send consumes it to retire exactly the admitting session.
+    operation: peer_registry::LogicalSessionOperation,
     /// The exact session that authorized and funded this run, as a thing that
     /// can be *awaited on* rather than merely asked. The run selects against it,
     /// so revocation ends the handler instead of being discovered afterwards.
@@ -5022,6 +5070,7 @@ async fn on_rpc_request(
     let payload = std::mem::take(&mut req.payload);
     let streaming = req.streaming;
     let request_id = std::mem::take(&mut req.request_id);
+    let operation = dispatch.logical_operation();
     let admitted = dispatch.with_captured_session_state(&state.peers, move |session, _app| {
         let Ok(task_lease) = reserve_rpc_handler_task(session, task_claim) else {
             // The id is handed back rather than dropped. The refusal below has
@@ -5047,6 +5096,7 @@ async fn on_rpc_request(
             },
             reply_id,
             owner: owner.clone(),
+            operation,
             witness: session.validity_witness(),
             _task_lease: task_lease,
         })
@@ -5078,6 +5128,7 @@ async fn on_rpc_request(
         call,
         reply_id: request_id,
         owner,
+        operation,
         witness,
         _task_lease,
     } = admitted;
@@ -5088,7 +5139,7 @@ async fn on_rpc_request(
             // because `run` is one arm of the select below and the witness is
             // the other: the same value names the session a send failure retires
             // and the session whose revocation cancels the run.
-            let send_witness = witness.clone();
+            let mut send_operation = Some(operation);
             tokio::spawn(async move {
                 // **Declared before the lease so it is dropped after it.**
                 // Locals unwind in reverse declaration order, which is what
@@ -5165,8 +5216,7 @@ async fn on_rpc_request(
                     state.reach_rpc_send_boundary().await;
                     send_rpc_frame_or_retire(
                         &state,
-                        &owner,
-                        &send_witness,
+                        &mut send_operation,
                         &MeshMessage::RpcResponse(frame),
                         "RPC response",
                     )
@@ -5194,7 +5244,7 @@ async fn on_rpc_request(
         }
         PreparedRpcHandler::Stream(h) => {
             // As in the unary arm.
-            let send_witness = witness.clone();
+            let mut send_operation = Some(operation);
             tokio::spawn(async move {
                 // Before the lease, for the reason given in the unary arm.
                 #[cfg(test)]
@@ -5232,8 +5282,7 @@ async fn on_rpc_request(
                             state.reach_rpc_send_boundary().await;
                             send_rpc_frame_or_retire(
                                 &state,
-                                &owner,
-                                &send_witness,
+                                &mut send_operation,
                                 &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                                     request_id,
                                     error: Some(e),
@@ -5295,8 +5344,7 @@ async fn on_rpc_request(
                         // rather than sending into what it just ended.
                         if !send_rpc_stream_frame_or_retire(
                             &state,
-                            &owner,
-                            &send_witness,
+                            &mut send_operation,
                             &frame,
                             if terminal {
                                 "RPC stream terminal"
@@ -5314,8 +5362,7 @@ async fn on_rpc_request(
                     }
                     send_rpc_frame_or_retire(
                         &state,
-                        &owner,
-                        &send_witness,
+                        &mut send_operation,
                         &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
                             request_id,
                             error: Some(
@@ -5382,10 +5429,7 @@ async fn on_rpc_response(
         /// The result cannot be taken: it is not representable as a claim, or
         /// the session will not fund it. Carries that exact session and the
         /// reason, so the retirement below names it and not a successor.
-        Unsettleable(
-            crate::runtime::session_broker::SessionValidityWitness,
-            &'static str,
-        ),
+        Unsettleable(&'static str),
     }
 
     // All of it inside the capture, and in this order: **check, measure, fund,
@@ -5417,15 +5461,11 @@ async fn on_rpc_response(
         let Ok(claim) = crate::rpc::single_response_claim(resp.ok.as_ref(), resp.error.as_deref())
         else {
             return Settlement::Unsettleable(
-                session.validity_witness(),
                 "delivered a response that is not representable as a resource claim",
             );
         };
         let Ok(retention) = session.reserve_retained(claim) else {
-            return Settlement::Unsettleable(
-                session.validity_witness(),
-                "would not fund the response it delivered",
-            );
+            return Settlement::Unsettleable("would not fund the response it delivered");
         };
         // Removes only for a single-response operation. The class was checked
         // above; this repeats it because the check and the removal are separate
@@ -5448,7 +5488,7 @@ async fn on_rpc_response(
         extracted.answer(crate::rpc::FundedRpcResult::new(result, retention));
         Settlement::Done
     });
-    if let Some(Settlement::Unsettleable(witness, reason)) = settlement {
+    if let Some(Settlement::Unsettleable(reason)) = settlement {
         // Both reasons are terminal for this session, and neither may be left as
         // "drop the frame and wait for the next one": the caller's entry is
         // still pending and nothing else is coming for it, so a session kept
@@ -5460,7 +5500,10 @@ async fn on_rpc_response(
         // that promoted in the meantime fails the identity check and is
         // untouched.
         state.reach_exact_retirement_barrier();
-        if state.peers.retire_exact_session(dispatch.owner(), &witness) {
+        if state
+            .peers
+            .retire_exact_session(dispatch.logical_operation())
+        {
             trace!(%reason, "retiring a session that could not settle its own response");
         }
     }
@@ -5538,12 +5581,15 @@ async fn on_rpc_stream_chunk(
         // finished with above — that happened first, and under the session that
         // funded it — so ending the session costs it nothing it had not already
         // been told.
-        Some((session.validity_witness(), reason))
+        Some(reason)
     });
-    if let Some(Some((witness, reason))) = unsettleable {
+    if let Some(Some(reason)) = unsettleable {
         // Outside the capture: retirement takes the same mutation lock.
         state.reach_exact_retirement_barrier();
-        if state.peers.retire_exact_session(dispatch.owner(), &witness) {
+        if state
+            .peers
+            .retire_exact_session(dispatch.logical_operation())
+        {
             trace!(%reason, "retiring a session whose stream chunk could not be carried");
         }
     }
@@ -5598,12 +5644,13 @@ async fn on_channel_frame(
     // Refusal is the intended outcome for a superseded installation: the
     // payload is dropped rather than delivered under an id someone else now
     // holds, and no subscriber is owed a notification of that.
-    let disposition = dispatch.with_captured_session_state(&state.peers, |session, _record| {
+    let disposition = dispatch.with_captured_logical_state(&state.peers, |operation| {
         // An endpoint frame is never interpreted as an ordinary-member routing
         // envelope: the inbound path delivers to subscribers and forwards to
         // nobody.
+        let validity = operation.validity().clone();
         let outcome = state.application_gateway.accept_channel(
-            session,
+            &validity,
             claim,
             retention,
             &channel,
@@ -5645,7 +5692,6 @@ async fn on_channel_frame(
             // actually refused rather than whichever holds the id afterwards.
             Err(crate::application_gateway::GatewayRefusal::Malformed) => {
                 ChannelDisposition::Unsettleable(
-                    session.validity_witness(),
                     "delivered a channel frame that is not representable",
                 )
             }
@@ -5653,10 +5699,13 @@ async fn on_channel_frame(
         }
     });
     match disposition {
-        Some(ChannelDisposition::Unsettleable(witness, reason)) => {
+        Some(ChannelDisposition::Unsettleable(reason)) => {
             // Outside the capture: retirement takes the same mutation lock.
             state.reach_exact_retirement_barrier();
-            if state.peers.retire_exact_session(dispatch.owner(), &witness) {
+            if state
+                .peers
+                .retire_exact_session(dispatch.logical_operation())
+            {
                 trace!(%reason, "retiring a session whose channel frame could not be admitted");
             }
         }
@@ -5689,10 +5738,7 @@ enum ChannelDisposition {
     /// the session is kept.
     Dropped,
     /// Terminal for the session named by the witness, for the stated reason.
-    Unsettleable(
-        crate::runtime::session_broker::SessionValidityWitness,
-        &'static str,
-    ),
+    Unsettleable(&'static str),
 }
 
 /// Resolve the exact current owner once, then send through it.
@@ -6509,27 +6555,177 @@ pub(crate) async fn drop_peer_if_current(
     owner: &peer_registry::PeerOwnerToken,
     reason: DropReason,
 ) {
-    // A stamped terminal callback can end one selected channel while another
-    // authenticated channel is added concurrently. One registry outcome
-    // linearizes that choice, so exact channel custody cannot be discarded by
-    // a second whole-peer lookup. No registry lock is held across native I/O.
-    match state.peers.remove_current_for_terminal(owner) {
-        peer_registry::CurrentTerminalCleanup::Stale => {}
-        peer_registry::CurrentTerminalCleanup::Channel(removed) => {
-            forget_dedup_owned(state, removed.dedup);
-            forget_dedups(state, removed.additional_dedup);
-            let closed = owner
-                .connection()
-                .await_exact_retired_worker(&removed.worker)
-                .await;
-            if let Some(Err(error)) = closed {
-                warn!(%error, "authenticated channel cleanup did not complete successfully");
+    if let Some(worker) = owner.worker().cloned() {
+        let Some(correlation) = owner.connection().attempt_for_worker(&worker) else {
+            return;
+        };
+        // A promoted worker is a channel terminal, not a logical-session
+        // terminal. Admit the exact logical witness first, bind it to this
+        // callback's worker, and let ChannelTerminal linearize removal against
+        // promotion/replacement. A speculative candidate has no logical
+        // session yet and falls through to the candidate cleanup seam below.
+        if let Some(dispatch) = admit_logical_terminal_dispatch(state, owner) {
+            match state.peers.remove_current_channel_for_terminal(
+                dispatch.exact_channel_operation(Arc::clone(&worker)),
+            ) {
+                peer_registry::ChannelTerminal::Channel { channel } => {
+                    forget_dedup_owned(state, channel.dedup);
+                    forget_dedups(state, channel.additional_dedup);
+                    let closed = owner
+                        .connection()
+                        .await_exact_retired_worker(&channel.worker)
+                        .await;
+                    if let Some(Err(error)) = closed {
+                        warn!(%error, "channel terminal cleanup did not complete successfully");
+                    }
+                    return;
+                }
+                peer_registry::ChannelTerminal::Peer { peer, channel } => {
+                    forget_dedup_owned(state, channel.dedup);
+                    forget_dedups(state, channel.additional_dedup);
+                    let closed = owner
+                        .connection()
+                        .await_exact_retired_worker(&channel.worker)
+                        .await;
+                    if let Some(Err(error)) = closed {
+                        warn!(%error, "logical peer terminal cleanup did not complete successfully");
+                    }
+                    finish_drop_peer(state, owner.device_id(), reason, Some(peer)).await;
+                    return;
+                }
+                peer_registry::ChannelTerminal::Stale => {}
             }
         }
-        peer_registry::CurrentTerminalCleanup::Peer(peer) => {
-            finish_drop_peer(state, owner.device_id(), reason, Some(peer)).await;
+        match state
+            .peers
+            .terminal_speculative_cleanup(owner, &correlation, &worker)
+        {
+            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+                forget_dedup_owned(state, retired.dedup);
+                forget_dedups(state, retired.additional_dedup);
+                let closed = owner
+                    .connection()
+                    .await_exact_retired_worker(&retired.worker)
+                    .await;
+                if let Some(Err(error)) = closed {
+                    warn!(%error, "speculative terminal cleanup did not complete successfully");
+                }
+            }
+            Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
+                forget_dedup_owned(state, removed.dedup);
+                forget_dedups(state, removed.additional_dedup);
+                let closed = owner
+                    .connection()
+                    .await_exact_retired_worker(&removed.worker)
+                    .await;
+                if let Some(Err(error)) = closed {
+                    warn!(%error, "promoted terminal cleanup did not complete successfully");
+                }
+                if removed.session_empty {
+                    finish_drop_peer(state, owner.device_id(), reason, Some(peer)).await;
+                }
+            }
+            None => {}
         }
+    } else if let Some(dispatch) = admit_logical_terminal_dispatch(state, owner) {
+        retire_admitted_logical_session(state, &dispatch).await;
+    } else if let Some(removed) = state.peers.remove_if_current_unpromoted(owner) {
+        finish_drop_peer(state, owner.device_id(), reason, Some(removed)).await;
     }
+}
+
+/// Build one logical-session dispatch for a current owner.
+///
+/// The registry intentionally keeps `LogicalSessionOperation::new` private:
+/// callers must obtain logical authority from an admission fence rather than
+/// assemble an owner/witness pair themselves. The terminal owner-only path
+/// therefore reuses the same admission lender and immediately drops the
+/// synthetic frame resources before handing its exact dispatch to the normal
+/// logical teardown seam.
+fn admit_logical_terminal_dispatch(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+) -> Option<peer_registry::AdmittedInboundDispatch> {
+    let encoded = Bytes::from(
+        serde_json::to_vec(&MeshMessage::Channel {
+            channel: "logical-terminal-probe".to_string(),
+            payload: serde_json::Value::Null,
+        })
+        .expect("the logical terminal probe serializes"),
+    );
+    state
+        .peers
+        .with_admitted_current_or_refused(
+            owner,
+            state.session_broker.as_ref(),
+            &state.network_id,
+            |admitted| {
+                let frame = admitted
+                    .with_session_state(|session, _record| {
+                        crate::application_gateway::AdmittedApplicationFrame::admit(
+                            session,
+                            encoded.clone(),
+                        )
+                    })
+                    .and_then(std::result::Result::ok)?;
+                let decoded = frame.decode().ok()?;
+                let operation = admitted.inbound_application_operation(decoded);
+                let (_message, _claim, work, dispatch) = operation.into_dispatch();
+                drop(work);
+                Some(dispatch)
+            },
+            |_| None,
+        )
+        .flatten()
+}
+
+/// The same synthetic terminal dispatch, but fenced to the session that
+/// funded an earlier frame. The expected witness is checked while the current
+/// admission holds the registry mutation lock; a successor may therefore be
+/// promoted by the admission attempt, but it can never be mistaken for the
+/// predecessor and retired by this failure path.
+fn admit_logical_terminal_dispatch_for_witness(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    expected: &crate::runtime::session_broker::SessionValidityWitness,
+) -> Option<peer_registry::AdmittedInboundDispatch> {
+    let encoded = Bytes::from(
+        serde_json::to_vec(&MeshMessage::Channel {
+            channel: "logical-terminal-probe".to_string(),
+            payload: serde_json::Value::Null,
+        })
+        .expect("the logical terminal probe serializes"),
+    );
+    state
+        .peers
+        .with_admitted_current_or_refused(
+            owner,
+            state.session_broker.as_ref(),
+            &state.network_id,
+            |admitted| {
+                let same_session = admitted
+                    .with_session_state(|session, _record| expected.witnesses(session))
+                    .unwrap_or(false);
+                if !same_session {
+                    return None;
+                }
+                let frame = admitted
+                    .with_session_state(|session, _record| {
+                        crate::application_gateway::AdmittedApplicationFrame::admit(
+                            session,
+                            encoded.clone(),
+                        )
+                    })
+                    .and_then(std::result::Result::ok)?;
+                let decoded = frame.decode().ok()?;
+                let operation = admitted.inbound_application_operation(decoded);
+                let (_message, _claim, work, dispatch) = operation.into_dispatch();
+                drop(work);
+                Some(dispatch)
+            },
+            |_| None,
+        )
+        .flatten()
 }
 
 /// Install the current peer owner and retire any replaced compatibility queue.
@@ -8236,7 +8432,7 @@ mod tests {
         let seal = state
             .cmd_tx
             .reserve_for_test(seal_claim)
-            .expect("seal all slack except one accepted command");
+            .expect("seal all slack except two accepted commands");
 
         let before = provider.in_use();
         assert!(state.cmd_tx.send(a).is_ok(), "A queues");
@@ -12421,7 +12617,7 @@ mod tests {
         msg: MeshMessage,
     ) -> Option<peer_registry::AdmittedInboundApplicationOperation> {
         let encoded = Bytes::from(serde_json::to_vec(&msg).expect("the control frame serializes"));
-        let (frame, witness) = state
+        let frame = state
             .peers
             .with_admitted_current_or_refused(
                 owner,
@@ -12435,15 +12631,22 @@ mod tests {
                             )
                         })
                         .and_then(std::result::Result::ok)?;
-                    Some((frame, admitted.session_witness()?))
+                    Some(frame)
                 },
                 |_| None,
             )
             .flatten()?;
         let decoded = frame.decode().ok()?;
-        state.peers.with_same_session(owner, &witness, |admitted| {
-            admitted.inbound_application_operation(decoded)
-        })
+        state
+            .peers
+            .with_admitted_current_or_refused(
+                owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |admitted| Some(admitted.inbound_application_operation(decoded)),
+                |_| None,
+            )
+            .flatten()
     }
 
     #[tokio::test]
@@ -12467,7 +12670,7 @@ mod tests {
         let encoded =
             Bytes::from(serde_json::to_vec(&shelve_frame()).expect("the control frame serializes"));
 
-        let (frame, witness) = state
+        let (_frame, witness) = state
             .peers
             .with_admitted_current_or_refused(
                 &owner,
@@ -12481,7 +12684,7 @@ mod tests {
                             )
                         })
                         .and_then(std::result::Result::ok)?;
-                    Some((frame, admitted.session_witness()?))
+                    Some((frame, admitted.session_witness()))
                 },
                 |_| None,
             )
@@ -12491,6 +12694,8 @@ mod tests {
             witness.is_live(),
             "non-vacuity: the witness names a session that is live at funding time"
         );
+        let stale_operation = admit_logical_terminal_dispatch(&state, &owner)
+            .expect("non-vacuity: the funded session yields exact logical authority");
 
         let promotion = commands
             .try_recv()
@@ -12554,13 +12759,10 @@ mod tests {
              cannot be what refuses"
         );
 
-        let decoded = frame.decode().expect("the control frame is well formed");
         assert!(
             state
                 .peers
-                .with_same_session(&owner, &witness, |admitted| {
-                    admitted.inbound_application_operation(decoded)
-                })
+                .with_same_session(stale_operation.logical_operation(), |_| ())
                 .is_none(),
             "a frame the replaced session funded commits nothing"
         );
@@ -18064,6 +18266,475 @@ mod tests {
         state.shutdown().await;
     }
 
+    /// An authenticated Depart removes only the admitted logical session.
+    ///
+    /// This control is intentionally at the inbound dispatch boundary. It
+    /// proves the positive session-terminal arm, the distinction from channel
+    /// terminal cleanup, and the stale-owner negative without manufacturing a
+    /// dispatch token in the test.
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_authenticated_depart_uses_logical_session_authority() {
+        let state = build_test_state_with_connector_slots("b2-authenticated-depart", 2);
+        let target = "b2-authenticated-depart-target";
+        let fixture = insert_promoted_peer(&state, target).await;
+        let owner = state
+            .peers
+            .owner(target)
+            .expect("the promoted owner exists");
+        assert!(
+            state
+                .peers
+                .admit_application_operation(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                )
+                .is_some(),
+            "the exact channel admission mints the logical session"
+        );
+        assert!(
+            fixture.peer.holds_promoted_session(),
+            "control 1: Depart starts from a real promoted logical session"
+        );
+        assert!(
+            state.peers.get_if_current(&owner).is_some(),
+            "control 2: the admitted installation is current before dispatch"
+        );
+        let depart = serde_json::to_vec(&MeshMessage::SessionControl(
+            crate::protocol::SessionControl::Depart,
+        ))
+        .expect("the authenticated Depart serializes");
+        handle_inbound_frame_from(&state, &owner, Bytes::from(depart.clone())).await;
+        assert!(
+            !fixture.peer.holds_promoted_session(),
+            "control 3: authenticated Depart ends the logical session"
+        );
+        assert!(
+            state.peers.get_if_current(&owner).is_none(),
+            "control 4: logical-session terminal cleanup removes the exact peer"
+        );
+
+        let successor = insert_promoted_peer(&state, target).await;
+        let successor_owner = state.peers.owner(target).expect("the successor is current");
+        assert!(
+            state
+                .peers
+                .admit_application_operation(
+                    &successor_owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                )
+                .is_some(),
+            "control 5: the replacement admits its own logical session"
+        );
+        assert!(
+            successor.peer.holds_promoted_session(),
+            "control 6: the admitted replacement owns a real logical session"
+        );
+        handle_inbound_frame_from(&state, &owner, Bytes::from(depart)).await;
+        assert!(
+            successor.peer.holds_promoted_session()
+                && state.peers.get_if_current(&successor_owner).is_some(),
+            "control 7: a stale admitted owner cannot retire the successor"
+        );
+        state.shutdown().await;
+    }
+
+    #[cfg(feature = "transport-lab")]
+    async fn prepare_b2_provider_speculative_channel(
+        state: &Arc<NetworkState>,
+        peer: &Arc<PeerConnection>,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        target: &str,
+        remote_key: &ed25519_dalek::SigningKey,
+    ) -> Arc<crate::endpoint_auth::EndpointAuthTask> {
+        let binding = candidate
+            .endpoint_auth_binding()
+            .await
+            .expect("the candidate exposes its endpoint-auth binding");
+        let connected = match candidate.confirm_data_channel_open() {
+            DataChannelOpenOwnership::Connected(connected) => connected,
+            _ => panic!("the candidate yields one connected handoff"),
+        };
+        let handoff = connected
+            .into_generic()
+            .expect("the candidate handoff carries its generic capability");
+        let context = crate::endpoint_auth::EndpointAuthContext::new(
+            &state.network_id,
+            state.identity.public_id(),
+            target,
+            binding,
+        )
+        .expect("the provider control fixes a complete auth context");
+        let task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+            context,
+            handoff,
+            crate::endpoint_auth::LocalIdentitySigner::for_identity(Arc::clone(&state.identity)),
+        ));
+        let peer_contribution = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("the provider control generates one canonical peer contribution");
+        task.accept_peer_hello(peer_contribution.clone())
+            .expect("the candidate binds the peer contribution");
+        let proof =
+            crate::endpoint_auth::peer_proof_for_test(&task, &peer_contribution, remote_key);
+        let capability = match task
+            .accept_peer_proof(&proof)
+            .expect("the candidate proof promotes its exact handoff")
+        {
+            crate::endpoint_auth::PeerProofAcceptance::Promoted(capability) => *capability,
+            crate::endpoint_auth::PeerProofAcceptance::AlreadyPromoted => {
+                panic!("a fresh candidate cannot already be promoted")
+            }
+        };
+        let lease = candidate
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(correlation))
+            .expect("the candidate retains its exact attempt lease");
+        assert!(peer.install_speculative(correlation.to_string(), Arc::clone(candidate), lease,));
+        assert!(peer.install_speculative_endpoint_auth(correlation, candidate, Arc::clone(&task),));
+        assert!(peer.install_speculative_authenticated_channel(
+            correlation,
+            candidate,
+            &task,
+            capability,
+        ));
+        task
+    }
+
+    /// The provider delta is measured at the actual logical-session, realtime
+    /// flow, peer-retirement, and command-mailbox seams. The first admission
+    /// prices its exact owner-bearing `ReplayCapabilities` delivery and drains
+    /// that delivery before asserting the stable session-only delta; mailbox
+    /// accounting cannot stand in for the retained logical record, channel
+    /// entry, or flow leases.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_provider_deltas_cover_logical_channel_flow_lifecycle() {
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let target = data_encoding::BASE32_NOPAD
+            .encode(remote_key.verifying_key().as_bytes())
+            .to_lowercase();
+        let (state, _signaling_in_rx, mut cmd_rx, provider, grant) = build_test_state_parts_metered(
+            "b2-provider-deltas",
+            Some(realtime_test_profile()),
+            3,
+            None,
+        );
+        let peer_state = build_test_state("b2-provider-deltas-remote");
+        let full_baseline = provider.in_use();
+        let fixture = insert_promoted_peer(&state, &target).await;
+        let owner = state
+            .peers
+            .owner(&target)
+            .expect("the fixture peer is current");
+        let baseline = provider.in_use();
+        assert!(
+            state
+                .peers
+                .admit_application_operation(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id
+                )
+                .is_some(),
+            "first admission mints the real logical session and channel entry"
+        );
+        assert_eq!(
+            fixture.peer.promoted_channel_count(),
+            1,
+            "first admission retains exactly one promoted channel entry"
+        );
+        let replay = NetworkCmd::ReplayCapabilities {
+            owner: owner.clone(),
+        };
+        let replay_charge =
+            crate::resource::ResourceMailboxSender::<NetworkCmd>::accepted_item_charge_for_test(
+                &replay,
+            );
+        let first_delta = provider
+            .in_use()
+            .checked_sub(baseline)
+            .expect("first admission only increases provider usage");
+        assert_eq!(
+            first_delta,
+            crate::runtime::session_broker::session_reservation_charge_for_test()
+                .checked_add(replay_charge)
+                .expect("first admission and replay charge are representable"),
+            "first admission charges the exact session reservation and queued ReplayCapabilities item"
+        );
+        let replay_delivery = cmd_rx
+            .try_recv()
+            .expect("first admission queues exactly one ReplayCapabilities delivery");
+        assert!(matches!(
+            replay_delivery.value(),
+            NetworkCmd::ReplayCapabilities { owner: announced }
+                if announced.device_id() == owner.device_id()
+                    && state.peers.get_if_current(announced).is_some()
+        ));
+        replay_delivery
+            .run_terminal_effect(|command| handle_command(&state, command))
+            .await;
+        assert_eq!(
+            provider
+                .in_use()
+                .checked_sub(baseline)
+                .expect("the provider remains above its baseline reservation"),
+            crate::runtime::session_broker::session_reservation_charge_for_test(),
+            "consuming the exact ReplayCapabilities delivery leaves only the stable session reservation"
+        );
+
+        // The native candidate's connector and Endpoint Auth claims are part
+        // of the measured additional lifecycle. Capture the near-side
+        // provider before opening that link so terminal cleanup can prove it
+        // returns every claim, not merely the logical channel reservation.
+        let before_link_one = provider.in_use();
+        let mut link_one =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
+                .await;
+        let open_one = link_one.take_open_event();
+        let open_one = link_one
+            .left
+            .accept_event(open_one)
+            .expect("the first real candidate accepts its genuine open callback");
+        let (open_one, open_one_resources) = open_one.into_parts();
+        assert!(
+            matches!(open_one, TransportEvent::DataChannelOpen),
+            "the first provider candidate uses the genuine left open callback"
+        );
+        link_one._left_events.commit_data_channel_open();
+        let candidate_one = Arc::clone(&link_one.left);
+        let correlation_one = "b2-provider-additional-one";
+        let _task_one = prepare_b2_provider_speculative_channel(
+            &state,
+            &fixture.peer,
+            &candidate_one,
+            correlation_one,
+            &target,
+            &remote_key,
+        )
+        .await;
+        drop(open_one_resources);
+        let before_additional = provider.in_use();
+        let attempt_charge = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+            PeerConnection::speculative_attempt_claim(correlation_one),
+        )
+        .expect("the first speculative attempt charge is representable");
+        assert!(
+            state
+                .peers
+                .promote_speculative_command(
+                    &owner,
+                    &candidate_one,
+                    correlation_one,
+                    state.session_broker.as_ref().expect("the broker exists"),
+                    &state.network_id,
+                )
+                .is_some(),
+            "the authenticated second channel is admitted into the logical session"
+        );
+        assert_eq!(
+            fixture.peer.promoted_channel_count(),
+            2,
+            "additional admission retains two exact channel entries"
+        );
+        let additional_delta = provider
+            .in_use()
+            .checked_add(attempt_charge)
+            .expect("the released speculative attempt charge is representable")
+            .checked_sub(before_additional)
+            .expect("additional admission releases only its speculative attempt charge");
+        assert_eq!(
+            additional_delta,
+            crate::runtime::session_broker::session_channel_reservation_charge_for_test(),
+            "additional channel admission consumes exactly its session/channel provider claim"
+        );
+        drop_peer_if_current(
+            &state,
+            &owner.for_worker(Arc::clone(&candidate_one)),
+            DropReason::IceFailed,
+        )
+        .await;
+        assert_eq!(
+            fixture.peer.promoted_channel_count(),
+            1,
+            "exact channel removal retains the logical session and first channel"
+        );
+        let link_one_outcomes = link_one.close_outcomes().await;
+        assert!(
+            link_one_outcomes.into_iter().all(|outcome| outcome.is_ok()),
+            "the first real provider candidate fixture closes before its baseline is measured"
+        );
+        drop(candidate_one);
+        drop(_task_one);
+        assert_eq!(
+            provider.in_use(),
+            before_link_one,
+            "candidate-one terminal cleanup releases its connector, Endpoint Auth, and channel claims"
+        );
+
+        let flow_name = realtime_test_name(61);
+        let flow_before = provider.in_use();
+        state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |session, flows, live| {
+                    flows
+                        .open(
+                            session,
+                            Some(live),
+                            crate::transport::webrtc::RealtimeFlowSpec {
+                                direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                                encoding: realtime_test_encoding(),
+                                name: flow_name.clone(),
+                            },
+                        )
+                        .expect("the admitted realtime session opens one funded flow");
+                },
+            )
+            .expect("the exact admitted owner reaches its live flow set");
+        let flow_delta = provider
+            .in_use()
+            .checked_sub(flow_before)
+            .expect("opening a flow only increases provider usage");
+        assert_ne!(
+            flow_delta,
+            crate::resource::ResourceClaim::ZERO,
+            "adding a flow consumes an actual provider flow lease"
+        );
+
+        let remains = state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.network_id,
+                |session, flows, live| {
+                    flows
+                        .close(session, Some(live), &flow_name)
+                        .expect("the exact flow closes through its live owner")
+                },
+            )
+            .expect("the exact admitted owner reaches the flow for removal");
+        drop(remains);
+        assert_eq!(
+            provider.in_use(),
+            flow_before,
+            "removing the flow releases its exact provider lease"
+        );
+
+        let mut link_two =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
+                .await;
+        let open_two = link_two.take_open_event();
+        let open_two = link_two
+            .left
+            .accept_event(open_two)
+            .expect("the second real candidate accepts its genuine open callback");
+        let (open_two, open_two_resources) = open_two.into_parts();
+        assert!(
+            matches!(open_two, TransportEvent::DataChannelOpen),
+            "the second provider candidate uses the genuine left open callback"
+        );
+        link_two._left_events.commit_data_channel_open();
+        let candidate_two = Arc::clone(&link_two.left);
+        let correlation_two = "b2-provider-additional-two";
+        let task_two = prepare_b2_provider_speculative_channel(
+            &state,
+            &fixture.peer,
+            &candidate_two,
+            correlation_two,
+            &target,
+            &remote_key,
+        )
+        .await;
+        drop(open_two_resources);
+        let record = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+            crate::resource::ResourceClaim::ZERO,
+        )
+        .expect("reservation record");
+        let reserved = grant
+            .checked_sub(provider.in_use())
+            .expect("the provider has measurable remaining capacity")
+            .checked_sub(record)
+            .expect("the seal can fund its own reservation record");
+        let seal = state
+            .cmd_tx
+            .reserve_for_test(reserved)
+            .expect("the test can occupy all remaining provider capacity");
+        assert!(
+            state
+                .peers
+                .promote_speculative_command(
+                    &owner,
+                    &candidate_two,
+                    correlation_two,
+                    state.session_broker.as_ref().expect("the broker exists"),
+                    &state.network_id,
+                )
+                .is_none(),
+            "full provider pressure refuses the additional channel reservation"
+        );
+        assert_eq!(
+            provider.in_use(),
+            grant,
+            "failed additional admission leaves provider usage unchanged"
+        );
+        assert!(
+            fixture
+                .peer
+                .speculative_is_exact(correlation_two, &candidate_two),
+            "failed additional admission rolls back to the exact speculative slot"
+        );
+        assert!(
+            fixture
+                .peer
+                .speculative_endpoint_auth(correlation_two, &candidate_two)
+                .is_some_and(|current| Arc::ptr_eq(&current, &task_two)),
+            "failed additional admission retains the exact Endpoint Auth task"
+        );
+        drop(seal);
+        assert!(
+            state
+                .peers
+                .promote_speculative_command(
+                    &owner,
+                    &candidate_two,
+                    correlation_two,
+                    state.session_broker.as_ref().expect("the broker exists"),
+                    &state.network_id,
+                )
+                .is_some(),
+            "released provider capacity admits the retried additional channel"
+        );
+        assert_eq!(fixture.peer.promoted_channel_count(), 2);
+
+        drop_peer_if_current(&state, &owner, DropReason::UserLeft).await;
+        assert!(!fixture.peer.holds_promoted_session());
+        let link_two_outcomes = link_two.close_outcomes().await;
+        assert!(
+            link_two_outcomes.into_iter().all(|outcome| outcome.is_ok()),
+            "the second real provider candidate fixture closes before final accounting"
+        );
+        drop(candidate_two);
+        drop(task_two);
+        drop(fixture);
+        drop(owner);
+        assert_eq!(
+            provider.in_use(),
+            full_baseline,
+            "full logical retirement and fixture teardown release every provider claim"
+        );
+        peer_state.shutdown().await;
+        state.shutdown().await;
+    }
+
     /// A legitimate replacement Offer is isolated rather than ignored: it
     /// receives its own provider-funded worker while the promoted worker stays
     /// application-usable until fresh Endpoint Auth completes the handoff.
@@ -18277,6 +18948,10 @@ mod tests {
                 .speculative_worker_route(owner, correlation, candidate),
             peer_registry::SpeculativeWorkerRoute::Promoted
         ));
+        let selected_before = owner
+            .connection()
+            .select_unique_usable_channel()
+            .expect("candidate-only refusal has one exact selected channel");
         retire_speculative_exact(state, owner, correlation, candidate).await;
         assert!(matches!(
             state
@@ -18284,19 +18959,23 @@ mod tests {
                 .speculative_worker_route(owner, correlation, candidate),
             peer_registry::SpeculativeWorkerRoute::Promoted
         ));
+        assert!(matches!(
+            state
+                .peers
+                .speculative_worker_route(owner, correlation, winner),
+            peer_registry::SpeculativeWorkerRoute::Promoted
+        ));
         assert!(Arc::ptr_eq(
-            winner,
+            &selected_before,
             &owner
                 .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("candidate-only refusal leaves the exact winner current")
+                .select_unique_usable_channel()
+                .expect("candidate-only refusal leaves the selected channel current")
         ));
         assert!(
             owner
                 .connection()
-                .endpoint_auth_task()
+                .endpoint_auth_task_for(Some(winner))
                 .is_some_and(|task| !task.is_retired()),
             "candidate-only refusal leaves the winning auth task live"
         );
@@ -18334,7 +19013,7 @@ mod tests {
             build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 4);
         let (state_b, command_driver_b, mut promotions_b, _promotion_gate_b, mut signaling_in_rx_b) =
             build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 4);
-        let linked = install_promoted_session_over_real_link(&state_a, &state_b).await;
+        let mut linked = install_promoted_session_over_real_link(&state_a, &state_b).await;
 
         let device_a = state_a.identity.public_id().to_string();
         let device_b = state_b.identity.public_id().to_string();
@@ -18346,18 +19025,6 @@ mod tests {
             .peers
             .owner(&device_a)
             .expect("the real link installs A in B's registry");
-        let old_a = owner_a
-            .connection()
-            .session
-            .lock()
-            .clone()
-            .expect("A starts with the promoted predecessor");
-        let old_b = owner_b
-            .connection()
-            .session
-            .lock()
-            .clone()
-            .expect("B starts with the promoted predecessor");
         assert!(
             state_a
                 .peers
@@ -18382,6 +19049,14 @@ mod tests {
         );
         assert!(owner_a.connection().holds_promoted_session());
         assert!(owner_b.connection().holds_promoted_session());
+        let old_a = owner_a
+            .connection()
+            .select_unique_usable_channel()
+            .expect("A's admitted slot exposes the promoted predecessor");
+        let old_b = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("B's admitted slot exposes the promoted predecessor");
 
         // Peer-wide application state belongs to the logical authenticated
         // session, not to whichever connector is selected for new writes. Park
@@ -18591,10 +19266,8 @@ mod tests {
             &old_a,
             &owner_a
                 .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("the old session remains current before proof")
+                .select_unique_usable_channel()
+                .expect("the old selected worker remains current before proof")
         ));
         assert!(
             state_a
@@ -18729,23 +19402,17 @@ mod tests {
             .await;
         await_b2_promotion(&mut promotions_a, &first_attempt).await;
         await_b2_promotion(&mut promotions_b, &first_attempt).await;
-        assert!(!Arc::ptr_eq(
-            &old_a,
-            &owner_a
-                .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("A's first promotion leaves a current session")
+        assert!(matches!(
+            state_a
+                .peers
+                .speculative_worker_route(&owner_a, &first_attempt, &first_candidate),
+            peer_registry::SpeculativeWorkerRoute::Promoted
         ));
-        assert!(!Arc::ptr_eq(
-            &old_b,
-            &owner_b
-                .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("B's first promotion leaves a current session")
+        assert!(matches!(
+            state_b
+                .peers
+                .speculative_worker_route(&owner_b, &first_attempt, &first_candidate_b),
+            peer_registry::SpeculativeWorkerRoute::Promoted
         ));
         assert!(
             old_a.live_connector_incarnation().is_some(),
@@ -18755,18 +19422,8 @@ mod tests {
             old_b.live_connector_incarnation().is_some(),
             "selection keeps B's predecessor connector alive with the logical session"
         );
-        let first_promoted_a = owner_a
-            .connection()
-            .session
-            .lock()
-            .clone()
-            .expect("A has the first replacement");
-        let first_promoted_b = owner_b
-            .connection()
-            .session
-            .lock()
-            .clone()
-            .expect("B has the first replacement");
+        let first_promoted_a = Arc::clone(&first_candidate);
+        let first_promoted_b = Arc::clone(&first_candidate_b);
         assert!(!Arc::ptr_eq(&first_promoted_a, &old_a));
         assert!(!Arc::ptr_eq(&first_promoted_b, &old_b));
         assert!(
@@ -19050,34 +19707,16 @@ mod tests {
         // successor task after promotion rather than the retired predecessor.
         let promoted_task_a = owner_a
             .connection()
-            .endpoint_auth_task()
+            .endpoint_auth_task_for(Some(&first_promoted_a))
             .expect("A's winning candidate task becomes current after promotion");
         let promoted_task_b = owner_b
             .connection()
-            .endpoint_auth_task()
+            .endpoint_auth_task_for(Some(&first_promoted_b))
             .expect("B's winning candidate task becomes current after promotion");
         assert!(!promoted_task_a.is_retired());
         assert!(!promoted_task_b.is_retired());
         assert!(first_promoted_a.owns_endpoint_auth(&promoted_task_a));
         assert!(first_promoted_b.owns_endpoint_auth(&promoted_task_b));
-        assert!(matches!(old_b_terminal, TransportEvent::DataChannelClosed));
-        handle_exact_promoted_terminal(&state_b, &owner_b, &old_b, DropReason::IceFailed).await;
-        let TransportEvent::Message(old_b_message) = old_b_message else {
-            panic!("the retained predecessor callback is a message");
-        };
-        handle_exact_promoted_message(&state_b, &owner_b, &old_b, old_b_message).await;
-        drop(old_b_terminal_resources);
-        drop(old_b_message_resources);
-        assert!(Arc::ptr_eq(
-            &first_promoted_b,
-            &owner_b
-                .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("accepted W0 callbacks cannot remove or replace W1")
-        ));
-        assert!(!promoted_task_b.is_retired());
         b2_nonterminal_refusal_after_promotion_preserves_winner(
             &state_b,
             &owner_b,
@@ -19242,17 +19881,18 @@ mod tests {
         // B's command completion is the strong replacement witness. Capture
         // it before A's policy revocation closes A's real channels and the
         // linked B channels observe their corresponding terminal callbacks.
-        await_b2_promotion(&mut promotions_b, &second_attempt).await;
+        stage_probe
+            .wait_for(&device_b, &second_attempt, B2Stage::DataChannelOpen)
+            .await;
         let second_promoted_b = owner_b
             .connection()
-            .session
-            .lock()
-            .clone()
-            .expect("B's W2 promotion leaves a current session before peer teardown");
+            .speculative_worker_for(&second_attempt)
+            .expect("B's W2 candidate remains in the exact slot until promotion");
+        await_b2_promotion(&mut promotions_b, &second_attempt).await;
         assert!(!Arc::ptr_eq(&first_promoted_b, &second_promoted_b));
         let second_task_b = owner_b
             .connection()
-            .endpoint_auth_task()
+            .endpoint_auth_task_for(Some(&second_promoted_b))
             .expect("B's W2 replacement owns fresh Endpoint Auth");
         assert!(first_promoted_b.live_connector_incarnation().is_some());
         assert!(state_b
@@ -19267,6 +19907,14 @@ mod tests {
             signaling_runtime_b.remembers_attempt_for_test(&first_attempt),
             "the authenticated W1 channel retains its provider-funded de-duplication key while the logical session remains live"
         );
+        let selected_before_delayed_w1 = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("B retains selected W0 while W1 is a standby");
+        assert!(
+            Arc::ptr_eq(&selected_before_delayed_w1, &old_b),
+            "B's delayed-W1 control starts from the exact selected W0"
+        );
         let frames_before_delayed_w1 = owner_b.connection().state.read().diag.frames_in;
         let TransportEvent::Message(delayed_w1_bytes) = delayed_w1_event else {
             panic!("the held predecessor callback remains a message");
@@ -19275,19 +19923,289 @@ mod tests {
             .await;
         drop(delayed_w1_resources);
         assert!(Arc::ptr_eq(
-            &second_promoted_b,
+            &selected_before_delayed_w1,
             &owner_b
                 .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("delayed W1 bytes cannot replace B's current W2 before teardown")
+                .select_unique_usable_channel()
+                .expect("delayed W1 bytes cannot replace selected W0")
         ));
         assert!(!second_task_b.is_retired());
         assert_eq!(
             owner_b.connection().state.read().diag.frames_in,
             frames_before_delayed_w1 + 1,
             "the held W1 callback is admitted once to the logical session state"
+        );
+
+        // B2-G/H terminal controls: W0 is selected, while W1 and W2 are
+        // authenticated standbys. Removing selected W0 must preserve the
+        // logical record but leave the slot unselected while two equivalent
+        // survivors remain. Removing one exact standby then makes W1 the sole
+        // usable survivor, and the production no-argument seam selects it.
+        // Authenticated Depart still crosses the logical witness carried by
+        // that selected standby and removes the row plus every channel.
+        let (_pending_b, mut pending_b_rx) = file_pending(&state_b, &device_a);
+        let reliable_b_before = state_b.peers.reliable_pending_total();
+        let (reliable_b_reply, mut reliable_b_waiter) = tokio::sync::oneshot::channel();
+        state_b
+            .peers
+            .with_live_session_state(
+                &owner_b,
+                state_b.session_broker.as_ref(),
+                &state_b.network_id,
+                |session, app| {
+                    app.submit(
+                        session,
+                        "b2-logical-session-b",
+                        serde_json::json!({ "pending": "across-w0-terminal" }),
+                        reliable_b_reply,
+                    );
+                },
+            )
+            .expect("B's selected W0 retains one reliable operation");
+        assert!(
+            owner_b.connection().promoted_channel_count() >= 3,
+            "the selection control has W0 plus two real standby channels"
+        );
+        let selected_before_terminal = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("W0 is the selected usable channel before its terminal");
+        assert!(
+            Arc::ptr_eq(&selected_before_terminal, &old_b),
+            "the selected worker is the slot-owned W0, never the legacy mirror"
+        );
+        let snapshot_before_terminal = owner_b.connection().snapshot();
+        assert!(matches!(old_b_terminal, TransportEvent::DataChannelClosed));
+        handle_exact_promoted_terminal(&state_b, &owner_b, &old_b, DropReason::IceFailed).await;
+        let TransportEvent::Message(old_b_message) = old_b_message else {
+            panic!("the retained predecessor callback is a message");
+        };
+        handle_exact_promoted_message(&state_b, &owner_b, &old_b, old_b_message).await;
+        drop(old_b_terminal_resources);
+        drop(old_b_message_resources);
+        let mut near_events_consumed = 0usize;
+        loop {
+            let old_a_is_authenticated = state_a
+                .peers
+                .owner(&device_b)
+                .is_some_and(|owner| owner.connection().owns_authenticated_worker(&old_a));
+            if !old_a_is_authenticated {
+                break;
+            }
+            let event = linked
+                .near
+                .receive_ready
+                .link
+                .left_events_mut()
+                .recv()
+                .await
+                .expect("the near event pump yields A's paired predecessor terminal");
+            near_events_consumed += 1;
+            handle_transport_event(&state_a, device_b.clone(), event).await;
+        }
+        assert!(
+            near_events_consumed > 0,
+            "B's exact predecessor terminal is consumed through A's raw production callback"
+        );
+        let selected_after_old_a = owner_a
+            .connection()
+            .select_unique_usable_channel()
+            .expect("A explicitly selects the live W1 successor after W0 closes");
+        assert!(
+            Arc::ptr_eq(&selected_after_old_a, &first_promoted_a),
+            "A's local selection seam chooses the exact W1 successor"
+        );
+        let after_w0_owner_b = state_b
+            .peers
+            .owner(&device_a)
+            .expect("selected-channel removal retains the logical peer");
+        let snapshot_after_w0 = after_w0_owner_b.connection().snapshot();
+        assert!(
+            after_w0_owner_b.connection().holds_promoted_session()
+                && after_w0_owner_b.connection().promoted_channel_count() == 2,
+            "selected W0 terminal preserves both standby channels and the logical session"
+        );
+        assert_eq!(
+            after_w0_owner_b
+                .connection()
+                .with_logical_session_state(|logical| logical.state().rpc_mut().pending_len()),
+            Some(1),
+            "selected W0 terminal preserves logical pending RPC state while selection is ambiguous"
+        );
+        assert_eq!(
+            after_w0_owner_b
+                .connection()
+                .with_logical_session_state(|logical| logical.state().pending()),
+            Some(1),
+            "selected W0 terminal preserves reliable logical state while selection is ambiguous"
+        );
+        assert_eq!(
+            snapshot_before_terminal.status, snapshot_after_w0.status,
+            "selected W0 terminal preserves the peer snapshot status"
+        );
+        assert_eq!(
+            snapshot_before_terminal.authenticated, snapshot_after_w0.authenticated,
+            "selected W0 terminal preserves snapshot authentication"
+        );
+        assert!(
+            after_w0_owner_b
+                .connection()
+                .select_unique_usable_channel()
+                .is_none(),
+            "two equivalent standby channels remain honestly unselected"
+        );
+        assert!(
+            after_w0_owner_b
+                .connection()
+                .select_unique_usable_channel()
+                .is_none(),
+            "repeating the no-argument selection seam cannot guess among equivalents"
+        );
+        assert!(
+            state_b
+                .peers
+                .admit_application_operation(
+                    &after_w0_owner_b,
+                    state_b.session_broker.as_ref(),
+                    &state_b.network_id
+                )
+                .is_none(),
+            "selection-gated current-channel admission refuses while W1/W2 are ambiguous"
+        );
+
+        let second_standby_owner_b = after_w0_owner_b.for_worker(Arc::clone(&second_promoted_b));
+        drop_peer_if_current(&state_b, &second_standby_owner_b, DropReason::IceFailed).await;
+        let standby_owner_b = state_b
+            .peers
+            .owner(&device_a)
+            .expect("exact W2 terminal retains the logical peer and W1");
+        let selected_after_unique = standby_owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("the sole usable W1 survivor is selected explicitly");
+        assert!(
+            Arc::ptr_eq(&selected_after_unique, &first_promoted_b),
+            "unique selection chooses exact W1, never a legacy session mirror"
+        );
+        assert_eq!(
+            standby_owner_b.connection().promoted_channel_count(),
+            1,
+            "exact W2 removal leaves one authenticated W1 survivor"
+        );
+        let snapshot_after_unique = standby_owner_b.connection().snapshot();
+        assert_eq!(
+            snapshot_after_w0.status, snapshot_after_unique.status,
+            "unique W1 selection is observational for peer status"
+        );
+        assert_eq!(
+            snapshot_after_w0.authenticated, snapshot_after_unique.authenticated,
+            "unique W1 selection is observational for authentication snapshot"
+        );
+        assert!(
+            state_b
+                .peers
+                .admit_application_operation(
+                    &standby_owner_b,
+                    state_b.session_broker.as_ref(),
+                    &state_b.network_id
+                )
+                .is_some(),
+            "application admission resumes only after unique W1 selection"
+        );
+        assert_eq!(
+            state_b.peers.reliable_pending_total(),
+            reliable_b_before + 1
+        );
+        assert_eq!(pending_len(&state_b, &device_a), Some(1));
+        assert!(
+            owner_a
+                .connection()
+                .speculative_worker_for(&hostile_correlation)
+                .is_some(),
+            "the unrelated hostile candidate coexists with held W2 and authenticated W0/W1/W2 before logical Depart"
+        );
+
+        let depart = MeshMessage::SessionControl(crate::protocol::SessionControl::Depart);
+        let (_depart_msg, _depart_claim, depart_work, depart_dispatch) =
+            admit_inbound_for_test(&state_b, &standby_owner_b, depart.clone())
+                .expect("standby channel admits authenticated Depart")
+                .into_dispatch();
+        let (_stale_msg, _stale_claim, stale_work, stale_dispatch) =
+            admit_inbound_for_test(&state_b, &standby_owner_b, depart)
+                .expect("duplicate Depart captures the same exact logical witness")
+                .into_dispatch();
+        on_session_control(
+            &state_b,
+            &depart_dispatch,
+            crate::protocol::SessionControl::Depart,
+        )
+        .await;
+        drop(depart_work);
+        assert!(
+            state_b.peers.owner(&device_a).is_none(),
+            "Depart on the standby removes the exact logical peer and all channels"
+        );
+        assert!(
+            !matches!(
+                pending_b_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "logical teardown resolves the pending operation exactly once"
+        );
+        assert!(
+            !matches!(
+                reliable_b_waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "logical teardown resolves the reliable operation exactly once"
+        );
+        on_session_control(
+            &state_b,
+            &stale_dispatch,
+            crate::protocol::SessionControl::Depart,
+        )
+        .await;
+        drop(stale_work);
+        assert!(
+            state_b.peers.owner(&device_a).is_none(),
+            "duplicate Depart is a no-op after exact logical removal"
+        );
+        let successor_b = insert_promoted_peer(&state_b, &device_a).await;
+        let successor_owner_b = state_b
+            .peers
+            .owner(&device_a)
+            .expect("the unrelated successor is installed");
+        assert!(
+            state_b
+                .peers
+                .admit_application_operation(
+                    &successor_owner_b,
+                    state_b.session_broker.as_ref(),
+                    &state_b.network_id,
+                )
+                .is_some(),
+            "the unrelated successor admits its own logical session"
+        );
+        assert!(successor_b.peer.holds_promoted_session());
+        let successor_selected_b = successor_owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("the unrelated successor exposes its exact selected channel");
+        on_session_control(
+            &state_b,
+            &stale_dispatch,
+            crate::protocol::SessionControl::Depart,
+        )
+        .await;
+        let successor_selected_after_stale_b = successor_owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("the stale Depart leaves the successor selected channel live");
+        assert!(
+            Arc::ptr_eq(&successor_selected_b, &successor_selected_after_stale_b)
+                && successor_b.peer.holds_promoted_session()
+                && state_b.peers.get_if_current(&successor_owner_b).is_some(),
+            "a stale Depart cannot retire the unrelated successor logical session"
         );
 
         // Let W2 authenticate completely, but stop its reducer immediately
@@ -19343,13 +20261,6 @@ mod tests {
                 .speculative_worker_for(&second_attempt)
                 .is_none(),
             "the policy-refused W2 correlation is retired exactly"
-        );
-        assert!(
-            owner_a
-                .connection()
-                .speculative_worker_for(&hostile_correlation)
-                .is_some(),
-            "W2 cleanup does not consume the unrelated hostile candidate"
         );
         assert!(
             first_promoted_a.live_connector_incarnation().is_none(),

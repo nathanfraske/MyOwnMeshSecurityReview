@@ -38,7 +38,7 @@ use crate::runtime::RuntimeIncarnation;
 
 pub(crate) use policy::CurrentPolicyAdmission;
 
-/// Proof that post-authentication session capacity was reserved.
+/// Proof that one post-authentication channel's capacity was reserved.
 ///
 /// There is no conversion from `PreAuthAttemptPermit` into this type, and none
 /// from `AuthenticatedChannelCapability` either: an authenticated channel is not
@@ -46,8 +46,8 @@ pub(crate) use policy::CurrentPolicyAdmission;
 /// permit releases exactly the reservation it took and nothing else.
 pub(crate) struct SessionPermit {
     runtime: RuntimeIncarnation,
-    /// The Mesh grant this reservation came out of, retained so the session can
-    /// pay for what it goes on to retain.
+    /// The Mesh grant this reservation came out of, retained so the shared
+    /// validity lineage can pay for what it goes on to retain.
     ///
     /// A promoted session holds application state whose size it does not know at
     /// promotion time — one retained frame per un-acknowledged reliable send.
@@ -58,7 +58,7 @@ pub(crate) struct SessionPermit {
     /// provider's own decision.
     scope: MeshConnectorResourceScope,
     /// Held for its `Drop`. The reservation exists for as long as the permit
-    /// does, which is for as long as the session it was promoted into.
+    /// does, which is for as long as this channel remains promoted.
     _lease: ResourceLease,
 }
 
@@ -68,8 +68,12 @@ impl SessionPermit {
         runtime: RuntimeIncarnation,
     ) -> Result<Self, ResourceUnavailable> {
         let lease = scope.reserve_session(
-            crate::runtime::peer_session::PromotedSession::promotion_claim().expect(
-                "the promoted record claim is `size_of` arithmetic over fixed types and cannot                  overflow",
+            // The slot owns the exact `LeasedMap` entry. The broker permit
+            // therefore funds only the channel-local realtime-flow root it
+            // retains; charging the map entry here would double-charge the
+            // first install and every additional channel.
+            crate::transport::webrtc::SessionRealtimeFlows::promotion_root_claim().expect(
+                "the realtime-flow promotion root claim is `size_of` arithmetic over fixed types and cannot overflow",
             ),
         )?;
         Ok(Self {
@@ -77,26 +81,6 @@ impl SessionPermit {
             scope: scope.clone(),
             _lease: lease,
         })
-    }
-
-    /// Reserve capacity this session retains on top of its own promotion charge.
-    ///
-    /// `Admitted` authority, like the promotion reservation itself, because what
-    /// it pays for belongs to a promoted session and must not be reclaimed as
-    /// though it were candidate work. The lease is returned bare: whatever holds
-    /// it decides how long the retention lasts, and dropping it releases exactly
-    /// that retention.
-    fn reserve_retained(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
-        self.scope.reserve_session(claim)
-    }
-
-    /// The runtime this reservation was taken under.
-    ///
-    /// The session reads its runtime from here rather than from the channel:
-    /// the permit is the post-authentication authority, and `promote` has
-    /// already proved the two agree.
-    pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.runtime
     }
 }
 
@@ -110,7 +94,11 @@ pub(crate) struct SessionCapability {
     /// The channel this session was promoted from. Held by value: the session
     /// *is* the authenticated channel's application-facing continuation, and
     /// dropping the session returns the connected claim to the connector.
-    authenticated_channel: AuthenticatedChannelCapability,
+    ///
+    /// The option is only so a slot-install refusal can move this exact
+    /// capability back to the connection's authenticated-channel slot before
+    /// the session's ordinary `Drop` releases its permit and validity owner.
+    authenticated_channel: Option<AuthenticatedChannelCapability>,
     /// The one local process principal, shared rather than re-minted.
     ///
     /// `Arc` because there is exactly one authenticated local principal per
@@ -119,7 +107,7 @@ pub(crate) struct SessionCapability {
     /// second principal, which is precisely the generic identity framework the
     /// directive excludes.
     local_principal: Arc<LocalPrincipalCapability>,
-    permit: SessionPermit,
+    _permit: SessionPermit,
     /// The exact connector this session was promoted from, retained privately
     /// so currentness is decided by pointer identity rather than by a device id
     /// a replacement may since have taken over.
@@ -134,6 +122,13 @@ struct SessionValidity {
     live: AtomicBool,
     channel_owners: AtomicUsize,
     wake: tokio::sync::Notify,
+    /// The exact provider scope that funded this logical validity lineage.
+    /// Retained reservations must come from this scope even when the channel
+    /// that first minted the lineage is no longer the caller.
+    scope: MeshConnectorResourceScope,
+    /// The runtime that funded the lineage, retained alongside its provider
+    /// scope so the record remains self-describing across shared channels.
+    runtime: RuntimeIncarnation,
     _lease: ResourceLease,
 }
 
@@ -157,15 +152,29 @@ impl SessionValidity {
     }
 
     fn mint(permit: &SessionPermit) -> Result<Arc<Self>, ResourceUnavailable> {
-        let lease = permit.reserve_retained(Self::claim().expect(
+        let scope = permit.scope.clone();
+        let runtime = permit.runtime.clone();
+        let lease = permit.scope.reserve_session(Self::claim().expect(
             "the validity record claim is size_of arithmetic over fixed types and cannot overflow",
         ))?;
         Ok(Arc::new(Self {
             live: AtomicBool::new(true),
             channel_owners: AtomicUsize::new(1),
             wake: tokio::sync::Notify::new(),
+            scope,
+            runtime,
             _lease: lease,
         }))
+    }
+
+    /// Reserve capacity retained by this logical validity lineage, independent
+    /// of whichever channel currently presents its witness.
+    fn reserve_retained(&self, claim: ResourceClaim) -> Result<ResourceLease, ResourceUnavailable> {
+        self.scope.reserve_session(claim)
+    }
+
+    fn runtime(&self) -> &RuntimeIncarnation {
+        &self.runtime
     }
 
     fn invalidate(&self) {
@@ -173,8 +182,32 @@ impl SessionValidity {
         self.wake.notify_waiters();
     }
 
-    fn add_channel_owner(&self) {
-        self.channel_owners.fetch_add(1, Ordering::AcqRel);
+    /// Try to attach another promoted channel without minting a second
+    /// validity allocation.  The owner is acquired only after the lineage is
+    /// observed live and is rechecked after the atomic increment so a
+    /// concurrent revocation cannot resurrect a dead session.
+    fn try_add_channel_owner(&self) -> bool {
+        loop {
+            if !self.live.load(Ordering::Acquire) {
+                return false;
+            }
+            let owners = self.channel_owners.load(Ordering::Acquire);
+            let Some(next) = owners.checked_add(1) else {
+                return false;
+            };
+            if self
+                .channel_owners
+                .compare_exchange(owners, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            if self.live.load(Ordering::Acquire) {
+                return true;
+            }
+            self.release_channel_owner();
+            return false;
+        }
     }
 
     fn release_channel_owner(&self) {
@@ -212,6 +245,23 @@ impl SessionValidityWitness {
         Arc::ptr_eq(&self.validity, &session.validity)
     }
 
+    /// Whether these two witnesses retain the exact same validity allocation.
+    ///
+    /// This is identity, not merely shared liveness: two live lineages are not
+    /// interchangeable authorities.
+    pub(crate) fn same_validity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.validity, &other.validity)
+    }
+
+    /// Reserve capacity against the exact provider scope retained by this
+    /// witness's logical validity lineage.
+    pub(crate) fn reserve_retained(
+        &self,
+        claim: ResourceClaim,
+    ) -> Result<ResourceLease, ResourceUnavailable> {
+        self.validity.reserve_retained(claim)
+    }
+
     pub(crate) async fn revoked(&self) {
         loop {
             if !self.is_live() {
@@ -235,13 +285,11 @@ impl Drop for SessionCapability {
 }
 
 impl SessionCapability {
-    pub(crate) fn join_logical_session(&mut self, established: &SessionCapability) {
-        if Arc::ptr_eq(&self.validity, &established.validity) {
-            return;
-        }
-        self.validity.release_channel_owner();
-        established.validity.add_channel_owner();
-        self.validity = Arc::clone(&established.validity);
+    /// Return the exact authenticated channel for rollback, consuming this
+    /// session capability. The capability's normal drop then releases its
+    /// validity owner and retained permit; no authority is cloned or recreated.
+    pub(crate) fn demote(mut self) -> Option<AuthenticatedChannelCapability> {
+        self.authenticated_channel.take()
     }
 
     pub(crate) fn validity_witness(&self) -> SessionValidityWitness {
@@ -250,7 +298,7 @@ impl SessionCapability {
         }
     }
     fn runtime(&self) -> &RuntimeIncarnation {
-        self.permit.runtime()
+        self.validity.runtime()
     }
 
     /// Whether this session was promoted from that exact connector incarnation.
@@ -296,22 +344,11 @@ impl SessionCapability {
     ///   presented for a peer or a network it was not authenticated for;
     /// - the local principal and the reservation, still bound to the runtime the
     ///   broker is currently promoting under.
-    pub(crate) fn is_current_for(
-        &self,
-        connector: &Arc<ConnectorIncarnation>,
-        mesh_context: &str,
-        remote_device_id: &str,
-        runtime: &RuntimeIncarnation,
-    ) -> bool {
-        self.belongs_to(connector)
-            && self.remote_device_id() == remote_device_id
-            && self.authenticated_for(mesh_context, remote_device_id)
-            && self.runtime().is_same(runtime)
-            && self.local_principal().runtime().is_same(runtime)
-    }
-
+    #[cfg(test)]
     pub(crate) fn authenticated_for(&self, mesh_context: &str, remote_device_id: &str) -> bool {
         self.authenticated_channel
+            .as_ref()
+            .expect("a live session retains its authenticated channel until demotion")
             .authenticated_for(mesh_context, remote_device_id)
     }
 
@@ -320,8 +357,13 @@ impl SessionCapability {
     /// For attribution only. It is derived from the authenticated record, so it
     /// cannot be used to *reach* a peer — reaching one requires presenting this
     /// capability to the registry fence, which revalidates it.
+    #[cfg(test)]
     pub(crate) fn remote_device_id(&self) -> &str {
-        self.authenticated_channel.record().remote_device_id()
+        self.authenticated_channel
+            .as_ref()
+            .expect("a live session retains its authenticated channel until demotion")
+            .record()
+            .remote_device_id()
     }
 
     pub(crate) fn local_principal(&self) -> &LocalPrincipalCapability {
@@ -345,7 +387,7 @@ impl SessionCapability {
         &self,
         claim: ResourceClaim,
     ) -> Result<ResourceLease, ResourceUnavailable> {
-        self.permit.reserve_retained(claim)
+        self.validity.reserve_retained(claim)
     }
 }
 
@@ -404,10 +446,6 @@ impl SessionBroker {
         }
     }
 
-    pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.runtime
-    }
-
     /// Promote the authenticated channel held in `slot` into a live session, or
     /// refuse without disturbing it.
     ///
@@ -436,6 +474,32 @@ impl SessionBroker {
         slot: &mut Option<AuthenticatedChannelCapability>,
         connector: &Arc<ConnectorIncarnation>,
         policy: CurrentPolicyAdmission,
+    ) -> Result<SessionCapability, SessionPromotionError> {
+        self.promote_with_logical(slot, connector, policy, None)
+    }
+
+    /// Promote an additional authenticated channel into an existing logical
+    /// session.  The new channel receives its own channel reservation, but
+    /// shares the established session validity owner directly.  In particular,
+    /// this path does not mint a second `SessionValidity` and then join it
+    /// after the fact, which would transiently charge and later release a
+    /// duplicate logical reservation.
+    pub(crate) fn promote_additional(
+        &self,
+        slot: &mut Option<AuthenticatedChannelCapability>,
+        connector: &Arc<ConnectorIncarnation>,
+        policy: CurrentPolicyAdmission,
+        established: &SessionCapability,
+    ) -> Result<SessionCapability, SessionPromotionError> {
+        self.promote_with_logical(slot, connector, policy, Some(established))
+    }
+
+    fn promote_with_logical(
+        &self,
+        slot: &mut Option<AuthenticatedChannelCapability>,
+        connector: &Arc<ConnectorIncarnation>,
+        policy: CurrentPolicyAdmission,
+        established: Option<&SessionCapability>,
     ) -> Result<SessionCapability, SessionPromotionError> {
         // Every free conjunct, decided against a borrow so that nothing is
         // consumed while an answer is still in doubt. The borrow ends with this
@@ -476,13 +540,33 @@ impl SessionBroker {
             return Err(error);
         }
 
+        if let Some(established) = established {
+            if !established.runtime().is_same(&self.runtime)
+                || !established
+                    .local_principal()
+                    .runtime()
+                    .is_same(&self.runtime)
+                || !established.validity_witness().is_live()
+            {
+                return Err(SessionPromotionError::ResourcesUnavailable);
+            }
+        }
+
         // The one fallible step that can refuse a channel which is in every
         // other respect promotable. Until it succeeds the slot still holds its
         // channel, so `?` here retries cleanly.
         let permit = SessionPermit::reserve(&self.resources, self.runtime.clone())
             .map_err(|_| SessionPromotionError::ResourcesUnavailable)?;
-        let validity = SessionValidity::mint(&permit)
-            .map_err(|_| SessionPromotionError::ResourcesUnavailable)?;
+        let validity = match established {
+            Some(established) => {
+                if !established.validity.try_add_channel_owner() {
+                    return Err(SessionPromotionError::ResourcesUnavailable);
+                }
+                Arc::clone(&established.validity)
+            }
+            None => SessionValidity::mint(&permit)
+                .map_err(|_| SessionPromotionError::ResourcesUnavailable)?,
+        };
 
         // Infallible from here: the move out of the slot *is* the commit.
         let authenticated_channel = slot
@@ -490,9 +574,9 @@ impl SessionBroker {
             .expect("the slot held a channel through every check above and nothing released it");
 
         Ok(SessionCapability {
-            authenticated_channel,
+            authenticated_channel: Some(authenticated_channel),
             local_principal: Arc::clone(&self.principal),
-            permit,
+            _permit: permit,
             connector: Arc::clone(connector),
             validity,
         })
@@ -579,9 +663,9 @@ fn session_in_scope_for_test(
         .expect("fixture provider admits one session validity allocation");
 
     SessionCapability {
-        authenticated_channel,
+        authenticated_channel: Some(authenticated_channel),
         local_principal,
-        permit,
+        _permit: permit,
         connector,
         validity,
     }
@@ -600,25 +684,53 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
     crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
 }
 
-/// What one promoted session actually costs the provider:
-/// [`PromotedSession::promotion_claim`](crate::runtime::peer_session::PromotedSession::promotion_claim)
-/// plus the record it keeps for the reservation carrying it.
-///
-/// Mechanically derived, and `pub(crate)` so every fixture that has to leave
-/// room for a session charges the same thing. A fixture that hand-adds the
-/// session claim alone is short by exactly the record the provider keeps, and is
-/// short *silently* until the grant happens to bind — which is the defect this
-/// exists to make unrepeatable.
-pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
-    let session = crate::resource::FiniteResourceProvider::reservation_planning_charge(
-        crate::runtime::peer_session::PromotedSession::promotion_claim()
-            .expect("the promoted record claim is `size_of` arithmetic and cannot overflow"),
+/// What one additional promoted channel costs the provider: the channel-local
+/// realtime-flow root and its exact leased-map entry. The shared validity
+/// lineage is deliberately absent because only the first channel funds it.
+#[cfg(test)]
+pub(crate) fn session_channel_reservation_charge_for_test() -> ResourceClaim {
+    let flow_root = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        crate::runtime::peer_session::PromotedSession::channel_claim()
+            .expect("the channel flow-root claim is `size_of` arithmetic and cannot overflow"),
     )
-    .expect("one session claim plus the provider's reservation record is representable");
+    .expect("the flow-root claim plus its provider record is representable");
+    let map_entry = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        crate::runtime::peer_session::PromotedSession::channel_map_entry_claim()
+            .expect("the channel map-entry claim is `size_of` arithmetic and cannot overflow"),
+    )
+    .expect("the map-entry claim plus its provider record is representable");
+    flow_root
+        .checked_add(map_entry)
+        .expect("the additional-channel reservations compose")
+}
+
+/// What a first promoted session costs the provider: four separate reservations
+/// for its flow root, logical record, leased-map entry, and validity lineage.
+///
+/// Each call to `reservation_planning_charge` includes the provider bookkeeping
+/// record for that one lease; combining the bare claims first would undercount.
+pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
+    let flow_root = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        crate::runtime::peer_session::PromotedSession::channel_claim()
+            .expect("the channel flow-root claim is `size_of` arithmetic and cannot overflow"),
+    )
+    .expect("the flow-root claim plus its provider record is representable");
+    let logical = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        crate::runtime::peer_session::PromotedSession::logical_claim()
+            .expect("the logical session claim is `size_of` arithmetic and cannot overflow"),
+    )
+    .expect("the logical claim plus its provider record is representable");
+    let map_entry = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        crate::runtime::peer_session::PromotedSession::channel_map_entry_claim()
+            .expect("the channel map-entry claim is `size_of` arithmetic and cannot overflow"),
+    )
+    .expect("the map-entry claim plus its provider record is representable");
     let validity = session_validity_reservation_charge_for_test();
-    session
-        .checked_add(validity)
-        .expect("the session and validity reservations compose")
+    flow_root
+        .checked_add(logical)
+        .and_then(|claim| claim.checked_add(map_entry))
+        .and_then(|claim| claim.checked_add(validity))
+        .expect("the four first-session reservations compose")
 }
 
 fn session_validity_reservation_charge_for_test() -> ResourceClaim {
@@ -679,7 +791,7 @@ fn fixture_scaffolding_claim() -> ResourceClaim {
     .expect("the fixture scaffolding claim is representable")
 }
 
-/// The scaffolding above plus room for exactly `sessions` promotions.
+/// The scaffolding above plus room for exactly `sessions` first promotions.
 #[cfg(test)]
 fn fixture_grant(sessions: u64) -> ResourceClaim {
     let sessions = session_reservation_charge_for_test()
@@ -884,6 +996,46 @@ mod tests {
             provider.in_use(),
             baseline,
             "the final witness drop releases the validity block and its provider record",
+        );
+    }
+
+    #[test]
+    fn v4_arc05_additional_promotion_shares_the_established_validity_owner() {
+        let runtime = crate::runtime::runtime_for_test();
+        let broker = broker_for_test(runtime.clone());
+
+        let first = crate::endpoint_auth::authenticated_for_test(runtime.clone());
+        let first_connector = Arc::clone(first.record().connector());
+        let mut first_slot = Some(first);
+        let established = broker
+            .promote(
+                &mut first_slot,
+                &first_connector,
+                CurrentPolicyAdmission::admitted_for_test(),
+            )
+            .expect("the first channel promotes");
+        let established_witness = established.validity_witness();
+
+        let additional = crate::endpoint_auth::authenticated_for_test(runtime);
+        let additional_connector = Arc::clone(additional.record().connector());
+        let mut additional_slot = Some(additional);
+        let joined = broker
+            .promote_additional(
+                &mut additional_slot,
+                &additional_connector,
+                CurrentPolicyAdmission::admitted_for_test(),
+                &established,
+            )
+            .expect("the additional channel reserves only channel capacity");
+
+        assert!(
+            established_witness.same_validity(&joined.validity_witness()),
+            "additional promotion must share the established validity allocation"
+        );
+        drop(established);
+        assert!(
+            joined.validity_witness().is_live(),
+            "dropping the first channel must not revoke the additional channel"
         );
     }
 

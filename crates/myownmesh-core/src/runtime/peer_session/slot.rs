@@ -7,10 +7,12 @@
 
 use std::sync::Arc;
 
-use crate::resource::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass};
+use crate::resource::{
+    LeasedMap, ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceUnavailable,
+};
 use crate::runtime::session_broker::SessionCapability;
 
-use super::PeerSessionState;
+use super::{LogicalSessionOperation, LogicalSessionRecord, PeerSessionState};
 
 use super::DedupToken;
 
@@ -56,44 +58,40 @@ pub(crate) struct PromotedChannelBinding {
     pub(crate) additional_dedup: Vec<DedupToken>,
 }
 
+/// Process-local exact identity for one worker. The value in the map retains
+/// the corresponding `Arc`, so an address cannot be recycled while its key is
+/// live and an old key cannot address a replacement worker.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct WorkerKey(usize);
+
+impl WorkerKey {
+    fn of(worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>) -> Self {
+        Self(Arc::as_ptr(worker) as usize)
+    }
+}
+
 pub(crate) struct PromotedSession {
-    selected: usize,
-    channels: Vec<PromotedChannel>,
-    app: PeerSessionState,
+    /// Exact selected-channel identity, never a `Vec` position.
+    selected: Option<Arc<crate::transport::webrtc::WebRtcConnectorWorker>>,
+    channels: LeasedMap<WorkerKey, PromotedChannel>,
+    logical: LogicalSessionRecord,
 }
 
 impl PromotedSession {
-    /// The post-authentication reservation one promoted session holds, derived
-    /// from the record promotion actually builds.
+    /// The logical reservation is owned by [`SessionCapability`] and its joined
+    /// validity witness. The slot must not mint or charge a second allocation.
     ///
     /// It lives here, beside [`PromotedSessionSlot::install`], because this is
     /// the module that allocates the thing being paid for. A claim written
     /// anywhere else would be a second statement of this record's shape, and the
     /// two would drift the first time a field is added.
     ///
-    /// Two terms, no more:
+    /// This is the singular logical record/root owned by the slot. The
+    /// capability's validity allocation is separate and is never duplicated.
     ///
-    /// * `size_of::<Self>()` — the whole record in one reading. It covers the
-    ///   session capability (and with it the authenticated channel it owns by
-    ///   value, the shared principal handle, the connector identity and the
-    ///   permit carrying this very reservation), the realtime flow set's own
-    ///   inline shape, and this session's application state — its reliable
-    ///   stream id, sequence, empty queue handle, inbound mark and empty advert
-    ///   slot. One `size_of` over the bundle cannot double-count what three
-    ///   `size_of`s over its fields might, and cannot miss a field added later.
-    /// * the heap `SessionRealtimeFlows::new` allocates for the refcounted roots
-    ///   the set is built from. Their number and types are the connector's to
-    ///   state: `promotion_root_claim` lives beside `new`, so the roots and
-    ///   their charge are read and written in one place. Restating either here —
-    ///   a count especially — would go stale the first time a root moves.
-    ///
-    /// The application state contributes no third term, and that is a property
-    /// of the record rather than an omission: at promotion its queue is empty
-    /// and holds no node, and its advert slot is empty and holds no buffer.
-    /// Everything either of them later retains is funded at the moment it is
-    /// retained, by [`SessionCapability::reserve_retained`], and released when it
-    /// is not. Pre-paying for them here would be the fixed ceiling this design
-    /// exists to remove.
+    /// Any later queue, flow, or payload retention is funded at the moment it
+    /// is taken, by [`SessionCapability::reserve_retained`], and released when
+    /// it is not. Promotion therefore does not pre-pay for a fixed capacity.
     ///
     /// Two exclusions are by design. The flow registry the set holds is the
     /// connector's own and preexisting — promotion clones a handle, it does not
@@ -104,28 +102,58 @@ impl PromotedSession {
     ///
     /// Deliberately not derived from anything measured before authentication: a
     /// pre-authentication lease is not proof that this capacity exists.
-    pub(crate) fn promotion_claim(
-    ) -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError> {
-        let record = u64::try_from(std::mem::size_of::<Self>()).map_err(|_| {
+    pub(crate) fn logical_claim() -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError>
+    {
+        let record = u64::try_from(std::mem::size_of::<LogicalSessionRecord>()).map_err(|_| {
             ResourceClaimArithmeticError::Overflow {
                 dimension: ResourceClass::AccountedMemoryBytes,
             }
         })?;
-        ResourceClaim::try_from_entries([(ResourceClass::AccountedMemoryBytes, record)])?
-            .checked_add(crate::transport::webrtc::SessionRealtimeFlows::promotion_root_claim()?)
+        ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, record),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
     }
 
-    /// The authority and the realtime flow set it owns.
-    fn selected(&self) -> &PromotedChannel {
-        &self.channels[self.selected]
+    /// The exact allocation owned by the channel outside its leased-map node.
+    /// The map node itself is charged only by the slot insertion seam.
+    pub(crate) fn channel_claim() -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError>
+    {
+        crate::transport::webrtc::SessionRealtimeFlows::promotion_root_claim()
     }
 
-    fn selected_mut(&mut self) -> &mut PromotedChannel {
-        &mut self.channels[self.selected]
+    /// The exact funded node required for one channel-map insertion.
+    ///
+    /// The key representation remains private so callers cannot restate worker
+    /// identity as a guessed integer or create a second accounting formula.
+    pub(crate) fn channel_map_entry_claim(
+    ) -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError> {
+        LeasedMap::<WorkerKey, PromotedChannel>::entry_claim()
     }
 
-    pub(crate) fn selected_worker(&self) -> &Arc<crate::transport::webrtc::WebRtcConnectorWorker> {
-        &self.selected().worker
+    fn selected_mut(&mut self) -> Option<&mut PromotedChannel> {
+        let selected = Arc::clone(self.selected.as_ref()?);
+        self.channels
+            .get_mut(&WorkerKey::of(&selected))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, &selected))
+    }
+
+    pub(crate) fn selected_worker(
+        &self,
+    ) -> Option<&Arc<crate::transport::webrtc::WebRtcConnectorWorker>> {
+        self.selected.as_ref()
+    }
+
+    /// Lend the exact selected channel authority with the singular logical
+    /// application state. The two borrows are field-split: selection is read
+    /// from the channel map, while state remains owned by the logical record.
+    pub(crate) fn app_mut(&mut self) -> Option<(&SessionCapability, &mut PeerSessionState)> {
+        let selected = self.selected.as_ref()?;
+        let channel = self
+            .channels
+            .get(&WorkerKey::of(selected))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, selected))?;
+        Some((&channel.session, &mut self.logical.state))
     }
 
     pub(crate) fn contains_worker(
@@ -133,8 +161,59 @@ impl PromotedSession {
         worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
     ) -> bool {
         self.channels
-            .iter()
-            .any(|channel| Arc::ptr_eq(&channel.worker, worker))
+            .get(&WorkerKey::of(worker))
+            .is_some_and(|channel| Arc::ptr_eq(&channel.worker, worker))
+    }
+
+    fn select_channel(
+        &mut self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> bool {
+        if worker.live_connector_incarnation().is_none() || !self.contains_worker(worker) {
+            return false;
+        }
+        self.selected = Some(Arc::clone(worker));
+        true
+    }
+
+    fn select_unique_usable(
+        &mut self,
+    ) -> Option<Arc<crate::transport::webrtc::WebRtcConnectorWorker>> {
+        if let Some(selected) = self.selected.as_ref() {
+            let usable = self
+                .channels
+                .get(&WorkerKey::of(selected))
+                .is_some_and(|channel| {
+                    Arc::ptr_eq(&channel.worker, selected)
+                        && channel
+                            .worker
+                            .live_connector_incarnation()
+                            .is_some_and(|live| channel.session.belongs_to(live))
+                });
+            if usable {
+                return Some(Arc::clone(selected));
+            }
+        }
+
+        let mut count = 0usize;
+        let mut candidate = None;
+        self.channels.for_each(|_, channel| {
+            if channel
+                .worker
+                .live_connector_incarnation()
+                .is_some_and(|live| channel.session.belongs_to(live))
+            {
+                count += 1;
+                candidate = Some(Arc::clone(&channel.worker));
+            }
+        });
+        if count == 1 {
+            self.selected = candidate.clone();
+            candidate
+        } else {
+            self.selected = None;
+            None
+        }
     }
 
     pub(crate) fn endpoint_auth_for(
@@ -142,8 +221,8 @@ impl PromotedSession {
         worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
     ) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
         self.channels
-            .iter()
-            .find(|channel| Arc::ptr_eq(&channel.worker, worker))
+            .get(&WorkerKey::of(worker))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, worker))
             .and_then(|channel| channel.endpoint_auth.as_ref().map(Arc::clone))
     }
 
@@ -152,20 +231,20 @@ impl PromotedSession {
         worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
     ) -> Option<String> {
         self.channels
-            .iter()
-            .find(|channel| Arc::ptr_eq(&channel.worker, worker))
+            .get(&WorkerKey::of(worker))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, worker))
             .map(|channel| channel.correlation.clone())
     }
 
     pub(crate) fn flows_mut(
         &mut self,
-    ) -> (
+    ) -> Option<(
         &SessionCapability,
         &mut crate::transport::webrtc::SessionRealtimeFlows,
         &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
-    ) {
-        let channel = self.selected_mut();
-        (&channel.session, &mut channel.flows, &channel.worker)
+    )> {
+        let channel = self.selected_mut()?;
+        Some((&channel.session, &mut channel.flows, &channel.worker))
     }
 
     pub(crate) fn flows_for_worker_mut(
@@ -178,8 +257,8 @@ impl PromotedSession {
     )> {
         let channel = self
             .channels
-            .iter_mut()
-            .find(|channel| Arc::ptr_eq(&channel.worker, worker))?;
+            .get_mut(&WorkerKey::of(worker))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, worker))?;
         Some((&channel.session, &mut channel.flows, &channel.worker))
     }
 
@@ -194,8 +273,8 @@ impl PromotedSession {
     )> {
         let channel = self
             .channels
-            .iter_mut()
-            .find(|channel| Arc::ptr_eq(&channel.worker, worker))?;
+            .get_mut(&WorkerKey::of(worker))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, worker))?;
         Some((
             &channel.session,
             &mut channel.flows,
@@ -203,20 +282,59 @@ impl PromotedSession {
             channel.correlation.as_str(),
         ))
     }
-
-    /// The authority and the application state it owns.
-    pub(crate) fn app_mut(&mut self) -> (&SessionCapability, &mut PeerSessionState) {
-        (&self.channels[self.selected].session, &mut self.app)
-    }
 }
 
 pub(crate) struct RemovedPromotedChannel {
     pub(crate) worker: Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
     pub(crate) dedup: Option<DedupToken>,
     pub(crate) additional_dedup: Vec<DedupToken>,
-    pub(crate) selected_worker: Option<Arc<crate::transport::webrtc::WebRtcConnectorWorker>>,
-    pub(crate) selected_correlation: Option<String>,
+    pub(crate) selection_needed: bool,
     pub(crate) session_empty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromotedSessionAdmissionRefusalReason {
+    SlotUnavailable,
+    LogicalSessionUnavailable,
+    DuplicateWorker,
+    ResourceUnavailable(ResourceUnavailable),
+    ClaimArithmetic(ResourceClaimArithmeticError),
+}
+
+pub(crate) struct PromotedSessionAdmissionRefusal {
+    pub(crate) reason: PromotedSessionAdmissionRefusalReason,
+    pub(crate) session: Box<SessionCapability>,
+    pub(crate) flows: Box<crate::transport::webrtc::SessionRealtimeFlows>,
+    pub(crate) binding: Box<PromotedChannelBinding>,
+}
+
+impl PromotedSessionAdmissionRefusal {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PromotedSessionAdmissionRefusalReason,
+        Box<SessionCapability>,
+        Box<crate::transport::webrtc::SessionRealtimeFlows>,
+        Box<PromotedChannelBinding>,
+    ) {
+        (self.reason, self.session, self.flows, self.binding)
+    }
+}
+
+pub(crate) type PromotedSessionInstallRefusal = PromotedSessionAdmissionRefusal;
+
+fn admission_refusal(
+    reason: PromotedSessionAdmissionRefusalReason,
+    session: SessionCapability,
+    flows: crate::transport::webrtc::SessionRealtimeFlows,
+    binding: PromotedChannelBinding,
+) -> PromotedSessionAdmissionRefusal {
+    PromotedSessionAdmissionRefusal {
+        reason,
+        session: Box::new(session),
+        flows: Box::new(flows),
+        binding: Box::new(binding),
+    }
 }
 
 /// The one slot a peer entry holds its promoted session in, and the use and
@@ -255,11 +373,17 @@ impl PromotedSessionSlot {
         self.slot.lock().is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn channel_count(&self) -> usize {
-        self.slot
-            .lock()
-            .as_ref()
-            .map_or(0, |session| session.channels.len())
+        let slot = self.slot.lock();
+        let Some(session) = slot.as_ref() else {
+            return 0;
+        };
+        let mut count = 0;
+        session.channels.for_each(|_, _| {
+            count += 1;
+        });
+        count
     }
 
     /// Drop whatever is installed.
@@ -278,22 +402,17 @@ impl PromotedSessionSlot {
         Option<DedupToken>,
         Vec<DedupToken>,
     )> {
-        self.slot
-            .lock()
-            .take()
-            .map(|session| {
-                session
-                    .channels
-                    .into_iter()
-                    .map(|channel| {
-                        if let Some(task) = channel.endpoint_auth {
-                            task.retire();
-                        }
-                        (channel.worker, channel.dedup, channel.additional_dedup)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(mut session) = self.slot.lock().take() else {
+            return Vec::new();
+        };
+        let mut workers = Vec::new();
+        while let Some((_key, channel)) = session.channels.pop_first_entry() {
+            if let Some(task) = channel.endpoint_auth {
+                task.retire();
+            }
+            workers.push((channel.worker, channel.dedup, channel.additional_dedup));
+        }
+        workers
     }
 
     /// Install a freshly promoted session, replacing anything present.
@@ -303,15 +422,15 @@ impl PromotedSessionSlot {
     /// mutation lock, which serializes promotion, and anything that appeared in
     /// the meantime would be a session this one supersedes.
     ///
-    /// Infallible, and deliberately: every step that could refuse has already
-    /// run inside `promote`, while the authenticated channel was still in its
-    /// slot and a refusal was still retryable. Nothing here can fail late.
+    /// Logical-session admission can still refuse while the authenticated
+    /// channel is being installed. Callers retain ownership of the candidate
+    /// and its cleanup obligations when this returns an error.
     pub(crate) fn install(
         &self,
         session: SessionCapability,
         flows: crate::transport::webrtc::SessionRealtimeFlows,
         binding: PromotedChannelBinding,
-    ) {
+    ) -> Result<(), PromotedSessionInstallRefusal> {
         let PromotedChannelBinding {
             worker,
             endpoint_auth,
@@ -319,28 +438,103 @@ impl PromotedSessionSlot {
             dedup,
             additional_dedup,
         } = binding;
-        *self.slot.lock() = Some(PromotedSession {
-            selected: 0,
-            channels: vec![PromotedChannel {
-                session,
-                flows,
-                worker,
-                endpoint_auth,
-                correlation,
-                dedup,
-                additional_dedup,
-            }],
-            app: PeerSessionState::new(),
-        });
+        let logical_claim = match PromotedSession::logical_claim() {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ClaimArithmetic(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let logical_lease = match session.reserve_retained(logical_claim) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ResourceUnavailable(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let entry_claim = match PromotedSession::channel_map_entry_claim() {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ClaimArithmetic(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let entry_lease = match session.reserve_retained(entry_claim) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ResourceUnavailable(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let logical = LogicalSessionRecord::new(session.validity_witness(), logical_lease);
+        let channel = PromotedChannel {
+            session,
+            flows,
+            worker: Arc::clone(&worker),
+            endpoint_auth,
+            correlation,
+            dedup,
+            additional_dedup,
+        };
+        let mut channels = LeasedMap::new();
+        channels
+            .insert(WorkerKey::of(&worker), channel, entry_lease)
+            .expect("a fresh promoted slot cannot contain its worker key");
+        let promoted = PromotedSession {
+            selected: None,
+            channels,
+            logical,
+        };
+        *self.slot.lock() = Some(promoted);
+        Ok(())
     }
 
     pub(crate) fn add_channel(
         &self,
-        mut session: SessionCapability,
+        session: SessionCapability,
         flows: crate::transport::webrtc::SessionRealtimeFlows,
         binding: PromotedChannelBinding,
-        select: bool,
-    ) -> Result<(), (Option<DedupToken>, Vec<DedupToken>)> {
+    ) -> Result<(), PromotedSessionAdmissionRefusal> {
         let PromotedChannelBinding {
             worker,
             endpoint_auth,
@@ -350,25 +544,147 @@ impl PromotedSessionSlot {
         } = binding;
         let mut slot = self.slot.lock();
         let Some(promoted) = slot.as_mut() else {
-            return Err((dedup, additional_dedup));
+            return Err(admission_refusal(
+                PromotedSessionAdmissionRefusalReason::SlotUnavailable,
+                session,
+                flows,
+                PromotedChannelBinding {
+                    worker,
+                    endpoint_auth,
+                    correlation,
+                    dedup,
+                    additional_dedup,
+                },
+            ));
         };
-        if promoted.contains_worker(&worker) {
-            return Err((dedup, additional_dedup));
+        if !promoted.logical.validity().is_live()
+            || !promoted.logical.validity().witnesses(&session)
+        {
+            return Err(admission_refusal(
+                PromotedSessionAdmissionRefusalReason::LogicalSessionUnavailable,
+                session,
+                flows,
+                PromotedChannelBinding {
+                    worker,
+                    endpoint_auth,
+                    correlation,
+                    dedup,
+                    additional_dedup,
+                },
+            ));
         }
-        session.join_logical_session(&promoted.selected().session);
-        promoted.channels.push(PromotedChannel {
+        if promoted.contains_worker(&worker) {
+            return Err(admission_refusal(
+                PromotedSessionAdmissionRefusalReason::DuplicateWorker,
+                session,
+                flows,
+                PromotedChannelBinding {
+                    worker,
+                    endpoint_auth,
+                    correlation,
+                    dedup,
+                    additional_dedup,
+                },
+            ));
+        }
+        let entry_claim = match PromotedSession::channel_map_entry_claim() {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ClaimArithmetic(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let entry_lease = match session.reserve_retained(entry_claim) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ResourceUnavailable(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let channel = PromotedChannel {
             session,
             flows,
-            worker,
+            worker: Arc::clone(&worker),
             endpoint_auth,
             correlation,
             dedup,
             additional_dedup,
-        });
-        if select {
-            promoted.selected = promoted.channels.len() - 1;
-        }
+        };
+        promoted
+            .channels
+            .insert(WorkerKey::of(&worker), channel, entry_lease)
+            .expect("duplicate worker was rejected under the slot lock");
         Ok(())
+    }
+
+    /// Select an exact installed channel. A failed lookup leaves the current
+    /// selection unchanged; it never guesses from channel order.
+    pub(crate) fn select_channel(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> bool {
+        let mut slot = self.slot.lock();
+        slot.as_mut()
+            .is_some_and(|promoted| promoted.select_channel(worker))
+    }
+
+    /// Preserve a usable exact selection, or select only one channel that
+    /// proves both live connector identity and capability membership. Zero or
+    /// multiple usable channels leave the slot unselected.
+    pub(crate) fn select_unique_usable(
+        &self,
+    ) -> Option<Arc<crate::transport::webrtc::WebRtcConnectorWorker>> {
+        let mut slot = self.slot.lock();
+        slot.as_mut()
+            .and_then(PromotedSession::select_unique_usable)
+    }
+
+    /// Return the exact selected worker, if this slot currently has one.
+    /// Selection is copied as an `Arc`; no borrowed worker escapes the slot lock.
+    pub(crate) fn selected_worker(
+        &self,
+    ) -> Option<Arc<crate::transport::webrtc::WebRtcConnectorWorker>> {
+        self.slot
+            .lock()
+            .as_ref()
+            .and_then(|promoted| promoted.selected_worker().cloned())
+    }
+
+    /// Lend one established capability synchronously without exposing map
+    /// storage or changing selection. Every channel in this bundle is joined to
+    /// the same logical validity lineage, so this is an authority anchor, not a
+    /// transport-selection decision.
+    pub(crate) fn with_established_session<R>(
+        &self,
+        effect: impl FnOnce(&SessionCapability) -> R,
+    ) -> Option<R> {
+        let slot = self.slot.lock();
+        let promoted = slot.as_ref()?;
+        if !promoted.logical.validity().is_live() {
+            return None;
+        }
+        let (_, channel) = promoted.channels.successor_after(None)?;
+        Some(effect(&channel.session))
     }
 
     pub(crate) fn contains_worker(
@@ -412,8 +728,8 @@ impl PromotedSessionSlot {
         };
         let Some(channel) = session
             .channels
-            .iter_mut()
-            .find(|channel| Arc::ptr_eq(&channel.worker, worker))
+            .get_mut(&WorkerKey::of(worker))
+            .filter(|channel| Arc::ptr_eq(&channel.worker, worker))
         else {
             return false;
         };
@@ -427,55 +743,52 @@ impl PromotedSessionSlot {
     ) -> Option<RemovedPromotedChannel> {
         let mut slot = self.slot.lock();
         let promoted = slot.as_mut()?;
-        let index = promoted
-            .channels
-            .iter()
-            .position(|channel| Arc::ptr_eq(&channel.worker, worker))?;
-        let was_selected = index == promoted.selected;
-        let channel = promoted.channels.remove(index);
+        let key = WorkerKey::of(worker);
+        let channel_ref = promoted.channels.get(&key)?;
+        if !Arc::ptr_eq(&channel_ref.worker, worker) {
+            return None;
+        }
+        let selection_needed = promoted
+            .selected
+            .as_ref()
+            .is_some_and(|selected| Arc::ptr_eq(selected, worker));
+        let (_, channel) = promoted.channels.remove_entry(&key)?;
         if let Some(task) = channel.endpoint_auth {
             task.retire();
         }
-        if promoted.channels.is_empty() {
+        if promoted.channels.successor_after(None).is_none() {
             drop(slot.take());
             return Some(RemovedPromotedChannel {
                 worker: channel.worker,
                 dedup: channel.dedup,
                 additional_dedup: channel.additional_dedup,
-                selected_worker: None,
-                selected_correlation: None,
+                selection_needed: false,
                 session_empty: true,
             });
         }
-        if index < promoted.selected {
-            promoted.selected -= 1;
-        } else if was_selected {
-            promoted.selected = 0;
+        if selection_needed {
+            // Removing the selected channel makes selection ambiguous. The
+            // caller must explicitly choose a surviving exact worker.
+            promoted.selected = None;
         }
         Some(RemovedPromotedChannel {
             worker: channel.worker,
             dedup: channel.dedup,
             additional_dedup: channel.additional_dedup,
-            selected_worker: Some(Arc::clone(promoted.selected_worker())),
-            selected_correlation: promoted.correlation_for(promoted.selected_worker()),
+            selection_needed,
             session_empty: false,
         })
     }
 
     /// Whether the installed session may still be reused, dropping it if not.
     ///
-    /// `current` is the caller's use-time conjunction, evaluated under this
-    /// slot's lock against the session's own record. `false` means either
-    /// nothing was installed or what was installed has been revoked and is now
-    /// gone.
-    pub(crate) fn reuse_or_revoke(
-        &self,
-        current: impl FnOnce(&SessionCapability) -> bool,
-    ) -> Reuse {
+    /// Logical reuse is decided only by the established validity witness. Exact
+    /// worker currentness belongs to the worker-specific lenders below.
+    pub(crate) fn reuse_or_revoke(&self) -> Reuse {
         let mut slot = self.slot.lock();
         match slot.as_ref() {
             None => Reuse::Vacant,
-            Some(bundle) if current(&bundle.selected().session) => Reuse::Current,
+            Some(bundle) if bundle.logical.validity().is_live() => Reuse::Current,
             Some(_) => {
                 drop(slot.take());
                 Reuse::Revoked
@@ -483,8 +796,24 @@ impl PromotedSessionSlot {
         }
     }
 
-    /// Lend the installed session if every use-time conjunct still holds, and
-    /// drop it if not.
+    /// Lend the singular logical state independently of channel selection.
+    ///
+    /// The operation carries the established validity witness across the
+    /// callback and never clears the slot when an exact channel is unusable.
+    pub(crate) fn with_logical_operation<R>(
+        &self,
+        effect: impl FnOnce(&mut LogicalSessionOperation<'_>) -> R,
+    ) -> Option<R> {
+        let mut slot = self.slot.lock();
+        let promoted = slot.as_mut()?;
+        let mut operation = promoted.logical.operation()?;
+        Some(effect(&mut operation))
+    }
+
+    /// Lend logical state while its established validity witness is live.
+    ///
+    /// This lender is non-promoting and non-clearing; exact worker currentness
+    /// belongs to the worker-specific lenders below.
     ///
     /// Non-promoting: it uses what exists and creates nothing, so a diagnostic
     /// read cannot bring a session into being. It is still not passive — a
@@ -494,22 +823,13 @@ impl PromotedSessionSlot {
     ///
     /// `effect` runs under this slot's lock. Anything it reads that is not in
     /// the bundle must be lockable *after* this slot, never before.
-    pub(crate) fn with_live<R>(
-        &self,
-        current: impl FnOnce(&SessionCapability) -> bool,
-        effect: impl FnOnce(&mut PromotedSession) -> R,
-    ) -> Option<R> {
+    pub(crate) fn with_live<R>(&self, effect: impl FnOnce(&mut PromotedSession) -> R) -> Option<R> {
         let mut slot = self.slot.lock();
-        if !slot
-            .as_ref()
-            .is_some_and(|bundle| current(&bundle.selected().session))
-        {
-            drop(slot.take());
+        let bundle = slot.as_mut()?;
+        if !bundle.logical.validity().is_live() {
             return None;
         }
-        Some(effect(slot.as_mut().expect(
-            "the conjunction above answered true, which requires an installed session",
-        )))
+        Some(effect(bundle))
     }
 
     pub(crate) fn with_live_worker<R>(
@@ -524,6 +844,9 @@ impl PromotedSessionSlot {
     ) -> Option<R> {
         let mut slot = self.slot.lock();
         let promoted = slot.as_mut()?;
+        if !promoted.logical.validity().is_live() {
+            return None;
+        }
         let (session, flows, worker) = promoted.flows_for_worker_mut(worker)?;
         if !current(session) {
             return None;
@@ -551,6 +874,9 @@ impl PromotedSessionSlot {
     ) -> Option<R> {
         let mut slot = self.slot.lock();
         let promoted = slot.as_mut()?;
+        if !promoted.logical.validity().is_live() {
+            return None;
+        }
         let (session, flows, channel_worker, correlation) =
             promoted.flows_for_worker_with_correlation_mut(worker)?;
         if !current(session) {

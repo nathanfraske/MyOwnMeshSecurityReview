@@ -4,7 +4,7 @@
 use crate::resource::{
     FundedArc, FundedWeak, LeasedMap, LeasedQueue, ResourceClaim, ResourceClass, ResourceLease,
 };
-use crate::runtime::session_broker::SessionCapability;
+use crate::runtime::peer_session::LogicalSessionValidityWitness;
 
 use super::{ApplicationGateway, GatewayAccepted, GatewayDelivery, GatewayMailbox, GatewayRefusal};
 
@@ -214,7 +214,7 @@ impl ApplicationGateway {
 
     pub(crate) fn accept_channel(
         &self,
-        session: &SessionCapability,
+        validity: &LogicalSessionValidityWitness,
         claim: ResourceClaim,
         parse_retention: ResourceLease,
         name: &str,
@@ -257,7 +257,7 @@ impl ApplicationGateway {
             (ResourceClass::OpaqueDependencyResidual, 2),
         ])
         .map_err(|_| GatewayRefusal::Malformed)?;
-        let _scratch = session
+        let _scratch = validity
             .reserve_retained(scratch_claim)
             .map_err(GatewayRefusal::Pressure)?;
         let subscribers = {
@@ -280,13 +280,13 @@ impl ApplicationGateway {
         let mut original_payload = Some(payload);
         let mut prepared = Vec::with_capacity(candidate_count);
         for (index, subscriber) in subscribers.iter().enumerate() {
-            let retention = session.reserve_retained(entry_claim).map_err(|error| {
+            let retention = validity.reserve_retained(entry_claim).map_err(|error| {
                 for subscriber in &subscribers {
                     subscriber.note_pressure();
                 }
                 GatewayRefusal::Pressure(error)
             })?;
-            let node = session.reserve_retained(node_claim).map_err(|error| {
+            let node = validity.reserve_retained(node_claim).map_err(|error| {
                 for subscriber in &subscribers {
                     subscriber.note_pressure();
                 }

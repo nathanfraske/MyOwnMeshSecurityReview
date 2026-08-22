@@ -11,7 +11,7 @@
 //! * **The exact owner token.** [`PeerOwnerToken`] names one *installation*,
 //!   not one device. A device id is a re-resolution key; a token is not, which
 //!   is why every peer-reaching helper takes one.
-//! * **The one-operation witnesses.** [`AdmittedSessionOperation`],
+//! * **The one-operation witnesses.** [`LogicalSessionOperation`],
 //!   [`AdmittedInboundApplicationOperation`], [`AdmittedInboundDispatch`],
 //!   [`AdmittedApplicationOperation`] and [`AdmittedRenegotiation`] are minted
 //!   under the mutation lock and bind the exact installation they were admitted
@@ -158,10 +158,20 @@ pub(super) enum SpeculativeTerminalCleanup {
     },
 }
 
-pub(super) enum CurrentTerminalCleanup {
+pub(super) enum ChannelTerminal {
     Stale,
-    Channel(crate::runtime::peer_session::RemovedPromotedChannel),
-    Peer(Arc<PeerConnection>),
+    Channel {
+        channel: crate::runtime::peer_session::RemovedPromotedChannel,
+    },
+    Peer {
+        peer: Arc<PeerConnection>,
+        channel: crate::runtime::peer_session::RemovedPromotedChannel,
+    },
+}
+
+pub(super) enum LogicalSessionTerminal {
+    Stale,
+    Removed(Arc<PeerConnection>),
 }
 
 impl Default for PeerRegistry {
@@ -524,18 +534,16 @@ impl PeerRegistry {
             return None;
         }
         let policy_admits = self.policy_admits(owner.device_id());
-        // Reaching this command means the local Endpoint Auth reducer selected
-        // this exact candidate. Other live candidates remain speculative; the
-        // authenticated winner becomes the connector used for new operations
-        // without destroying the logical peer session it joins.
-        let select = true;
+        // Reaching this command proves only the exact candidate's fresh Auth
+        // and owner custody. It must join the logical session without making
+        // this reducer an implicit transport selector; channel selection is a
+        // separate local policy decision.
         peer.promote_speculative_if_needed(
             correlation,
             candidate,
             broker,
             mesh_context,
             policy_admits,
-            select,
         )
     }
 
@@ -601,6 +609,35 @@ impl PeerRegistry {
         Some(effect(&current.value().peer))
     }
 
+    /// Resolve an exact installation without requiring a worker stamp.
+    ///
+    /// This is deliberately narrower than `with_current`: it is only for a
+    /// logical-session operation whose admission already established the
+    /// channel witness. A worker belongs to a channel, not to the logical
+    /// session, so requiring it again here would let a channel replacement
+    /// erase a valid post-admission session commit.
+    fn with_current_logical<R>(
+        &self,
+        operation: &LogicalSessionOperation,
+        effect: impl FnOnce(&Arc<PeerConnection>) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(operation.owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &operation.owner.installation)
+            || !operation.witness.is_live()
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if peer.with_logical_session_state(|logical| {
+            operation.witness.same_validity(logical.validity())
+        }) != Some(true)
+        {
+            return None;
+        }
+        Some(effect(peer))
+    }
+
     /// Run one synchronous application operation, only while `owner` is the
     /// installed peer **and** that peer holds a live promoted session.
     ///
@@ -627,7 +664,7 @@ impl PeerRegistry {
         owner: &PeerOwnerToken,
         broker: Option<&SessionBroker>,
         mesh_context: &str,
-        effect: impl FnOnce(&AdmittedSessionOperation<'_>) -> R,
+        effect: impl FnOnce(&LogicalSessionOperation) -> R,
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
@@ -640,11 +677,11 @@ impl PeerRegistry {
         if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
-        Some(effect(&AdmittedSessionOperation {
-            peer,
-            owner,
-            _not_send: std::marker::PhantomData,
-        }))
+        let witness = peer.with_logical_session_state(|logical| logical.validity().clone())?;
+        Some(effect(&LogicalSessionOperation::new(
+            owner.clone(),
+            witness,
+        )))
     }
 
     /// The same fence, session-gated, with an explicit refusal arm.
@@ -667,7 +704,7 @@ impl PeerRegistry {
         owner: &PeerOwnerToken,
         broker: Option<&SessionBroker>,
         mesh_context: &str,
-        admitted: impl FnOnce(&AdmittedSessionOperation<'_>) -> R,
+        admitted: impl FnOnce(&LogicalSessionOperation) -> R,
         refused: impl FnOnce(&Arc<PeerConnection>) -> R,
     ) -> Option<R> {
         let _mutation = self.mutation.lock();
@@ -683,11 +720,11 @@ impl PeerRegistry {
         if !promoted {
             return Some(refused(peer));
         }
-        Some(admitted(&AdmittedSessionOperation {
-            peer,
-            owner,
-            _not_send: std::marker::PhantomData,
-        }))
+        let witness = peer.with_logical_session_state(|logical| logical.validity().clone())?;
+        Some(admitted(&LogicalSessionOperation::new(
+            owner.clone(),
+            witness,
+        )))
     }
 
     /// Re-enter the fence to commit work an earlier acquisition funded, only if
@@ -720,30 +757,10 @@ impl PeerRegistry {
     /// could only misuse.
     pub(super) fn with_same_session<R>(
         &self,
-        owner: &PeerOwnerToken,
-        witness: &crate::runtime::session_broker::SessionValidityWitness,
-        committed: impl FnOnce(&AdmittedSessionOperation<'_>) -> R,
+        operation: LogicalSessionOperation,
+        committed: impl FnOnce(&LogicalSessionOperation) -> R,
     ) -> Option<R> {
-        let _mutation = self.mutation.lock();
-        let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
-            || !owner.worker_matches(&current.value().peer)
-        {
-            return None;
-        }
-        let peer = &current.value().peer;
-        // Read under the lock, like every other authorizing fact in this file.
-        // Deliberately *not* a promotion: promoting here would mint a fresh
-        // session on demand and then hand it work the previous session paid
-        // for, which is the precise substitution this check exists to refuse.
-        if !peer.with_live_session(|session| witness.witnesses(session))? {
-            return None;
-        }
-        Some(committed(&AdmittedSessionOperation {
-            peer,
-            owner,
-            _not_send: std::marker::PhantomData,
-        }))
+        self.with_current_logical(&operation, |_peer| committed(&operation))
     }
 
     /// End **exactly** the session `witness` names, and nothing else.
@@ -777,24 +794,23 @@ impl PeerRegistry {
     ///
     /// No timer, no grace period, no retry. The session either is the one that
     /// failed or is not.
-    pub(super) fn retire_exact_session(
-        &self,
-        owner: &PeerOwnerToken,
-        witness: &crate::runtime::session_broker::SessionValidityWitness,
-    ) -> bool {
+    pub(super) fn retire_exact_session(&self, operation: LogicalSessionOperation) -> bool {
         let _mutation = self.mutation.lock();
-        let Some(current) = self.peers.get(owner.device_id()) else {
+        let Some(current) = self.peers.get(operation.owner.device_id()) else {
             return false;
         };
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
-            || !owner.worker_matches(&current.value().peer)
+        if !Arc::ptr_eq(&current.value().installation, &operation.owner.installation)
+            || !operation.witness.is_live()
         {
             return false;
         }
         let peer = &current.value().peer;
         // Identity, not liveness. "This peer has *a* live session" would retire
         // a successor for its predecessor's failure.
-        if peer.with_live_session(|session| witness.witnesses(session)) != Some(true) {
+        if peer.with_logical_session_state(|logical| {
+            operation.witness.same_validity(logical.validity())
+        }) != Some(true)
+        {
             return false;
         }
         peer.revoke_promoted_session();
@@ -838,16 +854,11 @@ impl PeerRegistry {
         // preferred application path without sending W0's control through W1.
         // `worker_matches` above already proved the stamped worker belongs to
         // this installation's promoted logical session.
-        let session = owner
-            .worker()
-            .cloned()
-            .or_else(|| peer.session.lock().clone())?;
-        let validity = peer.with_live_session(|session| session.validity_witness())?;
+        let session = owner.worker().cloned().or_else(|| peer.current_worker())?;
+        let validity = peer.with_logical_session_state(|logical| logical.validity().clone())?;
+        let logical = LogicalSessionOperation::new(owner.clone(), validity);
         Some(AdmittedApplicationOperation {
-            peer: Arc::clone(peer),
-            session,
-            validity,
-            owner: owner.clone(),
+            channel: logical.into_exact_channel(session),
         })
     }
 
@@ -1094,11 +1105,13 @@ impl PeerRegistry {
         let peer = self.get_if_current(owner)?;
         let worker = peer.media_renegotiation_worker()?;
         let exact_owner = owner.for_worker(Arc::clone(&worker));
+        let logical_witness =
+            peer.with_logical_session_state(|logical| logical.validity().clone())?;
         self.with_live_session_flow_and_exact_worker_with_correlation(
             &exact_owner,
             broker,
             mesh_context,
-            |session, _flows, _live, worker, correlation| {
+            |_session, _flows, _live, worker, correlation| {
                 let mut data = peer.state.write();
                 if !data.media_reneg_pending {
                     return None;
@@ -1107,9 +1120,11 @@ impl PeerRegistry {
                 data.media_reneg_pending = false;
                 drop(data);
                 Some(AdmittedRenegotiation {
-                    session: Arc::clone(worker),
-                    owner: exact_owner.clone(),
-                    validity: session.validity_witness(),
+                    channel: LogicalSessionOperation::new(
+                        exact_owner.clone(),
+                        logical_witness.clone(),
+                    )
+                    .into_exact_channel(Arc::clone(worker)),
                     correlation: correlation.to_string(),
                 })
             },
@@ -1268,43 +1283,82 @@ impl PeerRegistry {
     }
 
     /// Remove one exact authenticated channel while retaining the logical peer
-    /// session and its selected fallback. This is the channel-terminal half of
-    /// [`super::drop_peer_if_current`]; the caller awaits the returned worker and
-    /// releases only its exact dedup custody after this fence is dropped.
+    /// session. This is the channel-terminal half of [`super::drop_peer_if_current`];
+    /// the caller awaits the returned worker and releases only its exact dedup
+    /// custody after this fence is dropped.
     /// Remove one exact terminal owner, or the whole peer when it is the last
     /// authenticated channel, under one mutation fence. The caller receives a
     /// typed outcome so a channel added before this fence cannot make the first
     /// exact retirement disappear into a later whole-peer check.
-    pub(super) fn remove_current_for_terminal(
+    pub(super) fn remove_current_channel_for_terminal(
         &self,
-        owner: &PeerOwnerToken,
-    ) -> CurrentTerminalCleanup {
+        operation: ExactChannelOperation,
+    ) -> ChannelTerminal {
         let _mutation = self.mutation.lock();
+        let owner = operation.owner().clone();
         let Some(current) = self.peers.get(owner.device_id()) else {
-            return CurrentTerminalCleanup::Stale;
+            return ChannelTerminal::Stale;
         };
         if !Arc::ptr_eq(&current.value().installation, &owner.installation)
-            || !owner.worker_matches(&current.value().peer)
+            || !operation.witness().is_live()
         {
-            return CurrentTerminalCleanup::Stale;
+            return ChannelTerminal::Stale;
         }
-        if let Some(worker) = owner.worker() {
-            let peer = &current.value().peer;
-            if peer.promoted_channel_count() > 1 {
-                return peer
-                    .retire_authenticated_worker(worker)
-                    .map(CurrentTerminalCleanup::Channel)
-                    .unwrap_or(CurrentTerminalCleanup::Stale);
-            }
+        let peer = &current.value().peer;
+        if peer.with_logical_session_state(|logical| {
+            operation.witness().same_validity(logical.validity())
+        }) != Some(true)
+            || !peer.owns_authenticated_worker(operation.worker())
+        {
+            return ChannelTerminal::Stale;
+        }
+        let Some(removed) = peer.retire_authenticated_worker(operation.worker()) else {
+            return ChannelTerminal::Stale;
+        };
+        if removed.session_empty {
+            drop(current);
+            let Some((_, entry)) = self.peers.remove(owner.device_id()) else {
+                return ChannelTerminal::Stale;
+            };
+            let peer = entry.peer;
+            peer.retire_connector();
+            self.track_removed_close(Arc::clone(&peer));
+            return ChannelTerminal::Peer {
+                peer,
+                channel: removed,
+            };
+        }
+        ChannelTerminal::Channel { channel: removed }
+    }
+
+    pub(super) fn remove_current_logical_session_for_terminal(
+        &self,
+        operation: LogicalSessionOperation,
+    ) -> LogicalSessionTerminal {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(operation.owner.device_id()) else {
+            return LogicalSessionTerminal::Stale;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &operation.owner.installation)
+            || !operation.witness.is_live()
+        {
+            return LogicalSessionTerminal::Stale;
+        }
+        let peer = &current.value().peer;
+        if peer.with_logical_session_state(|logical| {
+            operation.witness.same_validity(logical.validity())
+        }) != Some(true)
+        {
+            return LogicalSessionTerminal::Stale;
         }
         drop(current);
-        let Some((_, entry)) = self.peers.remove(owner.device_id()) else {
-            return CurrentTerminalCleanup::Stale;
+        let Some((_, entry)) = self.peers.remove(operation.owner.device_id()) else {
+            return LogicalSessionTerminal::Stale;
         };
         let peer = entry.peer;
         peer.retire_connector();
         self.track_removed_close(Arc::clone(&peer));
-        CurrentTerminalCleanup::Peer(peer)
+        LogicalSessionTerminal::Removed(peer)
     }
 
     pub(super) fn remove_if_current_unpromoted(
@@ -1392,17 +1446,33 @@ impl Drop for PeerRegistry {
 /// `PhantomData<*const ()>` makes it `!Send`: it cannot be moved into a task,
 /// and the lifetime keeps it inside the closure, so it can never be held across
 /// an await or outlive the fence that minted it.
-pub(super) struct AdmittedSessionOperation<'a> {
-    peer: &'a Arc<PeerConnection>,
-    /// The exact owner token this fence admitted, borrowed rather than cloned
-    /// so entering the fence costs nothing. Any witness that crosses an await
-    /// clones it, so later bookkeeping names *this* installation instead of
-    /// re-resolving a device id that a replacement may since have taken over.
-    owner: &'a PeerOwnerToken,
-    _not_send: std::marker::PhantomData<*const ()>,
+pub(super) struct LogicalSessionOperation {
+    owner: PeerOwnerToken,
+    witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
 }
 
-impl AdmittedSessionOperation<'_> {
+impl LogicalSessionOperation {
+    fn new(
+        owner: PeerOwnerToken,
+        witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
+    ) -> Self {
+        Self { owner, witness }
+    }
+
+    pub(super) fn owner(&self) -> &PeerOwnerToken {
+        &self.owner
+    }
+
+    pub(super) fn witness(&self) -> &crate::runtime::peer_session::LogicalSessionValidityWitness {
+        &self.witness
+    }
+
+    pub(super) fn session_witness(
+        &self,
+    ) -> crate::runtime::peer_session::LogicalSessionValidityWitness {
+        self.witness.clone()
+    }
+
     /// The exact admitted peer's device id.
     ///
     /// Production dispatch reads the id off the owner token it already carries,
@@ -1410,27 +1480,12 @@ impl AdmittedSessionOperation<'_> {
     /// without holding a witness for anything else.
     #[cfg(test)]
     pub(super) fn device_id(&self) -> &str {
-        &self.peer.device_id
+        self.owner.device_id()
     }
 
     /// Record inbound liveness and traffic on the exact admitted peer.
     pub(super) fn record_inbound(&self, effect: impl FnOnce(&Arc<PeerConnection>)) {
-        effect(self.peer);
-    }
-
-    /// A witness for the exact session this fence admitted.
-    ///
-    /// Read-only and carrying no authority of its own: it cannot send, cannot
-    /// retain, and cannot be turned back into a session. Its whole purpose is to
-    /// let work funded here be committed by a *later* acquisition through
-    /// [`PeerRegistry::with_same_session`], which is what allows peer-supplied
-    /// work to run outside the mutation lock without letting a replacement
-    /// inherit the result.
-    pub(super) fn session_witness(
-        &self,
-    ) -> Option<crate::runtime::session_broker::SessionValidityWitness> {
-        self.peer
-            .with_live_session(|session| session.validity_witness())
+        effect(self.owner.connection());
     }
 
     /// Lend the live session this fence admitted, and the application state it
@@ -1453,7 +1508,19 @@ impl AdmittedSessionOperation<'_> {
             &mut crate::runtime::peer_session::PeerSessionState,
         ) -> R,
     ) -> Option<R> {
-        self.peer.with_live_session_state(effect)
+        self.owner.connection().with_live_session_state(effect)
+    }
+
+    /// Lend only the one logical application state this witness names.
+    ///
+    /// This is the delayed-commit surface: it carries no SessionCapability and
+    /// performs no selected-channel lookup. The connection layer supplies the
+    /// logical-session lender.
+    pub(super) fn with_logical_state<R>(
+        &self,
+        effect: impl FnOnce(&mut crate::runtime::peer_session::LogicalSessionOperation<'_>) -> R,
+    ) -> Option<R> {
+        self.owner.connection().with_logical_session_state(effect)
     }
 
     /// Take one admitted inbound frame as an owned, move-only operation.
@@ -1470,10 +1537,40 @@ impl AdmittedSessionOperation<'_> {
         AdmittedInboundApplicationOperation {
             frame,
             dispatch: AdmittedInboundDispatch {
-                peer: Arc::clone(self.peer),
+                peer: Arc::clone(self.owner.connection()),
                 owner: self.owner.clone(),
+                witness: self.witness.clone(),
             },
         }
+    }
+
+    pub(super) fn into_exact_channel(
+        self,
+        worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    ) -> ExactChannelOperation {
+        ExactChannelOperation {
+            logical: self,
+            worker,
+        }
+    }
+}
+
+pub(super) struct ExactChannelOperation {
+    logical: LogicalSessionOperation,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+}
+
+impl ExactChannelOperation {
+    pub(super) fn owner(&self) -> &PeerOwnerToken {
+        self.logical.owner()
+    }
+
+    pub(super) fn witness(&self) -> &crate::runtime::peer_session::LogicalSessionValidityWitness {
+        self.logical.witness()
+    }
+
+    pub(super) fn worker(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
+        &self.worker
     }
 }
 
@@ -1535,6 +1632,7 @@ impl AdmittedInboundApplicationOperation {
 pub(super) struct AdmittedInboundDispatch {
     peer: Arc<PeerConnection>,
     owner: PeerOwnerToken,
+    witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
 }
 
 impl AdmittedInboundDispatch {
@@ -1542,6 +1640,24 @@ impl AdmittedInboundDispatch {
     /// `owner(device_id)` lookup — that is the escape being closed.
     pub(super) fn owner(&self) -> &PeerOwnerToken {
         &self.owner
+    }
+
+    /// Reify the logical-session authority carried by this dispatch. The
+    /// operation owns the installation and witness, and deliberately carries
+    /// no worker stamp: post-admission logical commits are about the session,
+    /// while channel-specific admissions use [`ExactChannelOperation`].
+    pub(super) fn logical_operation(&self) -> LogicalSessionOperation {
+        LogicalSessionOperation::new(self.owner.clone(), self.witness.clone())
+    }
+
+    /// Bind the worker captured by the accepting callback to this same
+    /// logical witness. The terminal path must use this exact pair; it may
+    /// not manufacture a fresh logical witness after the callback returns.
+    pub(super) fn exact_channel_operation(
+        &self,
+        worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    ) -> ExactChannelOperation {
+        self.logical_operation().into_exact_channel(worker)
     }
 
     /// Run one synchronous application effect on the exact captured peer,
@@ -1575,7 +1691,10 @@ impl AdmittedInboundDispatch {
         peers: &PeerRegistry,
         effect: impl FnOnce(&Arc<PeerConnection>) -> R,
     ) -> Option<R> {
-        peers.with_current(&self.owner, |_current| effect(&self.peer))
+        peers.with_current_logical(
+            &LogicalSessionOperation::new(self.owner.clone(), self.witness.clone()),
+            effect,
+        )
     }
 
     /// The same fence, additionally lending the live session this frame was
@@ -1600,9 +1719,23 @@ impl AdmittedInboundDispatch {
         ) -> R,
     ) -> Option<R> {
         peers
-            .with_current(&self.owner, |_current| {
-                self.peer.with_live_session_state(effect)
-            })
+            .with_current_logical(
+                &LogicalSessionOperation::new(self.owner.clone(), self.witness.clone()),
+                |_current| self.peer.with_live_session_state(effect),
+            )
+            .flatten()
+    }
+
+    pub(super) fn with_captured_logical_state<R>(
+        &self,
+        peers: &PeerRegistry,
+        effect: impl FnOnce(&mut crate::runtime::peer_session::LogicalSessionOperation<'_>) -> R,
+    ) -> Option<R> {
+        peers
+            .with_current_logical(
+                &LogicalSessionOperation::new(self.owner.clone(), self.witness.clone()),
+                |_current| self.peer.with_logical_session_state(effect),
+            )
             .flatten()
     }
 }
@@ -1630,10 +1763,7 @@ impl AdmittedInboundDispatch {
 /// consumed by value, so one admission authorizes one operation.
 #[must_use = "an admitted operation authorizes exactly one send and must be consumed"]
 pub(super) struct AdmittedApplicationOperation {
-    peer: Arc<PeerConnection>,
-    session: Arc<crate::transport::WebRtcConnectorWorker>,
-    validity: crate::runtime::session_broker::SessionValidityWitness,
-    owner: PeerOwnerToken,
+    channel: ExactChannelOperation,
 }
 
 impl AdmittedApplicationOperation {
@@ -1693,7 +1823,7 @@ impl AdmittedApplicationOperation {
         // rather than whatever the transport happened to fail first — a caller
         // that cannot tell a policy refusal from a broken connector has lost
         // the distinction this whole gate exists to draw.
-        if !self.validity.is_live() {
+        if !self.channel.witness().is_live() {
             return Err(Self::revoked());
         }
         after_precheck();
@@ -1711,7 +1841,7 @@ impl AdmittedApplicationOperation {
         // unaffected: revocation commits under the mutation lock below, so a
         // validation that passes proves no revocation had committed while this
         // permit was already held.
-        let send = match self.session.begin_send() {
+        let send = match self.channel.worker().begin_send() {
             Ok(send) => send,
             // The connector refused. Which answer is truthful depends on
             // whether this witness survived, because revocation closes this
@@ -1731,7 +1861,7 @@ impl AdmittedApplicationOperation {
             // authoritative check under the mutation lock is not reached on
             // this path at all.
             Err(native) => {
-                return Err(if self.validity.is_live() {
+                return Err(if self.channel.witness().is_live() {
                     native
                 } else {
                     Self::revoked()
@@ -1739,15 +1869,20 @@ impl AdmittedApplicationOperation {
             }
         };
         let _mutation = peers.mutation.lock();
-        let current = peers.peers.get(self.owner.device_id()).filter(|current| {
-            Arc::ptr_eq(&current.value().installation, &self.owner.installation)
-                && self.owner.worker_matches(&current.value().peer)
-        });
-        if current.is_none() || !self.validity.is_live() {
+        let current = peers
+            .peers
+            .get(self.channel.owner().device_id())
+            .filter(|current| {
+                Arc::ptr_eq(
+                    &current.value().installation,
+                    &self.channel.owner().installation,
+                ) && self.channel.owner().worker_matches(&current.value().peer)
+            });
+        if current.is_none() || !self.channel.witness().is_live() {
             return Err(Self::revoked());
         }
         Ok(StartedApplicationOperation {
-            peer: self.peer,
+            peer: Arc::clone(self.channel.owner().connection()),
             send,
         })
     }
@@ -1846,8 +1981,7 @@ impl StartedApplicationOperation {
 /// value, so one admission starts one run.
 #[must_use = "an admitted handler run authorizes exactly one start and must be consumed"]
 pub(super) struct AdmittedHandlerRun {
-    validity: crate::runtime::session_broker::SessionValidityWitness,
-    owner: PeerOwnerToken,
+    logical: LogicalSessionOperation,
 }
 
 impl AdmittedHandlerRun {
@@ -1860,9 +1994,11 @@ impl AdmittedHandlerRun {
     /// authority that never asked for it.
     pub(super) fn new(
         owner: PeerOwnerToken,
-        validity: crate::runtime::session_broker::SessionValidityWitness,
+        validity: crate::runtime::peer_session::LogicalSessionValidityWitness,
     ) -> Self {
-        Self { validity, owner }
+        Self {
+            logical: LogicalSessionOperation::new(owner, validity),
+        }
     }
 
     /// Cross the run's synchronous start point.
@@ -1895,16 +2031,21 @@ impl AdmittedHandlerRun {
         // dead, and without touching the registry-wide lock every peer mutation
         // contends on. Not the linearization point: it reads no registry state,
         // and the authoritative check is the one under the fence below.
-        if !self.validity.is_live() {
+        if !self.logical.witness().is_live() {
             return Err(Self::revoked());
         }
         at_precommit();
         let _mutation = peers.mutation.lock();
-        let current = peers.peers.get(self.owner.device_id()).filter(|current| {
-            Arc::ptr_eq(&current.value().installation, &self.owner.installation)
-                && self.owner.worker_matches(&current.value().peer)
-        });
-        if current.is_none() || !self.validity.is_live() {
+        let current = peers
+            .peers
+            .get(self.logical.owner().device_id())
+            .filter(|current| {
+                Arc::ptr_eq(
+                    &current.value().installation,
+                    &self.logical.owner().installation,
+                )
+            });
+        if current.is_none() || !self.logical.witness().is_live() {
             return Err(Self::revoked());
         }
         Ok(StartedHandlerRun { _started: () })
@@ -1945,36 +2086,33 @@ pub(super) struct StartedHandlerRun {
 /// replaced is safe — `complete` would find nothing current and write nothing.
 #[must_use = "a claimed renegotiation must be completed, or its in-flight guard stays latched"]
 pub(super) struct AdmittedRenegotiation {
-    session: Arc<crate::transport::WebRtcConnectorWorker>,
-    owner: PeerOwnerToken,
-    validity: crate::runtime::session_broker::SessionValidityWitness,
+    channel: ExactChannelOperation,
     correlation: String,
 }
 
 impl AdmittedRenegotiation {
     pub(super) fn is_live(&self) -> bool {
-        self.validity.is_live()
+        self.channel.witness().is_live()
     }
 
     pub(super) async fn revoked(&self) {
-        let validity = self.validity.clone();
-        validity.revoked().await;
+        self.channel.witness().revoked().await;
     }
 
     /// The connector this renegotiation drives. Its own liveness and close
     /// fence stays authoritative for every SDP call.
     pub(super) fn session(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
-        &self.session
+        self.channel.worker()
     }
 
     /// The exact installation and worker captured with this claim.
     pub(super) fn owner(&self) -> &PeerOwnerToken {
-        &self.owner
+        self.channel.owner()
     }
 
     /// The captured owner's device id, for logging and signaling attribution.
     pub(super) fn device_id(&self) -> &str {
-        self.owner.device_id()
+        self.channel.owner().device_id()
     }
 
     pub(super) fn correlation(&self) -> &str {
@@ -1987,7 +2125,7 @@ impl AdmittedRenegotiation {
     /// every write here becomes a no-op: the result is dropped rather than
     /// attributed to the replacement.
     pub(super) fn complete(self, peers: &PeerRegistry, outcome: std::result::Result<(), String>) {
-        let Some(peer) = peers.get_if_current(&self.owner) else {
+        let Some(peer) = peers.with_current_logical(&self.channel.logical, Arc::clone) else {
             return;
         };
         let mut data = peer.state.write();
@@ -1998,12 +2136,12 @@ impl AdmittedRenegotiation {
                 // after this claim was taken. Completing the older exchange
                 // must not erase that newer debt.
                 let rearmed = data.media_reneg_pending;
-                if self.session.role() == crate::transport::Role::Offerer {
+                if self.channel.worker().role() == crate::transport::Role::Offerer {
                     data.last_offer_sent_at = Some(std::time::Instant::now());
                 }
                 drop(data);
                 if !rearmed {
-                    peer.clear_media_renegotiation_worker(&self.session);
+                    peer.clear_media_renegotiation_worker(self.channel.worker());
                 }
                 peer.state.write().media_reneg_pending =
                     rearmed || peer.has_pending_media_renegotiation();
@@ -2013,7 +2151,7 @@ impl AdmittedRenegotiation {
                 // instead of losing the track-set change.
                 data.media_reneg_pending = true;
                 drop(data);
-                tracing::debug!(peer = %self.owner.device_id(), "renegotiation deferred: {error}");
+                tracing::debug!(peer = %self.channel.owner().device_id(), "renegotiation deferred: {error}");
             }
         }
     }
