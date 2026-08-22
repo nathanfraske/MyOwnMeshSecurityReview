@@ -2883,6 +2883,43 @@ struct PendingRemoteCandidateReservation {
     application: Option<crate::runtime::attempt::ApplyingRemoteCandidate>,
 }
 
+fn applied_remote_candidate_retained_claim() -> Result<crate::resource::ResourceClaim> {
+    let retained_bytes = std::mem::size_of::<PendingRemoteCandidateReservation>()
+        .checked_add(std::mem::size_of::<[u8; 32]>())
+        .ok_or_else(|| {
+            Error::Transport("applied remote-candidate ownership size overflowed".to_string())
+        })?;
+    let retained_bytes = u64::try_from(retained_bytes).map_err(|_| {
+        Error::Transport("applied remote-candidate ownership size is not representable".to_string())
+    })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            retained_bytes,
+        ),
+        (crate::resource::ResourceClass::StorageObject, 2),
+        // One ordered-set node, one linked-list node, and the native
+        // ICE-agent copy whose byte shape is hidden by webrtc-rs. The
+        // residual remains owned until this exact attempt retires.
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 3),
+    ])
+    .map_err(|error| {
+        Error::Transport(format!(
+            "applied remote-candidate ownership claim overflowed: {error}"
+        ))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn applied_remote_candidate_reservation_charge_for_test(
+) -> crate::resource::ResourceClaim {
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        applied_remote_candidate_retained_claim()
+            .expect("applied remote-candidate claim is representable"),
+    )
+    .expect("applied remote-candidate reservation charge is representable")
+}
+
 /// Exact Rust-owned production queue contribution for one candidate.
 ///
 /// The connector-neutral elastic lease owns its digest state. This separate
@@ -5314,34 +5351,7 @@ impl WebRtcConnectorWorker {
         }
         drop(observation);
         if let Some(mut reservation) = _queue_reservation {
-            let retained_bytes = std::mem::size_of::<PendingRemoteCandidateReservation>()
-                .checked_add(std::mem::size_of::<[u8; 32]>())
-                .ok_or_else(|| {
-                    Error::Transport(
-                        "applied remote-candidate ownership size overflowed".to_string(),
-                    )
-                })?;
-            let retained_bytes = u64::try_from(retained_bytes).map_err(|_| {
-                Error::Transport(
-                    "applied remote-candidate ownership size is not representable".to_string(),
-                )
-            })?;
-            let retained_claim = crate::resource::ResourceClaim::try_from_entries([
-                (
-                    crate::resource::ResourceClass::AccountedMemoryBytes,
-                    retained_bytes,
-                ),
-                (crate::resource::ResourceClass::StorageObject, 2),
-                // One ordered-set node, one linked-list node, and the native
-                // ICE-agent copy whose byte shape is hidden by webrtc-rs. The
-                // residual remains owned until this exact attempt retires.
-                (crate::resource::ResourceClass::OpaqueDependencyResidual, 3),
-            ])
-            .map_err(|error| {
-                Error::Transport(format!(
-                    "applied remote-candidate ownership claim overflowed: {error}"
-                ))
-            })?;
+            let retained_claim = applied_remote_candidate_retained_claim()?;
             if let Err(error) = elastic_application.transition_after_application(retained_claim) {
                 self.remote_candidates.lock().retire_attempt(&attempt);
                 return Err(Error::ResourceUnavailable(error));

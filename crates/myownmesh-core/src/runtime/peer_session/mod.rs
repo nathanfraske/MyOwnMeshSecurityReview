@@ -84,7 +84,8 @@ impl DedupToken {
 
 pub(crate) use reliable::{InboundOutcome, UnsentFrame};
 pub(crate) use slot::{
-    PromotedChannelBinding, PromotedSession, PromotedSessionSlot, RemovedPromotedChannel, Reuse,
+    PromotedChannelBinding, PromotedDedupDrain, PromotedDedupSet, PromotedSession,
+    PromotedSessionSlot, RemovedPromotedChannel, Reuse,
 };
 
 #[cfg(all(test, feature = "transport-lab"))]

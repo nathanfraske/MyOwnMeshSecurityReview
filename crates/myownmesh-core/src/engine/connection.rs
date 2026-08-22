@@ -16,7 +16,9 @@ use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 use crate::transport::{PeerDiag, SelectedCandidatePair, WebRtcConnectorWorker};
 
 use super::ladder::ConnectionTier;
-use crate::runtime::peer_session::{DedupToken, PromotedChannelBinding};
+use crate::runtime::peer_session::{
+    DedupToken, PromotedChannelBinding, PromotedDedupDrain, PromotedDedupSet,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -323,13 +325,27 @@ pub(super) struct SpeculativePromotion {
 
 pub(super) struct AttemptDisplacement {
     pub(super) dedup: Option<DedupToken>,
-    pub(super) additional_dedup: Vec<DedupToken>,
+    pub(super) additional_dedup: PromotedDedupSet,
+    pub(super) retired_dedup: Vec<DedupToken>,
 }
 
 pub(super) struct SpeculativeRetirement {
     pub(super) worker: Arc<WebRtcConnectorWorker>,
     pub(super) dedup: Option<DedupToken>,
-    pub(super) additional_dedup: Vec<DedupToken>,
+    pub(super) additional_dedup: PromotedDedupSet,
+}
+
+pub(super) struct DedupDrain {
+    primary: Option<DedupToken>,
+    additional: PromotedDedupDrain,
+}
+
+impl Iterator for DedupDrain {
+    type Item = DedupToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.primary.take().or_else(|| self.additional.next())
+    }
 }
 
 /// A provider-funded connector being considered as a replacement for the
@@ -342,7 +358,7 @@ pub(super) struct SpeculativeAttempt {
     pub(super) endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
     pub(super) authenticated_channel: Option<crate::endpoint_auth::AuthenticatedChannelCapability>,
     pub(super) dedup: Option<DedupToken>,
-    pub(super) additional_dedup: Vec<DedupToken>,
+    pub(super) additional_dedup: PromotedDedupSet,
     pub(super) _attempt_lease: ResourceLease,
 }
 
@@ -413,7 +429,7 @@ pub struct PeerConnection {
     /// and no decision anywhere reads it as authority or preference.
     attempt: RwLock<String>,
     attempt_dedup: Mutex<Option<DedupToken>>,
-    additional_attempt_dedup: Mutex<Vec<DedupToken>>,
+    additional_attempt_dedup: Mutex<PromotedDedupSet>,
     /// The promoted session bundle. This slot is the sole post-promotion
     /// authority: it owns channel membership/selection, Endpoint Auth,
     /// correlation, capability, realtime flows, and logical application state.
@@ -485,7 +501,7 @@ impl PeerConnection {
                 if let Some(dedup) = dedup {
                     self.retired_dedup.lock().push(dedup);
                 }
-                self.retired_dedup.lock().extend(additional_dedup);
+                drop(additional_dedup);
             }
             self.retain_closing_worker(Arc::clone(&worker));
             worker.start_close();
@@ -595,21 +611,73 @@ impl PeerConnection {
         let mut current = self.attempt.write();
         if *current == attempt {
             if let Some(dedup) = dedup {
-                self.additional_attempt_dedup.lock().push(dedup);
+                let worker = self.session.lock().clone();
+                let mut retained = self.additional_attempt_dedup.lock();
+                if let Some(worker) = worker {
+                    if let Err(dedup) = retained.try_push_speculative(&worker, dedup) {
+                        drop(retained);
+                        if let Some(runtime) = self
+                            .signaling_runtime
+                            .read()
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                        {
+                            runtime.forget_token(dedup);
+                        }
+                    }
+                } else {
+                    drop(retained);
+                    if let Some(runtime) = self
+                        .signaling_runtime
+                        .read()
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                    {
+                        runtime.forget_token(dedup);
+                    }
+                }
             }
             return None;
         }
         *current = attempt.to_string();
         let previous = std::mem::replace(&mut *self.attempt_dedup.lock(), dedup);
-        let additional_dedup = std::mem::take(&mut *self.additional_attempt_dedup.lock());
+        let additional_dedup = std::mem::replace(
+            &mut *self.additional_attempt_dedup.lock(),
+            PromotedDedupSet::new(),
+        );
         Some(AttemptDisplacement {
             dedup: previous,
             additional_dedup,
+            retired_dedup: Vec::new(),
         })
     }
 
     pub(super) fn retain_current_dedup(&self, token: DedupToken) {
-        self.additional_attempt_dedup.lock().push(token);
+        let worker = self.session.lock().clone();
+        let mut retained = self.additional_attempt_dedup.lock();
+        if let Some(worker) = worker {
+            if let Err(token) = retained.try_push_speculative(&worker, token) {
+                drop(retained);
+                if let Some(runtime) = self
+                    .signaling_runtime
+                    .read()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                {
+                    runtime.forget_token(token);
+                }
+            }
+        } else {
+            drop(retained);
+            if let Some(runtime) = self
+                .signaling_runtime
+                .read()
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                runtime.forget_token(token);
+            }
+        }
     }
 
     /// Install a separately owned replacement attempt.  The correlation is
@@ -664,7 +732,7 @@ impl PeerConnection {
             endpoint_auth: None,
             authenticated_channel: None,
             dedup: dedup.take(),
-            additional_dedup: Vec::new(),
+            additional_dedup: PromotedDedupSet::new(),
             _attempt_lease: attempt_lease,
         });
         true
@@ -782,8 +850,10 @@ impl PeerConnection {
             if let Some(attempt) = candidates.iter_mut().find(|attempt| {
                 attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
             }) {
-                attempt.additional_dedup.push(token);
-                return true;
+                return attempt
+                    .additional_dedup
+                    .try_push_speculative(worker, token)
+                    .is_ok();
             }
         }
         self.promoted_session.retain_dedup_for_worker(worker, token)
@@ -864,7 +934,7 @@ impl PeerConnection {
             endpoint_auth,
             correlation,
             mut dedup,
-            mut additional_dedup,
+            additional_dedup,
         ) = {
             let mut candidates = self.speculative.lock();
             let attempt = candidates.iter_mut().find(|attempt| {
@@ -887,7 +957,7 @@ impl PeerConnection {
                 endpoint_auth,
                 attempt.correlation.clone(),
                 attempt.dedup.take(),
-                std::mem::take(&mut attempt.additional_dedup),
+                std::mem::replace(&mut attempt.additional_dedup, PromotedDedupSet::new()),
             )
         };
         let policy = crate::runtime::session_broker::CurrentPolicyAdmission::from_admitted_peer(
@@ -943,7 +1013,7 @@ impl PeerConnection {
             endpoint_auth: Some(Arc::clone(&endpoint_auth)),
             correlation: correlation.clone(),
             dedup: dedup.take(),
-            additional_dedup: std::mem::take(&mut additional_dedup),
+            additional_dedup,
         };
         if let Err(refusal) =
             self.promoted_session
@@ -1009,7 +1079,7 @@ impl PeerConnection {
             authenticated_channel: Mutex::new(None),
             attempt: RwLock::new(mint_attempt()),
             attempt_dedup: Mutex::new(None),
-            additional_attempt_dedup: Mutex::new(Vec::new()),
+            additional_attempt_dedup: Mutex::new(PromotedDedupSet::new()),
             promoted_session: crate::runtime::peer_session::PromotedSessionSlot::new(),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1138,10 +1208,34 @@ impl PeerConnection {
             }
             attempt.session.retire();
             if let Some(dedup) = attempt.dedup {
-                self.retired_dedup.lock().push(dedup);
+                if let Some(runtime) = self
+                    .signaling_runtime
+                    .read()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                {
+                    runtime.forget_token(dedup);
+                } else {
+                    self.retired_dedup.lock().push(dedup);
+                }
             }
-            self.retired_dedup.lock().extend(attempt.additional_dedup);
-            workers.push((attempt.session, None, Vec::new()));
+            if let Some(runtime) = self
+                .signaling_runtime
+                .read()
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                for dedup in attempt.additional_dedup.drain_tokens() {
+                    runtime.forget_token(dedup);
+                }
+            } else {
+                drop(attempt.additional_dedup);
+            }
+            workers.push((
+                attempt.session,
+                None,
+                PromotedDedupSet::new().drain_tokens(),
+            ));
         }
         let worker = self.session.lock().take();
         if let Some(worker) = worker {
@@ -1149,14 +1243,38 @@ impl PeerConnection {
             workers.push((
                 worker,
                 self.attempt_dedup.lock().take(),
-                std::mem::take(&mut *self.additional_attempt_dedup.lock()),
+                std::mem::replace(
+                    &mut *self.additional_attempt_dedup.lock(),
+                    PromotedDedupSet::new(),
+                )
+                .drain_tokens(),
             ));
         }
         for (worker, dedup, additional_dedup) in workers {
             if let Some(dedup) = dedup {
-                self.retired_dedup.lock().push(dedup);
+                if let Some(runtime) = self
+                    .signaling_runtime
+                    .read()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                {
+                    runtime.forget_token(dedup);
+                } else {
+                    self.retired_dedup.lock().push(dedup);
+                }
             }
-            self.retired_dedup.lock().extend(additional_dedup);
+            if let Some(runtime) = self
+                .signaling_runtime
+                .read()
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                for dedup in additional_dedup {
+                    runtime.forget_token(dedup);
+                }
+            } else {
+                drop(additional_dedup);
+            }
             self.retain_closing_worker(worker);
         }
     }
@@ -1384,18 +1502,26 @@ impl PeerConnection {
     }
 
     pub(super) fn take_attempt_displacement(&self) -> AttemptDisplacement {
+        let additional_dedup = std::mem::replace(
+            &mut *self.additional_attempt_dedup.lock(),
+            PromotedDedupSet::new(),
+        );
         AttemptDisplacement {
             dedup: self.attempt_dedup.lock().take(),
-            additional_dedup: std::mem::take(&mut *self.additional_attempt_dedup.lock()),
+            additional_dedup,
+            retired_dedup: Vec::new(),
         }
     }
 
-    pub(super) fn take_current_dedups(&self) -> Vec<DedupToken> {
-        let mut tokens = std::mem::take(&mut *self.additional_attempt_dedup.lock());
-        if let Some(token) = self.attempt_dedup.lock().take() {
-            tokens.push(token);
+    pub(super) fn take_current_dedups(&self) -> DedupDrain {
+        DedupDrain {
+            primary: self.attempt_dedup.lock().take(),
+            additional: std::mem::replace(
+                &mut *self.additional_attempt_dedup.lock(),
+                PromotedDedupSet::new(),
+            )
+            .drain_tokens(),
         }
-        tokens
     }
 
     /// Build an entry that already holds `task` as its current endpoint-auth
@@ -1560,6 +1686,13 @@ impl PeerConnection {
         self.promoted_session.select_unique_usable()
     }
 
+    /// Select one exact installed promoted channel without consulting channel
+    /// order or applying fallback policy. The slot owns the identity check.
+    #[cfg(test)]
+    pub(super) fn select_promoted_channel(&self, worker: &Arc<WebRtcConnectorWorker>) -> bool {
+        self.promoted_session.select_channel(worker)
+    }
+
     /// Promote this entry's authenticated channel into a live session, once.
     ///
     /// Called only from inside the registry mutation lock, which is what makes
@@ -1689,8 +1822,9 @@ impl PeerConnection {
                         endpoint_auth,
                         correlation,
                         dedup: self.attempt_dedup.lock().take(),
-                        additional_dedup: std::mem::take(
+                        additional_dedup: std::mem::replace(
                             &mut *self.additional_attempt_dedup.lock(),
+                            PromotedDedupSet::new(),
                         ),
                     },
                 );

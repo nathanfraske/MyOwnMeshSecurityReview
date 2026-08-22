@@ -1163,9 +1163,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                                 )
                                 .await;
                             } else {
-                                let mut ended_tokens = owner.connection().take_current_dedups();
-                                ended_tokens.extend(owner.connection().take_retired_dedup());
-                                forget_dedups(state, ended_tokens);
+                                let ended_tokens = owner.connection().take_current_dedups();
+                                forget_dedups(
+                                    state,
+                                    ended_tokens
+                                        .chain(owner.connection().take_retired_dedup().into_iter()),
+                                );
                             }
                             trace!(
                                 peer = %device_id,
@@ -1179,12 +1182,13 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                         }
                     }
                     Err(e) => {
-                        let failed_offer_tokens = state
+                        if let Some(failed_offer_tokens) = state
                             .peers
                             .get_if_current(&owner)
                             .map(|peer| peer.take_current_dedups())
-                            .unwrap_or_default();
-                        forget_dedups(state, failed_offer_tokens);
+                        {
+                            forget_dedups(state, failed_offer_tokens);
+                        }
                         state.log_diag_with(
                             crate::events::DiagLevel::Error,
                             "signaling",
@@ -2400,7 +2404,7 @@ async fn retire_speculative_exact(
         .take_speculative_exact(owner, correlation, candidate)
     {
         forget_dedup_owned(state, retired.dedup);
-        forget_dedups(state, retired.additional_dedup);
+        forget_dedups(state, retired.additional_dedup.drain_tokens());
         let closed = owner
             .connection()
             .await_exact_retired_worker(&retired.worker)
@@ -2423,7 +2427,7 @@ async fn retire_speculative_terminal(
     {
         Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
             forget_dedup_owned(state, retired.dedup);
-            forget_dedups(state, retired.additional_dedup);
+            forget_dedups(state, retired.additional_dedup.drain_tokens());
             let closed = owner
                 .connection()
                 .await_exact_retired_worker(&retired.worker)
@@ -2434,7 +2438,7 @@ async fn retire_speculative_terminal(
         }
         Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
             forget_dedup_owned(state, removed.dedup);
-            forget_dedups(state, removed.additional_dedup);
+            forget_dedups(state, removed.additional_dedup.drain_tokens());
             let closed = owner
                 .connection()
                 .await_exact_retired_worker(&removed.worker)
@@ -4658,7 +4662,10 @@ fn retire_after_failed_rpc_send(
     }
 }
 
-/// Send one peer-facing RPC frame through the exact owner.
+/// Send one peer-facing RPC frame through the current selected channel of the
+/// exact logical operation. The explicit selection seam must run before this
+/// helper; this path only carries the workerless logical owner to the existing
+/// application admission and wire send.
 ///
 /// Answers whether it went out. `false` means the session that owned the
 /// operation has already been retired by [`retire_after_failed_rpc_send`], and
@@ -6495,7 +6502,10 @@ fn forget_dedup_owned(
     }
 }
 
-fn forget_dedups(state: &Arc<NetworkState>, tokens: Vec<crate::runtime::peer_session::DedupToken>) {
+fn forget_dedups<I>(state: &Arc<NetworkState>, tokens: I)
+where
+    I: IntoIterator<Item = crate::runtime::peer_session::DedupToken>,
+{
     for token in tokens {
         forget_dedup_owned(state, Some(token));
     }
@@ -6503,7 +6513,8 @@ fn forget_dedups(state: &Arc<NetworkState>, tokens: Vec<crate::runtime::peer_ses
 
 fn forget_displacement(state: &Arc<NetworkState>, displaced: connection::AttemptDisplacement) {
     forget_dedup_owned(state, displaced.dedup);
-    forget_dedups(state, displaced.additional_dedup);
+    forget_dedups(state, displaced.additional_dedup.drain_tokens());
+    forget_dedups(state, displaced.retired_dedup);
 }
 
 /// This peer's current attempt correlation, for stamping an outbound signal.
@@ -6570,7 +6581,7 @@ pub(crate) async fn drop_peer_if_current(
             ) {
                 peer_registry::ChannelTerminal::Channel { channel } => {
                     forget_dedup_owned(state, channel.dedup);
-                    forget_dedups(state, channel.additional_dedup);
+                    forget_dedups(state, channel.additional_dedup.drain_tokens());
                     let closed = owner
                         .connection()
                         .await_exact_retired_worker(&channel.worker)
@@ -6582,7 +6593,7 @@ pub(crate) async fn drop_peer_if_current(
                 }
                 peer_registry::ChannelTerminal::Peer { peer, channel } => {
                     forget_dedup_owned(state, channel.dedup);
-                    forget_dedups(state, channel.additional_dedup);
+                    forget_dedups(state, channel.additional_dedup.drain_tokens());
                     let closed = owner
                         .connection()
                         .await_exact_retired_worker(&channel.worker)
@@ -6602,7 +6613,7 @@ pub(crate) async fn drop_peer_if_current(
         {
             Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
                 forget_dedup_owned(state, retired.dedup);
-                forget_dedups(state, retired.additional_dedup);
+                forget_dedups(state, retired.additional_dedup.drain_tokens());
                 let closed = owner
                     .connection()
                     .await_exact_retired_worker(&retired.worker)
@@ -6613,7 +6624,7 @@ pub(crate) async fn drop_peer_if_current(
             }
             Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
                 forget_dedup_owned(state, removed.dedup);
-                forget_dedups(state, removed.additional_dedup);
+                forget_dedups(state, removed.additional_dedup.drain_tokens());
                 let closed = owner
                     .connection()
                     .await_exact_retired_worker(&removed.worker)
@@ -6744,7 +6755,7 @@ fn install_peer(
     let replaced = peers.install(peer)?;
     let mut attempt = replaced.take_attempt_displacement();
     replaced.retire_connector();
-    attempt.additional_dedup = replaced.take_retired_dedup();
+    attempt.retired_dedup = replaced.take_retired_dedup();
     peers.track_replaced_close(replaced);
     Some(attempt)
 }
@@ -18418,13 +18429,28 @@ mod tests {
         let target = data_encoding::BASE32_NOPAD
             .encode(remote_key.verifying_key().as_bytes())
             .to_lowercase();
-        let (state, _signaling_in_rx, mut cmd_rx, provider, grant) = build_test_state_parts_metered(
-            "b2-provider-deltas",
-            Some(realtime_test_profile()),
-            3,
-            None,
-        );
+        let (state, mut signaling_in_rx, mut cmd_rx, provider, grant) =
+            build_test_state_parts_metered(
+                "b2-provider-deltas",
+                Some(realtime_test_profile()),
+                3,
+                None,
+            );
         let peer_state = build_test_state("b2-provider-deltas-remote");
+        // The signaling runtime and its carrier are production-owned state.
+        // Publish them before the full baseline so their scope and receipt
+        // remain part of the measured provider throughout this lifecycle.
+        let signaling_runtime = signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state
+                .local_application_resource_scope()
+                .expect("the provider fixture issues one signaling-runtime scope"),
+        );
+        state.publish_signaling_runtime(&signaling_runtime);
+        let dedup_carrier = signaling_ingress::SignalingRuntime::attach(
+            &signaling_runtime,
+            SignalingCarrier::Nostr,
+        );
         let full_baseline = provider.in_use();
         let fixture = insert_promoted_peer(&state, &target).await;
         let owner = state
@@ -18448,6 +18474,7 @@ mod tests {
             1,
             "first admission retains exactly one promoted channel entry"
         );
+        let initial_promoted_correlation = owner.connection().attempt();
         let replay = NetworkCmd::ReplayCapabilities {
             owner: owner.clone(),
         };
@@ -18462,9 +18489,15 @@ mod tests {
         assert_eq!(
             first_delta,
             crate::runtime::session_broker::session_reservation_charge_for_test()
+                .checked_add(
+                    crate::runtime::session_broker::session_correlation_reservation_charge_for_test(
+                        &initial_promoted_correlation,
+                    ),
+                )
+                .expect("first-session correlation charge is representable")
                 .checked_add(replay_charge)
                 .expect("first admission and replay charge are representable"),
-            "first admission charges the exact session reservation and queued ReplayCapabilities item"
+            "first admission charges the exact session, correlation, and queued ReplayCapabilities items"
         );
         let replay_delivery = cmd_rx
             .try_recv()
@@ -18483,14 +18516,21 @@ mod tests {
                 .in_use()
                 .checked_sub(baseline)
                 .expect("the provider remains above its baseline reservation"),
-            crate::runtime::session_broker::session_reservation_charge_for_test(),
-            "consuming the exact ReplayCapabilities delivery leaves only the stable session reservation"
+            crate::runtime::session_broker::session_reservation_charge_for_test()
+                .checked_add(
+                    crate::runtime::session_broker::session_correlation_reservation_charge_for_test(
+                        &initial_promoted_correlation,
+                    ),
+                )
+                .expect("stable session and correlation charges are representable"),
+            "consuming the exact ReplayCapabilities delivery leaves stable session and correlation reservations"
         );
 
         // The native candidate's connector and Endpoint Auth claims are part
         // of the measured additional lifecycle. Capture the near-side
-        // provider before opening that link so terminal cleanup can prove it
-        // returns every claim, not merely the logical channel reservation.
+        // provider before opening that link so, after the external fixture
+        // anchors are released, terminal cleanup can prove it returns every
+        // claim, not merely the logical channel reservation.
         let before_link_one = provider.in_use();
         let mut link_one =
             crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
@@ -18517,6 +18557,61 @@ mod tests {
             &remote_key,
         )
         .await;
+        // Seed one real signaling-runtime de-duplication record while the
+        // candidate is still speculative. Promotion must transfer this funded
+        // node into the promoted channel's retained custody.
+        let before_dedup_seed = provider.in_use();
+        let dedup_node_charge =
+            crate::resource::FiniteResourceProvider::reservation_planning_charge(
+                crate::runtime::peer_session::PromotedDedupSet::entry_claim()
+                    .expect("the promoted dedup node claim is representable"),
+            )
+            .expect("the promoted dedup node planning charge is representable");
+        let signaling_record_charge =
+            crate::resource::FiniteResourceProvider::reservation_planning_charge(
+                crate::resource::ResourceClaim::single(
+                    crate::resource::ResourceClass::OpaqueDependencyResidual,
+                    1,
+                ),
+            )
+            .expect("the signaling record planning charge is representable");
+        let dedup_retention_charge = dedup_node_charge
+            .checked_add(signaling_record_charge)
+            .and_then(|charge| charge.checked_add(signaling_record_charge))
+            .expect("the three Candidate retention records compose");
+        let applied_candidate_charge =
+            crate::transport::webrtc::applied_remote_candidate_reservation_charge_for_test();
+        assert!(dedup_carrier.deliver(dedup_carrier.directed(
+            target.clone(),
+            myownmesh_signaling::SignalingMessage::Candidate {
+                peer_id: target.clone(),
+                offer_id: correlation_one.to_string(),
+                candidate:
+                    "candidate:foundation 1 udp 2113937151 192.0.2.1 5000 typ host".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            },
+        )));
+        let dedup_delivery = signaling_in_rx
+            .recv()
+            .await
+            .expect("the provider fixture receives the dedup seed");
+        dedup_delivery
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+            .await;
+        assert!(
+            signaling_runtime.remembers_attempt_for_test(correlation_one),
+            "the promoted candidate carries one real signaling de-duplication node"
+        );
+        assert_eq!(
+            provider.in_use(),
+            before_dedup_seed
+                .checked_add(dedup_retention_charge)
+                .and_then(|claim| claim.checked_add(applied_candidate_charge))
+                .expect("the Candidate retention delta is representable"),
+            "the production Candidate mailbox admission retains one applied ICE reservation and three dedup records"
+        );
         drop(open_one_resources);
         let before_additional = provider.in_use();
         let attempt_charge = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
@@ -18541,16 +18636,31 @@ mod tests {
             2,
             "additional admission retains two exact channel entries"
         );
-        let additional_delta = provider
-            .in_use()
-            .checked_add(attempt_charge)
-            .expect("the released speculative attempt charge is representable")
-            .checked_sub(before_additional)
-            .expect("additional admission releases only its speculative attempt charge");
+        let retained_charges =
+            crate::runtime::session_broker::session_channel_retained_reservation_charges_for_test(
+                correlation_one,
+                0,
+            );
         assert_eq!(
-            additional_delta,
-            crate::runtime::session_broker::session_channel_reservation_charge_for_test(),
-            "additional channel admission consumes exactly its session/channel provider claim"
+            retained_charges.len(),
+            3,
+            "the retained channel plan includes flow, map, and correlation"
+        );
+        let retained_channel_charge = retained_charges
+            .into_iter()
+            .try_fold(crate::resource::ResourceClaim::ZERO, |total, charge| {
+                total.checked_add(charge)
+            })
+            .expect("the exact retained channel planning records compose");
+        let expected_after_additional = before_additional
+            .checked_sub(attempt_charge)
+            .expect("promotion releases the exact speculative attempt reservation")
+            .checked_add(retained_channel_charge)
+            .expect("the promoted channel planning charge is representable");
+        assert_eq!(
+            provider.in_use(),
+            expected_after_additional,
+            "promotion releases the attempt and retains exactly the production-planned channel charge"
         );
         drop_peer_if_current(
             &state,
@@ -18573,7 +18683,7 @@ mod tests {
         assert_eq!(
             provider.in_use(),
             before_link_one,
-            "candidate-one terminal cleanup releases its connector, Endpoint Auth, and channel claims"
+            "after candidate fixture anchors are released, candidate-one cleanup returns connector, Endpoint Auth, and channel claims to the pre-link baseline while production-owned signaling state remains held"
         );
 
         let flow_name = realtime_test_name(61);
@@ -19470,6 +19580,41 @@ mod tests {
         // this exchange on W1: unlike the fixture-only W0 link, both W1 event
         // receivers are production speculative pumps that survive promotion,
         // so the authenticated offer and answer traverse both real engines.
+        assert!(
+            owner_a
+                .connection()
+                .select_promoted_channel(&first_promoted_a),
+            "A explicitly selects the exact promoted W1 before media"
+        );
+        assert!(
+            owner_b
+                .connection()
+                .select_promoted_channel(&first_promoted_b),
+            "B explicitly selects the exact promoted W1 before media"
+        );
+        let selected_w1_a = owner_a
+            .connection()
+            .select_unique_usable_channel()
+            .expect("A's exact W1 selection is observable");
+        let selected_w1_b = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("B's exact W1 selection is observable");
+        assert!(
+            Arc::ptr_eq(&selected_w1_a, &first_promoted_a)
+                && Arc::ptr_eq(&selected_w1_b, &first_promoted_b),
+            "media is explicitly owned by the exact promoted W1 connectors"
+        );
+        assert_eq!(
+            state_a.peers.reliable_pending_total(),
+            1,
+            "selecting W1 preserves the logical reliable state"
+        );
+        assert_eq!(
+            pending_len(&state_a, &device_b),
+            Some(1),
+            "selecting W1 preserves the logical pending RPC state"
+        );
         let first_owner_a = owner_a.for_worker(Arc::clone(&first_promoted_a));
         let replacement_flow_a = state_a
             .open_realtime_negotiated(
@@ -19616,6 +19761,36 @@ mod tests {
             !owner_a.connection().state.read().media_reneg_inflight
                 && !owner_b.connection().state.read().media_reneg_inflight,
             "the exact W1 claims settle without a second in-flight offer"
+        );
+        assert!(
+            owner_a.connection().select_promoted_channel(&old_a),
+            "A explicitly reselects the exact old W0 after media"
+        );
+        assert!(
+            owner_b.connection().select_promoted_channel(&old_b),
+            "B explicitly reselects the exact old W0 after media"
+        );
+        let selected_w0_a = owner_a
+            .connection()
+            .select_unique_usable_channel()
+            .expect("A's exact W0 reselection is observable");
+        let selected_w0_b = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("B's exact W0 reselection is observable");
+        assert!(
+            Arc::ptr_eq(&selected_w0_a, &old_a) && Arc::ptr_eq(&selected_w0_b, &old_b),
+            "the authenticated media exchange leaves exact W0 selected for terminal control"
+        );
+        assert_eq!(
+            state_a.peers.reliable_pending_total(),
+            1,
+            "reselecting W0 preserves the logical reliable state"
+        );
+        assert_eq!(
+            pending_len(&state_a, &device_b),
+            Some(1),
+            "reselecting W0 preserves the logical pending RPC state"
         );
         assert!(
             state_a
@@ -19936,6 +20111,51 @@ mod tests {
             "the held W1 callback is admitted once to the logical session state"
         );
 
+        // B2-G: admit an actual inbound RPC on the exact selected W0, then
+        // hold its reply at the production send boundary. This is placed
+        // immediately before the terminal handoff so the parked handler's
+        // funded task cannot interfere with the preceding media exchange.
+        let _rpc_b =
+            crate::rpc::Rpc::attach(&state_b).expect("the live B gateway admits its RPC owner");
+        _rpc_b
+            .serve("b2-logical-handoff", |_call: crate::rpc::RpcCall| async {
+                Ok(crate::rpc::RpcResponse::from_value(serde_json::json!({
+                    "handoff": true
+                })))
+            })
+            .expect("the B gateway serves the handoff control method");
+        let (handoff_request, handoff_waiter) = file_pending(&state_a, &device_b);
+        let reply_arrival = state_b.rpc_send_boundary.arrival();
+        tokio::pin!(reply_arrival);
+        reply_arrival.as_mut().enable();
+        state_b.rpc_send_boundary.arm();
+        let w0_owner_b = owner_b.for_worker(Arc::clone(&old_b));
+        let handoff_frame = MeshMessage::RpcRequest(RpcRequestMessage {
+            request_id: handoff_request.request_id.clone(),
+            method: "b2-logical-handoff".into(),
+            payload: serde_json::Value::Null,
+            streaming: false,
+        });
+        let (handoff_msg, _handoff_claim, handoff_work, handoff_dispatch) =
+            admit_inbound_for_test(&state_b, &w0_owner_b, handoff_frame)
+                .expect("the exact selected W0 admits the inbound RPC")
+                .into_dispatch();
+        let MeshMessage::RpcRequest(handoff_req) = handoff_msg else {
+            panic!("the admitted handoff authority carries the RPC request");
+        };
+        on_rpc_request(&state_b, &handoff_dispatch, handoff_req).await;
+        reply_arrival.await;
+        assert_eq!(
+            state_b.rpc_send_boundary.entered(),
+            1,
+            "the admitted W0 handler reaches and parks at the reply boundary"
+        );
+        assert_eq!(
+            state_b.rpc_send_boundary.passed(),
+            0,
+            "the W0 reply remains held until the surviving W1 is selected"
+        );
+
         // B2-G/H terminal controls: W0 is selected, while W1 and W2 are
         // authenticated standbys. Removing selected W0 must preserve the
         // logical record but leave the slot unselected while two equivalent
@@ -19943,7 +20163,7 @@ mod tests {
         // usable survivor, and the production no-argument seam selects it.
         // Authenticated Depart still crosses the logical witness carried by
         // that selected standby and removes the row plus every channel.
-        let (_pending_b, mut pending_b_rx) = file_pending(&state_b, &device_a);
+        let (pending_b, mut pending_b_rx) = file_pending(&state_b, &device_a);
         let reliable_b_before = state_b.peers.reliable_pending_total();
         let (reliable_b_reply, mut reliable_b_waiter) = tokio::sync::oneshot::channel();
         state_b
@@ -20112,11 +20332,49 @@ mod tests {
                 .is_some(),
             "application admission resumes only after unique W1 selection"
         );
+        // Release only after the explicit production selection seam above. The
+        // reply itself must now be admitted against the surviving logical L0
+        // and carried over W1; no send helper is allowed to select implicitly.
+        state_b.rpc_send_boundary.release();
+        assert!(
+            settle_until(|| state_b.rpc_send_boundary.finished() == 1).await,
+            "the held W0 handler completes after explicit W1 selection"
+        );
+        assert!(
+            handoff_waiter.await.is_ok(),
+            "the actual admitted RPC reply settles A's pending call through W1"
+        );
+        assert_eq!(
+            pending_len(&state_a, &device_b),
+            Some(1),
+            "the other L0 pending RPC survives the W0-to-W1 reply handoff"
+        );
+        assert_eq!(
+            state_a.peers.reliable_pending_total(),
+            1,
+            "the L0 reliable state survives the W0-to-W1 reply handoff"
+        );
+        drop(handoff_work);
         assert_eq!(
             state_b.peers.reliable_pending_total(),
             reliable_b_before + 1
         );
         assert_eq!(pending_len(&state_b, &device_a), Some(1));
+        // Capture an admitted response operation on logical L0 while W1 is
+        // current. It is deliberately held across Depart and replayed only
+        // after an unrelated replacement logical L1 is installed below.
+        let stale_rpc_frame = MeshMessage::RpcResponse(RpcResponseMessage {
+            request_id: pending_b.request_id.clone(),
+            ok: Some(serde_json::json!({ "stale": true })),
+            error: None,
+        });
+        let (stale_rpc_msg, _stale_rpc_claim, stale_rpc_work, stale_rpc_dispatch) =
+            admit_inbound_for_test(&state_b, &standby_owner_b, stale_rpc_frame)
+                .expect("W1 admits the response operation that names logical L0")
+                .into_dispatch();
+        let MeshMessage::RpcResponse(_stale_rpc_response) = stale_rpc_msg else {
+            panic!("the saved stale authority carries an RPC response");
+        };
         assert!(
             owner_a
                 .connection()
@@ -20191,6 +20449,27 @@ mod tests {
             .connection()
             .select_unique_usable_channel()
             .expect("the unrelated successor exposes its exact selected channel");
+        let (fresh_request, mut fresh_waiter) = file_pending(&state_b, &device_a);
+        on_rpc_response(
+            &state_b,
+            &stale_rpc_dispatch,
+            RpcResponseMessage {
+                request_id: fresh_request.request_id.clone(),
+                ok: Some(serde_json::json!({ "stale": true })),
+                error: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            pending_len(&state_b, &device_a),
+            Some(1),
+            "a saved L0 response cannot consume a pending operation on replacement L1"
+        );
+        assert!(
+            fresh_waiter.try_recv().is_err(),
+            "replaying the saved L0 operation leaves the L1 caller pending"
+        );
+        drop(stale_rpc_work);
         on_session_control(
             &state_b,
             &stale_dispatch,

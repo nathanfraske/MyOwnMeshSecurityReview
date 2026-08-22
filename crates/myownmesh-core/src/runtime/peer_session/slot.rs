@@ -44,7 +44,101 @@ pub(crate) struct PromotedChannel {
     endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
     correlation: String,
     dedup: Option<DedupToken>,
-    additional_dedup: Vec<DedupToken>,
+    additional_dedup: PromotedDedupSet,
+    /// Funds the heap storage owned by `correlation`. Additional dedup tokens
+    /// are individually funded by `PromotedDedupSet` map-node leases.
+    _correlation: crate::resource::ResourceLease,
+}
+
+/// Exact provider-backed custody for dedup tokens retained after promotion.
+/// Each token is one leased map node, so later growth allocates only after its
+/// own provider reservation succeeds; there is no spare-capacity vector or
+/// fixed candidate ceiling to underfund a subsequent Answer/Candidate.
+pub(crate) struct PromotedDedupSet {
+    entries: LeasedMap<usize, DedupToken>,
+    next: usize,
+}
+
+impl PromotedDedupSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: LeasedMap::new(),
+            next: 0,
+        }
+    }
+
+    pub(crate) fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+        LeasedMap::<usize, DedupToken>::entry_claim()
+    }
+
+    fn try_push(
+        &mut self,
+        session: &SessionCapability,
+        token: DedupToken,
+    ) -> Result<(), DedupToken> {
+        let claim = Self::entry_claim().expect("dedup entry claim is fixed-size arithmetic");
+        let lease = match session.reserve_retained(claim) {
+            Ok(lease) => lease,
+            Err(_) => return Err(token),
+        };
+        let key = match self.next.checked_add(1) {
+            Some(next) => {
+                let key = self.next;
+                self.next = next;
+                key
+            }
+            None => return Err(token),
+        };
+        self.entries
+            .insert(key, token, lease)
+            .expect("dedup retention keys are unique");
+        Ok(())
+    }
+
+    pub(crate) fn try_push_speculative(
+        &mut self,
+        worker: &crate::transport::webrtc::WebRtcConnectorWorker,
+        token: DedupToken,
+    ) -> Result<(), DedupToken> {
+        let claim = Self::entry_claim().expect("dedup entry claim is fixed-size arithmetic");
+        let lease = match worker.reserve_attempt_work(claim) {
+            Ok(lease) => lease,
+            Err(_) => return Err(token),
+        };
+        let key = match self.next.checked_add(1) {
+            Some(next) => {
+                let key = self.next;
+                self.next = next;
+                key
+            }
+            None => return Err(token),
+        };
+        self.entries
+            .insert(key, token, lease)
+            .expect("dedup retention keys are unique");
+        Ok(())
+    }
+
+    pub(crate) fn drain_tokens(self) -> PromotedDedupDrain {
+        PromotedDedupDrain { set: Some(self) }
+    }
+}
+
+pub(crate) struct PromotedDedupDrain {
+    set: Option<PromotedDedupSet>,
+}
+
+impl Iterator for PromotedDedupDrain {
+    type Item = DedupToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let set = self.set.as_mut()?;
+        let token = set.entries.pop_first_entry().map(|(_, token)| token);
+        if token.is_none() {
+            drop(self.set.take());
+        }
+        token
+    }
 }
 
 /// Exact identity and lifecycle custody for one promoted channel. Grouping the
@@ -55,7 +149,7 @@ pub(crate) struct PromotedChannelBinding {
     pub(crate) endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
     pub(crate) correlation: String,
     pub(crate) dedup: Option<DedupToken>,
-    pub(crate) additional_dedup: Vec<DedupToken>,
+    pub(crate) additional_dedup: PromotedDedupSet,
 }
 
 /// Process-local exact identity for one worker. The value in the map retains
@@ -129,6 +223,26 @@ impl PromotedSession {
     pub(crate) fn channel_map_entry_claim(
     ) -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError> {
         LeasedMap::<WorkerKey, PromotedChannel>::entry_claim()
+    }
+
+    /// The input-sized String allocation retained by one promoted channel.
+    /// Additional dedup tokens use individually leased map nodes rather than
+    /// a spare-capacity Vec, so later growth is charged at insertion.
+    pub(crate) fn channel_correlation_claim(
+        correlation: &String,
+    ) -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError> {
+        let correlation_bytes = u64::try_from(correlation.capacity()).map_err(|_| {
+            ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::AccountedMemoryBytes,
+            }
+        })?;
+        ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, correlation_bytes),
+            (
+                ResourceClass::StorageObject,
+                u64::from(correlation_bytes != 0),
+            ),
+        ])
     }
 
     fn selected_mut(&mut self) -> Option<&mut PromotedChannel> {
@@ -287,7 +401,7 @@ impl PromotedSession {
 pub(crate) struct RemovedPromotedChannel {
     pub(crate) worker: Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
     pub(crate) dedup: Option<DedupToken>,
-    pub(crate) additional_dedup: Vec<DedupToken>,
+    pub(crate) additional_dedup: PromotedDedupSet,
     pub(crate) selection_needed: bool,
     pub(crate) session_empty: bool,
 }
@@ -400,7 +514,7 @@ impl PromotedSessionSlot {
     ) -> Vec<(
         Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
         Option<DedupToken>,
-        Vec<DedupToken>,
+        PromotedDedupDrain,
     )> {
         let Some(mut session) = self.slot.lock().take() else {
             return Vec::new();
@@ -410,7 +524,11 @@ impl PromotedSessionSlot {
             if let Some(task) = channel.endpoint_auth {
                 task.retire();
             }
-            workers.push((channel.worker, channel.dedup, channel.additional_dedup));
+            workers.push((
+                channel.worker,
+                channel.dedup,
+                channel.additional_dedup.drain_tokens(),
+            ));
         }
         workers
     }
@@ -506,6 +624,40 @@ impl PromotedSessionSlot {
                 ));
             }
         };
+        let retained_claim = match PromotedSession::channel_correlation_claim(&correlation) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ClaimArithmetic(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let retained_lease = match session.reserve_retained(retained_claim) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ResourceUnavailable(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
         let logical = LogicalSessionRecord::new(session.validity_witness(), logical_lease);
         let channel = PromotedChannel {
             session,
@@ -515,6 +667,7 @@ impl PromotedSessionSlot {
             correlation,
             dedup,
             additional_dedup,
+            _correlation: retained_lease,
         };
         let mut channels = LeasedMap::new();
         channels
@@ -621,6 +774,40 @@ impl PromotedSessionSlot {
                 ));
             }
         };
+        let retained_claim = match PromotedSession::channel_correlation_claim(&correlation) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ClaimArithmetic(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
+        let retained_lease = match session.reserve_retained(retained_claim) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Err(admission_refusal(
+                    PromotedSessionAdmissionRefusalReason::ResourceUnavailable(error),
+                    session,
+                    flows,
+                    PromotedChannelBinding {
+                        worker,
+                        endpoint_auth,
+                        correlation,
+                        dedup,
+                        additional_dedup,
+                    },
+                ));
+            }
+        };
         let channel = PromotedChannel {
             session,
             flows,
@@ -629,6 +816,7 @@ impl PromotedSessionSlot {
             correlation,
             dedup,
             additional_dedup,
+            _correlation: retained_lease,
         };
         promoted
             .channels
@@ -733,8 +921,10 @@ impl PromotedSessionSlot {
         else {
             return false;
         };
-        channel.additional_dedup.push(token);
-        true
+        channel
+            .additional_dedup
+            .try_push(&channel.session, token)
+            .is_ok()
     }
 
     pub(crate) fn remove_channel(

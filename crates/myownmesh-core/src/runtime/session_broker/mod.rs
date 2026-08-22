@@ -684,24 +684,52 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
     crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
 }
 
-/// What one additional promoted channel costs the provider: the channel-local
-/// realtime-flow root and its exact leased-map entry. The shared validity
-/// lineage is deliberately absent because only the first channel funds it.
+/// The exact provider reservation for the owned correlation String of one
+/// promoted channel, including that lease's bookkeeping record.
 #[cfg(test)]
-pub(crate) fn session_channel_reservation_charge_for_test() -> ResourceClaim {
-    let flow_root = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+pub(crate) fn session_correlation_reservation_charge_for_test(correlation: &str) -> ResourceClaim {
+    let correlation = correlation.to_owned();
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(
+        crate::runtime::peer_session::PromotedSession::channel_correlation_claim(&correlation)
+            .expect("channel correlation claim is representable"),
+    )
+    .expect("channel correlation planning charge is representable")
+}
+
+/// The individual provider reservations for one promoted channel and its
+/// retained signaling custody. The returned entries deliberately remain
+/// separate: every correlation or dedup map-node lease carries its own
+/// provider bookkeeping record, and summing bare claims before applying that
+/// charge would underfund the fixture.
+#[cfg(test)]
+pub(crate) fn session_channel_retained_reservation_charges_for_test(
+    correlation: &str,
+    dedup_tokens: usize,
+) -> Vec<ResourceClaim> {
+    let mut charges = Vec::with_capacity(
+        dedup_tokens
+            .checked_add(3)
+            .expect("test planning charge count fits usize"),
+    );
+    let planning = |claim| {
+        crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("retained channel planning charge is representable")
+    };
+    charges.push(planning(
         crate::runtime::peer_session::PromotedSession::channel_claim()
-            .expect("the channel flow-root claim is `size_of` arithmetic and cannot overflow"),
-    )
-    .expect("the flow-root claim plus its provider record is representable");
-    let map_entry = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            .expect("channel flow-root claim is representable"),
+    ));
+    charges.push(planning(
         crate::runtime::peer_session::PromotedSession::channel_map_entry_claim()
-            .expect("the channel map-entry claim is `size_of` arithmetic and cannot overflow"),
-    )
-    .expect("the map-entry claim plus its provider record is representable");
-    flow_root
-        .checked_add(map_entry)
-        .expect("the additional-channel reservations compose")
+            .expect("channel map-entry claim is representable"),
+    ));
+    charges.push(session_correlation_reservation_charge_for_test(correlation));
+    let dedup_claim = crate::runtime::peer_session::PromotedDedupSet::entry_claim()
+        .expect("dedup map-entry claim is representable");
+    for _ in 0..dedup_tokens {
+        charges.push(planning(dedup_claim));
+    }
+    charges
 }
 
 /// What a first promoted session costs the provider: four separate reservations

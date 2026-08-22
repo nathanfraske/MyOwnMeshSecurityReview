@@ -721,7 +721,7 @@ impl PeerRegistry {
             return Some(refused(peer));
         }
         let witness = peer.with_logical_session_state(|logical| logical.validity().clone())?;
-        Some(admitted(&LogicalSessionOperation::new(
+        Some(admitted(&LogicalSessionOperation::new_inbound(
             owner.clone(),
             witness,
         )))
@@ -1449,14 +1449,38 @@ impl Drop for PeerRegistry {
 pub(super) struct LogicalSessionOperation {
     owner: PeerOwnerToken,
     witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
+    /// A channel stamp retained only long enough to construct the inbound
+    /// dispatch. It is deliberately absent from ordinary logical operations;
+    /// no logical lender or delayed commit consults this field.
+    inbound_worker: Option<Arc<crate::transport::WebRtcConnectorWorker>>,
 }
 
 impl LogicalSessionOperation {
     fn new(
+        mut owner: PeerOwnerToken,
+        witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
+    ) -> Self {
+        // A logical operation names only the installed lineage and its
+        // validity witness. Channel identity is retained solely by the
+        // ExactChannelOperation worker field; allowing this owner stamp to
+        // survive would make a later logical commit stale after channel
+        // replacement within the same session.
+        owner.worker = None;
+        Self {
+            owner,
+            witness,
+            inbound_worker: None,
+        }
+    }
+
+    fn new_inbound(
         owner: PeerOwnerToken,
         witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
     ) -> Self {
-        Self { owner, witness }
+        let inbound_worker = owner.worker.clone();
+        let mut operation = Self::new(owner, witness);
+        operation.inbound_worker = inbound_worker;
+        operation
     }
 
     pub(super) fn owner(&self) -> &PeerOwnerToken {
@@ -1534,11 +1558,15 @@ impl LogicalSessionOperation {
         &self,
         frame: crate::application_gateway::DecodedApplicationFrame,
     ) -> AdmittedInboundApplicationOperation {
+        let owner = self.inbound_worker.as_ref().map_or_else(
+            || self.owner.clone(),
+            |worker| self.owner.for_worker(Arc::clone(worker)),
+        );
         AdmittedInboundApplicationOperation {
             frame,
             dispatch: AdmittedInboundDispatch {
                 peer: Arc::clone(self.owner.connection()),
-                owner: self.owner.clone(),
+                owner,
                 witness: self.witness.clone(),
             },
         }
