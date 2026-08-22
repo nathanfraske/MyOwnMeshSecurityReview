@@ -262,6 +262,25 @@ pub(super) struct ConnectorCloseOwner {
     native_close_gate: SyncMutex<Option<Arc<NativeCloseGate>>>,
 }
 
+async fn wait_on_status(mut status: watch::Receiver<ConnectorCloseStatus>) -> Result<()> {
+    loop {
+        match status.borrow().clone() {
+            ConnectorCloseStatus::Closed => return Ok(()),
+            ConnectorCloseStatus::Failed(error) => {
+                return Err(Error::Transport(format!(
+                    "native peer cleanup failed and retained its exact claim: {error}"
+                )));
+            }
+            ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing => {}
+        }
+        if status.changed().await.is_err() {
+            return Err(Error::Transport(
+                "native peer cleanup owner stopped".to_string(),
+            ));
+        }
+    }
+}
+
 impl ConnectorCloseOwner {
     pub(super) fn new(
         ownership: ConnectorOwnership,
@@ -620,24 +639,19 @@ impl ConnectorCloseOwner {
     }
 
     pub(super) async fn wait(self: &Arc<Self>) -> Result<()> {
-        let mut status = self.status.subscribe();
+        let status = self.status.subscribe();
         self.start();
-        loop {
-            match status.borrow().clone() {
-                ConnectorCloseStatus::Closed => return Ok(()),
-                ConnectorCloseStatus::Failed(error) => {
-                    return Err(Error::Transport(format!(
-                        "native peer cleanup failed and retained its exact claim: {error}"
-                    )));
-                }
-                ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing => {}
-            }
-            if status.changed().await.is_err() {
-                return Err(Error::Transport(
-                    "native peer cleanup owner stopped".to_string(),
-                ));
-            }
-        }
+        wait_on_status(status).await
+    }
+
+    /// Start cleanup synchronously and return a waiter that retains only the
+    /// status receiver, never this owner's resource scope or Arc.
+    pub(super) fn close_waiter(
+        self: &Arc<Self>,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
+        let status = self.status.subscribe();
+        self.start();
+        wait_on_status(status)
     }
 
     #[cfg(test)]

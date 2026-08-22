@@ -2141,20 +2141,33 @@ async fn connect_peer(
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct SpeculativeLocalOfferStartError {
+    correlation: String,
+    reason: &'static str,
+}
+
+#[cfg(test)]
 async fn start_speculative_local_offer(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
-) {
-    let Some(peer) = state.peers.get_if_current(owner) else {
-        return;
-    };
-    if !peer.holds_promoted_session() {
-        return;
-    }
+) -> std::result::Result<String, SpeculativeLocalOfferStartError> {
     let mut random = [0u8; 8];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut random);
     let correlation = data_encoding::BASE32_NOPAD.encode(&random).to_lowercase();
+    let Some(peer) = state.peers.get_if_current(owner) else {
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "the owner is no longer current",
+        });
+    };
+    if !peer.holds_promoted_session() {
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "the owner has no promoted session",
+        });
+    }
     let cfg = state.config.read().clone();
     let construction = tokio::time::timeout(
         Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
@@ -2168,24 +2181,44 @@ async fn start_speculative_local_offer(
     .await;
     let (session, mut rx) = match construction {
         Ok(Ok(peer)) => peer,
-        _ => return,
+        Ok(Err(_)) => {
+            return Err(SpeculativeLocalOfferStartError {
+                correlation,
+                reason: "opening the speculative connector failed",
+            })
+        }
+        Err(_) => {
+            return Err(SpeculativeLocalOfferStartError {
+                correlation,
+                reason: "opening the speculative connector timed out",
+            })
+        }
     };
     let session = Arc::new(session);
     let Ok(attempt_lease) = session.reserve_attempt_work(
         connection::PeerConnection::speculative_attempt_claim(&correlation),
     ) else {
         session.retire();
-        return;
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "reserving the speculative attempt failed",
+        });
     };
     if !peer.install_speculative(correlation.clone(), session.clone(), attempt_lease) {
         session.retire();
-        return;
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "installing the speculative attempt failed",
+        });
     }
     let offer = match session.create_offer().await {
         Ok(offer) => offer,
         Err(_) => {
             retire_speculative_exact(state, owner, &correlation, &session).await;
-            return;
+            return Err(SpeculativeLocalOfferStartError {
+                correlation,
+                reason: "creating the speculative offer failed",
+            });
         }
     };
     if state.peers.get_if_current(owner).is_none()
@@ -2199,7 +2232,10 @@ async fn start_speculative_local_offer(
         } else {
             session.retire();
         }
-        return;
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "the speculative attempt became stale before enqueue",
+        });
     }
     if state
         .signaling_tx
@@ -2211,18 +2247,22 @@ async fn start_speculative_local_offer(
         .is_err()
     {
         retire_speculative_exact(state, owner, &correlation, &session).await;
-        return;
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "enqueueing the speculative offer failed",
+        });
     }
     let connector_state = Arc::clone(state);
     let exact_owner = owner.clone();
     let device_id = owner.device_id().to_string();
     let task_observation = session.observe_owned_task();
+    let pump_correlation = correlation.clone();
     tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(event) = rx.recv().await {
             let handled = match connector_state.peers.speculative_worker_route(
                 &exact_owner,
-                &correlation,
+                &pump_correlation,
                 &session,
             ) {
                 peer_registry::SpeculativeWorkerRoute::Promoted => {
@@ -2238,7 +2278,7 @@ async fn start_speculative_local_offer(
                     handle_speculative_transport_event(
                         &connector_state,
                         device_id.clone(),
-                        correlation.clone(),
+                        pump_correlation.clone(),
                         &session,
                         event,
                     )
@@ -2253,8 +2293,10 @@ async fn start_speculative_local_offer(
         // EOF is also candidate failure.  A connector can disappear without
         // first producing Failed/Closed, so release only the exact worker
         // owned by this attempt; a promoted replacement is already absent.
-        retire_speculative_terminal(&connector_state, &exact_owner, &correlation, &session).await;
+        retire_speculative_terminal(&connector_state, &exact_owner, &pump_correlation, &session)
+            .await;
     });
+    Ok(correlation)
 }
 
 /// Build a provider-funded answerer beside a healthy promoted connector.
@@ -2403,14 +2445,13 @@ async fn retire_speculative_exact(
         .peers
         .take_speculative_exact(owner, correlation, candidate)
     {
-        forget_dedup_owned(state, retired.dedup);
-        forget_dedups(state, retired.additional_dedup.drain_tokens());
-        let closed = owner
-            .connection()
-            .await_exact_retired_worker(&retired.worker)
-            .await;
-        if let Some(Err(error)) = closed {
-            warn!(%error, "speculative candidate cleanup did not complete successfully");
+        let started = owner.connection().start_exact_retired_worker(
+            &retired.worker,
+            retired.dedup,
+            retired.additional_dedup.drain_tokens(),
+        );
+        if !started {
+            warn!("speculative candidate close custody was already settled");
         }
     }
 }
@@ -2426,28 +2467,35 @@ async fn retire_speculative_terminal(
         .terminal_speculative_cleanup(owner, correlation, candidate)
     {
         Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
-            forget_dedup_owned(state, retired.dedup);
-            forget_dedups(state, retired.additional_dedup.drain_tokens());
-            let closed = owner
-                .connection()
-                .await_exact_retired_worker(&retired.worker)
-                .await;
-            if let Some(Err(error)) = closed {
-                warn!(%error, "speculative terminal cleanup did not complete successfully");
+            let started = owner.connection().start_exact_retired_worker(
+                &retired.worker,
+                retired.dedup,
+                retired.additional_dedup.drain_tokens(),
+            );
+            if !started {
+                warn!("speculative terminal close custody was already settled");
             }
         }
         Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
-            forget_dedup_owned(state, removed.dedup);
-            forget_dedups(state, removed.additional_dedup.drain_tokens());
-            let closed = owner
-                .connection()
-                .await_exact_retired_worker(&removed.worker)
-                .await;
-            if let Some(Err(error)) = closed {
-                warn!(%error, "promoted terminal cleanup did not complete successfully");
+            if removed.session_empty {
+                state.peers.track_removed_close(Arc::clone(&peer));
+                peer.retire_connector();
+            }
+            let started = owner.connection().start_exact_retired_worker(
+                &removed.worker,
+                removed.dedup,
+                removed.additional_dedup.drain_tokens(),
+            );
+            if !started {
+                warn!("promoted terminal close custody was already settled");
             }
             if removed.session_empty {
-                finish_drop_peer(state, owner.device_id(), DropReason::IceFailed, Some(peer)).await;
+                peer.start_all_retired_workers();
+                let state = Arc::clone(state);
+                let device_id = owner.device_id().to_string();
+                tokio::spawn(async move {
+                    finish_drop_peer_started(&state, &device_id, DropReason::IceFailed, peer).await;
+                });
             }
         }
         None => {}
@@ -4210,7 +4258,10 @@ async fn handle_inbound_frame_from(
             // decode/commit, before the reducer can send its semantic reply.
             // Production leaves this await empty.
             state.reach_rpc_send_boundary().await;
-            return semantic_ingress::reduce(state, durable, Some(&logical_route)).await;
+            let reduced = semantic_ingress::reduce(state, durable, Some(&logical_route)).await;
+            #[cfg(test)]
+            state.rpc_send_boundary.mark_semantic_finished();
+            return reduced;
         }
         semantic_ingress::SemanticAdmission::NotDurable(other) => other,
     };
@@ -5975,6 +6026,28 @@ pub(crate) async fn send_application_bytes(
     Ok(())
 }
 
+/// Send one semantic reply through the exact logical operation that admitted
+/// the request. The registry projects that workerless operation onto the
+/// session's already-selected current channel; this helper never converts it
+/// to a device owner, performs a lookup, or selects a channel itself.
+pub(in crate::engine) async fn send_logical_reply(
+    state: &Arc<NetworkState>,
+    operation: &peer_registry::LogicalSessionOperation,
+    msg: &MeshMessage,
+) -> Result<()> {
+    let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
+    let class = traffic::class_of(msg);
+    let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+    let sent = state
+        .peers
+        .admit_logical_reply_application_operation(operation)
+        .ok_or_else(|| Error::Network("logical reply operation is no longer current".into()))?
+        .send_frame(&state.peers, Bytes::from(serialized), timeout)
+        .await?;
+    state.traffic.record_tx(class, sent);
+    Ok(())
+}
+
 async fn send_channel_frame(
     state: &Arc<NetworkState>,
     peer: &str,
@@ -6417,14 +6490,33 @@ async fn finish_drop_peer(
     reason: DropReason,
     removed: Option<Arc<PeerConnection>>,
 ) {
+    finish_drop_peer_inner(state, device_id, reason, removed, false).await;
+}
+
+async fn finish_drop_peer_started(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    reason: DropReason,
+    removed: Arc<PeerConnection>,
+) {
+    finish_drop_peer_inner(state, device_id, reason, Some(removed), true).await;
+}
+
+async fn finish_drop_peer_inner(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    reason: DropReason,
+    removed: Option<Arc<PeerConnection>>,
+    already_started: bool,
+) {
     if let Some(peer) = removed {
-        state.peers.track_removed_close(Arc::clone(&peer));
-        // Retire synchronously to move every exact channel/candidate into
-        // native-close custody, then release only the dedup tokens owned by
-        // this peer before the asynchronous close wait begins.
-        peer.retire_connector();
-        for token in peer.take_retired_dedup() {
-            forget_dedup_owned(state, Some(token));
+        if !already_started {
+            state.peers.track_removed_close(Arc::clone(&peer));
+            // Retire synchronously to move every exact channel/candidate into
+            // native-close custody before the close supervisor begins. The
+            // connection owns dedup custody until each native close settles.
+            peer.retire_connector();
+            peer.start_all_retired_workers();
         }
         if let Err(error) = peer.retire_and_close().await {
             warn!(%error, "peer cleanup did not complete successfully");
@@ -6586,28 +6678,33 @@ pub(crate) async fn drop_peer_if_current(
                 dispatch.exact_channel_operation(Arc::clone(&worker)),
             ) {
                 peer_registry::ChannelTerminal::Channel { channel } => {
-                    forget_dedup_owned(state, channel.dedup);
-                    forget_dedups(state, channel.additional_dedup.drain_tokens());
-                    let closed = owner
-                        .connection()
-                        .await_exact_retired_worker(&channel.worker)
-                        .await;
-                    if let Some(Err(error)) = closed {
-                        warn!(%error, "channel terminal cleanup did not complete successfully");
+                    let started = owner.connection().start_exact_retired_worker(
+                        &channel.worker,
+                        channel.dedup,
+                        channel.additional_dedup.drain_tokens(),
+                    );
+                    if !started {
+                        warn!("channel terminal close custody was already settled");
                     }
                     return;
                 }
                 peer_registry::ChannelTerminal::Peer { peer, channel } => {
-                    forget_dedup_owned(state, channel.dedup);
-                    forget_dedups(state, channel.additional_dedup.drain_tokens());
-                    let closed = owner
-                        .connection()
-                        .await_exact_retired_worker(&channel.worker)
-                        .await;
-                    if let Some(Err(error)) = closed {
-                        warn!(%error, "logical peer terminal cleanup did not complete successfully");
+                    state.peers.track_removed_close(Arc::clone(&peer));
+                    peer.retire_connector();
+                    let started = owner.connection().start_exact_retired_worker(
+                        &channel.worker,
+                        channel.dedup,
+                        channel.additional_dedup.drain_tokens(),
+                    );
+                    if !started {
+                        warn!("logical peer terminal close custody was already settled");
                     }
-                    finish_drop_peer(state, owner.device_id(), reason, Some(peer)).await;
+                    peer.start_all_retired_workers();
+                    let state = Arc::clone(state);
+                    let device_id = owner.device_id().to_string();
+                    tokio::spawn(async move {
+                        finish_drop_peer_started(&state, &device_id, reason, peer).await;
+                    });
                     return;
                 }
                 peer_registry::ChannelTerminal::Stale => {}
@@ -6618,28 +6715,35 @@ pub(crate) async fn drop_peer_if_current(
             .terminal_speculative_cleanup(owner, &correlation, &worker)
         {
             Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
-                forget_dedup_owned(state, retired.dedup);
-                forget_dedups(state, retired.additional_dedup.drain_tokens());
-                let closed = owner
-                    .connection()
-                    .await_exact_retired_worker(&retired.worker)
-                    .await;
-                if let Some(Err(error)) = closed {
-                    warn!(%error, "speculative terminal cleanup did not complete successfully");
+                let started = owner.connection().start_exact_retired_worker(
+                    &retired.worker,
+                    retired.dedup,
+                    retired.additional_dedup.drain_tokens(),
+                );
+                if !started {
+                    warn!("speculative terminal close custody was already settled");
                 }
             }
             Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
-                forget_dedup_owned(state, removed.dedup);
-                forget_dedups(state, removed.additional_dedup.drain_tokens());
-                let closed = owner
-                    .connection()
-                    .await_exact_retired_worker(&removed.worker)
-                    .await;
-                if let Some(Err(error)) = closed {
-                    warn!(%error, "promoted terminal cleanup did not complete successfully");
+                if removed.session_empty {
+                    state.peers.track_removed_close(Arc::clone(&peer));
+                    peer.retire_connector();
+                }
+                let started = owner.connection().start_exact_retired_worker(
+                    &removed.worker,
+                    removed.dedup,
+                    removed.additional_dedup.drain_tokens(),
+                );
+                if !started {
+                    warn!("promoted terminal close custody was already settled");
                 }
                 if removed.session_empty {
-                    finish_drop_peer(state, owner.device_id(), reason, Some(peer)).await;
+                    peer.start_all_retired_workers();
+                    let state = Arc::clone(state);
+                    let device_id = owner.device_id().to_string();
+                    tokio::spawn(async move {
+                        finish_drop_peer_started(&state, &device_id, reason, peer).await;
+                    });
                 }
             }
             None => {}
@@ -7415,12 +7519,21 @@ impl B2PromotionGate {
         }
     }
 
-    async fn before_command(&self, correlation: &str) {
-        if self.target.lock().as_deref() != Some(correlation) {
-            return;
-        }
+    fn is_held(&self, correlation: &str) -> bool {
+        self.target.lock().as_deref() == Some(correlation)
+            && !self.released.lock().contains(correlation)
+    }
+
+    fn mark_reached(&self, correlation: &str) {
         self.reached.lock().insert(correlation.to_string());
         self.wake.notify_waiters();
+    }
+
+    fn is_released(&self, correlation: &str) -> bool {
+        self.released.lock().contains(correlation)
+    }
+
+    async fn wait_released(&self, correlation: &str) {
         loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
@@ -7430,6 +7543,21 @@ impl B2PromotionGate {
             }
             notified.await;
         }
+    }
+}
+
+#[cfg(test)]
+async fn run_test_promotion_delivery(
+    state: &Arc<NetworkState>,
+    delivery: crate::resource::ResourceMailboxDelivery<state::SpeculativePromotionCmd>,
+    promotion_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+) {
+    let correlation = delivery.value().correlation.clone();
+    delivery
+        .run_terminal_effect(|promotion| handle_speculative_promotion(state, promotion))
+        .await;
+    if let Some(promotion_tx) = promotion_tx {
+        let _ = promotion_tx.send(correlation);
     }
 }
 
@@ -7445,8 +7573,37 @@ fn spawn_test_command_driver(
         .take_speculative_promotion_rx()
         .expect("the test driver takes its speculative-promotion receiver once");
     tokio::spawn(async move {
+        let mut deferred_promotions: std::collections::VecDeque<
+            crate::resource::ResourceMailboxDelivery<state::SpeculativePromotionCmd>,
+        > = std::collections::VecDeque::new();
         loop {
+            if let Some(delivery) = deferred_promotions.front() {
+                let correlation = delivery.value().correlation.as_str();
+                if promotion_gate
+                    .as_ref()
+                    .is_none_or(|gate| gate.is_released(correlation))
+                {
+                    let delivery = deferred_promotions
+                        .pop_front()
+                        .expect("the deferred promotion front remains present");
+                    run_test_promotion_delivery(&command_state, delivery, promotion_tx.as_ref())
+                        .await;
+                    continue;
+                }
+            }
+            let deferred_release = deferred_promotions.front().and_then(|delivery| {
+                promotion_gate
+                    .as_ref()
+                    .map(|gate| (Arc::clone(gate), delivery.value().correlation.clone()))
+            });
             tokio::select! {
+                _ = async move {
+                    if let Some((gate, correlation)) = deferred_release {
+                        gate.wait_released(&correlation).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
                 delivery = cmd_rx.recv() => {
                     let Some(delivery) = delivery else { break };
                     delivery
@@ -7458,16 +7615,22 @@ fn spawn_test_command_driver(
                 delivery = speculative_promotion_rx.recv() => {
                     let Some(delivery) = delivery else { break };
                     let correlation = delivery.value().correlation.clone();
-                    if let Some(gate) = &promotion_gate {
-                        gate.before_command(&correlation).await;
-                    }
-                    delivery
-                        .run_terminal_effect(|promotion| {
-                            handle_speculative_promotion(&command_state, promotion)
-                        })
+                    if promotion_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.is_held(&correlation))
+                    {
+                        promotion_gate
+                            .as_ref()
+                            .expect("a held promotion has a gate")
+                            .mark_reached(&correlation);
+                        deferred_promotions.push_back(delivery);
+                    } else {
+                        run_test_promotion_delivery(
+                            &command_state,
+                            delivery,
+                            promotion_tx.as_ref(),
+                        )
                         .await;
-                    if let Some(promotion_tx) = &promotion_tx {
-                        let _ = promotion_tx.send(correlation);
                     }
                 }
             }
@@ -17466,12 +17629,18 @@ mod tests {
             SignalingCarrier::Nostr,
         );
         let target = "b2-invalid-offer-target";
-        let fixture = insert_promoted_peer(&state, target).await;
+        let mut fixture = insert_promoted_peer(&state, target).await;
         let owner = state.peers.owner(target).expect("the promoted peer exists");
         assert!(state
             .peers
             .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
             .is_some());
+        while let Some(event) = fixture._events.try_recv_nonblocking() {
+            let _ = handle_transport_event(&state, target.to_string(), event).await;
+        }
+        let baseline_active_reservations = provider.active_reservations();
+        let baseline_active_scopes = provider.active_scopes();
+        let baseline_retained_after_failed_cleanup = provider.retained_after_failed_cleanup();
         let baseline = provider.in_use();
 
         for index in 0..32usize {
@@ -17480,7 +17649,7 @@ mod tests {
                 target.to_string(),
                 myownmesh_signaling::SignalingMessage::Offer {
                     peer_id: target.to_string(),
-                    offer_id,
+                    offer_id: offer_id.clone(),
                     sdp: format!("v=0\r\na=x-invalid-b2-{index}\r\n"),
                 },
             )));
@@ -17495,15 +17664,46 @@ mod tests {
                 !owner.connection().has_speculative(),
                 "failed Offer {index} leaves no live candidate lookup"
             );
+            owner
+                .connection()
+                .await_retired_workers()
+                .await
+                .expect("invalid Offer native candidate close settles");
             assert_eq!(
                 owner.connection().retired_worker_count_for_test(),
                 0,
                 "invalid Offer {index} closes its candidate at the terminal edge"
             );
+            assert!(
+                !signaling_runtime.remembers_attempt_for_test(&offer_id),
+                "invalid Offer {index} releases its exact dedup witness"
+            );
+            while let Some(event) = fixture._events.try_recv_nonblocking() {
+                let _ = handle_transport_event(&state, target.to_string(), event).await;
+            }
+            assert_eq!(
+                provider.active_reservations(),
+                baseline_active_reservations,
+                "invalid Offer {index} restores active provider reservations"
+            );
+            assert_eq!(
+                provider.active_scopes(),
+                baseline_active_scopes,
+                "invalid Offer {index} restores active provider scopes"
+            );
+            assert_eq!(
+                provider.retained_after_failed_cleanup(),
+                baseline_retained_after_failed_cleanup,
+                "invalid Offer {index} restores failed-cleanup retention"
+            );
             assert_eq!(
                 provider.in_use(),
                 baseline,
                 "invalid Offer {index} returns provider usage to baseline"
+            );
+            assert!(
+                fixture.peer.holds_promoted_session(),
+                "invalid Offer {index} preserves the exact promoted fixture"
             );
         }
 
@@ -17524,10 +17724,37 @@ mod tests {
             .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
             .await;
         assert!(!owner.connection().has_speculative());
+        owner
+            .connection()
+            .await_retired_workers()
+            .await
+            .expect("retransmitted invalid Offer native candidate close settles");
         assert_eq!(
             owner.connection().retired_worker_count_for_test(),
             0,
             "the retransmitted Offer also closes only its fresh candidate"
+        );
+        assert!(
+            !signaling_runtime.remembers_attempt_for_test(retransmitted),
+            "the retransmitted Offer releases its exact dedup witness"
+        );
+        while let Some(event) = fixture._events.try_recv_nonblocking() {
+            let _ = handle_transport_event(&state, target.to_string(), event).await;
+        }
+        assert_eq!(
+            provider.active_reservations(),
+            baseline_active_reservations,
+            "the retransmitted Offer restores active provider reservations"
+        );
+        assert_eq!(
+            provider.active_scopes(),
+            baseline_active_scopes,
+            "the retransmitted Offer restores active provider scopes"
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            baseline_retained_after_failed_cleanup,
+            "the retransmitted Offer restores failed-cleanup retention"
         );
         assert_eq!(
             provider.in_use(),
@@ -19002,12 +19229,22 @@ mod tests {
         promotions: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         expected: &str,
     ) {
-        while let Some(correlation) = promotions.recv().await {
+        loop {
+            let correlation = tokio::time::timeout(
+                Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+                promotions.recv(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for promotion completion correlation {expected}")
+            })
+            .unwrap_or_else(|| {
+                panic!("the command driver stopped before handling promotion {expected}")
+            });
             if correlation == expected {
                 return;
             }
         }
-        panic!("the command driver stopped before handling promotion {expected}");
     }
 
     /// The production cleanup for a refused nonterminal message is an exact
@@ -19313,7 +19550,16 @@ mod tests {
         let (second_offer_ready_tx, second_offer_ready_rx) = tokio::sync::oneshot::channel();
         let (second_offer_release_tx, second_offer_release_rx) = tokio::sync::oneshot::channel();
 
-        start_speculative_local_offer(&state_a, &owner_a).await;
+        let first_offer_correlation = match start_speculative_local_offer(&state_a, &owner_a).await
+        {
+            Ok(correlation) => correlation,
+            Err(error) => {
+                panic!(
+                    "the first speculative Offer setup failed for {}: {}",
+                    error.correlation, error.reason
+                )
+            }
+        };
         let (first_attempt, first_sdp) = loop {
             let delivery = outbound_a
                 .recv()
@@ -19323,6 +19569,10 @@ mod tests {
                 break (attempt.clone(), sdp.clone());
             }
         };
+        assert_eq!(
+            first_attempt, first_offer_correlation,
+            "the observed first Offer carries the helper's exact generated correlation"
+        );
         let first_candidate = owner_a
             .connection()
             .speculative_worker_for(&first_attempt)
@@ -19962,14 +20212,31 @@ mod tests {
             .expect("W1 accepts the callback before W2 promotion");
         let (delayed_w1_event, delayed_w1_resources) = delayed_w1.into_parts();
 
-        start_speculative_local_offer(&state_a, &owner_a).await;
-        let second_offer = second_offer_ready_rx
-            .await
-            .expect("the relay exposes the held second offer");
+        let second_offer_correlation = match start_speculative_local_offer(&state_a, &owner_a).await
+        {
+            Ok(correlation) => correlation,
+            Err(error) => {
+                panic!(
+                    "the second speculative Offer setup failed for {}: {}",
+                    error.correlation, error.reason
+                )
+            }
+        };
+        let second_offer = tokio::time::timeout(
+            Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+            second_offer_ready_rx,
+        )
+        .await
+        .expect("timed out waiting for the relay to expose the second Offer")
+        .expect("the relay stopped before exposing the second Offer");
         let second_attempt = match second_offer {
             SignalingOutbound::Offer { attempt, .. } => attempt,
             _ => panic!("the held successor control is an offer"),
         };
+        assert_eq!(
+            second_attempt, second_offer_correlation,
+            "the observed second Offer carries the helper's exact generated correlation"
+        );
         promotion_gate_a.hold(&second_attempt);
         let successor = owner_a
             .connection()
@@ -20137,7 +20404,12 @@ mod tests {
             )
             .await
             .expect("A's exact selected W0 sends the production roster request");
-        roster_arrival.await;
+        tokio::time::timeout(
+            Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+            roster_arrival.as_mut(),
+        )
+        .await
+        .expect("timed out waiting for the exact-W0 roster arrival on B");
         assert_eq!(
             state_b.rpc_send_boundary.entered(),
             1,
@@ -20264,33 +20536,43 @@ mod tests {
         );
         let snapshot_before_terminal = owner_b.connection().snapshot();
         assert!(matches!(old_b_terminal, TransportEvent::DataChannelClosed));
-        handle_exact_promoted_terminal(&state_b, &owner_b, &old_b, DropReason::IceFailed).await;
+        let ((), near_events_consumed) = tokio::join!(
+            handle_exact_promoted_terminal(&state_b, &owner_b, &old_b, DropReason::IceFailed),
+            async {
+                tokio::time::timeout(
+                    Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+                    async {
+                        let mut near_events_consumed = 0usize;
+                        loop {
+                            let old_a_is_authenticated =
+                                state_a.peers.owner(&device_b).is_some_and(|owner| {
+                                    owner.connection().owns_authenticated_worker(&old_a)
+                                });
+                            if !old_a_is_authenticated {
+                                break near_events_consumed;
+                            }
+                            let event = tokio::time::timeout(
+                                Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+                                linked.near.receive_ready.link.left_events_mut().recv(),
+                            )
+                            .await
+                            .expect("timed out waiting for A's paired predecessor terminal event")
+                            .expect("the near event pump yields A's paired predecessor terminal");
+                            near_events_consumed += 1;
+                            handle_transport_event(&state_a, device_b.clone(), event).await;
+                        }
+                    },
+                )
+                .await
+                .expect("timed out while pumping A's predecessor terminal callback")
+            }
+        );
         let TransportEvent::Message(old_b_message) = old_b_message else {
             panic!("the retained predecessor callback is a message");
         };
         handle_exact_promoted_message(&state_b, &owner_b, &old_b, old_b_message).await;
         drop(old_b_terminal_resources);
         drop(old_b_message_resources);
-        let mut near_events_consumed = 0usize;
-        loop {
-            let old_a_is_authenticated = state_a
-                .peers
-                .owner(&device_b)
-                .is_some_and(|owner| owner.connection().owns_authenticated_worker(&old_a));
-            if !old_a_is_authenticated {
-                break;
-            }
-            let event = linked
-                .near
-                .receive_ready
-                .link
-                .left_events_mut()
-                .recv()
-                .await
-                .expect("the near event pump yields A's paired predecessor terminal");
-            near_events_consumed += 1;
-            handle_transport_event(&state_a, device_b.clone(), event).await;
-        }
         assert!(
             near_events_consumed > 0,
             "B's exact predecessor terminal is consumed through A's raw production callback"
@@ -20489,15 +20771,301 @@ mod tests {
                 .is_some(),
             "the unrelated hostile candidate coexists with held W2 and authenticated W0/W1/W2 before logical Depart"
         );
-
         let depart = MeshMessage::SessionControl(crate::protocol::SessionControl::Depart);
-        let (_depart_msg, _depart_claim, depart_work, depart_dispatch) =
+        let (_old_depart_msg, _old_depart_claim, old_depart_work, old_depart_dispatch) =
             admit_inbound_for_test(&state_b, &standby_owner_b, depart.clone())
-                .expect("standby channel admits authenticated Depart")
+                .expect("W1 admits the L0 Depart authority before replacement")
+                .into_dispatch();
+        let (_old_stale_msg, _old_stale_claim, old_stale_work, old_stale_dispatch) =
+            admit_inbound_for_test(&state_b, &standby_owner_b, depart.clone())
+                .expect("W1 captures the duplicate L0 Depart authority before replacement")
+                .into_dispatch();
+
+        // B2-G successor discriminator: park a second production RosterRequest
+        // after L0 has committed, then revoke L0 in place and install a real
+        // L1 over the same PeerConnection installations.  The parked logical
+        // route must be refused after the witness changes, while a fresh L1
+        // request must cross the newly selected native pair.
+        let stale_roster_probe = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(
+            &mut state_b.roster.write(),
+            &stale_roster_probe,
+            "b2-g-stale-l0-roster",
+        );
+        crate::roster::remove_peer_in(&mut state_a.roster.write(), &stale_roster_probe);
+        let stale_roster_request = serde_json::to_vec(&MeshMessage::RosterRequest(
+            crate::protocol::RosterRequestMessage {
+                include_all: true,
+                subtree_hashes: Vec::new(),
+            },
+        ))
+        .expect("the parked L0 roster request serializes");
+        let w1_owner_a = owner_a.for_worker(Arc::clone(&first_promoted_a));
+        state_a
+            .peers
+            .admit_application_operation(
+                &w1_owner_a,
+                state_a.session_broker.as_ref(),
+                &state_a.network_id,
+            )
+            .expect("A's selected L0 W1 funds the parked successor control")
+            .send_frame(
+                &state_a.peers,
+                Bytes::from(stale_roster_request),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("A's selected L0 W1 sends the parked successor control");
+        assert!(
+            settle_until(|| state_b.rpc_send_boundary.entered() == 3).await,
+            "the second production roster request commits on L0 before revocation"
+        );
+        assert_eq!(
+            state_b.rpc_send_boundary.passed(),
+            2,
+            "the new L0 roster reply is the only request held at the armed boundary"
+        );
+
+        owner_a.connection().revoke_promoted_session();
+        owner_b.connection().revoke_promoted_session();
+        assert!(!owner_a.connection().holds_promoted_session());
+        assert!(!owner_b.connection().holds_promoted_session());
+
+        let mut l1_link =
+            crate::endpoint_auth::native_link::connect_before_engine_open_receive_ready(
+                &state_a, &state_b,
+            )
+            .await;
+        let l1_open = l1_link.link.take_open_event();
+        let l1_open = l1_link
+            .link
+            .left
+            .accept_event(l1_open)
+            .expect("the same-installation L1 left connector accepts its open callback");
+        let (l1_open, _l1_open_resources) = l1_open.into_parts();
+        assert!(matches!(l1_open, TransportEvent::DataChannelOpen));
+        let l1_left_handoff = match l1_link.link.left.confirm_data_channel_open() {
+            DataChannelOpenOwnership::Connected(connected) => connected
+                .into_generic()
+                .expect("the L1 left connector yields its exact handoff"),
+            _ => panic!("the L1 left connector promotes exactly once"),
+        };
+        l1_link.link._left_events.commit_data_channel_open();
+        drop(_l1_open_resources);
+        let l1_right_handoff = l1_link.take_right_handoff();
+        let l1_left = Arc::clone(&l1_link.link.left);
+        let l1_right = Arc::clone(&l1_link.link.right);
+        owner_a
+            .connection()
+            .replace_connector_for_session_control(Arc::clone(&l1_left));
+        owner_a
+            .connection()
+            .install_authenticated_channel_over_for_test(
+                l1_left_handoff,
+                &state_a.network_id,
+                state_a.identity.public_id(),
+            );
+        owner_b
+            .connection()
+            .replace_connector_for_session_control(Arc::clone(&l1_right));
+        owner_b
+            .connection()
+            .install_authenticated_channel_over_for_test(
+                l1_right_handoff,
+                &state_b.network_id,
+                state_b.identity.public_id(),
+            );
+        assert!(
+            state_a
+                .peers
+                .admit_application_operation(
+                    &owner_a,
+                    state_a.session_broker.as_ref(),
+                    &state_a.network_id,
+                )
+                .is_some(),
+            "A promotes a distinct L1 over the unchanged owner installation"
+        );
+        assert!(
+            state_b
+                .peers
+                .admit_application_operation(
+                    &owner_b,
+                    state_b.session_broker.as_ref(),
+                    &state_b.network_id,
+                )
+                .is_some(),
+            "B promotes a distinct L1 over the unchanged owner installation"
+        );
+        assert!(owner_a.connection().select_promoted_channel(&l1_left));
+        assert!(owner_b.connection().select_promoted_channel(&l1_right));
+        let selected_l1_a = owner_a
+            .connection()
+            .select_unique_usable_channel()
+            .expect("A explicitly selects the fresh L1");
+        let selected_l1_b = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("B explicitly selects the fresh L1");
+        assert!(Arc::ptr_eq(&selected_l1_a, &l1_left));
+        assert!(Arc::ptr_eq(&selected_l1_b, &l1_right));
+        assert!(
+            !Arc::ptr_eq(&selected_l1_a, &first_promoted_a)
+                && !Arc::ptr_eq(&selected_l1_b, &first_promoted_b),
+            "L1 is a distinct selected connector on the same installations"
+        );
+        assert!(state_a.peers.get_if_current(&owner_a).is_some());
+        assert!(state_b.peers.get_if_current(&owner_b).is_some());
+
+        // Keep the two event receivers as disjoint borrows for the production
+        // two-direction pump below. The right receiver is extracted once;
+        // the left receiver remains the link's lifetime anchor.
+        let mut l1_right_events = l1_link.link.take_right_events();
+        let semantic_finished_before_stale_l1 = state_b.rpc_send_boundary.semantic_finished();
+        let frames_before_stale_l1 = owner_a.connection().state.read().diag.frames_in;
+        state_b.rpc_send_boundary.release();
+        assert!(
+            settle_until(|| state_b.rpc_send_boundary.passed() == 3).await,
+            "the parked L0 route is released only after L1 selection"
+        );
+        assert!(
+            settle_until(|| {
+                state_b.rpc_send_boundary.semantic_finished()
+                    == semantic_finished_before_stale_l1 + 1
+            })
+            .await,
+            "the stale L0 semantic reducer completes before a fresh L1 request"
+        );
+        assert!(
+            !state_a.is_rostered(&stale_roster_probe),
+            "the parked L0 response cannot cross the replacement L1"
+        );
+        assert_eq!(
+            owner_a.connection().state.read().diag.frames_in,
+            frames_before_stale_l1,
+            "the stale L0 reply contributes no inbound frame on the selected L1"
+        );
+
+        crate::roster::remove_peer_in(&mut state_b.roster.write(), &stale_roster_probe);
+        let fresh_roster_probe = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(
+            &mut state_b.roster.write(),
+            &fresh_roster_probe,
+            "b2-g-fresh-l1-roster",
+        );
+        crate::roster::remove_peer_in(&mut state_a.roster.write(), &fresh_roster_probe);
+        let fresh_roster_request = serde_json::to_vec(&MeshMessage::RosterRequest(
+            crate::protocol::RosterRequestMessage {
+                include_all: true,
+                subtree_hashes: Vec::new(),
+            },
+        ))
+        .expect("the fresh L1 roster request serializes");
+        let l1_owner_a = owner_a.for_worker(Arc::clone(&l1_left));
+        state_a
+            .peers
+            .admit_application_operation(
+                &l1_owner_a,
+                state_a.session_broker.as_ref(),
+                &state_a.network_id,
+            )
+            .expect("A's selected L1 funds the fresh roster request")
+            .send_frame(
+                &state_a.peers,
+                Bytes::from(fresh_roster_request),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("A's selected L1 sends the fresh roster request");
+        let ((), ()) = tokio::join!(
+            async {
+                while state_b.rpc_send_boundary.entered() < 4 {
+                    let event =
+                        tokio::time::timeout(Duration::from_secs(1), l1_right_events.recv())
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!("timed out polling A-to-B L1 right receiver")
+                            })
+                            .expect("the L1 right event stream remains live");
+                    let _ = handle_transport_event(&state_b, device_a.clone(), event).await;
+                }
+            },
+            async {
+                assert!(
+                    settle_until(|| state_b.rpc_send_boundary.entered() >= 4).await,
+                    "the fresh L1 request reaches B's exact boundary"
+                );
+                assert_eq!(
+                    state_b.rpc_send_boundary.entered(),
+                    4,
+                    "the fresh L1 boundary observer sees exactly one new request"
+                );
+                state_b.rpc_send_boundary.release();
+            }
+        );
+        assert_eq!(
+            state_b.rpc_send_boundary.entered(),
+            4,
+            "the fresh request reaches B through the selected L1"
+        );
+        while !state_a.is_rostered(&fresh_roster_probe) {
+            let event = tokio::time::timeout(
+                Duration::from_secs(1),
+                l1_link.link.left_events_mut().recv(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out polling B-to-A L1 left receiver"))
+            .expect("the L1 left event stream remains live");
+            let _ = handle_transport_event(&state_a, device_b.clone(), event).await;
+        }
+        assert!(
+            state_a.is_rostered(&fresh_roster_probe),
+            "a fresh L1 roster request receives its expected response"
+        );
+        assert!(
+            !state_a.is_rostered(&stale_roster_probe),
+            "the fresh L1 response does not carry the stale L0 roster row"
+        );
+        assert_eq!(
+            owner_a.connection().state.read().diag.frames_in,
+            frames_before_stale_l1 + 1,
+            "only the fresh L1 response adds one inbound frame after the stale baseline"
+        );
+
+        on_session_control(
+            &state_b,
+            &old_depart_dispatch,
+            crate::protocol::SessionControl::Depart,
+        )
+        .await;
+        assert!(
+            state_b.peers.get_if_current(&owner_b).is_some(),
+            "a stale L0 Depart cannot retire the same-installation replacement L1"
+        );
+        drop(old_depart_work);
+        on_session_control(
+            &state_b,
+            &old_stale_dispatch,
+            crate::protocol::SessionControl::Depart,
+        )
+        .await;
+        drop(old_stale_work);
+        assert!(
+            state_b.peers.get_if_current(&owner_b).is_some(),
+            "a duplicate stale L0 Depart remains a no-op while L1 is current"
+        );
+
+        let (_depart_msg, _depart_claim, depart_work, depart_dispatch) =
+            admit_inbound_for_test(&state_b, &owner_b, depart.clone())
+                .expect("the selected L1 channel admits authenticated Depart")
                 .into_dispatch();
         let (_stale_msg, _stale_claim, stale_work, stale_dispatch) =
-            admit_inbound_for_test(&state_b, &standby_owner_b, depart)
-                .expect("duplicate Depart captures the same exact logical witness")
+            admit_inbound_for_test(&state_b, &owner_b, depart)
+                .expect("duplicate L1 Depart captures the same exact logical witness")
                 .into_dispatch();
         on_session_control(
             &state_b,

@@ -340,6 +340,20 @@ pub(super) struct DedupDrain {
     additional: PromotedDedupDrain,
 }
 
+/// Exact custody for one retired native worker.
+///
+/// The worker and every dedup token accepted by that worker move together
+/// through native close.  A callback terminal path may therefore start a
+/// close and return to its pump without releasing the signaling key while the
+/// native close is still in flight.  The entry remains in `closing_workers`
+/// until the exact worker reports completion, so shutdown can join the same
+/// owner if its narrow waiter is cancelled or unavailable.
+struct ClosingWorker {
+    worker: Arc<WebRtcConnectorWorker>,
+    dedup: Option<DedupToken>,
+    additional_dedup: PromotedDedupDrain,
+}
+
 impl Iterator for DedupDrain {
     type Item = DedupToken;
 
@@ -392,7 +406,7 @@ pub struct PeerConnection {
     /// first and never trust this mirror to select a channel.
     pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
     speculative: Mutex<Vec<SpeculativeAttempt>>,
-    closing_workers: Mutex<Vec<Arc<WebRtcConnectorWorker>>>,
+    closing_workers: Mutex<Vec<ClosingWorker>>,
     retired_dedup: Mutex<Vec<DedupToken>>,
     signaling_runtime: RwLock<Option<Weak<crate::engine::signaling_ingress::SignalingRuntime>>>,
     media_renegotiation_workers: Mutex<Vec<Arc<WebRtcConnectorWorker>>>,
@@ -471,55 +485,187 @@ static DIAGNOSTIC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 impl PeerConnection {
     fn retain_closing_worker(&self, worker: Arc<WebRtcConnectorWorker>) {
+        self.retain_closing_worker_with_dedup(worker, None, PromotedDedupSet::new().drain_tokens());
+    }
+
+    fn retain_closing_worker_with_dedup(
+        &self,
+        worker: Arc<WebRtcConnectorWorker>,
+        dedup: Option<DedupToken>,
+        additional_dedup: PromotedDedupDrain,
+    ) {
         worker.retire();
         let mut closing = self.closing_workers.lock();
-        if !closing.iter().any(|current| Arc::ptr_eq(current, &worker)) {
-            closing.push(worker);
+        if let Some(current) = closing
+            .iter_mut()
+            .find(|current| Arc::ptr_eq(&current.worker, &worker))
+        {
+            debug_assert!(
+                current.dedup.is_none(),
+                "one retired worker receives dedup custody only once"
+            );
+            current.dedup = dedup;
+            current.additional_dedup = additional_dedup;
+        } else {
+            closing.push(ClosingWorker {
+                worker,
+                dedup,
+                additional_dedup,
+            });
         }
     }
 
-    pub(super) fn revoke_promoted_session(self: &Arc<Self>) {
-        let workers = self.promoted_session.take_workers_with_dedup();
+    fn release_dedup_custody(
+        &self,
+        dedup: Option<DedupToken>,
+        additional_dedup: PromotedDedupDrain,
+    ) {
         let runtime = self
             .signaling_runtime
             .read()
             .as_ref()
             .and_then(Weak::upgrade);
+        if let Some(runtime) = runtime {
+            if let Some(dedup) = dedup {
+                runtime.forget_token(dedup);
+            }
+            for dedup in additional_dedup {
+                runtime.forget_token(dedup);
+            }
+        } else {
+            let mut retired = self.retired_dedup.lock();
+            if let Some(dedup) = dedup {
+                retired.push(dedup);
+            }
+            retired.extend(additional_dedup);
+        }
+    }
+
+    fn complete_closing_worker(&self, worker: &Arc<WebRtcConnectorWorker>) {
+        let mut closing = self.closing_workers.lock();
+        let Some(index) = closing
+            .iter()
+            .position(|current| Arc::ptr_eq(&current.worker, worker))
+        else {
+            return;
+        };
+        let dedup = closing[index].dedup.take();
+        let additional_dedup = std::mem::replace(
+            &mut closing[index].additional_dedup,
+            PromotedDedupSet::new().drain_tokens(),
+        );
+        self.release_dedup_custody(dedup, additional_dedup);
+        let _ = closing.swap_remove(index);
+    }
+
+    fn complete_closing_worker_if_weak(&self, worker: &Weak<WebRtcConnectorWorker>) {
+        let mut closing = self.closing_workers.lock();
+        let Some(index) = closing
+            .iter()
+            .position(|current| worker.as_ptr() == Arc::as_ptr(&current.worker))
+        else {
+            return;
+        };
+        let dedup = closing[index].dedup.take();
+        let additional_dedup = std::mem::replace(
+            &mut closing[index].additional_dedup,
+            PromotedDedupSet::new().drain_tokens(),
+        );
+        self.release_dedup_custody(dedup, additional_dedup);
+        let _ = closing.swap_remove(index);
+    }
+
+    fn spawn_one_closing_worker(self: &Arc<Self>, worker: &Arc<WebRtcConnectorWorker>) -> bool {
+        let Some(current) = self
+            .closing_workers
+            .lock()
+            .iter()
+            .find(|current| Arc::ptr_eq(&current.worker, worker))
+            .map(|current| Arc::clone(&current.worker))
+        else {
+            return false;
+        };
+        let identity = Arc::downgrade(&current);
+        current.start_close();
+        let waiter = current.close_waiter();
+        drop(current);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return true;
+        };
+        let peer = Arc::clone(self);
+        handle.spawn(async move {
+            if let Err(error) = waiter.await {
+                tracing::warn!(%error, "exact retired connector native close failed");
+            }
+            peer.complete_closing_worker_if_weak(&identity);
+        });
+        true
+    }
+
+    /// Start one exact retired worker without awaiting it from a transport
+    /// callback.  The closing entry owns all dedup custody until the native
+    /// owner settles; the waiter is only a convenience, never the custody.
+    pub(super) fn start_exact_retired_worker(
+        self: &Arc<Self>,
+        worker: &Arc<WebRtcConnectorWorker>,
+        dedup: Option<DedupToken>,
+        additional_dedup: PromotedDedupDrain,
+    ) -> bool {
+        let Some(_current) = self
+            .closing_workers
+            .lock()
+            .iter()
+            .find(|current| Arc::ptr_eq(&current.worker, worker))
+            .map(|current| Arc::clone(&current.worker))
+        else {
+            self.release_dedup_custody(dedup, additional_dedup);
+            return false;
+        };
+        {
+            let mut closing = self.closing_workers.lock();
+            let Some(entry) = closing
+                .iter_mut()
+                .find(|entry| Arc::ptr_eq(&entry.worker, worker))
+            else {
+                drop(closing);
+                self.release_dedup_custody(dedup, additional_dedup);
+                return false;
+            };
+            if dedup.is_some() {
+                debug_assert!(
+                    entry.dedup.is_none(),
+                    "exact close custody is attached before the first native wait"
+                );
+                entry.dedup = dedup;
+            }
+            entry.additional_dedup = additional_dedup;
+        }
+        self.spawn_one_closing_worker(worker)
+    }
+
+    /// Start every currently retained native close before a caller hands the
+    /// peer to a detached or shutdown-visible supervisor.
+    pub(super) fn start_all_retired_workers(&self) {
+        let workers = self
+            .closing_workers
+            .lock()
+            .iter()
+            .map(|entry| Arc::clone(&entry.worker))
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.start_close();
+        }
+    }
+
+    pub(super) fn revoke_promoted_session(self: &Arc<Self>) {
+        let workers = self.promoted_session.take_workers_with_dedup();
         drop(self.session.lock().take());
         drop(self.endpoint_auth.lock().take());
         drop(self.authenticated_channel.lock().take());
         self.media_renegotiation_workers.lock().clear();
         for (worker, dedup, additional_dedup) in workers {
-            if let Some(runtime) = runtime.as_ref() {
-                if let Some(dedup) = dedup {
-                    runtime.forget_token(dedup);
-                }
-                for dedup in additional_dedup {
-                    runtime.forget_token(dedup);
-                }
-            } else {
-                if let Some(dedup) = dedup {
-                    self.retired_dedup.lock().push(dedup);
-                }
-                drop(additional_dedup);
-            }
-            self.retain_closing_worker(Arc::clone(&worker));
-            worker.start_close();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let peer = Arc::clone(self);
-                handle.spawn(async move {
-                    if let Err(error) = worker.retire_and_close().await {
-                        tracing::warn!(%error, "revoked connector native close failed");
-                    }
-                    let mut closing = peer.closing_workers.lock();
-                    if let Some(index) = closing
-                        .iter()
-                        .position(|current| Arc::ptr_eq(current, &worker))
-                    {
-                        drop(closing.swap_remove(index));
-                    }
-                });
-            }
+            self.retain_closing_worker_with_dedup(Arc::clone(&worker), dedup, additional_dedup);
+            let _ = self.spawn_one_closing_worker(&worker);
         }
     }
 
@@ -1207,39 +1353,14 @@ impl PeerConnection {
                 task.retire();
             }
             attempt.session.retire();
-            if let Some(dedup) = attempt.dedup {
-                if let Some(runtime) = self
-                    .signaling_runtime
-                    .read()
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                {
-                    runtime.forget_token(dedup);
-                } else {
-                    self.retired_dedup.lock().push(dedup);
-                }
-            }
-            if let Some(runtime) = self
-                .signaling_runtime
-                .read()
-                .as_ref()
-                .and_then(Weak::upgrade)
-            {
-                for dedup in attempt.additional_dedup.drain_tokens() {
-                    runtime.forget_token(dedup);
-                }
-            } else {
-                drop(attempt.additional_dedup);
-            }
             workers.push((
                 attempt.session,
-                None,
-                PromotedDedupSet::new().drain_tokens(),
+                attempt.dedup,
+                attempt.additional_dedup.drain_tokens(),
             ));
         }
         let worker = self.session.lock().take();
         if let Some(worker) = worker {
-            worker.retire();
             workers.push((
                 worker,
                 self.attempt_dedup.lock().take(),
@@ -1251,31 +1372,7 @@ impl PeerConnection {
             ));
         }
         for (worker, dedup, additional_dedup) in workers {
-            if let Some(dedup) = dedup {
-                if let Some(runtime) = self
-                    .signaling_runtime
-                    .read()
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                {
-                    runtime.forget_token(dedup);
-                } else {
-                    self.retired_dedup.lock().push(dedup);
-                }
-            }
-            if let Some(runtime) = self
-                .signaling_runtime
-                .read()
-                .as_ref()
-                .and_then(Weak::upgrade)
-            {
-                for dedup in additional_dedup {
-                    runtime.forget_token(dedup);
-                }
-            } else {
-                drop(additional_dedup);
-            }
-            self.retain_closing_worker(worker);
+            self.retain_closing_worker_with_dedup(worker, dedup, additional_dedup);
         }
     }
 
@@ -1301,9 +1398,17 @@ impl PeerConnection {
     pub(super) async fn await_retired_workers(&self) -> crate::Result<()> {
         let mut result = Ok(());
         loop {
-            let workers = self.closing_workers.lock().clone();
+            let workers = self
+                .closing_workers
+                .lock()
+                .iter()
+                .map(|entry| Arc::clone(&entry.worker))
+                .collect::<Vec<_>>();
             if workers.is_empty() {
                 return result;
+            }
+            for worker in &workers {
+                worker.start_close();
             }
             let outcomes =
                 futures::future::join_all(workers.into_iter().map(|worker| async move {
@@ -1317,50 +1422,9 @@ impl PeerConnection {
                         result = Err(error);
                     }
                 }
-                let mut closing = self.closing_workers.lock();
-                if let Some(index) = closing
-                    .iter()
-                    .position(|current| Arc::ptr_eq(current, &worker))
-                {
-                    drop(closing.swap_remove(index));
-                }
+                self.complete_closing_worker(&worker);
             }
         }
-    }
-
-    /// Remove and await one exact candidate retired by a registry operation.
-    ///
-    /// Candidate failure is a terminal edge, not peer teardown: retaining the
-    /// worker in `closing_workers` until the peer dies would pin its native
-    /// close owner and its provider claim for the peer's whole lifetime. The
-    /// registry only returns exact workers, and this method runs after that
-    /// fence has been released, so the native await never occurs under a
-    /// registry or candidate lock. A missing worker is stale and is left alone.
-    pub(super) async fn await_exact_retired_worker(
-        &self,
-        worker: &Arc<WebRtcConnectorWorker>,
-    ) -> Option<crate::Result<()>> {
-        if !self
-            .closing_workers
-            .lock()
-            .iter()
-            .any(|current| Arc::ptr_eq(current, worker))
-        {
-            return None;
-        }
-        // Keep exact custody visible until the native await completes. A
-        // concurrent shutdown may take the same Arc from the closing set and
-        // await its idempotent native close; it must never lose sight of a
-        // close merely because a candidate path started waiting first.
-        let result = worker.retire_and_close().await;
-        let mut closing = self.closing_workers.lock();
-        if let Some(index) = closing
-            .iter()
-            .position(|current| Arc::ptr_eq(current, worker))
-        {
-            drop(closing.swap_remove(index));
-        }
-        Some(result)
     }
 
     #[cfg(test)]

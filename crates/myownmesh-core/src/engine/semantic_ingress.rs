@@ -104,7 +104,8 @@ pub(crate) struct DurableSemanticExchange {
 ///
 /// **The split is load-bearing for the reply route.** [`reduce`] hands the
 /// optional [`LogicalSessionOperation`] itself to the inventory and request
-/// arms only. The operation exposes only its workerless owner to governance.
+/// arms only. Governance carries that workerless route to the final reply
+/// sender and never turns it into a channel-local route.
 /// [`Self::SignedFact`] is not merely trusted not to read it — it is never
 /// passed it, so for signed facts "a fact does not depend on its courier" is
 /// checked by the compiler rather than by review.
@@ -257,8 +258,9 @@ impl DurableSemanticExchange {
 /// landed mid-reduction does not receive the answer to a question its
 /// predecessor asked. It is `Option` because a durable exchange does not need
 /// one: a fact replayed from a cache or a file has nobody to answer, and that is
-/// an ordinary case rather than an error. Governance receives only the
-/// operation's workerless owner; channel identity never enters this reducer.
+/// an ordinary case rather than an error. Governance receives this workerless
+/// logical route and carries it to the final reply sender; channel identity
+/// never enters this reducer.
 ///
 /// It is **not** authority. The [`Exchange::SignedFact`] arms below are not
 /// passed it at all, which is the whole reason [`Exchange`] separates them:
@@ -313,10 +315,9 @@ pub(super) async fn reduce(
                 );
                 return;
             };
-            let owner = route.owner();
             match inventory {
-                Inventory::NetworkState(m) => governance::on_state_broadcast(state, owner, m).await,
-                Inventory::Roster(m) => governance::on_roster_summary(state, owner, m).await,
+                Inventory::NetworkState(m) => governance::on_state_broadcast(state, route, m).await,
+                Inventory::Roster(m) => governance::on_roster_summary(state, route, m).await,
             }
         }
         Exchange::DependencyRequest(DependencyRequest::Roster(m)) => {
@@ -324,8 +325,7 @@ pub(super) async fn reduce(
                 trace!(kind, "request with no route back; nothing to answer");
                 return;
             };
-            let owner = route.owner();
-            governance::on_roster_request(state, owner, m).await
+            governance::on_roster_request(state, route, m).await
         }
     }
 }

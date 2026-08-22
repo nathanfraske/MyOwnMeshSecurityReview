@@ -1243,6 +1243,7 @@ pub(crate) struct RpcSendBoundary {
     passed: std::sync::atomic::AtomicUsize,
     abandoned: std::sync::atomic::AtomicUsize,
     finished: std::sync::atomic::AtomicUsize,
+    semantic_finished: std::sync::atomic::AtomicUsize,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -1351,6 +1352,20 @@ impl RpcSendBoundary {
     /// merely near it.
     pub(crate) fn finished(&self) -> usize {
         self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record that one durable semantic reducer returned successfully. This is
+    /// separate from task/epilogue completion: a task may finish without
+    /// committing the semantic effect the control is proving.
+    pub(crate) fn mark_semantic_finished(&self) {
+        self.semantic_finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many durable semantic reducer completions were recorded.
+    pub(crate) fn semantic_finished(&self) -> usize {
+        self.semantic_finished
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

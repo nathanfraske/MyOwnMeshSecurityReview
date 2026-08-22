@@ -893,6 +893,49 @@ impl PeerRegistry {
         })
     }
 
+    /// Admit one durable logical reply for the exact operation that funded it,
+    /// and bind the resulting send to the session's already-selected channel.
+    ///
+    /// The logical operation deliberately carries no worker: its L0 witness
+    /// must remain usable after the channel that delivered the request is
+    /// retired. This fence is the only point that projects that logical
+    /// authority back into a transport send. It verifies the exact
+    /// installation, the live/current logical validity, and current durable
+    /// application policy, then reads the slot's explicitly selected worker.
+    /// There is no implicit selection, device-only re-resolution, or fallback
+    /// to the compatibility worker mirror. A same-installation L1 witness and
+    /// an unselected or no-longer-owned channel both refuse.
+    pub(super) fn admit_logical_reply_application_operation(
+        &self,
+        operation: &LogicalSessionOperation,
+    ) -> Option<AdmittedApplicationOperation> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(operation.owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &operation.owner.installation)
+            || !operation.witness.is_live()
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !peer.holds_promoted_session()
+            || !self.policy_admits(operation.owner.device_id())
+            || peer.with_logical_session_state(|logical| {
+                operation.witness.same_validity(logical.validity())
+            }) != Some(true)
+        {
+            return None;
+        }
+        let worker = peer.current_worker()?;
+        if !peer.owns_authenticated_worker(&worker) {
+            return None;
+        }
+        let logical =
+            LogicalSessionOperation::new(operation.owner.clone(), operation.witness.clone());
+        Some(AdmittedApplicationOperation {
+            channel: logical.into_exact_channel(worker),
+        })
+    }
+
     /// Run one realtime-flow operation against a live promoted session and a
     /// freshly acquired live connector incarnation.
     ///

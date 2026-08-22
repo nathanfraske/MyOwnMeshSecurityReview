@@ -84,6 +84,7 @@ use crate::runtime::attempt::{
 use super::ice::build_rtc_configuration;
 
 mod callback;
+
 /// The callback grant a scope-less lab connector states for itself.
 ///
 /// Published only where a scope-less connector can be built at all. Production
@@ -2382,7 +2383,9 @@ impl TransportEventReceiver {
                 _ = self.lifecycle.notified() => {
                     continue;
                 }
-                _ = self.callback_ready.notified() => { continue; }
+                _ = self.callback_ready.notified() => {
+                    continue;
+                }
                 _ = self.realtime_flows.ready.notified() => {
                     continue;
                 }
@@ -2488,7 +2491,9 @@ impl WebRtcConnectorEventReceiver {
                     }
                     continue;
                 }
-                queued = self.raw.recv_queued_filtered(self.data_channel_open_committed) => queued,
+                queued = self.raw.recv_queued_filtered(self.data_channel_open_committed) => {
+                    queued
+                },
             };
             if let Some(queued) = queued {
                 if let Some(event) = self.expose_queued(queued) {
@@ -2497,6 +2502,41 @@ impl WebRtcConnectorEventReceiver {
                 continue;
             }
             return None;
+        }
+    }
+
+    /// Pop one event that is already ready without waiting for a notification.
+    ///
+    /// This test-only seam follows [`Self::recv`] through the same recorded
+    /// close, retirement, candidate-reclamation, raw filtering, and callback
+    /// custody transitions. It consumes an event only when the raw receiver
+    /// has one ready; an empty receiver performs no allocation or scheduling.
+    #[cfg(test)]
+    pub(crate) fn try_recv_nonblocking(&mut self) -> Option<WebRtcConnectorEvent> {
+        loop {
+            if self.data_channel_closed {
+                return None;
+            }
+            if let Some(close) = self.expose_recorded_close() {
+                return Some(close);
+            }
+            if *self.retirement.borrow() {
+                return None;
+            }
+            if self
+                .attempt_retirement
+                .as_ref()
+                .is_some_and(|retirement| *retirement.borrow())
+                && self.reclaim_retired_attempt_candidate()
+            {
+                return None;
+            }
+            let queued = self
+                .raw
+                .try_scheduled_filtered(self.data_channel_open_committed)?;
+            if let Some(event) = self.expose_queued(queued) {
+                return Some(event);
+            }
         }
     }
 
@@ -5732,6 +5772,16 @@ impl WebRtcConnectorWorker {
     /// dependency's idempotent peer-connection close operation.
     pub(crate) async fn retire_and_close(&self) -> Result<()> {
         self.close_owner.wait().await
+    }
+
+    /// Return an owned waiter for the connector's existing close owner.
+    ///
+    /// The future retains only the funded close-owner state, not this worker's
+    /// Arc. Engine callback supervisors use it after dropping their strong
+    /// worker identity so a concurrent direct close join can release the
+    /// worker-owned resource observations immediately on completion.
+    pub(crate) fn close_waiter(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+        self.close_owner.close_waiter()
     }
 }
 

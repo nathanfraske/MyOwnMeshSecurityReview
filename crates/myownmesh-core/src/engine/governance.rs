@@ -45,7 +45,7 @@ use crate::protocol::{
 };
 
 use super::connection::PeerStatus;
-use super::peer_registry::PeerOwnerToken;
+use super::peer_registry::{LogicalSessionOperation, PeerOwnerToken};
 use super::state::{NetworkCmd, NetworkState as EngineState};
 
 // ---- helpers --------------------------------------------------------
@@ -698,15 +698,15 @@ pub async fn on_split(state: &Arc<EngineState>, msg: NetworkStateSplitMessage) {
 /// makes the post-mutation `NetworkState` broadcast double as a roster
 /// summary, so a peer learns of new members the moment any governance
 /// frame lands, not just on its own ACTIVE transition.
-// `pub(super)`: owner-bound, so it names a crate-private token, and the
+// `pub(super)`: logical-route-bound, so it names a crate-private operation, and the
 // engine's own frame dispatch is its only caller. The identity-keyed
 // governance handlers below stay `pub` — integration tests drive them.
 pub(super) async fn on_state_broadcast(
     state: &Arc<EngineState>,
-    owner: &PeerOwnerToken,
+    route: &LogicalSessionOperation,
     msg: NetworkStateBroadcast,
 ) {
-    let peer_id = owner.device_id();
+    let peer_id = route.owner().device_id();
     let (local_kind, local_count, local_member_count) = {
         let gov = state.governance_state.read();
         (
@@ -738,10 +738,10 @@ pub(super) async fn on_state_broadcast(
         crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
     let reply = state_broadcast_reply(local_count, local_member_count, &msg, membership_differs);
     if reply.pull_roster {
-        request_roster(state, owner).await;
+        request_roster(state, route).await;
     }
     if reply.re_advertise {
-        send_state_to_owner(state, owner).await;
+        send_state_to_owner(state, route).await;
     }
 }
 
@@ -805,16 +805,17 @@ fn state_broadcast_reply(
 /// network because a single member fell behind is precisely the flood the
 /// summary/request/entries shape exists to avoid.
 ///
-/// Through the captured owner, so a peer whose installation was replaced while
+/// Through the captured logical route, so a peer whose installation was replaced while
 /// we were deciding is answered on nothing rather than on a stale link — the
 /// same rule [`on_roster_request`] follows when it hands back the full roster.
-async fn send_state_to_owner(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
-    if state.peers.get_if_current(owner).is_none() {
-        return;
-    }
+async fn send_state_to_owner(state: &Arc<EngineState>, route: &LogicalSessionOperation) {
     let msg = MeshMessage::NetworkState(local_state_snapshot(state));
-    if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
-        tracing::debug!(peer = %owner.device_id(), err = %e, "state re-advertise send failed");
+    if let Err(e) = super::send_logical_reply(state, route, &msg).await {
+        tracing::debug!(
+            peer = %route.owner().device_id(),
+            err = %e,
+            "state re-advertise send failed"
+        );
     }
 }
 
@@ -903,10 +904,10 @@ pub(super) async fn broadcast_roster_summary_for_owner(
 /// ours, ask for their full roster so we can merge what we're missing.
 pub(super) async fn on_roster_summary(
     state: &Arc<EngineState>,
-    owner: &PeerOwnerToken,
+    route: &LogicalSessionOperation,
     msg: RosterSummaryMessage,
 ) {
-    maybe_request_roster(state, owner, &msg.root).await;
+    maybe_request_roster(state, route, &msg.root).await;
 }
 
 /// Inbound roster request. Reply peer-to-peer (not broadcast) with our
@@ -914,7 +915,7 @@ pub(super) async fn on_roster_summary(
 /// subtree-walk can ship later without changing the frame kind.
 pub(super) async fn on_roster_request(
     state: &Arc<EngineState>,
-    owner: &PeerOwnerToken,
+    route: &LogicalSessionOperation,
     _msg: RosterRequestMessage,
 ) {
     // A Silent network never emits roster entries — membership is not gossiped
@@ -943,11 +944,15 @@ pub(super) async fn on_roster_request(
         transitions,
         member_log,
     });
-    // Replying through the captured owner is what keeps our full membership and
+    // Replying through the captured logical route is what keeps our full membership and
     // signed governance log from being handed to whoever holds this device id
     // by the time the reply goes out. A superseded requester gets nothing.
-    if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
-        tracing::debug!(peer = %owner.device_id(), err = %e, "roster entries reply send failed");
+    if let Err(e) = super::send_logical_reply(state, route, &msg).await {
+        tracing::debug!(
+            peer = %route.owner().device_id(),
+            err = %e,
+            "roster entries reply send failed"
+        );
     }
 }
 
@@ -1436,27 +1441,35 @@ fn mirror_roles_to_roster(
 /// the side that's behind asks — so two peers don't both dump their whole
 /// rosters at each other. Idempotent and convergent: once memberships
 /// agree the roots match and no request fires.
-async fn maybe_request_roster(state: &Arc<EngineState>, owner: &PeerOwnerToken, their_root: &str) {
+async fn maybe_request_roster(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    their_root: &str,
+) {
     let our_root = crate::roster::membership_root(&state.roster.read());
     if our_root == their_root {
         return;
     }
-    request_roster(state, owner).await;
+    request_roster(state, route).await;
 }
 
 /// Send a targeted full-roster request to one peer. The reply
 /// ([`on_roster_request`]) carries both the membership entries and the signed
 /// governance log, so this is the single pull that converges *both* membership
 /// and roles.
-async fn request_roster(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
+async fn request_roster(state: &Arc<EngineState>, route: &LogicalSessionOperation) {
     let msg = MeshMessage::RosterRequest(RosterRequestMessage {
         include_all: true,
         subtree_hashes: Vec::new(),
     });
     // Owner-bound: the pull is a consequence of what one exact installation
     // told us, so it is asked of that installation or of nobody.
-    if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
-        tracing::debug!(peer = %owner.device_id(), err = %e, "roster request send failed");
+    if let Err(e) = super::send_logical_reply(state, route, &msg).await {
+        tracing::debug!(
+            peer = %route.owner().device_id(),
+            err = %e,
+            "roster request send failed"
+        );
     }
 }
 
