@@ -1706,12 +1706,24 @@ impl AdmittedInboundDispatch {
         &self.owner
     }
 
-    /// Reify the logical-session authority carried by this dispatch. The
-    /// operation owns the installation and witness, and deliberately carries
-    /// no worker stamp: post-admission logical commits are about the session,
-    /// while channel-specific admissions use [`ExactChannelOperation`].
-    pub(super) fn logical_operation(&self) -> LogicalSessionOperation {
+    /// Reify the durable semantic-reply authority carried by this dispatch.
+    ///
+    /// The operation owns only the captured installation and logical witness;
+    /// it deliberately carries no worker stamp. A semantic reply may outlive
+    /// the channel that delivered its request, so channel replacement must not
+    /// revoke a same-lineage logical commit. Conversely, the installation and
+    /// witness remain exact, so the operation cannot affect a replacement
+    /// logical session.
+    pub(super) fn logical_reply_operation(&self) -> LogicalSessionOperation {
         LogicalSessionOperation::new(self.owner.clone(), self.witness.clone())
+    }
+
+    /// Compatibility spelling for callers that need a generic logical route.
+    /// New durable semantic-reply code should use [`Self::logical_reply_operation`]
+    /// to make the workerless route explicit; channel-local code must use
+    /// [`Self::owner`] or [`Self::exact_channel_operation`].
+    pub(super) fn logical_operation(&self) -> LogicalSessionOperation {
+        self.logical_reply_operation()
     }
 
     /// Bind the worker captured by the accepting callback to this same

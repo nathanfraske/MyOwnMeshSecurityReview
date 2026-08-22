@@ -84,7 +84,7 @@ use crate::protocol::{
 };
 
 use super::governance;
-use super::peer_registry::PeerOwnerToken;
+use super::peer_registry::LogicalSessionOperation;
 use super::state::NetworkState;
 
 /// One admitted durable semantic exchange.
@@ -103,7 +103,8 @@ pub(crate) struct DurableSemanticExchange {
 /// the other two have anyone to answer.
 ///
 /// **The split is load-bearing for the reply route.** [`reduce`] hands the
-/// optional [`PeerOwnerToken`] itself to the inventory and request arms only.
+/// optional [`LogicalSessionOperation`] itself to the inventory and request
+/// arms only. The operation exposes only its workerless owner to governance.
 /// [`Self::SignedFact`] is not merely trusted not to read it — it is never
 /// passed it, so for signed facts "a fact does not depend on its courier" is
 /// checked by the compiler rather than by review.
@@ -251,12 +252,13 @@ impl DurableSemanticExchange {
 ///
 /// # The route is optional, and the facts cannot see it
 ///
-/// `reply` is where an answer would go, and it is the exact installation the
+/// `reply` is where an answer would go, and it is the exact logical session the
 /// input arrived on — not a device id to re-resolve, so a replacement that
 /// landed mid-reduction does not receive the answer to a question its
 /// predecessor asked. It is `Option` because a durable exchange does not need
 /// one: a fact replayed from a cache or a file has nobody to answer, and that is
-/// an ordinary case rather than an error.
+/// an ordinary case rather than an error. Governance receives only the
+/// operation's workerless owner; channel identity never enters this reducer.
 ///
 /// It is **not** authority. The [`Exchange::SignedFact`] arms below are not
 /// passed it at all, which is the whole reason [`Exchange`] separates them:
@@ -264,7 +266,7 @@ impl DurableSemanticExchange {
 /// than asserted in a comment.
 ///
 /// [`Exchange::FactBundle`] is passed a device id derived from the route, and
-/// only as a diagnostic label scoped to the session it arrived on. Nothing in
+/// only as a diagnostic label scoped to the logical session it arrived on. Nothing in
 /// the bundle's acceptance reads it, so the property still holds there — it is
 /// simply held by the reducer rather than by the type, and that distinction is
 /// stated instead of glossed.
@@ -272,14 +274,16 @@ impl DurableSemanticExchange {
 /// An inventory or a request that arrives with no route back is dropped with a
 /// trace. There is nothing else honest to do with "tell me what you have" when
 /// there is no-one to tell.
-pub(crate) async fn reduce(
+pub(super) async fn reduce(
     state: &Arc<NetworkState>,
     exchange: DurableSemanticExchange,
-    reply: Option<&PeerOwnerToken>,
+    reply: Option<&LogicalSessionOperation>,
 ) {
     let kind = exchange.kind_name();
     trace!(
-        source = reply.map(PeerOwnerToken::device_id).unwrap_or(NO_SESSION),
+        source = reply
+            .map(|route| route.owner().device_id())
+            .unwrap_or(NO_SESSION),
         kind,
         "reducing a durable semantic exchange"
     );
@@ -295,28 +299,32 @@ pub(crate) async fn reduce(
         // accept or reject anything. `on_roster_entries` verifies the logs from
         // genesis; `source` does not appear in that decision.
         Exchange::FactBundle(m) => {
-            let source = reply.map(PeerOwnerToken::device_id).unwrap_or(NO_SESSION);
+            let source = reply
+                .map(|route| route.owner().device_id())
+                .unwrap_or(NO_SESSION);
             governance::on_roster_entries(state, source, m).await
         }
         // Comparisons and questions. These are the ones with somebody to answer.
         Exchange::Inventory(inventory) => {
-            let Some(owner) = reply else {
+            let Some(route) = reply else {
                 trace!(
                     kind,
                     "inventory with no route back; nothing to compare against"
                 );
                 return;
             };
+            let owner = route.owner();
             match inventory {
                 Inventory::NetworkState(m) => governance::on_state_broadcast(state, owner, m).await,
                 Inventory::Roster(m) => governance::on_roster_summary(state, owner, m).await,
             }
         }
         Exchange::DependencyRequest(DependencyRequest::Roster(m)) => {
-            let Some(owner) = reply else {
+            let Some(route) = reply else {
                 trace!(kind, "request with no route back; nothing to answer");
                 return;
             };
+            let owner = route.owner();
             governance::on_roster_request(state, owner, m).await
         }
     }

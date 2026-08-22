@@ -4570,6 +4570,10 @@ pub(crate) struct WebRtcConnectorWorker {
     /// refuse, dressed as a test helper.
     #[cfg(all(test, feature = "transport-lab"))]
     withheld_binding_component: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    native_candidate_apply_calls: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    native_candidate_apply_gate: Option<Arc<NativeCandidateApplyGate>>,
 }
 
 struct AdmittedConnectorOwnership {
@@ -4980,6 +4984,10 @@ impl WebRtcConnectorWorker {
                 _transport_observation: transport_observation,
                 #[cfg(all(test, feature = "transport-lab"))]
                 withheld_binding_component: std::sync::atomic::AtomicU8::new(0),
+                #[cfg(test)]
+                native_candidate_apply_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                #[cfg(test)]
+                native_candidate_apply_gate: None,
             },
             receiver,
         ))
@@ -5353,9 +5361,30 @@ impl WebRtcConnectorWorker {
             Arc::clone(&self.close_owner),
             Arc::clone(&attempt),
         );
+        #[cfg(test)]
+        self.native_candidate_apply_calls
+            .fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        let native_operation = {
+            let native_operation = self.session.add_ice_candidate(candidate);
+            let native_apply_gate = self.native_candidate_apply_gate.clone();
+            async move {
+                if let Some(gate) = native_apply_gate {
+                    gate.entered.add_permits(1);
+                    gate.resume
+                        .acquire()
+                        .await
+                        .expect("native candidate apply gate remains open")
+                        .forget();
+                }
+                native_operation.await
+            }
+        };
+        #[cfg(not(test))]
+        let native_operation = self.session.add_ice_candidate(candidate);
         let result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
-            self.session.add_ice_candidate(candidate),
+            native_operation,
         )
         .await;
         let result = match result {
@@ -5789,6 +5818,22 @@ struct ConstructionTestHook {
     created: Semaphore,
     resume: Semaphore,
     peer_connection: SyncMutex<Option<Arc<RTCPeerConnection>>>,
+}
+
+#[cfg(test)]
+struct NativeCandidateApplyGate {
+    entered: Semaphore,
+    resume: Semaphore,
+}
+
+#[cfg(test)]
+impl NativeCandidateApplyGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Semaphore::new(0),
+            resume: Semaphore::new(0),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -9072,6 +9117,18 @@ mod tests {
         max_active_candidates: usize,
         callback_capacity: usize,
     ) -> MeshConnectorResourceScope {
+        test_resource_owner_with_additional(
+            max_active_candidates,
+            callback_capacity,
+            crate::resource::ResourceClaim::ZERO,
+        )
+    }
+
+    fn test_resource_owner_with_additional(
+        max_active_candidates: usize,
+        callback_capacity: usize,
+        additional: crate::resource::ResourceClaim,
+    ) -> MeshConnectorResourceScope {
         let max_active_candidates = std::num::NonZeroUsize::new(max_active_candidates)
             .expect("fixture has a nonzero candidate bound");
         let profiles = vec![test_webrtc_profile(callback_capacity); max_active_candidates.get()];
@@ -9082,7 +9139,9 @@ mod tests {
                 NonZeroUsize::new(callback_capacity).expect("fixture callback capacity is nonzero"),
             ),
         )
-        .expect("fixture connector and callback claims are representable");
+        .expect("fixture connector and callback claims are representable")
+        .checked_add(additional)
+        .expect("fixture connector additional claim is representable");
         let provider = ResourceProviderPort::new(FiniteResourceProvider::new(connector_grant))
             .expect("fixture provider accounts for its process scope");
         crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider)
@@ -14237,6 +14296,350 @@ mod tests {
             candidate_report(&context.report().pre_authentication).active,
             ResourceUse::ZERO
         );
+    }
+
+    fn native_remote_candidate_fixture_additional(
+        retained_charge: crate::resource::ResourceClaim,
+        slack: u64,
+    ) -> crate::resource::ResourceClaim {
+        let candidate = observed_candidate();
+        let string_capacity = candidate
+            .candidate
+            .capacity()
+            .checked_add(candidate.sdp_mid.as_ref().map_or(0, String::capacity))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    candidate
+                        .username_fragment
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+            })
+            .expect("native candidate fixture string capacity is representable");
+        let content = candidate_content_bytes(&candidate)
+            .expect("native candidate fixture content is representable");
+        let candidate_grant = transport_lab_remote_candidate_fixture_grant(
+            std::num::NonZeroU64::new(1).expect("one candidate is nonzero"),
+            std::num::NonZeroU64::new(1).expect("one digest operation is nonzero"),
+            std::num::NonZeroU64::new(
+                u64::try_from(string_capacity).expect("candidate string capacity fits u64"),
+            )
+            .expect("candidate string capacity is nonzero"),
+            std::num::NonZeroU64::new(u64::try_from(content).expect("candidate content fits u64"))
+                .expect("candidate content is nonzero"),
+            std::num::NonZeroU64::new(u64::try_from(content).expect("candidate content fits u64"))
+                .expect("candidate content is nonzero"),
+        )
+        .expect("native candidate fixture grant is representable");
+        candidate_grant
+            .checked_add(retained_charge)
+            .and_then(|claim| {
+                claim.checked_add(crate::resource::ResourceClaim::single(
+                    crate::resource::ResourceClass::AccountedMemoryBytes,
+                    slack,
+                ))
+            })
+            .expect("native candidate retained fixture grant is representable")
+    }
+
+    async fn native_remote_candidate_worker_fixture(
+        additional: crate::resource::ResourceClaim,
+    ) -> (
+        WebRtcConnectorWorker,
+        WebRtcConnectorEventReceiver,
+        PeerConnectionResourceScope,
+    ) {
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let resource_scope = context.peer_connection_scope();
+        let transport = Transport::new()
+            .expect("native candidate fixture transport")
+            .with_connector_resource_scope(
+                test_resource_owner_with_additional(1, 4, additional),
+                test_webrtc_profile(4),
+            );
+        let (worker, events) = transport
+            .open_connector_peer(Role::Offerer, &[], &[], resource_scope.clone())
+            .await
+            .expect("native candidate fixture connector is constructed");
+        (worker, events, resource_scope)
+    }
+
+    async fn native_remote_candidate_paired_worker_fixture(
+        additional: crate::resource::ResourceClaim,
+    ) -> (
+        WebRtcConnectorWorker,
+        WebRtcConnectorEventReceiver,
+        WebRtcConnectorWorker,
+        WebRtcConnectorEventReceiver,
+        PeerConnectionResourceScope,
+    ) {
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let offerer_scope = context.peer_connection_scope();
+        let answerer_scope = context.peer_connection_scope();
+        let transport = Transport::new().expect("paired native candidate fixture transport");
+        let offerer_transport = transport.clone().with_connector_resource_scope(
+            test_resource_owner_with_additional(1, 4, additional),
+            test_webrtc_profile(4),
+        );
+        let answerer_transport = transport.with_connector_resource_scope(
+            test_resource_owner_with_additional(1, 4, additional),
+            test_webrtc_profile(4),
+        );
+        let (offerer, offerer_events) = offerer_transport
+            .open_connector_peer(Role::Offerer, &[], &[], offerer_scope)
+            .await
+            .expect("paired offerer is constructed");
+        let (answerer, answerer_events) = answerer_transport
+            .open_connector_peer(Role::Answerer, &[], &[], answerer_scope)
+            .await
+            .expect("paired answerer is constructed");
+        let offer = offerer
+            .create_offer()
+            .await
+            .expect("paired offer is created");
+        answerer
+            .session
+            .set_remote_description(offer)
+            .await
+            .expect("paired answerer accepts the offer");
+        let answer = answerer
+            .create_answer()
+            .await
+            .expect("paired answer is created");
+        offerer
+            .session
+            .set_remote_description(answer)
+            .await
+            .expect("paired offerer accepts the answer");
+        (
+            offerer,
+            offerer_events,
+            answerer,
+            answerer_events,
+            context.peer_connection_scope(),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_production_candidate_pressure_refuses_before_native_mutation() {
+        let retained_claim = applied_remote_candidate_retained_claim()
+            .expect("applied candidate claim is representable");
+        let retained_charge = FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+            .expect("applied candidate reservation charge is representable");
+        let (worker, _events, resource_scope) = native_remote_candidate_worker_fixture(
+            native_remote_candidate_fixture_additional(retained_charge, 64),
+        )
+        .await;
+        let candidate = observed_candidate();
+        let attempt = Arc::clone(&worker.remote_candidates.lock().current.attempt);
+        let pending = {
+            let mut state = worker.remote_candidates.lock();
+            assert_eq!(
+                state.admit(candidate, &resource_scope),
+                PendingRemoteCandidateQueuePush::Queued
+            );
+            state
+                .current
+                .pending
+                .pop_last_for_application(&resource_scope)
+                .expect("production candidate reaches application")
+        };
+        let _held = worker
+            .ownership
+            .work_resource_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Speculative,
+                retained_claim,
+            )
+            .expect("production fixture admits one held retained claim");
+        let result = worker.apply_remote_candidate(pending).await;
+        assert!(matches!(
+            result,
+            Err(Error::ResourceUnavailable(ResourceUnavailable::Pressure(_)))
+        ));
+        assert_eq!(
+            worker.native_candidate_apply_calls.load(Ordering::Acquire),
+            0,
+            "provider pressure is rejected before the production native call"
+        );
+        assert!(!attempt.is_active(), "pressure retires the exact attempt");
+        worker
+            .retire_and_close()
+            .await
+            .expect("pressure control closes the production worker");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_production_candidate_error_after_native_entry_aborts_transaction() {
+        let retained_claim = applied_remote_candidate_retained_claim()
+            .expect("applied candidate claim is representable");
+        let retained_charge = FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+            .expect("applied candidate reservation charge is representable");
+        let (worker, _events, resource_scope) = native_remote_candidate_worker_fixture(
+            native_remote_candidate_fixture_additional(retained_charge, 64),
+        )
+        .await;
+        let candidate = observed_candidate();
+        let attempt = Arc::clone(&worker.remote_candidates.lock().current.attempt);
+        let pending = {
+            let mut state = worker.remote_candidates.lock();
+            assert_eq!(
+                state.admit(candidate, &resource_scope),
+                PendingRemoteCandidateQueuePush::Queued
+            );
+            state
+                .current
+                .pending
+                .pop_last_for_application(&resource_scope)
+                .expect("production candidate reaches application")
+        };
+        worker
+            .session
+            .pc
+            .close()
+            .await
+            .expect("native fixture closes before the forced apply error");
+        let result = worker.apply_remote_candidate(pending).await;
+        assert!(
+            result.is_err(),
+            "closed native peer rejects candidate apply"
+        );
+        assert_eq!(
+            worker.native_candidate_apply_calls.load(Ordering::Acquire),
+            1,
+            "the production native path was entered before its error"
+        );
+        assert!(
+            !attempt.is_active(),
+            "post-native error aborts the exact attempt"
+        );
+        worker
+            .close_owner
+            .wait()
+            .await
+            .expect("armed transaction starts exact close after native error");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_production_candidate_cancellation_aborts_armed_transaction() {
+        let retained_claim = applied_remote_candidate_retained_claim()
+            .expect("applied candidate claim is representable");
+        let retained_charge = FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+            .expect("applied candidate reservation charge is representable");
+        let (mut worker, _events, resource_scope) = native_remote_candidate_worker_fixture(
+            native_remote_candidate_fixture_additional(retained_charge, 64),
+        )
+        .await;
+        let candidate = observed_candidate();
+        let attempt = Arc::clone(&worker.remote_candidates.lock().current.attempt);
+        let pending = {
+            let mut state = worker.remote_candidates.lock();
+            assert_eq!(
+                state.admit(candidate, &resource_scope),
+                PendingRemoteCandidateQueuePush::Queued
+            );
+            state
+                .current
+                .pending
+                .pop_last_for_application(&resource_scope)
+                .expect("production candidate reaches application")
+        };
+        let gate = NativeCandidateApplyGate::new();
+        worker.native_candidate_apply_gate = Some(Arc::clone(&gate));
+        let close_owner = Arc::clone(&worker.close_owner);
+        let native_calls = Arc::clone(&worker.native_candidate_apply_calls);
+        let application = tokio::spawn(async move { worker.apply_remote_candidate(pending).await });
+
+        let _entered = gate
+            .entered
+            .acquire()
+            .await
+            .expect("production native candidate await entered");
+        assert_eq!(native_calls.load(Ordering::Acquire), 1);
+        assert!(
+            close_owner.ownership.incarnation.is_active(),
+            "the connector remains live while native apply is in flight"
+        );
+        application.abort();
+        assert!(
+            application.await.is_err(),
+            "production apply future is cancelled"
+        );
+        assert!(
+            !close_owner.ownership.incarnation.is_active(),
+            "cancellation retires the exact connector incarnation"
+        );
+        assert!(
+            !attempt.is_active(),
+            "cancellation aborts the exact ICE attempt"
+        );
+        close_owner
+            .wait()
+            .await
+            .expect("armed transaction settles exact close after cancellation");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_production_candidate_success_commits_and_disarms_transaction() {
+        let retained_claim = applied_remote_candidate_retained_claim()
+            .expect("applied candidate claim is representable");
+        let retained_charge = FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+            .expect("applied candidate reservation charge is representable");
+        let (worker, _offerer_events, answerer, _answerer_events, resource_scope) =
+            native_remote_candidate_paired_worker_fixture(
+                native_remote_candidate_fixture_additional(retained_charge, 64),
+            )
+            .await;
+        let candidate = observed_candidate();
+        let attempt = Arc::clone(&worker.remote_candidates.lock().current.attempt);
+        let pending = {
+            let mut state = worker.remote_candidates.lock();
+            assert_eq!(
+                state.admit(candidate, &resource_scope),
+                PendingRemoteCandidateQueuePush::Queued
+            );
+            state
+                .current
+                .pending
+                .pop_last_for_application(&resource_scope)
+                .expect("production candidate reaches application")
+        };
+        worker
+            .apply_remote_candidate(pending)
+            .await
+            .expect("native candidate application succeeds");
+        assert_eq!(
+            worker.native_candidate_apply_calls.load(Ordering::Acquire),
+            1
+        );
+        {
+            let state = worker.remote_candidates.lock();
+            assert!(
+                attempt.is_active(),
+                "successful apply keeps the exact attempt live"
+            );
+            assert_eq!(state.current.retained_reservations.len(), 1);
+            assert!(state
+                .current
+                .retained_reservations
+                .front()
+                .and_then(|reservation| reservation.application.as_ref())
+                .is_some());
+        }
+        worker
+            .retire_and_close()
+            .await
+            .expect("successful production apply closes through its owner");
+        answerer
+            .retire_and_close()
+            .await
+            .expect("paired answerer closes through its owner");
     }
 
     #[tokio::test]

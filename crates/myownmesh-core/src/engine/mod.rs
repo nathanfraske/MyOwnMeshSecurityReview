@@ -4187,7 +4187,6 @@ async fn handle_inbound_frame_from(
         .record_rx(traffic::class_of(&msg), bytes.len());
     // From here on `device_id` is never a dispatch key: every arm names the
     // captured installation, through the witness or through its owner token.
-    let owner = dispatch.owner();
     // The Semantic Node takes its own first, whole.
     //
     // Durable semantic exchange — the transition log, the roster, and the
@@ -4205,7 +4204,13 @@ async fn handle_inbound_frame_from(
     // reducer's fact arms cannot read it. See `semantic_ingress`.
     let msg = match semantic_ingress::admit(msg) {
         semantic_ingress::SemanticAdmission::Durable(durable) => {
-            return semantic_ingress::reduce(state, durable, Some(owner)).await
+            let logical_route = dispatch.logical_reply_operation();
+            // The test-only RPC boundary is also the lifecycle boundary for a
+            // durable request: it parks after exact admission and logical
+            // decode/commit, before the reducer can send its semantic reply.
+            // Production leaves this await empty.
+            state.reach_rpc_send_boundary().await;
+            return semantic_ingress::reduce(state, durable, Some(&logical_route)).await;
         }
         semantic_ingress::SemanticAdmission::NotDurable(other) => other,
     };
@@ -20091,11 +20096,58 @@ mod tests {
             })
             .expect("the B gateway serves the handoff control method");
         let (handoff_request, handoff_waiter) = file_pending(&state_a, &device_b);
-        let reply_arrival = state_b.rpc_send_boundary.arrival();
-        tokio::pin!(reply_arrival);
-        reply_arrival.as_mut().enable();
+        // B2-G semantic control: seed one B-only roster row so the actual
+        // RosterEntries reply has a durable, observable effect on A. The
+        // request is sent through A's exact selected W0 and reaches B through
+        // the normal connector pump, not a direct reducer invocation.
+        let roster_probe = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(
+            &mut state_b.roster.write(),
+            &roster_probe,
+            "b2-g-surviving-roster",
+        );
+        crate::roster::remove_peer_in(&mut state_a.roster.write(), &roster_probe);
+        let roster_arrival = state_b.rpc_send_boundary.arrival();
+        tokio::pin!(roster_arrival);
+        roster_arrival.as_mut().enable();
         state_b.rpc_send_boundary.arm();
         let w0_owner_b = owner_b.for_worker(Arc::clone(&old_b));
+        let w0_owner_a = owner_a.for_worker(Arc::clone(&old_a));
+        let roster_request = serde_json::to_vec(&MeshMessage::RosterRequest(
+            crate::protocol::RosterRequestMessage {
+                include_all: true,
+                subtree_hashes: Vec::new(),
+            },
+        ))
+        .expect("the production roster request serializes");
+        state_a
+            .peers
+            .admit_application_operation(
+                &w0_owner_a,
+                state_a.session_broker.as_ref(),
+                &state_a.network_id,
+            )
+            .expect("A's exact selected W0 funds the production roster request")
+            .send_frame(
+                &state_a.peers,
+                Bytes::from(roster_request),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("A's exact selected W0 sends the production roster request");
+        roster_arrival.await;
+        assert_eq!(
+            state_b.rpc_send_boundary.entered(),
+            1,
+            "B admits and funds the roster request on exact W0 before semantic reduction"
+        );
+        assert_eq!(
+            state_b.rpc_send_boundary.passed(),
+            0,
+            "the admitted roster request remains paused before its logical reply"
+        );
         let (saved_reliable_reply, mut saved_reliable_waiter) = tokio::sync::oneshot::channel();
         let saved_reliable_stream = state_b
             .peers
@@ -20162,16 +20214,14 @@ mod tests {
             panic!("the admitted handoff authority carries the RPC request");
         };
         on_rpc_request(&state_b, &handoff_dispatch, handoff_req).await;
-        reply_arrival.await;
-        assert_eq!(
-            state_b.rpc_send_boundary.entered(),
-            1,
-            "the admitted W0 handler reaches and parks at the reply boundary"
+        assert!(
+            settle_until(|| state_b.rpc_send_boundary.entered() == 2).await,
+            "the admitted W0 handler reaches the shared reply boundary"
         );
         assert_eq!(
             state_b.rpc_send_boundary.passed(),
             0,
-            "the W0 reply remains held until the surviving W1 is selected"
+            "the semantic and RPC replies remain held until the surviving W1 is selected"
         );
 
         // B2-G/H terminal controls: W0 is selected, while W1 and W2 are
@@ -20395,6 +20445,10 @@ mod tests {
         assert!(
             handoff_waiter.await.is_ok(),
             "the actual admitted RPC reply settles A's pending call through W1"
+        );
+        assert!(
+            settle_until(|| state_a.is_rostered(&roster_probe)).await,
+            "the paused production roster request resumes through logical L0 and its W1 reply crosses to A"
         );
         assert_eq!(
             pending_len(&state_a, &device_b),
