@@ -112,10 +112,6 @@ pub(crate) fn structural_json_claim(
 }
 
 impl DecodedApplicationFrame {
-    pub(crate) fn message(&self) -> &crate::protocol::MeshMessage {
-        &self.message
-    }
-
     pub(crate) fn into_parts(self) -> (crate::protocol::MeshMessage, ResourceClaim, ResourceLease) {
         (self.message, self.claim, self._work)
     }

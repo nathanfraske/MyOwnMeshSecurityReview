@@ -3987,6 +3987,7 @@ async fn handle_inbound_frame_from(
     /// inline avoids inventing a box on the refusal path.
     struct FundedInbound {
         witness: crate::runtime::session_broker::SessionValidityWitness,
+        dispatch: peer_registry::AdmittedInboundDispatch,
         frame: Option<crate::application_gateway::AdmittedApplicationFrame>,
     }
 
@@ -4011,6 +4012,7 @@ async fn handle_inbound_frame_from(
                 // session that refused rather than whichever one holds the
                 // device id by the time it runs.
                 let witness = admitted.session_witness();
+                let dispatch = admitted.capture_inbound_dispatch();
                 match admitted.with_session_state(|session, _record| {
                     crate::application_gateway::AdmittedApplicationFrame::admit(
                         session,
@@ -4019,6 +4021,7 @@ async fn handle_inbound_frame_from(
                 })? {
                     Ok(frame) => Some(FundedInbound {
                         witness,
+                        dispatch,
                         frame: Some(frame),
                     }),
                     // The owner will not fund this peer's traffic. Not a frame
@@ -4027,6 +4030,7 @@ async fn handle_inbound_frame_from(
                     // below names this session rather than a successor.
                     Err(_) => Some(FundedInbound {
                         witness,
+                        dispatch,
                         frame: None,
                     }),
                 }
@@ -4060,13 +4064,15 @@ async fn handle_inbound_frame_from(
         // paired with the witness, it names the session to retire, which is a
         // fact no boolean out here could carry.
         .flatten();
-    let (frame, witness) = match funded {
+    let (frame, witness, dispatch) = match funded {
         Some(FundedInbound {
             witness,
+            dispatch,
             frame: Some(frame),
-        }) => (frame, witness),
+        }) => (frame, witness, dispatch),
         Some(FundedInbound {
             witness,
+            dispatch: _,
             frame: None,
         }) => {
             // What an unfundable frame costs depends on what that frame was
@@ -4152,7 +4158,9 @@ async fn handle_inbound_frame_from(
     // Committed under the exact session that funded the parse. A revocation or
     // replacement that landed while the parse ran refuses here: the work was
     // paid for by a session that no longer speaks for this peer, so it
-    // authorizes nothing and the lease releases with `decoded`.
+    // authorizes nothing and the lease releases with `decoded`. This second
+    // half is deliberately workerless: the carrying channel may have ended
+    // while the logical session remains live.
     //
     // The reliable *outbox* drain stays inside this fence, unchanged and for the
     // unchanged reason: it is keyed by device id and shared across
@@ -4160,27 +4168,20 @@ async fn handle_inbound_frame_from(
     // installation owns. The receive-side high-water mark is still not settled
     // here — it moves with the delivery, under the dispatch's own fence, in
     // `on_channel_seq_admitted`.
-    let admitted = state
+    let (msg, application_claim, application_work) = decoded.into_parts();
+    if state
         .peers
-        .with_admitted_current_or_refused(
-            owner,
-            state.session_broker.as_ref(),
-            &state.network_id,
-            |admitted| {
-                reliable::admit_inbound_reliable(admitted, decoded.message());
-                Some(admitted.inbound_application_operation(decoded))
-            },
-            |_| None,
-        )
-        .flatten();
-    let Some(operation) = admitted else {
+        .with_same_session(dispatch.logical_operation(), |operation| {
+            reliable::admit_inbound_reliable(operation, &msg);
+        })
+        .is_none()
+    {
         trace!(
             peer = %device_id,
             "discarding an admitted frame whose session was replaced while it decoded"
         );
         return;
-    };
-    let (msg, application_claim, application_work, dispatch) = operation.into_dispatch();
+    }
     state
         .traffic
         .record_rx(traffic::class_of(&msg), bytes.len());
@@ -6690,53 +6691,18 @@ fn admit_logical_terminal_dispatch(
         .flatten()
 }
 
-/// The same synthetic terminal dispatch, but fenced to the session that
-/// funded an earlier frame. The expected witness is checked while the current
-/// admission holds the registry mutation lock; a successor may therefore be
-/// promoted by the admission attempt, but it can never be mistaken for the
-/// predecessor and retired by this failure path.
+/// Admit a logical terminal against the session that funded an earlier frame.
+/// The registry seam deliberately ignores the carrying worker, so a channel
+/// may disappear without making the logical witness unusable; a replacement
+/// installation still fails the witness and installation checks.
 fn admit_logical_terminal_dispatch_for_witness(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
     expected: &crate::runtime::session_broker::SessionValidityWitness,
 ) -> Option<peer_registry::AdmittedInboundDispatch> {
-    let encoded = Bytes::from(
-        serde_json::to_vec(&MeshMessage::Channel {
-            channel: "logical-terminal-probe".to_string(),
-            payload: serde_json::Value::Null,
-        })
-        .expect("the logical terminal probe serializes"),
-    );
     state
         .peers
-        .with_admitted_current_or_refused(
-            owner,
-            state.session_broker.as_ref(),
-            &state.network_id,
-            |admitted| {
-                let same_session = admitted
-                    .with_session_state(|session, _record| expected.witnesses(session))
-                    .unwrap_or(false);
-                if !same_session {
-                    return None;
-                }
-                let frame = admitted
-                    .with_session_state(|session, _record| {
-                        crate::application_gateway::AdmittedApplicationFrame::admit(
-                            session,
-                            encoded.clone(),
-                        )
-                    })
-                    .and_then(std::result::Result::ok)?;
-                let decoded = frame.decode().ok()?;
-                let operation = admitted.inbound_application_operation(decoded);
-                let (_message, _claim, work, dispatch) = operation.into_dispatch();
-                drop(work);
-                Some(dispatch)
-            },
-            |_| None,
-        )
-        .flatten()
+        .admit_logical_terminal_for_witness(owner, expected)
 }
 
 /// Install the current peer owner and retire any replaced compatibility queue.
@@ -20130,6 +20096,58 @@ mod tests {
         reply_arrival.as_mut().enable();
         state_b.rpc_send_boundary.arm();
         let w0_owner_b = owner_b.for_worker(Arc::clone(&old_b));
+        let (saved_reliable_reply, mut saved_reliable_waiter) = tokio::sync::oneshot::channel();
+        let saved_reliable_stream = state_b
+            .peers
+            .with_live_session_state(
+                &owner_b,
+                state_b.session_broker.as_ref(),
+                &state_b.network_id,
+                |session, app| {
+                    let stream = app.stream_for_test();
+                    app.submit(
+                        session,
+                        "b2-logical-preterminal",
+                        serde_json::json!({ "pending": "before-w0-terminal" }),
+                        saved_reliable_reply,
+                    );
+                    app.mark_sent(1);
+                    stream
+                },
+            )
+            .expect("W0 retains the reliable operation used by the saved logical dispatch");
+        let saved_terminal_bytes = Bytes::from(
+            serde_json::to_vec(&MeshMessage::ChannelAck {
+                stream: saved_reliable_stream,
+                up_to: 1,
+            })
+            .expect("the saved logical acknowledgement serializes"),
+        );
+        let (saved_terminal_frame, saved_terminal_witness, saved_terminal_dispatch) = state_b
+            .peers
+            .with_admitted_current_or_refused(
+                &w0_owner_b,
+                state_b.session_broker.as_ref(),
+                &state_b.network_id,
+                |admitted| {
+                    let frame = admitted
+                        .with_session_state(|session, _record| {
+                            crate::application_gateway::AdmittedApplicationFrame::admit(
+                                session,
+                                saved_terminal_bytes.clone(),
+                            )
+                        })
+                        .and_then(std::result::Result::ok)?;
+                    Some((
+                        frame,
+                        admitted.session_witness(),
+                        admitted.capture_inbound_dispatch(),
+                    ))
+                },
+                |_| None,
+            )
+            .flatten()
+            .expect("the valid logical acknowledgement is admitted and funded before W0 removal");
         let handoff_frame = MeshMessage::RpcRequest(RpcRequestMessage {
             request_id: handoff_request.request_id.clone(),
             method: "b2-logical-handoff".into(),
@@ -20256,8 +20274,8 @@ mod tests {
             after_w0_owner_b
                 .connection()
                 .with_logical_session_state(|logical| logical.state().pending()),
-            Some(1),
-            "selected W0 terminal preserves reliable logical state while selection is ambiguous"
+            Some(2),
+            "selected W0 terminal preserves both reliable logical operations while selection is ambiguous"
         );
         assert_eq!(
             snapshot_before_terminal.status, snapshot_after_w0.status,
@@ -20292,6 +20310,40 @@ mod tests {
                 .is_none(),
             "selection-gated current-channel admission refuses while W1/W2 are ambiguous"
         );
+        let saved_terminal_decoded = saved_terminal_frame
+            .decode()
+            .expect("the saved logical acknowledgement decodes after W0 removal");
+        let (saved_terminal_message, _saved_terminal_claim, saved_terminal_work) =
+            saved_terminal_decoded.into_parts();
+        let saved_logical_commit = state_b.peers.with_same_session(
+            saved_terminal_dispatch.logical_operation(),
+            |operation| {
+                reliable::admit_inbound_reliable(operation, &saved_terminal_message);
+            },
+        );
+        assert!(
+            saved_logical_commit.is_some(),
+            "the saved logical acknowledgement commits through L0 after W0 removal"
+        );
+        assert_eq!(
+            after_w0_owner_b
+                .connection()
+                .with_logical_session_state(|logical| logical.state().pending()),
+            Some(reliable_b_before),
+            "the saved logical acknowledgement settles its funded L0 frame and preserves the other"
+        );
+        assert!(
+            saved_reliable_waiter.try_recv().is_ok(),
+            "the saved logical acknowledgement resolves its funded L0 caller"
+        );
+        let saved_terminal_dispatch_after_commit = admit_logical_terminal_dispatch_for_witness(
+            &state_b,
+            &w0_owner_b,
+            &saved_terminal_witness,
+        )
+        .expect("the saved L0 terminal witness admits without retiring the logical session");
+        drop(saved_terminal_dispatch_after_commit);
+        drop(saved_terminal_work);
 
         let second_standby_owner_b = after_w0_owner_b.for_worker(Arc::clone(&second_promoted_b));
         drop_peer_if_current(&state_b, &second_standby_owner_b, DropReason::IceFailed).await;
@@ -20357,7 +20409,8 @@ mod tests {
         drop(handoff_work);
         assert_eq!(
             state_b.peers.reliable_pending_total(),
-            reliable_b_before + 1
+            reliable_b_before,
+            "the surviving L0 reliable operation remains after the saved predecessor acknowledgement"
         );
         assert_eq!(pending_len(&state_b, &device_a), Some(1));
         // Capture an admitted response operation on logical L0 while W1 is
@@ -20401,7 +20454,7 @@ mod tests {
         drop(depart_work);
         assert!(
             state_b.peers.owner(&device_a).is_none(),
-            "Depart on the standby removes the exact logical peer and all channels"
+            "the authenticated Depart removes the exact logical peer and all channels"
         );
         assert!(
             !matches!(
@@ -20449,6 +20502,22 @@ mod tests {
             .connection()
             .select_unique_usable_channel()
             .expect("the unrelated successor exposes its exact selected channel");
+        assert!(
+            admit_logical_terminal_dispatch_for_witness(
+                &state_b,
+                &w0_owner_b,
+                &saved_terminal_witness,
+            )
+            .is_none(),
+            "the saved L0 terminal witness cannot end replacement logical L1"
+        );
+        assert!(
+            state_b
+                .peers
+                .with_same_session(saved_terminal_dispatch.logical_operation(), |_| ())
+                .is_none(),
+            "the saved L0 logical commit cannot affect replacement logical L1"
+        );
         let (fresh_request, mut fresh_waiter) = file_pending(&state_b, &device_a);
         on_rpc_response(
             &state_b,

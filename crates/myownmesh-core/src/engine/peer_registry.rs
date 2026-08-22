@@ -561,6 +561,37 @@ impl PeerRegistry {
         })
     }
 
+    /// Admit a logical terminal for a captured session witness while allowing
+    /// the channel that carried it to have disappeared. The installation is
+    /// still exact, but the owner worker is deliberately ignored: this seam
+    /// never selects, promotes or re-resolves a channel.
+    pub(super) fn admit_logical_terminal_for_witness(
+        &self,
+        owner: &PeerOwnerToken,
+        expected: &crate::runtime::peer_session::LogicalSessionValidityWitness,
+    ) -> Option<AdmittedInboundDispatch> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) || !expected.is_live() {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if peer.with_logical_session_state(|logical| expected.same_validity(logical.validity()))
+            != Some(true)
+        {
+            return None;
+        }
+        Some(AdmittedInboundDispatch {
+            peer: Arc::clone(peer),
+            owner: PeerOwnerToken {
+                peer: Arc::clone(peer),
+                installation: Arc::clone(&current.value().installation),
+                worker: None,
+            },
+            witness: expected.clone(),
+        })
+    }
+
     pub(super) fn get_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
         self.peers.get(owner.device_id()).and_then(|entry| {
             (Arc::ptr_eq(&entry.value().installation, &owner.installation)
@@ -1547,28 +1578,33 @@ impl LogicalSessionOperation {
         self.owner.connection().with_logical_session_state(effect)
     }
 
-    /// Take one admitted inbound frame as an owned, move-only operation.
-    ///
-    /// The message is moved *in* to the fence by the caller and comes back out
-    /// only here, on the admitted arm, bound to the exact peer and owner this
-    /// fence proved. The binding is what lets the dispatch that follows name
-    /// *this* installation instead of re-resolving a device id a replacement
-    /// may since have taken over.
-    pub(super) fn inbound_application_operation(
-        &self,
-        frame: crate::application_gateway::DecodedApplicationFrame,
-    ) -> AdmittedInboundApplicationOperation {
+    /// Capture the admitted inbound installation, accepted channel and logical
+    /// witness without carrying any decoded frame state.
+    pub(super) fn capture_inbound_dispatch(&self) -> AdmittedInboundDispatch {
         let owner = self.inbound_worker.as_ref().map_or_else(
             || self.owner.clone(),
             |worker| self.owner.for_worker(Arc::clone(worker)),
         );
+        AdmittedInboundDispatch {
+            peer: Arc::clone(self.owner.connection()),
+            owner,
+            witness: self.witness.clone(),
+        }
+    }
+
+    /// Take one admitted inbound frame as an owned, move-only operation.
+    ///
+    /// The message is moved *in* to the fence by the caller and comes back out
+    /// only here, on the admitted arm, bound to the exact dispatch captured
+    /// above. The binding is what lets the dispatch name *this* installation
+    /// instead of re-resolving a device id a replacement may have taken over.
+    pub(super) fn inbound_application_operation(
+        &self,
+        frame: crate::application_gateway::DecodedApplicationFrame,
+    ) -> AdmittedInboundApplicationOperation {
         AdmittedInboundApplicationOperation {
             frame,
-            dispatch: AdmittedInboundDispatch {
-                peer: Arc::clone(self.owner.connection()),
-                owner,
-                witness: self.witness.clone(),
-            },
+            dispatch: self.capture_inbound_dispatch(),
         }
     }
 

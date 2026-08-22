@@ -5303,10 +5303,10 @@ impl WebRtcConnectorWorker {
                     .to_string(),
             ));
         }
-        // What refuses the native application below is the elastic attempt's own
-        // claim for it. The owner-selected application-work count that used to
-        // be checked here is gone: it could only refuse an apply the owner's
-        // grant would have funded.
+        // The elastic attempt first admits its own candidate claim, then the
+        // exact retained post-native claim is atomically charged before the
+        // irreversible native mutation. A refusal therefore cannot strand
+        // native ICE state without its retained ownership.
         let _ice_observation =
             observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::IceWork, 1, 0);
         let PendingRemoteCandidate {
@@ -5317,6 +5317,13 @@ impl WebRtcConnectorWorker {
             _elastic_lease,
             _production_queue_lease,
         } = pending;
+        let retained_claim = match applied_remote_candidate_retained_claim() {
+            Ok(claim) => claim,
+            Err(error) => {
+                self.remote_candidates.lock().retire_attempt(&attempt);
+                return Err(error);
+            }
+        };
         let mut elastic_application = match _elastic_lease {
             Some(lease) => lease.begin_apply().map_err(|error| {
                 self.remote_candidates.lock().retire_attempt(&attempt);
@@ -5337,31 +5344,52 @@ impl WebRtcConnectorWorker {
                 ));
             }
         };
+        if let Err(error) = elastic_application.transition_after_application(retained_claim) {
+            self.remote_candidates.lock().retire_attempt(&attempt);
+            return Err(Error::ResourceUnavailable(error));
+        }
+        let mut transaction = UncommittedIceTransaction::new(
+            Arc::clone(&self.remote_candidates),
+            Arc::clone(&self.close_owner),
+            Arc::clone(&attempt),
+        );
         let result = await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.add_ice_candidate(candidate),
         )
-        .await
-        .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?;
-        result?;
+        .await;
+        let result = match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => Err(error),
+            None => Err(Error::Transport(
+                "connector worker retired during ICE apply".to_string(),
+            )),
+        };
+        if let Err(error) = result {
+            self.remote_candidates.lock().retire_attempt(&attempt);
+            return Err(error);
+        }
         if !attempt.is_active() || !self.remote_candidates.lock().owns_attempt(&attempt) {
             return Err(Error::Transport(
                 "remote candidate completed after its ICE attempt retired".to_string(),
             ));
         }
         drop(observation);
-        if let Some(mut reservation) = _queue_reservation {
-            let retained_claim = applied_remote_candidate_retained_claim()?;
-            if let Err(error) = elastic_application.transition_after_application(retained_claim) {
-                self.remote_candidates.lock().retire_attempt(&attempt);
-                return Err(Error::ResourceUnavailable(error));
-            }
-            reservation.application = Some(elastic_application);
-            let mut state = self.remote_candidates.lock();
-            if state.current.owns_attempt(&attempt) {
-                state.current.retained_reservations.push_back(reservation);
-            }
+        let Some(mut reservation) = _queue_reservation else {
+            return Err(Error::Transport(
+                "remote candidate completed without its custody reservation".to_string(),
+            ));
+        };
+        let mut state = self.remote_candidates.lock();
+        if !state.current.owns_attempt(&attempt) {
+            return Err(Error::Transport(
+                "remote candidate completed after its ICE attempt drifted".to_string(),
+            ));
         }
+        reservation.application = Some(elastic_application);
+        state.current.retained_reservations.push_back(reservation);
+        drop(state);
+        transaction.disarm();
         Ok(())
     }
 
@@ -12528,6 +12556,129 @@ mod tests {
     }
 
     #[test]
+    fn v4_arc03_applied_candidate_pressure_refuses_before_native_mutation() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let candidate = observed_candidate();
+        let content =
+            candidate_content_bytes(&candidate).expect("fixture content is representable");
+        let retained_claim = applied_remote_candidate_retained_claim()
+            .expect("applied candidate claim is representable");
+        let retained_charge =
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+                .expect("applied candidate reservation charge is representable");
+        let held_claim_fixture_slack = crate::resource::ResourceClaim::single(
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            64,
+        );
+        let fixture_additional = retained_charge
+            .checked_add(held_claim_fixture_slack)
+            .expect("held retained-claim fixture slack is representable");
+        let (_provider, _owner, _candidate, _lifetime, work_resources) =
+            elastic_remote_candidate_test_resources_with_additional(
+                RemoteCandidateFixtureWork::new(1, content),
+                fixture_additional,
+            );
+        let mut state = RemoteCandidateState::with_resources(work_resources.clone());
+        assert_eq!(
+            state.admit(candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let mut pending = state
+            .current
+            .pending
+            .pop_last_for_application(&scope)
+            .expect("the funded candidate reaches application");
+        let mut application = pending
+            ._elastic_lease
+            .take()
+            .expect("the queued candidate retains its elastic lease")
+            .begin_apply()
+            .expect("the queued candidate enters application ownership");
+        let _held_retained_claim = work_resources
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Speculative,
+                retained_claim,
+            )
+            .expect("the fixture holds the exact retained claim to create pressure");
+        let mut native_called = false;
+        let transition = match application.transition_after_application(retained_claim) {
+            Ok(()) => {
+                native_called = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        assert!(
+            matches!(transition, Err(ResourceUnavailable::Pressure(_))),
+            "the exact retained claim is refused while its capacity is held"
+        );
+        assert!(
+            !native_called,
+            "native mutation follows successful custody admission"
+        );
+        state.current.retire();
+    }
+
+    #[test]
+    fn v4_arc03_applied_candidate_success_moves_ownership_into_attempt_custody() {
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let candidate = observed_candidate();
+        let content =
+            candidate_content_bytes(&candidate).expect("fixture content is representable");
+        let retained_claim = applied_remote_candidate_retained_claim()
+            .expect("applied candidate claim is representable");
+        let retained_charge =
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(retained_claim)
+                .expect("applied candidate reservation charge is representable");
+        let (_provider, _owner, _candidate, _lifetime, work_resources) =
+            elastic_remote_candidate_test_resources_with_additional(
+                RemoteCandidateFixtureWork::new(1, content),
+                retained_charge,
+            );
+        let mut state = RemoteCandidateState::with_resources(work_resources);
+        assert_eq!(
+            state.admit(candidate, &scope),
+            PendingRemoteCandidateQueuePush::Queued
+        );
+        let mut pending = state
+            .current
+            .pending
+            .pop_last_for_application(&scope)
+            .expect("the funded candidate reaches application");
+        let mut application = pending
+            ._elastic_lease
+            .take()
+            .expect("the queued candidate retains its elastic lease")
+            .begin_apply()
+            .expect("the queued candidate enters application ownership");
+        application
+            .transition_after_application(retained_claim)
+            .expect("the exact retained claim is admitted before native success");
+        let mut reservation = pending
+            ._queue_reservation
+            .take()
+            .expect("the queued candidate retains its custody slot");
+        reservation.application = Some(application);
+        state.current.retained_reservations.push_back(reservation);
+        assert_eq!(state.current.retained_reservations.len(), 1);
+        assert!(state
+            .current
+            .retained_reservations
+            .front()
+            .and_then(|reservation| reservation.application.as_ref())
+            .is_some());
+        state.current.retire();
+    }
+
+    #[test]
     /// One digest, one retention: a repeat submission is refused before it can
     /// take a second retention lease.
     ///
@@ -12871,6 +13022,35 @@ mod tests {
             .wait()
             .await
             .expect("the exact close owner completes after cancellation");
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_disarmed_ice_transaction_preserves_committed_attempt() {
+        let state = Arc::new(SyncMutex::new(RemoteCandidateState::new(
+            test_candidate_fixture_work(),
+        )));
+        let resource_owner = test_resource_owner(1, 1);
+        let (close_owner, _attempt_lifetime) = close_owner_fixture(&resource_owner);
+        assert!(close_owner.attach_remote_candidates(Arc::clone(&state)));
+        let attempt = Arc::clone(&state.lock().current.attempt);
+        let mut transaction = UncommittedIceTransaction::new(
+            Arc::clone(&state),
+            Arc::clone(&close_owner),
+            Arc::clone(&attempt),
+        );
+
+        transaction.disarm();
+        drop(transaction);
+
+        assert!(
+            state.lock().current.attempt.is_active(),
+            "disarming after the exact reservation commit preserves the attempt"
+        );
+        close_owner.start();
+        close_owner
+            .wait()
+            .await
+            .expect("the explicit cleanup completes after the disarmed proof");
     }
 
     #[tokio::test]
