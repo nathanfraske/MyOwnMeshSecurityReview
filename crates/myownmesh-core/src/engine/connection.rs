@@ -351,7 +351,10 @@ pub(super) struct DedupDrain {
 struct ClosingWorker {
     worker: Arc<WebRtcConnectorWorker>,
     dedup: Option<DedupToken>,
+    supplemental_dedup: Option<DedupToken>,
     additional_dedup: PromotedDedupDrain,
+    supplemental_additional_dedup: Option<PromotedDedupDrain>,
+    additional_attached: bool,
 }
 
 impl Iterator for DedupDrain {
@@ -485,7 +488,22 @@ static DIAGNOSTIC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 impl PeerConnection {
     fn retain_closing_worker(&self, worker: Arc<WebRtcConnectorWorker>) {
-        self.retain_closing_worker_with_dedup(worker, None, PromotedDedupSet::new().drain_tokens());
+        worker.retire();
+        let mut closing = self.closing_workers.lock();
+        if closing
+            .iter()
+            .any(|current| Arc::ptr_eq(&current.worker, &worker))
+        {
+            return;
+        }
+        closing.push(ClosingWorker {
+            worker,
+            dedup: None,
+            supplemental_dedup: None,
+            additional_dedup: PromotedDedupSet::new().drain_tokens(),
+            supplemental_additional_dedup: None,
+            additional_attached: false,
+        });
     }
 
     fn retain_closing_worker_with_dedup(
@@ -496,21 +514,39 @@ impl PeerConnection {
     ) {
         worker.retire();
         let mut closing = self.closing_workers.lock();
-        if let Some(current) = closing
-            .iter_mut()
-            .find(|current| Arc::ptr_eq(&current.worker, &worker))
+        if let Some(index) = closing
+            .iter()
+            .position(|current| Arc::ptr_eq(&current.worker, &worker))
         {
-            debug_assert!(
-                current.dedup.is_none(),
-                "one retired worker receives dedup custody only once"
-            );
-            current.dedup = dedup;
-            current.additional_dedup = additional_dedup;
+            let current = &mut closing[index];
+            // A second retirement of the same Arc is expected when a
+            // promoted worker is still present in the legacy mirror. Never
+            // overwrite the first custody. A primary token can fill an empty
+            // primary slot; a second source uses the bounded supplemental
+            // slot and remains attached to this exact close entry.
+            if current.dedup.is_none() {
+                current.dedup = dedup;
+            } else if current.supplemental_dedup.is_none() {
+                current.supplemental_dedup = dedup;
+            } else {
+                unreachable!("one exact worker has only one bounded duplicate primary source");
+            }
+            if !current.additional_attached {
+                current.additional_dedup = additional_dedup;
+                current.additional_attached = true;
+            } else if current.supplemental_additional_dedup.is_none() {
+                current.supplemental_additional_dedup = Some(additional_dedup);
+            } else {
+                unreachable!("one exact worker has only one bounded duplicate additional source");
+            }
         } else {
             closing.push(ClosingWorker {
                 worker,
                 dedup,
+                supplemental_dedup: None,
                 additional_dedup,
+                supplemental_additional_dedup: None,
+                additional_attached: true,
             });
         }
     }
@@ -543,43 +579,59 @@ impl PeerConnection {
 
     fn complete_closing_worker(&self, worker: &Arc<WebRtcConnectorWorker>) {
         let mut closing = self.closing_workers.lock();
-        let Some(index) = closing
-            .iter()
-            .position(|current| Arc::ptr_eq(&current.worker, worker))
-        else {
-            return;
-        };
-        let dedup = closing[index].dedup.take();
-        let additional_dedup = std::mem::replace(
-            &mut closing[index].additional_dedup,
-            PromotedDedupSet::new().drain_tokens(),
-        );
-        self.release_dedup_custody(dedup, additional_dedup);
-        let _ = closing.swap_remove(index);
+        for current in closing.iter_mut() {
+            if !Arc::ptr_eq(&current.worker, worker) {
+                continue;
+            }
+            let dedup = current.dedup.take();
+            let supplemental_dedup = current.supplemental_dedup.take();
+            let additional_dedup = std::mem::replace(
+                &mut current.additional_dedup,
+                PromotedDedupSet::new().drain_tokens(),
+            );
+            let supplemental_additional_dedup = current.supplemental_additional_dedup.take();
+            self.release_dedup_custody(dedup, additional_dedup);
+            if supplemental_dedup.is_some() || supplemental_additional_dedup.is_some() {
+                self.release_dedup_custody(
+                    supplemental_dedup,
+                    supplemental_additional_dedup
+                        .unwrap_or_else(|| PromotedDedupSet::new().drain_tokens()),
+                );
+            }
+        }
+        closing.retain(|current| !Arc::ptr_eq(&current.worker, worker));
     }
 
     fn complete_closing_worker_if_weak(&self, worker: &Weak<WebRtcConnectorWorker>) {
         let mut closing = self.closing_workers.lock();
-        let Some(index) = closing
-            .iter()
-            .position(|current| worker.as_ptr() == Arc::as_ptr(&current.worker))
-        else {
-            return;
-        };
-        let dedup = closing[index].dedup.take();
-        let additional_dedup = std::mem::replace(
-            &mut closing[index].additional_dedup,
-            PromotedDedupSet::new().drain_tokens(),
-        );
-        self.release_dedup_custody(dedup, additional_dedup);
-        let _ = closing.swap_remove(index);
+        for current in closing.iter_mut() {
+            if worker.as_ptr() != Arc::as_ptr(&current.worker) {
+                continue;
+            }
+            let dedup = current.dedup.take();
+            let supplemental_dedup = current.supplemental_dedup.take();
+            let additional_dedup = std::mem::replace(
+                &mut current.additional_dedup,
+                PromotedDedupSet::new().drain_tokens(),
+            );
+            let supplemental_additional_dedup = current.supplemental_additional_dedup.take();
+            self.release_dedup_custody(dedup, additional_dedup);
+            if supplemental_dedup.is_some() || supplemental_additional_dedup.is_some() {
+                self.release_dedup_custody(
+                    supplemental_dedup,
+                    supplemental_additional_dedup
+                        .unwrap_or_else(|| PromotedDedupSet::new().drain_tokens()),
+                );
+            }
+        }
+        closing.retain(|current| worker.as_ptr() != Arc::as_ptr(&current.worker));
     }
 
     fn spawn_one_closing_worker(self: &Arc<Self>, worker: &Arc<WebRtcConnectorWorker>) -> bool {
         let Some(current) = self
             .closing_workers
             .lock()
-            .iter()
+            .iter_mut()
             .find(|current| Arc::ptr_eq(&current.worker, worker))
             .map(|current| Arc::clone(&current.worker))
         else {
@@ -631,14 +683,21 @@ impl PeerConnection {
                 self.release_dedup_custody(dedup, additional_dedup);
                 return false;
             };
-            if dedup.is_some() {
-                debug_assert!(
-                    entry.dedup.is_none(),
-                    "exact close custody is attached before the first native wait"
-                );
+            if entry.dedup.is_none() {
                 entry.dedup = dedup;
+            } else if entry.supplemental_dedup.is_none() {
+                entry.supplemental_dedup = dedup;
+            } else {
+                unreachable!("one exact worker has only one bounded duplicate primary source");
             }
-            entry.additional_dedup = additional_dedup;
+            if !entry.additional_attached {
+                entry.additional_dedup = additional_dedup;
+                entry.additional_attached = true;
+            } else if entry.supplemental_additional_dedup.is_none() {
+                entry.supplemental_additional_dedup = Some(additional_dedup);
+            } else {
+                unreachable!("one exact worker has only one bounded duplicate additional source");
+            }
         }
         self.spawn_one_closing_worker(worker)
     }

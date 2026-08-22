@@ -19152,6 +19152,221 @@ mod tests {
         offer_state.shutdown().await;
     }
 
+    /// A production Candidate can retain a de-duplication token on the legacy
+    /// mirror before the exact same worker is promoted. Whole-peer retirement
+    /// must drain the promoted slot first and the mirror second without
+    /// releasing that token or starting two native closes for one Arc.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_promoted_legacy_mirror_dedup_close_custody() {
+        let (state, mut signaling_in_rx, mut cmd_rx, provider, _grant) =
+            build_test_state_parts_metered("b2-promoted-legacy-mirror-dedup", None, 2, None);
+        let baseline_active_reservations = provider.active_reservations();
+        let baseline_active_scopes = provider.active_scopes();
+        let baseline_retained_after_failed_cleanup = provider.retained_after_failed_cleanup();
+        let baseline = provider.in_use();
+        let signaling_runtime = signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state
+                .local_application_resource_scope()
+                .expect("the legacy-mirror control funds one signaling runtime"),
+        );
+        state.publish_signaling_runtime(&signaling_runtime);
+        let nostr = signaling_ingress::SignalingRuntime::attach(
+            &signaling_runtime,
+            SignalingCarrier::Nostr,
+        );
+        let mdns =
+            signaling_ingress::SignalingRuntime::attach(&signaling_runtime, SignalingCarrier::Mdns);
+        let target = "b2-promoted-legacy-mirror-target";
+        let fixture = insert_promoted_peer(&state, target).await;
+        let owner = state
+            .peers
+            .owner(target)
+            .expect("the legacy owner is installed");
+        let legacy_worker = owner
+            .connection()
+            .session
+            .lock()
+            .clone()
+            .expect("the fixture exposes one legacy W0 worker");
+        let attempt = owner.connection().attempt();
+        assert!(
+            !attempt.is_empty(),
+            "the legacy worker has a real attempt correlation"
+        );
+        let candidate = myownmesh_signaling::SignalingMessage::Candidate {
+            peer_id: target.to_string(),
+            offer_id: attempt.clone(),
+            candidate: "candidate:foundation 1 udp 2113937151 192.0.2.1 5000 typ host".to_string(),
+            sdp_mid: Some("0".to_string()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        };
+        let deliver_candidate = |carrier: &signaling_ingress::CarrierAttach| {
+            carrier.deliver(carrier.directed(target.to_string(), candidate.clone()))
+        };
+        assert!(deliver_candidate(&nostr));
+        signaling_in_rx
+            .recv()
+            .await
+            .expect("the production Candidate reaches legacy ingress")
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+            .await;
+        assert!(
+            signaling_runtime.remembers_attempt_for_test(&attempt),
+            "the queued legacy Candidate retains its real SignalingRuntime token"
+        );
+        assert!(!fixture.peer.holds_promoted_session());
+        assert!(Arc::ptr_eq(
+            &legacy_worker,
+            &owner
+                .connection()
+                .session
+                .lock()
+                .clone()
+                .expect("the Candidate leaves the same legacy W0 mirror installed")
+        ));
+        assert!(
+            state
+                .peers
+                .admit_application_operation(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.network_id,
+                )
+                .is_some(),
+            "the exact legacy worker promotes after production Candidate retention"
+        );
+        assert!(fixture.peer.holds_promoted_session());
+        assert_eq!(fixture.peer.promoted_channel_count(), 1);
+        let replay_delivery = cmd_rx
+            .try_recv()
+            .expect("promotion queues exactly one ReplayCapabilities delivery");
+        assert!(matches!(
+            replay_delivery.value(),
+            NetworkCmd::ReplayCapabilities { owner: announced }
+                if announced.device_id() == owner.device_id()
+                    && state.peers.get_if_current(announced).is_some()
+        ));
+        replay_delivery
+            .run_terminal_effect(|command| handle_command(&state, command))
+            .await;
+        assert!(Arc::ptr_eq(
+            &legacy_worker,
+            &owner
+                .connection()
+                .select_unique_usable_channel()
+                .expect("promotion selects the exact legacy W0 worker")
+        ));
+        assert!(Arc::ptr_eq(
+            &legacy_worker,
+            &owner
+                .connection()
+                .session
+                .lock()
+                .clone()
+                .expect("promotion preserves the legacy W0 mirror")
+        ));
+        let close_gate = legacy_worker.install_native_close_gate_for_test();
+        let retirement_state = Arc::clone(&state);
+        let retirement_target = target.to_string();
+        let retirement = tokio::spawn(async move {
+            drop_peer(&retirement_state, &retirement_target, DropReason::IceFailed).await;
+        });
+        close_gate.wait_for_entry().await;
+        assert!(
+            !retirement.is_finished(),
+            "whole-peer retirement remains held by the exact native W0 close"
+        );
+        assert!(state.peers.owner(target).is_none());
+        assert!(!fixture.peer.holds_promoted_session());
+        assert_eq!(
+            owner.connection().retired_worker_count_for_test(),
+            1,
+            "slot-first and legacy-mirror-second retirement retain one exact W0 close entry"
+        );
+        assert!(
+            signaling_runtime.remembers_attempt_for_test(&attempt),
+            "slot and mirror custody keep the real Candidate token remembered while gated"
+        );
+        assert!(deliver_candidate(&mdns));
+        assert!(
+            signaling_in_rx.try_recv().is_none(),
+            "the identical Candidate is suppressed before whole-peer close settlement"
+        );
+        close_gate.open();
+        retirement
+            .await
+            .expect("whole-peer retirement joins the exact gated native close");
+        assert_eq!(owner.connection().retired_worker_count_for_test(), 0);
+        assert!(
+            !signaling_runtime.remembers_attempt_for_test(&attempt),
+            "exact W0 settlement releases the Candidate token after both mirror drains"
+        );
+
+        let successor = insert_promoted_peer(&state, target).await;
+        let successor_owner = state.peers.owner(target).expect("the successor is current");
+        assert!(!Arc::ptr_eq(
+            owner.connection(),
+            successor_owner.connection()
+        ));
+        assert!(deliver_candidate(&mdns));
+        signaling_in_rx
+            .recv()
+            .await
+            .expect("the identical Candidate re-enters after exact W0 settlement")
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+            .await;
+        assert!(
+            state.peers.get_if_current(&successor_owner).is_some()
+                && !successor.peer.holds_promoted_session(),
+            "the stale W0 Candidate reaches ingress but cannot promote the successor"
+        );
+        assert!(!signaling_runtime.remembers_attempt_for_test(&attempt));
+        drop_peer_if_current(&state, &owner, DropReason::UserLeft).await;
+        assert!(
+            state.peers.get_if_current(&successor_owner).is_some(),
+            "the stale predecessor owner cannot retire the successor"
+        );
+        drop_peer(&state, target, DropReason::UserLeft).await;
+        drop(close_gate);
+        drop(owner);
+        drop(successor_owner);
+        drop(legacy_worker);
+        drop(successor);
+        drop(fixture);
+        drop(nostr);
+        drop(mdns);
+        drop(signaling_runtime);
+        state.shutdown().await;
+        assert!(
+            state.signaling_runtime().is_none(),
+            "shutdown clears the published SignalingRuntime owner from NetworkState"
+        );
+        assert_eq!(
+            provider.active_reservations(),
+            baseline_active_reservations,
+            "legacy-mirror teardown restores active provider reservations"
+        );
+        assert_eq!(
+            provider.active_scopes(),
+            baseline_active_scopes,
+            "legacy-mirror teardown restores active provider scopes"
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            baseline_retained_after_failed_cleanup,
+            "legacy-mirror teardown restores failed-cleanup retention"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "legacy-mirror close custody and successor cleanup restore provider baseline"
+        );
+    }
+
     /// Forward real production signaling messages between two in-process
     /// engines.  The connector pair is real; this only replaces the carrier
     /// that would normally transport the already-shaped offer, answer and

@@ -2499,12 +2499,16 @@ impl NetworkState {
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
     pub(crate) async fn shutdown(&self) {
+        // Keep the published runtime alive while every retired connector has
+        // finished releasing its exact de-duplication custody.  The field is
+        // cleared only after this is the last shutdown consumer of it.
+        let runtime = self.signaling_runtime();
         let retired = self.peers.retire_all();
         for peer in &retired {
             if let Err(error) = peer.retire_and_close().await {
                 tracing::warn!(%error, peer = %peer.device_id, "peer cleanup failed during shutdown");
             }
-            if let Some(runtime) = self.signaling_runtime() {
+            if let Some(runtime) = runtime.as_ref() {
                 for token in peer.take_retired_dedup() {
                     runtime.forget_token(token);
                 }
@@ -2512,6 +2516,8 @@ impl NetworkState {
         }
         self.peers.await_replaced_closes().await;
         drop(retired);
+        drop(runtime);
+        self.signaling_runtime.write().take();
         // Nothing outlives the engine: parked connect waits resolve with the
         // truth instead of hanging.
         //
