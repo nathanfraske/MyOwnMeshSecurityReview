@@ -54,6 +54,7 @@ use crate::resource::{
 use crate::transport::LocalIceCandidate;
 
 use super::state::{SignalingInbound, SignalingOutbound};
+use crate::runtime::peer_session::DedupToken;
 
 /// Which carrier observed a signaling message.
 ///
@@ -268,6 +269,7 @@ impl CarrierObservation {
             signal,
             attribution,
             inbound,
+            dedup: None,
         }
     }
 }
@@ -284,6 +286,7 @@ pub(crate) struct EphemeralIngress {
     signal: EphemeralSignal,
     attribution: CarrierAttribution,
     inbound: SignalingInbound,
+    dedup: Option<DedupToken>,
 }
 
 /// Redacting, and the derive it replaces was the reason.
@@ -360,9 +363,18 @@ impl EphemeralIngress {
         self.inbound
     }
 
+    pub(crate) fn dedup_token(&self) -> Option<DedupToken> {
+        self.dedup.clone()
+    }
+
     /// Variant name for driver-liveness traces — cheap, no payload.
     pub(crate) fn kind_name(&self) -> &'static str {
         self.inbound.kind_name()
+    }
+
+    fn with_dedup_token(mut self, token: DedupToken) -> Self {
+        self.dedup = Some(token);
+        self
     }
 }
 
@@ -593,6 +605,7 @@ enum Delivered {
 struct SeenKey {
     attempt: u64,
     key: u64,
+    token: std::sync::Weak<crate::runtime::peer_session::DedupTokenInner>,
     _lease: ResourceLease,
 }
 
@@ -633,6 +646,7 @@ pub(crate) struct SignalingRuntime {
     /// module names no count.
     scope: LocalApplicationResourceScope,
     instances: AtomicU64,
+    dedup_instances: AtomicU64,
     seen: Mutex<VecDeque<SeenKey>>,
 }
 
@@ -654,6 +668,7 @@ impl SignalingRuntime {
             tx,
             scope,
             instances: AtomicU64::new(0),
+            dedup_instances: AtomicU64::new(0),
             seen: Mutex::new(VecDeque::new()),
         })
     }
@@ -714,7 +729,24 @@ impl SignalingRuntime {
             return !matches!(self.send(ingress), Delivered::Closed);
         };
 
+        let Some(token) = DedupToken::try_new(
+            self.dedup_instances.fetch_add(1, Ordering::Relaxed),
+            &self.scope,
+        ) else {
+            // A lifecycle token is itself provider-funded. Under pressure the
+            // observation may still pass through, but it carries no custody
+            // and therefore cannot leave an unfunded token in the engine.
+            trace!(kind = ingress.kind_name(), "dedup token unfunded");
+            return !matches!(self.send(ingress), Delivered::Closed);
+        };
+        let weak_token = token.weak();
+        let ingress = ingress.with_dedup_token(token);
+
         let mut seen = self.seen.lock();
+        // The remembered key is non-owning. If every lifecycle owner forgot or
+        // dropped its token, release the lease before considering this copy;
+        // the ingress ring must never become a peer-lifetime tombstone.
+        seen.retain(|entry| entry.token.strong_count() != 0);
         if seen
             .iter()
             .any(|entry| entry.attempt == attempt && entry.key == key)
@@ -750,6 +782,7 @@ impl SignalingRuntime {
             Some(lease) => seen.push_back(SeenKey {
                 attempt,
                 key,
+                token: weak_token,
                 _lease: lease,
             }),
             None => trace!(kind, "de-duplication key unfunded; duplicates will pass"),
@@ -757,7 +790,7 @@ impl SignalingRuntime {
         true
     }
 
-    /// Forget everything remembered for one attempt.
+    /// Forget exactly one retained ingress key.
     ///
     /// Called by the engine when an attempt ends or is replaced — the two
     /// moments after which nothing belonging to it can legitimately arrive
@@ -768,13 +801,27 @@ impl SignalingRuntime {
     /// attempt from suppressing a live one; releasing on the exact end is what
     /// stops the ring from being a slowly filling record of every attempt the
     /// process ever made, emptied only by provider pressure.
-    pub(crate) fn forget_attempt(&self, attempt: &str) {
-        if attempt.is_empty() {
+    pub(crate) fn forget_token(&self, token: DedupToken) {
+        // Consume the exact lifecycle owner before checking the weak key. Two
+        // terminal callbacks can otherwise both observe the pre-drop strong
+        // count and leave a dead key behind forever; consuming makes exactly
+        // the last owner remove it, even when the callbacks race.
+        let mut seen = self.seen.lock();
+        let weak = token.weak();
+        drop(token);
+        if weak.strong_count() != 0 {
             return;
         }
+        seen.retain(|entry| !entry.token.ptr_eq(&weak));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remembers_attempt_for_test(&self, attempt: &str) -> bool {
         let attempt = hash_attempt(attempt);
-        let mut seen = self.seen.lock();
-        seen.retain(|entry| entry.attempt != attempt);
+        self.seen
+            .lock()
+            .iter()
+            .any(|entry| entry.attempt == attempt)
     }
 
     /// Fund one more remembered key, evicting the oldest once if that is what it
@@ -1287,7 +1334,7 @@ pub(super) mod tests {
     ///   simply disable de-duplication;
     /// - across two attempts the identical candidate is delivered, which is the
     ///   correction;
-    /// - after `forget_attempt` the first attempt's own candidate is delivered
+    /// - after exact-token forget the first attempt's own candidate is delivered
     ///   again, which proves the keys were released rather than merely
     ///   out-competed — a ring that had kept them would still swallow it.
     #[test]
@@ -1316,22 +1363,29 @@ pub(super) mod tests {
         };
 
         assert!(deliver("attempt-1"));
+        let first_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the first accepted candidate carries exact dedup custody");
         assert!(deliver("attempt-1"));
         assert_eq!(
             drain(&mut rx),
-            1,
+            0,
             "within one attempt the second copy is still a duplicate"
         );
 
         assert!(deliver("attempt-2"));
+        let second_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the replacement attempt carries its own exact dedup custody");
         assert_eq!(
             drain(&mut rx),
-            1,
-            "the identical candidate on the replacement attempt is delivered: \
-             this is what a content-only key swallowed"
+            0,
+            "the replacement attempt has exactly one delivered candidate"
         );
 
-        runtime.forget_attempt("attempt-1");
+        runtime.forget_token(first_token);
         assert!(deliver("attempt-1"));
         assert_eq!(
             drain(&mut rx),
@@ -1347,6 +1401,121 @@ pub(super) mod tests {
             drain(&mut rx),
             0,
             "forgetting one attempt does not empty the ring"
+        );
+        runtime.forget_token(second_token);
+    }
+
+    #[test]
+    fn exact_token_release_does_not_erase_same_correlation_successor() {
+        let (runtime, mut rx) = runtime_with_rx();
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+
+        let first = relay.deliver(relay.directed("peer-a".into(), offer("sdp-first")));
+        assert!(first);
+        let first_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the first candidate owns an exact dedup token");
+
+        let second = relay.deliver(relay.directed("peer-a".into(), offer("sdp-second")));
+        assert!(second);
+        let second_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the successor owns a distinct exact dedup token");
+
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("sdp-second"))));
+        assert!(
+            rx.try_recv().is_none(),
+            "the successor duplicate is suppressed"
+        );
+
+        runtime.forget_token(first_token);
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("sdp-second"))));
+        assert!(
+            rx.try_recv().is_none(),
+            "releasing W1 cannot erase W2's key"
+        );
+
+        runtime.forget_token(second_token);
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("sdp-second"))));
+        assert!(
+            rx.try_recv().is_some(),
+            "W2 admits a fresh copy after its own end"
+        );
+    }
+
+    #[test]
+    fn live_answer_and_candidate_custody_suppresses_restamped_duplicates() {
+        let (runtime, mut rx) = runtime_with_rx();
+        let relay_a = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+        let relay_b = SignalingRuntime::attach(&runtime, SignalingCarrier::Mdns);
+        let answer = || SignalingMessage::Answer {
+            peer_id: "peer-a".into(),
+            offer_id: "live-attempt".into(),
+            sdp: "answer-sdp".into(),
+        };
+        assert!(relay_a.deliver(relay_a.directed("peer-a".into(), answer())));
+        let answer_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("accepted Answer carries lifecycle custody");
+        assert!(relay_b.deliver(relay_b.directed("peer-a".into(), answer())));
+        assert!(
+            rx.try_recv().is_none(),
+            "a restamped Answer stays suppressed while its exact owner lives"
+        );
+        runtime.forget_token(answer_token);
+        assert!(relay_b.deliver(relay_b.directed("peer-a".into(), answer())));
+        assert!(rx.try_recv().is_some(), "Answer re-enters after exact end");
+
+        let candidate = || SignalingMessage::Candidate {
+            peer_id: "peer-a".into(),
+            offer_id: "live-attempt".into(),
+            candidate: "candidate:1 1 UDP 1 10.0.0.1 5000 typ host".into(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        };
+        assert!(relay_a.deliver(relay_a.directed("peer-a".into(), candidate())));
+        let candidate_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("accepted Candidate carries lifecycle custody");
+        assert!(relay_b.deliver(relay_b.directed("peer-a".into(), candidate())));
+        assert!(
+            rx.try_recv().is_none(),
+            "a restamped Candidate stays suppressed while its exact owner lives"
+        );
+        runtime.forget_token(candidate_token);
+        assert!(relay_b.deliver(relay_b.directed("peer-a".into(), candidate())));
+        assert!(
+            rx.try_recv().is_some(),
+            "Candidate re-enters after exact end"
+        );
+    }
+
+    #[test]
+    fn consumed_last_owner_releases_shared_key_without_prune() {
+        let (runtime, mut rx) = runtime_with_rx();
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("shared-owner"))));
+        let owner = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the accepted Offer carries funded lifecycle custody");
+        let second_owner = owner.clone();
+        assert!(runtime.remembers_attempt_for_test("offer-1"));
+
+        runtime.forget_token(owner);
+        assert!(
+            runtime.remembers_attempt_for_test("offer-1"),
+            "the first terminal owner cannot release a key still owned by its clone"
+        );
+        runtime.forget_token(second_owner);
+        assert!(
+            !runtime.remembers_attempt_for_test("offer-1"),
+            "the consumed last owner releases the key without an unrelated ingress prune"
         );
     }
 

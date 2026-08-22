@@ -5,7 +5,7 @@
 //! capabilities) plus the optional WebRTC connector worker.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
@@ -16,6 +16,7 @@ use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 use crate::transport::{PeerDiag, SelectedCandidatePair, WebRtcConnectorWorker};
 
 use super::ladder::ConnectionTier;
+use crate::runtime::peer_session::{DedupToken, PromotedChannelBinding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,6 +316,22 @@ impl Promotion {
     }
 }
 
+pub(super) struct SpeculativePromotion {
+    pub(super) displaced_attempt: Option<AttemptDisplacement>,
+    pub(super) selected: bool,
+}
+
+pub(super) struct AttemptDisplacement {
+    pub(super) dedup: Option<DedupToken>,
+    pub(super) additional_dedup: Vec<DedupToken>,
+}
+
+pub(super) struct SpeculativeRetirement {
+    pub(super) worker: Arc<WebRtcConnectorWorker>,
+    pub(super) dedup: Option<DedupToken>,
+    pub(super) additional_dedup: Vec<DedupToken>,
+}
+
 /// A provider-funded connector being considered as a replacement for the
 /// promoted connector.  This slot is deliberately separate from `session`:
 /// signaling may drive it, but it cannot borrow or mutate application
@@ -324,28 +341,29 @@ pub(super) struct SpeculativeAttempt {
     pub(super) session: Arc<WebRtcConnectorWorker>,
     pub(super) endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
     pub(super) authenticated_channel: Option<crate::endpoint_auth::AuthenticatedChannelCapability>,
-    pub(super) tombstone_lease: ResourceLease,
-}
-
-struct SpeculativeCorrelationTombstone {
-    correlation: String,
-    _lease: ResourceLease,
+    pub(super) dedup: Option<DedupToken>,
+    pub(super) additional_dedup: Vec<DedupToken>,
+    pub(super) _attempt_lease: ResourceLease,
 }
 
 impl PeerConnection {
-    pub(super) fn speculative_tombstone_claim(correlation: &str) -> ResourceClaim {
+    pub(super) fn speculative_attempt_claim(correlation: &str) -> ResourceClaim {
         let correlation_bytes = u64::try_from(correlation.len())
             .expect("correlation length fits the provider accounting width");
+        let record_bytes = u64::try_from(std::mem::size_of::<SpeculativeAttempt>())
+            .expect("candidate record size fits the provider accounting width");
+        let accounted = correlation_bytes
+            .checked_add(record_bytes)
+            .expect("candidate record accounting cannot overflow");
         ResourceClaim::try_from_entries([
-            // The lease is stored in the Vec element and therefore outlives
-            // the element's inline bytes.  Charge only the separately freed
-            // String allocation as accounted memory; the retained record and
-            // its owning collection are named by their storage domains.
-            (ResourceClass::AccountedMemoryBytes, correlation_bytes),
+            // One live candidate owns this correlation allocation and record.
+            // The lease is released with that exact candidate; there is no
+            // peer-lifetime replay tombstone or fixed candidate count.
+            (ResourceClass::AccountedMemoryBytes, accounted),
             (ResourceClass::StorageObject, 1),
             (ResourceClass::OpaqueDependencyResidual, 1),
         ])
-        .expect("fixed tombstone resource dimensions cannot overflow")
+        .expect("fixed candidate-record resource dimensions cannot overflow")
     }
 }
 
@@ -353,8 +371,11 @@ pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
     pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
-    speculative: Mutex<Option<SpeculativeAttempt>>,
-    retired_speculative_correlations: Mutex<Vec<SpeculativeCorrelationTombstone>>,
+    speculative: Mutex<Vec<SpeculativeAttempt>>,
+    closing_workers: Mutex<Vec<Arc<WebRtcConnectorWorker>>>,
+    retired_dedup: Mutex<Vec<DedupToken>>,
+    signaling_runtime: RwLock<Option<Weak<crate::engine::signaling_ingress::SignalingRuntime>>>,
+    media_renegotiation_workers: Mutex<Vec<Arc<WebRtcConnectorWorker>>>,
     endpoint_auth: Mutex<Option<Arc<crate::endpoint_auth::EndpointAuthTask>>>,
     /// The Arc 04 authority artifact for the exact current channel.
     ///
@@ -381,6 +402,8 @@ pub struct PeerConnection {
     /// not a route identity, not a path generation, not a session generation,
     /// and no decision anywhere reads it as authority or preference.
     attempt: RwLock<String>,
+    attempt_dedup: Mutex<Option<DedupToken>>,
+    additional_attempt_dedup: Mutex<Vec<DedupToken>>,
     /// The promoted session for the exact current channel.
     ///
     /// Promotion **moves** the authenticated capability out of the slot above
@@ -433,8 +456,64 @@ impl Drop for UnpromotedNegotiation {
 static DIAGNOSTIC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl PeerConnection {
-    pub(super) fn revoke_promoted_session(&self) {
-        self.promoted_session.clear();
+    fn retain_closing_worker(&self, worker: Arc<WebRtcConnectorWorker>) {
+        worker.retire();
+        let mut closing = self.closing_workers.lock();
+        if !closing.iter().any(|current| Arc::ptr_eq(current, &worker)) {
+            closing.push(worker);
+        }
+    }
+
+    pub(super) fn revoke_promoted_session(self: &Arc<Self>) {
+        let workers = self.promoted_session.take_workers_with_dedup();
+        let runtime = self
+            .signaling_runtime
+            .read()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        drop(self.session.lock().take());
+        drop(self.endpoint_auth.lock().take());
+        drop(self.authenticated_channel.lock().take());
+        self.media_renegotiation_workers.lock().clear();
+        for (worker, dedup, additional_dedup) in workers {
+            if let Some(runtime) = runtime.as_ref() {
+                if let Some(dedup) = dedup {
+                    runtime.forget_token(dedup);
+                }
+                for dedup in additional_dedup {
+                    runtime.forget_token(dedup);
+                }
+            } else {
+                if let Some(dedup) = dedup {
+                    self.retired_dedup.lock().push(dedup);
+                }
+                self.retired_dedup.lock().extend(additional_dedup);
+            }
+            self.retain_closing_worker(Arc::clone(&worker));
+            worker.start_close();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let peer = Arc::clone(self);
+                handle.spawn(async move {
+                    if let Err(error) = worker.retire_and_close().await {
+                        tracing::warn!(%error, "revoked connector native close failed");
+                    }
+                    let mut closing = peer.closing_workers.lock();
+                    if let Some(index) = closing
+                        .iter()
+                        .position(|current| Arc::ptr_eq(current, &worker))
+                    {
+                        drop(closing.swap_remove(index));
+                    }
+                });
+            }
+        }
+    }
+
+    pub(super) fn bind_signaling_runtime(
+        &self,
+        runtime: Weak<crate::engine::signaling_ingress::SignalingRuntime>,
+    ) {
+        *self.signaling_runtime.write() = Some(runtime);
     }
 
     /// Replace this installed peer's connector after its promoted session and
@@ -484,61 +563,95 @@ impl PeerConnection {
     /// Ignores an empty value, which is what an unstamped frame decodes to:
     /// blanking the field would leave this side emitting uncorrelated signals
     /// for an attempt that has a perfectly good name.
+    #[cfg(test)]
     pub(super) fn adopt_attempt(&self, attempt: &str) -> Option<String> {
+        let previous = self.attempt();
+        self.adopt_attempt_with_dedup(attempt, None)
+            .map(|_| previous)
+    }
+
+    pub(super) fn adopt_attempt_with_dedup(
+        &self,
+        attempt: &str,
+        dedup: Option<DedupToken>,
+    ) -> Option<AttemptDisplacement> {
         if attempt.is_empty() {
             return None;
         }
         let mut current = self.attempt.write();
         if *current == attempt {
+            if let Some(dedup) = dedup {
+                self.additional_attempt_dedup.lock().push(dedup);
+            }
             return None;
         }
-        Some(std::mem::replace(&mut *current, attempt.to_string()))
+        *current = attempt.to_string();
+        let previous = std::mem::replace(&mut *self.attempt_dedup.lock(), dedup);
+        let additional_dedup = std::mem::take(&mut *self.additional_attempt_dedup.lock());
+        Some(AttemptDisplacement {
+            dedup: previous,
+            additional_dedup,
+        })
+    }
+
+    pub(super) fn retain_current_dedup(&self, token: DedupToken) {
+        self.additional_attempt_dedup.lock().push(token);
     }
 
     /// Install a separately owned replacement attempt.  The correlation is
     /// only a lookup key; ownership is proved by the worker stored here.
+    #[cfg(test)]
     pub(super) fn install_speculative(
         &self,
         correlation: String,
         session: Arc<WebRtcConnectorWorker>,
-        tombstone_lease: ResourceLease,
+        attempt_lease: ResourceLease,
+    ) -> bool {
+        let mut dedup = None;
+        self.install_speculative_with_dedup(correlation, session, attempt_lease, &mut dedup)
+    }
+
+    pub(super) fn install_speculative_with_dedup(
+        &self,
+        correlation: String,
+        session: Arc<WebRtcConnectorWorker>,
+        attempt_lease: ResourceLease,
+        dedup: &mut Option<DedupToken>,
     ) -> bool {
         if self.registry_retired() || self.session.lock().is_none() {
             return false;
         }
-        self.install_speculative_after_precheck(correlation, session, tombstone_lease)
+        self.install_speculative_after_precheck(correlation, session, attempt_lease, dedup)
     }
 
     fn install_speculative_after_precheck(
         &self,
         correlation: String,
         session: Arc<WebRtcConnectorWorker>,
-        tombstone_lease: ResourceLease,
+        attempt_lease: ResourceLease,
+        dedup: &mut Option<DedupToken>,
     ) -> bool {
-        let mut slot = self.speculative.lock();
+        let mut candidates = self.speculative.lock();
         // Retirement sets this flag before waiting for the same slot lock. If
         // insertion won the lock first, retirement drains the new slot after
         // release; if retirement won first, this recheck refuses the insert.
         if self.registry_retired() {
             return false;
         }
-        if slot.is_some() {
-            return false;
-        }
-        if self
-            .retired_speculative_correlations
-            .lock()
+        if candidates
             .iter()
-            .any(|tombstone| tombstone.correlation == correlation)
+            .any(|attempt| Arc::ptr_eq(&attempt.session, &session))
         {
             return false;
         }
-        *slot = Some(SpeculativeAttempt {
+        candidates.push(SpeculativeAttempt {
             correlation,
             session,
             endpoint_auth: None,
             authenticated_channel: None,
-            tombstone_lease,
+            dedup: dedup.take(),
+            additional_dedup: Vec::new(),
+            _attempt_lease: attempt_lease,
         });
         true
     }
@@ -552,33 +665,48 @@ impl PeerConnection {
         &self,
         correlation: String,
         session: Arc<WebRtcConnectorWorker>,
-        tombstone_lease: ResourceLease,
+        attempt_lease: ResourceLease,
     ) -> bool {
         if self.registry_retired() || self.session.lock().is_none() {
             return false;
         }
         self.retire_connector();
-        self.install_speculative_after_precheck(correlation, session, tombstone_lease)
+        let mut dedup = None;
+        self.install_speculative_after_precheck(correlation, session, attempt_lease, &mut dedup)
     }
 
     #[cfg(test)]
     pub(super) fn speculative_resources_empty_for_test(&self) -> bool {
-        self.speculative.lock().is_none() && self.retired_speculative_correlations.lock().is_empty()
+        self.speculative.lock().is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn speculative_worker_for(
         &self,
         correlation: &str,
     ) -> Option<Arc<WebRtcConnectorWorker>> {
-        let slot = self.speculative.lock();
-        (slot
-            .as_ref()
-            .is_some_and(|attempt| attempt.correlation == correlation))
-        .then(|| Arc::clone(&slot.as_ref().expect("checked above").session))
+        self.speculative
+            .lock()
+            .iter()
+            .find(|attempt| attempt.correlation == correlation)
+            .map(|attempt| Arc::clone(&attempt.session))
     }
 
+    pub(super) fn speculative_workers_for(
+        &self,
+        correlation: &str,
+    ) -> Vec<Arc<WebRtcConnectorWorker>> {
+        self.speculative
+            .lock()
+            .iter()
+            .filter(|attempt| attempt.correlation == correlation)
+            .map(|attempt| Arc::clone(&attempt.session))
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(super) fn has_speculative(&self) -> bool {
-        self.speculative.lock().is_some()
+        !self.speculative.lock().is_empty()
     }
 
     pub(super) fn speculative_is_exact(
@@ -586,7 +714,7 @@ impl PeerConnection {
         correlation: &str,
         worker: &Arc<WebRtcConnectorWorker>,
     ) -> bool {
-        self.speculative.lock().as_ref().is_some_and(|attempt| {
+        self.speculative.lock().iter().any(|attempt| {
             attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
         })
     }
@@ -594,63 +722,75 @@ impl PeerConnection {
     pub(super) fn speculative_endpoint_auth(
         &self,
         correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
     ) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
-        let slot = self.speculative.lock();
-        slot.as_ref()
-            .filter(|attempt| attempt.correlation == correlation)
+        self.speculative
+            .lock()
+            .iter()
+            .find(|attempt| {
+                attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+            })
             .and_then(|attempt| attempt.endpoint_auth.clone())
     }
 
     /// Remove one failed or superseded candidate.  The promoted worker is not
     /// touched, even when the candidate's carrier correlation is forged.
-    pub(super) fn take_speculative(&self, correlation: &str) -> Option<Arc<WebRtcConnectorWorker>> {
-        let mut slot = self.speculative.lock();
-        if slot
-            .as_ref()
-            .is_some_and(|attempt| attempt.correlation == correlation)
-        {
-            let attempt = slot.take().expect("checked above");
-            self.retired_speculative_correlations
-                .lock()
-                .push(SpeculativeCorrelationTombstone {
-                    correlation: attempt.correlation,
-                    _lease: attempt.tombstone_lease,
-                });
-            if let Some(task) = attempt.endpoint_auth {
-                task.retire();
-            }
-            return Some(attempt.session);
-        }
-        None
-    }
-
     pub(super) fn take_speculative_exact(
         &self,
         correlation: &str,
         worker: &Arc<WebRtcConnectorWorker>,
-    ) -> Option<Arc<WebRtcConnectorWorker>> {
-        if !self.speculative_is_exact(correlation, worker) {
-            return None;
+    ) -> Option<SpeculativeRetirement> {
+        let mut candidates = self.speculative.lock();
+        let index = candidates.iter().position(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+        })?;
+        let attempt = candidates.swap_remove(index);
+        if let Some(task) = attempt.endpoint_auth {
+            task.retire();
         }
-        self.take_speculative(correlation)
+        let worker = attempt.session;
+        self.retain_closing_worker(Arc::clone(&worker));
+        Some(SpeculativeRetirement {
+            worker,
+            dedup: attempt.dedup,
+            additional_dedup: attempt.additional_dedup,
+        })
+    }
+
+    pub(super) fn retain_dedup_for_worker(
+        &self,
+        correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
+        token: DedupToken,
+    ) -> bool {
+        {
+            let mut candidates = self.speculative.lock();
+            if let Some(attempt) = candidates.iter_mut().find(|attempt| {
+                attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+            }) {
+                attempt.additional_dedup.push(token);
+                return true;
+            }
+        }
+        self.promoted_session.retain_dedup_for_worker(worker, token)
     }
 
     pub(super) fn install_speculative_endpoint_auth(
         &self,
         correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
         task: Arc<crate::endpoint_auth::EndpointAuthTask>,
     ) -> bool {
         if self.registry_retired() {
             return false;
         }
-        let mut slot = self.speculative.lock();
-        let Some(attempt) = slot.as_mut() else {
+        let mut candidates = self.speculative.lock();
+        let Some(attempt) = candidates.iter_mut().find(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+        }) else {
             return false;
         };
-        if attempt.correlation != correlation
-            || !attempt.session.owns_endpoint_auth(&task)
-            || attempt.endpoint_auth.is_some()
-        {
+        if !attempt.session.owns_endpoint_auth(&task) || attempt.endpoint_auth.is_some() {
             return false;
         }
         attempt.endpoint_auth = Some(task);
@@ -660,21 +800,23 @@ impl PeerConnection {
     pub(super) fn install_speculative_authenticated_channel(
         &self,
         correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
         task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
         capability: crate::endpoint_auth::AuthenticatedChannelCapability,
     ) -> bool {
         if self.registry_retired() {
             return false;
         }
-        let mut slot = self.speculative.lock();
-        let Some(attempt) = slot.as_mut() else {
+        let mut candidates = self.speculative.lock();
+        let Some(attempt) = candidates.iter_mut().find(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+        }) else {
             return false;
         };
-        if attempt.correlation != correlation
-            || attempt
-                .endpoint_auth
-                .as_ref()
-                .is_none_or(|current| !Arc::ptr_eq(current, task))
+        if attempt
+            .endpoint_auth
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, task))
             || attempt.authenticated_channel.is_some()
             || task.is_retired()
             || !capability.belongs_to(task.incarnation())
@@ -697,16 +839,24 @@ impl PeerConnection {
         broker: &crate::runtime::session_broker::SessionBroker,
         mesh_context: &str,
         policy_admits: bool,
-    ) -> Option<Arc<WebRtcConnectorWorker>> {
+        select: bool,
+    ) -> Option<SpeculativePromotion> {
         if self.registry_retired() || !policy_admits || self.unpromoted_offer_in_flight() {
             return None;
         }
-        let (candidate, connector, capability, endpoint_auth, correlation) = {
-            let mut slot = self.speculative.lock();
-            let attempt = slot.as_mut()?;
-            if attempt.correlation != correlation || !Arc::ptr_eq(&attempt.session, candidate) {
-                return None;
-            }
+        let (
+            candidate,
+            connector,
+            capability,
+            endpoint_auth,
+            correlation,
+            mut dedup,
+            mut additional_dedup,
+        ) = {
+            let mut candidates = self.speculative.lock();
+            let attempt = candidates.iter_mut().find(|attempt| {
+                attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, candidate)
+            })?;
             let endpoint_auth = attempt.endpoint_auth.as_ref()?.clone();
             if endpoint_auth.is_retired() || !attempt.session.owns_endpoint_auth(&endpoint_auth) {
                 return None;
@@ -723,6 +873,8 @@ impl PeerConnection {
                 capability,
                 endpoint_auth,
                 attempt.correlation.clone(),
+                attempt.dedup.take(),
+                std::mem::take(&mut attempt.additional_dedup),
             )
         };
         let policy = crate::runtime::session_broker::CurrentPolicyAdmission::from_admitted_peer(
@@ -735,23 +887,27 @@ impl PeerConnection {
             Ok(promoted) => promoted,
             Err(_) => {
                 if let Some(capability) = channel {
-                    let mut slot = self.speculative.lock();
-                    if let Some(attempt) = slot
-                        .as_mut()
-                        .filter(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
+                    let mut candidates = self.speculative.lock();
+                    if let Some(attempt) = candidates
+                        .iter_mut()
+                        .find(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
                     {
                         attempt.authenticated_channel = Some(capability);
                         attempt.endpoint_auth = Some(endpoint_auth);
+                        attempt.dedup = dedup;
+                        attempt.additional_dedup = additional_dedup;
                     } else {
                         endpoint_auth.retire();
                     }
                 } else {
-                    let mut slot = self.speculative.lock();
-                    if let Some(attempt) = slot
-                        .as_mut()
-                        .filter(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
+                    let mut candidates = self.speculative.lock();
+                    if let Some(attempt) = candidates
+                        .iter_mut()
+                        .find(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
                     {
                         attempt.endpoint_auth = Some(endpoint_auth);
+                        attempt.dedup = dedup;
+                        attempt.additional_dedup = additional_dedup;
                     } else {
                         endpoint_auth.retire();
                     }
@@ -759,29 +915,72 @@ impl PeerConnection {
                 return None;
             }
         };
-        let predecessor = self.session.lock().replace(Arc::clone(&candidate));
-        *self.attempt.write() = correlation;
-        self.promoted_session
-            .install(promoted, candidate.new_session_flows());
-        let predecessor_endpoint_auth = self.endpoint_auth.lock().replace(endpoint_auth);
-        if let Some(task) = predecessor_endpoint_auth {
-            task.retire();
-        }
-        let mut slot = self.speculative.lock();
-        if slot
-            .as_ref()
-            .is_some_and(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
-        {
-            if let Some(attempt) = slot.take() {
-                self.retired_speculative_correlations.lock().push(
-                    SpeculativeCorrelationTombstone {
-                        correlation: attempt.correlation,
-                        _lease: attempt.tombstone_lease,
-                    },
-                );
+        let binding = PromotedChannelBinding {
+            worker: Arc::clone(&candidate),
+            endpoint_auth: Some(Arc::clone(&endpoint_auth)),
+            correlation: correlation.clone(),
+            dedup: dedup.take(),
+            additional_dedup: std::mem::take(&mut additional_dedup),
+        };
+        if let Err((returned_dedup, returned_additional_dedup)) = self.promoted_session.add_channel(
+            promoted,
+            candidate.new_session_flows(),
+            binding,
+            select,
+        ) {
+            endpoint_auth.retire();
+            candidate.retire();
+            // Leave the exact attempt in the speculative slot. The command
+            // consumer will run the normal exact terminal cleanup, which
+            // retains the token long enough for the caller to release only
+            // this candidate's dedup record.
+            dedup = returned_dedup;
+            additional_dedup = returned_additional_dedup;
+            if let Some(attempt) = self
+                .speculative
+                .lock()
+                .iter_mut()
+                .find(|attempt| Arc::ptr_eq(&attempt.session, &candidate))
+            {
+                attempt.dedup = dedup;
+                attempt.additional_dedup = additional_dedup;
             }
+            return None;
         }
-        predecessor
+        if select {
+            self.session.lock().replace(Arc::clone(&candidate));
+            self.endpoint_auth.lock().replace(endpoint_auth);
+        }
+        let displaced_attempt = if select {
+            let mut attempt = self.attempt.write();
+            if *attempt == correlation {
+                None
+            } else {
+                *attempt = correlation.clone();
+                let dedup = self.attempt_dedup.lock().take();
+                let additional_dedup = std::mem::take(&mut *self.additional_attempt_dedup.lock());
+                Some(AttemptDisplacement {
+                    dedup,
+                    additional_dedup,
+                })
+            }
+        } else {
+            None
+        };
+        if select && displaced_attempt.is_some() {
+            self.attempt_dedup.lock().take();
+            self.additional_attempt_dedup.lock().clear();
+        }
+        let mut candidates = self.speculative.lock();
+        if let Some(index) = candidates.iter().position(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, &candidate)
+        }) {
+            drop(candidates.swap_remove(index));
+        }
+        Some(SpeculativePromotion {
+            displaced_attempt,
+            selected: select,
+        })
     }
 
     pub(super) fn new(device_id: String, session: Option<Arc<WebRtcConnectorWorker>>) -> Self {
@@ -789,11 +988,16 @@ impl PeerConnection {
             device_id,
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
-            speculative: Mutex::new(None),
-            retired_speculative_correlations: Mutex::new(Vec::new()),
+            speculative: Mutex::new(Vec::new()),
+            closing_workers: Mutex::new(Vec::new()),
+            retired_dedup: Mutex::new(Vec::new()),
+            signaling_runtime: RwLock::new(None),
+            media_renegotiation_workers: Mutex::new(Vec::new()),
             endpoint_auth: Mutex::new(None),
             authenticated_channel: Mutex::new(None),
             attempt: RwLock::new(mint_attempt()),
+            attempt_dedup: Mutex::new(None),
+            additional_attempt_dedup: Mutex::new(Vec::new()),
             promoted_session: crate::runtime::peer_session::PromotedSessionSlot::new(),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -906,7 +1110,7 @@ impl PeerConnection {
         // dropped on the same edge. Dropping it also releases its
         // post-authentication resource reservation, so a retired connector does
         // not hold session capacity its replacement then has to compete for.
-        self.promoted_session.clear();
+        let mut workers = self.promoted_session.take_workers_with_dedup();
         // Retire the endpoint-auth task at the source, so a superseded
         // connector refuses promotion rather than merely failing to install
         // afterwards. Without this the task stays live with its handoff
@@ -917,31 +1121,122 @@ impl PeerConnection {
         if let Some(task) = self.endpoint_auth.lock().as_ref() {
             task.retire();
         }
-        if let Some(attempt) = self.speculative.lock().take() {
+        for attempt in self.speculative.lock().drain(..) {
             if let Some(task) = attempt.endpoint_auth {
                 task.retire();
             }
             attempt.session.retire();
+            if let Some(dedup) = attempt.dedup {
+                self.retired_dedup.lock().push(dedup);
+            }
+            self.retired_dedup.lock().extend(attempt.additional_dedup);
+            workers.push((attempt.session, None, Vec::new()));
         }
-        let worker = self.session.lock().clone();
+        let worker = self.session.lock().take();
         if let Some(worker) = worker {
             worker.retire();
+            workers.push((
+                worker,
+                self.attempt_dedup.lock().take(),
+                std::mem::take(&mut *self.additional_attempt_dedup.lock()),
+            ));
         }
+        for (worker, dedup, additional_dedup) in workers {
+            if let Some(dedup) = dedup {
+                self.retired_dedup.lock().push(dedup);
+            }
+            self.retired_dedup.lock().extend(additional_dedup);
+            self.retain_closing_worker(worker);
+        }
+    }
+
+    pub(super) fn take_retired_dedup(&self) -> Vec<DedupToken> {
+        std::mem::take(&mut *self.retired_dedup.lock())
     }
 
     /// Fence the exact connector, await its single native cleanup owner, then
     /// release Endpoint Auth Task's connected-channel claim.
     pub(super) async fn retire_and_close(&self) -> crate::Result<()> {
         self.retire_connector();
-        let worker = self.session.lock().clone();
-        let result = match worker {
-            Some(worker) => worker.retire_and_close().await,
-            None => Ok(()),
-        };
+        let result = self.await_retired_workers().await;
         drop(self.authenticated_channel.lock().take());
         self.promoted_session.clear();
         drop(self.endpoint_auth.lock().take());
         result
+    }
+
+    /// Await every worker this peer already retired without retiring the live
+    /// logical session. Candidate refusal uses this in controls to prove the
+    /// native owners really settled; full peer teardown calls it after first
+    /// moving every remaining worker into the same list.
+    pub(super) async fn await_retired_workers(&self) -> crate::Result<()> {
+        let mut result = Ok(());
+        loop {
+            let workers = self.closing_workers.lock().clone();
+            if workers.is_empty() {
+                return result;
+            }
+            let outcomes =
+                futures::future::join_all(workers.into_iter().map(|worker| async move {
+                    let outcome = worker.retire_and_close().await;
+                    (worker, outcome)
+                }))
+                .await;
+            for (worker, outcome) in outcomes {
+                if let Err(error) = outcome {
+                    if result.is_ok() {
+                        result = Err(error);
+                    }
+                }
+                let mut closing = self.closing_workers.lock();
+                if let Some(index) = closing
+                    .iter()
+                    .position(|current| Arc::ptr_eq(current, &worker))
+                {
+                    drop(closing.swap_remove(index));
+                }
+            }
+        }
+    }
+
+    /// Remove and await one exact candidate retired by a registry operation.
+    ///
+    /// Candidate failure is a terminal edge, not peer teardown: retaining the
+    /// worker in `closing_workers` until the peer dies would pin its native
+    /// close owner and its provider claim for the peer's whole lifetime. The
+    /// registry only returns exact workers, and this method runs after that
+    /// fence has been released, so the native await never occurs under a
+    /// registry or candidate lock. A missing worker is stale and is left alone.
+    pub(super) async fn await_exact_retired_worker(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+    ) -> Option<crate::Result<()>> {
+        if !self
+            .closing_workers
+            .lock()
+            .iter()
+            .any(|current| Arc::ptr_eq(current, worker))
+        {
+            return None;
+        }
+        // Keep exact custody visible until the native await completes. A
+        // concurrent shutdown may take the same Arc from the closing set and
+        // await its idempotent native close; it must never lose sight of a
+        // close merely because a candidate path started waiting first.
+        let result = worker.retire_and_close().await;
+        let mut closing = self.closing_workers.lock();
+        if let Some(index) = closing
+            .iter()
+            .position(|current| Arc::ptr_eq(current, worker))
+        {
+            drop(closing.swap_remove(index));
+        }
+        Some(result)
+    }
+
+    #[cfg(test)]
+    pub(super) fn retired_worker_count_for_test(&self) -> usize {
+        self.closing_workers.lock().len()
     }
 
     pub(super) fn registry_retired(&self) -> bool {
@@ -981,6 +1276,115 @@ impl PeerConnection {
     /// The current endpoint-auth task, if this entry still owns one.
     pub(super) fn endpoint_auth_task(&self) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
         (!self.registry_retired()).then(|| self.endpoint_auth.lock().clone())?
+    }
+
+    pub(super) fn endpoint_auth_task_for(
+        &self,
+        worker: Option<&Arc<WebRtcConnectorWorker>>,
+    ) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
+        if self.registry_retired() {
+            return None;
+        }
+        let Some(worker) = worker else {
+            return self.endpoint_auth_task();
+        };
+        self.promoted_session.endpoint_auth_for(worker).or_else(|| {
+            self.session
+                .lock()
+                .as_ref()
+                .filter(|current| Arc::ptr_eq(current, worker))
+                .and_then(|_| self.endpoint_auth.lock().clone())
+        })
+    }
+
+    pub(super) fn attempt_for_worker(&self, worker: &Arc<WebRtcConnectorWorker>) -> Option<String> {
+        self.promoted_session.correlation_for(worker).or_else(|| {
+            self.session
+                .lock()
+                .as_ref()
+                .filter(|current| Arc::ptr_eq(current, worker))
+                .map(|_| self.attempt())
+        })
+    }
+
+    pub(super) fn owns_authenticated_worker(&self, worker: &Arc<WebRtcConnectorWorker>) -> bool {
+        !self.registry_retired()
+            && (self.promoted_session.contains_worker(worker)
+                || self
+                    .session
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, worker)))
+    }
+
+    pub(super) fn mark_media_renegotiation(&self, worker: &Arc<WebRtcConnectorWorker>) -> bool {
+        if !self.owns_authenticated_worker(worker) {
+            return false;
+        }
+        let mut pending = self.media_renegotiation_workers.lock();
+        if !pending.iter().any(|current| Arc::ptr_eq(current, worker)) {
+            pending.push(Arc::clone(worker));
+        }
+        true
+    }
+
+    pub(super) fn media_renegotiation_worker(&self) -> Option<Arc<WebRtcConnectorWorker>> {
+        self.media_renegotiation_workers.lock().first().cloned()
+    }
+
+    pub(super) fn clear_media_renegotiation_worker(&self, worker: &Arc<WebRtcConnectorWorker>) {
+        let mut pending = self.media_renegotiation_workers.lock();
+        if let Some(index) = pending
+            .iter()
+            .position(|current| Arc::ptr_eq(current, worker))
+        {
+            drop(pending.swap_remove(index));
+        }
+    }
+
+    pub(super) fn has_pending_media_renegotiation(&self) -> bool {
+        !self.media_renegotiation_workers.lock().is_empty()
+    }
+
+    pub(super) fn retire_authenticated_worker(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+    ) -> Option<crate::runtime::peer_session::RemovedPromotedChannel> {
+        let removed = self.promoted_session.remove_channel(worker)?;
+        self.clear_media_renegotiation_worker(worker);
+        self.retain_closing_worker(Arc::clone(&removed.worker));
+        if let Some(selected) = removed.selected_worker.as_ref() {
+            self.session.lock().replace(Arc::clone(selected));
+            if let Some(task) = self.promoted_session.endpoint_auth_for(selected) {
+                self.endpoint_auth.lock().replace(task);
+            }
+            if let Some(correlation) = removed.selected_correlation.as_ref() {
+                *self.attempt.write() = correlation.clone();
+            }
+            self.attempt_dedup.lock().take();
+            self.additional_attempt_dedup.lock().clear();
+        } else {
+            drop(self.session.lock().take());
+            drop(self.endpoint_auth.lock().take());
+            self.attempt_dedup.lock().take();
+            self.additional_attempt_dedup.lock().clear();
+        }
+        Some(removed)
+    }
+
+    pub(super) fn take_attempt_displacement(&self) -> AttemptDisplacement {
+        AttemptDisplacement {
+            dedup: self.attempt_dedup.lock().take(),
+            additional_dedup: std::mem::take(&mut *self.additional_attempt_dedup.lock()),
+        }
+    }
+
+    pub(super) fn take_current_dedups(&self) -> Vec<DedupToken> {
+        let mut tokens = std::mem::take(&mut *self.additional_attempt_dedup.lock());
+        if let Some(token) = self.attempt_dedup.lock().take() {
+            tokens.push(token);
+        }
+        tokens
     }
 
     /// Build an entry that already holds `task` as its current endpoint-auth
@@ -1133,6 +1537,10 @@ impl PeerConnection {
         self.promoted_session.is_installed()
     }
 
+    pub(super) fn promoted_channel_count(&self) -> usize {
+        self.promoted_session.channel_count()
+    }
+
     /// Promote this entry's authenticated channel into a live session, once.
     ///
     /// Called only from inside the registry mutation lock, which is what makes
@@ -1256,8 +1664,24 @@ impl PeerConnection {
                 // The flow set is built by the exact worker this session was
                 // promoted from, so its registry and the session's connector are
                 // the same one by construction rather than by a later check.
-                self.promoted_session
-                    .install(session, worker.new_session_flows());
+                // Real Endpoint Auth always leaves its exact task here. The
+                // optional form is reserved for the transport-lab helper that
+                // installs a real capability directly and therefore has no
+                // task to counterfeit merely to exercise this admission seam.
+                let endpoint_auth = self.endpoint_auth.lock().clone();
+                self.promoted_session.install(
+                    session,
+                    worker.new_session_flows(),
+                    PromotedChannelBinding {
+                        worker: Arc::clone(&worker),
+                        endpoint_auth,
+                        correlation: self.attempt(),
+                        dedup: self.attempt_dedup.lock().take(),
+                        additional_dedup: std::mem::take(
+                            &mut *self.additional_attempt_dedup.lock(),
+                        ),
+                    },
+                );
                 Promotion::NewlyPromoted
             }
             // Includes the capacity refusal, which is not terminal: the exact
@@ -1381,8 +1805,50 @@ impl PeerConnection {
         self.promoted_session.with_live(
             |session| self.session_is_current(session, &live),
             |bundle| {
-                let (session, flows) = bundle.flows_mut();
-                effect(session, flows, &live, &worker)
+                let (session, flows, channel_worker) = bundle.flows_mut();
+                if !Arc::ptr_eq(channel_worker, &worker) {
+                    return None;
+                }
+                Some(effect(session, flows, &live, &worker))
+            },
+        )?
+    }
+
+    pub(super) fn with_live_session_flow_and_exact_worker<R>(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+            &Arc<WebRtcConnectorWorker>,
+        ) -> R,
+    ) -> Option<R> {
+        let live = worker.live_connector_incarnation()?.clone();
+        self.promoted_session.with_live_worker(
+            worker,
+            |session| session.belongs_to(&live),
+            |session, flows, channel_worker| effect(session, flows, &live, channel_worker),
+        )
+    }
+
+    pub(super) fn with_live_session_flow_and_exact_worker_with_correlation<R>(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+            &Arc<WebRtcConnectorWorker>,
+            &str,
+        ) -> R,
+    ) -> Option<R> {
+        let live = worker.live_connector_incarnation()?.clone();
+        self.promoted_session.with_live_worker_and_correlation(
+            worker,
+            |session| session.belongs_to(&live),
+            |session, flows, channel_worker, correlation| {
+                effect(session, flows, &live, channel_worker, correlation)
             },
         )
     }
@@ -1404,7 +1870,7 @@ impl PeerConnection {
         session: &crate::runtime::session_broker::SessionCapability,
         live: &Arc<crate::connector::ConnectorIncarnation>,
     ) -> bool {
-        session.belongs_to(live) && self.state.read().is_admitted()
+        session.belongs_to(live)
     }
 
     /// Whether this entry holds a live authenticated channel for its exact

@@ -102,7 +102,7 @@ use crate::transport::{
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
-pub use state::{NetworkCmd, NetworkState, SpeculativeCandidate};
+pub use state::{NetworkCmd, NetworkState};
 // The raw signaling surface is crate-private: `SignalingOutbound`, the two
 // mailbox endpoints on `NetworkState`, its constructors, `run_driver` and
 // `EphemeralIngress` are all reachable only from inside this crate. A repo-wide
@@ -128,6 +128,9 @@ enum B2Stage {
     AuthStarted,
     PeerProofAccepted,
     PromotionQueued,
+    MediaOfferApplied,
+    MediaAnswerApplied,
+    MediaOfferSent,
 }
 
 #[cfg(all(test, feature = "transport-lab"))]
@@ -256,6 +259,9 @@ pub(crate) async fn run_driver(
     mut signaling_inbound: crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
     mut cmd_rx: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
 ) {
+    let mut speculative_promotion_rx = state
+        .take_speculative_promotion_rx()
+        .expect("the network driver takes its speculative-promotion receiver once");
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
     // Settle the signed-eviction verdict from the persisted governance
     // state before anything announces or dials: a device evicted in a
@@ -350,6 +356,17 @@ pub(crate) async fn run_driver(
                 // neither the command nor anything derived from it outlives the
                 // claim.
                 cmd.run_terminal_effect(|cmd| handle_command(&state, cmd)).await;
+            }
+
+            promotion = speculative_promotion_rx.recv() => {
+                let Some(promotion) = promotion else {
+                    break "speculative promotion channel closed";
+                };
+                promotion
+                    .run_terminal_effect(|promotion| {
+                        handle_speculative_promotion(&state, promotion)
+                    })
+                    .await;
             }
 
             sig = signaling_inbound.recv() => {
@@ -495,33 +512,6 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         NetworkCmd::FanoutCapabilities { caps } => {
             let _ = broadcast_capabilities(state, caps).await;
         }
-        NetworkCmd::PromoteSpeculative {
-            owner,
-            candidate,
-            correlation,
-        } => {
-            let candidate = candidate.worker();
-            if let Some(broker) = state.session_broker.as_ref() {
-                if let Some(predecessor) = state.peers.promote_speculative_command(
-                    &owner,
-                    candidate,
-                    &correlation,
-                    broker,
-                    &state.network_id,
-                ) {
-                    predecessor.retire();
-                    replay_local_capabilities_to_owner(state, &owner).await;
-                    return;
-                }
-            }
-            if let Some(candidate) =
-                state
-                    .peers
-                    .take_speculative_exact(&owner, &correlation, candidate)
-            {
-                candidate.retire();
-            }
-        }
         // The registry fence enqueued this at the moment it minted a session, and
         // it is handled here because the send awaits and no fence lock may be held
         // across it. Nothing is answered to a caller: the command carries no reply
@@ -563,6 +553,33 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             let _ = reply.send(governance::snapshot(state));
         }
     }
+}
+
+async fn handle_speculative_promotion(
+    state: &Arc<NetworkState>,
+    promotion: state::SpeculativePromotionCmd,
+) {
+    let state::SpeculativePromotionCmd {
+        owner,
+        candidate,
+        correlation,
+    } = promotion;
+    if let Some(broker) = state.session_broker.as_ref() {
+        if let Some(promotion) = state.peers.promote_speculative_command(
+            &owner,
+            &candidate,
+            &correlation,
+            broker,
+            &state.network_id,
+        ) {
+            if let Some(displaced) = promotion.displaced_attempt {
+                forget_displacement(state, displaced);
+            }
+            let _selected = promotion.selected;
+            return;
+        }
+    }
+    retire_speculative_exact(state, &owner, &correlation, &candidate).await;
 }
 
 /// The role a peer's **live connection** was opened with, read from that
@@ -694,6 +711,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
     // place in the engine where how the carrier came by the device id changes
     // what happens, and `into_inbound` drops the provenance by design.
     let attribution = delivered.attribution();
+    let mut dedup = delivered.dedup_token();
     match delivered.into_inbound() {
         SignalingInbound::PeerAnnounced { device_id } => {
             // A stood-down engine (this device is signed-evicted from the
@@ -945,6 +963,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             attempt,
             sdp,
         } => {
+            if attempt.is_empty() {
+                forget_dedup_owned(state, dedup.take());
+                return;
+            }
             // A carrier-supplied Offer is speculative control, never a
             // lifecycle decision.  Once this installation owns a promoted
             // SessionCapability, the old connector is an application
@@ -957,7 +979,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 .owner(&device_id)
                 .is_some_and(|owner| owner.connection().holds_promoted_session())
             {
-                start_speculative_offer(state, &device_id, &attempt, sdp).await;
+                start_speculative_offer(state, &device_id, &attempt, sdp, dedup).await;
                 return;
             }
             // If we didn't already start an answerer, do so now.
@@ -1033,6 +1055,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 );
                 if let Some(owner) = existing_owner.as_ref() {
                     let Some(removed) = state.peers.remove_if_current_unpromoted(owner) else {
+                        forget_dedup_owned(state, dedup.take());
                         return;
                     };
                     finish_drop_peer(state, &device_id, DropReason::IceFailed, Some(removed)).await;
@@ -1040,6 +1063,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             }
             ensure_peer_session(state, &device_id, role).await;
             let Some(owner) = state.peers.owner(&device_id) else {
+                forget_dedup_owned(state, dedup.take());
                 return;
             };
             // Opening an answerer can yield while another path promotes the
@@ -1047,13 +1071,18 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             // that transition; the current owner is the only authority for
             // choosing a speculative worker.
             if owner.connection().holds_promoted_session() {
+                forget_dedup_owned(state, dedup.take());
                 return;
             }
             let Some(_untrusted_negotiation) = state.peers.begin_unpromoted_negotiation(&owner)
             else {
+                forget_dedup_owned(state, dedup.take());
                 return;
             };
-            apply_remote_sdp(state, &owner, RTCSdpType::Offer, sdp).await;
+            if !apply_remote_sdp(state, &owner, RTCSdpType::Offer, sdp).await {
+                forget_dedup_owned(state, dedup.take());
+                return;
+            }
             // Build the answer. Extract the session under the lock,
             // Establish the offerer's correlation on the installation that is
             // actually going to answer, and not before it exists: everything
@@ -1070,7 +1099,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             let (session, displaced) = state
                 .peers
                 .with_current(&owner, |peer| {
-                    let displaced = peer.adopt_attempt(&attempt);
+                    let displaced = peer.adopt_attempt_with_dedup(&attempt, dedup.take());
                     (peer.session.lock().clone(), displaced)
                 })
                 .unwrap_or((None, None));
@@ -1079,35 +1108,68 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             // legitimately arrive again, so its keys go back now rather than
             // waiting for pressure to evict them.
             if let Some(displaced) = displaced {
-                forget_attempt(state, &displaced);
+                forget_displacement(state, displaced);
+            } else {
+                // A same-correlation Offer was retained by
+                // adopt_attempt_with_dedup itself. Re-prove that exact owner
+                // still carries the attempt; only a vanished/replaced owner
+                // releases the delivered token.
+                let still_current = state
+                    .peers
+                    .with_current(&owner, |peer| peer.attempt() == attempt)
+                    == Some(true);
+                if !still_current {
+                    forget_dedup_owned(state, dedup.take());
+                }
             }
             let accepted_attempt = attempt.clone();
             if let Some(session) = session {
                 match session.create_answer().await {
                     Ok(desc) => {
                         let sdp_bytes = desc.sdp.len();
-                        let sent = state
+                        let send_result = state
                             .peers
                             .with_current(&owner, |peer| {
                                 if peer.attempt() != accepted_attempt {
-                                    return false;
+                                    return None;
                                 }
-                                state
-                                    .signaling_tx
-                                    .send(SignalingOutbound::Answer {
-                                        device_id: device_id.clone(),
-                                        attempt: accepted_attempt.clone(),
-                                        sdp: desc.sdp,
-                                    })
-                                    .is_ok()
+                                Some(
+                                    state
+                                        .signaling_tx
+                                        .send(SignalingOutbound::Answer {
+                                            device_id: device_id.clone(),
+                                            attempt: accepted_attempt.clone(),
+                                            sdp: desc.sdp,
+                                        })
+                                        .is_ok(),
+                                )
                             })
-                            .unwrap_or(false);
-                        if sent {
+                            .flatten();
+                        if send_result == Some(true) {
                             state.log_diag_with(
                                 crate::events::DiagLevel::Debug,
                                 "signaling",
                                 format!("answer sent to {}", short_peer(&device_id)),
                                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp_bytes }),
+                            );
+                        } else if send_result == Some(false) {
+                            let removed = state.peers.remove_if_current_unpromoted_offer(&owner);
+                            if let Some(removed) = removed {
+                                finish_drop_peer(
+                                    state,
+                                    &device_id,
+                                    DropReason::IceFailed,
+                                    Some(removed),
+                                )
+                                .await;
+                            } else {
+                                let mut ended_tokens = owner.connection().take_current_dedups();
+                                ended_tokens.extend(owner.connection().take_retired_dedup());
+                                forget_dedups(state, ended_tokens);
+                            }
+                            trace!(
+                                peer = %device_id,
+                                "answer enqueue refused; exact unpromoted attempt retired"
                             );
                         } else {
                             trace!(
@@ -1117,6 +1179,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                         }
                     }
                     Err(e) => {
+                        let failed_offer_tokens = state
+                            .peers
+                            .get_if_current(&owner)
+                            .map(|peer| peer.take_current_dedups())
+                            .unwrap_or_default();
+                        forget_dedups(state, failed_offer_tokens);
                         state.log_diag_with(
                             crate::events::DiagLevel::Error,
                             "signaling",
@@ -1134,24 +1202,42 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             sdp,
         } => {
             let Some(owner) = state.peers.owner(&device_id) else {
+                forget_dedup_owned(state, dedup.take());
                 return;
             };
             // An Answer is correlation only.  It cannot select or mutate the
             // promoted worker, even when its carrier-supplied correlation
             // happens to match the primary installation.
             if owner.connection().holds_promoted_session() {
-                let Some(worker) = owner.connection().speculative_worker_for(&attempt) else {
-                    return;
-                };
-                if !worker.awaiting_answer() {
+                let workers = owner.connection().speculative_workers_for(&attempt);
+                if workers.is_empty() {
+                    forget_dedup_owned(state, dedup.take());
                     return;
                 }
-                if worker
-                    .apply_remote_sdp(RTCSdpType::Answer, sdp)
-                    .await
-                    .is_err()
-                {
-                    retire_speculative_exact(state, &owner, &attempt, &worker);
+                let mut retained = false;
+                for worker in workers {
+                    if !worker.awaiting_answer() {
+                        continue;
+                    }
+                    if worker
+                        .apply_remote_sdp(RTCSdpType::Answer, sdp.clone())
+                        .await
+                        .is_ok()
+                    {
+                        if let Some(token) = dedup.as_ref() {
+                            retained |= state.peers.retain_dedup_for_worker(
+                                &owner,
+                                &attempt,
+                                &worker,
+                                token.clone(),
+                            );
+                        }
+                    } else {
+                        retire_speculative_exact(state, &owner, &attempt, &worker).await;
+                    }
+                }
+                if !retained {
+                    forget_dedup_owned(state, dedup.take());
                 }
                 return;
             }
@@ -1168,9 +1254,11 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                     peer = %device_id,
                     "answer for another attempt ignored"
                 );
+                forget_dedup_owned(state, dedup.take());
                 return;
             }
             let Some(_unpromoted_answer) = state.peers.begin_unpromoted_negotiation(&owner) else {
+                forget_dedup_owned(state, dedup.take());
                 return;
             };
             state.log_diag_with(
@@ -1179,7 +1267,23 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 format!("answer received from {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
             );
-            apply_remote_sdp(state, &owner, RTCSdpType::Answer, sdp).await;
+            if apply_remote_sdp(state, &owner, RTCSdpType::Answer, sdp).await {
+                let retained = dedup.as_ref().is_some_and(|token| {
+                    state.peers.with_current(&owner, |peer| {
+                        if peer.attempt() == attempt {
+                            peer.retain_current_dedup(token.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }) == Some(true)
+                });
+                if !retained {
+                    forget_dedup_owned(state, dedup.take());
+                }
+            } else {
+                forget_dedup_owned(state, dedup.take());
+            }
         }
         SignalingInbound::Candidate {
             device_id,
@@ -1187,27 +1291,45 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             candidate,
         } => {
             let Some(owner) = state.peers.owner(&device_id) else {
+                forget_dedup_owned(state, dedup.take());
                 return;
             };
             // Candidate input is also speculative.  A matching correlation
             // is not authority and must not reach a worker that backs a
             // promoted SessionCapability.
             if owner.connection().holds_promoted_session() {
-                let Some(worker) = owner.connection().speculative_worker_for(&attempt) else {
+                let workers = owner.connection().speculative_workers_for(&attempt);
+                if workers.is_empty() {
+                    forget_dedup_owned(state, dedup.take());
                     return;
-                };
-                let report = worker.add_remote_candidate_observed(candidate).await;
-                if report.is_err()
-                    || report.as_ref().is_ok_and(|report| {
-                        matches!(
-                            report.disposition,
-                            RemoteCandidateDisposition::AttemptRetired
-                                | RemoteCandidateDisposition::InvalidBinding(_)
-                                | RemoteCandidateDisposition::RefusedByOwner
-                        )
-                    })
-                {
-                    retire_speculative_exact(state, &owner, &attempt, &worker);
+                }
+                let mut retained = false;
+                for worker in workers {
+                    let report = worker
+                        .add_remote_candidate_observed(candidate.clone())
+                        .await;
+                    if report.is_err()
+                        || report.as_ref().is_ok_and(|report| {
+                            matches!(
+                                report.disposition,
+                                RemoteCandidateDisposition::AttemptRetired
+                                    | RemoteCandidateDisposition::InvalidBinding(_)
+                                    | RemoteCandidateDisposition::RefusedByOwner
+                            )
+                        })
+                    {
+                        retire_speculative_exact(state, &owner, &attempt, &worker).await;
+                    } else if let Some(token) = dedup.as_ref() {
+                        retained |= state.peers.retain_dedup_for_worker(
+                            &owner,
+                            &attempt,
+                            &worker,
+                            token.clone(),
+                        );
+                    }
+                }
+                if !retained {
+                    forget_dedup_owned(state, dedup.take());
                 }
                 return;
             }
@@ -1227,10 +1349,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                     peer = %device_id,
                     "candidate for another attempt ignored"
                 );
+                forget_dedup_owned(state, dedup.take());
                 return;
             }
             let Some(_unpromoted_candidate) = state.peers.begin_unpromoted_negotiation(&owner)
             else {
+                forget_dedup_owned(state, dedup.take());
                 return;
             };
             // The worker decides whether the remote description is ready and
@@ -1256,13 +1380,16 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                             }),
                         );
                         warn!(peer = %device_id, "add_ice_candidate failed: {e}");
+                        forget_dedup_owned(state, dedup.take());
                         return;
                     }
                 };
                 if report.disposition == RemoteCandidateDisposition::AttemptRetired {
+                    forget_dedup_owned(state, dedup.take());
                     return;
                 }
                 let Some(kind) = report.kind else {
+                    forget_dedup_owned(state, dedup.take());
                     return;
                 };
                 if state
@@ -1272,6 +1399,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                     })
                     .is_none()
                 {
+                    forget_dedup_owned(state, dedup.take());
                     return;
                 }
                 match report.disposition {
@@ -1319,6 +1447,34 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                         );
                     }
                 }
+                let retain_candidate = matches!(
+                    report.disposition,
+                    RemoteCandidateDisposition::Applied
+                        | RemoteCandidateDisposition::QueuedUntilRemoteDescription
+                        | RemoteCandidateDisposition::DuplicateIgnored
+                );
+                if retain_candidate {
+                    if let Some(token) = dedup.take() {
+                        let mut token = Some(token);
+                        let retained = state.peers.with_current(&owner, |peer| {
+                            if peer.attempt() == attempt {
+                                peer.retain_current_dedup(token.take().expect("token present"));
+                                true
+                            } else {
+                                false
+                            }
+                        }) == Some(true);
+                        if !retained {
+                            // The token was not adopted by the exact current attempt.
+                            // It is safe to release only this delivery's key.
+                            forget_dedup_owned(state, token.take());
+                        }
+                    }
+                } else {
+                    forget_dedup_owned(state, dedup.take());
+                }
+            } else {
+                forget_dedup_owned(state, dedup.take());
             }
         }
         // **A carrier withdrawal is reachability evidence, not authority.**
@@ -1541,13 +1697,6 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         let Some(owner) = state.peers.owner(&device_id) else {
             continue;
         };
-        // A healthy promoted connector is never used as a speculative
-        // signaling target.  Build a separately funded local offerer instead;
-        // its Answer is routed by the exact candidate correlation below.
-        if owner.connection().holds_promoted_session() {
-            start_speculative_local_offer(state, &owner).await;
-            continue;
-        }
         let Some(renegotiation) = state.peers.claim_renegotiation(
             &owner,
             state.session_broker.as_ref(),
@@ -1555,63 +1704,89 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         ) else {
             continue;
         };
-        let state = state.clone();
-        tokio::spawn(async move {
-            if !renegotiation.is_live() {
-                renegotiation.complete(&state.peers, Err("session revoked".to_string()));
-                return;
-            }
-            let outcome = if renegotiation.session().signaling_state()
-                != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
-            {
-                // Mid-negotiation (glare, or our own earlier offer still
-                // settling): do not stack an offer on it or touch the
-                // session. The error below re-arms the explicit pending flag.
-                Err("signaling not stable".to_string())
-            } else {
-                // The connector already changed its transceiver set. One offer
-                // now carries the complete pending delta.
-                let offer = tokio::select! {
-                    biased;
-                    () = renegotiation.revoked() => {
-                        renegotiation.complete(&state.peers, Err("session revoked".to_string()));
-                        return;
-                    }
-                    offer = renegotiation.session().create_offer() => offer,
-                };
-                match offer {
-                    Ok(desc) => {
-                        let emitted = renegotiation.with_live(&state.peers, || {
-                            let device_id = renegotiation.device_id();
-                            state.log_diag_with(
-                                crate::events::DiagLevel::Debug,
-                                "realtime",
-                                format!(
-                                    "renegotiation offer to {} (track set changed)",
-                                    short_peer(device_id)
-                                ),
-                                serde_json::json!({
-                                    "peer": device_id,
-                                    "sdp_bytes": desc.sdp.len(),
-                                }),
-                            );
-                            let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                                device_id: device_id.to_string(),
-                                attempt: attempt_of(&state, device_id),
-                                sdp: desc.sdp,
-                            });
-                        });
-                        if emitted.is_none() {
-                            return;
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e.to_string()),
+        tokio::spawn(run_media_renegotiation(state.clone(), renegotiation));
+    }
+}
+
+/// Execute one exact connector-local media renegotiation claim.
+///
+/// SDP for a promoted connector never crosses the sender-claimed signaling
+/// carriers. The fixed offerer sends an authenticated in-session offer; the
+/// fixed answerer either answers it or, for a unilateral local change, asks the
+/// offerer to create one. Both directions therefore stay on the exact channel
+/// whose local track set changed, and complementary fixed roles make glare
+/// structurally impossible.
+async fn run_media_renegotiation(
+    state: Arc<NetworkState>,
+    renegotiation: peer_registry::AdmittedRenegotiation,
+) {
+    if !renegotiation.is_live() {
+        renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+        return;
+    }
+    if renegotiation.session().signaling_state()
+        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+    {
+        // Mid-negotiation: do not stack another offer or request. Completion
+        // re-arms the explicit pending work; elapsed time grants nothing.
+        renegotiation.complete(&state.peers, Err("signaling not stable".to_string()));
+        return;
+    }
+
+    let message = match renegotiation.session().role() {
+        Role::Offerer => {
+            let offer = tokio::select! {
+                biased;
+                () = renegotiation.revoked() => {
+                    renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+                    return;
+                }
+                offer = renegotiation.session().create_offer() => offer,
+            };
+            let offer = match offer {
+                Ok(offer) => offer,
+                Err(error) => {
+                    renegotiation.complete(&state.peers, Err(error.to_string()));
+                    return;
                 }
             };
-            renegotiation.complete(&state.peers, outcome);
-        });
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "realtime",
+                format!(
+                    "authenticated renegotiation offer to {} (track set changed)",
+                    short_peer(renegotiation.device_id())
+                ),
+                serde_json::json!({
+                    "peer": renegotiation.device_id(),
+                    "correlation": renegotiation.correlation(),
+                    "sdp_bytes": offer.sdp.len(),
+                }),
+            );
+            MeshMessage::SessionControl(crate::protocol::SessionControl::RenegotiateOffer {
+                sdp: offer.sdp,
+            })
+        }
+        Role::Answerer => {
+            // The answerer never creates a competing offer. Its authenticated
+            // request wakes the exact channel's fixed offerer, whose one offer
+            // carries both sides' current track-set state.
+            MeshMessage::SessionControl(crate::protocol::SessionControl::RenegotiateRequest)
+        }
+    };
+
+    let outcome = tokio::select! {
+        biased;
+        () = renegotiation.revoked() => Err("session revoked".to_string()),
+        sent = send_to_peer_owner(&state, renegotiation.owner(), &message) => {
+            sent.map_err(|error| error.to_string())
+        }
+    };
+    #[cfg(all(test, feature = "transport-lab"))]
+    if outcome.is_ok() && renegotiation.session().role() == Role::Offerer {
+        record_b2_stage(&state, renegotiation.correlation(), B2Stage::MediaOfferSent);
     }
+    renegotiation.complete(&state.peers, outcome);
 }
 
 /// The state-watch tick's backstop for offerer-side reconnects. Events
@@ -1961,6 +2136,7 @@ async fn connect_peer(
     maybe_reactive_announce(state);
 }
 
+#[cfg(test)]
 async fn start_speculative_local_offer(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
@@ -1968,7 +2144,7 @@ async fn start_speculative_local_offer(
     let Some(peer) = state.peers.get_if_current(owner) else {
         return;
     };
-    if !peer.holds_promoted_session() || peer.has_speculative() {
+    if !peer.holds_promoted_session() {
         return;
     }
     let mut random = [0u8; 8];
@@ -1991,20 +2167,20 @@ async fn start_speculative_local_offer(
         _ => return,
     };
     let session = Arc::new(session);
-    let Ok(tombstone_lease) = session.reserve_attempt_work(
-        connection::PeerConnection::speculative_tombstone_claim(&correlation),
+    let Ok(attempt_lease) = session.reserve_attempt_work(
+        connection::PeerConnection::speculative_attempt_claim(&correlation),
     ) else {
         session.retire();
         return;
     };
-    if !peer.install_speculative(correlation.clone(), session.clone(), tombstone_lease) {
+    if !peer.install_speculative(correlation.clone(), session.clone(), attempt_lease) {
         session.retire();
         return;
     }
     let offer = match session.create_offer().await {
         Ok(offer) => offer,
         Err(_) => {
-            retire_speculative_exact(state, owner, &correlation, &session);
+            retire_speculative_exact(state, owner, &correlation, &session).await;
             return;
         }
     };
@@ -2015,7 +2191,7 @@ async fn start_speculative_local_offer(
             .peers
             .take_speculative_exact(owner, &correlation, &session)
         {
-            candidate.retire();
+            candidate.worker.retire();
         } else {
             session.retire();
         }
@@ -2030,7 +2206,7 @@ async fn start_speculative_local_offer(
         })
         .is_err()
     {
-        retire_speculative_exact(state, owner, &correlation, &session);
+        retire_speculative_exact(state, owner, &correlation, &session).await;
         return;
     }
     let connector_state = Arc::clone(state);
@@ -2046,7 +2222,13 @@ async fn start_speculative_local_offer(
                 &session,
             ) {
                 peer_registry::SpeculativeWorkerRoute::Promoted => {
-                    handle_transport_event(&connector_state, device_id.clone(), event).await
+                    handle_transport_event_from_worker(
+                        &connector_state,
+                        device_id.clone(),
+                        &session,
+                        event,
+                    )
+                    .await
                 }
                 peer_registry::SpeculativeWorkerRoute::Speculative => {
                     handle_speculative_transport_event(
@@ -2079,17 +2261,14 @@ async fn start_speculative_offer(
     device_id: &str,
     correlation: &str,
     sdp: String,
+    mut dedup: Option<crate::runtime::peer_session::DedupToken>,
 ) {
     let Some(owner) = state.peers.owner(device_id) else {
+        forget_dedup_owned(state, dedup.take());
         return;
     };
     if !owner.connection().holds_promoted_session() {
-        return;
-    }
-    // A live candidate is not displaced by an unauthenticated Offer. An exact
-    // duplicate is idempotently ignored, and a different correlation is
-    // refused until the current candidate retires itself.
-    if owner.connection().has_speculative() {
+        forget_dedup_owned(state, dedup.take());
         return;
     }
     let cfg = state.config.read().clone();
@@ -2105,23 +2284,29 @@ async fn start_speculative_offer(
     .await;
     let (session, mut rx) = match construction {
         Ok(Ok(peer)) => peer,
-        _ => return,
+        _ => {
+            forget_dedup_owned(state, dedup.take());
+            return;
+        }
     };
     let session = Arc::new(session);
-    let Ok(tombstone_lease) = session.reserve_attempt_work(
-        connection::PeerConnection::speculative_tombstone_claim(correlation),
+    let Ok(attempt_lease) = session.reserve_attempt_work(
+        connection::PeerConnection::speculative_attempt_claim(correlation),
     ) else {
         session.retire();
+        forget_dedup_owned(state, dedup.take());
         return;
     };
     if state.peers.get_if_current(&owner).is_none()
-        || !owner.connection().install_speculative(
+        || !owner.connection().install_speculative_with_dedup(
             correlation.to_string(),
             session.clone(),
-            tombstone_lease,
+            attempt_lease,
+            &mut dedup,
         )
     {
         session.retire();
+        forget_dedup_owned(state, dedup.take());
         return;
     }
     if session
@@ -2129,13 +2314,13 @@ async fn start_speculative_offer(
         .await
         .is_err()
     {
-        retire_speculative_exact(state, &owner, correlation, &session);
+        retire_speculative_exact(state, &owner, correlation, &session).await;
         return;
     }
     let answer = match session.create_answer().await {
         Ok(answer) => answer,
         Err(_) => {
-            retire_speculative_exact(state, &owner, correlation, &session);
+            retire_speculative_exact(state, &owner, correlation, &session).await;
             return;
         }
     };
@@ -2144,7 +2329,7 @@ async fn start_speculative_offer(
             .connection()
             .speculative_is_exact(correlation, &session)
     {
-        retire_speculative_exact(state, &owner, correlation, &session);
+        retire_speculative_exact(state, &owner, correlation, &session).await;
         return;
     }
     if state
@@ -2156,7 +2341,7 @@ async fn start_speculative_offer(
         })
         .is_err()
     {
-        retire_speculative_exact(state, &owner, correlation, &session);
+        retire_speculative_exact(state, &owner, correlation, &session).await;
         return;
     }
     let connector_state = Arc::clone(state);
@@ -2173,7 +2358,13 @@ async fn start_speculative_offer(
                 &session,
             ) {
                 peer_registry::SpeculativeWorkerRoute::Promoted => {
-                    handle_transport_event(&connector_state, peer_id.clone(), event).await
+                    handle_transport_event_from_worker(
+                        &connector_state,
+                        peer_id.clone(),
+                        &session,
+                        event,
+                    )
+                    .await
                 }
                 peer_registry::SpeculativeWorkerRoute::Speculative => {
                     handle_speculative_transport_event(
@@ -2198,17 +2389,25 @@ async fn start_speculative_offer(
     });
 }
 
-fn retire_speculative_exact(
+async fn retire_speculative_exact(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
     correlation: &str,
     candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
 ) {
-    if let Some(candidate) = state
+    if let Some(retired) = state
         .peers
         .take_speculative_exact(owner, correlation, candidate)
     {
-        candidate.retire();
+        forget_dedup_owned(state, retired.dedup);
+        forget_dedups(state, retired.additional_dedup);
+        let closed = owner
+            .connection()
+            .await_exact_retired_worker(&retired.worker)
+            .await;
+        if let Some(Err(error)) = closed {
+            warn!(%error, "speculative candidate cleanup did not complete successfully");
+        }
     }
 }
 
@@ -2222,11 +2421,30 @@ async fn retire_speculative_terminal(
         .peers
         .terminal_speculative_cleanup(owner, correlation, candidate)
     {
-        Some(peer_registry::SpeculativeTerminalCleanup::Candidate(candidate)) => {
-            candidate.retire();
+        Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+            forget_dedup_owned(state, retired.dedup);
+            forget_dedups(state, retired.additional_dedup);
+            let closed = owner
+                .connection()
+                .await_exact_retired_worker(&retired.worker)
+                .await;
+            if let Some(Err(error)) = closed {
+                warn!(%error, "speculative terminal cleanup did not complete successfully");
+            }
         }
-        Some(peer_registry::SpeculativeTerminalCleanup::Promoted(peer)) => {
-            finish_drop_peer(state, owner.device_id(), DropReason::IceFailed, Some(peer)).await;
+        Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
+            forget_dedup_owned(state, removed.dedup);
+            forget_dedups(state, removed.additional_dedup);
+            let closed = owner
+                .connection()
+                .await_exact_retired_worker(&removed.worker)
+                .await;
+            if let Some(Err(error)) = closed {
+                warn!(%error, "promoted terminal cleanup did not complete successfully");
+            }
+            if removed.session_empty {
+                finish_drop_peer(state, owner.device_id(), DropReason::IceFailed, Some(peer)).await;
+            }
         }
         None => {}
     }
@@ -2242,17 +2460,21 @@ async fn handle_speculative_transport_event(
     let Some(owner) = state.peers.owner(&device_id) else {
         return false;
     };
-    let Some(worker) = owner.connection().speculative_worker_for(&correlation) else {
+    if !owner
+        .connection()
+        .speculative_is_exact(&correlation, candidate)
+    {
         if matches!(
             state
                 .peers
                 .speculative_worker_route(&owner, &correlation, candidate),
             peer_registry::SpeculativeWorkerRoute::Promoted
         ) {
-            return handle_transport_event(state, device_id, event).await;
+            return handle_transport_event_from_worker(state, device_id, candidate, event).await;
         }
         return false;
-    };
+    }
+    let worker = Arc::clone(candidate);
     let Some(event) = worker.accept_event(event) else {
         return false;
     };
@@ -2292,7 +2514,7 @@ async fn handle_speculative_transport_event(
                         // take is linearized under the registry fence; if
                         // promotion won first, the speculative slot is gone
                         // and this cannot retire the now-current winner.
-                        retire_speculative_exact(state, &owner, &correlation, &worker);
+                        retire_speculative_exact(state, &owner, &correlation, &worker).await;
                     }
                     return handled;
                 }
@@ -2334,7 +2556,10 @@ async fn handle_speculative_message(
         }
         peer_registry::SpeculativeWorkerRoute::Speculative => {}
     }
-    let Some(task) = owner.connection().speculative_endpoint_auth(correlation) else {
+    let Some(task) = owner
+        .connection()
+        .speculative_endpoint_auth(correlation, worker)
+    else {
         return match state
             .peers
             .speculative_worker_route(owner, correlation, worker)
@@ -2392,7 +2617,12 @@ async fn handle_speculative_message(
                 record_b2_stage(state, correlation, B2Stage::PeerProofAccepted);
                 if !owner
                     .connection()
-                    .install_speculative_authenticated_channel(correlation, &task, *capability)
+                    .install_speculative_authenticated_channel(
+                        correlation,
+                        worker,
+                        &task,
+                        *capability,
+                    )
                 {
                     return SpeculativeMessageOutcome::Handled(false);
                 }
@@ -2405,6 +2635,10 @@ async fn handle_speculative_message(
                 }
                 #[cfg(not(all(test, feature = "transport-lab")))]
                 let _ = queued;
+                if !queued {
+                    retire_speculative_exact(state, owner, correlation, worker).await;
+                    return SpeculativeMessageOutcome::Handled(false);
+                }
             }
             SpeculativeMessageOutcome::Handled(true)
         }
@@ -2449,7 +2683,7 @@ async fn begin_speculative_endpoint_auth(
     ));
     if !owner
         .connection()
-        .install_speculative_endpoint_auth(correlation, task.clone())
+        .install_speculative_endpoint_auth(correlation, worker, task.clone())
     {
         task.retire();
         return false;
@@ -2542,7 +2776,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // Doing this is what keeps the ring from accumulating a record of every
     // attempt a long-lived reconnecting peer ever made.
     if let Some(replaced) = install_peer(&state.peers, peer.clone()) {
-        forget_attempt(state, &replaced);
+        forget_displacement(state, replaced);
     }
 
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
@@ -2621,10 +2855,18 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // borrow the caller's id.
     let peer_id_for_pump = device_id.to_string();
     let task_observation = session.observe_owned_task();
+    let pump_session = Arc::clone(&session);
     tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(ev) = rx.recv().await {
-            if handle_transport_event(&connector_state, peer_id_for_pump.clone(), ev).await {
+            if handle_transport_event_from_worker(
+                &connector_state,
+                peer_id_for_pump.clone(),
+                &pump_session,
+                ev,
+            )
+            .await
+            {
                 rx.commit_data_channel_open();
             }
         }
@@ -2636,7 +2878,8 @@ async fn apply_remote_sdp(
     owner: &peer_registry::PeerOwnerToken,
     sdp_type: RTCSdpType,
     sdp: String,
-) {
+) -> bool {
+    let mut applied = false;
     let device_id = owner.device_id();
     let session = state
         .peers
@@ -2657,7 +2900,7 @@ async fn apply_remote_sdp(
         if sdp_type == RTCSdpType::Answer {
             reoffer_after_failed_answer(state, device_id).await;
         }
-        return;
+        return false;
     };
     // A stale Answer — one that arrives when we're not holding a local offer
     // (a duplicate from relay redundancy, or the answer to an offer we've since
@@ -2676,7 +2919,7 @@ async fn apply_remote_sdp(
             serde_json::json!({ "peer": device_id, "reason": "not_awaiting_answer" }),
         );
         reoffer_after_failed_answer(state, device_id).await;
-        return;
+        return false;
     }
     if matches!(sdp_type, RTCSdpType::Offer | RTCSdpType::Answer) {
         match session.apply_remote_sdp(sdp_type, sdp).await {
@@ -2706,6 +2949,7 @@ async fn apply_remote_sdp(
                 }
             }
             Ok(report) => {
+                applied = true;
                 // Drain any ICE candidates that arrived ahead of the
                 // SDP. The lock comes off before any await — we pull
                 // the pending vec out, then apply each candidate
@@ -2747,6 +2991,7 @@ async fn apply_remote_sdp(
             serde_json::json!({ "peer": device_id, "sdp_type": format!("{sdp_type:?}") }),
         );
     }
+    applied
 }
 
 /// An inbound Answer that can't be applied — it arrived after we tore the
@@ -2850,10 +3095,25 @@ async fn handle_transport_event(
         .as_ref()
         .and_then(|owner| state.peers.get_if_current(owner))
         .and_then(|peer| peer.session.lock().clone());
-    let (Some(owner), Some(worker)) = (owner, worker) else {
+    let (Some(_owner), Some(worker)) = (owner, worker) else {
         trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
         return false;
     };
+    handle_transport_event_from_worker(state, device_id, &worker, event).await
+}
+
+async fn handle_transport_event_from_worker(
+    state: &Arc<NetworkState>,
+    device_id: String,
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+    event: WebRtcConnectorEvent,
+) -> bool {
+    let Some(owner) = state.peers.owner(&device_id) else {
+        return false;
+    };
+    if !owner.connection().owns_authenticated_worker(worker) {
+        return false;
+    }
     let Some(event) = worker.accept_event(event) else {
         trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
         return false;
@@ -2862,7 +3122,7 @@ async fn handle_transport_event(
     // Retain the worker that accepted this callback through every effect. The
     // owner installation can survive a speculative W0 -> W1 handoff, so an
     // owner-only lookup after this point could accidentally mutate W1.
-    let owner = owner.for_worker(Arc::clone(&worker));
+    let owner = owner.for_worker(Arc::clone(worker));
     match event {
         TransportEvent::RenegotiationNeeded => {
             // The connector's track set changed. Don't offer inline — a
@@ -2870,7 +3130,9 @@ async fn handle_transport_event(
             // collapse into one offer, and glare with the remote's own
             // changes is least likely on the paced tick.
             state.peers.with_current(&owner, |peer| {
-                peer.state.write().media_reneg_pending = true;
+                if peer.mark_media_renegotiation(worker) {
+                    peer.state.write().media_reneg_pending = true;
+                }
             });
         }
         TransportEvent::LocalIceCandidate(Some(cand)) => {
@@ -2882,13 +3144,15 @@ async fn handle_transport_event(
             let accepted = state
                 .peers
                 .with_current(&owner, |peer| {
+                    let attempt = peer.attempt_for_worker(worker)?;
                     peer.state.write().diag.local_candidates.record(kind);
-                    state.signaling_tx.send(SignalingOutbound::Candidate {
+                    Some(state.signaling_tx.send(SignalingOutbound::Candidate {
                         device_id: device_id.clone(),
-                        attempt: peer.attempt(),
+                        attempt,
                         candidate: cand.clone(),
-                    })
+                    }))
                 })
+                .flatten()
                 .is_some();
             if !accepted {
                 return false;
@@ -3113,10 +3377,10 @@ async fn handle_transport_event(
                 ),
                 serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
             );
-            handle_exact_promoted_terminal(state, &owner, &worker, reason).await;
+            handle_exact_promoted_terminal(state, &owner, worker, reason).await;
         }
         TransportEvent::Message(bytes) => {
-            handle_exact_promoted_message(state, &owner, &worker, bytes).await;
+            handle_exact_promoted_message(state, &owner, worker, bytes).await;
         }
         TransportEvent::RealtimeUnit(delivery) => {
             state.deliver_realtime_unit(&owner, delivery);
@@ -4076,6 +4340,108 @@ async fn on_session_control(
                 serde_json::json!({ "peer": dispatch.owner().device_id() }),
             );
             drop_peer_if_current(state, dispatch.owner(), DropReason::UserLeft).await;
+        }
+        crate::protocol::SessionControl::RenegotiateRequest => {
+            let Some(worker) = dispatch.owner().worker().cloned() else {
+                return;
+            };
+            if worker.role() != Role::Offerer {
+                return;
+            }
+            let _ = dispatch.with_captured_peer(&state.peers, |peer| {
+                // A request ordered before the answer on this reliable channel
+                // is already represented by the in-flight offer: the answerer
+                // will build its reply from its current local track set. Do not
+                // manufacture a second offer or a glare lane.
+                let already_covered =
+                    worker.awaiting_answer() || peer.state.read().media_reneg_inflight;
+                if !already_covered && peer.mark_media_renegotiation(&worker) {
+                    peer.state.write().media_reneg_pending = true;
+                }
+            });
+        }
+        crate::protocol::SessionControl::RenegotiateOffer { sdp } => {
+            let Some(worker) = dispatch.owner().worker().cloned() else {
+                return;
+            };
+            if worker.role() != Role::Answerer
+                || worker.signaling_state()
+                    != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+            {
+                return;
+            }
+            #[cfg(all(test, feature = "transport-lab"))]
+            let correlation = dispatch
+                .with_captured_peer(&state.peers, |peer| peer.attempt_for_worker(&worker))
+                .flatten();
+            let applied = worker.apply_remote_sdp(RTCSdpType::Offer, sdp).await;
+            if let Err(error) = applied {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Warn,
+                    "realtime",
+                    format!(
+                        "authenticated renegotiation offer from {} refused: {error}",
+                        short_peer(dispatch.owner().device_id())
+                    ),
+                    serde_json::json!({
+                        "peer": dispatch.owner().device_id(),
+                        "error": error.to_string(),
+                    }),
+                );
+                return;
+            }
+            #[cfg(all(test, feature = "transport-lab"))]
+            if let Some(correlation) = correlation.as_deref() {
+                record_b2_stage(state, correlation, B2Stage::MediaOfferApplied);
+            }
+            let answer = match worker.create_answer().await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    state.log_diag_with(
+                        crate::events::DiagLevel::Warn,
+                        "realtime",
+                        format!(
+                            "authenticated renegotiation answer for {} failed: {error}",
+                            short_peer(dispatch.owner().device_id())
+                        ),
+                        serde_json::json!({
+                            "peer": dispatch.owner().device_id(),
+                            "error": error.to_string(),
+                        }),
+                    );
+                    return;
+                }
+            };
+            let _ = send_to_peer_owner(
+                state,
+                dispatch.owner(),
+                &MeshMessage::SessionControl(crate::protocol::SessionControl::RenegotiateAnswer {
+                    sdp: answer.sdp,
+                }),
+            )
+            .await;
+        }
+        crate::protocol::SessionControl::RenegotiateAnswer { sdp } => {
+            let Some(worker) = dispatch.owner().worker().cloned() else {
+                return;
+            };
+            if worker.role() != Role::Offerer || !worker.awaiting_answer() {
+                return;
+            }
+            #[cfg(all(test, feature = "transport-lab"))]
+            let correlation = dispatch
+                .with_captured_peer(&state.peers, |peer| peer.attempt_for_worker(&worker))
+                .flatten();
+            if worker
+                .apply_remote_sdp(RTCSdpType::Answer, sdp)
+                .await
+                .is_ok()
+            {
+                #[cfg(all(test, feature = "transport-lab"))]
+                if let Some(correlation) = correlation.as_deref() {
+                    record_b2_stage(state, correlation, B2Stage::MediaAnswerApplied);
+                }
+            }
         }
     }
 }
@@ -5448,10 +5814,10 @@ pub(crate) async fn send_to_peer_owner(
         .peers
         .get_if_current(owner)
         .ok_or_else(|| Error::Network(format!("peer owner is stale: {}", owner.device_id())))?;
-    let session = peer
-        .session
-        .lock()
-        .clone()
+    let session = owner
+        .worker()
+        .cloned()
+        .or_else(|| peer.session.lock().clone())
         .ok_or_else(|| Error::Transport("session not yet established".into()))?;
     let sent = tokio::time::timeout(timeout, session.send_owned(Bytes::from(serialized)))
         .await
@@ -5993,15 +6359,18 @@ async fn finish_drop_peer(
     removed: Option<Arc<PeerConnection>>,
 ) {
     if let Some(peer) = removed {
-        // The attempt is over, so its de-duplication keys are released now
-        // rather than left for provider pressure to evict eventually.
-        forget_attempt(state, &peer.attempt());
-        let cleanup_peer = Arc::clone(&peer);
-        tokio::spawn(async move {
-            if let Err(error) = cleanup_peer.retire_and_close().await {
-                warn!(%error, "peer cleanup did not complete successfully");
-            }
-        });
+        state.peers.track_removed_close(Arc::clone(&peer));
+        // Retire synchronously to move every exact channel/candidate into
+        // native-close custody, then release only the dedup tokens owned by
+        // this peer before the asynchronous close wait begins.
+        peer.retire_connector();
+        for token in peer.take_retired_dedup() {
+            forget_dedup_owned(state, Some(token));
+        }
+        if let Err(error) = peer.retire_and_close().await {
+            warn!(%error, "peer cleanup did not complete successfully");
+        }
+        state.peers.complete_removed_close(&peer);
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
@@ -6071,15 +6440,24 @@ async fn finish_drop_peer(
     ladder::reevaluate_topology(state).await;
 }
 
-/// Tell the signaling runtime that an attempt is over, if there is one to tell.
-///
-/// Called at exactly the two moments after which nothing belonging to that
-/// attempt can legitimately arrive again: the installation was retired, or it
-/// was replaced. Both release the keys the ingress remembered under it.
-fn forget_attempt(state: &Arc<NetworkState>, attempt: &str) {
-    if let Some(runtime) = state.signaling_runtime() {
-        runtime.forget_attempt(attempt);
+fn forget_dedup_owned(
+    state: &Arc<NetworkState>,
+    token: Option<crate::runtime::peer_session::DedupToken>,
+) {
+    if let (Some(runtime), Some(token)) = (state.signaling_runtime(), token) {
+        runtime.forget_token(token);
     }
+}
+
+fn forget_dedups(state: &Arc<NetworkState>, tokens: Vec<crate::runtime::peer_session::DedupToken>) {
+    for token in tokens {
+        forget_dedup_owned(state, Some(token));
+    }
+}
+
+fn forget_displacement(state: &Arc<NetworkState>, displaced: connection::AttemptDisplacement) {
+    forget_dedup_owned(state, displaced.dedup);
+    forget_dedups(state, displaced.additional_dedup);
 }
 
 /// This peer's current attempt correlation, for stamping an outbound signal.
@@ -6131,11 +6509,27 @@ pub(crate) async fn drop_peer_if_current(
     owner: &peer_registry::PeerOwnerToken,
     reason: DropReason,
 ) {
-    let removed = state.peers.remove_if_current(owner);
-    if removed.is_none() {
-        return;
+    // A stamped terminal callback can end one selected channel while another
+    // authenticated channel is added concurrently. One registry outcome
+    // linearizes that choice, so exact channel custody cannot be discarded by
+    // a second whole-peer lookup. No registry lock is held across native I/O.
+    match state.peers.remove_current_for_terminal(owner) {
+        peer_registry::CurrentTerminalCleanup::Stale => {}
+        peer_registry::CurrentTerminalCleanup::Channel(removed) => {
+            forget_dedup_owned(state, removed.dedup);
+            forget_dedups(state, removed.additional_dedup);
+            let closed = owner
+                .connection()
+                .await_exact_retired_worker(&removed.worker)
+                .await;
+            if let Some(Err(error)) = closed {
+                warn!(%error, "authenticated channel cleanup did not complete successfully");
+            }
+        }
+        peer_registry::CurrentTerminalCleanup::Peer(peer) => {
+            finish_drop_peer(state, owner.device_id(), reason, Some(peer)).await;
+        }
     }
-    finish_drop_peer(state, owner.device_id(), reason, removed).await;
 }
 
 /// Install the current peer owner and retire any replaced compatibility queue.
@@ -6147,14 +6541,15 @@ pub(crate) async fn drop_peer_if_current(
 /// The return value is what lets the production call sites release the replaced
 /// attempt's de-duplication keys. Fixtures that only need a peer in the registry
 /// ignore it: a control that never signals has no keys to release.
-fn install_peer(peers: &peer_registry::PeerRegistry, peer: Arc<PeerConnection>) -> Option<String> {
+fn install_peer(
+    peers: &peer_registry::PeerRegistry,
+    peer: Arc<PeerConnection>,
+) -> Option<connection::AttemptDisplacement> {
     let replaced = peers.install(peer)?;
-    let attempt = replaced.attempt();
-    tokio::spawn(async move {
-        if let Err(error) = replaced.retire_and_close().await {
-            warn!(%error, "replaced peer cleanup did not complete successfully");
-        }
-    });
+    let mut attempt = replaced.take_attempt_displacement();
+    replaced.retire_connector();
+    attempt.additional_dedup = replaced.take_retired_dedup();
+    peers.track_replaced_close(replaced);
     Some(attempt)
 }
 
@@ -6224,7 +6619,7 @@ fn build_test_state_parts_with(
     Arc<NetworkState>,
     crate::resource::ResourceMailboxReceiver<NetworkCmd>,
 ) {
-    let (state, cmd_rx, _provider, _grant) = build_test_state_parts_metered(
+    let (state, _signaling_in_rx, cmd_rx, _provider, _grant) = build_test_state_parts_metered(
         network_id_suffix,
         profile_override,
         connector_slots,
@@ -6241,6 +6636,7 @@ fn build_test_state_parts_metered(
     retained: Option<crate::resource::ResourceClaim>,
 ) -> (
     Arc<NetworkState>,
+    crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
     crate::resource::ResourceMailboxReceiver<NetworkCmd>,
     crate::resource::FiniteResourceProvider,
     crate::resource::ResourceClaim,
@@ -6406,7 +6802,7 @@ fn build_test_state_parts_metered(
             )
             .expect("engine fixture JSON input capacity is representable");
     // The engine owns one local-application scope below the process and one
-    // network-local child below it. Its three mailboxes each own another child
+    // network-local child below it. Its four mailboxes each own another child
     // scope plus an exact root reservation. Price those from the real types;
     // otherwise they silently consume the connector callback envelope and make
     // pressure controls depend on unrelated transport slack.
@@ -6419,6 +6815,8 @@ fn build_test_state_parts_metered(
             .expect("outbound signaling mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<NetworkCmd>::root_claim()
             .expect("engine command mailbox root is representable"),
+        crate::resource::ResourceMailboxSender::<state::SpeculativePromotionCmd>::root_claim()
+            .expect("speculative promotion mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<EphemeralIngress>::root_claim()
             .expect("inbound signaling mailbox root is representable"),
     ]
@@ -6480,18 +6878,10 @@ fn build_test_state_parts_metered(
         )
         .expect("engine fixture outbound signaling capacity is representable");
 
-    // `GovernanceSnapshot` conservatively stands in for the smaller
-    // `ReplayCapabilities`: both retain the fixed command value, while the
-    // snapshot also owns a reply effect. The caller-shaped frame exercises the
-    // fixture's named JSON payload allowance.
-    let (promotion_reply, _promotion_reply_rx) = tokio::sync::oneshot::channel();
-    let promotion_command = NetworkCmd::GovernanceSnapshot {
-        reply: promotion_reply,
-    };
-    let promotion_commands =
-        crate::resource::ResourceMailboxSender::<NetworkCmd>::accepted_item_charge_for_test(
-            &promotion_command,
-        )
+    // Price the internal promotion value through its exact builder measurement.
+    // The fixture does not have a worker until after this grant has created the
+    // transport, so planning deliberately measures without constructing one.
+    let promotion_commands = state::speculative_promotion_item_charge_for_test("fixture-attempt")
         .checked_scale(
             connectors
                 .get()
@@ -6564,15 +6954,16 @@ fn build_test_state_parts_metered(
         .expect("engine fixture process owner issues one explicit Mesh scope");
     let transport = crate::transport::Transport::new()
         .expect("transport")
-        .with_connector_resource_scope(scope, webrtc_profile);
+        .with_connector_resource_scope_for_test(scope, webrtc_profile)
+        .expect("engine fixture installs its registered real-time codecs");
     let mesh_scope = process.mesh_runtime_scope();
     let local_resources = process
         .issue_local_application_scope()
         .expect("engine fixture issues local application authority");
-    let (state, _signaling_in_rx, cmd_rx) =
+    let (state, signaling_in_rx, cmd_rx) =
         NetworkState::new_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources)
             .expect("network state");
-    (state, cmd_rx, metered, grant)
+    (state, signaling_in_rx, cmd_rx, metered, grant)
 }
 
 /// A cancelled governance planner or commit leaves its planning owner on the
@@ -6705,7 +7096,7 @@ pub(crate) fn build_test_state_with_retained_capacity(
     network_id_suffix: &str,
     retained: crate::resource::ResourceClaim,
 ) -> (Arc<NetworkState>, RetainedCapacityMeter) {
-    let (state, cmd_rx, provider, grant) = build_test_state_parts_metered(
+    let (state, _signaling_in_rx, cmd_rx, provider, grant) = build_test_state_parts_metered(
         network_id_suffix,
         None,
         FIXTURE_CONNECTOR_SLOTS,
@@ -6737,7 +7128,7 @@ pub(crate) fn build_test_state_with_retained_capacity(
 /// one-active-binding remote-description grant stays correct, and the connector
 /// grant auto-derives from the profile.
 #[cfg(all(test, feature = "transport-lab"))]
-pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> Arc<NetworkState> {
+fn realtime_test_profile() -> crate::WebRtcConnectorProfile {
     use crate::runtime::attempt::ConnectorCallbackPolicy;
     let realtime_profile = crate::WebRtcRealtimeProfile::new(vec![crate::WebRtcRealtimeCodec {
         kind: crate::WebRtcRtpKind::Video,
@@ -6750,12 +7141,16 @@ pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> A
         rtcp_feedback: Vec::new(),
     }])
     .expect("engine real-time fixture registers one well-formed family");
-    let profile = crate::WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
+    crate::WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
         .with_realtime_profile(realtime_profile)
-        .expect("the engine real-time fixture enables real-time, so a profile is accepted");
+        .expect("the engine real-time fixture enables real-time, so a profile is accepted")
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) fn build_test_state_with_realtime_flows(network_id_suffix: &str) -> Arc<NetworkState> {
     let (state, cmd_rx) = build_test_state_parts_with(
         network_id_suffix,
-        Some(profile),
+        Some(realtime_test_profile()),
         FIXTURE_CONNECTOR_SLOTS,
         None,
     );
@@ -6803,23 +7198,100 @@ fn realtime_test_encoding() -> crate::transport::webrtc::RealtimeEncoding {
 /// Build test state with the same serialized command consumer that owns
 /// delayed exact-peer mutations in the production driver.
 #[cfg(test)]
+struct B2PromotionGate {
+    target: parking_lot::Mutex<Option<String>>,
+    reached: parking_lot::Mutex<std::collections::HashSet<String>>,
+    released: parking_lot::Mutex<std::collections::HashSet<String>>,
+    wake: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl B2PromotionGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            target: parking_lot::Mutex::new(None),
+            reached: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            released: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            wake: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn hold(&self, correlation: &str) {
+        *self.target.lock() = Some(correlation.to_string());
+    }
+
+    fn release(&self, correlation: &str) {
+        self.released.lock().insert(correlation.to_string());
+        self.wake.notify_waiters();
+    }
+
+    async fn wait_reached(&self, correlation: &str) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.reached.lock().contains(correlation) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn before_command(&self, correlation: &str) {
+        if self.target.lock().as_deref() != Some(correlation) {
+            return;
+        }
+        self.reached.lock().insert(correlation.to_string());
+        self.wake.notify_waiters();
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.lock().contains(correlation) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
 fn spawn_test_command_driver(
     state: &Arc<NetworkState>,
     mut cmd_rx: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
     promotion_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    promotion_gate: Option<Arc<B2PromotionGate>>,
 ) -> tokio::task::JoinHandle<()> {
     let command_state = Arc::clone(state);
+    let mut speculative_promotion_rx = state
+        .take_speculative_promotion_rx()
+        .expect("the test driver takes its speculative-promotion receiver once");
     tokio::spawn(async move {
-        while let Some(delivery) = cmd_rx.recv().await {
-            let promotion = promotion_tx.as_ref().and_then(|_| match delivery.value() {
-                NetworkCmd::PromoteSpeculative { correlation, .. } => Some(correlation.clone()),
-                _ => None,
-            });
-            delivery
-                .run_terminal_effect(|command| handle_command(&command_state, command))
-                .await;
-            if let (Some(promotion_tx), Some(correlation)) = (&promotion_tx, promotion) {
-                let _ = promotion_tx.send(correlation);
+        loop {
+            tokio::select! {
+                delivery = cmd_rx.recv() => {
+                    let Some(delivery) = delivery else { break };
+                    delivery
+                        .run_terminal_effect(|command| {
+                            handle_command(&command_state, command)
+                        })
+                        .await;
+                }
+                delivery = speculative_promotion_rx.recv() => {
+                    let Some(delivery) = delivery else { break };
+                    let correlation = delivery.value().correlation.clone();
+                    if let Some(gate) = &promotion_gate {
+                        gate.before_command(&correlation).await;
+                    }
+                    delivery
+                        .run_terminal_effect(|promotion| {
+                            handle_speculative_promotion(&command_state, promotion)
+                        })
+                        .await;
+                    if let Some(promotion_tx) = &promotion_tx {
+                        let _ = promotion_tx.send(correlation);
+                    }
+                }
             }
         }
     })
@@ -6830,7 +7302,7 @@ pub(crate) fn build_test_state_with_command_driver(
     network_id_suffix: &str,
 ) -> (Arc<NetworkState>, tokio::task::JoinHandle<()>) {
     let (state, cmd_rx) = build_test_state_parts(network_id_suffix);
-    let command_driver = spawn_test_command_driver(&state, cmd_rx, None);
+    let command_driver = spawn_test_command_driver(&state, cmd_rx, None, None);
     (state, command_driver)
 }
 
@@ -6840,19 +7312,30 @@ pub(crate) fn build_test_state_with_command_driver(
 /// and the command driver must remain live so promotion is exercised through
 /// the production queue rather than by a direct test-only mutation.
 #[cfg(test)]
-fn build_test_state_with_command_driver_and_slots(
-    network_id_suffix: &str,
-    connector_slots: usize,
-) -> (
+type B2CommandDriverFixture = (
     Arc<NetworkState>,
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::UnboundedReceiver<String>,
-) {
-    let (state, cmd_rx) =
-        build_test_state_parts_with(network_id_suffix, None, connector_slots, None);
+    Arc<B2PromotionGate>,
+    crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
+);
+
+#[cfg(test)]
+fn build_test_state_with_command_driver_and_slots(
+    network_id_suffix: &str,
+    connector_slots: usize,
+) -> B2CommandDriverFixture {
+    #[cfg(feature = "transport-lab")]
+    let profile = Some(realtime_test_profile());
+    #[cfg(not(feature = "transport-lab"))]
+    let profile = None;
+    let (state, signaling_in_rx, cmd_rx, _provider, _grant) =
+        build_test_state_parts_metered(network_id_suffix, profile, connector_slots, None);
     let (promotion_tx, promotion_rx) = tokio::sync::mpsc::unbounded_channel();
-    let command_driver = spawn_test_command_driver(&state, cmd_rx, Some(promotion_tx));
-    (state, command_driver, promotion_rx)
+    let gate = B2PromotionGate::new();
+    let command_driver =
+        spawn_test_command_driver(&state, cmd_rx, Some(promotion_tx), Some(Arc::clone(&gate)));
+    (state, command_driver, promotion_rx, gate, signaling_in_rx)
 }
 
 /// Insert a peer with no WebRTC session and a chosen `last_recv_at`,
@@ -7736,7 +8219,7 @@ mod tests {
         let a = NetworkCmd::FanoutCapabilities { caps: caps("A") };
         let one =
             crate::resource::ResourceMailboxSender::<NetworkCmd>::accepted_item_charge_for_test(&a);
-        let (state, mut cmd_rx, provider, grant) =
+        let (state, _signaling_in_rx, mut cmd_rx, provider, grant) =
             build_test_state_parts_metered("fanout-mailbox", None, 2, Some(one));
         let record = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
             crate::resource::ResourceClaim::ZERO,
@@ -10810,12 +11293,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
     async fn v4_f4_a_refused_promotion_announces_nothing_and_the_later_one_announces_once() {
-        let (state, mut commands, provider, grant) = build_test_state_parts_metered(
-            "f4-capacity-refusal",
-            None,
-            FIXTURE_CONNECTOR_SLOTS,
-            Some(crate::resource::ResourceClaim::ZERO),
-        );
+        let (state, _signaling_in_rx, mut commands, provider, grant) =
+            build_test_state_parts_metered(
+                "f4-capacity-refusal",
+                None,
+                FIXTURE_CONNECTOR_SLOTS,
+                Some(crate::resource::ResourceClaim::ZERO),
+            );
         let meter = RetainedCapacityMeter { provider, grant };
 
         // Install both connectors before sealing. The seal must close the
@@ -14588,7 +15072,7 @@ mod tests {
     /// only way the installation can accept another channel at all.
     fn promote_successor_over(
         state: &NetworkState,
-        peer: &PeerConnection,
+        peer: &Arc<PeerConnection>,
         worker: Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
         handoff: crate::connector::ConnectedChannelHandoff,
     ) {
@@ -16775,6 +17259,194 @@ mod tests {
         state.shutdown().await;
     }
 
+    /// Unique invalid Offers are independent provider-funded attempts, not
+    /// peer-lifetime lookup entries. Once each exact candidate has failed and
+    /// its native close owner settles, both the candidate set and provider
+    /// usage return to the promoted peer's baseline.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_many_invalid_offers_leave_no_permanent_candidate_lookup() {
+        let (state, mut signaling_in_rx, cmd_rx, provider, _grant) =
+            build_test_state_parts_metered("b2-invalid-offer-baseline", None, 2, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let signaling_runtime = signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state
+                .local_application_resource_scope()
+                .expect("invalid-offer control funds one signaling runtime"),
+        );
+        state.publish_signaling_runtime(&signaling_runtime);
+        let carrier = signaling_ingress::SignalingRuntime::attach(
+            &signaling_runtime,
+            SignalingCarrier::Nostr,
+        );
+        let target = "b2-invalid-offer-target";
+        let fixture = insert_promoted_peer(&state, target).await;
+        let owner = state.peers.owner(target).expect("the promoted peer exists");
+        assert!(state
+            .peers
+            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .is_some());
+        let baseline = provider.in_use();
+
+        for index in 0..32usize {
+            let offer_id = format!("unique-invalid-offer-{index}");
+            assert!(carrier.deliver(carrier.directed(
+                target.to_string(),
+                myownmesh_signaling::SignalingMessage::Offer {
+                    peer_id: target.to_string(),
+                    offer_id,
+                    sdp: format!("v=0\r\na=x-invalid-b2-{index}\r\n"),
+                },
+            )));
+            let delivery = signaling_in_rx
+                .recv()
+                .await
+                .expect("the production signaling mailbox receives the invalid Offer");
+            delivery
+                .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+                .await;
+            assert!(
+                !owner.connection().has_speculative(),
+                "failed Offer {index} leaves no live candidate lookup"
+            );
+            assert_eq!(
+                owner.connection().retired_worker_count_for_test(),
+                0,
+                "invalid Offer {index} closes its candidate at the terminal edge"
+            );
+            assert_eq!(
+                provider.in_use(),
+                baseline,
+                "invalid Offer {index} returns provider usage to baseline"
+            );
+        }
+
+        let retransmitted = "unique-invalid-offer-31";
+        assert!(carrier.deliver(carrier.directed(
+            target.to_string(),
+            myownmesh_signaling::SignalingMessage::Offer {
+                peer_id: target.to_string(),
+                offer_id: retransmitted.to_string(),
+                sdp: "v=0\r\na=x-invalid-b2-31\r\n".to_string(),
+            },
+        )));
+        let delivery = signaling_in_rx
+            .recv()
+            .await
+            .expect("exact dedup-token release permits the identical Offer to re-enter");
+        delivery
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+            .await;
+        assert!(!owner.connection().has_speculative());
+        assert_eq!(
+            owner.connection().retired_worker_count_for_test(),
+            0,
+            "the retransmitted Offer also closes only its fresh candidate"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the retransmitted Offer returns fresh candidate funding to baseline"
+        );
+
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "unique invalid Offers release their attempt leases and native connector funding"
+        );
+        assert!(fixture.peer.holds_promoted_session());
+        state.shutdown().await;
+    }
+
+    /// A valid legacy Offer whose Answer cannot be enqueued ends only its exact
+    /// unpromoted attempt. The same Offer can therefore re-enter after the
+    /// refusal, while no successor/current installation is touched.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_refused_legacy_answer_releases_exact_attempt() {
+        let (state, mut signaling_in_rx, cmd_rx, _provider, _grant) =
+            build_test_state_parts_metered("b2-refused-legacy-answer", None, 2, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let signaling_runtime = signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state
+                .local_application_resource_scope()
+                .expect("the refusal control funds one signaling runtime"),
+        );
+        state.publish_signaling_runtime(&signaling_runtime);
+        let carrier = signaling_ingress::SignalingRuntime::attach(
+            &signaling_runtime,
+            SignalingCarrier::Nostr,
+        );
+        drop(
+            state
+                .take_signaling_outbound_rx()
+                .expect("the control owns and closes the Answer mailbox"),
+        );
+
+        let offer_state = build_test_state("b2-refused-legacy-answer-source");
+        let (offer_worker, _offer_events) = offer_state
+            .transport
+            .open_connector_peer(
+                Role::Offerer,
+                &[],
+                &[],
+                offer_state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the source offerer opens");
+        let offer = offer_worker
+            .create_offer()
+            .await
+            .expect("the source produces a valid Offer");
+        let target = "b2-refused-legacy-answer-target".to_string();
+        let attempt = "b2-refused-legacy-answer-attempt".to_string();
+        let deliver_offer = || {
+            carrier.deliver(carrier.directed(
+                target.clone(),
+                myownmesh_signaling::SignalingMessage::Offer {
+                    peer_id: target.clone(),
+                    offer_id: attempt.clone(),
+                    sdp: offer.sdp.clone(),
+                },
+            ))
+        };
+
+        assert!(deliver_offer());
+        signaling_in_rx
+            .recv()
+            .await
+            .expect("the first Offer reaches production ingress")
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+            .await;
+        assert!(
+            state.peers.owner(&target).is_none(),
+            "Answer enqueue refusal retires the exact legacy attempt"
+        );
+        assert!(
+            !signaling_runtime.remembers_attempt_for_test(&attempt),
+            "the refused attempt releases its exact dedup key"
+        );
+
+        assert!(deliver_offer());
+        signaling_in_rx
+            .recv()
+            .await
+            .expect("the identical Offer re-enters after exact refusal cleanup")
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state, signal))
+            .await;
+        assert!(
+            state.peers.owner(&target).is_none(),
+            "the retransmitted refusal still affects no successor/current owner"
+        );
+
+        state.shutdown().await;
+        offer_state.shutdown().await;
+    }
+
     /// A legacy untrusted-signaling mutation keeps its exact-owner witness
     /// through the awaited effect. Promotion and reentrant Answer/Candidate
     /// input staged at that boundary must refuse; otherwise the later effect
@@ -16829,13 +17501,13 @@ mod tests {
         }
         install_peer(&state.peers, Arc::clone(&peer));
         let correlation = "offer-witness-candidate".to_string();
-        let tombstone_lease = candidate
-            .reserve_attempt_work(PeerConnection::speculative_tombstone_claim(&correlation))
-            .expect("the candidate retains its exact tombstone lease");
+        let attempt_lease = candidate
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(&correlation))
+            .expect("the candidate retains its exact live-attempt lease");
         assert!(peer.install_speculative(
             correlation.clone(),
             Arc::clone(&candidate),
-            tombstone_lease,
+            attempt_lease,
         ));
         let owner = state
             .peers
@@ -16967,14 +17639,14 @@ mod tests {
         ));
         let candidate = Arc::new(candidate);
         let correlation = "retire-before-speculative-insert".to_string();
-        let tombstone_lease = candidate
-            .reserve_attempt_work(PeerConnection::speculative_tombstone_claim(&correlation))
-            .expect("the candidate retains its tombstone lease until admission");
+        let attempt_lease = candidate
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(&correlation))
+            .expect("the candidate retains its live-attempt lease until admission");
         assert!(
             !peer.install_speculative_after_retire_race_for_test(
                 correlation,
                 Arc::clone(&candidate),
-                tombstone_lease,
+                attempt_lease,
             ),
             "retirement between precheck and slot insertion refuses the candidate"
         );
@@ -16984,7 +17656,7 @@ mod tests {
         );
         assert!(
             peer.speculative_resources_empty_for_test(),
-            "no speculative tombstone lease or retained slot remains"
+            "no speculative attempt lease or retained slot remains"
         );
         assert!(
             candidate.live_connector_incarnation().is_some(),
@@ -16996,6 +17668,87 @@ mod tests {
             "the candidate native worker is released after the refused insertion"
         );
         state.shutdown().await;
+    }
+
+    /// Full peer teardown retains and awaits every worker it owned, including
+    /// a still-speculative candidate. Both native close owners must reach their
+    /// exact gates before teardown can complete.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_teardown_awaits_primary_and_speculative_native_close() {
+        let state = build_test_state_with_connector_slots("b2-all-worker-close", 2);
+        let (primary, _primary_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the primary connector opens");
+        let (candidate, _candidate_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Offerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the speculative connector opens");
+        let primary = Arc::new(primary);
+        let candidate = Arc::new(candidate);
+        let primary_gate = primary.install_native_close_gate_for_test();
+        let candidate_gate = candidate.install_native_close_gate_for_test();
+        let peer = Arc::new(PeerConnection::new(
+            "b2-all-worker-close-target".to_string(),
+            Some(Arc::clone(&primary)),
+        ));
+        let correlation = "b2-close-speculative".to_string();
+        let lease = candidate
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(&correlation))
+            .expect("the speculative worker owns its exact live-attempt lease");
+        assert!(peer.install_speculative(correlation, Arc::clone(&candidate), lease,));
+        install_peer(&state.peers, Arc::clone(&peer));
+
+        let teardown_state = Arc::clone(&state);
+        let teardown = tokio::spawn(async move {
+            drop_peer(
+                &teardown_state,
+                "b2-all-worker-close-target",
+                DropReason::IceFailed,
+            )
+            .await;
+        });
+        tokio::join!(
+            primary_gate.wait_for_entry(),
+            candidate_gate.wait_for_entry()
+        );
+        assert_eq!(primary_gate.entries(), 1);
+        assert_eq!(candidate_gate.entries(), 1);
+        assert!(
+            !teardown.is_finished(),
+            "teardown remains pending while either native close is held"
+        );
+        let shutdown_state = Arc::clone(&state);
+        let shutdown = tokio::spawn(async move {
+            shutdown_state.shutdown().await;
+        });
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown remains pending on the removed peer's tracked close custody"
+        );
+        primary_gate.open();
+        candidate_gate.open();
+        teardown.await.expect("the production teardown task runs");
+        shutdown
+            .await
+            .expect("shutdown joins the tracked removed close");
+        assert!(state.peers.owner("b2-all-worker-close-target").is_none());
+        assert!(primary.live_connector_incarnation().is_none());
+        assert!(candidate.live_connector_incarnation().is_none());
     }
 
     #[tokio::test]
@@ -17026,8 +17779,8 @@ mod tests {
         let candidate = Arc::new(candidate);
         let correlation = "terminal-first-candidate".to_string();
         let lease = candidate
-            .reserve_attempt_work(PeerConnection::speculative_tombstone_claim(&correlation))
-            .expect("the candidate tombstone is funded");
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(&correlation))
+            .expect("the candidate attempt is funded");
         assert!(fixture.peer.install_speculative(
             correlation.clone(),
             Arc::clone(&candidate),
@@ -17037,8 +17790,8 @@ mod tests {
             .peers
             .terminal_speculative_cleanup(&owner, &correlation, &candidate)
         {
-            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(worker)) => {
-                worker.retire();
+            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+                retired.worker.retire();
             }
             _ => panic!("terminal-first consumes only the speculative candidate"),
         }
@@ -17103,8 +17856,8 @@ mod tests {
         let successor = Arc::new(successor);
         let correlation = "accepted-terminal-first-successor".to_string();
         let lease = successor
-            .reserve_attempt_work(PeerConnection::speculative_tombstone_claim(&correlation))
-            .expect("the pending successor tombstone is funded");
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(&correlation))
+            .expect("the pending successor attempt is funded");
         assert!(fixture.peer.install_speculative(
             correlation.clone(),
             Arc::clone(&successor),
@@ -17182,18 +17935,46 @@ mod tests {
             .peers
             .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
             .is_some());
+        let successor_gate = successor.install_native_close_gate_for_test();
         let removed = match state.peers.terminal_speculative_cleanup(
             &owner,
             "promotion-first-terminal",
             &successor,
         ) {
-            Some(peer_registry::SpeculativeTerminalCleanup::Promoted(peer)) => peer,
+            Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, .. }) => peer,
             _ => panic!("promotion-first cleans the exact current winner"),
         };
-        finish_drop_peer(&state, target, DropReason::IceFailed, Some(removed)).await;
+        let terminal_state = Arc::clone(&state);
+        let terminal = tokio::spawn(async move {
+            finish_drop_peer(
+                &terminal_state,
+                target,
+                DropReason::IceFailed,
+                Some(removed),
+            )
+            .await;
+        });
+        successor_gate.wait_for_entry().await;
+        terminal.abort();
+        assert!(
+            terminal.await.is_err(),
+            "the first close waiter is cancelled after native close entry"
+        );
+        let shutdown_state = Arc::clone(&state);
+        let shutdown = tokio::spawn(async move {
+            shutdown_state.shutdown().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown remains pending on terminal speculative close custody"
+        );
+        successor_gate.open();
+        shutdown
+            .await
+            .expect("shutdown joins terminal cleanup custody");
         assert!(state.peers.get(target).is_none());
         assert!(successor.live_connector_incarnation().is_none());
-        state.shutdown().await;
     }
 
     #[tokio::test]
@@ -17234,10 +18015,10 @@ mod tests {
         let successor = Arc::new(successor);
         let stale_correlation = "stale-terminal-attempt".to_string();
         let stale_lease = stale
-            .reserve_attempt_work(PeerConnection::speculative_tombstone_claim(
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(
                 &stale_correlation,
             ))
-            .expect("the stale candidate tombstone is funded");
+            .expect("the stale candidate attempt is funded");
         assert!(fixture.peer.install_speculative(
             stale_correlation.clone(),
             Arc::clone(&stale),
@@ -17247,15 +18028,17 @@ mod tests {
             .peers
             .terminal_speculative_cleanup(&owner, &stale_correlation, &stale)
         {
-            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(worker)) => worker.retire(),
+            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+                retired.worker.retire()
+            }
             _ => panic!("the first terminal event retires its own candidate"),
         }
         let successor_correlation = "later-successor-attempt".to_string();
         let successor_lease = successor
-            .reserve_attempt_work(PeerConnection::speculative_tombstone_claim(
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(
                 &successor_correlation,
             ))
-            .expect("the successor tombstone is funded");
+            .expect("the successor attempt is funded");
         assert!(fixture.peer.install_speculative(
             successor_correlation.clone(),
             Arc::clone(&successor),
@@ -17273,7 +18056,9 @@ mod tests {
             .peers
             .terminal_speculative_cleanup(&owner, &successor_correlation, &successor)
         {
-            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(worker)) => worker.retire(),
+            Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+                retired.worker.retire()
+            }
             _ => panic!("successor cleanup remains exact"),
         }
         state.shutdown().await;
@@ -17479,7 +18264,7 @@ mod tests {
     /// command boundary: the slot is already absent, so the current winner,
     /// its fresh auth task, and application admission must all survive.
     #[cfg(feature = "transport-lab")]
-    fn b2_nonterminal_refusal_after_promotion_preserves_winner(
+    async fn b2_nonterminal_refusal_after_promotion_preserves_winner(
         state: &Arc<NetworkState>,
         owner: &peer_registry::PeerOwnerToken,
         correlation: &str,
@@ -17492,7 +18277,7 @@ mod tests {
                 .speculative_worker_route(owner, correlation, candidate),
             peer_registry::SpeculativeWorkerRoute::Promoted
         ));
-        retire_speculative_exact(state, owner, correlation, candidate);
+        retire_speculative_exact(state, owner, correlation, candidate).await;
         assert!(matches!(
             state
                 .peers
@@ -17545,10 +18330,10 @@ mod tests {
         // Fresh Endpoint Auth therefore binds the same network to two real,
         // non-vacuous principals rather than allowing two isolated networks to
         // make the handoff appear healthy.
-        let (state_a, command_driver_a, mut promotions_a) =
-            build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 3);
-        let (state_b, command_driver_b, mut promotions_b) =
-            build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 3);
+        let (state_a, command_driver_a, mut promotions_a, promotion_gate_a, _signaling_in_rx_a) =
+            build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 4);
+        let (state_b, command_driver_b, mut promotions_b, _promotion_gate_b, mut signaling_in_rx_b) =
+            build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 4);
         let linked = install_promoted_session_over_real_link(&state_a, &state_b).await;
 
         let device_a = state_a.identity.public_id().to_string();
@@ -17597,6 +18382,150 @@ mod tests {
         );
         assert!(owner_a.connection().holds_promoted_session());
         assert!(owner_b.connection().holds_promoted_session());
+
+        // Peer-wide application state belongs to the logical authenticated
+        // session, not to whichever connector is selected for new writes. Park
+        // one reliable send and one RPC before W1 exists; neither is allowed to
+        // resolve merely because W1 wins connector selection.
+        let (reliable_reply, mut reliable_waiter) = tokio::sync::oneshot::channel();
+        state_a
+            .peers
+            .with_live_session_state(
+                &owner_a,
+                state_a.session_broker.as_ref(),
+                &state_a.network_id,
+                |session, app| {
+                    app.submit(
+                        session,
+                        "b2-logical-session",
+                        serde_json::json!({ "pending": "across-selection" }),
+                        reliable_reply,
+                    );
+                },
+            )
+            .expect("the predecessor logical session retains one reliable operation");
+        let (_pending_rpc, mut pending_rpc_waiter) = file_pending(&state_a, &device_b);
+        assert_eq!(state_a.peers.reliable_pending_total(), 1);
+        assert_eq!(pending_len(&state_a, &device_b), Some(1));
+        assert!(reliable_waiter.try_recv().is_err());
+        assert!(pending_rpc_waiter.try_recv().is_err());
+
+        // Connector-native realtime ownership is exact. This handle is opened
+        // against W0 and remains tied to W0 even after W1 becomes the selected
+        // application connector.
+        let old_owner_a = owner_a.for_worker(Arc::clone(&old_a));
+        let old_flow = state_a
+            .peers
+            .with_live_session_flow(
+                &old_owner_a,
+                state_a.session_broker.as_ref(),
+                &state_a.network_id,
+                |session, flows, live| {
+                    let name = flows
+                        .open(
+                            session,
+                            Some(live),
+                            crate::transport::webrtc::RealtimeFlowSpec {
+                                direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                                encoding: realtime_test_encoding(),
+                                name: realtime_test_name(41),
+                            },
+                        )
+                        .expect("W0 opens one exact outbound realtime flow");
+                    let flow = flows
+                        .flow_identity(&name)
+                        .expect("the newly opened W0 flow has an exact identity");
+                    crate::realtime::RealtimeFlowHandle::new(
+                        old_owner_a.clone(),
+                        flows.identity(),
+                        flow,
+                        name,
+                        Arc::downgrade(&state_a),
+                    )
+                },
+            )
+            .expect("W0's exact connector flow set is live");
+        state_a
+            .send_realtime(
+                &old_flow,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"before-w1"),
+                },
+            )
+            .expect("the exact W0 flow is usable before selection");
+        let old_owner_b = owner_b.for_worker(Arc::clone(&old_b));
+        let old_flow_b = state_b
+            .peers
+            .with_live_session_flow(
+                &old_owner_b,
+                state_b.session_broker.as_ref(),
+                &state_b.network_id,
+                |session, flows, live| {
+                    let name = flows
+                        .open(
+                            session,
+                            Some(live),
+                            crate::transport::webrtc::RealtimeFlowSpec {
+                                direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                                encoding: realtime_test_encoding(),
+                                name: realtime_test_name(42),
+                            },
+                        )
+                        .expect("B's W0 opens one exact outbound realtime flow");
+                    let flow = flows
+                        .flow_identity(&name)
+                        .expect("B's newly opened W0 flow has an exact identity");
+                    crate::realtime::RealtimeFlowHandle::new(
+                        old_owner_b.clone(),
+                        flows.identity(),
+                        flow,
+                        name,
+                        Arc::downgrade(&state_b),
+                    )
+                },
+            )
+            .expect("B's W0 exact connector flow set is live");
+        state_b
+            .send_realtime(
+                &old_flow_b,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"before-w1-b"),
+                },
+            )
+            .expect("B's exact W0 flow is usable before selection");
+
+        // A funded hostile/stalled candidate may coexist with the legitimate
+        // W1. It owns no authority and cannot monopolize a singleton slot.
+        let (hostile, hostile_events) = state_a
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state_a.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the provider independently funds one stalled candidate");
+        let hostile = Arc::new(hostile);
+        let hostile_correlation = "b2-stalled-hostile-candidate".to_string();
+        let hostile_lease = hostile
+            .reserve_attempt_work(PeerConnection::speculative_attempt_claim(
+                &hostile_correlation,
+            ))
+            .expect("the stalled candidate owns its exact live-attempt lease");
+        assert!(owner_a.connection().install_speculative(
+            hostile_correlation.clone(),
+            Arc::clone(&hostile),
+            hostile_lease,
+        ));
+        let _hostile_events = hostile_events;
+
+        // The durable policy still admits B while the transient peer status is
+        // Reconnecting. Candidate reduction must use that current policy, not
+        // copy the predecessor's diagnostic status.
+        owner_a.connection().state.write().status = PeerStatus::Reconnecting;
 
         // Non-vacuity for predecessor custody: accept both a terminal callback
         // and a protocol-shaped message on W0 before the replacement begins,
@@ -17708,6 +18637,44 @@ mod tests {
                 .speculative_worker_route(&owner_b, &first_attempt, &first_candidate_b,),
             peer_registry::SpeculativeWorkerRoute::Speculative
         ));
+        // Seed one real Signaling Runtime de-duplication record while B's W1
+        // candidate is still speculative. Promotion then carries the exact
+        // token into W1 custody, rather than routing this Candidate through
+        // the promoted-only A/C refusal path.
+        let signaling_runtime_b = signaling_ingress::SignalingRuntime::new(
+            state_b.signaling_inbound_tx.clone(),
+            state_b
+                .local_application_resource_scope()
+                .expect("B issues one test signaling-runtime scope"),
+        );
+        state_b.publish_signaling_runtime(&signaling_runtime_b);
+        let dedup_carrier_b = signaling_ingress::SignalingRuntime::attach(
+            &signaling_runtime_b,
+            SignalingCarrier::Nostr,
+        );
+        assert!(dedup_carrier_b.deliver(dedup_carrier_b.directed(
+            device_a.clone(),
+            myownmesh_signaling::SignalingMessage::Candidate {
+                peer_id: device_b.clone(),
+                offer_id: first_attempt.clone(),
+                candidate:
+                    "candidate:foundation 1 udp 2113937151 192.0.2.1 5000 typ host".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            },
+        )));
+        let dedup_delivery = signaling_in_rx_b
+            .recv()
+            .await
+            .expect("B's production signaling mailbox receives the dedup seed");
+        dedup_delivery
+            .run_terminal_effect(|signal| handle_signaling_inbound(&state_b, signal))
+            .await;
+        assert!(
+            signaling_runtime_b.remembers_attempt_for_test(&first_attempt),
+            "W1's provider-funded de-duplication key is retained before promotion"
+        );
         // B must own the speculative slot before A's queued ICE candidates
         // are forwarded. The carrier is lossy by design: a candidate arriving
         // while B still has only its promoted predecessor is correctly
@@ -17780,8 +18747,14 @@ mod tests {
                 .clone()
                 .expect("B's first promotion leaves a current session")
         ));
-        assert!(old_a.live_connector_incarnation().is_none());
-        assert!(old_b.live_connector_incarnation().is_none());
+        assert!(
+            old_a.live_connector_incarnation().is_some(),
+            "selection keeps A's predecessor connector alive with the logical session"
+        );
+        assert!(
+            old_b.live_connector_incarnation().is_some(),
+            "selection keeps B's predecessor connector alive with the logical session"
+        );
         let first_promoted_a = owner_a
             .connection()
             .session
@@ -17796,6 +18769,259 @@ mod tests {
             .expect("B has the first replacement");
         assert!(!Arc::ptr_eq(&first_promoted_a, &old_a));
         assert!(!Arc::ptr_eq(&first_promoted_b, &old_b));
+        assert!(
+            owner_a
+                .connection()
+                .speculative_is_exact(&hostile_correlation, &hostile),
+            "the independently funded stalled candidate coexists while the legitimate W1 wins"
+        );
+        assert_eq!(
+            state_a.peers.reliable_pending_total(),
+            1,
+            "connector selection preserves the logical session's reliable queue"
+        );
+        assert_eq!(
+            pending_len(&state_a, &device_b),
+            Some(1),
+            "connector selection preserves pending RPC state"
+        );
+        assert!(reliable_waiter.try_recv().is_err());
+        assert!(pending_rpc_waiter.try_recv().is_err());
+        state_a
+            .send_realtime(
+                &old_flow,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"after-w1"),
+                },
+            )
+            .expect("selecting W1 leaves W0's exact realtime flow usable");
+
+        assert_eq!(
+            owner_a.connection().state.read().status,
+            PeerStatus::Reconnecting,
+            "W1 reduced successfully while the incumbent diagnostic state was Reconnecting"
+        );
+        // The Reconnecting state above is the B2-E reduction precondition, not
+        // the separate realtime-renegotiation precondition. Move the fixture
+        // back to its normal active diagnostic state before asking the tick
+        // service to claim explicit local track-set debt.
+        owner_a.connection().state.write().status = PeerStatus::Active;
+
+        // W0's flow above proves selection does not migrate or invalidate an
+        // existing connector-owned flow set. Open the track changes that drive
+        // this exchange on W1: unlike the fixture-only W0 link, both W1 event
+        // receivers are production speculative pumps that survive promotion,
+        // so the authenticated offer and answer traverse both real engines.
+        let first_owner_a = owner_a.for_worker(Arc::clone(&first_promoted_a));
+        let replacement_flow_a = state_a
+            .open_realtime_negotiated(
+                &device_b,
+                crate::transport::webrtc::RealtimeFlowSpec {
+                    direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                    encoding: realtime_test_encoding(),
+                    name: realtime_test_name(43),
+                },
+            )
+            .await
+            .expect("A's selected W1 opens one real outbound track and flow");
+        let first_owner_b = owner_b.for_worker(Arc::clone(&first_promoted_b));
+        let replacement_flow_b = state_b
+            .open_realtime_negotiated(
+                &device_a,
+                crate::transport::webrtc::RealtimeFlowSpec {
+                    direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                    encoding: realtime_test_encoding(),
+                    name: realtime_test_name(44),
+                },
+            )
+            .await
+            .expect("B's selected W1 opens one real outbound track and flow");
+
+        // The Endpoint-Auth promotion and the native peer-connection state
+        // settle on separate callbacks.  The renegotiation service is
+        // intentionally fail-closed while either exact W1 is still in a
+        // non-Stable signaling state; it re-arms the explicit debt for the
+        // next service tick rather than creating a second local offer.  This
+        // control drives that production contract directly, so do not make a
+        // one-shot service call race the final native transition and then
+        // wait forever for stages from a task that correctly refused.
+        assert!(
+            settle_until(|| {
+                first_promoted_a.signaling_state()
+                    == webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+                    && first_promoted_b.signaling_state()
+                        == webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+            })
+            .await,
+            "both selected W1 connectors settle before local renegotiation is serviced"
+        );
+
+        // Simultaneous local track-set notifications on both fixed roles drive
+        // one authenticated in-session offer/answer exchange. The answerer
+        // sends only a request; the offerer alone creates the offer, so no
+        // carrier-supplied SDP touches the promoted connector and no glare lane
+        // exists. Both exact W0 flow sets remain usable beside W1.
+        for _ in 0..2 {
+            let _ = handle_transport_event_from_worker(
+                &state_a,
+                device_b.clone(),
+                &first_promoted_a,
+                first_promoted_a.stamp_event_for_test(TransportEvent::RenegotiationNeeded),
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            let _ = handle_transport_event_from_worker(
+                &state_b,
+                device_a.clone(),
+                &first_promoted_b,
+                first_promoted_b.stamp_event_for_test(TransportEvent::RenegotiationNeeded),
+            )
+            .await;
+        }
+        assert!(
+            owner_a.connection().state.read().media_reneg_pending,
+            "A's exact promoted connector records coalesced local renegotiation debt"
+        );
+        assert!(
+            owner_b.connection().state.read().media_reneg_pending,
+            "B's exact promoted connector records coalesced local renegotiation debt"
+        );
+        assert!(
+            owner_a.connection().state.read().data_channel_open
+                && owner_b.connection().state.read().data_channel_open,
+            "both production tick candidates retain an open authenticated channel"
+        );
+        assert!(
+            owner_a
+                .connection()
+                .media_renegotiation_worker()
+                .is_some_and(|worker| Arc::ptr_eq(&worker, &first_promoted_a))
+                && owner_b
+                    .connection()
+                    .media_renegotiation_worker()
+                    .is_some_and(|worker| Arc::ptr_eq(&worker, &first_promoted_b)),
+            "the coalesced debt names each exact W1 connector"
+        );
+        let renegotiation_correlation_a = owner_a
+            .connection()
+            .attempt_for_worker(&first_promoted_a)
+            .expect("A's W1 retains its exact correlation");
+        let renegotiation_correlation_b = owner_b
+            .connection()
+            .attempt_for_worker(&first_promoted_b)
+            .expect("B's W1 retains its exact correlation");
+        service_media_renegotiations(&state_a).await;
+        service_media_renegotiations(&state_b).await;
+        let (offerer_device, offerer_correlation, answerer_device, answerer_correlation) =
+            if first_promoted_a.role() == Role::Offerer {
+                (
+                    device_a.as_str(),
+                    renegotiation_correlation_a.as_str(),
+                    device_b.as_str(),
+                    renegotiation_correlation_b.as_str(),
+                )
+            } else {
+                (
+                    device_b.as_str(),
+                    renegotiation_correlation_b.as_str(),
+                    device_a.as_str(),
+                    renegotiation_correlation_a.as_str(),
+                )
+            };
+        stage_probe
+            .wait_for(offerer_device, offerer_correlation, B2Stage::MediaOfferSent)
+            .await;
+        stage_probe
+            .wait_for(
+                answerer_device,
+                answerer_correlation,
+                B2Stage::MediaOfferApplied,
+            )
+            .await;
+        stage_probe
+            .wait_for(
+                offerer_device,
+                offerer_correlation,
+                B2Stage::MediaAnswerApplied,
+            )
+            .await;
+        assert_eq!(
+            first_promoted_a.signaling_state(),
+            webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+        );
+        assert_eq!(
+            first_promoted_b.signaling_state(),
+            webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+        );
+        assert!(
+            !owner_a.connection().state.read().media_reneg_inflight
+                && !owner_b.connection().state.read().media_reneg_inflight,
+            "the exact W1 claims settle without a second in-flight offer"
+        );
+        assert!(
+            state_a
+                .peers
+                .claim_renegotiation(
+                    &first_owner_a,
+                    state_a.session_broker.as_ref(),
+                    &state_a.network_id,
+                )
+                .is_none()
+                && state_b
+                    .peers
+                    .claim_renegotiation(
+                        &first_owner_b,
+                        state_b.session_broker.as_ref(),
+                        &state_b.network_id,
+                    )
+                    .is_none(),
+            "simultaneous changes leave no duplicate offer debt on either fixed role"
+        );
+        assert!(
+            owner_a
+                .connection()
+                .speculative_is_exact(&hostile_correlation, &hostile),
+            "connector-local media negotiation neither consumes nor replaces an unrelated candidate"
+        );
+        state_a
+            .send_realtime(
+                &old_flow,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"after-renegotiation"),
+                },
+            )
+            .expect("the authenticated exchange does not blank or detach A's W0 flow set");
+        state_b
+            .send_realtime(
+                &old_flow_b,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"after-renegotiation-b"),
+                },
+            )
+            .expect("the authenticated exchange does not blank or detach B's W0 flow set");
+        state_a
+            .send_realtime(
+                &replacement_flow_a,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"after-renegotiation-w1"),
+                },
+            )
+            .expect("A's renegotiated W1 flow remains usable");
+        state_b
+            .send_realtime(
+                &replacement_flow_b,
+                crate::transport::webrtc::RealtimeSendUnit {
+                    pace: Duration::from_millis(20),
+                    data: Bytes::from_static(b"after-renegotiation-w1-b"),
+                },
+            )
+            .expect("B's renegotiated W1 flow remains usable");
+
         assert!(
             state_a
                 .peers
@@ -17858,7 +19084,8 @@ mod tests {
             &first_attempt,
             &first_candidate_b,
             &first_promoted_b,
-        );
+        )
+        .await;
         let resumed_hello = crate::engine::handshake::local_hello(
             &state_a,
             promoted_task_a.local_contribution(),
@@ -17958,6 +19185,7 @@ mod tests {
             SignalingOutbound::Offer { attempt, .. } => attempt,
             _ => panic!("the held successor control is an offer"),
         };
+        promotion_gate_a.hold(&second_attempt);
         let successor = owner_a
             .connection()
             .speculative_worker_for(&second_attempt)
@@ -17992,32 +19220,18 @@ mod tests {
             ),
         )
         .await;
-        let (stale_processed_tx, stale_processed_rx) = tokio::sync::oneshot::channel();
         assert!(
             state_a
-                .cmd_tx
-                .send(NetworkCmd::PromoteSpeculative {
+                .speculative_promotion_tx
+                .send(state::SpeculativePromotionCmd {
                     owner: owner_a.clone(),
-                    candidate: state::SpeculativeCandidate::from_worker(Arc::clone(
-                        &first_candidate,
-                    )),
+                    candidate: Arc::clone(&first_candidate),
                     correlation: first_attempt.clone(),
                 })
                 .is_ok(),
             "the command driver accepts the stale promotion"
         );
-        assert!(
-            state_a
-                .cmd_tx
-                .send(NetworkCmd::GovernanceSnapshot {
-                    reply: stale_processed_tx,
-                })
-                .is_ok(),
-            "the command driver accepts the stale-command barrier"
-        );
-        let _ = stale_processed_rx
-            .await
-            .expect("the command driver processed the stale promotion first");
+        await_b2_promotion(&mut promotions_a, &first_attempt).await;
         let after_stale = owner_a
             .connection()
             .speculative_worker_for(&second_attempt)
@@ -18025,36 +19239,22 @@ mod tests {
         assert!(Arc::ptr_eq(&successor, &after_stale));
         let _ = second_offer_release_tx.send(());
 
-        await_b2_promotion(&mut promotions_a, &second_attempt).await;
+        // B's command completion is the strong replacement witness. Capture
+        // it before A's policy revocation closes A's real channels and the
+        // linked B channels observe their corresponding terminal callbacks.
         await_b2_promotion(&mut promotions_b, &second_attempt).await;
-        assert!(!Arc::ptr_eq(
-            &first_promoted_a,
-            &owner_a
-                .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("A's successor promotion leaves a current session")
-        ));
-        assert!(!Arc::ptr_eq(
-            &first_promoted_b,
-            &owner_b
-                .connection()
-                .session
-                .lock()
-                .clone()
-                .expect("B's successor promotion leaves a current session")
-        ));
-        assert!(first_promoted_a.live_connector_incarnation().is_none());
-        assert!(first_promoted_b.live_connector_incarnation().is_none());
-        assert!(state_a
-            .peers
-            .admit_application_operation(
-                &owner_a,
-                state_a.session_broker.as_ref(),
-                &state_a.network_id
-            )
-            .is_some());
+        let second_promoted_b = owner_b
+            .connection()
+            .session
+            .lock()
+            .clone()
+            .expect("B's W2 promotion leaves a current session before peer teardown");
+        assert!(!Arc::ptr_eq(&first_promoted_b, &second_promoted_b));
+        let second_task_b = owner_b
+            .connection()
+            .endpoint_auth_task()
+            .expect("B's W2 replacement owns fresh Endpoint Auth");
+        assert!(first_promoted_b.live_connector_incarnation().is_some());
         assert!(state_b
             .peers
             .admit_application_operation(
@@ -18063,16 +19263,10 @@ mod tests {
                 &state_b.network_id
             )
             .is_some());
-        let second_promoted_b = owner_b
-            .connection()
-            .session
-            .lock()
-            .clone()
-            .expect("B's W2 replacement is current");
-        let second_task_b = owner_b
-            .connection()
-            .endpoint_auth_task()
-            .expect("B's W2 replacement owns fresh Endpoint Auth");
+        assert!(
+            signaling_runtime_b.remembers_attempt_for_test(&first_attempt),
+            "the authenticated W1 channel retains its provider-funded de-duplication key while the logical session remains live"
+        );
         let frames_before_delayed_w1 = owner_b.connection().state.read().diag.frames_in;
         let TransportEvent::Message(delayed_w1_bytes) = delayed_w1_event else {
             panic!("the held predecessor callback remains a message");
@@ -18087,26 +19281,104 @@ mod tests {
                 .session
                 .lock()
                 .clone()
-                .expect("delayed W1 bytes cannot replace W2")
+                .expect("delayed W1 bytes cannot replace B's current W2 before teardown")
         ));
         assert!(!second_task_b.is_retired());
         assert_eq!(
             owner_b.connection().state.read().diag.frames_in,
-            frames_before_delayed_w1,
-            "delayed W1 bytes do not enter W2 frame/state accounting"
+            frames_before_delayed_w1 + 1,
+            "the held W1 callback is admitted once to the logical session state"
         );
+
+        // Let W2 authenticate completely, but stop its reducer immediately
+        // before the mutation-fenced durable-policy read. The policy changes at
+        // that boundary, so the candidate must be retired and all of its
+        // attempt resources released instead of inheriting W1's retained
+        // diagnostic admission.
+        promotion_gate_a.wait_reached(&second_attempt).await;
+        state_a.peers.with_governance_commit(|governance| {
+            governance.kind = crate::network_state::NetworkKind::Closed;
+            governance.roles.clear();
+            governance.roles.insert(
+                state_a.identity.public_id().to_string(),
+                crate::network_state::Role::Owner,
+            );
+        });
+        assert!(
+            !crate::engine::governance::current_policy_admits(
+                &state_a.governance_state.read(),
+                state_a.identity.public_id(),
+                &device_b,
+            ),
+            "the exact durable policy no longer admits B before W2 reduction"
+        );
+        assert!(
+            !owner_a.connection().holds_promoted_session(),
+            "the same policy commit revokes the previously live logical session"
+        );
+        assert!(
+            !matches!(
+                reliable_waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "policy revocation resolves the reliable waiter only after it survived W1 selection"
+        );
+        assert!(
+            !matches!(
+                pending_rpc_waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "policy revocation ends the pending RPC only after it survived W1 selection"
+        );
+        promotion_gate_a.release(&second_attempt);
+
+        await_b2_promotion(&mut promotions_a, &second_attempt).await;
+        assert!(
+            successor.live_connector_incarnation().is_none(),
+            "A retires the now-policy-refused W2 candidate"
+        );
+        assert!(
+            owner_a
+                .connection()
+                .speculative_worker_for(&second_attempt)
+                .is_none(),
+            "the policy-refused W2 correlation is retired exactly"
+        );
+        assert!(
+            owner_a
+                .connection()
+                .speculative_worker_for(&hostile_correlation)
+                .is_some(),
+            "W2 cleanup does not consume the unrelated hostile candidate"
+        );
+        assert!(
+            first_promoted_a.live_connector_incarnation().is_none(),
+            "the durable policy commit retires A's previously authenticated W1"
+        );
+        assert!(state_a
+            .peers
+            .admit_application_operation(
+                &owner_a,
+                state_a.session_broker.as_ref(),
+                &state_a.network_id
+            )
+            .is_none());
 
         relay_a.abort();
         relay_b.abort();
         let _ = relay_a.await;
         let _ = relay_b.await;
+        state_a.shutdown().await;
+        state_b.shutdown().await;
+        assert!(
+            !signaling_runtime_b.remembers_attempt_for_test(&first_attempt),
+            "the exact W1 de-duplication key is released when B's production lifecycle ends"
+        );
         let close_outcomes = linked.close_outcomes().await;
         assert!(
             close_outcomes.into_iter().all(|outcome| outcome.is_ok()),
             "the original real link closes cleanly after both replacements"
         );
-        state_a.shutdown().await;
-        state_b.shutdown().await;
         // Signal the fixture-owned command consumers after native/link and
         // peer shutdown. This closes their state-owned command senders and
         // lets both production-shaped drivers observe a terminal EOF.
@@ -18514,6 +19786,10 @@ mod tests {
                  entered the embedder's closure — the count is still the one the \
                  live run made ({} arm)",
                 if streaming { "stream" } else { "unary" }
+            );
+            assert!(
+                settle_until(|| peer.retired_worker_count_for_test() == 0).await,
+                "production revocation drives native close and removes its exact custody"
             );
         }
     }

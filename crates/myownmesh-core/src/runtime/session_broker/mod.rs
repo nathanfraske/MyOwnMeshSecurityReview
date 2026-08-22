@@ -25,7 +25,7 @@
 pub(crate) mod policy;
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -132,6 +132,7 @@ pub(crate) struct SessionCapability {
 /// until the final witness drops rather than merely until the session does.
 struct SessionValidity {
     live: AtomicBool,
+    channel_owners: AtomicUsize,
     wake: tokio::sync::Notify,
     _lease: ResourceLease,
 }
@@ -161,6 +162,7 @@ impl SessionValidity {
         ))?;
         Ok(Arc::new(Self {
             live: AtomicBool::new(true),
+            channel_owners: AtomicUsize::new(1),
             wake: tokio::sync::Notify::new(),
             _lease: lease,
         }))
@@ -169,6 +171,16 @@ impl SessionValidity {
     fn invalidate(&self) {
         self.live.store(false, Ordering::Release);
         self.wake.notify_waiters();
+    }
+
+    fn add_channel_owner(&self) {
+        self.channel_owners.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn release_channel_owner(&self) {
+        if self.channel_owners.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.invalidate();
+        }
     }
 }
 
@@ -218,11 +230,20 @@ impl SessionValidityWitness {
 
 impl Drop for SessionCapability {
     fn drop(&mut self) {
-        self.validity.invalidate();
+        self.validity.release_channel_owner();
     }
 }
 
 impl SessionCapability {
+    pub(crate) fn join_logical_session(&mut self, established: &SessionCapability) {
+        if Arc::ptr_eq(&self.validity, &established.validity) {
+            return;
+        }
+        self.validity.release_channel_owner();
+        established.validity.add_channel_owner();
+        self.validity = Arc::clone(&established.validity);
+    }
+
     pub(crate) fn validity_witness(&self) -> SessionValidityWitness {
         SessionValidityWitness {
             validity: Arc::clone(&self.validity),

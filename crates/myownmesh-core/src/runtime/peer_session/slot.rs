@@ -5,10 +5,14 @@
 //! conjunct still holds, and one that fails a conjunct is destroyed rather than
 //! merely refused.
 
+use std::sync::Arc;
+
 use crate::resource::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass};
 use crate::runtime::session_broker::SessionCapability;
 
 use super::PeerSessionState;
+
+use super::DedupToken;
 
 /// One promoted session and everything promotion built under it.
 ///
@@ -22,12 +26,39 @@ use super::PeerSessionState;
 /// therefore cannot pair one session's authority with another session's state:
 /// it receives the authority and the state from the same borrow of the same
 /// bundle.
-pub(crate) struct PromotedSession {
+pub(crate) struct PromotedChannel {
     session: SessionCapability,
     /// Opaque to the engine. Constructed by the worker the session was promoted
     /// from, so the flows draw on that exact connector's registry; the engine
     /// never names a label table, a flow, or a port.
     flows: crate::transport::webrtc::SessionRealtimeFlows,
+    worker: Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    /// The exact Endpoint Auth task that minted this channel's capability.
+    ///
+    /// Production promotions always install `Some`. The `None` form exists only
+    /// for the transport-lab helper that installs an already-authenticated
+    /// capability directly so legacy admission controls can exercise the
+    /// promotion fence without counterfeiting an Endpoint Auth exchange.
+    endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
+    correlation: String,
+    dedup: Option<DedupToken>,
+    additional_dedup: Vec<DedupToken>,
+}
+
+/// Exact identity and lifecycle custody for one promoted channel. Grouping the
+/// fields keeps promotion/install call sites from accidentally separating the
+/// worker, Endpoint Auth task, correlation, and their dedup ownership.
+pub(crate) struct PromotedChannelBinding {
+    pub(crate) worker: Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    pub(crate) endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
+    pub(crate) correlation: String,
+    pub(crate) dedup: Option<DedupToken>,
+    pub(crate) additional_dedup: Vec<DedupToken>,
+}
+
+pub(crate) struct PromotedSession {
+    selected: usize,
+    channels: Vec<PromotedChannel>,
     app: PeerSessionState,
 }
 
@@ -85,19 +116,107 @@ impl PromotedSession {
     }
 
     /// The authority and the realtime flow set it owns.
+    fn selected(&self) -> &PromotedChannel {
+        &self.channels[self.selected]
+    }
+
+    fn selected_mut(&mut self) -> &mut PromotedChannel {
+        &mut self.channels[self.selected]
+    }
+
+    pub(crate) fn selected_worker(&self) -> &Arc<crate::transport::webrtc::WebRtcConnectorWorker> {
+        &self.selected().worker
+    }
+
+    pub(crate) fn contains_worker(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> bool {
+        self.channels
+            .iter()
+            .any(|channel| Arc::ptr_eq(&channel.worker, worker))
+    }
+
+    pub(crate) fn endpoint_auth_for(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
+        self.channels
+            .iter()
+            .find(|channel| Arc::ptr_eq(&channel.worker, worker))
+            .and_then(|channel| channel.endpoint_auth.as_ref().map(Arc::clone))
+    }
+
+    pub(crate) fn correlation_for(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<String> {
+        self.channels
+            .iter()
+            .find(|channel| Arc::ptr_eq(&channel.worker, worker))
+            .map(|channel| channel.correlation.clone())
+    }
+
     pub(crate) fn flows_mut(
         &mut self,
     ) -> (
         &SessionCapability,
         &mut crate::transport::webrtc::SessionRealtimeFlows,
+        &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
     ) {
-        (&self.session, &mut self.flows)
+        let channel = self.selected_mut();
+        (&channel.session, &mut channel.flows, &channel.worker)
+    }
+
+    pub(crate) fn flows_for_worker_mut(
+        &mut self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<(
+        &SessionCapability,
+        &mut crate::transport::webrtc::SessionRealtimeFlows,
+        &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    )> {
+        let channel = self
+            .channels
+            .iter_mut()
+            .find(|channel| Arc::ptr_eq(&channel.worker, worker))?;
+        Some((&channel.session, &mut channel.flows, &channel.worker))
+    }
+
+    pub(crate) fn flows_for_worker_with_correlation_mut(
+        &mut self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<(
+        &SessionCapability,
+        &mut crate::transport::webrtc::SessionRealtimeFlows,
+        &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+        &str,
+    )> {
+        let channel = self
+            .channels
+            .iter_mut()
+            .find(|channel| Arc::ptr_eq(&channel.worker, worker))?;
+        Some((
+            &channel.session,
+            &mut channel.flows,
+            &channel.worker,
+            channel.correlation.as_str(),
+        ))
     }
 
     /// The authority and the application state it owns.
     pub(crate) fn app_mut(&mut self) -> (&SessionCapability, &mut PeerSessionState) {
-        (&self.session, &mut self.app)
+        (&self.channels[self.selected].session, &mut self.app)
     }
+}
+
+pub(crate) struct RemovedPromotedChannel {
+    pub(crate) worker: Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    pub(crate) dedup: Option<DedupToken>,
+    pub(crate) additional_dedup: Vec<DedupToken>,
+    pub(crate) selected_worker: Option<Arc<crate::transport::webrtc::WebRtcConnectorWorker>>,
+    pub(crate) selected_correlation: Option<String>,
+    pub(crate) session_empty: bool,
 }
 
 /// The one slot a peer entry holds its promoted session in, and the use and
@@ -136,6 +255,13 @@ impl PromotedSessionSlot {
         self.slot.lock().is_some()
     }
 
+    pub(crate) fn channel_count(&self) -> usize {
+        self.slot
+            .lock()
+            .as_ref()
+            .map_or(0, |session| session.channels.len())
+    }
+
     /// Drop whatever is installed.
     ///
     /// The connector-retirement and entry-teardown edge. A session promoted
@@ -143,6 +269,31 @@ impl PromotedSessionSlot {
     /// dropping it is what releases its reservation and answers its callers.
     pub(crate) fn clear(&self) {
         drop(self.slot.lock().take());
+    }
+
+    pub(crate) fn take_workers_with_dedup(
+        &self,
+    ) -> Vec<(
+        Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+        Option<DedupToken>,
+        Vec<DedupToken>,
+    )> {
+        self.slot
+            .lock()
+            .take()
+            .map(|session| {
+                session
+                    .channels
+                    .into_iter()
+                    .map(|channel| {
+                        if let Some(task) = channel.endpoint_auth {
+                            task.retire();
+                        }
+                        (channel.worker, channel.dedup, channel.additional_dedup)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Install a freshly promoted session, replacing anything present.
@@ -159,12 +310,156 @@ impl PromotedSessionSlot {
         &self,
         session: SessionCapability,
         flows: crate::transport::webrtc::SessionRealtimeFlows,
+        binding: PromotedChannelBinding,
     ) {
+        let PromotedChannelBinding {
+            worker,
+            endpoint_auth,
+            correlation,
+            dedup,
+            additional_dedup,
+        } = binding;
         *self.slot.lock() = Some(PromotedSession {
-            session,
-            flows,
+            selected: 0,
+            channels: vec![PromotedChannel {
+                session,
+                flows,
+                worker,
+                endpoint_auth,
+                correlation,
+                dedup,
+                additional_dedup,
+            }],
             app: PeerSessionState::new(),
         });
+    }
+
+    pub(crate) fn add_channel(
+        &self,
+        mut session: SessionCapability,
+        flows: crate::transport::webrtc::SessionRealtimeFlows,
+        binding: PromotedChannelBinding,
+        select: bool,
+    ) -> Result<(), (Option<DedupToken>, Vec<DedupToken>)> {
+        let PromotedChannelBinding {
+            worker,
+            endpoint_auth,
+            correlation,
+            dedup,
+            additional_dedup,
+        } = binding;
+        let mut slot = self.slot.lock();
+        let Some(promoted) = slot.as_mut() else {
+            return Err((dedup, additional_dedup));
+        };
+        if promoted.contains_worker(&worker) {
+            return Err((dedup, additional_dedup));
+        }
+        session.join_logical_session(&promoted.selected().session);
+        promoted.channels.push(PromotedChannel {
+            session,
+            flows,
+            worker,
+            endpoint_auth,
+            correlation,
+            dedup,
+            additional_dedup,
+        });
+        if select {
+            promoted.selected = promoted.channels.len() - 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn contains_worker(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> bool {
+        self.slot
+            .lock()
+            .as_ref()
+            .is_some_and(|session| session.contains_worker(worker))
+    }
+
+    pub(crate) fn endpoint_auth_for(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<Arc<crate::endpoint_auth::EndpointAuthTask>> {
+        self.slot
+            .lock()
+            .as_ref()
+            .and_then(|session| session.endpoint_auth_for(worker))
+    }
+
+    pub(crate) fn correlation_for(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<String> {
+        self.slot
+            .lock()
+            .as_ref()
+            .and_then(|session| session.correlation_for(worker))
+    }
+
+    pub(crate) fn retain_dedup_for_worker(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+        token: DedupToken,
+    ) -> bool {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return false;
+        };
+        let Some(channel) = session
+            .channels
+            .iter_mut()
+            .find(|channel| Arc::ptr_eq(&channel.worker, worker))
+        else {
+            return false;
+        };
+        channel.additional_dedup.push(token);
+        true
+    }
+
+    pub(crate) fn remove_channel(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+    ) -> Option<RemovedPromotedChannel> {
+        let mut slot = self.slot.lock();
+        let promoted = slot.as_mut()?;
+        let index = promoted
+            .channels
+            .iter()
+            .position(|channel| Arc::ptr_eq(&channel.worker, worker))?;
+        let was_selected = index == promoted.selected;
+        let channel = promoted.channels.remove(index);
+        if let Some(task) = channel.endpoint_auth {
+            task.retire();
+        }
+        if promoted.channels.is_empty() {
+            drop(slot.take());
+            return Some(RemovedPromotedChannel {
+                worker: channel.worker,
+                dedup: channel.dedup,
+                additional_dedup: channel.additional_dedup,
+                selected_worker: None,
+                selected_correlation: None,
+                session_empty: true,
+            });
+        }
+        if index < promoted.selected {
+            promoted.selected -= 1;
+        } else if was_selected {
+            promoted.selected = 0;
+        }
+        Some(RemovedPromotedChannel {
+            worker: channel.worker,
+            dedup: channel.dedup,
+            additional_dedup: channel.additional_dedup,
+            selected_worker: Some(Arc::clone(promoted.selected_worker())),
+            selected_correlation: promoted.correlation_for(promoted.selected_worker()),
+            session_empty: false,
+        })
     }
 
     /// Whether the installed session may still be reused, dropping it if not.
@@ -180,7 +475,7 @@ impl PromotedSessionSlot {
         let mut slot = self.slot.lock();
         match slot.as_ref() {
             None => Reuse::Vacant,
-            Some(bundle) if current(&bundle.session) => Reuse::Current,
+            Some(bundle) if current(&bundle.selected().session) => Reuse::Current,
             Some(_) => {
                 drop(slot.take());
                 Reuse::Revoked
@@ -205,13 +500,63 @@ impl PromotedSessionSlot {
         effect: impl FnOnce(&mut PromotedSession) -> R,
     ) -> Option<R> {
         let mut slot = self.slot.lock();
-        if !slot.as_ref().is_some_and(|bundle| current(&bundle.session)) {
+        if !slot
+            .as_ref()
+            .is_some_and(|bundle| current(&bundle.selected().session))
+        {
             drop(slot.take());
             return None;
         }
         Some(effect(slot.as_mut().expect(
             "the conjunction above answered true, which requires an installed session",
         )))
+    }
+
+    pub(crate) fn with_live_worker<R>(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+        current: impl FnOnce(&SessionCapability) -> bool,
+        effect: impl FnOnce(
+            &SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+        ) -> R,
+    ) -> Option<R> {
+        let mut slot = self.slot.lock();
+        let promoted = slot.as_mut()?;
+        let (session, flows, worker) = promoted.flows_for_worker_mut(worker)?;
+        if !current(session) {
+            return None;
+        }
+        Some(effect(session, flows, worker))
+    }
+
+    /// Lend one exact channel together with the correlation that names it.
+    ///
+    /// The correlation is borrowed from the same [`PromotedChannel`] as the
+    /// capability, flow set and worker, while this slot guard is held.  A
+    /// caller must not reacquire the slot from its effect closure: doing so is
+    /// a non-reentrant self-deadlock and, more importantly, would split the
+    /// channel identity from the authority that proved it current.
+    pub(crate) fn with_live_worker_and_correlation<R>(
+        &self,
+        worker: &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+        current: impl FnOnce(&SessionCapability) -> bool,
+        effect: impl FnOnce(
+            &SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::transport::webrtc::WebRtcConnectorWorker>,
+            &str,
+        ) -> R,
+    ) -> Option<R> {
+        let mut slot = self.slot.lock();
+        let promoted = slot.as_mut()?;
+        let (session, flows, channel_worker, correlation) =
+            promoted.flows_for_worker_with_correlation_mut(worker)?;
+        if !current(session) {
+            return None;
+        }
+        Some(effect(session, flows, channel_worker, correlation))
     }
 }
 

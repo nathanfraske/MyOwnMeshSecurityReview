@@ -23,7 +23,7 @@
 //! between a check and the act it authorized. Everything run under it must be
 //! synchronous, non-reentrant, and free to hand a value off but not to await.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::error::{Error, Result};
 use crate::resource::ResourceMailboxSender;
@@ -55,7 +55,12 @@ pub(crate) struct PeerRegistry {
     /// Unbound in a bare registry, which is what the unit fixtures build: those
     /// promote and exercise the fence without a driver, and an announcement with
     /// nowhere to go is correctly dropped rather than being an error.
-    promotion_tx: std::sync::OnceLock<ResourceMailboxSender<super::state::NetworkCmd>>,
+    command_tx: std::sync::OnceLock<ResourceMailboxSender<super::state::NetworkCmd>>,
+    speculative_promotion_tx:
+        std::sync::OnceLock<ResourceMailboxSender<super::state::SpeculativePromotionCmd>>,
+    retired_closes: Arc<Mutex<Vec<Arc<PeerConnection>>>>,
+    signaling_runtime:
+        parking_lot::RwLock<Option<Weak<super::signaling_ingress::SignalingRuntime>>>,
 }
 
 struct PeerRegistryEntry {
@@ -105,13 +110,14 @@ impl PeerOwnerToken {
         }
     }
 
+    pub(super) fn worker(&self) -> Option<&Arc<crate::transport::WebRtcConnectorWorker>> {
+        self.worker.as_ref()
+    }
+
     fn worker_matches(&self, peer: &PeerConnection) -> bool {
-        self.worker.as_ref().is_none_or(|worker| {
-            peer.session
-                .lock()
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, worker))
-        })
+        self.worker
+            .as_ref()
+            .is_none_or(|worker| peer.owns_authenticated_worker(worker))
     }
 
     /// A token naming a peer that is installed nowhere.
@@ -145,8 +151,17 @@ pub(super) enum SpeculativeWorkerRoute {
 }
 
 pub(super) enum SpeculativeTerminalCleanup {
-    Candidate(Arc<crate::transport::WebRtcConnectorWorker>),
-    Promoted(Arc<PeerConnection>),
+    Candidate(super::connection::SpeculativeRetirement),
+    Promoted {
+        peer: Arc<PeerConnection>,
+        removed: crate::runtime::peer_session::RemovedPromotedChannel,
+    },
+}
+
+pub(super) enum CurrentTerminalCleanup {
+    Stale,
+    Channel(crate::runtime::peer_session::RemovedPromotedChannel),
+    Peer(Arc<PeerConnection>),
 }
 
 impl Default for PeerRegistry {
@@ -170,7 +185,59 @@ impl PeerRegistry {
             mutation: Mutex::new(()),
             governance,
             local_device_id,
-            promotion_tx: std::sync::OnceLock::new(),
+            command_tx: std::sync::OnceLock::new(),
+            speculative_promotion_tx: std::sync::OnceLock::new(),
+            retired_closes: Arc::new(Mutex::new(Vec::new())),
+            signaling_runtime: parking_lot::RwLock::new(None),
+        }
+    }
+
+    pub(super) fn bind_signaling_runtime(
+        &self,
+        runtime: Weak<super::signaling_ingress::SignalingRuntime>,
+    ) {
+        *self.signaling_runtime.write() = Some(runtime.clone());
+        for entry in self.peers.iter() {
+            entry.value().peer.bind_signaling_runtime(runtime.clone());
+        }
+    }
+
+    /// Retain one synchronously replaced peer until its detached native close
+    /// owner completes. The custody is process-local and narrowly tied to
+    /// replacement; shutdown drains it rather than guessing which removed
+    /// peer tasks still exist.
+    pub(super) fn track_replaced_close(&self, peer: Arc<PeerConnection>) {
+        self.retired_closes.lock().push(Arc::clone(&peer));
+        let custody = Arc::clone(&self.retired_closes);
+        tokio::spawn(async move {
+            if let Err(error) = peer.retire_and_close().await {
+                tracing::warn!(%error, "replaced peer cleanup did not complete successfully");
+            }
+            custody
+                .lock()
+                .retain(|current| !Arc::ptr_eq(current, &peer));
+        });
+    }
+
+    pub(super) fn track_removed_close(&self, peer: Arc<PeerConnection>) {
+        let mut closes = self.retired_closes.lock();
+        if !closes.iter().any(|current| Arc::ptr_eq(current, &peer)) {
+            closes.push(peer);
+        }
+    }
+
+    pub(super) fn complete_removed_close(&self, peer: &Arc<PeerConnection>) {
+        self.retired_closes
+            .lock()
+            .retain(|current| !Arc::ptr_eq(current, peer));
+    }
+
+    pub(super) async fn await_replaced_closes(&self) {
+        let closes = std::mem::take(&mut *self.retired_closes.lock());
+        for close in closes {
+            if let Err(error) = close.retire_and_close().await {
+                tracing::warn!(%error, "replaced peer cleanup did not complete successfully");
+            }
         }
     }
 
@@ -231,8 +298,15 @@ impl PeerRegistry {
     /// panicking: the binding is an identity this registry holds for its whole
     /// life, so a second one could only be the same queue again or a mistake,
     /// and neither is worth taking a process down for.
-    pub(super) fn bind_promotion_sink(&self, tx: ResourceMailboxSender<super::state::NetworkCmd>) {
-        let _ = self.promotion_tx.set(tx);
+    pub(super) fn bind_command_sink(&self, tx: ResourceMailboxSender<super::state::NetworkCmd>) {
+        let _ = self.command_tx.set(tx);
+    }
+
+    pub(super) fn bind_speculative_promotion_sink(
+        &self,
+        tx: ResourceMailboxSender<super::state::SpeculativePromotionCmd>,
+    ) {
+        let _ = self.speculative_promotion_tx.set(tx);
     }
 
     /// Promote if needed, announcing a session this call minted.
@@ -261,13 +335,12 @@ impl PeerRegistry {
         broker: &SessionBroker,
         mesh_context: &str,
     ) -> bool {
-        let promotion = peer.promote_session_if_needed(
-            broker,
-            mesh_context,
-            peer.state.read().is_admitted() && self.policy_admits(owner.device_id()),
-        );
+        let durable_policy = self.policy_admits(owner.device_id());
+        let policy_admits =
+            durable_policy && (peer.holds_promoted_session() || peer.state.read().is_admitted());
+        let promotion = peer.promote_session_if_needed(broker, mesh_context, policy_admits);
         if promotion == super::connection::Promotion::NewlyPromoted {
-            if let Some(tx) = self.promotion_tx.get() {
+            if let Some(tx) = self.command_tx.get() {
                 if tx
                     .send(super::state::NetworkCmd::ReplayCapabilities {
                         owner: owner.clone(),
@@ -303,23 +376,19 @@ impl PeerRegistry {
         if !peer.speculative_is_exact(correlation, candidate) {
             return false;
         }
-        let Some(tx) = self.promotion_tx.get() else {
-            if let Some(candidate) = peer.take_speculative_exact(correlation, candidate) {
-                candidate.retire();
-            }
+        let Some(tx) = self.speculative_promotion_tx.get() else {
+            candidate.retire();
             return false;
         };
         if tx
-            .send(super::state::NetworkCmd::PromoteSpeculative {
+            .send(super::state::SpeculativePromotionCmd {
                 owner: owner.clone(),
-                candidate: super::state::SpeculativeCandidate::from_worker(Arc::clone(candidate)),
+                candidate: Arc::clone(candidate),
                 correlation: correlation.to_string(),
             })
             .is_err()
         {
-            if let Some(candidate) = peer.take_speculative_exact(correlation, candidate) {
-                candidate.retire();
-            }
+            candidate.retire();
             return false;
         }
         true
@@ -335,7 +404,7 @@ impl PeerRegistry {
         owner: &PeerOwnerToken,
         correlation: &str,
         candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
-    ) -> Option<Arc<crate::transport::WebRtcConnectorWorker>> {
+    ) -> Option<super::connection::SpeculativeRetirement> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
         if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
@@ -345,6 +414,26 @@ impl PeerRegistry {
             .value()
             .peer
             .take_speculative_exact(correlation, candidate)
+    }
+
+    pub(super) fn retain_dedup_for_worker(
+        &self,
+        owner: &PeerOwnerToken,
+        correlation: &str,
+        worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+        token: crate::runtime::peer_session::DedupToken,
+    ) -> bool {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return false;
+        }
+        current
+            .value()
+            .peer
+            .retain_dedup_for_worker(correlation, worker, token)
     }
 
     /// Classify a pump's exact worker under the registry mutation fence. The
@@ -367,13 +456,7 @@ impl PeerRegistry {
         if peer.speculative_is_exact(correlation, candidate) {
             return SpeculativeWorkerRoute::Speculative;
         }
-        if peer
-            .session
-            .lock()
-            .as_ref()
-            .is_some_and(|session| Arc::ptr_eq(session, candidate))
-            && peer.holds_promoted_session()
-        {
+        if peer.owns_authenticated_worker(candidate) && peer.holds_promoted_session() {
             SpeculativeWorkerRoute::Promoted
         } else {
             SpeculativeWorkerRoute::Stale
@@ -399,20 +482,25 @@ impl PeerRegistry {
         if let Some(candidate) = peer.take_speculative_exact(correlation, candidate) {
             return Some(SpeculativeTerminalCleanup::Candidate(candidate));
         }
-        let promoted = peer
-            .session
-            .lock()
-            .as_ref()
-            .is_some_and(|session| Arc::ptr_eq(session, candidate))
-            && peer.holds_promoted_session();
+        let promoted = peer.owns_authenticated_worker(candidate) && peer.holds_promoted_session();
         if !promoted {
             return None;
         }
+        let peer_arc = Arc::clone(peer);
+        let removed = peer.retire_authenticated_worker(candidate)?;
         drop(current);
-        let (_, entry) = self.peers.remove(owner.device_id())?;
-        let peer = entry.peer;
-        peer.retire_connector();
-        Some(SpeculativeTerminalCleanup::Promoted(peer))
+        if removed.session_empty {
+            let (_, entry) = self.peers.remove(owner.device_id())?;
+            let peer = entry.peer;
+            peer.retire_connector();
+            self.track_removed_close(Arc::clone(&peer));
+            Some(SpeculativeTerminalCleanup::Promoted { peer, removed })
+        } else {
+            Some(SpeculativeTerminalCleanup::Promoted {
+                peer: peer_arc,
+                removed,
+            })
+        }
     }
 
     pub(super) fn promote_speculative_command(
@@ -422,7 +510,7 @@ impl PeerRegistry {
         correlation: &str,
         broker: &SessionBroker,
         mesh_context: &str,
-    ) -> Option<Arc<crate::transport::WebRtcConnectorWorker>> {
+    ) -> Option<super::connection::SpeculativePromotion> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
         if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
@@ -435,14 +523,19 @@ impl PeerRegistry {
         if !peer.speculative_is_exact(correlation, candidate) {
             return None;
         }
-        let policy_admits =
-            peer.state.read().is_admitted() && self.policy_admits(owner.device_id());
+        let policy_admits = self.policy_admits(owner.device_id());
+        // Reaching this command means the local Endpoint Auth reducer selected
+        // this exact candidate. Other live candidates remain speculative; the
+        // authenticated winner becomes the connector used for new operations
+        // without destroying the logical peer session it joins.
+        let select = true;
         peer.promote_speculative_if_needed(
             correlation,
             candidate,
             broker,
             mesh_context,
             policy_admits,
+            select,
         )
     }
 
@@ -739,7 +832,16 @@ impl PeerRegistry {
         if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
-        let session = peer.session.lock().clone()?;
+        // A worker-stamped owner selects that exact authenticated channel, not
+        // the peer's currently selected connector. This is what lets an
+        // existing realtime flow renegotiate on W0 after W1 becomes the
+        // preferred application path without sending W0's control through W1.
+        // `worker_matches` above already proved the stamped worker belongs to
+        // this installation's promoted logical session.
+        let session = owner
+            .worker()
+            .cloned()
+            .or_else(|| peer.session.lock().clone())?;
         let validity = peer.with_live_session(|session| session.validity_witness())?;
         Some(AdmittedApplicationOperation {
             peer: Arc::clone(peer),
@@ -884,7 +986,13 @@ impl PeerRegistry {
         if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
-        peer.with_live_session_flow(effect)
+        match owner.worker() {
+            Some(worker) => peer.with_live_session_flow_and_exact_worker(
+                worker,
+                |session, flows, live, _worker| effect(session, flows, live),
+            ),
+            None => peer.with_live_session_flow(effect),
+        }
     }
 
     /// The same fence, additionally lending the connector worker.
@@ -916,7 +1024,38 @@ impl PeerRegistry {
         if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
             return None;
         }
-        peer.with_live_session_flow_and_worker(effect)
+        match owner.worker() {
+            Some(worker) => peer.with_live_session_flow_and_exact_worker(worker, effect),
+            None => peer.with_live_session_flow_and_worker(effect),
+        }
+    }
+
+    fn with_live_session_flow_and_exact_worker_with_correlation<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        broker: Option<&SessionBroker>,
+        mesh_context: &str,
+        effect: impl FnOnce(
+            &crate::runtime::session_broker::SessionCapability,
+            &mut crate::transport::webrtc::SessionRealtimeFlows,
+            &Arc<crate::connector::ConnectorIncarnation>,
+            &Arc<crate::transport::WebRtcConnectorWorker>,
+            &str,
+        ) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !self.promote_and_announce(peer, owner, broker?, mesh_context) {
+            return None;
+        }
+        let worker = owner.worker()?;
+        peer.with_live_session_flow_and_exact_worker_with_correlation(worker, effect)
     }
 
     /// Claim the pending renegotiation for `owner`, if there is one to claim.
@@ -952,13 +1091,15 @@ impl PeerRegistry {
         broker: Option<&SessionBroker>,
         mesh_context: &str,
     ) -> Option<AdmittedRenegotiation> {
-        self.with_live_session_flow_and_worker(
-            owner,
+        let peer = self.get_if_current(owner)?;
+        let worker = peer.media_renegotiation_worker()?;
+        let exact_owner = owner.for_worker(Arc::clone(&worker));
+        self.with_live_session_flow_and_exact_worker_with_correlation(
+            &exact_owner,
             broker,
             mesh_context,
-            |session, _flows, _live, worker| {
-                let peer = self.peers.get(owner.device_id())?;
-                let mut data = peer.value().peer.state.write();
+            |session, _flows, _live, worker, correlation| {
+                let mut data = peer.state.write();
                 if !data.media_reneg_pending {
                     return None;
                 }
@@ -967,8 +1108,9 @@ impl PeerRegistry {
                 drop(data);
                 Some(AdmittedRenegotiation {
                     session: Arc::clone(worker),
-                    owner: owner.clone(),
+                    owner: exact_owner.clone(),
                     validity: session.validity_witness(),
+                    correlation: correlation.to_string(),
                 })
             },
         )
@@ -1080,11 +1222,14 @@ impl PeerRegistry {
             .insert(
                 device_id,
                 PeerRegistryEntry {
-                    peer,
+                    peer: Arc::clone(&peer),
                     installation: Arc::new(()),
                 },
             )
             .map(|entry| entry.peer);
+        if let Some(runtime) = self.signaling_runtime.read().as_ref() {
+            peer.bind_signaling_runtime(runtime.clone());
+        }
         if let Some(replaced) = replaced.as_ref() {
             replaced.retire_connector();
         }
@@ -1096,9 +1241,11 @@ impl PeerRegistry {
         let (_, entry) = self.peers.remove(device_id)?;
         let peer = entry.peer;
         peer.retire_connector();
+        self.track_removed_close(Arc::clone(&peer));
         Some(peer)
     }
 
+    #[cfg(test)]
     pub(super) fn remove_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
@@ -1107,11 +1254,57 @@ impl PeerRegistry {
         {
             return None;
         }
+        if owner
+            .worker()
+            .is_some_and(|_| current.value().peer.promoted_channel_count() > 1)
+        {
+            return None;
+        }
         drop(current);
         let (_, entry) = self.peers.remove(owner.device_id())?;
         let peer = entry.peer;
         peer.retire_connector();
         Some(peer)
+    }
+
+    /// Remove one exact authenticated channel while retaining the logical peer
+    /// session and its selected fallback. This is the channel-terminal half of
+    /// [`super::drop_peer_if_current`]; the caller awaits the returned worker and
+    /// releases only its exact dedup custody after this fence is dropped.
+    /// Remove one exact terminal owner, or the whole peer when it is the last
+    /// authenticated channel, under one mutation fence. The caller receives a
+    /// typed outcome so a channel added before this fence cannot make the first
+    /// exact retirement disappear into a later whole-peer check.
+    pub(super) fn remove_current_for_terminal(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> CurrentTerminalCleanup {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return CurrentTerminalCleanup::Stale;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
+            return CurrentTerminalCleanup::Stale;
+        }
+        if let Some(worker) = owner.worker() {
+            let peer = &current.value().peer;
+            if peer.promoted_channel_count() > 1 {
+                return peer
+                    .retire_authenticated_worker(worker)
+                    .map(CurrentTerminalCleanup::Channel)
+                    .unwrap_or(CurrentTerminalCleanup::Stale);
+            }
+        }
+        drop(current);
+        let Some((_, entry)) = self.peers.remove(owner.device_id()) else {
+            return CurrentTerminalCleanup::Stale;
+        };
+        let peer = entry.peer;
+        peer.retire_connector();
+        self.track_removed_close(Arc::clone(&peer));
+        CurrentTerminalCleanup::Peer(peer)
     }
 
     pub(super) fn remove_if_current_unpromoted(
@@ -1130,6 +1323,26 @@ impl PeerRegistry {
         let (_, entry) = self.peers.remove(owner.device_id())?;
         let peer = entry.peer;
         peer.retire_connector();
+        self.track_removed_close(Arc::clone(&peer));
+        Some(peer)
+    }
+
+    pub(super) fn remove_if_current_unpromoted_offer(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Option<Arc<PeerConnection>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || current.value().peer.holds_promoted_session()
+        {
+            return None;
+        }
+        drop(current);
+        let (_, entry) = self.peers.remove(owner.device_id())?;
+        let peer = entry.peer;
+        peer.retire_connector();
+        self.track_removed_close(Arc::clone(&peer));
         Some(peer)
     }
 
@@ -1735,6 +1948,7 @@ pub(super) struct AdmittedRenegotiation {
     session: Arc<crate::transport::WebRtcConnectorWorker>,
     owner: PeerOwnerToken,
     validity: crate::runtime::session_broker::SessionValidityWitness,
+    correlation: String,
 }
 
 impl AdmittedRenegotiation {
@@ -1747,27 +1961,24 @@ impl AdmittedRenegotiation {
         validity.revoked().await;
     }
 
-    /// Run the final synchronous effect only while this installation and the
-    /// promoted session that minted the claim are both still live. Governance
-    /// revocation takes the same registry mutation lock while it invalidates
-    /// the session witness, so the check and hand-off order wholly before or
-    /// after that commit rather than leaving a check-then-send window.
-    pub(super) fn with_live<R>(
-        &self,
-        peers: &PeerRegistry,
-        effect: impl FnOnce() -> R,
-    ) -> Option<R> {
-        peers.with_current(&self.owner, |_peer| self.validity.is_live().then(effect))?
-    }
     /// The connector this renegotiation drives. Its own liveness and close
     /// fence stays authoritative for every SDP call.
     pub(super) fn session(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
         &self.session
     }
 
+    /// The exact installation and worker captured with this claim.
+    pub(super) fn owner(&self) -> &PeerOwnerToken {
+        &self.owner
+    }
+
     /// The captured owner's device id, for logging and signaling attribution.
     pub(super) fn device_id(&self) -> &str {
         self.owner.device_id()
+    }
+
+    pub(super) fn correlation(&self) -> &str {
+        &self.correlation
     }
 
     /// Record the outcome against the exact captured installation.
@@ -1783,7 +1994,19 @@ impl AdmittedRenegotiation {
         data.media_reneg_inflight = false;
         match outcome {
             Ok(()) => {
-                data.last_offer_sent_at = Some(std::time::Instant::now());
+                // A later track-set event may have re-armed the same worker
+                // after this claim was taken. Completing the older exchange
+                // must not erase that newer debt.
+                let rearmed = data.media_reneg_pending;
+                if self.session.role() == crate::transport::Role::Offerer {
+                    data.last_offer_sent_at = Some(std::time::Instant::now());
+                }
+                drop(data);
+                if !rearmed {
+                    peer.clear_media_renegotiation_worker(&self.session);
+                }
+                peer.state.write().media_reneg_pending =
+                    rearmed || peer.has_pending_media_renegotiation();
             }
             Err(error) => {
                 // Leave the work owed: the flag re-arms the next tick's attempt

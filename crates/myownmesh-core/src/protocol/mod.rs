@@ -234,29 +234,28 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
     })
 }
 
-/// The closed lifecycle control of one authenticated Peer Session.
+/// Authenticated control for the exact Peer Session carrying it.
 ///
 /// **Not application payload, not a durable fact, and not signaling.** It is the
-/// one thing an endpoint may say about the session it is already speaking on,
-/// and it is deliberately the narrowest union that can say it.
+/// narrow control an endpoint may exercise over the session it is already
+/// speaking on.
 ///
 /// # Why it carries no target
 ///
 /// There is no Device ID field, and its absence is the security property rather
-/// than an economy. The session defines its own two endpoints, so a `Depart`
-/// means "this session is ending" and can mean nothing else. A target field
-/// would immediately be a way for one authenticated peer to ask a receiver to
-/// retire a *third* device's session — the same third-party naming that makes
-/// an unauthenticated carrier leave untrustworthy, reintroduced on the one path
-/// that is trusted.
+/// than an economy. The session defines its own two endpoints, so every variant
+/// can affect only the connector that carried it. A target field would
+/// immediately be a way for one authenticated peer to name a *third* device's
+/// session — the same third-party naming that makes an unauthenticated carrier
+/// hint untrustworthy, reintroduced on the one path that is trusted.
 ///
 /// # What a receiver may do with it
 ///
-/// Retire the exact session that carried it, and nothing else. It is consumed
-/// under the current session owner, so a frame that arrives on a session which
-/// has since been replaced retires nothing — a stale departure cannot reach
-/// through to its own replacement. Repeats are idempotent: the second one finds
-/// the session already gone.
+/// `Depart` may retire the exact session that carried it. Renegotiation controls
+/// may mutate only that same connector, after application admission and the
+/// connector's fixed offerer/answerer role are re-proved. A frame that arrives
+/// on a channel which has since been retired affects nothing; it cannot be
+/// redirected through a Device ID lookup to a successor.
 ///
 /// No acknowledgement, retry, timer, or grace period participates. A departure
 /// that is lost resolves the way every other lost frame does, through ordinary
@@ -269,6 +268,20 @@ pub enum SessionControl {
     /// which keeps its session and application state while the transport
     /// underneath it recovers or is replaced.
     Depart,
+    /// The answerer has a locally authorized track-set change. It cannot create
+    /// an offer without glare, so it asks this channel's fixed offerer to make
+    /// the one in-band offer. The exact authenticated connector carrying the
+    /// frame is the correlation and target.
+    RenegotiateRequest,
+    /// SDP created by this channel's fixed offerer for connector-local media
+    /// changes. This is authenticated application control, not carrier
+    /// signaling, and may be applied only to the exact answerer connector that
+    /// carried it.
+    RenegotiateOffer { sdp: String },
+    /// The exact answerer connector's reply to [`Self::RenegotiateOffer`].
+    /// Only the matching fixed offerer connector may apply it, and only while
+    /// that connector is awaiting an answer.
+    RenegotiateAnswer { sdp: String },
 }
 
 /// Tagged union of every wire frame the mesh transport carries.
@@ -292,8 +305,8 @@ pub enum MeshMessage {
     CapabilitiesUpdate(CapabilitiesUpdateMessage),
     Shelve(ShelveMessage),
     Unshelve(UnshelveMessage),
-    /// The authenticated session-lifecycle control. See [`SessionControl`] for
-    /// why it has no target field and what a receiver may do with it.
+    /// Authenticated exact-session control. See [`SessionControl`] for why it
+    /// has no target field and what a receiver may do with it.
     SessionControl(SessionControl),
     RpcRequest(RpcRequestMessage),
     RpcResponse(RpcResponseMessage),
@@ -659,6 +672,22 @@ mod tests {
             }
             _ => panic!("did not parse as RosterRequest"),
         }
+    }
+
+    #[test]
+    fn authenticated_renegotiation_control_round_trips_on_the_session_wire() {
+        let message = MeshMessage::SessionControl(SessionControl::RenegotiateOffer {
+            sdp: "v=0\r\na=ice-ufrag:exact-channel\r\n".to_string(),
+        });
+        let encoded = serde_json::to_string(&message).expect("session control serializes");
+        assert!(encoded.contains(r#""kind":"session_control""#));
+        assert!(encoded.contains(r#""op":"renegotiate_offer""#));
+        let decoded: MeshMessage = serde_json::from_str(&encoded).expect("session control decodes");
+        assert!(matches!(
+            decoded,
+            MeshMessage::SessionControl(SessionControl::RenegotiateOffer { sdp })
+                if sdp.contains("exact-channel")
+        ));
     }
 
     #[test]

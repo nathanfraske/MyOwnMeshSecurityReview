@@ -477,7 +477,7 @@ impl<T> ResourceMailboxDelivery<T> {
     /// outlive this claim exactly as the returned value would have.
     ///
     /// So the load-bearing rule is the census, not the type. The seam is
-    /// crate-private and has exactly three callers, all listed below; each hands
+    /// crate-private and has exactly five callers, all listed below; each hands
     /// the message to a terminal handler that consumes it locally — the command
     /// handlers move only a `oneshot::Sender` out in order to answer, and the
     /// signaling handler hands its payload to a transport call that finishes
@@ -488,12 +488,13 @@ impl<T> ResourceMailboxDelivery<T> {
     ///
     /// **Not for serialization, writes, or fan-out.** Those keep the delivery
     /// whole and read through [`Self::value`]; a writer has somewhere for the
-    /// bytes to go and so does not need this. The callers are exactly the two
-    /// `NetworkCmd` dispatch sites in `engine/mod.rs` — the driver loop and the
-    /// test command driver — plus the driver loop's `EphemeralIngress` arm, and
-    /// that census is the point of the seam being `pub(crate)` and named for
-    /// what it is. `the_terminal_effect_seam_has_exactly_its_documented_callers`
-    /// fails if the number moves.
+    /// bytes to go and so does not need this. The callers are the driver loop's
+    /// `NetworkCmd`, `SpeculativePromotionCmd`, and `EphemeralIngress` arms,
+    /// plus the test command driver's `NetworkCmd` and
+    /// `SpeculativePromotionCmd` arms. That census is the point of the seam
+    /// being `pub(crate)` and named for what it is.
+    /// `the_terminal_effect_seam_has_exactly_its_documented_callers` fails if
+    /// the number moves.
     pub(crate) async fn run_terminal_effect<F>(self, effect: impl FnOnce(T) -> F)
     where
         F: std::future::Future<Output = ()>,
@@ -1165,18 +1166,21 @@ mod tests {
     /// `handle_command` an owned command is what the seam is for, and no other
     /// route out of a delivery is public. But a caller under `mod tests` must
     /// not be able to raise the number this census exists to hold down, so the
-    /// file is cut at its test module and three are counted before it — the
-    /// driver loop's `NetworkCmd` arm, the `#[cfg(test)]` command driver that
-    /// mirrors it, and the driver loop's `EphemeralIngress` arm. Test coverage
-    /// of the seam is then asserted separately, as coverage rather than as
-    /// census.
+    /// file is cut at its test module and five are counted before it — the
+    /// driver loop's `NetworkCmd`, `SpeculativePromotionCmd`, and
+    /// `EphemeralIngress` arms, plus matching `NetworkCmd` and
+    /// `SpeculativePromotionCmd` arms in the `#[cfg(test)]` command driver.
+    /// Promotion handling consumes each owned delivery inside the same
+    /// terminal effect, so these are intentional consumers rather than leaks.
+    /// Test coverage of the seam is then asserted separately, as coverage
+    /// rather than as census.
     ///
     /// A real check with two stated limits. It cannot see a call added in some
-    /// *other* module, so it catches the likely drift — a fourth command path
+    /// *other* module, so it catches the likely drift — a sixth command path
     /// growing inside the engine — and not the unlikely one. And the cut is at
     /// the test module, not at every `#[cfg(test)]` item, so a helper gated
     /// outside that module still counts: that is why the production number is
-    /// three and not two.
+    /// five and not three.
     #[test]
     fn the_terminal_effect_seam_has_exactly_its_documented_callers() {
         const ENGINE: &str = include_str!("../engine/mod.rs");
@@ -1211,14 +1215,14 @@ mod tests {
             .map(|line| line.matches(SEAM).count())
             .sum();
         assert_eq!(
-            production, 3,
-            "the seam's contract names three call sites ahead of the engine's \
-             test module: the driver loop's `NetworkCmd` arm, the `#[cfg(test)]` \
-             command driver, and the driver loop's `EphemeralIngress` arm. A \
-             fourth is not automatically wrong, but it is a new place a \
-             delivered message can be consumed, and `Output = ()` does not stop \
-             it being spawned or stored, so it needs the same read the first \
-             three got before this number moves"
+            production, 5,
+            "the seam's contract names five call sites ahead of the engine's \
+             test module: the driver loop's `NetworkCmd`, \
+             `SpeculativePromotionCmd`, and `EphemeralIngress` arms, plus the \
+             matching `NetworkCmd` and `SpeculativePromotionCmd` arms in the \
+             test command driver. Each consumes its owned delivery inside the \
+             terminal effect; an additional route still needs the same review \
+             before this number moves"
         );
 
         let under_test: usize = lines[boundary..]

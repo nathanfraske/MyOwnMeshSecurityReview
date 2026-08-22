@@ -314,7 +314,7 @@ pub(super) async fn on_hello_with_retention(
     let Some(task) = state
         .peers
         .get_if_current(owner)
-        .and_then(|p| p.endpoint_auth_task())
+        .and_then(|p| p.endpoint_auth_task_for(owner.worker()))
     else {
         warn!(peer = %device_id, "no endpoint-auth task at hello — dropping");
         super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
@@ -480,7 +480,7 @@ pub async fn on_auth_response(
     let Some(auth_task) = state
         .peers
         .get_if_current(owner)
-        .and_then(|p| p.endpoint_auth_task())
+        .and_then(|p| p.endpoint_auth_task_for(owner.worker()))
     else {
         warn!(peer = %device_id, "no current endpoint-auth task at auth_response — dropping");
         super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;

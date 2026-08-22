@@ -31,24 +31,42 @@ use tokio::sync::{broadcast, oneshot, watch};
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
 
-/// Opaque process-local identity for a speculative connector promotion.
+/// Internal driver work for reducing one authenticated candidate.
 ///
-/// The command enum is public for the engine command surface, but its exact
-/// worker must remain private: callers can carry this token only after the
-/// engine minted it and no public constructor can fabricate one.
-#[derive(Clone)]
-pub struct SpeculativeCandidate {
-    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+/// Kept out of [`NetworkCmd`]: neither the exact worker pointer nor candidate
+/// promotion is part of the public command surface.
+pub(super) struct SpeculativePromotionCmd {
+    pub(super) owner: PeerOwnerToken,
+    pub(super) candidate: Arc<crate::transport::WebRtcConnectorWorker>,
+    pub(super) correlation: String,
 }
 
-impl SpeculativeCandidate {
-    pub(super) fn from_worker(worker: Arc<crate::transport::WebRtcConnectorWorker>) -> Self {
-        Self { worker }
+impl ResourceMailboxItem for SpeculativePromotionCmd {
+    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+        let measure = strings_measure([self.correlation.as_str()])?;
+        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn speculative_promotion_item_charge_for_test(correlation: &str) -> ResourceClaim {
+    struct PlanningItem<'a>(&'a str);
+
+    impl crate::resource::ResourceMailboxItemBuilder<SpeculativePromotionCmd> for PlanningItem<'_> {
+        fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+            let measure = strings_measure([self.0])?;
+            mailbox_retained_claim::<SpeculativePromotionCmd>(measure.0, measure.1, measure.2)
+        }
+
+        fn build(self) -> SpeculativePromotionCmd {
+            unreachable!("planning a fixture mailbox charge never builds the command")
+        }
     }
 
-    pub(super) fn worker(&self) -> &Arc<crate::transport::WebRtcConnectorWorker> {
-        &self.worker
-    }
+    ResourceMailboxSender::<SpeculativePromotionCmd>::building_item_planning_charge(&PlanningItem(
+        correlation,
+    ))
+    .expect("fixture speculative-promotion charge is representable")
 }
 
 /// See a closed flow's native half retired, whichever half it had.
@@ -159,14 +177,6 @@ pub enum NetworkCmd {
     /// that announces.
     ReplayCapabilities {
         owner: super::peer_registry::PeerOwnerToken,
-    },
-    /// Mailbox-admitted candidate promotion. The worker identity is the
-    /// process-local authority; correlation is retained only for diagnostics
-    /// and an initial exact-slot filter.
-    PromoteSpeculative {
-        owner: super::peer_registry::PeerOwnerToken,
-        candidate: SpeculativeCandidate,
-        correlation: String,
     },
     /// Switch the topology selector at runtime.
     SetTopology(TopologyMode),
@@ -324,9 +334,6 @@ impl ResourceMailboxItem for NetworkCmd {
     fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
         let measure = match self {
             Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
-            Self::PromoteSpeculative { correlation, .. } => {
-                strings_measure([correlation.as_str()])?
-            }
             Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
             Self::ApproveRoster {
                 device_id, label, ..
@@ -397,9 +404,7 @@ impl ResourceMailboxItem for NetworkCmd {
         let effect_allocations = match self {
             // No reply, no cancellation, no channel: nothing to fund past the
             // payload the walk above already measured.
-            Self::ReplayCapabilities { .. }
-            | Self::PromoteSpeculative { .. }
-            | Self::FanoutCapabilities { .. } => 0,
+            Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
             Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
             Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
             Self::ApproveRoster { .. }
@@ -688,6 +693,8 @@ pub struct NetworkState {
     /// provider pressure, so an unattached network simply has nothing to tell.
     signaling_runtime: parking_lot::RwLock<Option<Arc<super::signaling_ingress::SignalingRuntime>>>,
     pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
+    pub(super) speculative_promotion_tx: ResourceMailboxSender<SpeculativePromotionCmd>,
+    speculative_promotion_rx: Mutex<Option<ResourceMailboxReceiver<SpeculativePromotionCmd>>>,
 
     /// Receiving end of `signaling_tx` — held here so callers can
     /// drain it via [`Self::take_signaling_outbound_rx`] when they
@@ -1009,6 +1016,8 @@ impl NetworkState {
         let (signaling_tx, signaling_outbound_rx) =
             crate::resource::resource_mailbox(local_resources.child()?)?;
         let (cmd_tx, cmd_rx) = crate::resource::resource_mailbox(local_resources.child()?)?;
+        let (speculative_promotion_tx, speculative_promotion_rx) =
+            crate::resource::resource_mailbox(local_resources.child()?)?;
         let (signaling_inbound_tx, signaling_inbound_rx) =
             crate::resource::resource_mailbox(local_resources.child()?)?;
         let session_broker = transport.session_broker();
@@ -1036,6 +1045,8 @@ impl NetworkState {
             signaling_inbound_tx,
             signaling_runtime: parking_lot::RwLock::new(None),
             cmd_tx,
+            speculative_promotion_tx,
+            speculative_promotion_rx: Mutex::new(Some(speculative_promotion_rx)),
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             #[cfg(test)]
             parked_command_receiver: Mutex::new(None),
@@ -1071,7 +1082,10 @@ impl NetworkState {
         // here because this is the one place that owns both the registry and the
         // queue; the registry cannot construct it and the driver cannot reach
         // inside the fence.
-        state.peers.bind_promotion_sink(state.cmd_tx.clone());
+        state.peers.bind_command_sink(state.cmd_tx.clone());
+        state
+            .peers
+            .bind_speculative_promotion_sink(state.speculative_promotion_tx.clone());
         Ok((state, signaling_inbound_rx, cmd_rx))
     }
 
@@ -1394,6 +1408,7 @@ impl NetworkState {
         runtime: &Arc<super::signaling_ingress::SignalingRuntime>,
     ) {
         *self.signaling_runtime.write() = Some(Arc::clone(runtime));
+        self.peers.bind_signaling_runtime(Arc::downgrade(runtime));
     }
 
     /// The signaling runtime, if a carrier has attached one.
@@ -1407,6 +1422,12 @@ impl NetworkState {
         self: &Arc<Self>,
     ) -> Option<ResourceMailboxReceiver<SignalingOutbound>> {
         self.signaling_outbound_rx.lock().take()
+    }
+
+    pub(super) fn take_speculative_promotion_rx(
+        &self,
+    ) -> Option<ResourceMailboxReceiver<SpeculativePromotionCmd>> {
+        self.speculative_promotion_rx.lock().take()
     }
 
     /// Keep an otherwise undriven fixture's command receiver alive until the
@@ -1428,6 +1449,7 @@ impl NetworkState {
             .store(true, std::sync::atomic::Ordering::Release);
         self.shutdown_ready.notify_waiters();
         self.cmd_tx.close();
+        self.speculative_promotion_tx.close();
         self.signaling_inbound_tx.close();
     }
 
@@ -1834,6 +1856,7 @@ impl NetworkState {
                     session.validity_witness(),
                 ))
             })?;
+        let owner = owner.for_worker(Arc::clone(&worker));
 
         // Phase 2. Branching on the minted identity rather than re-deriving the
         // direction: the two must not be able to disagree.
@@ -2466,7 +2489,13 @@ impl NetworkState {
             if let Err(error) = peer.retire_and_close().await {
                 tracing::warn!(%error, peer = %peer.device_id, "peer cleanup failed during shutdown");
             }
+            if let Some(runtime) = self.signaling_runtime() {
+                for token in peer.take_retired_dedup() {
+                    runtime.forget_token(token);
+                }
+            }
         }
+        self.peers.await_replaced_closes().await;
         drop(retired);
         // Nothing outlives the engine: parked connect waits resolve with the
         // truth instead of hanging.

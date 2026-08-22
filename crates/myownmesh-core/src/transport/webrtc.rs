@@ -2358,11 +2358,6 @@ impl TransportEventReceiver {
         self.begin_callback_execution(event)
     }
 
-    #[cfg(any(test, feature = "transport-lab"))]
-    fn try_scheduled(&mut self) -> Option<QueuedTransportEvent> {
-        self.try_scheduled_filtered(true)
-    }
-
     async fn recv_queued_filtered(
         &mut self,
         allow_endpoint_data: bool,
@@ -2407,7 +2402,7 @@ impl TransportEventReceiver {
 
     #[cfg(any(test, feature = "transport-lab"))]
     pub fn try_recv(&mut self) -> std::result::Result<TransportEvent, mpsc::error::TryRecvError> {
-        if let Some(queued) = self.try_scheduled() {
+        if let Some(queued) = self.try_scheduled_filtered(true) {
             return Ok(queued.event);
         }
         if self.control.is_closed()
@@ -5622,6 +5617,12 @@ impl WebRtcConnectorWorker {
         self.close_owner.retire_local();
     }
 
+    /// Start the funded native close owner without requiring an async caller.
+    /// The owner remains independently awaitable through `retire_and_close`.
+    pub(crate) fn start_close(&self) {
+        self.close_owner.start();
+    }
+
     /// Install this connector's native-close hold point. **Controls only.**
     #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) fn install_native_close_gate_for_test(&self) -> NativeCloseGateHandle {
@@ -6090,6 +6091,24 @@ impl Transport {
         self.connector_resource_scope = Some(scope);
         self.webrtc_profile = Some(profile);
         self
+    }
+
+    /// Test-only counterpart that installs the profile's codecs into the
+    /// media engine before binding the connector scope. The ordinary policy
+    /// constructor performs this step; explicit test scopes must do the same
+    /// or a negotiated outbound track reaches SDP with an empty media-engine
+    /// codec set and is refused as an RTPSender with no codecs.
+    #[cfg(test)]
+    pub(crate) fn with_connector_resource_scope_for_test(
+        self,
+        scope: MeshConnectorResourceScope,
+        profile: WebRtcConnectorProfile,
+    ) -> Result<Self> {
+        let installed = match profile.realtime() {
+            Some(realtime) => self.with_realtime_media_api(realtime)?,
+            None => self,
+        };
+        Ok(installed.with_connector_resource_scope(scope, profile))
     }
 
     /// Bind this transport to the one resource provider held by the process

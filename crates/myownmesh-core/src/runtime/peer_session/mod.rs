@@ -44,14 +44,48 @@ mod capabilities;
 mod reliable;
 mod slot;
 
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
 use crate::protocol::CapabilityAdvert;
+use crate::resource::{LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease};
 use crate::runtime::session_broker::SessionCapability;
 
+/// Opaque process-local custody for one retained signaling key. This type lives
+/// below the engine so the session bundle can retain it without an
+/// engine-to-runtime dependency. It is retention bookkeeping only and is never
+/// consulted as routing, authentication, or application authority.
+#[derive(Clone)]
+pub(crate) struct DedupToken(Arc<DedupTokenInner>);
+
+pub(crate) struct DedupTokenInner {
+    /// Funds this exact lifecycle custody independently of the weak retained
+    /// ingress record. The lease dies with the last strong token owner.
+    _lease: ResourceLease,
+}
+
+impl DedupToken {
+    pub(crate) fn try_new(_id: u64, scope: &LocalApplicationResourceScope) -> Option<Self> {
+        let lease = scope
+            .acquire(ResourceClaim::single(
+                ResourceClass::OpaqueDependencyResidual,
+                1,
+            ))
+            .ok()?;
+        Some(Self(Arc::new(DedupTokenInner { _lease: lease })))
+    }
+
+    pub(crate) fn weak(&self) -> std::sync::Weak<DedupTokenInner> {
+        Arc::downgrade(&self.0)
+    }
+}
+
 pub(crate) use reliable::{InboundOutcome, UnsentFrame};
-pub(crate) use slot::{PromotedSession, PromotedSessionSlot, Reuse};
+pub(crate) use slot::{
+    PromotedChannelBinding, PromotedSession, PromotedSessionSlot, RemovedPromotedChannel, Reuse,
+};
 
 #[cfg(all(test, feature = "transport-lab"))]
 pub(crate) use capabilities::{
