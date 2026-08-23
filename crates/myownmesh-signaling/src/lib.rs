@@ -63,6 +63,63 @@ pub enum CarrierAttribution {
     SenderClaimed,
 }
 
+/// A typed refusal of one exact negotiation attempt.
+///
+/// This is deliberately separate from relay logging.  The engine can drain
+/// these records from its driver handle and route the refusal to the attempt
+/// owner identified by `attempt`, without guessing from event order or relay
+/// diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NegotiationRefusal {
+    DuplicateLiveEvent,
+    Provider(String),
+}
+
+/// Exact attempt identity and its typed admission refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRefusal {
+    pub attempt: String,
+    pub event_id: String,
+    pub refusal: NegotiationRefusal,
+}
+
+/// Consumer-owned sink for typed attempt refusals.
+///
+/// The driver hands each record to this sink immediately.  It deliberately
+/// does not provide a queue or a drain operation: retention and routing are
+/// the consumer's provider-admitted responsibility, not an unbounded driver
+/// allocation.
+pub trait AttemptRefusalSink: Send + Sync {
+    fn refused(&self, refusal: AttemptRefusal);
+}
+
+/// Authoritative terminal for one exact admitted attempt or relay custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptOutcomeKind {
+    /// One concrete relay-session custody accepted the event.
+    Accepted {
+        session: Option<crate::nostr::delivery::RelaySessionId>,
+    },
+    /// A relay session retired before it could produce a terminal ACK.
+    CarrierUnavailable,
+    TypedRefused(String),
+    Cancelled,
+    Replaced,
+}
+
+/// Exact attempt/event identity paired with an authoritative outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptOutcome {
+    pub attempt: String,
+    pub event_id: String,
+    pub kind: AttemptOutcomeKind,
+}
+
+/// Consumer-owned sink for authoritative attempt outcomes.
+pub trait AttemptOutcomeSink: Send + Sync {
+    fn outcome(&self, outcome: AttemptOutcome);
+}
+
 /// Where a driver pulls the engine events it is meant to publish.
 ///
 /// # Why a driver no longer owns an outbound queue either

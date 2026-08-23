@@ -1,4 +1,9 @@
-//! Closed-network governance: kinds, roles, signed transitions.
+//! Compatibility snapshots for network policy and wire state.
+//!
+//! Canonical V4 authority lives in `semantic::FactGraph`. The transition,
+//! proposal, and log fields below remain deserializable migration shapes for
+//! older control clients; engine authority must be projected from canonical
+//! facts and must not be created by these helpers.
 //!
 //! This module owns the types and signing primitives that distinguish
 //! an `open` network (any member can write to the roster) from a
@@ -27,7 +32,6 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::semantic::{ClosedProfileId, MeshContextId, VerifiedBootstrap};
 
 /// Domain-separation tag prefixed to every signed state-transition
 /// payload. Distinct from the endpoint-auth transcript domain so a signature
@@ -313,33 +317,19 @@ pub struct NetworkState {
     /// with the on-disk filename triggers a fresh state on load.
     pub network_id: String,
     pub kind: NetworkKind,
-    /// Roles assigned to peers in this network. Empty for `open`
-    /// networks — every peer is implicitly `Member`. For `closed`
-    /// networks, presence in this map is what gives a peer their
-    /// authority; absence defaults to `Member`.
+    /// Compatibility role projection derived from the canonical FactGraph;
+    /// this map is not an authority source.
     pub roles: std::collections::BTreeMap<String, Role>,
-    /// Append-only signed **governance** log: kind changes, owner and manager
-    /// (controller) grants/revokes/evicts, and splits. Strict-prefix-extend on
-    /// adoption — the slow-changing root + intermediate tiers of the cert
-    /// chain. Most recent last.
+    /// Legacy transition records retained only for migration serialization;
+    /// they are never an engine admission source.
     pub transitions: Vec<Transition>,
-    /// Signed **member** log: per-entry admits (`RoleGrant{Member}`) and
-    /// removals (`RoleRevoke`/`Evict`) of plain members, each authored by a
-    /// single owner/manager. Multi-writer: union-merged on adoption so
-    /// distributed managers can admit concurrently (offline) without forking —
-    /// the leaf tier of the cert chain. Projected via [`verify_member_log`];
-    /// merged via [`merge_member_logs`].
+    /// Legacy member records retained only for migration serialization.
     pub member_log: Vec<Transition>,
-    /// Pending proposals awaiting ratification.
+    /// Legacy pending records; canonical V4 never ratifies these.
     pub pending: Vec<Proposal>,
-    /// Splits this network has spawned. Each entry was derived from
-    /// a stuck close proposal here.
+    /// Legacy split records retained for migration serialization.
     pub splits: Vec<SplitRecord>,
-    /// Governed connection topology, set by a ratified
-    /// [`TransitionVariant::TopologyChange`]. `Some` is authoritative
-    /// over the device-local config topology (the same precedence
-    /// `kind` has); `None` means no topology transition has ever been
-    /// ratified and the local config rules.
+    /// Legacy topology projection. Current V4 topology is local configuration.
     pub topology: Option<crate::config::TopologyMode>,
     /// Instance-owned persistence root. It is deliberately not serialized:
     /// the wire-level network id remains the sole signed identity, while a
@@ -369,6 +359,20 @@ impl NetworkState {
             topology: None,
             persistence_root: None,
         }
+    }
+
+    /// Build a compatibility snapshot from a canonical role projection.
+    /// Legacy logs, pending proposals, and split records are intentionally
+    /// empty so callers cannot mistake the snapshot for mutable authority.
+    pub fn from_canonical_projection(
+        network_id: &str,
+        kind: NetworkKind,
+        roles: std::collections::BTreeMap<String, Role>,
+    ) -> Self {
+        let mut state = Self::empty_for(network_id);
+        state.kind = kind;
+        state.roles = roles;
+        state
     }
 
     fn with_persistence_root(mut self, root: Option<&Path>) -> Self {
@@ -774,59 +778,6 @@ pub fn verify_log(network_id: &str, transitions: &[Transition]) -> Result<Networ
         verify_quorum(&state, t)?;
         state = apply_transition(state, t);
     }
-    Ok(state)
-}
-
-/// Replay the legacy governance/member-log representation against an exact
-/// semantic Closed bootstrap. The bootstrap supplies the one verified root as
-/// an initial owner in memory; no synthetic `KindChange` is appended or
-/// persisted. This keeps the old projection and idempotent/eviction callers
-/// usable while removing founder self-election from the import path.
-pub(crate) fn verify_seeded_logs(
-    bootstrap: &VerifiedBootstrap,
-    expected_context_id: &MeshContextId,
-    network_id: &str,
-    transitions: &[Transition],
-    member_log: &[Transition],
-) -> Result<NetworkState> {
-    if bootstrap.profile() != Some(ClosedProfileId::SingleRootSignedMemberLogV1) {
-        return Err(Error::Protocol(
-            "seeded legacy logs require the SingleRootSignedMemberLogV1 profile".into(),
-        ));
-    }
-    if bootstrap.context_id() != *expected_context_id {
-        return Err(Error::Protocol(
-            "seeded legacy logs do not match the authenticated bootstrap context".into(),
-        ));
-    }
-    if bootstrap.context().scope != network_id {
-        return Err(Error::Protocol(
-            "seeded legacy logs do not match the bootstrap context scope".into(),
-        ));
-    }
-    let root = bootstrap
-        .authority_roots()
-        .iter()
-        .next()
-        .cloned()
-        .ok_or_else(|| Error::Protocol("Closed bootstrap has no authority root".into()))?;
-
-    let mut state = NetworkState::empty_for(network_id);
-    state.kind = NetworkKind::Closed;
-    state.roles.insert(root, Role::Owner);
-    for transition in transitions.iter().chain(member_log.iter()) {
-        if matches!(transition.variant, TransitionVariant::KindChange { .. }) {
-            return Err(Error::Protocol(
-                "seeded legacy logs cannot contain a synthetic kind transition".into(),
-            ));
-        }
-    }
-    for transition in transitions {
-        verify_transition_signatures(network_id, transition)?;
-        verify_quorum(&state, transition)?;
-        state = apply_transition(state, transition);
-    }
-    state.member_log = member_log.to_vec();
     Ok(state)
 }
 

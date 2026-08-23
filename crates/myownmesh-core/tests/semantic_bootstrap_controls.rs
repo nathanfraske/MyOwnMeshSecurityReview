@@ -5,7 +5,7 @@
 use ed25519_dalek::SigningKey;
 
 use myownmesh_core::semantic::{
-    FactBody, FactContent, FactDomain, FactGraph, GovernanceKind, SemanticError, SignedFact,
+    DeviceId, FactBody, FactContent, FactDomain, FactGraph, Role, SemanticError, SignedFact,
     VerifiedBootstrap,
 };
 
@@ -13,10 +13,8 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-fn author(key: &SigningKey) -> String {
-    data_encoding::BASE32_NOPAD
-        .encode(key.verifying_key().as_bytes())
-        .to_lowercase()
+fn author(key: &SigningKey) -> DeviceId {
+    DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).expect("valid device id")
 }
 
 fn closed(seed: u8, creation_id: u8) -> VerifiedBootstrap {
@@ -28,9 +26,10 @@ fn fact(bootstrap: &VerifiedBootstrap, signing_key: &SigningKey) -> SignedFact {
     SignedFact::sign(
         FactContent::new(
             FactDomain::Governance,
-            bootstrap.context_id().to_string(),
-            FactBody::KindChange {
-                to: GovernanceKind::Closed,
+            bootstrap.context_id(),
+            FactBody::RoleGrant {
+                target: author(signing_key),
+                role: Role::Member,
             },
             author(signing_key),
             Vec::new(),
@@ -73,16 +72,9 @@ fn foreign_context_refuses_before_quarantine_or_projection() {
 fn open_bootstrap_has_no_founder_and_only_self_participation() {
     let bootstrap = VerifiedBootstrap::open("bootstrap-controls").expect("open bootstrap");
     let signing_key = key(23);
-    let device = data_encoding::BASE32_NOPAD
-        .encode(signing_key.verifying_key().as_bytes())
-        .to_lowercase();
-    let participation = FactContent::open_participation(
-        bootstrap.context_id().to_string(),
-        device.clone(),
-        true,
-        "self",
-        Vec::new(),
-    );
+    let device = author(&signing_key);
+    let participation =
+        FactContent::open_participation(bootstrap.context_id(), device.clone(), true, Vec::new());
     let mut graph = FactGraph::from_bootstrap(&bootstrap);
     graph
         .admit(SignedFact::sign(participation, &signing_key).expect("participation signs"))

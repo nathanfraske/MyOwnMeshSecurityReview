@@ -49,7 +49,8 @@ pub mod rpc;
 pub mod topology;
 
 pub use departure::{
-    DepartureCorrelation, DepartureCorrelationError, MAX_DEPARTURE_CORRELATION_BYTES,
+    DepartureCorrelation, DepartureCorrelationError, DEPARTURE_CORRELATION_BYTES,
+    DEPARTURE_CORRELATION_WIRE_CHARS, MAX_DEPARTURE_CORRELATION_BYTES,
 };
 pub use facts::{
     CanonicalFact, FactBundleMessage, FactContent, FactId, FactInventory, FactInventoryMessage,
@@ -146,6 +147,28 @@ where
     let mut buffer = Vec::with_capacity(len);
     serde_json::to_writer(&mut buffer, value).ok()?;
     (buffer.len() == len).then(|| buffer.into_boxed_slice())
+}
+
+/// Count the exact compact JSON bytes of one authenticated departure receipt.
+///
+/// The count walks the same protocol-owned value that is later encoded, so a
+/// provider claim can fund the receipt buffer without a guessed multiplier.
+pub(crate) fn departure_receipt_json_len(correlation: &DepartureCorrelation) -> Option<usize> {
+    let message = MeshMessage::SessionControl(SessionControl::DepartObserved {
+        correlation: correlation.clone(),
+    });
+    encoded_json_len(&message)
+}
+
+/// Encode one departure receipt into exactly the counted allocation.
+pub(crate) fn encode_departure_receipt_exact(
+    correlation: &DepartureCorrelation,
+) -> Option<Box<[u8]>> {
+    let message = MeshMessage::SessionControl(SessionControl::DepartObserved {
+        correlation: correlation.clone(),
+    });
+    let len = encoded_json_len(&message)?;
+    encode_json_exact(&message, len)
 }
 
 /// First-stage classification obtained from the small leading JSON tag only.
@@ -814,7 +837,7 @@ mod tests {
 
     #[test]
     fn authenticated_departure_control_round_trips_with_bounded_correlation() {
-        let correlation = DepartureCorrelation::new("leave-opaque-1").unwrap();
+        let correlation = DepartureCorrelation::from_bytes([0x11; DEPARTURE_CORRELATION_BYTES]);
         let message = MeshMessage::SessionControl(SessionControl::Depart {
             correlation: correlation.clone(),
         });
@@ -839,7 +862,21 @@ mod tests {
             MeshMessage::SessionControl(SessionControl::DepartObserved { correlation: value })
                 if value == correlation
         ));
-        let too_long = format!("{}x", "a".repeat(MAX_DEPARTURE_CORRELATION_BYTES));
+        let exact_len = departure_receipt_json_len(&correlation).expect("receipt is countable");
+        let exact = encode_departure_receipt_exact(&correlation).expect("receipt is encodable");
+        assert_eq!(
+            exact.len(),
+            exact_len,
+            "the receipt uses the exact allocation that was counted"
+        );
+        let exact_decoded: MeshMessage =
+            serde_json::from_slice(&exact).expect("exactly encoded receipt decodes");
+        assert!(matches!(
+            exact_decoded,
+            MeshMessage::SessionControl(SessionControl::DepartObserved { correlation: value })
+                if value == correlation
+        ));
+        let too_long = "a".repeat(MAX_DEPARTURE_CORRELATION_BYTES + 1);
         assert!(serde_json::from_str::<MeshMessage>(&format!(
             r#"{{"kind":"session_control","op":"depart","correlation":"{too_long}"}}"#
         ))

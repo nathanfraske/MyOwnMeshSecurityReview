@@ -33,7 +33,7 @@
 //!   [`myownmesh_signaling::local::LocalBroker`] (tests and
 //!   single-process apps).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
 use myownmesh_signaling::mdns::{
@@ -46,7 +46,10 @@ use myownmesh_signaling::nostr::delivery::{
 use myownmesh_signaling::nostr::driver::{
     self as nostr_driver, NostrDriverConfig, NostrDriverHandle, NostrInbound, NostrOutbound,
 };
-use myownmesh_signaling::{InboundSink, OutboundSource, OwnedSignal, SignalingMessage};
+use myownmesh_signaling::{
+    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, InboundSink,
+    NegotiationRefusal, OutboundSource, OwnedSignal, SignalingMessage,
+};
 use tracing::{trace, warn};
 
 use crate::resource::{
@@ -58,7 +61,7 @@ use super::signaling_ingress::{
     outbound_signal, CarrierAttach, CarrierAttribution, CarrierObservation, SignalingCarrier,
     SignalingRuntime,
 };
-use super::state::{NetworkState, SignalingOutbound};
+use super::state::{NetworkCmd, NetworkState, SignalingOutbound};
 
 /// One driver's outbound side: the engine's admitted values, translated on the
 /// driver's own pull.
@@ -96,6 +99,7 @@ struct TranslatedOutbound<T> {
     rx: ResourceMailboxReceiver<SignalingOutbound>,
     scope: LocalApplicationResourceScope,
     translate: Box<dyn Fn(&SignalingOutbound) -> T + Send>,
+    refusal_sink: Option<Arc<dyn AttemptRefusalSink>>,
 }
 
 /// The pre-drain value, built only once its lease exists.
@@ -177,6 +181,55 @@ struct CoreNostrDeliveryLease {
     _lease: ResourceLease,
 }
 
+/// Routes a typed Nostr attempt admission refusal through the exact owner
+/// token captured for the still-current attempt.  Unknown or replaced
+/// attempts are deliberately ignored; there is no device-id fallback.
+struct CoreAttemptRefusalSink {
+    state: Weak<NetworkState>,
+}
+
+impl AttemptRefusalSink for CoreAttemptRefusalSink {
+    fn refused(&self, refusal: AttemptRefusal) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some(owner) = super::owner_for_signaling_attempt(&state, &refusal.attempt) else {
+            return;
+        };
+        if owner.connection().attempt() != refusal.attempt {
+            return;
+        }
+        let _ = state
+            .cmd_tx
+            .send(NetworkCmd::AttemptRefused { owner, refusal });
+    }
+}
+
+/// Routes authoritative provider outcomes through the exact current owner.
+/// The engine handler rechecks both the installation token and correlation;
+/// this sink never settles delivery recursively and never falls back to a
+/// device-id lookup.
+struct CoreAttemptOutcomeSink {
+    state: Weak<NetworkState>,
+}
+
+impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
+    fn outcome(&self, outcome: AttemptOutcome) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some(owner) = super::owner_for_signaling_attempt(&state, &outcome.attempt) else {
+            return;
+        };
+        if owner.connection().attempt() != outcome.attempt {
+            return;
+        }
+        let _ = state
+            .cmd_tx
+            .send(NetworkCmd::AttemptOutcome { owner, outcome });
+    }
+}
+
 impl DeliveryLease for CoreNostrDeliveryLease {
     fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
         // Dropping the exact lease is the settlement.  The terminal is
@@ -185,24 +238,16 @@ impl DeliveryLease for CoreNostrDeliveryLease {
     }
 }
 
-impl DeliveryProvider for CoreNostrDeliveryProvider {
-    fn reserve(
+impl CoreNostrDeliveryProvider {
+    fn lease_for_bytes(
         &self,
-        _attempt: &str,
-        _session: RelaySessionId,
-        _event: &myownmesh_signaling::nostr::event::NostrEvent,
-        retention: DeliveryRetention,
+        bytes: usize,
+        label: &str,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        let encoded_bytes = retention
-            .encoded_event_bytes
-            .checked_add(retention.structural_entry_bytes)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| DeliveryRefusal::Provider("EVENT retention overflow".to_string()))?;
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| DeliveryRefusal::Provider(format!("{label} retention overflow")))?;
         let claim = ResourceClaim::try_from_entries([
-            (
-                crate::resource::ResourceClass::AccountedMemoryBytes,
-                encoded_bytes,
-            ),
+            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
             (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
         ])
         .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
@@ -211,6 +256,83 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
             .acquire(claim)
             .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
         Ok(Box::new(CoreNostrDeliveryLease { _lease: lease }))
+    }
+}
+
+impl DeliveryProvider for CoreNostrDeliveryProvider {
+    fn reserve_session_record(
+        &self,
+        _session: RelaySessionId,
+        retention: myownmesh_signaling::nostr::delivery::SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.session_record_bytes, "session record")
+    }
+
+    fn reserve_session_set_node(
+        &self,
+        _session: RelaySessionId,
+        retention: myownmesh_signaling::nostr::delivery::SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.session_set_node_bytes, "session set node")
+    }
+
+    fn reserve_session_set_growth(
+        &self,
+        _session: RelaySessionId,
+        retention: myownmesh_signaling::nostr::delivery::SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.session_set_growth_bytes, "session set growth")
+    }
+
+    fn reserve_attempt_record(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.attempt_record_bytes, "attempt record")
+    }
+
+    fn reserve_attempt_key(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.attempt_key_bytes, "attempt key")
+    }
+
+    fn reserve_attempt_map_growth(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.attempt_map_growth_bytes, "attempt map growth")
+    }
+
+    fn reserve(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        let bytes = retention
+            .encoded_event_bytes
+            .checked_add(retention.structural_entry_bytes)
+            .ok_or_else(|| DeliveryRefusal::Provider("EVENT retention overflow".to_string()))?;
+        self.lease_for_bytes(bytes, "relay delivery")
+    }
+
+    fn reserve_relay_map_growth(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.relay_map_growth_bytes, "relay map growth")
     }
 }
 
@@ -233,6 +355,15 @@ pub(crate) fn nostr_delivery_provider(
 /// here reads it as a peer limit or a queue depth — there is no queue.
 const DERIVED_OUTBOUND_CLAIM: ResourceClaim =
     ResourceClaim::single(crate::resource::ResourceClass::OpaqueDependencyResidual, 1);
+
+fn outbound_attempt(value: &SignalingOutbound) -> Option<&str> {
+    match value {
+        SignalingOutbound::Offer { attempt, .. }
+        | SignalingOutbound::Answer { attempt, .. }
+        | SignalingOutbound::Candidate { attempt, .. } => Some(attempt),
+        SignalingOutbound::Announce | SignalingOutbound::Leave => None,
+    }
+}
 
 #[async_trait::async_trait]
 impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
@@ -261,6 +392,16 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             let derived = match self.scope.acquire(DERIVED_OUTBOUND_CLAIM) {
                 Ok(lease) => lease,
                 Err(error) => {
+                    if let (Some(sink), Some(attempt)) = (
+                        self.refusal_sink.as_ref(),
+                        outbound_attempt(delivery.value()),
+                    ) {
+                        sink.refused(AttemptRefusal {
+                            attempt: attempt.to_string(),
+                            event_id: String::new(),
+                            refusal: NegotiationRefusal::Provider(error.to_string()),
+                        });
+                    }
                     // This emission is dropped, and only this emission. The
                     // delivery falls out of scope at the end of the iteration,
                     // which releases the funding the engine put behind it, and
@@ -445,6 +586,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     },
                 },
             }),
+            refusal_sink: None,
         });
     let _ = state.with_local_signaling_forwarder(|| {
         let forwarder = broker.join_with_sink(
@@ -712,15 +854,24 @@ fn attach_nostr_with(
                     },
                 },
             }),
+            refusal_sink: Some(Arc::new(CoreAttemptRefusalSink {
+                state: Arc::downgrade(state),
+            })),
         });
 
     // Inbound: NostrInbound → engine SignalingInbound on the driver's own task,
     // through this carrier's attach on the shared runtime.
-    let handle = nostr_driver::start_with_delivery_provider(
+    let handle = nostr_driver::start_with_delivery_provider_and_sinks(
         nostr_cfg,
         outbound,
         carrier_sink(attach),
         provider,
+        Arc::new(CoreAttemptRefusalSink {
+            state: Arc::downgrade(state),
+        }),
+        Arc::new(CoreAttemptOutcomeSink {
+            state: Arc::downgrade(state),
+        }),
     );
     // Hand the engine the force-reconnect signal so resume-from-sleep
     // (and any other recovery path) can make every relay redial at
@@ -731,6 +882,24 @@ fn attach_nostr_with(
     // wait for signaling to actually come back before it offers (see
     // `network_watch::on_network_change`).
     state.set_relay_connected_signal(handle.connected_signal());
+    Some(handle)
+}
+
+/// Attach Nostr while retaining the exact driver handle behind the network's
+/// settlement seam.  The public single-driver helper keeps its historical
+/// owning return type; the production multi-driver path uses this wrapper so
+/// engine lifecycle events can settle the driver's exact attempt map without
+/// resolving a peer by device id.
+fn attach_nostr_shared(
+    state: &Arc<NetworkState>,
+    outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
+    attach: CarrierAttach,
+) -> Option<Arc<NostrDriverHandle>> {
+    let handle = Arc::new(attach_nostr_with(state, outbound_rx, attach)?);
+    let settlement_handle = Arc::clone(&handle);
+    state.set_attempt_settlement(Arc::new(move |attempt, terminal| {
+        settlement_handle.finish_attempt(attempt, terminal)
+    }));
     Some(handle)
 }
 
@@ -821,6 +990,7 @@ fn attach_mdns_with(
                     },
                 },
             }),
+            refusal_sink: None,
         });
 
     // The driver's setup is synchronously fallible (mDNS daemon, TCP listener),
@@ -850,7 +1020,7 @@ fn attach_mdns_with(
 /// signaling down for a network by dropping this value, exactly as
 /// it did with the bare Nostr handle before mDNS existed.
 pub struct SignalingDrivers {
-    nostr: Option<NostrDriverHandle>,
+    nostr: Option<Arc<NostrDriverHandle>>,
     mdns: Option<MdnsDriverHandle>,
     fanout: Option<tokio::task::JoinHandle<()>>,
 }
@@ -962,7 +1132,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             let (mdns_tx, mdns_rx) =
                 crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let fanout = spawn_fanout(state.clone(), outbound_rx, vec![nostr_tx, mdns_tx]);
-            let nostr = attach_nostr_with(
+            let nostr = attach_nostr_shared(
                 state,
                 nostr_rx,
                 SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr),
@@ -979,7 +1149,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             }
         }
         (true, false) => SignalingDrivers {
-            nostr: attach_nostr_with(
+            nostr: attach_nostr_shared(
                 state,
                 outbound_rx,
                 SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr),
@@ -1075,6 +1245,9 @@ fn spawn_fanout(
             // the admission is exhaustive, so an emission that is not ephemeral
             // transport control cannot be added without deciding that here.
             let signal = outbound_signal(msg).name();
+            let attempt = outbound_attempt(msg).map(str::to_owned);
+            let mut delivered = false;
+            let mut refusal_reason = None;
             for tx in &driver_txs {
                 let kind = match msg {
                     SignalingOutbound::Announce => "announce",
@@ -1084,8 +1257,12 @@ fn spawn_fanout(
                     SignalingOutbound::Candidate { .. } => "candidate",
                 };
                 match tx.send(msg.clone()) {
-                    Ok(()) | Err(ResourceMailboxSendError::Closed(_)) => {}
+                    Ok(()) => delivered = true,
+                    Err(ResourceMailboxSendError::Closed(_)) => {
+                        refusal_reason = Some("signaling carrier unavailable".to_string());
+                    }
                     Err(ResourceMailboxSendError::Pressure { error, .. }) => {
+                        refusal_reason = Some(error.to_string());
                         warn!(
                             kind,
                             signal,
@@ -1094,8 +1271,21 @@ fn spawn_fanout(
                         );
                     }
                     Err(ResourceMailboxSendError::Claim { error, .. }) => {
+                        refusal_reason = Some(error.to_string());
                         warn!(kind, signal, %error, "unrepresentable signaling driver copy dropped");
                     }
+                }
+            }
+            if !delivered && !driver_txs.is_empty() {
+                if let (Some(attempt), Some(reason)) = (attempt, refusal_reason) {
+                    CoreAttemptRefusalSink {
+                        state: Arc::downgrade(&state),
+                    }
+                    .refused(AttemptRefusal {
+                        attempt,
+                        event_id: String::new(),
+                        refusal: NegotiationRefusal::Provider(reason),
+                    });
                 }
             }
         }
@@ -1167,6 +1357,7 @@ mod tests {
                     other => unreachable!("this control only emits offers, not {other:?}"),
                 }
             }),
+            refusal_sink: None,
         }
     }
 

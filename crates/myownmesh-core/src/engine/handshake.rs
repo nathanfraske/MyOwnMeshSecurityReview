@@ -706,22 +706,30 @@ fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &st
         return true;
     }
 
-    let local_device_id = crate::signing::pubkey_part(state.identity.public_id()).to_string();
-    let remote_device_id = crate::signing::pubkey_part(remote_device_id).to_string();
+    let Ok(local_device_id) =
+        crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+    else {
+        return false;
+    };
+    let Ok(remote_device_id) = crate::semantic::DeviceId::from_canonical_str(remote_device_id)
+    else {
+        return false;
+    };
     let roots = state.verified_bootstrap().authority_roots();
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
     let projection = graph.projection();
 
-    let role_admits = |device_id: &str| {
+    let role_admits = |device_id: &crate::semantic::DeviceId| {
         if projection.is_stood_down(device_id) {
             return false;
         }
-        if !roots
-            .iter()
-            .any(|root| crate::signing::pubkey_part(root) == device_id)
-        {
-            let role_cell = crate::semantic::ExclusiveCell::new(device_id, "role");
+        if !roots.iter().any(|root| {
+            crate::semantic::DeviceId::from_canonical_str(root)
+                .map(|root| root == device_id.clone())
+                .unwrap_or(false)
+        }) {
+            let role_cell = crate::semantic::ExclusiveCell::role(device_id.clone());
             let Some(role_id) = projection.value(&role_cell) else {
                 return false;
             };
@@ -731,7 +739,7 @@ fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &st
             if !matches!(
                 &role_fact.content.body,
                 crate::semantic::FactBody::RoleGrant { target, role }
-                    if crate::signing::pubkey_part(target) == device_id
+                    if target == device_id
                         && matches!(
                             role,
                             crate::semantic::Role::Member
@@ -743,7 +751,7 @@ fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &st
             }
         }
 
-        let membership_cell = crate::semantic::ExclusiveCell::new(device_id, "membership");
+        let membership_cell = crate::semantic::ExclusiveCell::membership(device_id.clone());
         if projection.is_conflicted(&membership_cell) {
             return false;
         }
@@ -754,7 +762,7 @@ fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &st
             if matches!(
                 &membership_fact.content.body,
                 crate::semantic::FactBody::Evict { target }
-                    if crate::signing::pubkey_part(target) == device_id
+                    if target == device_id
             ) {
                 return false;
             }

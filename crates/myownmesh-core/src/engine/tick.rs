@@ -159,6 +159,7 @@ impl Ticker for ReconnectSupervisor {
 
     async fn tick(&mut self, state: &Arc<NetworkState>) {
         super::service_reconnect_intents(state).await;
+        super::service_recovery_demands(state).await;
     }
 }
 

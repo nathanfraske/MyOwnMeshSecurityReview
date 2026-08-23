@@ -17,7 +17,9 @@ use myownmesh_core::engine::{
     attach_local, create_network_in_instance_root, import_network_in_instance_root, NetworkState,
 };
 use myownmesh_core::identity::Identity;
-use myownmesh_core::network_state::{self, NetworkKind, Role, Transition, TransitionVariant};
+use myownmesh_core::network_state::{
+    NetworkKind, NetworkState as CanonicalNetworkState, Role, TransitionVariant,
+};
 use myownmesh_core::semantic::{ClosedProfileId, VerifiedProjectPolicy};
 use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
@@ -115,11 +117,7 @@ async fn spawn_closed_creator(
             if policy.profile() == ClosedProfileId::SingleRootSignedMemberLogV1
     ));
     assert_eq!(
-        state
-            .governance_state
-            .read()
-            .roles
-            .get(identity.public_id()),
+        canonical_snapshot(&state).roles.get(identity.public_id()),
         Some(&Role::Owner),
         "the explicit Closed creator must be the verified bootstrap root"
     );
@@ -192,22 +190,6 @@ async fn onboard_member(
     )
     .await
     .expect("alice signs bob's root-authorized Closed membership");
-    // First prove Alice's local compatibility projection. Bob's delivery is
-    // observed through the canonical projection below; a semantic signature
-    // is not a legacy member-log signature and must not be manufactured into
-    // one merely to satisfy this control.
-    wait_for(
-        "alice's member log grants bob",
-        Duration::from_secs(10),
-        || {
-            member_granted(
-                &alice.governance_state.read().member_log,
-                bob_id.public_id(),
-            )
-        },
-    )
-    .await;
-
     // This proves production delivery of the canonical grant: Bob has an exact
     // Member role entry, both sides of the Closed policy have explicit role
     // entries, and the production roster mirror authorizes Bob as Member.
@@ -217,12 +199,11 @@ async fn onboard_member(
         || {
             let bob_pk = bob_id.public_id();
             let alice_pk = alice_id.public_id();
-            let policy_has_explicit_roles = {
-                let gov = bob.governance_state.read();
-                gov.roles.get(bob_pk).copied() == Some(Role::Member)
-                    && gov.roles.contains_key(alice_pk)
-                    && gov.roles.contains_key(bob_pk)
-            };
+            let projected = canonical_snapshot(bob);
+            let policy_has_explicit_roles = projected.roles.get(bob_pk).copied()
+                == Some(Role::Member)
+                && projected.roles.contains_key(alice_pk)
+                && projected.roles.contains_key(bob_pk);
             policy_has_explicit_roles
                 && bob.is_rostered(bob_pk)
                 && roster_role(bob, bob_pk) == Some(Role::Member)
@@ -236,23 +217,6 @@ async fn onboard_member(
         alice_approved && bob_approved,
         "both peers must reach the Approved/Active outcome"
     );
-}
-
-/// Whether a signed member log carries a ratified `RoleGrant` admitting
-/// `target` as a plain `Member`.
-///
-/// One matcher for every reader of this log. Three hand-written copies of the
-/// same `matches!` is how one of them comes to match nothing — and a member-log
-/// predicate that matches nothing reads exactly like a membership that is
-/// correctly absent.
-fn member_granted(log: &[Transition], target: &str) -> bool {
-    log.iter().any(|entry| {
-        matches!(
-            &entry.variant,
-            TransitionVariant::RoleGrant { target: granted, role: Role::Member }
-                if granted == target
-        )
-    })
 }
 
 #[tokio::test]
@@ -298,23 +262,14 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
     // The onboarding helper has completed the root-signed grant and the
     // production approval barriers. Both nodes began from the same verified
     // Closed bootstrap.
-    assert_eq!(
-        alice_state.governance_state.read().kind,
-        NetworkKind::Closed
-    );
-    assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Closed);
-    assert!(alice_state.governance_state.read().transitions.is_empty());
-    assert!(member_granted(
-        &alice_state.governance_state.read().member_log,
-        bob_id.public_id()
-    ));
+    let alice_view = canonical_snapshot(&alice_state);
+    let bob_view = canonical_snapshot(&bob_state);
+    assert_eq!(alice_view.kind, NetworkKind::Closed);
+    assert_eq!(bob_view.kind, NetworkKind::Closed);
 
-    // The verified bootstrap seats Alice as root Owner; the signed member log
+    // The verified bootstrap seats Alice as root Owner; the canonical RoleGrant
     // admits Bob as Member without a synthetic KindChange transition.
     {
-        let alice_view = alice_state.governance_state.read();
-        let bob_view = bob_state.governance_state.read();
-
         assert_eq!(alice_view.kind, NetworkKind::Closed);
         assert_eq!(bob_view.kind, NetworkKind::Closed);
 
@@ -339,25 +294,6 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
             "bob's own view agrees with the signed Member grant"
         );
 
-        // The shared bootstrap has no synthetic KindChange transition.
-        assert!(alice_view.transitions.is_empty());
-        assert!(bob_view.transitions.is_empty());
-        // And the proposal should have left the pending list on both sides.
-        assert!(
-            alice_view.pending.is_empty(),
-            "alice still has pending: {:?}",
-            alice_view.pending
-        );
-        assert!(
-            bob_view.pending.is_empty(),
-            "bob still has pending: {:?}",
-            bob_view.pending
-        );
-
-        // Alice retains the local compatibility member-log projection. Bob's
-        // canonical projection is intentionally checked above rather than by
-        // requiring a synthetic legacy log entry.
-        assert!(member_granted(&alice_view.member_log, bob_id.public_id()));
         assert_eq!(
             bob_view.roles.get(bob_id.public_id()).copied(),
             Some(Role::Member),
@@ -459,12 +395,9 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     )
     .await;
     assert_eq!(
-        bob_state
-            .governance_state
-            .read()
-            .role_of(carol_id.public_id()),
+        canonical_role(&bob_state, carol_id.public_id()),
         Role::Member,
-        "Carol must converge as a Member on Bob via the signed log alone"
+        "Carol must converge as a Member on Bob via the canonical fact graph"
     );
     shutdown_drivers([
         (alice_state.clone(), alice_driver),
@@ -579,13 +512,13 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
 }
 
 #[tokio::test]
-async fn manager_admits_a_member_which_converges_via_the_member_log() {
+async fn manager_admits_a_member_which_converges_via_canonical_facts() {
     // The two-key model end to end: an owner promotes a peer to **manager**
     // (Controller), and that manager — not just the owner — admits a member.
-    // The admission rides the multi-writer **member log** (not the governance
-    // log), and converges to the owner by union-merge even though the owner
-    // never signed it. This is the cert chain in motion: the owner issues the
-    // manager (governance log), the manager issues the member (member log).
+    // The admission rides a manager-authored canonical RoleGrant and converges
+    // to the owner even though the owner never signed it. This is the cert
+    // chain in motion: the owner issues the manager, then the manager issues
+    // the member through the canonical fact graph.
     let broker = LocalBroker::new();
     let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
@@ -622,7 +555,7 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     .await;
 
     // Alice promotes Bob to manager (Controller) — owner-only authority. This
-    // rides the governance log and converges to Bob.
+    // rides the canonical fact graph and converges to Bob.
     myownmesh_core::engine::governance::propose(
         &alice_state,
         TransitionVariant::RoleGrant {
@@ -636,19 +569,13 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     wait_for(
         "bob's governance view makes bob a controller",
         Duration::from_secs(10),
-        || {
-            bob_state
-                .governance_state
-                .read()
-                .role_of(bob_id.public_id())
-                == Role::Controller
-        },
+        || canonical_role(&bob_state, bob_id.public_id()) == Role::Controller,
     )
     .await;
 
     // Bob — now a manager — admits Dave. Authority for a member grant is ≥1
     // controller/owner; Bob qualifies, so it ratifies on Bob alone and lands in
-    // his MEMBER log (Dave need not be present).
+    // the canonical graph (Dave need not be present).
     myownmesh_core::engine::governance::propose(
         &bob_state,
         TransitionVariant::RoleGrant {
@@ -664,24 +591,13 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     })
     .await;
 
-    // The admission rode the member log, NOT the governance log.
-    {
-        let bob_view = bob_state.governance_state.read();
-        assert!(
-            bob_view.member_log.iter().any(|t| matches!(
-                &t.variant,
-                TransitionVariant::RoleGrant { target, role: Role::Member } if target == dave_id.public_id()
-            )),
-            "Dave's admit must be in the manager's member log"
-        );
-        assert!(
-            !bob_view.transitions.iter().any(|t| matches!(
-                &t.variant,
-                TransitionVariant::RoleGrant { target, .. } if target == dave_id.public_id()
-            )),
-            "a manager's member admit must NOT extend the governance (owner) log"
-        );
-    }
+    // The manager-authored admission is a canonical RoleGrant fact; no legacy
+    // legacy log representation is authoritative.
+    assert_eq!(
+        canonical_role(&bob_state, dave_id.public_id()),
+        Role::Member,
+        "Dave's canonical member grant must project on the manager"
+    );
 
     // And it converges to the OWNER by union-merge: Alice never signed Dave, yet
     // recognises Bob's manager-authored admission and surfaces Dave as a member.
@@ -692,12 +608,9 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     )
     .await;
     assert_eq!(
-        alice_state
-            .governance_state
-            .read()
-            .role_of(dave_id.public_id()),
+        canonical_role(&alice_state, dave_id.public_id()),
         Role::Member,
-        "Dave converges as a Member on the owner via the union-merged member log"
+        "Dave converges as a Member on the owner via canonical fact exchange"
     );
     shutdown_drivers([
         (alice_state.clone(), alice_driver),
@@ -763,10 +676,7 @@ async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
         "a plain Member must not author an authority-bearing RoleGrant"
     );
     assert_eq!(
-        bob_state
-            .governance_state
-            .read()
-            .role_of(bob_id.public_id()),
+        canonical_role(&bob_state, bob_id.public_id()),
         Role::Member,
         "Bob's valid canonical membership must remain after the refusal"
     );
@@ -778,18 +688,8 @@ async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
     );
     assert!(!rostered(&alice_state, carol_id.public_id()));
     assert!(!rostered(&bob_state, carol_id.public_id()));
-    assert!(!alice_state
-        .governance_state
-        .read()
-        .roles
-        .contains_key(carol_id.public_id()));
-    assert!(!bob_state
-        .governance_state
-        .read()
-        .roles
-        .contains_key(carol_id.public_id()));
-    assert!(alice_state.governance_state.read().pending.is_empty());
-    assert!(bob_state.governance_state.read().pending.is_empty());
+    assert!(!canonical_has_role(&alice_state, carol_id.public_id()));
+    assert!(!canonical_has_role(&bob_state, carol_id.public_id()));
     shutdown_drivers([
         (alice_state.clone(), alice_driver),
         (bob_state.clone(), bob_driver),
@@ -832,7 +732,7 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
     .await
     .expect("admit");
     assert_eq!(
-        alice_state.governance_state.read().role_of(&carol_pk),
+        canonical_role(&alice_state, &carol_pk),
         Role::Member,
         "the root-authored member grant must be visible before eviction"
     );
@@ -846,11 +746,7 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
     .await
     .expect("evict");
     assert!(
-        !alice_state
-            .governance_state
-            .read()
-            .roles
-            .contains_key(carol_pk.as_str()),
+        !canonical_has_role(&alice_state, carol_pk.as_str()),
         "an evicted member must be absent from the projected membership"
     );
     propose(
@@ -865,7 +761,7 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
     .expect("re-admit");
 
     assert_eq!(
-        alice_state.governance_state.read().role_of(&carol_pk),
+        canonical_role(&alice_state, &carol_pk),
         Role::Member,
         "a causal re-admit must supersede the evict head deterministically"
     );
@@ -938,7 +834,7 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
     .await
     .expect("promote carol");
     assert_eq!(
-        alice_state.governance_state.read().role_of(&carol_pk),
+        canonical_role(&alice_state, &carol_pk),
         Role::Controller,
         "carol should be a manager after promotion"
     );
@@ -958,15 +854,12 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
     // logs may remain evidence but cannot decide whether Carol is admitted.
     // Canonical projection is authoritative here; compatibility logs are not
     // used to decide whether Carol remains admitted.
-    {
-        let g = alice_state.governance_state.read();
-        assert!(!g.roles.contains_key(&carol_pk));
-        assert_eq!(
-            g.roles.get(alice_id.public_id()),
-            Some(&Role::Owner),
-            "evicting Carol must not remove the verified bootstrap root"
-        );
-    }
+    assert!(!canonical_has_role(&alice_state, &carol_pk));
+    assert_eq!(
+        canonical_role(&alice_state, alice_id.public_id()),
+        Role::Owner,
+        "evicting Carol must not remove the verified bootstrap root"
+    );
     assert!(!rostered(&alice_state, &carol_pk));
     assert_ne!(roster_role(&alice_state, &carol_pk), Some(Role::Controller));
     shutdown_drivers([(alice_state.clone(), alice_driver)]).await;
@@ -1021,7 +914,7 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     .await
     .expect("promote bob");
     assert_eq!(
-        alice_state.governance_state.read().role_of(&bob_pk),
+        canonical_role(&alice_state, &bob_pk),
         Role::Controller,
         "Bob must be a Controller before the withdrawal"
     );
@@ -1052,16 +945,12 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
         "withdrawing a role must reset the authoring device's roster tag to member"
     );
     assert_eq!(
-        alice_state.governance_state.read().role_of(&bob_pk),
+        canonical_role(&alice_state, &bob_pk),
         Role::Member,
         "the canonical projection must demote Bob to the default Member role"
     );
     assert!(
-        !alice_state
-            .governance_state
-            .read()
-            .roles
-            .contains_key(&bob_pk),
+        !canonical_has_role(&alice_state, &bob_pk),
         "the revoked Controller cell must no longer project an authority role"
     );
     // ...and Bob stays in the roster — a withdraw demotes, it doesn't remove.
@@ -1230,11 +1119,7 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     );
     // Her own roster view keeps whatever she had; the flag is what stands
     // her down — and the signed logs she adopted agree she is out.
-    let verdict = {
-        let gov = carol_state.governance_state.read();
-        network_state::member_log_removed(&gov, &gov.member_log, network_id)
-            .contains(carol_id.public_id())
-    };
+    let verdict = !canonical_has_role(&carol_state, carol_id.public_id());
     assert!(
         verdict,
         "carol's own adopted (verified) state must carry her eviction"
@@ -1310,16 +1195,8 @@ async fn two_owners_converge_their_rosters() {
         "both governance views make bob an owner",
         Duration::from_secs(10),
         || {
-            alice_state
-                .governance_state
-                .read()
-                .role_of(bob_id.public_id())
-                == Role::Owner
-                && bob_state
-                    .governance_state
-                    .read()
-                    .role_of(bob_id.public_id())
-                    == Role::Owner
+            canonical_role(&alice_state, bob_id.public_id()) == Role::Owner
+                && canonical_role(&bob_state, bob_id.public_id()) == Role::Owner
         },
     )
     .await;
@@ -1350,7 +1227,7 @@ async fn two_owners_converge_their_rosters() {
         "the two owners must author distinct content-derived canonical facts"
     );
 
-    // The union-merged member log must converge: BOTH owners end up holding BOTH
+    // Canonical fact exchange must converge: BOTH owners end up holding BOTH
     // members. This is the "rosters never converge between the two owners"
     // symptom turned into a passing assertion.
     wait_for_two_owner_rosters(
@@ -1370,67 +1247,39 @@ async fn two_owners_converge_their_rosters() {
         "Bob must see the member Alice admitted"
     );
     assert_eq!(
-        alice_state
-            .governance_state
-            .read()
-            .role_of(carol_id.public_id()),
+        canonical_role(&alice_state, carol_id.public_id()),
         Role::Member,
         "Alice's local canonical fact must project Carol locally"
     );
     assert!(
-        alice_state
-            .governance_state
-            .read()
-            .roles
-            .contains_key(carol_id.public_id()),
+        canonical_has_role(&alice_state, carol_id.public_id()),
         "Alice's canonical role map must contain Carol"
     );
     assert_eq!(
-        bob_state
-            .governance_state
-            .read()
-            .role_of(dave_id.public_id()),
+        canonical_role(&bob_state, dave_id.public_id()),
         Role::Member,
         "Bob's local canonical fact must project Dave locally"
     );
     assert!(
-        bob_state
-            .governance_state
-            .read()
-            .roles
-            .contains_key(dave_id.public_id()),
+        canonical_has_role(&bob_state, dave_id.public_id()),
         "Bob's canonical role map must contain Dave"
     );
     assert_eq!(
-        alice_state
-            .governance_state
-            .read()
-            .role_of(dave_id.public_id()),
+        canonical_role(&alice_state, dave_id.public_id()),
         Role::Member,
         "Bob's remote canonical fact must reach Alice's role projection"
     );
     assert!(
-        alice_state
-            .governance_state
-            .read()
-            .roles
-            .contains_key(dave_id.public_id()),
+        canonical_has_role(&alice_state, dave_id.public_id()),
         "Alice's canonical role map must contain Bob's remote Dave grant"
     );
     assert_eq!(
-        bob_state
-            .governance_state
-            .read()
-            .role_of(carol_id.public_id()),
+        canonical_role(&bob_state, carol_id.public_id()),
         Role::Member,
         "Alice's remote canonical fact must reach Bob's role projection"
     );
     assert!(
-        bob_state
-            .governance_state
-            .read()
-            .roles
-            .contains_key(carol_id.public_id()),
+        canonical_has_role(&bob_state, carol_id.public_id()),
         "Bob's canonical role map must contain Alice's remote Carol grant"
     );
     assert_eq!(
@@ -1453,7 +1302,7 @@ async fn two_owners_converge_their_rosters() {
 // ---- helpers --------------------------------------------------------
 
 #[tokio::test]
-async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
+async fn local_topology_control_does_not_enter_canonical_governance() {
     let broker = LocalBroker::new();
     let transport = support::test_transport();
 
@@ -1494,51 +1343,42 @@ async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
         hubs: vec![alice_id.public_id().to_string()],
         spoke_redundancy: Some(1),
     };
-    myownmesh_core::engine::governance::propose(
-        &alice_state,
-        TransitionVariant::TopologyChange {
-            to: governed.clone(),
-        },
-        None,
-    )
-    .await
-    .expect("topology proposal");
+    assert!(
+        alice_state
+            .cmd_tx
+            .send(myownmesh_core::engine::NetworkCmd::SetTopology(
+                governed.clone(),
+            ))
+            .is_ok(),
+        "send local topology set"
+    );
 
     // Both governance views AND both runtime selectors converge — Bob
     // never signs anything; adopting the extended log reshapes him.
     wait_for(
-        "both views and both selectors take the topology",
+        "alice's local selector takes the topology",
         Duration::from_secs(10),
-        || {
-            alice_state.governance_state.read().topology.as_ref() == Some(&governed)
-                && bob_state.governance_state.read().topology.as_ref() == Some(&governed)
-                && *alice_state.topology.read() == governed
-                && *bob_state.topology.read() == governed
-        },
+        || *alice_state.topology.read() == governed,
     )
     .await;
 
     // The governed log re-verifies from scratch — what a third node
     // joining later replays to learn the shape with zero prior trust.
-    network_state::verify_log(network_id, &alice_state.governance_state.read().transitions)
-        .expect("governed log re-verifies standalone");
-
     // Backstop: a manual local SetTopology on a governed network is
     // ignored — one device can't fork itself off the owner's shape.
     assert!(
-        bob_state
-            .cmd_tx
-            .send(myownmesh_core::engine::NetworkCmd::SetTopology(
-                TopologyMode::FullMesh,
-            ))
-            .is_ok(),
-        "send local set"
+        *bob_state.topology.read() != governed,
+        "a local topology policy must not reshape a different node"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
-        *bob_state.topology.read(),
-        governed,
-        "local topology set must not override the governed shape"
+        canonical_snapshot(&alice_state).topology,
+        None,
+        "local topology policy must not enter canonical governance"
+    );
+    assert_eq!(
+        canonical_snapshot(&bob_state).topology,
+        None,
+        "canonical governance must not carry a signed topology"
     );
     shutdown_drivers([
         (alice_state.clone(), alice_driver),
@@ -1633,38 +1473,26 @@ async fn wait_for_two_owner_rosters(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let alice_carol = {
-        let gov = alice.governance_state.read();
-        (
-            gov.roles.contains_key(carol),
-            gov.role_of(carol),
-            rostered(alice, carol),
-        )
-    };
-    let alice_dave = {
-        let gov = alice.governance_state.read();
-        (
-            gov.roles.contains_key(dave),
-            gov.role_of(dave),
-            rostered(alice, dave),
-        )
-    };
-    let bob_carol = {
-        let gov = bob.governance_state.read();
-        (
-            gov.roles.contains_key(carol),
-            gov.role_of(carol),
-            rostered(bob, carol),
-        )
-    };
-    let bob_dave = {
-        let gov = bob.governance_state.read();
-        (
-            gov.roles.contains_key(dave),
-            gov.role_of(dave),
-            rostered(bob, dave),
-        )
-    };
+    let alice_carol = (
+        canonical_has_role(alice, carol),
+        canonical_role(alice, carol),
+        rostered(alice, carol),
+    );
+    let alice_dave = (
+        canonical_has_role(alice, dave),
+        canonical_role(alice, dave),
+        rostered(alice, dave),
+    );
+    let bob_carol = (
+        canonical_has_role(bob, carol),
+        canonical_role(bob, carol),
+        rostered(bob, carol),
+    );
+    let bob_dave = (
+        canonical_has_role(bob, dave),
+        canonical_role(bob, dave),
+        rostered(bob, dave),
+    );
     panic!(
         concat!(
             "two-owner roster wait timed out within {:?}; ",
@@ -1676,6 +1504,18 @@ async fn wait_for_two_owner_rosters(
 }
 
 /// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
+fn canonical_snapshot(state: &Arc<NetworkState>) -> CanonicalNetworkState {
+    myownmesh_core::engine::governance::snapshot(state)
+}
+
+fn canonical_role(state: &Arc<NetworkState>, id: &str) -> Role {
+    canonical_snapshot(state).role_of(id)
+}
+
+fn canonical_has_role(state: &Arc<NetworkState>, id: &str) -> bool {
+    canonical_snapshot(state).roles.contains_key(id)
+}
+
 fn rostered(state: &Arc<NetworkState>, id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), id)
 }

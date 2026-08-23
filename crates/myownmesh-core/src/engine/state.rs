@@ -32,6 +32,10 @@ use tokio::task::JoinHandle;
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
 
+pub(crate) type AttemptSettlement = Arc<
+    dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
+>;
+
 /// Internal driver work for reducing one authenticated candidate.
 ///
 /// Kept out of [`NetworkCmd`]: neither the exact worker pointer nor candidate
@@ -198,6 +202,20 @@ pub enum NetworkCmd {
         device_id: String,
         reason: DropReason,
     },
+    /// A Nostr provider refused this exact outbound attempt before it could
+    /// enter the driver's live delivery map.  The owner token is captured at
+    /// refusal routing time; the command must never re-resolve by device id.
+    AttemptRefused {
+        owner: super::peer_registry::PeerOwnerToken,
+        refusal: myownmesh_signaling::AttemptRefusal,
+    },
+    /// An authoritative terminal emitted by the provider-owned Nostr store.
+    /// The owner token and attempt are both rechecked by the engine handler;
+    /// stale outcomes are discarded and never settle a successor.
+    AttemptOutcome {
+        owner: super::peer_registry::PeerOwnerToken,
+        outcome: myownmesh_signaling::AttemptOutcome,
+    },
     /// Manually triggered in-place reconnect — the non-destructive twin of a
     /// leave-then-rejoin. `peer == None` reconnects the whole network (redial
     /// signaling + renegotiate ICE with every peer); `peer == Some(id)`
@@ -290,40 +308,6 @@ pub enum NetworkCmd {
         mfa_code: Option<String>,
         reply: oneshot::Sender<Result<crate::semantic::FactId>>,
     },
-    /// Sign an existing pending proposal. Verifies the local user
-    /// has authority for the variant + that the proposal hasn't
-    /// already been signed by this device, then signs and
-    /// broadcasts a `NetworkStateAck { decision: Sign }`. If the
-    /// signature satisfies the quorum, the engine ratifies the
-    /// transition in the same step.
-    SignProposal {
-        proposal_id: crate::semantic::FactId,
-        /// Per-device custody second factor (see `ProposeTransition`).
-        mfa_code: Option<String>,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Deny a pending proposal. Any single deny invalidates the
-    /// proposal — the engine drops it from pending and broadcasts
-    /// the signed deny.
-    DenyProposal {
-        proposal_id: crate::semantic::FactId,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Withdraw a proposal the local device floated. No
-    /// broadcast — peers see the proposal disappear via the
-    /// next `NetworkState` snapshot.
-    WithdrawProposal {
-        proposal_id: crate::semantic::FactId,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Proposer-initiated split fallback. Spawns a derived closed
-    /// network from the signers the proposer has so far. Reply
-    /// carries the derived `network_id` so the caller can join
-    /// the new network straight away.
-    SpawnSplit {
-        proposal_id: crate::semantic::FactId,
-        reply: oneshot::Sender<Result<String>>,
-    },
     /// Snapshot of the current governance state. Used by the
     /// control protocol to surface live state to the GUI.
     GovernanceSnapshot {
@@ -353,6 +337,40 @@ impl ResourceMailboxItem for NetworkCmd {
                     | DropReason::HeartbeatTimeout => None,
                 };
                 strings_measure([Some(device_id.as_str()), reason].into_iter().flatten())?
+            }
+            Self::AttemptRefused { refusal, .. } => {
+                let reason = match &refusal.refusal {
+                    myownmesh_signaling::NegotiationRefusal::DuplicateLiveEvent => None,
+                    myownmesh_signaling::NegotiationRefusal::Provider(reason) => {
+                        Some(reason.as_str())
+                    }
+                };
+                strings_measure(
+                    [
+                        Some(refusal.attempt.as_str()),
+                        Some(refusal.event_id.as_str()),
+                        reason,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )?
+            }
+            Self::AttemptOutcome { outcome, .. } => {
+                let reason = match &outcome.kind {
+                    myownmesh_signaling::AttemptOutcomeKind::TypedRefused(reason) => {
+                        Some(reason.as_str())
+                    }
+                    _ => None,
+                };
+                strings_measure(
+                    [
+                        Some(outcome.attempt.as_str()),
+                        Some(outcome.event_id.as_str()),
+                        reason,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )?
             }
             Self::Reconnect { peer } => strings_measure(peer.iter().map(String::as_str))?,
             Self::SendChannelReliable {
@@ -387,19 +405,6 @@ impl ResourceMailboxItem for NetworkCmd {
                 mailbox_measure_serialized(variant)?,
                 strings_measure(mfa_code.iter().map(String::as_str))?,
             )?,
-            Self::SignProposal {
-                proposal_id,
-                mfa_code,
-                ..
-            } => checked_measure_add(
-                strings_measure([proposal_id.to_string().as_str()])?,
-                strings_measure(mfa_code.iter().map(String::as_str))?,
-            )?,
-            Self::DenyProposal { proposal_id, .. }
-            | Self::WithdrawProposal { proposal_id, .. }
-            | Self::SpawnSplit { proposal_id, .. } => {
-                strings_measure([proposal_id.to_string().as_str()])?
-            }
         };
         // Channel/Arc-backed effects are opaque dependency allocations, not OS
         // sockets or handles. The payload walk above counts its own allocations;
@@ -409,6 +414,7 @@ impl ResourceMailboxItem for NetworkCmd {
             // payload the walk above already measured.
             Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
             Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
+            Self::AttemptRefused { .. } | Self::AttemptOutcome { .. } => 1,
             Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
             Self::ApproveRoster { .. }
             | Self::RemoveRoster { .. }
@@ -417,10 +423,6 @@ impl ResourceMailboxItem for NetworkCmd {
             | Self::BroadcastChannelFrame { .. }
             | Self::SendRpcRequest { .. }
             | Self::ProposeTransition { .. }
-            | Self::SignProposal { .. }
-            | Self::DenyProposal { .. }
-            | Self::WithdrawProposal { .. }
-            | Self::SpawnSplit { .. }
             | Self::GovernanceSnapshot { .. } => 1,
         };
         let allocations = measure.2.checked_add(effect_allocations).ok_or(
@@ -707,6 +709,11 @@ pub struct NetworkState {
     /// fails without it: releasing early is an optimization over waiting for
     /// provider pressure, so an unattached network simply has nothing to tell.
     signaling_runtime: parking_lot::RwLock<Option<Arc<super::signaling_ingress::SignalingRuntime>>>,
+    /// Exact Nostr delivery settlement for this network's current driver.
+    /// The bridge installs a closure over the retained driver handle; engine
+    /// lifecycle code supplies only the exact attempt correlation and terminal
+    /// outcome, never a device-id fallback.
+    attempt_settlement: Mutex<Option<AttemptSettlement>>,
     pub cmd_tx: ResourceMailboxSender<NetworkCmd>,
     pub(super) speculative_promotion_tx: ResourceMailboxSender<SpeculativePromotionCmd>,
     speculative_promotion_rx: Mutex<Option<ResourceMailboxReceiver<SpeculativePromotionCmd>>>,
@@ -736,6 +743,17 @@ pub struct NetworkState {
     /// peer's announce); the state-watch tick is the backstop that retries
     /// on a backoff for the cases no event covers.
     pub reconnect_intents: Mutex<std::collections::HashMap<String, ReconnectIntent>>,
+
+    /// Provider-owned answerer recovery demands whose logical session record
+    /// has already been retired.  The owner token is retained with the
+    /// handle, so a replacement installation can never settle or cancel an
+    /// older demand by device id alone.
+    pub(crate) pending_recovery_demands: Mutex<
+        Vec<(
+            PeerOwnerToken,
+            crate::runtime::peer_session::RecoveryDemandHandle,
+        )>,
+    >,
 
     /// Peers this node maintains a standing dial for (config
     /// `pinned_peers` plus runtime `connect_peer(…, sticky)`). On a
@@ -1038,51 +1056,40 @@ impl NetworkState {
             config.pinned_peers.iter().cloned().collect();
         let persistence_root = instance_root.as_deref();
         let roster = crate::roster::load_at(persistence_root, &config.network_id)?;
-        // Load (or initialise) the per-network signed state log. If
-        // the config requests Closed kind but the on-disk log says
-        // Open (or vice-versa), the on-disk log wins — kind is
-        // authoritatively a signed-state property, not a config one.
-        // The config field only seeds new networks at first attach.
-        // Keep the legacy projection only as a compatibility mirror for the
-        // current peer-policy compiler. Its policy shape and initial root are
-        // derived from the verified bootstrap, never from config or the local
-        // identity. No local founder transition is minted or persisted here.
-        let mut governance_state =
-            crate::network_state::load_at(persistence_root, &config.network_id)?;
-        governance_state.kind = if bootstrap_is_closed {
+        // The legacy NetworkState is a derived compatibility snapshot only.
+        // Never load its transitions, member log, pending proposals, or split
+        // records as authority. Canonical bootstrap policy supplies the kind
+        // and initial root role; Silent remains a local transport behavior on
+        // the verified Open semantic profile.
+        let governance_kind = if bootstrap_is_closed {
             crate::network_state::NetworkKind::Closed
-        } else if matches!(config.kind, crate::network_state::NetworkKind::Silent) {
-            // Silent is a local transport behavior layered on the verified
-            // Open semantic profile; it is not a second authority shape.
-            crate::network_state::NetworkKind::Silent
         } else {
             crate::network_state::NetworkKind::Open
         };
-        governance_state.roles.clear();
+        let mut governance_roles = std::collections::BTreeMap::new();
         if let crate::semantic::VerifiedProjectPolicy::Closed(policy) = verified_bootstrap.policy()
         {
-            governance_state.roles.insert(
+            governance_roles.insert(
                 policy.authority_root().to_string(),
                 crate::network_state::Role::Owner,
             );
         }
-        // Topology has the same precedence as kind: a ratified
-        // `TopologyChange` in the signed log outranks whatever the
-        // local config says; the config value only shapes networks
-        // governance hasn't spoken for.
-        let effective_topology = governance_state
-            .topology
-            .clone()
-            .unwrap_or_else(|| config.topology.clone());
+        let governance_state = crate::network_state::NetworkState::from_canonical_projection(
+            &config.network_id,
+            governance_kind,
+            governance_roles,
+        );
+        // Topology is connector/deployment policy, not a canonical
+        // authority-bearing fact. It therefore remains local configuration.
+        let effective_topology = config.topology.clone();
         let topology_impl = crate::topology::from_mode(&effective_topology);
         let (events_tx, _) = broadcast::channel(256);
         // Deep enough to ride out a transition storm (a sleep/wake
         // fan-out re-handshaking every peer) without the watcher lagging;
         // lossy past that, with a `lagged` marker surfaced to the stream.
         let (conn_trace_tx, _) = broadcast::channel(512);
-        let conn_trace_force_on = std::env::var("MYOWNMESH_CONN_TRACE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
+        let conn_trace_force_on =
+            std::env::var("MYOWNMESH_CONN_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
         let (signaling_tx, signaling_outbound_rx) =
             crate::resource::resource_mailbox(local_resources.child()?)?;
         let (cmd_tx, cmd_rx) = crate::resource::resource_mailbox(local_resources.child()?)?;
@@ -1107,7 +1114,7 @@ impl NetworkState {
             config: RwLock::new(config.clone()),
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
-            peers: PeerRegistry::new(Arc::clone(&governance_state), local_device_id),
+            peers: PeerRegistry::new(local_device_id),
             roster: RwLock::new(roster),
             governance_state,
             fact_graph,
@@ -1120,6 +1127,7 @@ impl NetworkState {
             signaling_tx,
             signaling_inbound_tx,
             signaling_runtime: parking_lot::RwLock::new(None),
+            attempt_settlement: Mutex::new(None),
             cmd_tx,
             speculative_promotion_tx,
             speculative_promotion_rx: Mutex::new(Some(speculative_promotion_rx)),
@@ -1130,6 +1138,7 @@ impl NetworkState {
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
+            pending_recovery_demands: Mutex::new(Vec::new()),
             sticky_peers: Mutex::new(pinned),
             self_evicted: std::sync::atomic::AtomicBool::new(false),
             traffic: super::traffic::TrafficCounters::default(),
@@ -1161,6 +1170,10 @@ impl NetworkState {
         // here because this is the one place that owns both the registry and the
         // queue; the registry cannot construct it and the driver cannot reach
         // inside the fence.
+        state.peers.bind_canonical_authority(
+            state.verified_bootstrap().clone(),
+            state.authoritative_fact_graph(),
+        );
         state.peers.bind_command_sink(state.cmd_tx.clone());
         state
             .peers
@@ -1624,6 +1637,23 @@ impl NetworkState {
         self.signaling_runtime.read().clone()
     }
 
+    pub(crate) fn set_attempt_settlement(&self, settlement: AttemptSettlement) {
+        *self.attempt_settlement.lock() = Some(settlement);
+    }
+
+    pub(crate) fn clear_attempt_settlement(&self) {
+        self.attempt_settlement.lock().take();
+    }
+
+    pub(crate) fn settle_attempt(
+        &self,
+        attempt: &str,
+        terminal: myownmesh_signaling::nostr::delivery::DeliveryTerminal,
+    ) -> usize {
+        let settlement = self.attempt_settlement.lock().clone();
+        settlement.map_or(0, |settlement| settlement(attempt, terminal))
+    }
+
     pub(crate) fn take_signaling_outbound_rx(
         self: &Arc<Self>,
     ) -> Option<ResourceMailboxReceiver<SignalingOutbound>> {
@@ -1737,6 +1767,95 @@ impl NetworkState {
         self.reconnect_intents.lock().contains_key(device_id)
     }
 
+    fn same_recovery_owner(left: &PeerOwnerToken, right: &PeerOwnerToken) -> bool {
+        if !Arc::ptr_eq(left.connection(), right.connection()) {
+            return false;
+        }
+        match (left.worker(), right.worker()) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Publish one exact-owner demand after its terminal mutation succeeds.
+    /// Repeated publication of the same owner coalesces without replacing the
+    /// shared handle or releasing its lease.
+    pub(crate) fn retain_recovery_demand(
+        &self,
+        owner: PeerOwnerToken,
+        demand: crate::runtime::peer_session::RecoveryDemandHandle,
+    ) {
+        let mut pending = self.pending_recovery_demands.lock();
+        if let Some((_, existing)) = pending
+            .iter_mut()
+            .find(|(existing, _)| Self::same_recovery_owner(existing, &owner))
+        {
+            *existing = demand;
+        } else {
+            pending.push((owner, demand));
+        }
+    }
+
+    /// Remove a demand only when its process-local owner token is identical.
+    pub(crate) fn take_recovery_demand(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Option<crate::runtime::peer_session::RecoveryDemandHandle> {
+        let mut pending = self.pending_recovery_demands.lock();
+        let index = pending
+            .iter()
+            .position(|(existing, _)| Self::same_recovery_owner(existing, owner))?;
+        Some(pending.swap_remove(index).1)
+    }
+
+    /// Snapshot demands for the event/tick service without retaining the map
+    /// lock across provider work or an async engine operation.
+    pub(crate) fn recovery_demands_snapshot(
+        &self,
+    ) -> Vec<(
+        PeerOwnerToken,
+        crate::runtime::peer_session::RecoveryDemandHandle,
+    )> {
+        self.pending_recovery_demands.lock().clone()
+    }
+
+    /// A usable replacement for this device supersedes every older exact
+    /// demand.  The removal is keyed by device only for cancellation; no
+    /// device lookup is used to settle a terminal demand.
+    pub(crate) fn cancel_recovery_demands_for_device(&self, device_id: &str) {
+        let demands = {
+            let mut pending = self.pending_recovery_demands.lock();
+            let mut cancelled = Vec::new();
+            let mut index = 0;
+            while index < pending.len() {
+                if pending[index].0.device_id() == device_id {
+                    cancelled.push(pending.swap_remove(index).1);
+                } else {
+                    index += 1;
+                }
+            }
+            cancelled
+        };
+        for demand in demands {
+            demand.cancel();
+        }
+    }
+
+    /// Shutdown owns all remaining provider custody and releases it exactly
+    /// once, outside the pending-map lock.
+    pub(crate) fn cancel_all_recovery_demands(&self) {
+        let demands = self
+            .pending_recovery_demands
+            .lock()
+            .drain(..)
+            .map(|(_, demand)| demand)
+            .collect::<Vec<_>>();
+        for demand in demands {
+            demand.cancel();
+        }
+    }
+
     /// Intent ids whose backoff is due now. Drops expired intents (past the
     /// reconnecting grace) and advances the backoff of the ones returned, so
     /// the state-watch tick re-offers each at most once per backoff step.
@@ -1833,12 +1952,10 @@ impl NetworkState {
         let now = std::time::Instant::now();
         {
             let mut guard = self.last_relay_rescue_at.lock();
-            let due = guard
-                .map(|prev| {
-                    now.duration_since(prev)
-                        >= std::time::Duration::from_millis(RELAY_RESCUE_MIN_INTERVAL_MS)
-                })
-                .unwrap_or(true);
+            let due = guard.is_none_or(|prev| {
+                now.duration_since(prev)
+                    >= std::time::Duration::from_millis(RELAY_RESCUE_MIN_INTERVAL_MS)
+            });
             if !due {
                 return false;
             }
@@ -2594,11 +2711,15 @@ impl NetworkState {
     /// uses this form while holding the exact peer-installation fence so a
     /// replacement cannot land between owner validation and persistence.
     pub(super) fn approve_roster_now(&self, device_id: &str, label: &str) -> Result<()> {
-        if !super::governance::current_policy_admits(
-            &self.governance_state.read(),
+        let graph = self.fact_graph.read();
+        let admitted = super::governance::canonical_policy_admits_from(
+            &self.verified_bootstrap,
+            &graph,
             self.identity.public_id(),
             device_id,
-        ) {
+        );
+        drop(graph);
+        if !admitted {
             return Err(Error::Network(
                 "Closed membership requires a signed governance grant".into(),
             ));
@@ -2608,29 +2729,6 @@ impl NetworkState {
         // rostered by ANY path — not mutual-ACTIVE persistence, not a
         // manual approve from a stale UI. Re-admission is a signed member
         // grant (the owner re-claiming it), which flips the verdict first.
-        {
-            let gov = self.governance_state.read();
-            if !gov.kind.is_open_governance() {
-                let pubkey = crate::signing::pubkey_part(device_id).to_string();
-                let evicted = !matches!(
-                    gov.roles.get(&pubkey),
-                    Some(crate::network_state::Role::Owner)
-                        | Some(crate::network_state::Role::Controller)
-                ) && crate::network_state::member_log_removed(
-                    &gov,
-                    &gov.member_log,
-                    &self.network_id,
-                )
-                .contains(&pubkey);
-                if evicted {
-                    return Err(Error::Network(
-                        "this device was evicted by the network's signed governance — \
-                         re-admit it by signing it back in (re-claim), not by approving"
-                            .into(),
-                    ));
-                }
-            }
-        }
         let mut roster = self.roster.write();
         crate::roster::add_peer_in(&mut roster, device_id, label);
         crate::roster::save(&roster)?;
@@ -2720,12 +2818,17 @@ impl NetworkState {
     /// driver's shutdown path.
     pub(crate) async fn shutdown(&self) {
         self.request_shutdown();
+        self.cancel_all_recovery_demands();
         // Keep the published runtime alive while every retired connector has
         // finished releasing its exact de-duplication custody.  The field is
         // cleared only after this is the last shutdown consumer of it.
         let runtime = self.signaling_runtime();
         let retired = self.peers.retire_all();
         for peer in &retired {
+            self.settle_attempt(
+                &peer.attempt(),
+                myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+            );
             if let Err(error) = peer.retire_and_close().await {
                 tracing::warn!(%error, peer = %peer.device_id, "peer cleanup failed during shutdown");
             }
@@ -2739,6 +2842,7 @@ impl NetworkState {
         drop(retired);
         drop(runtime);
         self.signaling_runtime.write().take();
+        self.clear_attempt_settlement();
         for forwarder in self.take_local_signaling_forwarders() {
             if let Err(error) = forwarder.await {
                 tracing::warn!(%error, "local signaling forwarder failed during shutdown");
@@ -2945,15 +3049,14 @@ impl NetworkState {
         }
     }
 
-    /// True when this network's governance kind is `Silent`. The load-bearing
+    /// True when this network uses local `Silent` connection policy. The load-bearing
     /// predicate for the two Silent behaviours: the engine suppresses
     /// auto-dial-on-presence (see `handle_signaling_inbound`) and roster
-    /// gossip (see [`super::governance::broadcast_roster_summary`]). Read off
-    /// the authoritative signed-state kind, which is seeded from
-    /// `NetworkConfig.kind` at attach.
+    /// gossip (see [`super::governance::broadcast_roster_summary`]). This is
+    /// not a durable semantic governance kind.
     pub fn is_silent(&self) -> bool {
         matches!(
-            self.governance_state.read().kind,
+            self.config.read().kind,
             crate::network_state::NetworkKind::Silent
         )
     }
@@ -2976,8 +3079,7 @@ pub(crate) fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]

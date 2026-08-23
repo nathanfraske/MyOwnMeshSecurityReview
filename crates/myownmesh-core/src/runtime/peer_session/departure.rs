@@ -140,6 +140,7 @@ impl DepartureWaiter {
 pub(crate) struct DepartureState {
     pending: Option<PendingDeparture>,
     remote_terminal: bool,
+    recovery: super::recovery::RecoveryDemandState,
 }
 
 impl DepartureState {
@@ -147,6 +148,7 @@ impl DepartureState {
         Self {
             pending: None,
             remote_terminal: false,
+            recovery: super::recovery::RecoveryDemandState::new(),
         }
     }
 
@@ -202,14 +204,13 @@ impl DepartureState {
     /// Mark the one matching local receipt observed.  The lease is dropped
     /// only after the exact correlation has won the state transition.
     pub(crate) fn observe_local(&mut self, correlation: &DepartureCorrelation) -> bool {
-        let matches = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| &pending.correlation == correlation);
-        if !matches {
+        let Some(pending) = self.pending.take() else {
+            return false;
+        };
+        if pending.correlation != *correlation {
+            self.pending = Some(pending);
             return false;
         }
-        let pending = self.pending.take().expect("matching pending departure");
         if !pending.observation.observed() {
             self.pending = Some(pending);
             return false;
@@ -227,19 +228,35 @@ impl DepartureState {
             return false;
         }
         self.remote_terminal = true;
+        self.recovery.mark_terminal();
         true
+    }
+
+    pub(crate) fn arm_recovery(
+        &mut self,
+        validity: &LogicalSessionValidityWitness,
+    ) -> Result<super::recovery::RecoveryDemandAdmission, super::recovery::RecoveryDemandError>
+    {
+        self.recovery.arm(validity)
+    }
+
+    pub(crate) fn cancel_recovery_for_shutdown(&mut self) -> bool {
+        self.recovery.cancel_for_shutdown()
+    }
+
+    pub(crate) fn cancel_recovery_for_usable_successor(&mut self) -> bool {
+        self.recovery.cancel_for_usable_successor()
     }
 
     /// Cancel only the local observation carried by this exact connector.
     pub(crate) fn cancel_for_carrier(&mut self, carrier: DepartureCarrier) -> bool {
-        let matches = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.carrier.same(&carrier));
-        if !matches {
+        let Some(pending) = self.pending.take() else {
+            return false;
+        };
+        if !pending.carrier.same(&carrier) {
+            self.pending = Some(pending);
             return false;
         }
-        let pending = self.pending.take().expect("matching pending departure");
         if !pending.observation.cancel() {
             self.pending = Some(pending);
             return false;

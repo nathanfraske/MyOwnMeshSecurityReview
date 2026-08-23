@@ -1,112 +1,56 @@
 //! Engine half of closed-network governance.
 //!
-//! Owns the proposal lifecycle:
+//! Canonical governance ingress and projection.
 //!
-//!   1. **Propose** — the local device floats a transition. The
-//!      engine signs the canonical payload with the local identity,
-//!      appends a `Proposal` to the persisted state's pending list,
-//!      and broadcasts a canonical `Fact` to every active peer.
-//!
-//!   2. **Inbound propose** — a peer's signed proposal arrives. The
-//!      engine verifies the signature (and rejects the frame if it
-//!      fails), then records the proposal in pending. The local
-//!      user surfaces it via the GUI's Approvals tab and chooses
-//!      sign / deny.
-//!
-//!   3. **Sign / deny** — the local device authors an
-//!      signed contribution `Fact`. Sign signatures accumulate; deny is a
-//!      single-shot kill switch. When the accumulated signer set
-//!      satisfies the quorum table for the variant (see
-//!      [`crate::network_state::verify_quorum`]), the engine
-//!      builds the final `Transition`, applies it to the state via
-//!      `apply_transition`, persists, and emits an authoritative
-//!      `NetworkState` broadcast so peers learn the new shape.
-//!
-//!   4. **Withdraw / split** — the proposer can withdraw before
-//!      ratification or, after `STATE_PROPOSAL_TIMEOUT_S`, fire a
-//!      proposer-initiated split that spawns a derived closed
-//!      network from the signers it has.
-//!
-//! All mutations go through here (rather than directly into
-//! `NetworkState.governance_state`) so persistence + ack-emission
-//! stay co-located with the state mutation that motivates them.
+//! Signed V4 facts are admitted into the one bootstrap-bound `FactGraph`,
+//! projected into compatibility snapshots, and broadcast with their exact
+//! content address. Legacy proposal/ratification records remain only as a
+//! read-only migration shape until the external control surface is migrated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::events::DropReason;
-use crate::network_state::{self, NetworkKind, Proposal, Role, Transition, TransitionVariant};
+use crate::network_state::{self, NetworkKind, Role, TransitionVariant};
 use crate::protocol::{
     FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
     RosterEntriesMessage, RosterEntry, RosterRequestMessage, RosterSummaryMessage,
 };
-use crate::semantic::{AttestationDecision, FactBody, FactContent, FactId, SignedFact};
+use crate::semantic::{DeviceId, FactBody, FactContent, FactId, SignedFact};
 
 use super::connection::PeerStatus;
 use super::peer_registry::{LogicalSessionOperation, PeerOwnerToken};
-use super::state::{NetworkCmd, NetworkState as EngineState};
+use super::state::NetworkState as EngineState;
 
 // ---- helpers --------------------------------------------------------
 
-fn now_unix() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+fn canonical_device(value: &str) -> Result<DeviceId> {
+    DeviceId::from_canonical_str(value)
+        .map_err(|error| Error::Other(format!("noncanonical DeviceId: {error}")))
 }
 
-fn fact_body(variant: &TransitionVariant) -> FactBody {
+fn fact_body(variant: &TransitionVariant) -> Result<FactBody> {
     match variant {
-        TransitionVariant::KindChange { to } => FactBody::KindChange {
-            to: match to {
-                NetworkKind::Open => crate::semantic::GovernanceKind::Open,
-                NetworkKind::Closed => crate::semantic::GovernanceKind::Closed,
-                NetworkKind::Silent => crate::semantic::GovernanceKind::Silent,
-            },
-        },
-        TransitionVariant::RoleGrant { target, role } => FactBody::RoleGrant {
-            target: target.clone(),
+        TransitionVariant::RoleGrant { target, role } => Ok(FactBody::RoleGrant {
+            target: canonical_device(target)?,
             role: match role {
                 Role::Member => crate::semantic::Role::Member,
                 Role::Controller => crate::semantic::Role::Controller,
                 Role::Owner => crate::semantic::Role::Owner,
             },
-        },
-        TransitionVariant::RoleRevoke { target } => FactBody::RoleRevoke {
-            target: target.clone(),
-        },
-        TransitionVariant::Evict { target } => FactBody::Evict {
-            target: target.clone(),
-        },
-        TransitionVariant::Split {
-            new_network_id,
-            members,
-        } => FactBody::Split {
-            new_network_id: new_network_id.clone(),
-            members: members.clone(),
-        },
-        TransitionVariant::TopologyChange { to } => FactBody::TopologyChange {
-            to: match to {
-                crate::config::TopologyMode::FullMesh => crate::semantic::Topology::FullMesh,
-                crate::config::TopologyMode::Ring { n_preferred } => {
-                    crate::semantic::Topology::Ring {
-                        preferred: *n_preferred,
-                    }
-                }
-                crate::config::TopologyMode::Star { hub } => {
-                    crate::semantic::Topology::Star { hub: hub.clone() }
-                }
-                crate::config::TopologyMode::Hubs {
-                    hubs,
-                    spoke_redundancy,
-                } => crate::semantic::Topology::Hubs {
-                    hubs: hubs.clone(),
-                    spoke_redundancy: *spoke_redundancy,
-                },
-            },
-        },
+        }),
+        TransitionVariant::RoleRevoke { target } => Ok(FactBody::RoleRevoke {
+            target: canonical_device(target)?,
+        }),
+        TransitionVariant::Evict { target } => Ok(FactBody::Evict {
+            target: canonical_device(target)?,
+        }),
+        TransitionVariant::KindChange { .. }
+        | TransitionVariant::Split { .. }
+        | TransitionVariant::TopologyChange { .. } => Err(Error::Other(
+            "legacy transition is not a canonical V4 durable fact".into(),
+        )),
     }
 }
 
@@ -134,9 +78,9 @@ fn signed_fact(
     SignedFact::sign(
         FactContent::new(
             body.domain(),
-            state.mesh_context_id_string(),
+            state.mesh_context_id(),
             body,
-            state.identity.public_id().to_string(),
+            canonical_device(state.identity.public_id())?,
             parents,
         ),
         state.identity.signing_key(),
@@ -158,17 +102,6 @@ fn admit_authored_fact(state: &Arc<EngineState>, fact: &SignedFact) -> Result<()
     Ok(())
 }
 
-fn parse_fact_id(value: &str) -> Option<FactId> {
-    let bytes = data_encoding::BASE32_NOPAD
-        .decode(value.to_uppercase().as_bytes())
-        .ok()?;
-    (bytes.len() == 32).then(|| {
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&bytes);
-        FactId::from_bytes(raw)
-    })
-}
-
 /// Strip the display suffix (`-XXXXX`) from a Device ID. The
 /// governance store keys everything on the bare pubkey.
 fn pk(device_id: &str) -> String {
@@ -176,6 +109,7 @@ fn pk(device_id: &str) -> String {
 }
 
 /// The single temporary live-policy projection used by every session edge.
+#[cfg(test)]
 pub(super) fn current_policy_admits(
     gov: &network_state::NetworkState,
     local_device_id: &str,
@@ -185,6 +119,72 @@ pub(super) fn current_policy_admits(
         return true;
     }
     gov.roles.contains_key(&pk(local_device_id)) && gov.roles.contains_key(&pk(remote_device_id))
+}
+
+/// Canonical Closed-policy admission for registry fences. The bootstrap roots
+/// and the shared FactGraph are the only authority inputs; compatibility
+/// NetworkState roles/logs are intentionally not consulted.
+pub(super) fn canonical_policy_admits_from(
+    bootstrap: &crate::semantic::VerifiedBootstrap,
+    graph: &crate::semantic::FactGraph,
+    local_device_id: &str,
+    remote_device_id: &str,
+) -> bool {
+    if matches!(
+        bootstrap.policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
+    ) {
+        return true;
+    }
+    let Ok(local) = crate::semantic::DeviceId::from_canonical_str(local_device_id) else {
+        return false;
+    };
+    let Ok(remote) = crate::semantic::DeviceId::from_canonical_str(remote_device_id) else {
+        return false;
+    };
+    let roots = bootstrap.authority_roots();
+    let projection = graph.projection();
+    let role_admits = |device: &crate::semantic::DeviceId| {
+        if projection.is_stood_down(device) {
+            return false;
+        }
+        if !roots.iter().any(|root| root == device) {
+            let cell = crate::semantic::ExclusiveCell::role(device.clone());
+            let Some(id) = projection.value(&cell) else {
+                return false;
+            };
+            let Some(fact) = graph.get(&id) else {
+                return false;
+            };
+            if !matches!(
+                &fact.content.body,
+                crate::semantic::FactBody::RoleGrant { target, role }
+                    if target == device
+                        && matches!(
+                            role,
+                            crate::semantic::Role::Member
+                                | crate::semantic::Role::Controller
+                                | crate::semantic::Role::Owner
+                        )
+            ) {
+                return false;
+            }
+        }
+        let membership = crate::semantic::ExclusiveCell::membership(device.clone());
+        if projection.is_conflicted(&membership) {
+            return false;
+        }
+        projection
+            .value(&membership)
+            .and_then(|id| graph.get(&id))
+            .is_none_or(|fact| {
+                !matches!(
+                    &fact.content.body,
+                    crate::semantic::FactBody::Evict { target } if target == device
+                )
+            })
+    };
+    role_admits(&local) && role_admits(&remote)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,8 +197,6 @@ enum CanonicalRoleProjection {
 
 #[derive(Default)]
 struct CanonicalProjection {
-    kind: Option<NetworkKind>,
-    topology: Option<crate::config::TopologyMode>,
     roles: BTreeMap<String, Role>,
     evicted: BTreeSet<String>,
 }
@@ -232,58 +230,15 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
     let mut result = CanonicalProjection::default();
 
     for root in state.verified_bootstrap().authority_roots().iter() {
-        result.roles.insert(pk(root), Role::Owner);
+        result.roles.insert(root.to_string(), Role::Owner);
     }
 
     for (cell, _) in projection.cells() {
-        if cell.subject == "network" && cell.field == "kind" {
-            if let Some(id) = projection.value(cell) {
-                if let Some(fact) = graph.get(&id) {
-                    if let FactBody::KindChange { to } = &fact.content.body {
-                        result.kind = Some(match to {
-                            crate::semantic::GovernanceKind::Open => NetworkKind::Open,
-                            crate::semantic::GovernanceKind::Closed => NetworkKind::Closed,
-                            crate::semantic::GovernanceKind::Silent => NetworkKind::Silent,
-                        });
-                    }
-                }
-            }
+        let crate::semantic::ExclusiveCell::Role { subject } = cell else {
             continue;
-        }
-        if cell.subject == "network" && cell.field == "topology" {
-            if let Some(id) = projection.value(cell) {
-                if let Some(fact) = graph.get(&id) {
-                    if let FactBody::TopologyChange { to } = &fact.content.body {
-                        result.topology = Some(match to {
-                            crate::semantic::Topology::FullMesh => {
-                                crate::config::TopologyMode::FullMesh
-                            }
-                            crate::semantic::Topology::Ring { preferred } => {
-                                crate::config::TopologyMode::Ring {
-                                    n_preferred: *preferred,
-                                }
-                            }
-                            crate::semantic::Topology::Star { hub } => {
-                                crate::config::TopologyMode::Star { hub: hub.clone() }
-                            }
-                            crate::semantic::Topology::Hubs {
-                                hubs,
-                                spoke_redundancy,
-                            } => crate::config::TopologyMode::Hubs {
-                                hubs: hubs.clone(),
-                                spoke_redundancy: *spoke_redundancy,
-                            },
-                        });
-                    }
-                }
-            }
-            continue;
-        }
-        if cell.field != "role" {
-            continue;
-        }
+        };
 
-        let subject = pk(&cell.subject);
+        let subject = subject.to_string();
         let Some(id) = projection.value(cell) else {
             // A conflict is not a vote for any side.  Remove the cached role
             // so legacy policy cannot accidentally treat a conflicted subject
@@ -312,38 +267,7 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
 
 async fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
     let projection = canonical_projection_snapshot(state);
-    let CanonicalProjection {
-        kind,
-        topology,
-        roles,
-        evicted,
-    } = projection;
-    let (changed, projected_topology) = state.peers.with_governance_commit(|gov| {
-        let mut changed = false;
-        if let Some(kind) = kind {
-            if gov.kind != kind {
-                gov.kind = kind;
-                changed = true;
-            }
-        }
-        if gov.roles != roles {
-            gov.roles = roles.clone();
-            changed = true;
-        }
-        let topology_changed = topology
-            .as_ref()
-            .filter(|topology| gov.topology.as_ref() != Some(*topology))
-            .cloned();
-        if let Some(topology) = &topology_changed {
-            gov.topology = Some(topology.clone());
-            changed = true;
-        }
-        if changed {
-            let _ = network_state::save(gov);
-        }
-        (changed, topology.clone())
-    });
-
+    let CanonicalProjection { roles, evicted } = projection;
     let roster_changed = {
         let mut roster = state.roster.write();
         let mut changed = false;
@@ -372,18 +296,9 @@ async fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
         }
         changed
     };
-    if let Some(topology) = projected_topology {
-        let runtime_changed = {
-            let current = state.topology.read();
-            *current != topology
-        };
-        if runtime_changed {
-            *state.topology.write() = topology.clone();
-            *state.topology_impl.write() = crate::topology::from_mode(&topology);
-            super::ladder::reevaluate_topology(state).await;
-        }
-    }
-    changed || roster_changed
+    // The NetworkState compatibility object is deliberately not rewritten:
+    // callers that need a snapshot derive it from this graph projection.
+    roster_changed
 }
 
 /// Iterate active peers — those whose data channel is ACTIVE +
@@ -637,18 +552,33 @@ fn diag(state: &Arc<EngineState>, level: crate::events::DiagLevel, msg: impl Int
 
 // ---- snapshot -------------------------------------------------------
 
-/// Read-only copy of the current governance state — kind, roles,
-/// transitions, pending proposals, splits. Used by the control
-/// protocol to surface live state to clients.
+/// Read-only compatibility snapshot derived from the bootstrap policy and the
+/// canonical FactGraph projection. Legacy transitions and pending proposals
+/// are intentionally absent from this view.
 pub fn snapshot(state: &Arc<EngineState>) -> network_state::NetworkState {
-    state.governance_state.read().clone()
+    let kind = if matches!(
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Closed(_)
+    ) {
+        NetworkKind::Closed
+    } else if state.config.read().kind == NetworkKind::Silent {
+        NetworkKind::Silent
+    } else {
+        NetworkKind::Open
+    };
+    network_state::NetworkState::from_canonical_projection(
+        &state.network_id,
+        kind,
+        canonical_projection_snapshot(state).roles,
+    )
 }
 
 // ---- local proposals ------------------------------------------------
 
 /// Float a new signed transition from this device. Signs with the
 /// local identity, persists to pending, broadcasts to peers.
-pub async fn propose(
+#[cfg(any())]
+async fn legacy_propose(
     state: &Arc<EngineState>,
     variant: TransitionVariant,
     mfa_code: Option<&str>,
@@ -680,13 +610,13 @@ pub async fn propose(
             })
             .unwrap_or(false);
         if gov.roles.get(target).copied() == Some(*role) && signed_member {
-            let body = fact_body(&variant);
+            let body = fact_body(&variant)?;
             let parents = causal_parents(state, &body, Vec::new());
             let content = FactContent::new(
                 body.domain(),
-                state.mesh_context_id_string(),
+                state.mesh_context_id(),
                 body,
-                state.identity.public_id().to_string(),
+                canonical_device(state.identity.public_id())?,
                 parents,
             );
             return Ok(FactId::from_content(&content));
@@ -701,7 +631,7 @@ pub async fn propose(
     let signature =
         network_state::sign_transition(&state.network_id, &variant, state.identity.signing_key());
     let created_at = member_tier_timestamp(state, &variant);
-    let fact = signed_fact(state, fact_body(&variant), Vec::new())?;
+    let fact = signed_fact(state, fact_body(&variant)?, Vec::new())?;
     admit_authored_fact(state, &fact)?;
     broadcast_fact_inventory(state).await;
     let _ = apply_canonical_projection(state).await;
@@ -760,7 +690,7 @@ pub async fn propose(
                     TransitionVariant::RoleGrant {
                         target: entry_target,
                         role: Role::Member,
-                    } if entry_target == target
+                    } if entry_target == target.as_ref()
                 )
             });
         if committed {
@@ -771,6 +701,34 @@ pub async fn propose(
     }
 
     Ok(fact_id)
+}
+
+/// Author and broadcast one canonical governance fact. Compatibility state is
+/// projected only after graph admission; it never creates a proposal or a
+/// legacy transition entry.
+pub async fn propose(
+    state: &Arc<EngineState>,
+    variant: TransitionVariant,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    crate::custody::require(&state.network_id, mfa_code)?;
+    let fact = signed_fact(state, fact_body(&variant)?, Vec::new())?;
+    admit_authored_fact(state, &fact)?;
+    let _ = apply_canonical_projection(state).await;
+    broadcast_fact_inventory(state).await;
+    broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    broadcast_state(state).await;
+
+    if let FactBody::RoleGrant { target, role } = &fact.content.body {
+        if *role == crate::semantic::Role::Member
+            && canonical_projection_snapshot(state).roles.get(&pk(target)) == Some(&Role::Member)
+        {
+            if let Some(owner) = send_pending_role_grant(state, target, &fact).await {
+                super::handshake::reevaluate_after_role_grant(state, &owner).await;
+            }
+        }
+    }
+    Ok(fact.id)
 }
 
 /// The wire announcement for a proposal this device just filed.
@@ -799,7 +757,8 @@ pub async fn propose(
 /// re-sign — a no-op if the local pubkey is already in the signer
 /// list). Broadcasts the signed ack. If the signature satisfies the
 /// quorum, ratifies the transition in the same step.
-pub async fn sign_proposal(
+#[cfg(any())]
+async fn legacy_sign_proposal(
     state: &Arc<EngineState>,
     proposal_id: &str,
     mfa_code: Option<&str>,
@@ -823,16 +782,17 @@ pub async fn sign_proposal(
     };
     let signature =
         network_state::sign_transition(&state.network_id, &variant, state.identity.signing_key());
+    let target = variant_target(&variant)?;
 
     let proposal = parse_fact_id(proposal_id)
         .ok_or_else(|| Error::Other("proposal id is not a FactId".into()))?;
     let fact = signed_fact(
         state,
         FactBody::Attestation {
-            target: proposal_id.to_string(),
+            target,
             proposal,
             decision: AttestationDecision::Approve,
-            signer: self_pubkey.clone(),
+            signer: canonical_device(&self_pubkey)?,
             contributions: Vec::new(),
         },
         vec![proposal],
@@ -862,9 +822,10 @@ pub async fn sign_proposal(
 /// Deny a pending proposal. Signs a deny payload (so a deny can't
 /// be forged) and broadcasts. Any single deny invalidates the
 /// proposal.
-pub async fn deny_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
+#[cfg(any())]
+async fn legacy_deny_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
     let self_pubkey = state.identity.public_id().to_string();
-    {
+    let target = {
         let gov = state.governance_state.read();
         let proposal = gov
             .pending
@@ -874,17 +835,18 @@ pub async fn deny_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Resul
         if proposal.deniers.iter().any(|s| s == &self_pubkey) {
             return Err(Error::Other("already denied".into()));
         }
-    }
+        variant_target(&proposal.variant)?
+    };
 
     let proposal = parse_fact_id(proposal_id)
         .ok_or_else(|| Error::Other("proposal id is not a FactId".into()))?;
     let fact = signed_fact(
         state,
         FactBody::Attestation {
-            target: proposal_id.to_string(),
+            target,
             proposal,
             decision: AttestationDecision::Reject,
-            signer: self_pubkey.clone(),
+            signer: canonical_device(&self_pubkey)?,
             contributions: Vec::new(),
         },
         vec![proposal],
@@ -922,7 +884,8 @@ pub async fn deny_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Resul
 
 /// Withdraw a proposal authored by the local device. No broadcast —
 /// peers see the proposal disappear via the next state snapshot.
-pub async fn withdraw_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
+#[cfg(any())]
+async fn legacy_withdraw_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
     let self_pubkey = state.identity.public_id().to_string();
     {
         let mut gov = state.governance_state.write();
@@ -946,105 +909,296 @@ pub async fn withdraw_proposal(state: &Arc<EngineState>, proposal_id: &str) -> R
 /// Fire the proposer-initiated split fallback. Spawns a derived
 /// closed network from the signers the proposal has so far; the
 /// local device becomes founder-owner of the new network.
-pub async fn spawn_split(state: &Arc<EngineState>, proposal_id: &str) -> Result<String> {
-    let self_pubkey = state.identity.public_id().to_string();
-    let (new_network_id, signers, split_signature) = {
-        let gov = state.governance_state.read();
-        let p = gov
-            .pending
-            .iter()
-            .find(|p| p.id == proposal_id)
-            .ok_or_else(|| Error::Other(format!("proposal not found: {proposal_id}")))?;
-        if p.proposer != self_pubkey {
-            return Err(Error::Other("only the proposer can spawn a split".into()));
-        }
-        if p.split_spawned {
-            return Err(Error::Other("split already spawned".into()));
-        }
-        if !matches!(
-            &p.variant,
-            TransitionVariant::KindChange {
-                to: NetworkKind::Closed
+#[cfg(any())]
+async fn legacy_spawn_split(state: &Arc<EngineState>, proposal_id: &str) -> Result<String> {
+    let _ = (state, proposal_id);
+    return Err(Error::Other(
+        "split is not an adopted V4 durable fact; create a new mesh explicitly".into(),
+    ));
+    /* legacy implementation retained below only as migration reference
+        let self_pubkey = state.identity.public_id().to_string();
+        let (new_network_id, signers, split_signature) = {
+            let gov = state.governance_state.read();
+            let p = gov
+                .pending
+                .iter()
+                .find(|p| p.id == proposal_id)
+                .ok_or_else(|| Error::Other(format!("proposal not found: {proposal_id}")))?;
+            if p.proposer != self_pubkey {
+                return Err(Error::Other("only the proposer can spawn a split".into()));
             }
-        ) {
-            return Err(Error::Other(
-                "splits only apply to stuck open→closed proposals".into(),
-            ));
-        }
+            if p.split_spawned {
+                return Err(Error::Other("split already spawned".into()));
+            }
+            if !matches!(
+                &p.variant,
+                TransitionVariant::KindChange {
+                    to: NetworkKind::Closed
+                }
+            ) {
+                return Err(Error::Other(
+                    "splits only apply to stuck open→closed proposals".into(),
+                ));
+            }
 
-        // Derived network id is deterministic from the parent + signer
-        // set, so the same signers always land in the same network
-        // (idempotent retry-safe). The signed payload binds the new
-        // network's id + members; the proposer is the lone signer
-        // since the split's quorum is single-signer (the would-be
-        // founder owner).
-        let signers = p.signers.clone();
-        let new_network_id = network_state::derive_split_network_id(&state.network_id, &signers);
-        let split_variant = TransitionVariant::Split {
-            new_network_id: new_network_id.clone(),
-            members: signers.clone(),
+            // Derived network id is deterministic from the parent + signer
+            // set, so the same signers always land in the same network
+            // (idempotent retry-safe). The signed payload binds the new
+            // network's id + members; the proposer is the lone signer
+            // since the split's quorum is single-signer (the would-be
+            // founder owner).
+            let signers = p.signers.clone();
+            let new_network_id = network_state::derive_split_network_id(&state.network_id, &signers);
+            let split_variant = TransitionVariant::Split {
+                new_network_id: new_network_id.clone(),
+                members: signers.clone(),
+            };
+            let split_signature = network_state::sign_transition(
+                &state.network_id,
+                &split_variant,
+                state.identity.signing_key(),
+            );
+
+            (new_network_id, signers, split_signature)
         };
-        let split_signature = network_state::sign_transition(
-            &state.network_id,
-            &split_variant,
-            state.identity.signing_key(),
+
+        let parent = parse_fact_id(proposal_id)
+            .ok_or_else(|| Error::Other("proposal id is not a FactId".into()))?;
+        let fact = signed_fact(
+            state,
+        /* removed legacy split body {
+                new_network_id: new_network_id.clone(),
+                members: signers.clone(),
+        }, */
+            vec![parent],
+        )?;
+        admit_authored_fact(state, &fact)?;
+        broadcast_fact_inventory(state).await;
+        let _ = apply_canonical_projection(state).await;
+        {
+            let mut gov = state.governance_state.write();
+            if !gov.pending.iter().any(|p| p.id == proposal_id) {
+                return Err(Error::Other(format!("proposal not found: {proposal_id}")));
+            }
+            let split_variant = TransitionVariant::Split {
+                new_network_id: new_network_id.clone(),
+                members: signers.clone(),
+            };
+            let transition = Transition {
+                at: now_unix(),
+                variant: split_variant,
+                signers: vec![self_pubkey],
+                signatures: vec![split_signature],
+            };
+            let after = network_state::apply_transition(gov.clone(), &transition);
+            *gov = after;
+            if let Some(pending) = gov.pending.iter_mut().find(|p| p.id == proposal_id) {
+                pending.split_spawned = true;
+            }
+            network_state::save(&gov)?;
+        }
+        let _ = apply_canonical_projection(state).await;
+        let msg = MeshMessage::Fact(fact);
+        broadcast(state, msg).await;
+        broadcast_state(state).await;
+        diag(
+            state,
+            crate::events::DiagLevel::Info,
+            format!("spawned split → {new_network_id}"),
         );
-
-        (new_network_id, signers, split_signature)
-    };
-
-    let parent = parse_fact_id(proposal_id)
-        .ok_or_else(|| Error::Other("proposal id is not a FactId".into()))?;
-    let fact = signed_fact(
-        state,
-        FactBody::Split {
-            new_network_id: new_network_id.clone(),
-            members: signers.clone(),
-        },
-        vec![parent],
-    )?;
-    admit_authored_fact(state, &fact)?;
-    broadcast_fact_inventory(state).await;
-    let _ = apply_canonical_projection(state).await;
-    {
-        let mut gov = state.governance_state.write();
-        if !gov.pending.iter().any(|p| p.id == proposal_id) {
-            return Err(Error::Other(format!("proposal not found: {proposal_id}")));
-        }
-        let split_variant = TransitionVariant::Split {
-            new_network_id: new_network_id.clone(),
-            members: signers.clone(),
-        };
-        let transition = Transition {
-            at: now_unix(),
-            variant: split_variant,
-            signers: vec![self_pubkey],
-            signatures: vec![split_signature],
-        };
-        let after = network_state::apply_transition(gov.clone(), &transition);
-        *gov = after;
-        if let Some(pending) = gov.pending.iter_mut().find(|p| p.id == proposal_id) {
-            pending.split_spawned = true;
-        }
-        network_state::save(&gov)?;
+        Ok(new_network_id)
     }
-    let _ = apply_canonical_projection(state).await;
-    let msg = MeshMessage::Fact(fact);
-    broadcast(state, msg).await;
-    broadcast_state(state).await;
-    diag(
-        state,
-        crate::events::DiagLevel::Info,
-        format!("spawned split → {new_network_id}"),
-    );
-    Ok(new_network_id)
+
+    // ---- inbound dispatch -----------------------------------------------
+
+    /// Reduce one canonical V4 fact.  The fact id, complete body, parent list and
+    /// embedded author are all verified before any legacy policy projection is
+    /// updated; the carrier is never consulted for authority.
+    pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
+        if let Err(error) = fact.verify() {
+            diag(
+                state,
+                crate::events::DiagLevel::Warn,
+                format!("rejecting invalid semantic fact {error}"),
+            );
+            return;
+        }
+        {
+            let graph = state.authoritative_fact_graph();
+            let mut graph = graph.write();
+            if graph.get(&fact.id).is_none() {
+                match graph.admit(fact.clone()) {
+                    Ok(crate::semantic::Admission::Inserted)
+                    | Ok(crate::semantic::Admission::AlreadyPresent) => {}
+                    Ok(crate::semantic::Admission::Quarantined { .. }) => return,
+                    Err(error) => {
+                        diag(
+                            state,
+                            crate::events::DiagLevel::Warn,
+                            format!("rejecting semantic fact admission: {error}"),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Semantic facts are already authenticated and admitted by the canonical
+        // graph.  They are projected directly into the compatibility state; their
+        // FactId/signature is never placed in a legacy Transition envelope, whose
+        // verifier expects a different signed payload.
+        let changed = apply_canonical_projection(state).await;
+        broadcast_fact_inventory(state).await;
+        if changed {
+            broadcast_roster_summary(state).await;
+            broadcast_state(state).await;
+        }
+        if let FactBody::RoleGrant { target, .. } = &fact.content.body {
+            if pk(target) == pk(state.identity.public_id()) {
+                request_pending_approval(state, &fact.content.author).await;
+            }
+        }
+    }
+
+    /// A peer broadcasts their view of the network's governance state.
+    /// We diag-log governance drift, and — because the broadcast carries the
+    /// sender's roster membership root — drive roster convergence off it too:
+    /// if their roster membership differs from ours, pull the delta. This
+    /// makes the post-mutation `NetworkState` broadcast double as a roster
+    /// summary, so a peer learns of new members the moment any governance
+    /// frame lands, not just on its own ACTIVE transition.
+    // `pub(super)`: logical-route-bound, so it names a crate-private operation, and the
+    // engine's own frame dispatch is its only caller. The identity-keyed
+    // governance handlers below stay `pub` — integration tests drive them.
+    pub(super) async fn on_state_broadcast(
+        state: &Arc<EngineState>,
+        route: &LogicalSessionOperation,
+        msg: NetworkStateBroadcast,
+    ) {
+        let peer_id = route.owner().device_id();
+        let (local_kind, local_count, local_member_count) = {
+            let gov = state.governance_state.read();
+            (
+                gov.kind,
+                gov.transitions.len() as u32,
+                gov.member_log.len() as u32,
+            )
+        };
+        let local_fact_heads = local_count.saturating_add(local_member_count);
+        if local_kind != msg.kind || local_fact_heads != msg.fact_heads_count {
+            diag(
+                state,
+                crate::events::DiagLevel::Info,
+                format!(
+                    "governance drift with {}: local {:?}/{} vs theirs {:?}/{}",
+                    &peer_id[..peer_id.len().min(12)],
+                    local_kind,
+                    local_fact_heads,
+                    msg.kind,
+                    msg.fact_heads_count
+                ),
+            );
+        }
+        // Pull the peer's roster — which now carries the signed governance log —
+        // when *either* our membership root differs or the peer's log is ahead of
+        // ours. The log half is what converges roles (who the owner is) fleet-wide:
+        // a role grant (or the founder election) bumps `transitions_count` without
+        // necessarily changing membership, so a membership-only check would miss it.
+        let membership_differs =
+            crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
+        let reply = state_broadcast_reply(local_count, local_member_count, &msg, membership_differs);
+        if reply.pull_roster {
+            request_roster(state, route).await;
+        }
+        if reply.re_advertise {
+            send_state_to_owner(state, route).await;
+        }
+        let inventory = MeshMessage::FactInventory(local_fact_inventory(state));
+        if let Err(error) = super::send_logical_reply(state, route, &inventory).await {
+            tracing::debug!(
+                peer = %route.owner().device_id(),
+                %error,
+                "fact inventory route advertisement failed"
+            );
+        }
+    }
+
+    /// Decide both halves of the reply from four numbers.
+    ///
+    /// Extracted from [`on_state_broadcast`] because the interesting property is
+    /// the decision rather than the send, and a decision reachable only through a
+    /// transport is one nothing can state exhaustively.
+    ///
+    /// **Why a re-advertise exists at all.** Every pull condition asks "is the
+    /// *sender* ahead of me". That converges a peer who hears from someone further
+    /// along, and does nothing at all for a peer who is behind and hears from
+    /// someone who is not: the peer that holds the newer log sees a stale snapshot,
+    /// has no reason to pull, and — before this — said nothing back. Since
+    /// [`broadcast_state`] fires only on a local mutation or an activation, and
+    /// nothing re-announces on a timer, one broadcast that arrives while a peer is
+    /// not yet Active left that peer stale until the next mutation or a reconnect.
+    /// In a two-peer mesh that is a hang; in a fleet it is one owner holding a
+    /// member the others never see, arriving through timing rather than a fork.
+    ///
+    /// **Why this cannot echo.** A re-advertise is triggered only by a *strict*
+    /// inequality on a count. For any one count, at most one of two peers can be
+    /// strictly greater, so the peer we answer cannot answer us back on that same
+    /// count — it is strictly behind, so it pulls instead. `membership_differs` is
+    /// symmetric and deliberately does **not** trigger one; two peers whose roots
+    /// disagree would otherwise answer each other forever. Genuine cross-divergence
+    /// — each side ahead on a different count — costs exactly one frame each way,
+    /// and both sides also pull, so the next exchange has equal counts and both
+    /// fall silent. Convergence is the fixed point: nothing is strictly ahead, so
+    /// nothing is sent.
+        */
 }
 
-// ---- inbound dispatch -----------------------------------------------
+/// Legacy proposal controls are intentionally inert during the canonical V4
+/// migration. Callers must submit a canonical fact instead; no proposal or
+/// transition log is created here.
+pub async fn sign_proposal(
+    _state: &Arc<EngineState>,
+    _proposal_id: &str,
+    _mfa_code: Option<&str>,
+) -> Result<()> {
+    Err(Error::Other(
+        "legacy proposal signing is disabled; submit a canonical fact".into(),
+    ))
+}
 
-/// Reduce one canonical V4 fact.  The fact id, complete body, parent list and
-/// embedded author are all verified before any legacy policy projection is
-/// updated; the carrier is never consulted for authority.
+pub async fn deny_proposal(_state: &Arc<EngineState>, _proposal_id: &str) -> Result<()> {
+    Err(Error::Other(
+        "legacy proposal denial is disabled; submit a canonical fact".into(),
+    ))
+}
+
+pub async fn withdraw_proposal(_state: &Arc<EngineState>, _proposal_id: &str) -> Result<()> {
+    Err(Error::Other(
+        "legacy proposal withdrawal is disabled; submit a canonical fact".into(),
+    ))
+}
+
+pub async fn spawn_split(_state: &Arc<EngineState>, _proposal_id: &str) -> Result<String> {
+    Err(Error::Other(
+        "split is not an adopted V4 durable fact; create a new mesh explicitly".into(),
+    ))
+}
+
+/// Compatibility callers may still invoke the old adoption hook, but it has
+/// no authority and deliberately performs no mutation. Canonical facts must
+/// arrive through semantic ingress and the shared FactGraph.
+#[cfg(test)]
+pub(super) async fn adopt_transition_log(
+    _state: &Arc<EngineState>,
+    _peer_id: &str,
+    _incoming_gov: &[network_state::Transition],
+    _incoming_members: &[network_state::Transition],
+) {
+}
+
+/// Admit one verified canonical fact and project it into the read-only
+/// compatibility view. The carrier and legacy transition logs are never used
+/// as authority.
 pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
     if let Err(error) = fact.verify() {
         diag(
@@ -1054,30 +1208,16 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         );
         return;
     }
-    {
-        let graph = state.authoritative_fact_graph();
-        let mut graph = graph.write();
-        if graph.get(&fact.id).is_none() {
-            match graph.admit(fact.clone()) {
-                Ok(crate::semantic::Admission::Inserted)
-                | Ok(crate::semantic::Admission::AlreadyPresent) => {}
-                Ok(crate::semantic::Admission::Quarantined { .. }) => return,
-                Err(error) => {
-                    diag(
-                        state,
-                        crate::events::DiagLevel::Warn,
-                        format!("rejecting semantic fact admission: {error}"),
-                    );
-                    return;
-                }
-            }
-        }
+    let graph = state.authoritative_fact_graph();
+    let admission = graph.write().admit(fact.clone());
+    if let Err(error) = admission {
+        diag(
+            state,
+            crate::events::DiagLevel::Warn,
+            format!("rejecting semantic fact admission: {error}"),
+        );
+        return;
     }
-
-    // Semantic facts are already authenticated and admitted by the canonical
-    // graph.  They are projected directly into the compatibility state; their
-    // FactId/signature is never placed in a legacy Transition envelope, whose
-    // verifier expects a different signed payload.
     let changed = apply_canonical_projection(state).await;
     broadcast_fact_inventory(state).await;
     if changed {
@@ -1091,70 +1231,8 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
     }
 }
 
-/// A peer broadcasts their view of the network's governance state.
-/// We diag-log governance drift, and — because the broadcast carries the
-/// sender's roster membership root — drive roster convergence off it too:
-/// if their roster membership differs from ours, pull the delta. This
-/// makes the post-mutation `NetworkState` broadcast double as a roster
-/// summary, so a peer learns of new members the moment any governance
-/// frame lands, not just on its own ACTIVE transition.
-// `pub(super)`: logical-route-bound, so it names a crate-private operation, and the
-// engine's own frame dispatch is its only caller. The identity-keyed
-// governance handlers below stay `pub` — integration tests drive them.
-pub(super) async fn on_state_broadcast(
-    state: &Arc<EngineState>,
-    route: &LogicalSessionOperation,
-    msg: NetworkStateBroadcast,
-) {
-    let peer_id = route.owner().device_id();
-    let (local_kind, local_count, local_member_count) = {
-        let gov = state.governance_state.read();
-        (
-            gov.kind,
-            gov.transitions.len() as u32,
-            gov.member_log.len() as u32,
-        )
-    };
-    let local_fact_heads = local_count.saturating_add(local_member_count);
-    if local_kind != msg.kind || local_fact_heads != msg.fact_heads_count {
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!(
-                "governance drift with {}: local {:?}/{} vs theirs {:?}/{}",
-                &peer_id[..peer_id.len().min(12)],
-                local_kind,
-                local_fact_heads,
-                msg.kind,
-                msg.fact_heads_count
-            ),
-        );
-    }
-    // Pull the peer's roster — which now carries the signed governance log —
-    // when *either* our membership root differs or the peer's log is ahead of
-    // ours. The log half is what converges roles (who the owner is) fleet-wide:
-    // a role grant (or the founder election) bumps `transitions_count` without
-    // necessarily changing membership, so a membership-only check would miss it.
-    let membership_differs =
-        crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
-    let reply = state_broadcast_reply(local_count, local_member_count, &msg, membership_differs);
-    if reply.pull_roster {
-        request_roster(state, route).await;
-    }
-    if reply.re_advertise {
-        send_state_to_owner(state, route).await;
-    }
-    let inventory = MeshMessage::FactInventory(local_fact_inventory(state));
-    if let Err(error) = super::send_logical_reply(state, route, &inventory).await {
-        tracing::debug!(
-            peer = %route.owner().device_id(),
-            %error,
-            "fact inventory route advertisement failed"
-        );
-    }
-}
-
 /// What one received `NetworkState` snapshot obliges us to send back.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StateBroadcastReply {
     /// Ask the sender for their roster and signed logs: they hold something we
@@ -1165,33 +1243,7 @@ struct StateBroadcastReply {
     re_advertise: bool,
 }
 
-/// Decide both halves of the reply from four numbers.
-///
-/// Extracted from [`on_state_broadcast`] because the interesting property is
-/// the decision rather than the send, and a decision reachable only through a
-/// transport is one nothing can state exhaustively.
-///
-/// **Why a re-advertise exists at all.** Every pull condition asks "is the
-/// *sender* ahead of me". That converges a peer who hears from someone further
-/// along, and does nothing at all for a peer who is behind and hears from
-/// someone who is not: the peer that holds the newer log sees a stale snapshot,
-/// has no reason to pull, and — before this — said nothing back. Since
-/// [`broadcast_state`] fires only on a local mutation or an activation, and
-/// nothing re-announces on a timer, one broadcast that arrives while a peer is
-/// not yet Active left that peer stale until the next mutation or a reconnect.
-/// In a two-peer mesh that is a hang; in a fleet it is one owner holding a
-/// member the others never see, arriving through timing rather than a fork.
-///
-/// **Why this cannot echo.** A re-advertise is triggered only by a *strict*
-/// inequality on a count. For any one count, at most one of two peers can be
-/// strictly greater, so the peer we answer cannot answer us back on that same
-/// count — it is strictly behind, so it pulls instead. `membership_differs` is
-/// symmetric and deliberately does **not** trigger one; two peers whose roots
-/// disagree would otherwise answer each other forever. Genuine cross-divergence
-/// — each side ahead on a different count — costs exactly one frame each way,
-/// and both sides also pull, so the next exchange has equal counts and both
-/// fall silent. Convergence is the fixed point: nothing is strictly ahead, so
-/// nothing is sent.
+#[cfg(test)]
 fn state_broadcast_reply(
     local_transitions: u32,
     local_members: u32,
@@ -1202,27 +1254,6 @@ fn state_broadcast_reply(
     StateBroadcastReply {
         pull_roster: membership_differs || msg.fact_heads_count > local_heads,
         re_advertise: local_heads > msg.fact_heads_count,
-    }
-}
-
-/// Send our current snapshot to exactly one peer.
-///
-/// Targeted rather than a fleet broadcast, and that is the whole difference
-/// from [`broadcast_state`]: this answers one stale peer, and telling the whole
-/// network because a single member fell behind is precisely the flood the
-/// summary/request/entries shape exists to avoid.
-///
-/// Through the captured logical route, so a peer whose installation was replaced while
-/// we were deciding is answered on nothing rather than on a stale link — the
-/// same rule [`on_roster_request`] follows when it hands back the full roster.
-async fn send_state_to_owner(state: &Arc<EngineState>, route: &LogicalSessionOperation) {
-    let msg = MeshMessage::NetworkState(local_state_snapshot(state));
-    if let Err(e) = super::send_logical_reply(state, route, &msg).await {
-        tracing::debug!(
-            peer = %route.owner().device_id(),
-            err = %e,
-            "state re-advertise send failed"
-        );
     }
 }
 
@@ -1237,19 +1268,45 @@ async fn send_state_to_owner(state: &Arc<EngineState>, route: &LogicalSessionOpe
 /// so peers reconcile on who is in the network rather than on per-node label
 /// and timestamp churn — see [`crate::roster::membership_root`].
 fn local_state_snapshot(state: &Arc<EngineState>) -> NetworkStateBroadcast {
-    let (kind, transitions_count, member_log_count) = {
-        let gov = state.governance_state.read();
-        (
-            gov.kind,
-            gov.transitions.len() as u32,
-            gov.member_log.len() as u32,
-        )
-    };
+    let graph = state.authoritative_fact_graph();
+    let fact_heads_count = graph.read().len() as u32;
+    let kind = snapshot(state).kind;
     NetworkStateBroadcast {
         kind,
-        fact_heads_count: transitions_count.saturating_add(member_log_count),
+        fact_heads_count,
         roster_root: crate::roster::membership_root(&state.roster.read()),
     }
+}
+
+/// Reconcile canonical fact heads after receiving a compatibility snapshot.
+/// The snapshot is only a hint; all authority comes from FactInventory and
+/// FactRequest over the shared graph.
+pub(super) async fn on_state_broadcast(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    msg: NetworkStateBroadcast,
+) {
+    let local_heads = state.authoritative_fact_graph().read().len() as u32;
+    if msg.fact_heads_count != local_heads {
+        let inventory = MeshMessage::FactInventory(local_fact_inventory(state));
+        if let Err(error) = super::send_logical_reply(state, route, &inventory).await {
+            tracing::debug!(
+                peer = %route.owner().device_id(),
+                %error,
+                "canonical inventory reconciliation send failed"
+            );
+        }
+    }
+}
+
+/// Unsigned roster roots cannot authorize membership. Keep this compatibility
+/// hook side-effect free; canonical inventory reconciliation handles durable
+/// convergence.
+async fn maybe_request_roster(
+    _state: &Arc<EngineState>,
+    _route: &LogicalSessionOperation,
+    _their_root: &str,
+) {
 }
 
 // ---- roster gossip --------------------------------------------------
@@ -1404,18 +1461,15 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, source: &str, msg: Rost
 /// owner/controller is never "evicted" (a stale member-tier entry can't
 /// outrank the governance tier).
 pub(super) fn log_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
-    let pubkey = pk(device_id);
-    let gov = state.governance_state.read();
-    if gov.kind.is_open_governance() {
-        return false;
-    }
     if matches!(
-        gov.roles.get(&pubkey),
-        Some(Role::Owner) | Some(Role::Controller)
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
     ) {
         return false;
     }
-    network_state::member_log_removed(&gov, &gov.member_log, &state.network_id).contains(&pubkey)
+    canonical_projection_snapshot(state)
+        .evicted
+        .contains(&pk(device_id))
 }
 
 /// Recompute and cache whether the signed state has evicted THIS device
@@ -1510,7 +1564,8 @@ pub(super) async fn deny_if_evicted(
 /// members, so this is the single source of truth for `gov.roles`. A governance
 /// log that fails to verify (never expected for our own ratified state) falls
 /// back to no governance roles rather than panicking.
-fn project_roles(
+#[cfg(any())]
+fn legacy_project_roles(
     bootstrap: &crate::semantic::VerifiedBootstrap,
     context: &crate::semantic::MeshContextId,
     network_id: &str,
@@ -1547,7 +1602,8 @@ fn project_roles(
 /// the roster, and re-gossip so it ripples on. We keep our in-flight pending
 /// proposals throughout.
 #[cfg(test)]
-pub(super) async fn adopt_transition_log(
+#[cfg(any())]
+async fn legacy_adopt_transition_log(
     state: &Arc<EngineState>,
     peer_id: &str,
     incoming_gov: &[Transition],
@@ -1728,92 +1784,6 @@ pub(super) async fn adopt_transition_log(
     broadcast_state(state).await;
 }
 
-/// Mirror the converged signed state into the roster. Role-bearing pubkeys
-/// missing from the roster are added (so the owner shows up even before
-/// membership gossip reaches us) and role tags are updated. Returns whether the
-/// roster changed (to gate the disk write).
-///
-/// `removed` is the set of devices the signed member log has **explicitly
-/// tombstoned** (an `Evict`/`RoleRevoke`). Those — and only those — are deleted
-/// from the roster (never this device, `self_pubkey`), so an eviction learned
-/// only through gossip actually de-authorises the target, matching the
-/// local-ratify path. Crucially we do **not** prune "anyone not in the signed
-/// projection": a device added by `roster_approve` (or one whose signed admit
-/// this node can't verify yet) is left in place rather than silently dropped —
-/// that over-pruning is what made members vanish and re-appear.
-#[cfg(test)]
-fn mirror_roles_to_roster(
-    roles: &std::collections::BTreeMap<String, Role>,
-    roster: &mut crate::roster::Roster,
-    removed: &std::collections::BTreeSet<String>,
-    self_pubkey: &str,
-) -> bool {
-    let mut changed = false;
-    for (pubkey, role) in roles {
-        if !crate::roster::is_authorized(roster, pubkey) {
-            crate::roster::add_peer_in(roster, pubkey, "");
-            changed = true;
-        }
-        if crate::roster::set_role_in(roster, pubkey, *role) {
-            changed = true;
-        }
-    }
-    // Drop only the explicitly-evicted, and never ourselves.
-    let self_pk = crate::signing::pubkey_part(self_pubkey);
-    let before = roster.authorized_devices.len();
-    roster
-        .authorized_devices
-        .retain(|e| e.device_id == self_pk || !removed.contains(&e.device_id));
-    if roster.authorized_devices.len() != before {
-        changed = true;
-    }
-    // Clear a stale role tag on any entry the signed roles no longer cover.
-    for entry in roster.authorized_devices.iter_mut() {
-        if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
-            entry.role = Role::Member;
-            changed = true;
-        }
-    }
-    changed
-}
-
-/// If `their_root` (a membership root) differs from ours, send a targeted
-/// request for the peer's full roster. We only ever *pull* on a mismatch —
-/// the side that's behind asks — so two peers don't both dump their whole
-/// rosters at each other. Idempotent and convergent: once memberships
-/// agree the roots match and no request fires.
-async fn maybe_request_roster(
-    state: &Arc<EngineState>,
-    route: &LogicalSessionOperation,
-    their_root: &str,
-) {
-    let our_root = crate::roster::membership_root(&state.roster.read());
-    if our_root == their_root {
-        return;
-    }
-    request_roster(state, route).await;
-}
-
-/// Send a targeted full-roster request to one peer. The reply
-/// ([`on_roster_request`]) carries both the membership entries and the signed
-/// governance log, so this is the single pull that converges *both* membership
-/// and roles.
-async fn request_roster(state: &Arc<EngineState>, route: &LogicalSessionOperation) {
-    let msg = MeshMessage::RosterRequest(RosterRequestMessage {
-        include_all: true,
-        subtree_hashes: Vec::new(),
-    });
-    // Owner-bound: the pull is a consequence of what one exact installation
-    // told us, so it is asked of that installation or of nobody.
-    if let Err(e) = super::send_logical_reply(state, route, &msg).await {
-        tracing::debug!(
-            peer = %route.owner().device_id(),
-            err = %e,
-            "roster request send failed"
-        );
-    }
-}
-
 // ---- ratification ---------------------------------------------------
 
 /// Reorder a transition's `(signer, signature)` pairs into a canonical,
@@ -1830,30 +1800,9 @@ async fn request_roster(state: &Arc<EngineState>, route: &LogicalSessionOperatio
 /// whole entry agrees. Keeping the proposer first preserves the
 /// `signers.first() == founder/proposer` convention `apply_transition` relies
 /// on (genesis and splits are single-signer, so this is a no-op for them).
-fn canonicalize_signers(
-    proposer: &str,
-    signers: &[String],
-    signatures: &[String],
-) -> (Vec<String>, Vec<String>) {
-    // A malformed pending record with mismatched lengths is left as-is so the
-    // downstream signature check rejects it cleanly rather than mis-pairing.
-    if signers.len() != signatures.len() {
-        return (signers.to_vec(), signatures.to_vec());
-    }
-    let mut pairs: Vec<(&String, &String)> = signers.iter().zip(signatures.iter()).collect();
-    pairs.sort_by(|a, b| {
-        let ka = (if a.0 == proposer { 0 } else { 1 }, a.0);
-        let kb = (if b.0 == proposer { 0 } else { 1 }, b.0);
-        ka.cmp(&kb)
-    });
-    pairs
-        .into_iter()
-        .map(|(s, g)| (s.clone(), g.clone()))
-        .unzip()
-}
-
 /// The pubkey a member-tier transition acts on, if it is one.
-fn member_entry_target(t: &Transition) -> Option<&str> {
+#[cfg(any())]
+fn legacy_member_entry_target(t: &network_state::Transition) -> Option<&str> {
     match &t.variant {
         TransitionVariant::RoleGrant { target, .. }
         | TransitionVariant::RoleRevoke { target }
@@ -1870,7 +1819,8 @@ fn member_entry_target(t: &Transition) -> Option<&str> {
 /// distinguishable; re-admission after a tombstone requires canonical causal
 /// resolution, never a larger timestamp. Governance-tier transitions likewise
 /// retain the wall clock only as non-authoritative metadata.
-fn member_tier_timestamp(state: &Arc<EngineState>, variant: &TransitionVariant) -> u64 {
+#[cfg(any())]
+fn legacy_member_tier_timestamp(state: &Arc<EngineState>, variant: &TransitionVariant) -> u64 {
     let now = now_unix();
     let gov = state.governance_state.read();
     let target = match variant {
@@ -1903,26 +1853,12 @@ fn member_tier_timestamp(state: &Arc<EngineState>, variant: &TransitionVariant) 
     now.max(newest.saturating_add(1))
 }
 
-/// Whether two transitions carry the same signer *set*, order-independent.
-/// The shared-prefix fork guard uses this so the same ratified transition,
-/// recorded with its co-signers in different orders on two peers, is recognised
-/// as the same entry rather than a fork. New ratifications are canonicalised by
-/// [`canonicalize_signers`]; this also tolerates logs written before that.
-#[cfg(test)]
-fn same_signer_set(a: &Transition, b: &Transition) -> bool {
-    if a.signers.len() != b.signers.len() {
-        return false;
-    }
-    let a_set: std::collections::BTreeSet<&str> = a.signers.iter().map(String::as_str).collect();
-    let b_set: std::collections::BTreeSet<&str> = b.signers.iter().map(String::as_str).collect();
-    a_set == b_set
-}
-
 /// If `proposal_id`'s pending entry has gathered enough signatures
 /// to satisfy the quorum table for its variant — and hasn't been
 /// denied — fold it into the signed transition log, apply, persist,
 /// and broadcast a fresh state snapshot.
-async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
+#[cfg(any())]
+async fn legacy_try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
     let transition = state
         .peers
         .with_governance_commit(|gov| -> Result<Option<Transition>> {
@@ -2230,7 +2166,7 @@ mod governance_projection_controls {
         {
             let gov = state.governance_state.read();
             assert_eq!(gov.kind, NetworkKind::Closed);
-            assert_eq!(gov.roles.get(&root).copied(), Some(Role::Owner));
+            assert_eq!(gov.roles.get(&root.to_string()).copied(), Some(Role::Owner));
         }
 
         let proposal_id = propose(
@@ -2243,25 +2179,16 @@ mod governance_projection_controls {
         )
         .await
         .expect("verified bootstrap root can author a member grant");
-        let proposal_id_text = proposal_id.to_string();
 
         {
             let graph = state.authoritative_fact_graph();
             assert!(graph.read().get(&proposal_id).is_some());
-            let gov = state.governance_state.read();
-            assert_eq!(gov.roles.get(&root).copied(), Some(Role::Owner));
-            assert_eq!(gov.roles.get(&member).copied(), Some(Role::Member));
-            assert!(gov
-                .pending
-                .iter()
-                .all(|pending| pending.id != proposal_id_text));
-            assert!(gov.member_log.iter().any(|entry| {
-                matches!(
-                    &entry.variant,
-                    TransitionVariant::RoleGrant { target, role: Role::Member }
-                        if target == &member
-                )
-            }));
+            let projected = snapshot(&state);
+            assert_eq!(
+                projected.roles.get(&root.to_string()).copied(),
+                Some(Role::Owner)
+            );
+            assert_eq!(projected.roles.get(&member).copied(), Some(Role::Member));
         }
         {
             let roster = state.roster.read();
@@ -2273,13 +2200,24 @@ mod governance_projection_controls {
                 "canonical member grant must project into the compatibility roster"
             );
         }
-        let gov = state.governance_state.read();
+        let graph = state.authoritative_fact_graph();
+        let graph = graph.read();
         assert!(
-            current_policy_admits(&gov, &root, &member),
+            canonical_policy_admits_from(
+                state.verified_bootstrap(),
+                &graph,
+                &root.to_string(),
+                &member,
+            ),
             "closed policy must admit the root-to-member session"
         );
         assert!(
-            current_policy_admits(&gov, &root, &root),
+            canonical_policy_admits_from(
+                state.verified_bootstrap(),
+                &graph,
+                &root.to_string(),
+                &root.to_string(),
+            ),
             "the verified root owner must retain self-admission"
         );
     }

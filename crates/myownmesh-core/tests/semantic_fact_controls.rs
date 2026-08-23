@@ -4,23 +4,20 @@
 
 use std::collections::HashMap;
 
-use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
 
 use myownmesh_core::protocol::FactBundleMessage;
 use myownmesh_core::semantic::{
-    Admission, AttestationDecision, FactBody, FactContent, FactDomain, FactGraph, FactId,
-    GovernanceKind, Role, SemanticError, SignedFact, VerifiedBootstrap,
+    Admission, AttestationDecision, DeviceId, FactBody, FactContent, FactDomain, FactGraph, FactId,
+    Role, SemanticError, SignedFact, VerifiedBootstrap,
 };
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-fn author(key: &SigningKey) -> String {
-    BASE32_NOPAD
-        .encode(key.verifying_key().as_bytes())
-        .to_lowercase()
+fn author(key: &SigningKey) -> DeviceId {
+    DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).expect("valid device id")
 }
 
 fn closed_bootstrap(seed: u8, creation_id: u8) -> VerifiedBootstrap {
@@ -36,13 +33,7 @@ fn fact(
 ) -> SignedFact {
     let domain = body.domain();
     SignedFact::sign(
-        FactContent::new(
-            domain,
-            bootstrap.context_id().to_string(),
-            body,
-            author(key),
-            parents,
-        ),
+        FactContent::new(domain, bootstrap.context_id(), body, author(key), parents),
         key,
     )
     .expect("semantic fixture fact signs")
@@ -52,17 +43,19 @@ fn fact(
 fn canonical_field_mutation_is_refused() {
     let signing_key = key(1);
     let bootstrap = closed_bootstrap(1, 1);
+    let original_target = author(&key(8));
+    let mutated_target = author(&key(9));
     let mut signed = fact(
         &bootstrap,
         &signing_key,
         FactBody::RoleGrant {
-            target: "member-a".into(),
+            target: original_target,
             role: Role::Member,
         },
         Vec::new(),
     );
     signed.content.body = FactBody::RoleGrant {
-        target: "member-b".into(),
+        target: mutated_target,
         role: Role::Member,
     };
     assert!(matches!(
@@ -78,8 +71,9 @@ fn wire_file_and_cache_round_trips_preserve_one_fact_identity() {
     let signed = fact(
         &bootstrap,
         &signing_key,
-        FactBody::KindChange {
-            to: GovernanceKind::Closed,
+        FactBody::RoleGrant {
+            target: author(&signing_key),
+            role: Role::Member,
         },
         Vec::new(),
     );
@@ -110,16 +104,17 @@ fn arrival_order_is_independent_and_missing_parents_quarantine() {
     let genesis = fact(
         &bootstrap,
         &signing_key,
-        FactBody::KindChange {
-            to: GovernanceKind::Open,
+        FactBody::RoleGrant {
+            target: author(&signing_key),
+            role: Role::Member,
         },
         Vec::new(),
     );
     let successor = fact(
         &bootstrap,
         &signing_key,
-        FactBody::KindChange {
-            to: GovernanceKind::Closed,
+        FactBody::RoleRevoke {
+            target: author(&signing_key),
         },
         vec![genesis.id],
     );
@@ -148,21 +143,19 @@ fn arrival_order_is_independent_and_missing_parents_quarantine() {
 fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     let signing_key = key(4);
     let bootstrap = VerifiedBootstrap::open("semantic-controls").expect("open bootstrap");
-    let context = bootstrap.context_id().to_string();
     let device = author(&signing_key);
     let participation =
-        FactContent::open_participation(context, device.clone(), true, "join", Vec::new());
+        FactContent::open_participation(bootstrap.context_id(), device.clone(), true, Vec::new());
     let signed_participation =
         SignedFact::sign(participation, &signing_key).expect("participation signs");
     assert!(signed_participation.verify().is_ok());
 
     let invalid = FactContent::new(
         FactDomain::Participation,
-        bootstrap.context_id().to_string(),
+        bootstrap.context_id(),
         FactBody::OpenParticipation {
-            device_id: "some-other-device".into(),
+            device_id: author(&key(6)),
             joined: true,
-            label: "join".into(),
         },
         device.clone(),
         Vec::new(),
@@ -185,9 +178,8 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     let proposal = fact(
         &eviction_bootstrap,
         &signing_key,
-        FactBody::Checkpoint {
-            checkpoint_id: "eviction-proposal".into(),
-            heads: Vec::new(),
+        FactBody::Evict {
+            target: device.clone(),
         },
         Vec::new(),
     );
@@ -247,20 +239,28 @@ fn attestation_mutation_and_forged_eviction_are_rejected() {
     let bootstrap = closed_bootstrap(5, 5);
     let device = author(&signing_key);
     let mut attestation = SignedFact::sign(
-        FactContent::open_participation(
-            bootstrap.context_id().to_string(),
+        FactContent::new(
+            FactDomain::Governance,
+            bootstrap.context_id(),
+            FactBody::Attestation {
+                target: device.clone(),
+                proposal: FactId::from_bytes([8; 32]),
+                decision: AttestationDecision::Approve,
+                signer: device.clone(),
+                contributions: Vec::new(),
+            },
             device.clone(),
-            true,
-            "attested",
             Vec::new(),
         ),
         &signing_key,
     )
     .expect("attestation signs");
-    attestation.content.body = FactBody::OpenParticipation {
-        device_id: device,
-        joined: false,
-        label: "forged-after-signing".into(),
+    attestation.content.body = FactBody::Attestation {
+        target: device.clone(),
+        proposal: FactId::from_bytes([8; 32]),
+        decision: AttestationDecision::Reject,
+        signer: device.clone(),
+        contributions: Vec::new(),
     };
     assert!(matches!(
         attestation.verify(),
@@ -270,7 +270,7 @@ fn attestation_mutation_and_forged_eviction_are_rejected() {
     let other_device = author(&key(6));
     let mismatched_eviction = FactContent::new(
         FactDomain::EvictionProof,
-        bootstrap.context_id().to_string(),
+        bootstrap.context_id(),
         FactBody::SelfStandDown {
             device_id: other_device,
             evidence: vec![FactId::from_bytes([7; 32])],
@@ -294,8 +294,9 @@ fn foreign_context_is_rejected_before_quarantine() {
     let foreign_fact = fact(
         &foreign,
         &signing_key,
-        FactBody::KindChange {
-            to: GovernanceKind::Closed,
+        FactBody::RoleGrant {
+            target: author(&signing_key),
+            role: Role::Member,
         },
         Vec::new(),
     );

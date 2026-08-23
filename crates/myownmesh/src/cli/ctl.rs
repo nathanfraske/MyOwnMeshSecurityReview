@@ -44,8 +44,8 @@ pub enum CtlCmd {
     /// Host infrastructure services for the mesh: signaling / STUN / TURN.
     #[command(subcommand)]
     Services(ServicesCmd),
-    /// Closed-network governance: state, proposals, signing, and the
-    /// per-device custody MFA that guards owner/kind changes.
+    /// Closed-network governance: state, proposals, and the per-device
+    /// custody MFA that guards canonical authoring.
     #[command(subcommand)]
     Governance(GovernanceCmd),
 }
@@ -54,14 +54,6 @@ pub enum CtlCmd {
 pub enum GovernanceCmd {
     /// Show governance state (kind, roles, transition log, pending).
     State { network: String },
-    /// Propose a kind change. `to` is `open` or `closed`.
-    ProposeKind {
-        network: String,
-        to: String,
-        /// Custody second factor, if this device enrolled one (`mfa enroll`).
-        #[arg(long)]
-        mfa_code: Option<String>,
-    },
     /// Propose granting `target` a role: `member` | `controller` | `owner`.
     GrantRole {
         network: String,
@@ -76,23 +68,6 @@ pub enum GovernanceCmd {
         target: String,
         #[arg(long)]
         mfa_code: Option<String>,
-    },
-    /// Sign a pending proposal.
-    Sign {
-        network: String,
-        proposal_id: String,
-        #[arg(long)]
-        mfa_code: Option<String>,
-    },
-    /// Deny a pending proposal (single-shot kill switch).
-    Deny {
-        network: String,
-        proposal_id: String,
-    },
-    /// Withdraw a proposal this device floated.
-    Withdraw {
-        network: String,
-        proposal_id: String,
     },
     /// Per-device custody MFA (TOTP) that gates governance authoring.
     #[command(subcommand)]
@@ -163,21 +138,6 @@ pub enum NetworksCmd {
         /// `id1,id2[,…][:spoke_redundancy]`.
         #[arg(long)]
         hub: Option<String>,
-    },
-    /// Propose the network-wide, owner-signed topology (closed
-    /// networks). Once ratified, every member's daemon converges on it
-    /// — this is how infra hubs are designated for the whole network.
-    TopologyPropose {
-        network_id: String,
-        /// `ring`, `star`, `hubs`, or `full_mesh`.
-        topology: String,
-        /// Hub spec: `star` takes a device id; `hubs` takes
-        /// `id1,id2[,…][:spoke_redundancy]`.
-        #[arg(long)]
-        hub: Option<String>,
-        /// Custody TOTP code, if this device enrolled one.
-        #[arg(long)]
-        mfa: Option<String>,
     },
     /// Deliberately dial one peer by device id on a joined network. On a
     /// `silent` network this is how a connection is opened at all (nothing
@@ -269,17 +229,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
             topology,
             hub,
         },
-        CtlCmd::Networks(NetworksCmd::TopologyPropose {
-            network_id,
-            topology,
-            hub,
-            mfa,
-        }) => Request::GovernanceProposeTopology {
-            network: network_id,
-            topology,
-            hub,
-            mfa_code: mfa,
-        },
         CtlCmd::Peers { network } => Request::PeersList { network },
         CtlCmd::Roster(RosterCmd::List { network }) => Request::RosterList { network },
         CtlCmd::Roster(RosterCmd::Approve {
@@ -297,15 +246,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         CtlCmd::Governance(GovernanceCmd::State { network }) => {
             Request::GovernanceState { network }
         }
-        CtlCmd::Governance(GovernanceCmd::ProposeKind {
-            network,
-            to,
-            mfa_code,
-        }) => Request::GovernanceProposeKindChange {
-            network,
-            to: parse_kind(&to)?,
-            mfa_code,
-        },
         CtlCmd::Governance(GovernanceCmd::GrantRole {
             network,
             target,
@@ -326,29 +266,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
             target,
             mfa_code,
         },
-        CtlCmd::Governance(GovernanceCmd::Sign {
-            network,
-            proposal_id,
-            mfa_code,
-        }) => Request::GovernanceSign {
-            network,
-            proposal_id,
-            mfa_code,
-        },
-        CtlCmd::Governance(GovernanceCmd::Deny {
-            network,
-            proposal_id,
-        }) => Request::GovernanceDeny {
-            network,
-            proposal_id,
-        },
-        CtlCmd::Governance(GovernanceCmd::Withdraw {
-            network,
-            proposal_id,
-        }) => Request::GovernanceWithdraw {
-            network,
-            proposal_id,
-        },
         CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Enroll { network })) => {
             Request::GovernanceMfaEnroll { network }
         }
@@ -363,21 +280,12 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
     print_response(response)
 }
 
-/// Parse a CLI network-kind argument.
-fn parse_kind(s: &str) -> Result<myownmesh_core::NetworkKind> {
-    match s.to_ascii_lowercase().as_str() {
-        "open" => Ok(myownmesh_core::NetworkKind::Open),
-        "closed" => Ok(myownmesh_core::NetworkKind::Closed),
-        other => bail!("invalid kind '{other}' — expected open | closed"),
-    }
-}
-
 /// Parse a CLI role argument.
-fn parse_role(s: &str) -> Result<myownmesh_core::Role> {
+fn parse_role(s: &str) -> Result<myownmesh_core::network_state::Role> {
     match s.to_ascii_lowercase().as_str() {
-        "member" => Ok(myownmesh_core::Role::Member),
-        "controller" => Ok(myownmesh_core::Role::Controller),
-        "owner" => Ok(myownmesh_core::Role::Owner),
+        "member" => Ok(myownmesh_core::network_state::Role::Member),
+        "controller" => Ok(myownmesh_core::network_state::Role::Controller),
+        "owner" => Ok(myownmesh_core::network_state::Role::Owner),
         other => bail!("invalid role '{other}' — expected member | controller | owner"),
     }
 }

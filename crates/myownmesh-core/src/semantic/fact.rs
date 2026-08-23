@@ -5,8 +5,9 @@ use ed25519_dalek::SigningKey;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use super::content::{Encoder, FactBody, FactDomain};
+use super::content::{DeviceId, Encoder, FactBody, FactDomain};
 use super::verify::SemanticError;
+use super::MeshContextId;
 
 /// The digest of canonical fact content.  It is the only identity used by the
 /// causal graph; envelopes and couriers cannot create a second identity.
@@ -86,18 +87,18 @@ pub struct FactContent {
     /// Explicit wire-carried version. Only V4 semantic content is admitted.
     pub version: u32,
     pub domain: FactDomain,
-    pub mesh_context: String,
+    pub mesh_context: MeshContextId,
     pub body: FactBody,
-    pub author: String,
+    pub author: DeviceId,
     pub parents: Vec<FactId>,
 }
 
 impl FactContent {
     pub fn new(
         domain: FactDomain,
-        mesh_context: impl Into<String>,
+        mesh_context: MeshContextId,
         body: FactBody,
-        author: impl Into<String>,
+        author: DeviceId,
         mut parents: Vec<FactId>,
     ) -> Self {
         parents.sort();
@@ -107,30 +108,25 @@ impl FactContent {
         Self {
             version: super::SEMANTIC_SCHEMA_VERSION,
             domain,
-            mesh_context: mesh_context.into(),
+            mesh_context,
             body,
-            author: author.into(),
+            author,
             parents,
         }
     }
 
     pub fn open_participation(
-        mesh_context: impl Into<String>,
-        device_id: impl Into<String>,
+        mesh_context: MeshContextId,
+        device_id: DeviceId,
         joined: bool,
-        label: impl Into<String>,
         parents: Vec<FactId>,
     ) -> Self {
-        let device_id = device_id.into();
+        let author = device_id.clone();
         Self::new(
             FactDomain::Participation,
             mesh_context,
-            FactBody::OpenParticipation {
-                device_id: device_id.clone(),
-                joined,
-                label: label.into(),
-            },
-            device_id,
+            FactBody::OpenParticipation { device_id, joined },
+            author,
             parents,
         )
     }
@@ -141,8 +137,8 @@ impl FactContent {
         out.tag("schema");
         out.bytes(&self.version.to_be_bytes());
         out.tag(self.domain.tag());
-        out.text(&self.mesh_context);
-        out.text(&self.author);
+        out.context(self.mesh_context);
+        out.device(&self.author);
         out.tag("parents");
         out.list_ids(&self.parents);
         out.tag("body");
@@ -153,12 +149,6 @@ impl FactContent {
     pub fn validate(&self) -> Result<(), SemanticError> {
         if self.version != super::SEMANTIC_SCHEMA_VERSION {
             return Err(SemanticError::UnsupportedVersion(self.version));
-        }
-        if self.mesh_context.is_empty() {
-            return Err(SemanticError::EmptyField("mesh_context"));
-        }
-        if self.author.is_empty() {
-            return Err(SemanticError::EmptyField("author"));
         }
         if self.body.domain() != self.domain {
             return Err(SemanticError::DomainMismatch);
@@ -175,15 +165,12 @@ impl FactContent {
         match &self.body {
             FactBody::OpenParticipation { device_id, .. }
             | FactBody::SelfStandDown { device_id, .. } => {
-                if crate::signing::pubkey_part(&self.author)
-                    != crate::signing::pubkey_part(device_id)
-                {
+                if self.author != *device_id {
                     return Err(SemanticError::InvalidOpenAuthor);
                 }
             }
             FactBody::Attestation { signer, .. } => {
-                if crate::signing::pubkey_part(&self.author) != crate::signing::pubkey_part(signer)
-                {
+                if self.author != *signer {
                     return Err(SemanticError::AuthorMismatch);
                 }
             }
@@ -197,9 +184,9 @@ impl FactContent {
 struct WireFactContent {
     version: u32,
     domain: FactDomain,
-    mesh_context: String,
+    mesh_context: MeshContextId,
     body: FactBody,
-    author: String,
+    author: DeviceId,
     parents: Vec<FactId>,
 }
 
@@ -233,10 +220,9 @@ pub struct SignedFact {
 impl SignedFact {
     pub fn sign(content: FactContent, key: &SigningKey) -> Result<Self, SemanticError> {
         content.validate()?;
-        let expected_author = BASE32_NOPAD
-            .encode(key.verifying_key().as_bytes())
-            .to_lowercase();
-        if crate::signing::pubkey_part(&content.author) != expected_author {
+        let expected_author = DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+            .map_err(|_| SemanticError::AuthorMismatch)?;
+        if content.author != expected_author {
             return Err(SemanticError::AuthorMismatch);
         }
         let id = FactId::from_content(&content);
@@ -255,3 +241,121 @@ impl SignedFact {
 
 /// Alias used by adapters when they need to state that a value is canonical.
 pub type CanonicalFact = SignedFact;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic::{FactBody, FactDomain, VerifiedBootstrap};
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[9; 32])
+    }
+
+    fn device(key: &SigningKey) -> DeviceId {
+        DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn canonical_context_and_device_are_part_of_fact_identity() {
+        let key = key();
+        let device = device(&key);
+        let bootstrap = VerifiedBootstrap::create_closed("mesh-a", vec![key.clone()], [0; 32])
+            .expect("bootstrap");
+        let context = bootstrap.context_id();
+        let content = FactContent::new(
+            FactDomain::Participation,
+            context,
+            FactBody::OpenParticipation {
+                device_id: device.clone(),
+                joined: true,
+            },
+            device,
+            Vec::new(),
+        );
+        let fact = SignedFact::sign(content, &key).expect("canonical fact");
+        assert!(fact.verify().is_ok());
+        assert_eq!(FactId::from_content(&fact.content), fact.id);
+    }
+
+    #[test]
+    fn open_participation_does_not_sign_a_display_label() {
+        let key = key();
+        let device = device(&key);
+        let context = VerifiedBootstrap::create_closed("mesh-a", vec![key.clone()], [0; 32])
+            .expect("bootstrap")
+            .context_id();
+        let content = FactContent::new(
+            FactDomain::Participation,
+            context,
+            FactBody::OpenParticipation {
+                device_id: device.clone(),
+                joined: true,
+            },
+            device,
+            Vec::new(),
+        );
+        let encoded = content.canonical_bytes();
+        assert!(!encoded
+            .windows(b"label".len())
+            .any(|window| window == b"label"));
+    }
+
+    #[test]
+    fn grant_revoke_evict_and_resolution_share_only_typed_cells() {
+        let key = key();
+        let device = device(&key);
+        let grant = FactBody::RoleGrant {
+            target: device.clone(),
+            role: crate::semantic::Role::Member,
+        };
+        let revoke = FactBody::RoleRevoke {
+            target: device.clone(),
+        };
+        let evict = FactBody::Evict {
+            target: device.clone(),
+        };
+        assert_eq!(grant.exclusive_cells(), revoke.exclusive_cells());
+        assert_eq!(evict.exclusive_cells().len(), 2);
+        assert!(matches!(
+            evict.exclusive_cells().as_slice(),
+            [
+                crate::semantic::ExclusiveCell::Role { .. },
+                crate::semantic::ExclusiveCell::Membership { .. }
+            ]
+        ));
+
+        let proposal = FactId::from_bytes([3; 32]);
+        let resolution = FactBody::Resolution {
+            cell: crate::semantic::ExclusiveCell::decision(proposal),
+            cited_heads: vec![proposal],
+            selected_head: proposal,
+        };
+        assert!(matches!(
+            resolution.exclusive_cells().as_slice(),
+            [crate::semantic::ExclusiveCell::Decision { proposal: id }] if *id == proposal
+        ));
+    }
+
+    #[test]
+    fn participation_cannot_claim_governance_domain() {
+        let key = key();
+        let device = device(&key);
+        let context = VerifiedBootstrap::create_closed("mesh-a", vec![key], [0; 32])
+            .expect("bootstrap")
+            .context_id();
+        let content = FactContent::new(
+            FactDomain::Governance,
+            context,
+            FactBody::OpenParticipation {
+                device_id: device.clone(),
+                joined: true,
+            },
+            device,
+            Vec::new(),
+        );
+        assert!(matches!(
+            content.validate(),
+            Err(crate::semantic::SemanticError::DomainMismatch)
+        ));
+    }
+}

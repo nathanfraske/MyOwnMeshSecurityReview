@@ -1,4 +1,4 @@
-//! Roster and governance: the two snapshots, the twelve signed-transition
+//! Roster and governance: the two snapshots, the five signed-transition
 //! operations, and local MFA custody.
 //!
 //! Two things distinguish this domain from the rest, and both are about
@@ -143,7 +143,7 @@ pub(in crate::control) async fn roster_remove(
     answered(result, owner, admission)
 }
 
-/// Set the topology directly, which a governed network refuses.
+/// Set the local topology directly.
 pub(in crate::control) async fn topology_set(
     state: &Arc<ControlState>,
     admission: &FrameAdmission,
@@ -156,64 +156,14 @@ pub(in crate::control) async fn topology_set(
         Err(error) => Err(error),
         Ok(mode) => match state.registry.get(&network) {
             None => Err(no_such_network(&network)),
-            Some(net) => {
-                if net
-                    .governance_state()
-                    .await
-                    .is_ok_and(|governance| governance.topology.is_some())
-                {
-                    Err("this network's topology is governed by a signed owner transition — propose a change instead (`networks topology-propose` / GovernanceProposeTopology)".to_owned())
-                } else {
-                    net.set_topology(mode)
-                        .await
-                        .map(|_| OperationReplyData::Topology(topology))
-                        .map_err(|error| error.to_string())
-                }
-            }
+            Some(net) => net
+                .set_topology(mode)
+                .await
+                .map(|_| OperationReplyData::Topology(topology))
+                .map_err(|error| error.to_string()),
         },
     };
     answered(result, owner, admission)
-}
-
-/// Propose one signed transition, whatever its variant.
-///
-/// The five `propose_*` operations differ only in the variant they build, so
-/// they build it in their own arm's function and submit it through here.
-async fn propose(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    variant: myownmesh_core::TransitionVariant,
-    mfa_code: Option<String>,
-) -> Result<Answer> {
-    let owner = operation_owner(admission)?;
-    let result = match state.registry.get(&network) {
-        Some(net) => net
-            .propose_transition(variant, mfa_code)
-            .await
-            .map(OperationReplyData::ProposalId)
-            .map_err(|error| error.to_string()),
-        None => Err(no_such_network(&network)),
-    };
-    answered(result, owner, admission)
-}
-
-/// Propose a change to what kind of network this is.
-pub(in crate::control) async fn propose_kind_change(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    to: myownmesh_core::NetworkKind,
-    mfa_code: Option<String>,
-) -> Result<Answer> {
-    propose(
-        state,
-        admission,
-        network,
-        myownmesh_core::TransitionVariant::KindChange { to },
-        mfa_code,
-    )
-    .await
 }
 
 /// Propose granting a role to a device.
@@ -222,17 +172,19 @@ pub(in crate::control) async fn propose_role_grant(
     admission: &FrameAdmission,
     network: String,
     target: String,
-    role: myownmesh_core::Role,
+    role: myownmesh_core::network_state::Role,
     mfa_code: Option<String>,
 ) -> Result<Answer> {
-    propose(
-        state,
-        admission,
-        network,
-        myownmesh_core::TransitionVariant::RoleGrant { target, role },
-        mfa_code,
-    )
-    .await
+    let owner = operation_owner(admission)?;
+    let result = match state.registry.get(&network) {
+        Some(net) => net
+            .propose_role_grant(&target, role, mfa_code)
+            .await
+            .map(|id| OperationReplyData::ProposalId(id.to_string()))
+            .map_err(|error| error.to_string()),
+        None => Err(no_such_network(&network)),
+    };
+    answered(result, owner, admission)
 }
 
 /// Propose revoking a device's role.
@@ -243,14 +195,16 @@ pub(in crate::control) async fn propose_role_revoke(
     target: String,
     mfa_code: Option<String>,
 ) -> Result<Answer> {
-    propose(
-        state,
-        admission,
-        network,
-        myownmesh_core::TransitionVariant::RoleRevoke { target },
-        mfa_code,
-    )
-    .await
+    let owner = operation_owner(admission)?;
+    let result = match state.registry.get(&network) {
+        Some(net) => net
+            .propose_role_revoke(&target, mfa_code)
+            .await
+            .map(|id| OperationReplyData::ProposalId(id.to_string()))
+            .map_err(|error| error.to_string()),
+        None => Err(no_such_network(&network)),
+    };
+    answered(result, owner, admission)
 }
 
 /// Propose evicting a device from the network.
@@ -261,116 +215,12 @@ pub(in crate::control) async fn propose_evict(
     target: String,
     mfa_code: Option<String>,
 ) -> Result<Answer> {
-    propose(
-        state,
-        admission,
-        network,
-        myownmesh_core::TransitionVariant::Evict { target },
-        mfa_code,
-    )
-    .await
-}
-
-/// Propose a governed topology change.
-///
-/// The only proposal that can be refused before it is submitted: an
-/// unparseable topology never reaches the network.
-pub(in crate::control) async fn propose_topology(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    topology: String,
-    hub: Option<String>,
-    mfa_code: Option<String>,
-) -> Result<Answer> {
-    let mode = match super::network::parse_topology(&topology, hub.as_deref()) {
-        Ok(mode) => mode,
-        Err(error) => {
-            let owner = operation_owner(admission)?;
-            return answered(Err(error), owner, admission);
-        }
-    };
-    propose(
-        state,
-        admission,
-        network,
-        myownmesh_core::TransitionVariant::TopologyChange { to: mode },
-        mfa_code,
-    )
-    .await
-}
-
-/// Add this device's signature to a proposal.
-pub(in crate::control) async fn sign(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    proposal_id: String,
-    mfa_code: Option<String>,
-) -> Result<Answer> {
     let owner = operation_owner(admission)?;
     let result = match state.registry.get(&network) {
         Some(net) => net
-            .sign_proposal(&proposal_id, mfa_code)
+            .propose_evict(&target, mfa_code)
             .await
-            .map(|_| OperationReplyData::Signed(proposal_id))
-            .map_err(|error| error.to_string()),
-        None => Err(no_such_network(&network)),
-    };
-    answered(result, owner, admission)
-}
-
-/// Record this device's objection to a proposal.
-pub(in crate::control) async fn deny(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    proposal_id: String,
-) -> Result<Answer> {
-    let owner = operation_owner(admission)?;
-    let result = match state.registry.get(&network) {
-        Some(net) => net
-            .deny_proposal(&proposal_id)
-            .await
-            .map(|_| OperationReplyData::Denied(proposal_id))
-            .map_err(|error| error.to_string()),
-        None => Err(no_such_network(&network)),
-    };
-    answered(result, owner, admission)
-}
-
-/// Withdraw a proposal this device raised.
-pub(in crate::control) async fn withdraw(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    proposal_id: String,
-) -> Result<Answer> {
-    let owner = operation_owner(admission)?;
-    let result = match state.registry.get(&network) {
-        Some(net) => net
-            .withdraw_proposal(&proposal_id)
-            .await
-            .map(|_| OperationReplyData::Withdrawn(proposal_id))
-            .map_err(|error| error.to_string()),
-        None => Err(no_such_network(&network)),
-    };
-    answered(result, owner, admission)
-}
-
-/// Carry out an approved split, answering with the new network's id.
-pub(in crate::control) async fn spawn_split(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    proposal_id: String,
-) -> Result<Answer> {
-    let owner = operation_owner(admission)?;
-    let result = match state.registry.get(&network) {
-        Some(net) => net
-            .spawn_split(&proposal_id)
-            .await
-            .map(OperationReplyData::NewNetworkId)
+            .map(|id| OperationReplyData::ProposalId(id.to_string()))
             .map_err(|error| error.to_string()),
         None => Err(no_such_network(&network)),
     };

@@ -42,6 +42,7 @@
 
 mod capabilities;
 mod departure;
+mod recovery;
 mod reliable;
 mod slot;
 
@@ -85,6 +86,10 @@ impl DedupToken {
 
 pub(crate) use departure::{
     DepartureAdmissionError, DepartureCarrier, DepartureWaitOutcome, DepartureWaiter,
+};
+pub(crate) use recovery::{
+    RecoveryAttempt, RecoveryDemandAdmission, RecoveryDemandError, RecoveryDemandHandle,
+    RecoveryDemandSettlement,
 };
 pub(crate) use reliable::{InboundOutcome, UnsentFrame};
 pub(crate) use slot::{
@@ -207,12 +212,24 @@ impl LogicalSessionOperation<'_> {
         self.state.departure.accept_remote(correlation)
     }
 
+    pub(crate) fn arm_recovery_demand(
+        &mut self,
+    ) -> std::result::Result<RecoveryDemandAdmission, RecoveryDemandError> {
+        self.state.departure.arm_recovery(&self.validity)
+    }
+
+    pub(crate) fn cancel_recovery_for_usable_successor(&mut self) -> bool {
+        self.state.departure.cancel_recovery_for_usable_successor()
+    }
+
     pub(crate) fn cancel_departure_for_carrier(&mut self, carrier: DepartureCarrier) -> bool {
         self.state.departure.cancel_for_carrier(carrier)
     }
 
     pub(crate) fn cancel_departure_for_shutdown(&mut self) -> bool {
-        self.state.departure.cancel_for_shutdown()
+        let cancelled = self.state.departure.cancel_for_shutdown();
+        self.state.departure.cancel_recovery_for_shutdown();
+        cancelled
     }
 
     pub(crate) fn departure_pending(&self) -> bool {

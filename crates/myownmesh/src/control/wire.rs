@@ -236,30 +236,16 @@ pub enum Request {
 
     // ---- closed-network governance --------------------------------
     /// Snapshot the per-network signed governance state — kind,
-    /// roles, transition log, pending proposals, splits. The GUI
-    /// polls this to render its Governance tab + per-network kind
-    /// badge.
+    /// roles. Legacy proposal queues and split state are not authority and
+    /// are absent from this read-only view.
     GovernanceState {
         network: String,
-    },
-    /// Float a kind-change proposal (`open → closed` or
-    /// `closed → open`). Engine signs with the local identity,
-    /// broadcasts to peers, attempts immediate ratification if the
-    /// quorum is already met. Returns the new proposal id.
-    GovernanceProposeKindChange {
-        network: String,
-        /// Target kind. Must differ from the current one.
-        to: myownmesh_core::NetworkKind,
-        /// Per-device custody second factor, if this device enrolled one for
-        /// the network (see the `GovernanceMfa*` ops). Omitted otherwise.
-        #[serde(default)]
-        mfa_code: Option<String>,
     },
     /// Float a role-grant proposal.
     GovernanceProposeRoleGrant {
         network: String,
         target: String,
-        role: myownmesh_core::Role,
+        role: myownmesh_core::network_state::Role,
         #[serde(default)]
         mfa_code: Option<String>,
     },
@@ -277,47 +263,6 @@ pub enum Request {
         target: String,
         #[serde(default)]
         mfa_code: Option<String>,
-    },
-    /// Float a topology-change proposal: the owner-signed, network-wide
-    /// shape (mode, hub set, spoke redundancy) in one transition. Once
-    /// ratified it outranks every device's local config topology and
-    /// converges through the signed log exactly like roles do — this is
-    /// how a node is made an infra hub for the whole network. Closed
-    /// networks only; open/silent ones keep the per-device `TopologySet`.
-    GovernanceProposeTopology {
-        network: String,
-        /// Same encoding `TopologySet` takes: `ring`, `star`, `hubs`,
-        /// or `full_mesh`.
-        topology: String,
-        /// Hub spec for `star` (`<device_id>`) / `hubs`
-        /// (`id1,id2[,…][:spoke_redundancy]`).
-        #[serde(default)]
-        hub: Option<String>,
-        #[serde(default)]
-        mfa_code: Option<String>,
-    },
-    /// Sign a pending proposal.
-    GovernanceSign {
-        network: String,
-        proposal_id: String,
-        #[serde(default)]
-        mfa_code: Option<String>,
-    },
-    /// Deny a pending proposal. Single-shot kill switch.
-    GovernanceDeny {
-        network: String,
-        proposal_id: String,
-    },
-    /// Withdraw a proposal the local device floated.
-    GovernanceWithdraw {
-        network: String,
-        proposal_id: String,
-    },
-    /// Spawn a proposer-initiated split. Returns the derived
-    /// network id of the new closed network.
-    GovernanceSpawnSplit {
-        network: String,
-        proposal_id: String,
     },
     /// Enroll a per-device TOTP custody lock for `network` on this daemon.
     /// Returns the secret (base32 + `otpauth://` URI for a QR) and the

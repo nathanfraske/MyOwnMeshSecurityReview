@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use myownmesh_signaling::nostr::delivery::{
     DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryStore,
-    DeliveryTerminal, RelaySessionId,
+    DeliveryTerminal, RelaySessionId, SessionRetention,
 };
 use myownmesh_signaling::nostr::driver::{
     start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
@@ -40,6 +40,12 @@ struct CountingLease {
     stats: Arc<DeliveryStats>,
 }
 
+struct NoopLease;
+
+impl DeliveryLease for NoopLease {
+    fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {}
+}
+
 impl DeliveryLease for CountingLease {
     fn finish(self: Box<Self>, terminal: DeliveryTerminal) {
         self.stats.finished.fetch_add(1, Ordering::SeqCst);
@@ -59,6 +65,67 @@ impl DeliveryLease for CountingLease {
 }
 
 impl DeliveryProvider for CountingProvider {
+    fn reserve_session_record(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_session_set_node(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_session_set_growth(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_attempt_record(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_attempt_key(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_attempt_map_growth(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_relay_map_growth(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
     fn reserve(
         &self,
         _attempt: &str,

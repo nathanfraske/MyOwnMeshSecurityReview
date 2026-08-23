@@ -1,22 +1,23 @@
 //! Canonical, transport-independent V4 semantic content.
 //!
-//! This module deliberately contains no wire envelope, session route, clock,
-//! or courier field.  The byte encoding is explicit so a future serializer
-//! cannot accidentally make map order or serde representation authoritative.
+//! Authority-bearing values in this module are deliberately typed.  A display
+//! label, carrier spelling, or alternate serialization cannot become a second
+//! semantic identity or exclusive-cell key.
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use data_encoding::BASE32_NOPAD;
+use ed25519_dalek::VerifyingKey;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use super::FactId;
 
-/// Domain separation for canonical semantic facts.
+/// Domain separation for the adopted V4 durable fact union.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactDomain {
     Governance,
     Participation,
-    Checkpoint,
     EvictionProof,
 }
 
@@ -25,24 +26,103 @@ impl FactDomain {
         match self {
             Self::Governance => "governance",
             Self::Participation => "participation",
-            Self::Checkpoint => "checkpoint",
             Self::EvictionProof => "eviction_proof",
         }
     }
 }
 
-/// V4 governance kind.  This is intentionally independent of the legacy wire
-/// `NetworkKind`; adapters may translate it during migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GovernanceKind {
-    Open,
-    Closed,
-    Silent,
+/// The only authority-bearing device identity accepted by canonical facts.
+///
+/// This is the raw Ed25519 public key in its canonical lowercase base32 form.
+/// Display suffixes, uppercase encodings, padding, and alternate base32 forms
+/// are rejected before a value can enter a fact or cell.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceId(String);
+
+pub type CanonicalDeviceId = DeviceId;
+
+impl DeviceId {
+    pub fn from_public_key_bytes(bytes: [u8; 32]) -> Result<Self, String> {
+        VerifyingKey::from_bytes(&bytes)
+            .map_err(|error| format!("invalid Ed25519 public key: {error}"))?;
+        let encoded = BASE32_NOPAD.encode(&bytes).to_lowercase();
+        Ok(Self(encoded))
+    }
+
+    pub fn from_canonical_str(value: &str) -> Result<Self, String> {
+        if value.is_empty() || value != value.to_lowercase() {
+            return Err("DeviceId must use lowercase unpadded base32".into());
+        }
+        let bytes = BASE32_NOPAD
+            .decode(value.to_uppercase().as_bytes())
+            .map_err(|error| format!("DeviceId is not canonical base32: {error}"))?;
+        if bytes.len() != 32 {
+            return Err("DeviceId must decode to 32 bytes".into());
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        let id = Self::from_public_key_bytes(key)?;
+        if id.base32() != value {
+            return Err("DeviceId is not the canonical base32 spelling".into());
+        }
+        Ok(id)
+    }
+
+    pub fn as_bytes(&self) -> [u8; 32] {
+        let bytes = BASE32_NOPAD
+            .decode(self.0.to_uppercase().as_bytes())
+            .expect("DeviceId stores canonical base32");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        key
+    }
+
+    pub fn base32(&self) -> String {
+        self.0.clone()
+    }
 }
 
-/// V4 role tier, kept in the Semantic owner rather than borrowed from a wire
-/// projection.
+impl std::ops::Deref for DeviceId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DeviceId").field(&self.base32()).finish()
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.base32())
+    }
+}
+
+impl Serialize for DeviceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.base32())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_canonical_str(&value).map_err(D::Error::custom)
+    }
+}
+
+/// V4 role tier.  The selected Closed profile determines which tier may
+/// author each governance operation; the fact body does not flatten that rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -59,98 +139,103 @@ pub enum AttestationDecision {
     Reject,
 }
 
-/// Canonical topology body.  Lists are normalized before encoding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum Topology {
-    FullMesh,
-    Ring {
-        preferred: Option<u32>,
-    },
-    Star {
-        hub: String,
-    },
-    Hubs {
-        hubs: Vec<String>,
-        spoke_redundancy: Option<u32>,
-    },
-}
-
-/// The exclusive semantic cell a fact may advance.
+/// Closed typed union of semantic cells.  The subject type is fixed by the
+/// variant, so a free-form `(subject, field)` pair cannot alias authority.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ExclusiveCell {
-    pub subject: String,
-    pub field: String,
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ExclusiveCell {
+    Role { subject: DeviceId },
+    Membership { subject: DeviceId },
+    OpenParticipation { subject: DeviceId },
+    Decision { proposal: FactId },
 }
 
 impl ExclusiveCell {
-    pub fn new(subject: impl Into<String>, field: impl Into<String>) -> Self {
-        Self {
-            subject: subject.into(),
-            field: field.into(),
+    pub fn role(subject: DeviceId) -> Self {
+        Self::Role { subject }
+    }
+
+    pub fn membership(subject: DeviceId) -> Self {
+        Self::Membership { subject }
+    }
+
+    pub fn open_participation(subject: DeviceId) -> Self {
+        Self::OpenParticipation { subject }
+    }
+
+    pub fn decision(proposal: FactId) -> Self {
+        Self::Decision { proposal }
+    }
+
+    pub(crate) fn encode(&self, out: &mut Encoder) {
+        match self {
+            Self::Role { subject } => {
+                out.tag("role");
+                out.device(subject);
+            }
+            Self::Membership { subject } => {
+                out.tag("membership");
+                out.device(subject);
+            }
+            Self::OpenParticipation { subject } => {
+                out.tag("open_participation");
+                out.device(subject);
+            }
+            Self::Decision { proposal } => {
+                out.tag("decision");
+                out.id(*proposal);
+            }
         }
     }
 }
 
-/// Typed V4 bodies mirroring the current transition fields without retaining
-/// the legacy envelope, timestamp, or parallel signer-vector shape.
+impl fmt::Display for ExclusiveCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Role { subject } => write!(f, "role:{subject}"),
+            Self::Membership { subject } => write!(f, "membership:{subject}"),
+            Self::OpenParticipation { subject } => write!(f, "open_participation:{subject}"),
+            Self::Decision { proposal } => write!(f, "decision:{proposal}"),
+        }
+    }
+}
+
+/// The adopted V4 durable semantic union.  Context selection, topology, and
+/// compaction evidence are outside this ordinary fact graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum FactBody {
-    KindChange {
-        to: GovernanceKind,
-    },
     RoleGrant {
-        target: String,
+        target: DeviceId,
         role: Role,
     },
     RoleRevoke {
-        target: String,
+        target: DeviceId,
     },
     Evict {
-        target: String,
+        target: DeviceId,
     },
-    Split {
-        new_network_id: String,
-        members: Vec<String>,
-    },
-    TopologyChange {
-        to: Topology,
-    },
-    /// Self-authored Open/Silent participation.  The author must equal
-    /// `device_id` after display-suffix normalization.
+    /// Self-authored Open participation.  Presentation labels are local UI
+    /// data and are intentionally not signed into membership authority.
     OpenParticipation {
-        device_id: String,
+        device_id: DeviceId,
         joined: bool,
-        label: String,
     },
-    /// Foundation type for later durable-store checkpoints.  It is content
-    /// and verification only; persistence/recovery remains a later unit.
-    Checkpoint {
-        checkpoint_id: String,
-        heads: Vec<FactId>,
-    },
-    /// Foundation type for later durable eviction proof delivery.
     EvictionProof {
-        target: String,
+        target: DeviceId,
         evidence: Vec<FactId>,
     },
-    /// A device may author its own stand-down with complete evidence.
     SelfStandDown {
-        device_id: String,
+        device_id: DeviceId,
         evidence: Vec<FactId>,
     },
-    /// A signed decision binds its proposal, target, decision, signer, and
-    /// every contribution into one canonical semantic fact.
     Attestation {
-        target: String,
+        target: DeviceId,
         proposal: FactId,
         decision: AttestationDecision,
-        signer: String,
+        signer: DeviceId,
         contributions: Vec<FactId>,
     },
-    /// A resolution explicitly names every incomparable head it resolves.
-    /// `selected_head` must be one of `cited_heads`.
     Resolution {
         cell: ExclusiveCell,
         cited_heads: Vec<FactId>,
@@ -159,35 +244,20 @@ pub enum FactBody {
 }
 
 impl FactBody {
-    /// Normalize constructor input. Wire deserialization and validation use
-    /// `validate_canonical` instead, so alternate list order never hashes to
-    /// the same identity as canonical wire content.
     pub fn normalize(&mut self) {
         match self {
-            Self::Split { members, .. } => {
-                members.sort();
-                members.dedup();
+            Self::EvictionProof { evidence, .. }
+            | Self::SelfStandDown { evidence, .. }
+            | Self::Attestation {
+                contributions: evidence,
+                ..
             }
-            Self::TopologyChange { to } => to.normalize(),
-            Self::Checkpoint { heads, .. } => {
-                heads.sort();
-                heads.dedup();
-            }
-            Self::EvictionProof { evidence, .. } => {
+            | Self::Resolution {
+                cited_heads: evidence,
+                ..
+            } => {
                 evidence.sort();
                 evidence.dedup();
-            }
-            Self::SelfStandDown { evidence, .. } => {
-                evidence.sort();
-                evidence.dedup();
-            }
-            Self::Attestation { contributions, .. } => {
-                contributions.sort();
-                contributions.dedup();
-            }
-            Self::Resolution { cited_heads, .. } => {
-                cited_heads.sort();
-                cited_heads.dedup();
             }
             _ => {}
         }
@@ -195,39 +265,17 @@ impl FactBody {
 
     pub(crate) fn validate_canonical(&self) -> Result<(), super::SemanticError> {
         match self {
-            Self::Split { members, .. } => require_sorted_unique(members, "Split.members"),
-            Self::TopologyChange { to } => to.validate_canonical(),
-            Self::Checkpoint { heads, .. } => require_sorted_unique(heads, "Checkpoint.heads"),
-            Self::EvictionProof { target, evidence } => {
-                if target.is_empty() || evidence.is_empty() {
+            Self::EvictionProof { evidence, .. } | Self::SelfStandDown { evidence, .. } => {
+                if evidence.is_empty() {
                     return Err(super::SemanticError::IncompleteEvictionProof);
                 }
-                require_sorted_unique(evidence, "EvictionProof.evidence")
+                require_sorted_unique(evidence, "eviction evidence")
             }
-            Self::SelfStandDown {
-                device_id,
-                evidence,
-            } => {
-                if device_id.is_empty() || evidence.is_empty() {
-                    return Err(super::SemanticError::IncompleteEvictionProof);
-                }
-                require_sorted_unique(evidence, "SelfStandDown.evidence")
-            }
-            Self::Attestation {
-                target,
-                signer,
-                contributions,
-                ..
-            } => {
-                if target.is_empty() || signer.is_empty() {
-                    return Err(super::SemanticError::EmptyField(
-                        "attestation target/signer",
-                    ));
-                }
-                require_sorted_unique(contributions, "Attestation.contributions")
+            Self::Attestation { contributions, .. } => {
+                require_sorted_unique(contributions, "attestation contributions")
             }
             Self::Resolution { cited_heads, .. } => {
-                require_sorted_unique(cited_heads, "Resolution.cited_heads")
+                require_sorted_unique(cited_heads, "resolution cited heads")
             }
             _ => Ok(()),
         }
@@ -236,55 +284,34 @@ impl FactBody {
     pub fn domain(&self) -> FactDomain {
         match self {
             Self::OpenParticipation { .. } => FactDomain::Participation,
-            Self::Checkpoint { .. } => FactDomain::Checkpoint,
             Self::EvictionProof { .. } | Self::SelfStandDown { .. } => FactDomain::EvictionProof,
-            Self::Attestation { .. } => FactDomain::Governance,
             _ => FactDomain::Governance,
         }
     }
 
-    /// Return every exclusive cell affected by this body.  Eviction advances
-    /// both role and membership, so it intentionally contributes two cells.
     pub fn exclusive_cells(&self) -> Vec<ExclusiveCell> {
         match self {
-            Self::KindChange { .. } => vec![ExclusiveCell::new("network", "kind")],
             Self::RoleGrant { target, .. } | Self::RoleRevoke { target } => {
-                vec![ExclusiveCell::new(target, "role")]
+                vec![ExclusiveCell::role(target.clone())]
             }
             Self::Evict { target } => vec![
-                ExclusiveCell::new(target, "role"),
-                ExclusiveCell::new(target, "membership"),
+                ExclusiveCell::role(target.clone()),
+                ExclusiveCell::membership(target.clone()),
             ],
-            Self::Split { new_network_id, .. } => {
-                vec![ExclusiveCell::new(new_network_id, "split")]
-            }
-            Self::TopologyChange { .. } => vec![ExclusiveCell::new("network", "topology")],
             Self::OpenParticipation { device_id, .. } => {
-                vec![ExclusiveCell::new(device_id, "open_participation")]
+                vec![ExclusiveCell::open_participation(device_id.clone())]
             }
-            Self::Checkpoint { .. } | Self::EvictionProof { .. } | Self::SelfStandDown { .. } => {
-                Vec::new()
-            }
-            Self::Attestation { proposal, .. } => {
-                vec![ExclusiveCell::new(proposal.to_string(), "decision")]
-            }
+            Self::EvictionProof { .. } | Self::SelfStandDown { .. } => Vec::new(),
+            Self::Attestation { proposal, .. } => vec![ExclusiveCell::decision(*proposal)],
             Self::Resolution { cell, .. } => vec![cell.clone()],
         }
     }
 
     pub(crate) fn encode(&self, out: &mut Encoder) {
         match self {
-            Self::KindChange { to } => {
-                out.tag("kind_change");
-                out.tag(match to {
-                    GovernanceKind::Open => "open",
-                    GovernanceKind::Closed => "closed",
-                    GovernanceKind::Silent => "silent",
-                });
-            }
             Self::RoleGrant { target, role } => {
                 out.tag("role_grant");
-                out.text(target);
+                out.device(target);
                 out.tag(match role {
                     Role::Member => "member",
                     Role::Controller => "controller",
@@ -293,45 +320,20 @@ impl FactBody {
             }
             Self::RoleRevoke { target } => {
                 out.tag("role_revoke");
-                out.text(target);
+                out.device(target);
             }
             Self::Evict { target } => {
                 out.tag("evict");
-                out.text(target);
+                out.device(target);
             }
-            Self::Split {
-                new_network_id,
-                members,
-            } => {
-                out.tag("split");
-                out.text(new_network_id);
-                out.list_text(members);
-            }
-            Self::TopologyChange { to } => {
-                out.tag("topology_change");
-                to.encode(out);
-            }
-            Self::OpenParticipation {
-                device_id,
-                joined,
-                label,
-            } => {
+            Self::OpenParticipation { device_id, joined } => {
                 out.tag("open_participation");
-                out.text(device_id);
+                out.device(device_id);
                 out.bool(*joined);
-                out.text(label);
-            }
-            Self::Checkpoint {
-                checkpoint_id,
-                heads,
-            } => {
-                out.tag("checkpoint");
-                out.text(checkpoint_id);
-                out.list_ids(heads);
             }
             Self::EvictionProof { target, evidence } => {
                 out.tag("eviction_proof");
-                out.text(target);
+                out.device(target);
                 out.list_ids(evidence);
             }
             Self::SelfStandDown {
@@ -339,7 +341,7 @@ impl FactBody {
                 evidence,
             } => {
                 out.tag("self_stand_down");
-                out.text(device_id);
+                out.device(device_id);
                 out.list_ids(evidence);
             }
             Self::Attestation {
@@ -350,14 +352,14 @@ impl FactBody {
                 contributions,
             } => {
                 out.tag("attestation");
-                out.text(target);
+                out.device(target);
                 out.id(*proposal);
                 out.tag(match decision {
                     AttestationDecision::Evict => "evict",
                     AttestationDecision::Approve => "approve",
                     AttestationDecision::Reject => "reject",
                 });
-                out.text(signer);
+                out.device(signer);
                 out.list_ids(contributions);
             }
             Self::Resolution {
@@ -374,44 +376,6 @@ impl FactBody {
     }
 }
 
-impl Topology {
-    fn normalize(&mut self) {
-        if let Self::Hubs { hubs, .. } = self {
-            hubs.sort();
-            hubs.dedup();
-        }
-    }
-
-    fn validate_canonical(&self) -> Result<(), super::SemanticError> {
-        match self {
-            Self::Hubs { hubs, .. } => require_sorted_unique(hubs, "Topology.hubs"),
-            _ => Ok(()),
-        }
-    }
-
-    fn encode(&self, out: &mut Encoder) {
-        match self {
-            Self::FullMesh => out.tag("full_mesh"),
-            Self::Ring { preferred } => {
-                out.tag("ring");
-                out.option_u32(*preferred);
-            }
-            Self::Star { hub } => {
-                out.tag("star");
-                out.text(hub);
-            }
-            Self::Hubs {
-                hubs,
-                spoke_redundancy,
-            } => {
-                out.tag("hubs");
-                out.list_text(hubs);
-                out.option_u32(*spoke_redundancy);
-            }
-        }
-    }
-}
-
 fn require_sorted_unique<T: Ord>(
     values: &[T],
     field: &'static str,
@@ -420,13 +384,6 @@ fn require_sorted_unique<T: Ord>(
         Ok(())
     } else {
         Err(super::SemanticError::NonCanonicalSet(field))
-    }
-}
-
-impl ExclusiveCell {
-    pub(crate) fn encode(&self, out: &mut Encoder) {
-        out.text(&self.subject);
-        out.text(&self.field);
     }
 }
 
@@ -461,17 +418,15 @@ impl Encoder {
         self.bytes.push(u8::from(value));
     }
 
-    pub(crate) fn option_u32(&mut self, value: Option<u32>) {
-        match value {
-            Some(value) => {
-                self.bool(true);
-                self.bytes.extend_from_slice(&value.to_be_bytes());
-            }
-            None => self.bool(false),
-        }
+    pub(crate) fn id(&mut self, value: FactId) {
+        self.bytes.extend_from_slice(value.as_bytes());
     }
 
-    pub(crate) fn id(&mut self, value: FactId) {
+    pub(crate) fn device(&mut self, value: &DeviceId) {
+        self.bytes.extend_from_slice(&value.as_bytes());
+    }
+
+    pub(crate) fn context(&mut self, value: super::MeshContextId) {
         self.bytes.extend_from_slice(value.as_bytes());
     }
 
@@ -483,21 +438,43 @@ impl Encoder {
         }
     }
 
-    pub(crate) fn list_text(&mut self, values: &[String]) {
-        self.bytes
-            .extend_from_slice(&(values.len() as u64).to_be_bytes());
-        for value in values {
-            self.text(value);
-        }
-    }
-
     pub(crate) fn finish(self) -> Vec<u8> {
         self.bytes
     }
 }
 
-impl fmt::Display for ExclusiveCell {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.subject, self.field)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device() -> DeviceId {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn device_aliases_are_rejected_before_fact_construction() {
+        let canonical = device().base32();
+        assert!(DeviceId::from_canonical_str(&canonical).is_ok());
+        assert!(DeviceId::from_canonical_str(&canonical.to_uppercase()).is_err());
+        assert!(DeviceId::from_canonical_str(&format!("{canonical}-label")).is_err());
+        assert!(DeviceId::from_canonical_str(&format!("{canonical}=")).is_err());
+    }
+
+    #[test]
+    fn exclusive_cells_are_a_closed_typed_union() {
+        let id = device();
+        assert_ne!(
+            ExclusiveCell::role(id.clone()),
+            ExclusiveCell::membership(id.clone())
+        );
+        assert_eq!(
+            ExclusiveCell::role(id.clone()).to_string(),
+            format!("role:{id}")
+        );
+        assert_eq!(
+            ExclusiveCell::open_participation(id.clone()).to_string(),
+            format!("open_participation:{id}")
+        );
     }
 }

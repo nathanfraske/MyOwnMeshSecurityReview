@@ -1777,26 +1777,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceProposeKindChange {
-                network,
-                to,
-                mfa_code,
-            } => {
-                let (reply, output) = dispatch::governance::propose_kind_change(
-                    &state,
-                    &json_lines,
-                    network,
-                    to,
-                    mfa_code,
-                )
-                .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
             Request::GovernanceProposeRoleGrant {
                 network,
                 target,
@@ -1852,84 +1832,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     mfa_code,
                 )
                 .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceProposeTopology {
-                network,
-                topology,
-                hub,
-                mfa_code,
-            } => {
-                let (reply, output) = dispatch::governance::propose_topology(
-                    &state,
-                    &json_lines,
-                    network,
-                    topology,
-                    hub,
-                    mfa_code,
-                )
-                .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceSign {
-                network,
-                proposal_id,
-                mfa_code,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::sign(&state, &json_lines, network, proposal_id, mfa_code)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceDeny {
-                network,
-                proposal_id,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::deny(&state, &json_lines, network, proposal_id).await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceWithdraw {
-                network,
-                proposal_id,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::withdraw(&state, &json_lines, network, proposal_id)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceSpawnSplit {
-                network,
-                proposal_id,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::spawn_split(&state, &json_lines, network, proposal_id)
-                        .await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("governance/network response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {

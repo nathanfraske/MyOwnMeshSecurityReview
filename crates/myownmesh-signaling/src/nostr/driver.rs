@@ -38,8 +38,21 @@ use super::handle::derive_room_handle;
 use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
 use crate::{
-    CarrierAttribution, ErasedOwner, ErasedSource, InboundSink, OutboundSource, SignalingMessage,
+    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierAttribution,
+    ErasedOwner, ErasedSource, InboundSink, OutboundSource, SignalingMessage,
 };
+
+struct UnmeteredAttemptRefusalSink;
+
+impl AttemptRefusalSink for UnmeteredAttemptRefusalSink {
+    fn refused(&self, _refusal: AttemptRefusal) {}
+}
+
+struct UnmeteredAttemptOutcomeSink;
+
+impl AttemptOutcomeSink for UnmeteredAttemptOutcomeSink {
+    fn outcome(&self, _outcome: AttemptOutcome) {}
+}
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -134,12 +147,60 @@ where
     )
 }
 
-/// Start with the provider that funds each exact relay-session delivery.
+/// Start with the provider that funds each exact attempt and relay-session
+/// delivery.  Attempt custody is acquired before the event enters the live
+/// map; relay custody is acquired before a frame is encoded.
 pub fn start_with_delivery_provider<S>(
     config: NostrDriverConfig,
     outbound: S,
     inbound_tx: InboundSink<NostrInbound>,
     provider: Arc<dyn DeliveryProvider>,
+) -> NostrDriverHandle
+where
+    S: OutboundSource<NostrOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
+    start_with_delivery_provider_and_refusal_sink(
+        config,
+        outbound,
+        inbound_tx,
+        provider,
+        Arc::new(UnmeteredAttemptRefusalSink),
+    )
+}
+
+/// Start with provider custody and a consumer-owned sink for typed refusal
+/// records. The sink receives each exact attempt/event record immediately;
+/// the driver never retains a refusal queue.
+pub fn start_with_delivery_provider_and_refusal_sink<S>(
+    config: NostrDriverConfig,
+    outbound: S,
+    inbound_tx: InboundSink<NostrInbound>,
+    provider: Arc<dyn DeliveryProvider>,
+    refusal_sink: Arc<dyn AttemptRefusalSink>,
+) -> NostrDriverHandle
+where
+    S: OutboundSource<NostrOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
+    start_with_delivery_provider_and_sinks(
+        config,
+        outbound,
+        inbound_tx,
+        provider,
+        refusal_sink,
+        Arc::new(UnmeteredAttemptOutcomeSink),
+    )
+}
+
+/// Start with provider custody and consumer-owned refusal/outcome sinks.
+pub fn start_with_delivery_provider_and_sinks<S>(
+    config: NostrDriverConfig,
+    outbound: S,
+    inbound_tx: InboundSink<NostrInbound>,
+    provider: Arc<dyn DeliveryProvider>,
+    refusal_sink: Arc<dyn AttemptRefusalSink>,
+    outcome_sink: Arc<dyn AttemptOutcomeSink>,
 ) -> NostrDriverHandle
 where
     S: OutboundSource<NostrOutbound> + Send + 'static,
@@ -186,7 +247,7 @@ where
         Vec::new()
     };
 
-    let delivery = DeliveryStore::new(provider);
+    let delivery = DeliveryStore::new_with_outcome_sink(provider, outcome_sink);
     let (presence_tx, _) = watch::channel::<Option<Arc<NostrEvent>>>(None);
     // Force-reconnect signal. A bumped generation tells every relay
     // task to drop its current socket and redial *now*, skipping the
@@ -213,6 +274,7 @@ where
         outbound: tokio::sync::Mutex::new(Some(Box::new(ErasedSource::new(outbound))
             as Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>)),
         delivery: delivery.clone(),
+        refusal_sink,
         presence_tx,
         force_reconnect: force_reconnect.clone(),
         relay_connected: relay_connected.clone(),
@@ -353,6 +415,7 @@ struct DriverShared {
     outbound:
         tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>>>,
     delivery: Arc<DeliveryStore>,
+    refusal_sink: Arc<dyn AttemptRefusalSink>,
     presence_tx: watch::Sender<Option<Arc<NostrEvent>>>,
     /// Generation counter for forced reconnects. Bumping it wakes
     /// every relay task's `watch::Receiver` so it drops its socket
@@ -513,14 +576,24 @@ async fn run_relay(
                 if let Some(c) = &live {
                     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                let (session, refused) = shared.delivery.open_session();
-                for (event_id, error) in refused {
+                let (session, session_refusal, refused) =
+                    shared.delivery.open_session_with_refusals();
+                if let Some(error) = session_refusal {
                     warn!(
                         relay = %short(&url),
-                        %event_id,
                         ?error,
+                        "relay-session custody refused by provider"
+                    );
+                }
+                for refusal in refused {
+                    warn!(
+                        relay = %short(&url),
+                        attempt = %refusal.attempt,
+                        event_id = %refusal.event_id,
+                        ?refusal.refusal,
                         "relay-session delivery refused by provider"
                     );
+                    shared.refusal_sink.refused(refusal);
                 }
                 let outcome = run_relay_session(
                     &url,
@@ -1118,13 +1191,19 @@ async fn run_outbound_pump_v2(
             outbound.map(move |outbound| translate_outbound_event(&shared_for_event, outbound));
         if let Some(attempt) = attempt {
             let report = shared.delivery.admit(attempt.clone(), owned);
-            if let Some(refusal) = report.attempt_refusal {
+            if let Some(refusal) = report.attempt_refusal.clone() {
+                let refusal_record = AttemptRefusal {
+                    attempt: attempt.clone(),
+                    event_id: report.event_id.clone(),
+                    refusal: refusal.into_negotiation(),
+                };
                 warn!(
                     %attempt,
                     event_id = %report.event_id,
-                    ?refusal,
+                    ?refusal_record.refusal,
                     "negotiation attempt refused before relay admission"
                 );
+                shared.refusal_sink.refused(refusal_record);
             }
             for (session, error) in &report.refused {
                 warn!(
@@ -1268,6 +1347,7 @@ mod tests {
             relays: Mutex::new(Vec::new()),
             outbound: tokio::sync::Mutex::new(Some(out_rx)),
             delivery: DeliveryStore::new(Arc::new(UnmeteredDeliveryProvider)),
+            refusal_sink: Arc::new(UnmeteredAttemptRefusalSink),
             presence_tx: watch::channel(None).0,
             force_reconnect: Arc::new(watch::channel(0u64).0),
             relay_connected: Arc::new(watch::channel(0u64).0),

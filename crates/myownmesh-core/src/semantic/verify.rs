@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use super::{FactId, MeshContextId, SignedFact};
+use super::{ExclusiveCell, FactBody, FactId, MeshContextId, SignedFact};
 
 /// Errors raised before a fact can enter the canonical causal graph.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -74,4 +74,14 @@ pub fn verify_fact(fact: &SignedFact) -> Result<(), SemanticError> {
         return Err(SemanticError::InvalidSignature);
     }
     Ok(())
+}
+
+/// Whether a body is a candidate for the exact exclusive cell named by a
+/// resolution.  Keeping this check beside the canonical fact verifier avoids
+/// letting a caller use a merely related cell (or a stringly-typed alias) as
+/// resolution authority.
+pub(crate) fn body_advances_cell(body: &FactBody, cell: &ExclusiveCell) -> bool {
+    body.exclusive_cells()
+        .iter()
+        .any(|candidate| candidate == cell)
 }

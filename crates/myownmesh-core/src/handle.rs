@@ -405,6 +405,79 @@ impl JoinedNetwork {
         self.state.peer_info(device_id)
     }
 
+    /// Read the canonical governance projection as a compatibility snapshot.
+    /// Legacy transitions, pending proposals, and split records are never
+    /// exposed as mutable authority through this outer control seam.
+    pub async fn governance_state(&self) -> Result<crate::network_state::NetworkState> {
+        Ok(crate::engine::governance::snapshot(&self.state))
+    }
+
+    async fn propose_transition(
+        &self,
+        variant: crate::network_state::TransitionVariant,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::ProposeTransition {
+                variant,
+                mfa_code,
+                reply,
+            })
+            .map_err(|error| error.into_admission_error())?;
+        receiver
+            .await
+            .map_err(|_| Error::Network("engine dropped governance proposal reply".into()))?
+    }
+
+    /// Propose a canonical member/controller/owner grant.
+    pub async fn propose_role_grant(
+        &self,
+        target: &str,
+        role: crate::network_state::Role,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        self.propose_transition(
+            crate::network_state::TransitionVariant::RoleGrant {
+                target: target.to_string(),
+                role,
+            },
+            mfa_code,
+        )
+        .await
+    }
+
+    /// Propose demoting a device to the canonical member role.
+    pub async fn propose_role_revoke(
+        &self,
+        target: &str,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        self.propose_transition(
+            crate::network_state::TransitionVariant::RoleRevoke {
+                target: target.to_string(),
+            },
+            mfa_code,
+        )
+        .await
+    }
+
+    /// Propose canonical eviction of a device.
+    pub async fn propose_evict(
+        &self,
+        target: &str,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        self.propose_transition(
+            crate::network_state::TransitionVariant::Evict {
+                target: target.to_string(),
+            },
+            mfa_code,
+        )
+        .await
+    }
+
     /// How many RPC operations are filed against `device_id`'s current
     /// session, or `None` if that peer has no live session at all.
     ///

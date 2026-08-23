@@ -17,6 +17,7 @@
 
 use std::future::Future;
 use std::mem::size_of;
+#[cfg(any(test, feature = "transport-lab"))]
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};

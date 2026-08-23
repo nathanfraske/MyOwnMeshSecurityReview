@@ -463,8 +463,9 @@ mod tests {
         assert_eq!(
             class(MeshMessage::SessionControl(
                 crate::protocol::SessionControl::Depart {
-                    correlation: crate::protocol::DepartureCorrelation::new("test-departure")
-                        .expect("test departure correlation is bounded"),
+                    correlation: crate::protocol::DepartureCorrelation::from_bytes(
+                        [0x22; crate::protocol::DEPARTURE_CORRELATION_BYTES]
+                    ),
                 }
             )),
             "not_durable",

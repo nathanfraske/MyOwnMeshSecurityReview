@@ -1,4 +1,9 @@
-//! Crash-safe persistence for the local canonical bootstrap pair.
+//! Persistence for the local canonical bootstrap pair.
+//!
+//! The temporary file is synchronized before the create-once hard link on all
+//! platforms. Unix also synchronizes the containing directory and propagates
+//! that failure. Other platforms retain functional create-once persistence,
+//! but a successful return does not claim parent-directory crash durability.
 //!
 //! The local slot is only a storage locator.  It is hashed before it reaches
 //! the path and is never consulted as a source of semantic authority; the
@@ -144,11 +149,12 @@ impl BootstrapStore {
             path: parent.to_path_buf(),
             source,
         })?;
+        sync_parent(parent)?;
         let temp = self.write_temp(&bytes)?;
         match std::fs::hard_link(&temp, &self.path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temp);
-                sync_parent(parent);
+                sync_parent(parent)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let _ = std::fs::remove_file(&temp);
@@ -236,14 +242,24 @@ impl BootstrapStore {
 }
 
 #[cfg(unix)]
-fn sync_parent(parent: &Path) {
-    if let Ok(directory) = std::fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
+fn sync_parent(parent: &Path) -> Result<(), BootstrapStoreError> {
+    let directory = std::fs::File::open(parent).map_err(|source| BootstrapStoreError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    directory
+        .sync_all()
+        .map_err(|source| BootstrapStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_parent: &Path) {}
+fn sync_parent(parent: &Path) -> Result<(), BootstrapStoreError> {
+    let _ = parent;
+    Ok(())
+}
 
 /// Fail-closed storage and validation failures.
 #[derive(Debug, Error)]

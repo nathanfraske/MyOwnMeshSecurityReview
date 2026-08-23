@@ -42,7 +42,9 @@ use super::connection::PeerConnection;
 pub(crate) struct PeerRegistry {
     peers: DashMap<String, PeerRegistryEntry>,
     mutation: Mutex<()>,
-    governance: Arc<parking_lot::RwLock<crate::network_state::NetworkState>>,
+    canonical_bootstrap: parking_lot::RwLock<Option<crate::semantic::VerifiedBootstrap>>,
+    canonical_fact_graph:
+        parking_lot::RwLock<Option<Arc<parking_lot::RwLock<crate::semantic::FactGraph>>>>,
     local_device_id: String,
     /// Where a newly minted session is announced.
     ///
@@ -200,20 +202,20 @@ impl AdmittedLocalDeparture {
 // A receipt send started on the exact authenticated channel that carried a
 // remote departure. The peer remains current until the receipt has settled so
 // a simultaneous local departure can observe it on its own exact witness.
-// The JSON receipt envelope is well below one correlation's wire bound; two
-// bounds leave finite room for the fixed kind/op/quotes without relying on an
-// unmeasured allocation. The lease below is acquired before the receipt bytes
-// are serialized.
-const MAX_DEPARTURE_RECEIPT_FRAME_BYTES: usize =
-    crate::protocol::MAX_DEPARTURE_CORRELATION_BYTES * 2;
-
-fn remote_departure_receipt_claim() -> std::result::Result<
+fn remote_departure_receipt_claim(
+    frame_len: usize,
+) -> std::result::Result<
     crate::resource::ResourceClaim,
     crate::resource::ResourceClaimArithmeticError,
 > {
+    let frame = u64::try_from(frame_len).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::QueuedBytes,
+        }
+    })?;
     let bytes = u64::try_from(
         std::mem::size_of::<RemoteDepartureReceipt>()
-            .checked_add(MAX_DEPARTURE_RECEIPT_FRAME_BYTES)
+            .checked_add(frame_len)
             .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
                 dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
             })?,
@@ -223,11 +225,6 @@ fn remote_departure_receipt_claim() -> std::result::Result<
             dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
         },
     )?;
-    let frame = u64::try_from(MAX_DEPARTURE_RECEIPT_FRAME_BYTES).map_err(|_| {
-        crate::resource::ResourceClaimArithmeticError::Overflow {
-            dimension: crate::resource::ResourceClass::QueuedBytes,
-        }
-    })?;
     crate::resource::ResourceClaim::try_from_entries([
         (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
         (crate::resource::ResourceClass::QueuedBytes, frame),
@@ -236,10 +233,12 @@ fn remote_departure_receipt_claim() -> std::result::Result<
     ])
 }
 
-/// The exact carrying-channel send permit and its bounded receipt lease.
+/// The exact carrying-channel send permit and its exact serialized receipt
+/// lease. Serialization is owned by the protocol caller after admission.
 pub(super) struct RemoteDepartureReceipt {
     send: crate::transport::StartedConnectorSend,
-    /// Explicitly funds the bounded serialized receipt buffer in addition to
+    frame_len: usize,
+    /// Explicitly funds the exact serialized receipt buffer in addition to
     /// the connector operation permit. Dropping it on send failure/cancel
     /// returns the exact receipt claim to the logical provider scope.
     _frame_lease: crate::resource::ResourceLease,
@@ -247,9 +246,9 @@ pub(super) struct RemoteDepartureReceipt {
 
 impl RemoteDepartureReceipt {
     pub(super) async fn send(self, data: bytes::Bytes) -> Result<usize> {
-        if data.len() > MAX_DEPARTURE_RECEIPT_FRAME_BYTES {
+        if data.len() != self.frame_len {
             return Err(Error::Transport(
-                "departure receipt exceeded its funded frame bound".into(),
+                "departure receipt length differed from its funded exact count".into(),
             ));
         }
         self.send.send(data).await
@@ -279,24 +278,17 @@ fn departure_carrier(
 
 impl Default for PeerRegistry {
     fn default() -> Self {
-        Self::new(
-            Arc::new(parking_lot::RwLock::new(
-                crate::network_state::NetworkState::default(),
-            )),
-            String::new(),
-        )
+        Self::new(String::new())
     }
 }
 
 impl PeerRegistry {
-    pub(super) fn new(
-        governance: Arc<parking_lot::RwLock<crate::network_state::NetworkState>>,
-        local_device_id: String,
-    ) -> Self {
+    pub(super) fn new(local_device_id: String) -> Self {
         Self {
             peers: DashMap::new(),
             mutation: Mutex::new(()),
-            governance,
+            canonical_bootstrap: parking_lot::RwLock::new(None),
+            canonical_fact_graph: parking_lot::RwLock::new(None),
             local_device_id,
             command_tx: std::sync::OnceLock::new(),
             speculative_promotion_tx: std::sync::OnceLock::new(),
@@ -357,54 +349,32 @@ impl PeerRegistry {
         }
     }
 
+    /// Bind the verified bootstrap and the one authoritative FactGraph used
+    /// by every registry policy fence. The engine calls this once after state
+    /// construction; a missing binding fails closed for Closed policy.
+    pub(crate) fn bind_canonical_authority(
+        &self,
+        bootstrap: crate::semantic::VerifiedBootstrap,
+        fact_graph: Arc<parking_lot::RwLock<crate::semantic::FactGraph>>,
+    ) {
+        *self.canonical_bootstrap.write() = Some(bootstrap);
+        *self.canonical_fact_graph.write() = Some(fact_graph);
+    }
+
     fn policy_admits(&self, remote_device_id: &str) -> bool {
-        super::governance::current_policy_admits(
-            &self.governance.read(),
+        let Some(bootstrap) = self.canonical_bootstrap.read().clone() else {
+            return false;
+        };
+        let Some(graph) = self.canonical_fact_graph.read().clone() else {
+            return false;
+        };
+        let graph = graph.read();
+        super::governance::canonical_policy_admits_from(
+            &bootstrap,
+            &graph,
             &self.local_device_id,
             remote_device_id,
         )
-    }
-
-    /// Apply one verified governance mutation and synchronously revoke every
-    /// session the resulting projection no longer admits.
-    ///
-    /// The lock order is the live authority order: registry mutation first,
-    /// governance second. Every application lender uses the same first lock, so
-    /// no effect can occur between publishing the new projection and clearing
-    /// its denied session. The closure is synchronous; callers perform roster
-    /// mirrors, broadcasts and connector cleanup after this returns.
-    pub(super) fn with_governance_commit<R>(
-        &self,
-        commit: impl FnOnce(&mut crate::network_state::NetworkState) -> R,
-    ) -> R {
-        let _mutation = self.mutation.lock();
-        let (result, denied) = {
-            let mut governance = self.governance.write();
-            let result = commit(&mut governance);
-            let local_admitted = super::governance::current_policy_admits(
-                &governance,
-                &self.local_device_id,
-                &self.local_device_id,
-            );
-            let denied = self
-                .peers
-                .iter()
-                .filter(|entry| {
-                    !local_admitted
-                        || !super::governance::current_policy_admits(
-                            &governance,
-                            &self.local_device_id,
-                            &entry.value().peer.device_id,
-                        )
-                })
-                .map(|entry| Arc::clone(&entry.value().peer))
-                .collect::<Vec<_>>();
-            (result, denied)
-        };
-        for peer in denied {
-            peer.revoke_promoted_session();
-        }
-        result
     }
 
     /// Bind the queue newly minted sessions are announced on.
@@ -1625,17 +1595,16 @@ impl PeerRegistry {
     /// so a channel terminal or replacement cannot slip between the two.  The
     /// returned worker stamp is used only for the departure frame; the waiter
     /// itself is funded by the logical validity lineage.
-    pub(super) fn begin_local_departure<C: AsRef<str>>(
+    pub(super) fn begin_local_departure(
         &self,
         owner: &PeerOwnerToken,
-        correlation: C,
+        correlation: &crate::protocol::DepartureCorrelation,
     ) -> Option<
         std::result::Result<
             AdmittedLocalDeparture,
             crate::runtime::peer_session::DepartureAdmissionError,
         >,
     > {
-        let correlation = crate::protocol::DepartureCorrelation::new(correlation.as_ref()).ok()?;
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
         if !Arc::ptr_eq(&current.value().installation, &owner.installation)
@@ -1649,7 +1618,7 @@ impl PeerRegistry {
         let witness_and_waiter = peer.with_logical_session_state(|logical| {
             let witness = logical.validity().clone();
             logical
-                .begin_departure(correlation, carrier)
+                .begin_departure(correlation.clone(), carrier)
                 .map(|waiter| (witness, waiter))
         })?;
         Some(
@@ -1683,6 +1652,7 @@ impl PeerRegistry {
     /// Read the number of exact logical records currently holding a pending
     /// departure observation. This is an observation for shutdown controls;
     /// it does not admit, select, or retain any session.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(super) fn pending_departure_count(&self) -> usize {
         let _mutation = self.mutation.lock();
         self.peers
@@ -1707,6 +1677,7 @@ impl PeerRegistry {
         &self,
         dispatch: &AdmittedInboundDispatch,
         correlation: &crate::protocol::DepartureCorrelation,
+        receipt_frame_len: usize,
     ) -> RemoteDepartureAdmission {
         let _mutation = self.mutation.lock();
         let Some(worker) = dispatch.owner.worker().cloned() else {
@@ -1726,18 +1697,17 @@ impl PeerRegistry {
         // state. If the logical admission below rejects as stale, this value
         // drops without publishing a terminal transition or retaining a
         // provider lease.
-        let receipt = dispatch
-            .witness
-            .reserve_retained(
-                remote_departure_receipt_claim()
-                    .expect("the fixed departure receipt claim is representable"),
-            )
+        let receipt = remote_departure_receipt_claim(receipt_frame_len)
             .ok()
+            .and_then(|claim| dispatch.witness.reserve_retained(claim).ok())
             .and_then(|_frame_lease| {
-                worker
-                    .begin_send()
-                    .ok()
-                    .map(|send| Box::new(RemoteDepartureReceipt { send, _frame_lease }))
+                worker.begin_send().ok().map(|send| {
+                    Box::new(RemoteDepartureReceipt {
+                        send,
+                        frame_len: receipt_frame_len,
+                        _frame_lease,
+                    })
+                })
             });
         let Some(defer_retirement) = peer
             .with_logical_session_state(|logical| {
@@ -2011,12 +1981,12 @@ impl AdmittedPendingSemanticOperation {
     pub(super) fn accepts_message(&self, message: &crate::protocol::MeshMessage) -> bool {
         match message {
             crate::protocol::MeshMessage::Fact(fact) => {
-                fact.content.mesh_context == self.mesh_context
+                fact.content.mesh_context.base32() == self.mesh_context.as_str()
             }
             crate::protocol::MeshMessage::FactBundle(bundle) => bundle
                 .facts
                 .iter()
-                .all(|fact| fact.content.mesh_context == self.mesh_context),
+                .all(|fact| fact.content.mesh_context.base32() == self.mesh_context.as_str()),
             // Inventory/request are exact-context Application-phase
             // coordination, never pending durable semantic input.
             crate::protocol::MeshMessage::FactInventory(_)

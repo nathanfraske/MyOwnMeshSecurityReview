@@ -2,11 +2,10 @@
 
 //! Projection and conflict controls for the V4 semantic owner.
 
-use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
 
 use myownmesh_core::semantic::{
-    CellProjection, ExclusiveCell, FactBody, FactContent, FactGraph, FactId, GovernanceKind, Role,
+    CellProjection, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph, FactId, Role,
     SignedFact, VerifiedBootstrap,
 };
 
@@ -14,10 +13,8 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-fn author(key: &SigningKey) -> String {
-    BASE32_NOPAD
-        .encode(key.verifying_key().as_bytes())
-        .to_lowercase()
+fn author(key: &SigningKey) -> DeviceId {
+    DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).expect("valid device id")
 }
 
 fn bootstrap(seed: u8, creation_id: u8) -> VerifiedBootstrap {
@@ -33,13 +30,7 @@ fn fact(
 ) -> SignedFact {
     let domain = body.domain();
     SignedFact::sign(
-        FactContent::new(
-            domain,
-            bootstrap.context_id().to_string(),
-            body,
-            author(key),
-            parents,
-        ),
+        FactContent::new(domain, bootstrap.context_id(), body, author(key), parents),
         key,
     )
     .expect("projection fixture fact signs")
@@ -49,26 +40,29 @@ fn fact(
 fn incomparable_heads_fail_closed_until_full_head_resolution() {
     let signing_key = key(11);
     let bootstrap = bootstrap(11, 11);
+    let subject = author(&signing_key);
     let first = fact(
         &bootstrap,
         &signing_key,
-        FactBody::KindChange {
-            to: GovernanceKind::Open,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Member,
         },
         Vec::new(),
     );
     let second = fact(
         &bootstrap,
         &signing_key,
-        FactBody::KindChange {
-            to: GovernanceKind::Closed,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Owner,
         },
         Vec::new(),
     );
     let mut graph = FactGraph::from_bootstrap(&bootstrap);
     graph.admit(first.clone()).unwrap();
     graph.admit(second.clone()).unwrap();
-    let cell = ExclusiveCell::new("network", "kind");
+    let cell = ExclusiveCell::role(subject.clone());
     assert!(graph.projection().is_conflicted(&cell));
     assert_eq!(graph.projection().value(&cell), None);
 
@@ -117,7 +111,7 @@ fn conflict_projection_does_not_depend_on_arrival_order() {
         &bootstrap,
         &signing_key,
         FactBody::RoleGrant {
-            target: "member-a".into(),
+            target: author(&signing_key),
             role: Role::Member,
         },
         Vec::new(),
@@ -126,7 +120,7 @@ fn conflict_projection_does_not_depend_on_arrival_order() {
         &bootstrap,
         &signing_key,
         FactBody::RoleGrant {
-            target: "member-a".into(),
+            target: author(&signing_key),
             role: Role::Owner,
         },
         Vec::new(),
@@ -140,5 +134,5 @@ fn conflict_projection_does_not_depend_on_arrival_order() {
     assert_eq!(left.projection(), right.projection());
     assert!(left
         .projection()
-        .is_conflicted(&ExclusiveCell::new("member-a", "role")));
+        .is_conflicted(&ExclusiveCell::role(author(&signing_key))));
 }

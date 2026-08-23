@@ -104,7 +104,7 @@ pub(super) enum PreparedReply {
 }
 
 pub(super) struct GovernanceDiagnostic {
-    pub(super) state: myownmesh_core::NetworkState,
+    pub(super) state: myownmesh_core::network_state::NetworkState,
     pub(super) evicted: Vec<String>,
 }
 
@@ -379,7 +379,7 @@ impl serde::Serialize for PreparedReply {
             Self::Governance(governance) => {
                 #[derive(serde::Serialize)]
                 struct GovernanceData<'a> {
-                    state: &'a myownmesh_core::NetworkState,
+                    state: &'a myownmesh_core::network_state::NetworkState,
                     evicted: &'a [String],
                 }
                 let mut response = serializer.serialize_struct("Response", 2)?;
@@ -416,10 +416,6 @@ pub(super) enum OperationReplyData {
     Removed(String),
     Topology(String),
     ProposalId(String),
-    Signed(String),
-    Denied(String),
-    Withdrawn(String),
-    NewNetworkId(String),
     Reconnecting(String),
     Connecting {
         peer: String,
@@ -565,18 +561,6 @@ fn serialize_operation_reply<S: serde::Serializer>(
                 ProposalId {
                     proposal_id: &'a str,
                 },
-                Signed {
-                    signed: &'a str,
-                },
-                Denied {
-                    denied: &'a str,
-                },
-                Withdrawn {
-                    withdrawn: &'a str,
-                },
-                NewNetworkId {
-                    new_network_id: &'a str,
-                },
                 Reconnecting {
                     reconnecting: &'a str,
                 },
@@ -634,14 +618,6 @@ fn serialize_operation_reply<S: serde::Serializer>(
                 OperationReplyData::ProposalId(value) => {
                     OperationField::ProposalId { proposal_id: value }
                 }
-                OperationReplyData::Signed(value) => OperationField::Signed { signed: value },
-                OperationReplyData::Denied(value) => OperationField::Denied { denied: value },
-                OperationReplyData::Withdrawn(value) => {
-                    OperationField::Withdrawn { withdrawn: value }
-                }
-                OperationReplyData::NewNetworkId(value) => OperationField::NewNetworkId {
-                    new_network_id: value,
-                },
                 OperationReplyData::Reconnecting(value) => OperationField::Reconnecting {
                     reconnecting: value,
                 },

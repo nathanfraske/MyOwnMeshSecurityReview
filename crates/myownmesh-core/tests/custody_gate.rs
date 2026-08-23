@@ -52,7 +52,7 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     .await
     .expect("create Closed bootstrap for alice");
     assert_eq!(state.verified_authority_root(), Some(alice.public_id()));
-    assert_eq!(state.governance_state.read().kind, NetworkKind::Closed);
+    assert_eq!(governance::snapshot(&state).kind, NetworkKind::Closed);
 
     // Enroll a custody lock for this network on this device.
     let enrolled = myownmesh_core::custody::enroll(&net_id, "alice-laptop").expect("enroll");
@@ -80,7 +80,7 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     );
 
     // With a valid one-time recovery code, the root-authorized member grant
-    // proceeds and projects into both canonical compatibility state and the
+    // proceeds and projects into the canonical read-only snapshot and the
     // production roster.
     let fact_id = governance::propose(
         &state,
@@ -93,15 +93,13 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     .await
     .expect("root-authorized RoleGrant with a valid recovery code");
     assert_eq!(fact_id.to_string().len(), 52, "returned canonical FactId");
-    {
-        let governance = state.governance_state.read();
-        assert_eq!(
-            governance.roles.get(&target_id).copied(),
-            Some(Role::Member),
-            "recovery-authored grant must project to Member"
-        );
-        assert!(governance.pending.is_empty());
-    }
+    let projected = governance::snapshot(&state);
+    assert_eq!(
+        projected.roles.get(&target_id).copied(),
+        Some(Role::Member),
+        "recovery-authored grant must project to Member"
+    );
+    assert!(projected.pending.is_empty());
     assert!(state.is_rostered(&target_id));
     assert_eq!(
         state

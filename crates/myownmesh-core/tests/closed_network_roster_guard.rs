@@ -93,12 +93,9 @@ async fn roster_membership_authority_gate() {
         alice.verified_bootstrap().context().scope,
         "closed-roster-guard"
     );
+    let initial_snapshot = governance::snapshot(&alice);
     assert_eq!(
-        alice
-            .governance_state
-            .read()
-            .roles
-            .get(alice_id.public_id()),
+        initial_snapshot.roles.get(alice_id.public_id()),
         Some(&Role::Owner),
         "the explicit Closed creator is the canonical root owner"
     );
@@ -127,11 +124,15 @@ async fn roster_membership_authority_gate() {
         bob_fact, carol_fact,
         "each RoleGrant is a distinct canonical fact"
     );
-    {
-        let gov = alice.governance_state.read();
-        assert_eq!(gov.roles.get(bob.public_id()), Some(&Role::Member));
-        assert_eq!(gov.roles.get(carol.public_id()), Some(&Role::Controller));
-    }
+    let canonical_snapshot = governance::snapshot(&alice);
+    assert_eq!(
+        canonical_snapshot.roles.get(bob.public_id()),
+        Some(&Role::Member)
+    );
+    assert_eq!(
+        canonical_snapshot.roles.get(carol.public_id()),
+        Some(&Role::Controller)
+    );
     assert!(
         rostered(&alice, bob.public_id()) && rostered(&alice, carol.public_id()),
         "canonical RoleGrants must project into the compatibility roster"

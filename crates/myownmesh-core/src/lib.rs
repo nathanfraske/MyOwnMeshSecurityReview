@@ -187,8 +187,8 @@ pub use runtime::attempt::{
 pub use runtime::session_broker::session_reservation_planning_claim;
 pub use semantic::{
     CanonicalFact, CellProjection, DurableCheckpoint, EvictionProofReference, ExclusiveCell,
-    FactBody, FactContent, FactDomain, FactGraph, FactId, GovernanceKind, Projection,
-    Role as SemanticRole, SemanticError, SignedFact, Topology as SemanticTopology,
+    FactBody, FactContent, FactDomain, FactGraph, FactId, Projection, Role as SemanticRole,
+    SemanticError, SignedFact,
 };
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;

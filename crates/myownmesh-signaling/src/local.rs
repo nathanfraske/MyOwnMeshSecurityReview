@@ -291,7 +291,7 @@ mod tests {
         let (_bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
         let bob_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
             Box::new(crate::UnboundedSource::new(bob_rx));
-        let _ = broker.join_with_sink(
+        drop(broker.join_with_sink(
             "room1",
             "bob",
             bob_outbound,
@@ -301,7 +301,7 @@ mod tests {
                 }
                 true
             }),
-        );
+        ));
 
         let directed = |peer_id: &str| LocalOutbound::DirectedToPeer {
             to: "bob".to_string(),

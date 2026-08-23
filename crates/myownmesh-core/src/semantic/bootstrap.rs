@@ -13,6 +13,8 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::content::DeviceId;
+
 pub const BASIS_VERSION: u16 = 1;
 pub const CONTEXT_VERSION: u16 = 1;
 
@@ -187,7 +189,7 @@ pub struct BasisCore {
     pub version: u16,
     pub scope: String,
     pub profile: ClosedProfileId,
-    pub authority_roots: Vec<String>,
+    pub authority_roots: Vec<DeviceId>,
     pub creation_id: [u8; 32],
 }
 
@@ -199,7 +201,7 @@ impl BasisCore {
         out.extend_from_slice(&self.version.to_be_bytes());
         put_text(&mut out, &self.scope);
         put_text(&mut out, self.profile.tag());
-        put_list(&mut out, &self.authority_roots);
+        put_devices(&mut out, &self.authority_roots);
         out.extend_from_slice(&self.creation_id);
         Ok(out)
     }
@@ -226,9 +228,6 @@ impl BasisCore {
         {
             return Err(BootstrapError::AuthorityRootsNotCanonical);
         }
-        for root in &self.authority_roots {
-            validate_root(root)?;
-        }
         Ok(())
     }
 }
@@ -239,7 +238,7 @@ pub struct GenesisBasis {
     pub version: u16,
     pub scope: String,
     pub profile: ClosedProfileId,
-    pub authority_roots: Vec<String>,
+    pub authority_roots: Vec<DeviceId>,
     pub creation_id: [u8; 32],
     /// Lowercase base32 Ed25519 proofs over the context/core transcript.
     pub root_signatures: Vec<String>,
@@ -282,10 +281,11 @@ impl GenesisBasis {
         self.validate()?;
         let transcript = root_proof_transcript(context_id, core_commitment);
         let root = &self.authority_roots[0];
-        let valid = crate::signing::verify(root, &transcript, &self.root_signatures[0])
-            .map_err(|_| BootstrapError::InvalidRootSignature(root.clone()))?;
+        let root_text = root.to_string();
+        let valid = crate::signing::verify(&root_text, &transcript, &self.root_signatures[0])
+            .map_err(|_| BootstrapError::InvalidRootSignature(root_text.clone()))?;
         if !valid {
-            return Err(BootstrapError::InvalidRootSignature(root.clone()));
+            return Err(BootstrapError::InvalidRootSignature(root_text));
         }
         Ok(())
     }
@@ -303,11 +303,11 @@ pub struct BootstrapRecord {
 /// policy input; only a VerifiedBootstrap can mint this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedAuthorityRoots {
-    roots: Vec<String>,
+    roots: Vec<DeviceId>,
 }
 
 impl VerifiedAuthorityRoots {
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, String> {
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, DeviceId> {
         self.roots.iter()
     }
 }
@@ -321,7 +321,7 @@ pub struct VerifiedClosedPolicy {
     profile: ClosedProfileId,
     scope: String,
     core_commitment: [u8; 32],
-    authority_root: String,
+    authority_root: DeviceId,
 }
 
 impl VerifiedClosedPolicy {
@@ -337,7 +337,7 @@ impl VerifiedClosedPolicy {
         &self.core_commitment
     }
 
-    pub(crate) fn authority_root(&self) -> &str {
+    pub(crate) fn authority_root(&self) -> &DeviceId {
         &self.authority_root
     }
 }
@@ -403,9 +403,8 @@ impl VerifiedBootstrap {
             return Err(BootstrapError::ExactlyOneAuthorityRoot);
         }
         let key = keys.pop().expect("one key was checked");
-        let root = BASE32_NOPAD
-            .encode(key.verifying_key().as_bytes())
-            .to_lowercase();
+        let root = DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+            .map_err(BootstrapError::InvalidAuthorityRoot)?;
         let profile = ClosedProfileId::SingleRootSignedMemberLogV1;
         let core = BasisCore {
             version: BASIS_VERSION,
@@ -422,7 +421,7 @@ impl VerifiedBootstrap {
             version: BASIS_VERSION,
             scope,
             profile,
-            authority_roots: vec![root],
+            authority_roots: vec![root.clone()],
             creation_id,
             root_signatures: vec![crate::signing::sign_with(&key, &transcript)],
         };
@@ -575,20 +574,7 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), BootstrapError>
     Ok(())
 }
 
-fn validate_root(root: &str) -> Result<(), BootstrapError> {
-    if root != root.to_lowercase() || root != crate::signing::pubkey_part(root) {
-        return Err(BootstrapError::NonCanonicalField("authority root"));
-    }
-    let bytes = BASE32_NOPAD
-        .decode(root.to_uppercase().as_bytes())
-        .map_err(|_| BootstrapError::InvalidAuthorityRoot(root.to_string()))?;
-    if bytes.len() != 32 || BASE32_NOPAD.encode(&bytes).to_lowercase() != root {
-        return Err(BootstrapError::InvalidAuthorityRoot(root.to_string()));
-    }
-    Ok(())
-}
-
-fn validate_signature(signature: &str, root: &str) -> Result<(), BootstrapError> {
+fn validate_signature(signature: &str, root: &DeviceId) -> Result<(), BootstrapError> {
     if signature.is_empty() || signature != signature.to_lowercase() {
         return Err(BootstrapError::InvalidRootSignature(root.to_string()));
     }
@@ -610,10 +596,11 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
-fn put_list(out: &mut Vec<u8>, values: &[String]) {
+fn put_devices(out: &mut Vec<u8>, values: &[DeviceId]) {
     out.extend_from_slice(&(values.len() as u64).to_be_bytes());
     for value in values {
-        put_text(out, value);
+        let bytes = value.as_bytes();
+        out.extend_from_slice(&bytes);
     }
 }
 
@@ -669,7 +656,7 @@ mod tests {
         let extra = VerifiedBootstrap::create_closed("scope-a", vec![key(3), key(4)], [9; 32]);
         assert_eq!(extra, Err(BootstrapError::ExactlyOneAuthorityRoot));
 
-        let mut basis = GenesisBasis {
+        let basis = GenesisBasis {
             version: BASIS_VERSION,
             scope: "scope-a".into(),
             profile: ClosedProfileId::SingleRootSignedMemberLogV1,
@@ -681,8 +668,7 @@ mod tests {
             basis.commitment(),
             Err(BootstrapError::ExactlyOneAuthorityRoot)
         );
-        basis.authority_roots.push("not-a-root".into());
-        assert!(basis.commitment().is_err());
+        assert!(DeviceId::from_canonical_str("not-a-root").is_err());
     }
 
     #[test]

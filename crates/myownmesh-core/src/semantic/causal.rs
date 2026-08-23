@@ -2,8 +2,36 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::content::FactBody;
+use super::content::{DeviceId, ExclusiveCell, FactBody, Role};
 use super::{FactId, MeshContextId, Projection, SemanticError, SignedFact, VerifiedBootstrap};
+
+/// Return the complete canonical dependency set for one fact.  Every caller
+/// that decides whether a fact is ready must use this function: parents,
+/// durable evidence, attestation inputs, and explicitly cited resolution
+/// heads are all causal inputs, regardless of their arrival order.
+pub fn dependencies(fact: &SignedFact) -> Vec<FactId> {
+    let mut dependencies = fact.content.parents.clone();
+    match &fact.content.body {
+        FactBody::EvictionProof { evidence, .. } | FactBody::SelfStandDown { evidence, .. } => {
+            dependencies.extend(evidence.iter().copied())
+        }
+        FactBody::Attestation {
+            proposal,
+            contributions,
+            ..
+        } => {
+            dependencies.push(*proposal);
+            dependencies.extend(contributions.iter().copied());
+        }
+        FactBody::Resolution { cited_heads, .. } => {
+            dependencies.extend(cited_heads.iter().copied())
+        }
+        _ => {}
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    dependencies
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
@@ -18,7 +46,7 @@ pub struct FactGraph {
     pub(crate) facts: BTreeMap<FactId, SignedFact>,
     pub(crate) quarantined: BTreeMap<FactId, SignedFact>,
     context_id: MeshContextId,
-    authority_roots: BTreeSet<String>,
+    authority_roots: BTreeSet<DeviceId>,
 }
 
 impl FactGraph {
@@ -30,7 +58,11 @@ impl FactGraph {
             facts: BTreeMap::new(),
             quarantined: BTreeMap::new(),
             context_id: bootstrap.context_id(),
-            authority_roots: bootstrap.authority_roots().iter().cloned().collect(),
+            authority_roots: bootstrap
+                .authority_roots()
+                .iter()
+                .filter_map(|root| DeviceId::from_canonical_str(root).ok())
+                .collect(),
         }
     }
 
@@ -56,11 +88,10 @@ impl FactGraph {
 
     pub fn admit(&mut self, fact: SignedFact) -> Result<Admission, SemanticError> {
         fact.verify()?;
-        let expected = self.context_id.to_string();
-        if fact.content.mesh_context != expected {
+        if fact.content.mesh_context != self.context_id {
             return Err(SemanticError::ContextMismatch {
                 expected: self.context_id,
-                found: fact.content.mesh_context,
+                found: fact.content.mesh_context.to_string(),
             });
         }
         if let Some(existing) = self.facts.get(&fact.id) {
@@ -70,48 +101,17 @@ impl FactGraph {
                 Err(SemanticError::DuplicateFact(fact.id))
             };
         }
+        if let Some(existing) = self.quarantined.get(&fact.id) {
+            return if existing == &fact {
+                Ok(Admission::AlreadyPresent)
+            } else {
+                Err(SemanticError::DuplicateFact(fact.id))
+            };
+        }
         if fact.content.parents.contains(&fact.id) {
             return Err(SemanticError::SelfParent);
         }
-        let mut missing: Vec<_> = fact
-            .content
-            .parents
-            .iter()
-            .copied()
-            .filter(|parent| !self.facts.contains_key(parent))
-            .collect();
-        let proof_evidence = match &fact.content.body {
-            FactBody::EvictionProof { evidence, .. } | FactBody::SelfStandDown { evidence, .. } => {
-                Some(evidence)
-            }
-            _ => None,
-        };
-        if let Some(evidence) = proof_evidence {
-            missing.extend(
-                evidence
-                    .iter()
-                    .copied()
-                    .filter(|evidence| !self.facts.contains_key(evidence)),
-            );
-        }
-        if let FactBody::Attestation {
-            proposal,
-            contributions,
-            ..
-        } = &fact.content.body
-        {
-            if !self.facts.contains_key(proposal) {
-                missing.push(*proposal);
-            }
-            missing.extend(
-                contributions
-                    .iter()
-                    .copied()
-                    .filter(|contribution| !self.facts.contains_key(contribution)),
-            );
-        }
-        missing.sort();
-        missing.dedup();
+        let missing = self.missing_dependencies(&fact);
         if !missing.is_empty() {
             self.quarantined.insert(fact.id, fact);
             return Ok(Admission::Quarantined { missing });
@@ -146,27 +146,20 @@ impl FactGraph {
                 if !fact.content.parents.contains(head) {
                     return Err(SemanticError::IncompleteResolution);
                 }
+                if !super::verify::body_advances_cell(&self.facts[head].content.body, cell) {
+                    return Err(SemanticError::IncompleteResolution);
+                }
             }
             if self.cell_heads(cell) != cited {
                 return Err(SemanticError::ResolutionNotCurrent);
             }
         }
-        if let Some(error) = Self::unauthorized_governance_error(&fact.content.body) {
-            if !self.is_authorized_signer(&fact.content.author) {
+        if let Some(error) = Self::authorization_error(&fact.content.body) {
+            if !self.is_authorized_for(&fact.content.body, &fact.content.author) {
                 return Err(error);
             }
         }
         match &fact.content.body {
-            FactBody::RoleGrant { .. } => {
-                if !self.is_authorized_signer(&fact.content.author) {
-                    return Err(SemanticError::UnauthorizedRoleGrant);
-                }
-            }
-            FactBody::Attestation { signer, .. } => {
-                if !self.is_authorized_signer(signer) {
-                    return Err(SemanticError::UnauthorizedAttestation);
-                }
-            }
             FactBody::EvictionProof { target, evidence } => {
                 self.validate_eviction_proof(target, evidence, &fact.content.author)?;
             }
@@ -184,11 +177,16 @@ impl FactGraph {
 
     fn validate_eviction_proof(
         &self,
-        target: &str,
+        target: &DeviceId,
         evidence: &[FactId],
-        author: &str,
+        author: &DeviceId,
     ) -> Result<(), SemanticError> {
-        if !self.is_authorized_signer(author) {
+        if !self.is_authorized_for(
+            &FactBody::Evict {
+                target: target.clone(),
+            },
+            author,
+        ) {
             return Err(SemanticError::UnauthorizedEviction);
         }
         for evidence_id in evidence {
@@ -205,9 +203,8 @@ impl FactGraph {
                 return Err(SemanticError::InvalidEvictionEvidence);
             };
             if attestation_target != target
-                || !self.is_authorized_signer(signer)
-                || crate::signing::pubkey_part(signer)
-                    != crate::signing::pubkey_part(&attestation.content.author)
+                || !self.has_tier(signer, Role::Member)
+                || *signer != attestation.content.author
             {
                 return Err(SemanticError::InvalidEvictionEvidence);
             }
@@ -219,14 +216,11 @@ impl FactGraph {
     /// can mutate governance or an exclusive cell. Participation and durable
     /// evidence retain their separate self-author/proof rules below; they do
     /// not become implicitly authorized by this table.
-    fn unauthorized_governance_error(body: &FactBody) -> Option<SemanticError> {
+    fn authorization_error(body: &FactBody) -> Option<SemanticError> {
         match body {
-            FactBody::KindChange { .. }
-            | FactBody::RoleGrant { .. }
+            FactBody::RoleGrant { .. }
             | FactBody::RoleRevoke { .. }
             | FactBody::Evict { .. }
-            | FactBody::Split { .. }
-            | FactBody::TopologyChange { .. }
             | FactBody::Resolution { .. } => Some(SemanticError::UnauthorizedRoleGrant),
             FactBody::Attestation { .. } => Some(SemanticError::UnauthorizedAttestation),
             _ => None,
@@ -235,11 +229,11 @@ impl FactGraph {
 
     fn validate_self_stand_down(
         &self,
-        device_id: &str,
+        device_id: &DeviceId,
         evidence: &[FactId],
-        author: &str,
+        author: &DeviceId,
     ) -> Result<(), SemanticError> {
-        if crate::signing::pubkey_part(device_id) != crate::signing::pubkey_part(author) {
+        if device_id != author {
             return Err(SemanticError::InvalidStandDownProof);
         }
         for evidence_id in evidence {
@@ -256,32 +250,100 @@ impl FactGraph {
         Ok(())
     }
 
-    pub fn is_authorized_signer(&self, signer: &str) -> bool {
-        if self
-            .authority_roots
-            .iter()
-            .any(|root| crate::signing::pubkey_part(root) == crate::signing::pubkey_part(signer))
-        {
-            return true;
-        }
-        let projection = self.projection();
-        self.facts.iter().any(|(id, fact)| {
-            let FactBody::RoleGrant { target, role } = &fact.content.body else {
-                return false;
-            };
-            if !matches!(role, super::Role::Controller | super::Role::Owner)
-                || crate::signing::pubkey_part(target) != crate::signing::pubkey_part(signer)
-            {
-                return false;
-            }
-            projection.value(&super::ExclusiveCell::new(target, "role")) == Some(*id)
-        })
+    pub fn is_authorized_signer(&self, signer: &DeviceId) -> bool {
+        self.current_role(signer).is_some()
     }
 
-    /// Retry quarantined facts whose parents have since arrived.  Quarantined
-    /// facts never participate in heads or projection until this succeeds.
+    fn current_role(&self, subject: &DeviceId) -> Option<Role> {
+        if self.authority_roots.contains(subject) {
+            return Some(Role::Owner);
+        }
+        let id = self
+            .projection()
+            .value(&ExclusiveCell::role(subject.clone()))?;
+        let fact = self.facts.get(&id)?;
+        match &fact.content.body {
+            FactBody::RoleGrant { target, role } if target == subject => Some(*role),
+            _ => None,
+        }
+    }
+
+    fn has_tier(&self, signer: &DeviceId, required: Role) -> bool {
+        let Some(actual) = self.current_role(signer) else {
+            return false;
+        };
+        matches!(
+            (actual, required),
+            (Role::Owner, _)
+                | (Role::Controller, Role::Controller | Role::Member)
+                | (Role::Member, Role::Member)
+        )
+    }
+
+    fn target_tier(&self, target: &DeviceId) -> Role {
+        match self.current_role(target) {
+            Some(Role::Owner) => Role::Owner,
+            Some(Role::Controller) => Role::Controller,
+            Some(Role::Member) => Role::Controller,
+            None => Role::Owner,
+        }
+    }
+
+    fn resolution_tier(&self, cell: &ExclusiveCell, cited_heads: &[FactId]) -> Role {
+        match cell {
+            ExclusiveCell::Role { subject } => match self.current_role(subject) {
+                Some(_) => self.target_tier(subject),
+                None => cited_heads
+                    .iter()
+                    .filter_map(|id| self.facts.get(id))
+                    .map(|fact| match &fact.content.body {
+                        FactBody::RoleGrant {
+                            role: Role::Member, ..
+                        } => Role::Controller,
+                        _ => Role::Owner,
+                    })
+                    .max()
+                    .unwrap_or(Role::Owner),
+            },
+            ExclusiveCell::Membership { subject } => self.target_tier(subject),
+            ExclusiveCell::Decision { .. } | ExclusiveCell::OpenParticipation { .. } => {
+                Role::Member
+            }
+        }
+    }
+
+    fn is_authorized_for(&self, body: &FactBody, author: &DeviceId) -> bool {
+        let required = match body {
+            FactBody::RoleGrant { role, .. } => match role {
+                Role::Member => Role::Controller,
+                Role::Controller | Role::Owner => Role::Owner,
+            },
+            FactBody::RoleRevoke { target } | FactBody::Evict { target } => {
+                self.target_tier(target)
+            }
+            FactBody::Attestation { .. } => Role::Member,
+            FactBody::Resolution {
+                cell, cited_heads, ..
+            } => self.resolution_tier(cell, cited_heads),
+            _ => return true,
+        };
+        self.has_tier(author, required)
+    }
+
+    pub fn missing_dependencies(&self, fact: &SignedFact) -> Vec<FactId> {
+        dependencies(fact)
+            .into_iter()
+            .filter(|dependency| !self.facts.contains_key(dependency))
+            .collect()
+    }
+
+    /// Retry quarantined facts whose dependencies have since arrived.
+    /// Quarantined facts never participate in heads or projection until this
+    /// succeeds. Each successful round strictly decreases quarantine; an
+    /// empty ready set or a round with no insertion terminates, so malformed
+    /// dependency cycles cannot spin forever.
     pub fn retry_quarantined(&mut self) -> Result<Vec<FactId>, SemanticError> {
-        let expected = self.context_id.to_string();
+        let expected = self.context_id;
         if let Some(fact) = self
             .quarantined
             .values()
@@ -289,7 +351,7 @@ impl FactGraph {
         {
             return Err(SemanticError::ContextMismatch {
                 expected: self.context_id,
-                found: fact.content.mesh_context.clone(),
+                found: fact.content.mesh_context.to_string(),
             });
         }
         let mut inserted = Vec::new();
@@ -297,39 +359,32 @@ impl FactGraph {
             let ready: Vec<_> = self
                 .quarantined
                 .values()
-                .filter(|fact| {
-                    let parents_ready = fact
-                        .content
-                        .parents
-                        .iter()
-                        .all(|parent| self.facts.contains_key(parent));
-                    let evidence_ready = match &fact.content.body {
-                        FactBody::EvictionProof { evidence, .. }
-                        | FactBody::SelfStandDown { evidence, .. } => evidence
-                            .iter()
-                            .all(|evidence| self.facts.contains_key(evidence)),
-                        _ => true,
-                    };
-                    parents_ready && evidence_ready
-                })
+                .filter(|fact| self.missing_dependencies(fact).is_empty())
                 .map(|fact| fact.id)
                 .collect();
             if ready.is_empty() {
                 return Ok(inserted);
             }
+            let mut round_progress = false;
             for id in ready {
                 let fact = self
                     .quarantined
                     .remove(&id)
                     .expect("ready quarantine entry remains present");
                 match self.admit(fact.clone()) {
-                    Ok(Admission::Inserted) => inserted.push(id),
+                    Ok(Admission::Inserted) => {
+                        round_progress = true;
+                        inserted.push(id)
+                    }
                     Ok(Admission::AlreadyPresent | Admission::Quarantined { .. }) => {}
                     Err(error) => {
                         self.quarantined.insert(id, fact);
                         return Err(error);
                     }
                 }
+            }
+            if !round_progress {
+                return Ok(inserted);
             }
         }
     }
