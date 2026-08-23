@@ -1797,6 +1797,26 @@ impl PeerConnection {
         self.promoted_session.is_installed()
     }
 
+    /// Whether this current installation still has a usable recovery path.
+    ///
+    /// A promoted session is usable when any channel still proves both a live
+    /// connector incarnation and capability membership. Selection is not part
+    /// of this observation: multiple usable channels remain ambiguous and are
+    /// deliberately left untouched. An unpromoted installation is usable only
+    /// when its current connector is still live.
+    pub(crate) fn has_usable_session_for_recovery(&self) -> bool {
+        if self.registry_retired() {
+            return false;
+        }
+        if self.promoted_session.is_installed() {
+            return self.promoted_session.has_usable_channel();
+        }
+        self.session
+            .lock()
+            .as_ref()
+            .is_some_and(|worker| worker.live_connector_incarnation().is_some())
+    }
+
     #[cfg(test)]
     pub(super) fn promoted_channel_count(&self) -> usize {
         self.promoted_session.channel_count()

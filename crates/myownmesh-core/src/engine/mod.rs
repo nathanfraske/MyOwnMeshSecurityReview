@@ -1184,7 +1184,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             if state
                 .peers
                 .owner(&device_id)
-                .is_some_and(|owner| owner.connection().holds_promoted_session())
+                .is_some_and(|owner| owner.connection().has_usable_session_for_recovery())
             {
                 return;
             }
@@ -1912,7 +1912,15 @@ pub(crate) fn short_peer(id: &str) -> String {
 /// into a storm of relay publishes. Returns whether the announce was
 /// actually emitted. The driver's own steady-state announcer is
 /// independent of this and unaffected.
-pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReactiveAnnounceResult {
+    NotAttempted,
+    RateLimited,
+    Sent,
+    Refused,
+}
+
+fn maybe_reactive_announce_result(state: &Arc<NetworkState>) -> ReactiveAnnounceResult {
     let mut guard = state.last_reactive_announce_at.lock();
     let now = Instant::now();
     let due = guard
@@ -1920,12 +1928,46 @@ pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
             now.duration_since(prev) >= Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
         })
         .unwrap_or(true);
-    if due {
-        *guard = Some(now);
-        drop(guard);
-        let _ = state.signaling_tx.send(SignalingOutbound::Announce);
+    if !due {
+        return ReactiveAnnounceResult::RateLimited;
     }
-    due
+    // Admission can refuse under provider pressure or after shutdown. Do not
+    // consume the cooldown until the exact outbound item is accepted, or a
+    // transient refusal can suppress the only recovery nudge for a full
+    // interval while the peer remains without an offerer.
+    if state.signaling_tx.send(SignalingOutbound::Announce).is_ok() {
+        *guard = Some(now);
+        ReactiveAnnounceResult::Sent
+    } else {
+        ReactiveAnnounceResult::Refused
+    }
+}
+
+fn reactive_announce_remaining(state: &Arc<NetworkState>) -> Option<Duration> {
+    let last = *state.last_reactive_announce_at.lock();
+    let elapsed = last?.elapsed();
+    let interval = Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS);
+    (elapsed < interval).then_some(interval - elapsed)
+}
+
+/// Complete one cooldown-coalesced Answerer recovery nudge after the exact
+/// terminal has settled. The delay is copied out of the mutex before awaiting;
+/// another producer may win the global slot in the meantime, in which case
+/// that producer supplied the same required post-terminal announce.
+async fn maybe_reactive_announce_after_terminal(
+    state: &Arc<NetworkState>,
+) -> ReactiveAnnounceResult {
+    if let Some(remaining) = reactive_announce_remaining(state) {
+        tokio::time::sleep(remaining).await;
+    }
+    maybe_reactive_announce_result(state)
+}
+
+pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
+    matches!(
+        maybe_reactive_announce_result(state),
+        ReactiveAnnounceResult::Sent
+    )
 }
 
 /// Re-offer to a peer we hold a reconnect intent for, when conditions allow:
@@ -1941,7 +1983,11 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
     if state.is_offline() {
         return;
     }
-    if state.peers.contains_key(device_id) {
+    if state
+        .peers
+        .get(device_id)
+        .is_some_and(|peer| peer.has_usable_session_for_recovery())
+    {
         return;
     }
     // Manual/no-intent recovery keeps the deterministic offerer gate. A
@@ -3070,7 +3116,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     if state
         .peers
         .get(device_id)
-        .is_some_and(|p| p.session.lock().is_some())
+        .is_some_and(|p| p.has_usable_session_for_recovery())
     {
         return;
     }
@@ -7027,7 +7073,9 @@ async fn finish_drop_peer_inner(
     removed: Option<Arc<PeerConnection>>,
     opened_as: Option<OpenedAs>,
     already_started: bool,
-) {
+) -> ReactiveAnnounceResult {
+    let mut announce_result = ReactiveAnnounceResult::NotAttempted;
+    let mut retry_announce_after_terminal = false;
     if let Some(peer) = removed {
         let sticky = state.is_sticky(device_id);
         let evicted = governance::log_evicted(state, device_id);
@@ -7050,6 +7098,16 @@ async fn finish_drop_peer_inner(
             state.resolve_connect_waiters(device_id, Some(&why));
         }
 
+        // An exact recoverable Answerer cannot arm local reconnect: the
+        // remote Offerer owns the next negotiation. Nudge that owner before
+        // native close settles, but only when the removed worker's role is
+        // known exactly; an absent role fails closed. The helper's existing
+        // floor coalesces repeated terminal edges into one announce.
+        if recoverable && !sticky && opened_as.is_some_and(|opened_as| !opened_as.is_offerer()) {
+            announce_result = maybe_reactive_announce_result(state);
+            retry_announce_after_terminal = announce_result == ReactiveAnnounceResult::RateLimited;
+        }
+
         if !already_started {
             state.peers.track_removed_close(Arc::clone(&peer));
             // Retire synchronously to move every exact channel/candidate into
@@ -7062,6 +7120,9 @@ async fn finish_drop_peer_inner(
             warn!(%error, "peer cleanup did not complete successfully");
         }
         state.peers.complete_removed_close(&peer);
+        if retry_announce_after_terminal {
+            announce_result = maybe_reactive_announce_after_terminal(state).await;
+        }
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
@@ -7081,6 +7142,7 @@ async fn finish_drop_peer_inner(
     }
     phase::recompute(state);
     ladder::reevaluate_topology(state).await;
+    announce_result
 }
 
 fn forget_dedup_owned(
@@ -15024,10 +15086,16 @@ mod tests {
             .await;
         });
         gate.wait_for_entry().await;
-        assert!(
-            state.has_reconnect_intent(&target),
-            "actual offerer recovery intent is visible while native close is gated"
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.has_reconnect_intent(&target) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual offerer recovery intent is published while native close is gated");
         gate.open();
         drop_task
             .await
@@ -15049,6 +15117,244 @@ mod tests {
         );
         drop(events);
         state.shutdown().await;
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn answerer_recovery_announces_before_native_close_without_local_intent() {
+        use crate::network_state::{transition_payload, Role, Transition, TransitionVariant};
+
+        let (state, _signaling_in_rx, cmd_rx, _provider, _grant) =
+            build_test_state_parts_metered_with_creation(
+                "answerer-recovery-announce",
+                None,
+                3,
+                None,
+                Some([0x75; 32]),
+            );
+        state.park_command_receiver_for_test(cmd_rx);
+        let mut signaling_out_rx = state
+            .take_signaling_outbound_rx()
+            .expect("the answerer recovery control takes the outbound receiver");
+
+        let evicted = "evicted-answerer-recovery".to_string();
+        let net = state.network_id.clone();
+        let authority_id = state.identity.public_id().to_string();
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(&net, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(
+                    state.identity.signing_key(),
+                    &payload,
+                )],
+                signers: vec![authority_id.clone()],
+                variant,
+            }
+        };
+        governance::adopt_transition_log(
+            &state,
+            &authority_id,
+            &[],
+            &[
+                signed(
+                    TransitionVariant::RoleGrant {
+                        target: evicted.clone(),
+                        role: Role::Member,
+                    },
+                    1,
+                ),
+                signed(
+                    TransitionVariant::Evict {
+                        target: evicted.clone(),
+                    },
+                    2,
+                ),
+            ],
+        )
+        .await;
+        assert!(governance::log_evicted(&state, &evicted));
+
+        let intentional = insert_promoted_peer(&state, "intentional-answerer-recovery").await;
+        let intentional_worker = intentional
+            .peer
+            .current_worker()
+            .expect("intentional control exposes its answerer worker");
+        let intentional_gate = intentional_worker.install_native_close_gate_for_test();
+        let (removed, opened_as) = remove_peer(&state.peers, "intentional-answerer-recovery")
+            .expect("intentional answerer peer is removed");
+        assert!(opened_as.is_some_and(|opened_as| !opened_as.is_offerer()));
+        let drop_state = Arc::clone(&state);
+        let drop_task = tokio::spawn(async move {
+            finish_drop_peer_inner(
+                &drop_state,
+                "intentional-answerer-recovery",
+                DropReason::UserLeft,
+                Some(removed),
+                opened_as,
+                false,
+            )
+            .await
+        });
+        intentional_gate.wait_for_entry().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), signaling_out_rx.recv())
+                .await
+                .is_err(),
+            "intentional answerer retirement emits no recovery announce while gated"
+        );
+        assert!(!state.has_reconnect_intent("intentional-answerer-recovery"));
+        intentional_gate.open();
+        assert_eq!(
+            drop_task.await.expect("intentional answerer drop joins"),
+            ReactiveAnnounceResult::NotAttempted
+        );
+
+        let evicted_fixture = insert_promoted_peer(&state, &evicted).await;
+        let evicted_worker = evicted_fixture
+            .peer
+            .current_worker()
+            .expect("evicted control exposes its answerer worker");
+        let evicted_gate = evicted_worker.install_native_close_gate_for_test();
+        let (removed, opened_as) =
+            remove_peer(&state.peers, &evicted).expect("evicted answerer peer is removed");
+        let drop_state = Arc::clone(&state);
+        let drop_target = evicted.clone();
+        let drop_task = tokio::spawn(async move {
+            finish_drop_peer_inner(
+                &drop_state,
+                &drop_target,
+                DropReason::IceFailed,
+                Some(removed),
+                opened_as,
+                false,
+            )
+            .await
+        });
+        evicted_gate.wait_for_entry().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), signaling_out_rx.recv())
+                .await
+                .is_err(),
+            "evicted answerer retirement emits no recovery announce while gated"
+        );
+        assert!(!state.has_reconnect_intent(&evicted));
+        evicted_gate.open();
+        assert_eq!(
+            drop_task.await.expect("evicted answerer drop joins"),
+            ReactiveAnnounceResult::NotAttempted
+        );
+
+        drop(intentional._events);
+        drop(evicted_fixture._events);
+        state.shutdown().await;
+
+        // Keep the positive observation on a fresh one-slot state. The
+        // negative terminals above deliberately exercise their own close and
+        // provider-release paths; sharing their mailbox would make a missing
+        // announce indistinguishable from stale fixture custody or cooldown.
+        let (positive_state, _signaling_in_rx, positive_cmd_rx, _provider, _grant) =
+            build_test_state_parts_metered("answerer-recovery-positive", None, 1, None);
+        positive_state.park_command_receiver_for_test(positive_cmd_rx);
+        let mut positive_signaling_out_rx = positive_state
+            .take_signaling_outbound_rx()
+            .expect("the positive control takes the outbound receiver");
+        let recovering = "recovering-answerer";
+        let recovering_fixture = insert_promoted_peer(&positive_state, recovering).await;
+        let recovering_worker = recovering_fixture
+            .peer
+            .current_worker()
+            .expect("recovering control exposes its answerer worker");
+        let recovering_gate = recovering_worker.install_native_close_gate_for_test();
+        let (removed, opened_as) = remove_peer(&positive_state.peers, recovering)
+            .expect("recovering answerer peer is removed");
+        assert!(opened_as.is_some_and(|opened_as| !opened_as.is_offerer()));
+        let drop_state = Arc::clone(&positive_state);
+        let drop_task = tokio::spawn(async move {
+            finish_drop_peer_inner(
+                &drop_state,
+                recovering,
+                DropReason::IceFailed,
+                Some(removed),
+                opened_as,
+                false,
+            )
+            .await
+        });
+        recovering_gate.wait_for_entry().await;
+        let announcement =
+            tokio::time::timeout(Duration::from_secs(1), positive_signaling_out_rx.recv())
+                .await
+                .expect("recoverable answerer announce arrives while close is gated")
+                .expect("the positive outbound receiver remains open");
+        assert!(matches!(announcement.value(), SignalingOutbound::Announce));
+        drop(announcement);
+        assert!(!positive_state.has_reconnect_intent(recovering));
+        recovering_gate.open();
+        assert_eq!(
+            drop_task.await.expect("recovering answerer drop joins"),
+            ReactiveAnnounceResult::Sent
+        );
+
+        drop(recovering_fixture._events);
+        positive_state.shutdown().await;
+
+        // A cooldown already occupied by an unrelated announce must not turn
+        // this exact recoverable Answerer terminal into a permanent no-op.
+        // The retry is joined by this same close task and therefore happens
+        // only after native terminal settlement.
+        let (cooldown_state, _signaling_in_rx, cooldown_cmd_rx, _provider, _grant) =
+            build_test_state_parts_metered("answerer-recovery-cooldown", None, 1, None);
+        cooldown_state.park_command_receiver_for_test(cooldown_cmd_rx);
+        let mut cooldown_signaling_out_rx = cooldown_state
+            .take_signaling_outbound_rx()
+            .expect("the cooldown control takes the outbound receiver");
+        *cooldown_state.last_reactive_announce_at.lock() = Some(Instant::now());
+        let cooldown_fixture = insert_promoted_peer(&cooldown_state, "cooldown-answerer").await;
+        let cooldown_worker = cooldown_fixture
+            .peer
+            .current_worker()
+            .expect("cooldown control exposes its answerer worker");
+        let cooldown_gate = cooldown_worker.install_native_close_gate_for_test();
+        let (removed, opened_as) = remove_peer(&cooldown_state.peers, "cooldown-answerer")
+            .expect("cooldown answerer peer is removed");
+        assert!(opened_as.is_some_and(|opened_as| !opened_as.is_offerer()));
+        let cooldown_drop_state = Arc::clone(&cooldown_state);
+        let cooldown_drop_task = tokio::spawn(async move {
+            finish_drop_peer_inner(
+                &cooldown_drop_state,
+                "cooldown-answerer",
+                DropReason::IceFailed,
+                Some(removed),
+                opened_as,
+                false,
+            )
+            .await
+        });
+        cooldown_gate.wait_for_entry().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cooldown_signaling_out_rx.recv())
+                .await
+                .is_err(),
+            "a rate-limited Answerer recovery announce waits for native close"
+        );
+        cooldown_gate.open();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cooldown_drop_task)
+                .await
+                .expect("cooldown recovery retry does not detach")
+                .expect("cooldown answerer drop joins"),
+            ReactiveAnnounceResult::Sent
+        );
+        let announcement = cooldown_signaling_out_rx
+            .recv()
+            .await
+            .expect("the post-terminal cooldown announce remains queued");
+        assert!(matches!(announcement.value(), SignalingOutbound::Announce));
+        drop(announcement);
+        drop(cooldown_fixture._events);
+        cooldown_state.shutdown().await;
     }
 
     #[tokio::test]
@@ -15124,6 +15430,203 @@ mod tests {
             state.has_reconnect_intent(&live),
             "a non-evicted sticky peer still recovers on IceFailed"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_entry_is_not_treated_as_live() {
+        let state = build_test_state("stale-recovery-entry");
+        let target = "stale-recovery-peer";
+        insert_session_less_peer(&state, target, None);
+        let stale = state
+            .peers
+            .owner(target)
+            .expect("the stale recovery entry is installed");
+        assert!(
+            !stale.connection().has_usable_session_for_recovery(),
+            "a session-less current entry is replaceable by recovery"
+        );
+
+        let successor = Arc::new(PeerConnection::new(target.to_string(), None));
+        install_peer(&state.peers, Arc::clone(&successor));
+        let current = state
+            .peers
+            .get(target)
+            .expect("the replacement entry remains installed");
+        assert!(
+            Arc::ptr_eq(&current, &successor),
+            "stale recovery evidence is replaced atomically by the registry"
+        );
+    }
+
+    /// Two live capability-bound channels make recovery usable without making
+    /// either channel uniquely selectable. The observation must remain
+    /// non-mutating: ambiguity is preserved before and after the predicate.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens native WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_ambiguous_live_promoted_channels_are_usable_without_selection() {
+        let state = build_test_state_with_connector_slots("b2-ambiguous-recovery", 3);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let target = data_encoding::BASE32_NOPAD
+            .encode(remote_key.verifying_key().as_bytes())
+            .to_lowercase();
+        let first = insert_promoted_peer(&state, &target).await;
+        let owner = state
+            .peers
+            .owner(&target)
+            .expect("the first promoted owner is current");
+        assert!(
+            state
+                .peers
+                .admit_application_operation(
+                    &owner,
+                    state.session_broker.as_ref(),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_some(),
+            "the first live capability-bound channel is promoted"
+        );
+        let first_worker = owner
+            .connection()
+            .session
+            .lock()
+            .clone()
+            .expect("the selected W0 worker is retained in the compatibility mirror");
+
+        let peer_state = build_test_state("b2-ambiguous-recovery-remote");
+        let mut second_link =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &peer_state)
+                .await;
+        let second_open = second_link.take_open_event();
+        let second_open = second_link
+            .left
+            .accept_event(second_open)
+            .expect("the second connector accepts its genuine open callback");
+        let (second_open, _second_open_resources) = second_open.into_parts();
+        assert!(
+            matches!(second_open, TransportEvent::DataChannelOpen),
+            "the second connector reaches the genuine open callback"
+        );
+        second_link._left_events.commit_data_channel_open();
+        let second = Arc::clone(&second_link.left);
+        let correlation = "b2-ambiguous-recovery-second";
+        let _second_task = prepare_b2_provider_speculative_channel(
+            &state,
+            &first.peer,
+            &second,
+            correlation,
+            &target,
+            &remote_key,
+        )
+        .await;
+        assert!(
+            state
+                .peers
+                .promote_speculative_command(
+                    &owner,
+                    &second,
+                    correlation,
+                    state.session_broker.as_ref().expect("the broker exists"),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_some(),
+            "the second live capability-bound channel is promoted"
+        );
+        assert_eq!(
+            first.peer.promoted_channel_count(),
+            2,
+            "the installed logical session contains W0 and one live standby"
+        );
+
+        let third_peer_state = build_test_state("b2-ambiguous-recovery-remote-third");
+        let mut third_link = crate::endpoint_auth::native_link::connect_before_engine_open(
+            &state,
+            &third_peer_state,
+        )
+        .await;
+        let third_open = third_link.take_open_event();
+        let third_open = third_link
+            .left
+            .accept_event(third_open)
+            .expect("the third connector accepts its genuine open callback");
+        let (third_open, _third_open_resources) = third_open.into_parts();
+        assert!(
+            matches!(third_open, TransportEvent::DataChannelOpen),
+            "the third connector reaches the genuine open callback"
+        );
+        third_link._left_events.commit_data_channel_open();
+        let third = Arc::clone(&third_link.left);
+        let third_correlation = "b2-ambiguous-recovery-third";
+        let _third_task = prepare_b2_provider_speculative_channel(
+            &state,
+            &first.peer,
+            &third,
+            third_correlation,
+            &target,
+            &remote_key,
+        )
+        .await;
+        assert!(
+            state
+                .peers
+                .promote_speculative_command(
+                    &owner,
+                    &third,
+                    third_correlation,
+                    state.session_broker.as_ref().expect("the broker exists"),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_some(),
+            "the third live capability-bound channel is promoted"
+        );
+        assert_eq!(
+            first.peer.promoted_channel_count(),
+            3,
+            "the installed logical session contains selected W0 plus W1/W2 standbys"
+        );
+        assert!(
+            first
+                .peer
+                .select_unique_usable_channel()
+                .is_some_and(|worker| { Arc::ptr_eq(&worker, &first_worker) }),
+            "W0 remains the selected channel before its exact terminal"
+        );
+        handle_exact_promoted_terminal(&state, &owner, &first_worker, DropReason::IceFailed).await;
+        let current_owner = state
+            .peers
+            .owner(&target)
+            .expect("removing selected W0 preserves the logical peer");
+        assert_eq!(
+            current_owner.connection().promoted_channel_count(),
+            2,
+            "the exact W0 terminal leaves both live standbys installed"
+        );
+        assert!(
+            current_owner.connection().has_usable_session_for_recovery(),
+            "the two live standbys make recovery usable after W0 removal"
+        );
+        assert!(
+            current_owner
+                .connection()
+                .select_unique_usable_channel()
+                .is_none(),
+            "the two surviving standbys remain unselected before a repeated observation"
+        );
+        assert!(
+            current_owner.connection().has_usable_session_for_recovery(),
+            "the repeated recovery observation remains non-mutating"
+        );
+        assert!(
+            current_owner
+                .connection()
+                .select_unique_usable_channel()
+                .is_none(),
+            "the repeated observation does not select a channel"
+        );
+
+        state.shutdown().await;
+        peer_state.shutdown().await;
+        third_peer_state.shutdown().await;
     }
 
     #[tokio::test]
@@ -21368,9 +21871,10 @@ mod tests {
             .expect("the B gateway serves the handoff control method");
         let (handoff_request, handoff_waiter) = file_pending(&state_a, &device_b);
         // B2-G semantic control: seed one B-only roster row so the actual
-        // RosterEntries reply has a durable, observable effect on A. The
-        // request is sent through A's exact selected W0 and reaches B through
-        // the normal connector pump, not a direct reducer invocation.
+        // RosterEntries reply carries an unsigned membership hint. The
+        // canonical contract is that this carrier does not mutate A's roster.
+        // The request is sent through A's exact selected W0 and reaches B
+        // through the normal connector pump, not a direct reducer invocation.
         let roster_probe = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
@@ -21631,6 +22135,12 @@ mod tests {
         assert!(
             after_w0_owner_b
                 .connection()
+                .has_usable_session_for_recovery(),
+            "ambiguous live channels remain usable for recovery without auto-selection"
+        );
+        assert!(
+            after_w0_owner_b
+                .connection()
                 .select_unique_usable_channel()
                 .is_none(),
             "repeating the no-argument selection seam cannot guess among equivalents"
@@ -21733,8 +22243,8 @@ mod tests {
             "the actual admitted RPC reply settles A's pending call through W1"
         );
         assert!(
-            settle_until(|| state_a.is_rostered(&roster_probe)).await,
-            "the paused production roster request resumes through logical L0 and its W1 reply crosses to A"
+            !state_a.is_rostered(&roster_probe),
+            "the B-only unsigned roster carrier does not mutate A's canonical roster"
         );
         assert_eq!(
             pending_len(&state_a, &device_b),

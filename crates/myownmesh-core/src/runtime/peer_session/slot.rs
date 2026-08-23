@@ -258,6 +258,23 @@ impl PromotedSession {
         self.selected.as_ref()
     }
 
+    fn has_usable_channel(&self) -> bool {
+        if !self.logical.validity().is_live() {
+            return false;
+        }
+        let mut usable = false;
+        self.channels.for_each(|_, channel| {
+            if channel
+                .worker
+                .live_connector_incarnation()
+                .is_some_and(|live| channel.session.belongs_to(live))
+            {
+                usable = true;
+            }
+        });
+        usable
+    }
+
     /// Lend the exact selected channel authority with the singular logical
     /// application state. The two borrows are field-split: selection is read
     /// from the channel map, while state remains owned by the logical record.
@@ -856,6 +873,17 @@ impl PromotedSessionSlot {
             .lock()
             .as_ref()
             .and_then(|promoted| promoted.selected_worker().cloned())
+    }
+
+    /// Whether at least one promoted channel still has both a live connector
+    /// incarnation and its capability bound to that incarnation. This is an
+    /// observation-only predicate: unlike unique selection it never changes
+    /// the slot, so multiple usable channels remain ambiguous and untouched.
+    pub(crate) fn has_usable_channel(&self) -> bool {
+        self.slot
+            .lock()
+            .as_ref()
+            .is_some_and(PromotedSession::has_usable_channel)
     }
 
     /// Lend one established capability synchronously without exposing map
